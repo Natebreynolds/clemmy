@@ -2,12 +2,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { HOST_UNSCOPED_DISCOVERY_SUBJECT } from './discovery-governor.js';
 import { test } from 'node:test';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-discovery-role-budget-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
+const { HOST_UNSCOPED_DISCOVERY_SUBJECT } = await import('./discovery-governor.js');
 const eventlog = await import('./eventlog.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const {

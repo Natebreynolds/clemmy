@@ -139,6 +139,28 @@ test('the orchestrator halt hook ends the turn on a successful background contro
   );
 });
 
+test('a real question has a distinct resumable final-output contract', async () => {
+  const {
+    formatAwaitingUserInputFinalOutput,
+    parseAwaitingUserInputFinalOutput,
+    parseControlReceiptFinalOutput,
+  } = await import('./terminal-tool.js');
+  const { toOrchestratorDecision } = await import('./loop.js');
+  const question = 'Which connected account should I use?';
+  const output = formatAwaitingUserInputFinalOutput(question);
+
+  assert.equal(parseAwaitingUserInputFinalOutput(output), question);
+  assert.equal(parseControlReceiptFinalOutput(output), null,
+    'a pause must never decode as a completed control receipt');
+  assert.deepEqual(toOrchestratorDecision(output), {
+    summary: question,
+    reply: question,
+    done: false,
+    nextAction: 'awaiting_user_input',
+    reason: 'awaiting_user_input',
+  });
+});
+
 // The alignment-beat refusal must never halt the turn as a "successful"
 // dispatch receipt: unmarked, it was rendered into a fabricated "Started …"
 // line and the honesty floor blocked the whole turn (live 2026-08-11,

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { webcrypto } from 'node:crypto';
+import { createHash, webcrypto } from 'node:crypto';
 
 const TMP_ROOT = mkdtempSync(path.join(os.tmpdir(), 'clemmy-sessions-test-'));
 process.env.CLEMENTINE_HOME = TMP_ROOT;
@@ -21,6 +21,8 @@ test.after(() => {
 
 const {
   createSession,
+  createSessionForExistingDevice,
+  createOrReuseSessionForExistingDevice,
   validateSession,
   rotateSessionToken,
   detectTokenReuse,
@@ -125,6 +127,121 @@ test('a key-bound session cannot be rebound by a stolen cookie', async () => {
   const { token } = await createSession({ devicePublicKeyJwk: await publicJwk() }, { stateDir });
   const attempt = await bindDeviceKey(token, await publicJwk(), { stateDir });
   assert.equal(attempt, undefined, 'rebinding an already-bound session must be refused');
+});
+
+test('origin adoption can append a session only for a currently live device', async () => {
+  const stateDir = freshDir();
+  const original = await createSession({ deviceLabel: 'Roaming phone' }, { stateDir });
+  const adopted = await createSessionForExistingDevice({
+    deviceId: original.record.deviceId,
+    deviceLabel: original.record.deviceLabel,
+  }, { stateDir });
+  assert.ok(adopted);
+  assert.equal(adopted!.record.deviceId, original.record.deviceId);
+  assert.equal(listSessions({ stateDir }).length, 2, 'one device may hold one cookie per origin');
+
+  await revokeSessionByDeviceId(original.record.deviceId, { stateDir });
+  assert.equal(
+    await createSessionForExistingDevice({ deviceId: original.record.deviceId }, { stateDir }),
+    undefined,
+    'a durable handoff cannot resurrect a revoked device',
+  );
+  assert.equal(listSessions({ stateDir }).length, 0);
+});
+
+test('origin adoption reuses the exact deterministic bearer after a lost response', async () => {
+  const stateDir = freshDir();
+  const original = await createSession({ deviceLabel: 'Retry phone' }, { stateDir });
+  const handoffToken = 'handoff-retry-token-with-at-least-thirty-two-bytes';
+  const first = await createOrReuseSessionForExistingDevice(
+    { deviceId: original.record.deviceId, deviceLabel: original.record.deviceLabel },
+    handoffToken,
+    { stateDir },
+  );
+  const retry = await createOrReuseSessionForExistingDevice(
+    { deviceId: original.record.deviceId, deviceLabel: original.record.deviceLabel },
+    handoffToken,
+    { stateDir },
+  );
+  assert.ok(first && retry);
+  assert.equal(retry!.token, first!.token);
+  assert.equal(retry!.record.tokenHash, first!.record.tokenHash);
+  assert.equal(retry!.record.createdAt, first!.record.createdAt);
+  assert.equal(retry!.record.deviceId, first!.record.deviceId);
+  assert.equal(listSessions({ stateDir }).length, 2, 'retry does not append a third session');
+});
+
+test('a settled origin adoption cannot mint fresh authority after its bearer rotates', async () => {
+  const stateDir = freshDir();
+  const original = await createSession({ deviceLabel: 'Rotation phone' }, { stateDir });
+  const handoffToken = 'settled-handoff-token-with-at-least-thirty-two-bytes';
+  const adopted = await createOrReuseSessionForExistingDevice(
+    { deviceId: original.record.deviceId, deviceLabel: original.record.deviceLabel },
+    handoffToken,
+    { stateDir },
+  );
+  assert.ok(adopted);
+  assert.ok(await rotateSessionToken(handoffToken, { stateDir }));
+
+  const replay = await createOrReuseSessionForExistingDevice(
+    { deviceId: original.record.deviceId, reuseOnly: true },
+    handoffToken,
+    { stateDir },
+  );
+  assert.equal(replay, undefined, 'retired bearer cannot create a replacement origin session');
+  assert.equal(listSessions({ stateDir }).length, 2, 'replay appends no third session');
+});
+
+test('the session digest fences a crash before the handoff receipt is marked adopted', async () => {
+  const stateDir = freshDir();
+  const original = await createSession({ deviceLabel: 'Crash-window phone' }, { stateDir });
+  const handoffToken = 'crash-window-handoff-token-with-thirty-two-bytes';
+  const originHandoffDigest = createHash('sha256').update(handoffToken).digest('hex');
+  const first = await createOrReuseSessionForExistingDevice(
+    { deviceId: original.record.deviceId, originHandoffDigest },
+    handoffToken,
+    { stateDir },
+  );
+  assert.ok(first);
+  assert.ok(await rotateSessionToken(handoffToken, { stateDir }));
+
+  const replay = await createOrReuseSessionForExistingDevice(
+    { deviceId: original.record.deviceId, originHandoffDigest },
+    handoffToken,
+    { stateDir },
+  );
+  assert.equal(replay, undefined, 'receipt-write crash cannot reopen create authority');
+  assert.equal(listSessions({ stateDir }).length, 2);
+});
+
+test('concurrent device revocation and origin adoption always end revoked', async () => {
+  const stateDir = freshDir();
+  const original = await createSession({}, { stateDir });
+  await Promise.all([
+    createSessionForExistingDevice({ deviceId: original.record.deviceId }, { stateDir }),
+    revokeSessionByDeviceId(original.record.deviceId, { stateDir }),
+  ]);
+  assert.equal(
+    listSessions({ stateDir }).filter((row) => row.deviceId === original.record.deviceId).length,
+    0,
+    'the shared atomic session lock makes either serialization order safe',
+  );
+});
+
+test('an expired device row cannot authorize an origin adoption', async () => {
+  const stateDir = freshDir();
+  const original = await createSession(
+    { deviceId: 'dev-expired-origin' },
+    { stateDir, ttlMs: 100, now: () => 1_000 },
+  );
+  assert.equal(
+    await createSessionForExistingDevice(
+      { deviceId: original.record.deviceId },
+      { stateDir, now: () => 1_101 },
+    ),
+    undefined,
+  );
+  assert.equal(listSessions({ stateDir, now: () => 1_101 }).length, 0);
 });
 
 test('rotation preserves device identity and the absolute ceiling', async () => {

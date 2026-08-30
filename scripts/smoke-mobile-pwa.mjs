@@ -11,11 +11,12 @@
 //   6. GET /m/auth/status              → 200 JSON (existing API still matches first)
 //   7. GET /m/inbox  (Accept: text/html)→ 200 HTML (SPA fallback)
 //   8. GET /m/api/whoami               → 401 (auth API not shadowed by static)
-//   9. Host=<configured mobile hostname> hides non-/m daemon routes
-//  10. Host=<configured mobile hostname> can approve via /m/api/approvals
+//   9. Unknown named Hosts are rejected before either surface is served
+//  10. The disposable loopback PWA can approve via /m/api/approvals
 //
 // Run: node scripts/smoke-mobile-pwa.mjs
-// Build of the mobile-web bundle happens automatically if missing.
+// The mobile-web bundle is always rebuilt. A pre-existing dist is never proof
+// that it represents the source under test.
 
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, cpSync, symlinkSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -40,15 +41,13 @@ if (!existsSync(path.join(DAEMON_DIST, 'index.js'))) {
   process.exit(2);
 }
 
-if (!existsSync(path.join(PWA_DIST, 'index.html'))) {
-  console.log('  • building mobile-web…');
-  const build = spawnSync('npm', ['run', 'build'], { cwd: PWA_ROOT, stdio: 'inherit' });
-  if (build.status !== 0) {
-    console.error('  ✗ mobile-web build failed');
-    process.exit(1);
-  }
+console.log('  • rebuilding mobile-web from current source…');
+const pwaBuild = spawnSync('npm', ['run', 'build'], { cwd: PWA_ROOT, stdio: 'inherit' });
+if (pwaBuild.status !== 0 || !existsSync(path.join(PWA_DIST, 'index.html'))) {
+  console.error('  ✗ mobile-web build failed or did not emit dist/index.html');
+  process.exit(1);
 }
-ok('mobile-web build present');
+ok('mobile-web rebuilt from current source');
 
 const tmpHome = mkdtempSync(path.join(os.tmpdir(), 'clemmy-pwa-smoke-'));
 const tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'clemmy-pwa-smoke-cwd-'));
@@ -69,24 +68,6 @@ writeFileSync(
     configured: { auth: 'openai', discord: false, composio: false, workspaceCount: 0, profileSet: false },
   }),
 );
-writeFileSync(
-  path.join(stateDir, 'mobile-access.json'),
-  JSON.stringify({
-    version: 1,
-    tunnel: {
-      id: '00000000-0000-4000-8000-000000000000',
-      name: 'pwa-smoke',
-      hostname: 'phone-smoke.example.test',
-      credentialsFile: '/tmp/not-used.json',
-    },
-    binary: null,
-    autoStart: false,
-    status: 'inactive',
-    updatedAt: new Date().toISOString(),
-  }, null, 2),
-  { mode: 0o600 },
-);
-
 const PORT = 10000 + Math.floor(Math.random() * 200);
 
 const stagedRoot = path.join(tmpHome, 'daemon-stage');
@@ -110,6 +91,11 @@ const child = spawn(process.execPath, [path.join(stagedDist, 'index.js'), 'servi
     WEBHOOK_PORT: String(PORT),
     WEBHOOK_ENABLED: 'true',
     DISCORD_ENABLED: 'false',
+    // This is a PWA serve smoke, not a LAN/relay ingress smoke. Keep every
+    // optional network door closed; their socket-derived boundary has focused
+    // coverage in mobile-ingress.test.ts and mobile-relay.test.ts.
+    CLEMENTINE_MOBILE_APP_LISTENER: 'off',
+    CLEMENTINE_MOBILE_RELAY: 'off',
     NODE_ENV: 'test',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -261,21 +247,24 @@ process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
   else fail(`expected 401 for whoami, got ${res.status}`);
 }
 
-// 9. Mobile hostname only exposes /m/*.
+// 9. A named Host does not become trusted merely because the caller supplies
+// it. Mobile trust now follows the pinned-TLS/relay listener; granting access
+// from Host alone would re-open DNS rebinding.
 {
   const mobile = await getWithHost('/m', 'phone-smoke.example.test', { accept: 'text/html' });
   const blocked = await getWithHost('/api/status', 'phone-smoke.example.test');
-  if (mobile.status >= 200 && mobile.status < 400 && blocked.status === 404) ok('configured mobile hostname serves /m but hides non-mobile daemon routes');
-  else fail(`mobile host boundary wrong: /m=${mobile.status} /api/status=${blocked.status}`);
+  if (mobile.status === 421 && blocked.status === 421) ok('unknown named Host is rejected across mobile and daemon surfaces');
+  else fail(`unknown Host boundary wrong: /m=${mobile.status} /api/status=${blocked.status}`);
 }
 
-// 10. Mobile approval API stays inside /m on the configured hostname.
+// 10. Mobile approval API stays inside /m on this disposable loopback origin.
 {
   const { setPin } = await import(`${stagedDist}/runtime/mobile-pin.js`);
   const { createSession } = await import(`${stagedDist}/runtime/harness/eventlog.js`);
   const approvalRegistry = await import(`${stagedDist}/runtime/harness/approval-registry.js`);
   await setPin('SmokeTest-2024!');
-  const login = await requestWithHost('/m/auth/login', 'phone-smoke.example.test', {
+  const loopbackHost = `127.0.0.1:${PORT}`;
+  const login = await requestWithHost('/m/auth/login', loopbackHost, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify({ pin: 'SmokeTest-2024!', deviceLabel: 'PWA smoke phone' }),
@@ -283,7 +272,7 @@ process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
   const setCookie = login.headers['set-cookie'];
   const cookie = String(Array.isArray(setCookie) ? setCookie[0] : setCookie ?? '').split(';')[0];
   if (login.status !== 200 || !cookie.includes('clem_mobile_session=')) {
-    fail(`mobile login on configured host failed: status=${login.status} body=${login.body.slice(0, 160)}`);
+    fail(`mobile login on disposable loopback failed: status=${login.status} body=${login.body.slice(0, 160)}`);
   } else {
     const session = createSession({
       id: `pwa-smoke-${Date.now().toString(36)}`,
@@ -298,15 +287,15 @@ process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
       tool: 'run_shell_command',
       args: { command: 'echo ok' },
     });
-    const list = await requestWithHost('/m/api/approvals', 'phone-smoke.example.test', {
+    const list = await requestWithHost('/m/api/approvals', loopbackHost, {
       headers: { cookie, accept: 'application/json' },
     });
-    const approve = await requestWithHost(`/m/api/approvals/${approval.approvalId}/approve`, 'phone-smoke.example.test', {
+    const approve = await requestWithHost(`/m/api/approvals/${approval.approvalId}/approve`, loopbackHost, {
       method: 'POST',
       headers: { cookie, accept: 'application/json' },
     });
     if (list.status === 200 && list.body.includes(approval.approvalId) && approve.status === 200) {
-      ok('mobile host approval list + approve work under /m/api/approvals');
+      ok('disposable loopback approval list + approve work under /m/api/approvals');
     } else {
       fail(`mobile approval API failed: list=${list.status} approve=${approve.status} listBody=${list.body.slice(0, 160)} approveBody=${approve.body.slice(0, 160)}`);
     }

@@ -40,6 +40,7 @@ import {
   authorizeResolvedLogicalCallContract,
   currentLogicalCall,
 } from '../runtime/harness/attempt-identity.js';
+import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
 import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import { isTrustedComposioGateway } from '../runtime/harness/runtime-tool-identity.js';
 import {
@@ -55,6 +56,17 @@ import { isHarnessRefusalText, textResult } from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 import { resolveAcceptedExactMcpCarrier } from '../runtime/harness/accepted-mcp-carrier.js';
+import {
+  isCurrentCallableCatalogEntry,
+  peekHostCapabilityCatalogFactory,
+  type RegisteredHostCapability,
+} from '../runtime/harness/host-capability-catalog-factory.js';
+import {
+  capabilityManifestDigest,
+  currentCapabilityManifest,
+} from '../runtime/harness/capability-manifest.js';
+import { resolveProductionPortsForManifest } from '../runtime/harness/production-capability-ports.js';
+import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import {
   validateIrreversibleSendPayload,
@@ -67,7 +79,11 @@ import {
   settleResolvedCarrierRefusal,
   type ResolvedCarrierTarget,
 } from '../runtime/harness/resolved-carrier-refusal.js';
-import type { SettleToolAttemptInput } from '../runtime/harness/attempt-settlement.js';
+import {
+  settleToolAttempt,
+  ToolAttemptSettlementAuthorityError,
+  type SettleToolAttemptInput,
+} from '../runtime/harness/attempt-settlement.js';
 import {
   normalizeComposioCarrierInput,
   serializeComposioCarrier,
@@ -82,6 +98,151 @@ import {
 } from '../runtime/harness/turn-control.js';
 
 export { materializeStrictNullableFields } from '../runtime/schema-normalizer.js';
+
+/** Unique current catalog operation for this exact inner name. Presence is
+ * identity, not dispatch: the production port still has to exist. */
+function uniqueCurrentCallableCatalogOperation(name: string): RegisteredHostCapability | null {
+  const identity = name.trim().toLowerCase();
+  if (!identity) return null;
+  const matches = peekHostCapabilityCatalogFactory()?.snapshot().filter((entry) => (
+    isCurrentCallableCatalogEntry(entry)
+    && (
+      entry.toolName.trim().toLowerCase() === identity
+      || entry.manifest.operationId.trim().toLowerCase() === identity
+    )
+  )) ?? [];
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+/**
+ * Nested_owned catalog dispatch is a terminal owner. Composio already writes
+ * the durable logical settlement the host later adopts; the catalog production
+ * port used to return a value and leave the row open. The host then failed
+ * closed on "nested-owned logical settlement is missing" and killed the turn
+ * (live 2026-08-29: work_call → salesforce_sf_soql_query, source 98339).
+ *
+ * Only the host-owned nested path needs this write. Direct/unit callers still
+ * let wrapToolForHarness settle, so they skip here.
+ */
+function settleCurrentCatalogProductionAttempt(input: {
+  target: string;
+  args: Record<string, unknown>;
+  effect: string;
+  result?: unknown;
+  thrown?: unknown;
+}): void {
+  const run = harnessRunContextStorage.getStore();
+  if (!run?.hostOwnsToolDeadlineAndSettlement) return;
+  if (
+    !run.sessionId
+    || !Number.isSafeInteger(run.sourceUserSeq)
+    || (run.sourceUserSeq ?? 0) <= 0
+  ) return;
+  const mutating = input.effect === 'local_write'
+    || input.effect === 'external_write'
+    || input.effect === 'admin';
+  const thrownPresent = Object.prototype.hasOwnProperty.call(input, 'thrown');
+  const result = input.result;
+  const record = result && typeof result === 'object' && !Array.isArray(result)
+    ? result as Record<string, unknown>
+    : null;
+  const carriesOwnEnvelope = record !== null && (
+    'successful' in record || 'success' in record || 'error' in record || 'errors' in record
+  );
+  try {
+    settleToolAttempt({
+      sessionId: run.sessionId,
+      sourceUserSeq: run.sourceUserSeq,
+      turn: run.turn,
+      lane: 'byo',
+      toolName: input.target,
+      args: input.args,
+      ...(currentLogicalCall()?.logicalToolCallId
+        ? { callId: currentLogicalCall()!.logicalToolCallId }
+        : {}),
+      ...(run.dispatchLease ? { dispatchLease: run.dispatchLease } : {}),
+      mutating,
+      businessCall: input.effect !== 'host_only',
+      ...(thrownPresent ? { thrown: input.thrown } : { result }),
+      ...(thrownPresent
+        ? {}
+        : {
+            signals: {
+              hostExecuted: true,
+              ...(carriesOwnEnvelope ? {} : { envelopeSuccessful: true }),
+            },
+          }),
+    });
+  } catch (error) {
+    if (error instanceof ToolAttemptSettlementAuthorityError) throw error;
+  }
+}
+
+async function invokeCurrentCatalogProductionPort(input: {
+  sessionId: string;
+  sourceUserSeq: number | undefined;
+  logicalToolCallId: string;
+  target: string;
+  args: unknown;
+  dispatch: {
+    entry: RegisteredHostCapability;
+    manifest: NonNullable<ReturnType<typeof currentCapabilityManifest>>;
+    port: NonNullable<ReturnType<typeof resolveProductionPortsForManifest>>;
+  };
+}): Promise<unknown> {
+  if (!Number.isSafeInteger(input.sourceUserSeq) || (input.sourceUserSeq ?? 0) <= 0) {
+    throw new Error('catalog production dispatch requires an accepted source');
+  }
+  const { entry, manifest, port } = input.dispatch;
+  const payload = input.args && typeof input.args === 'object' && !Array.isArray(input.args)
+    ? input.args as Record<string, unknown>
+    : {};
+  const manifestDigest = capabilityManifestDigest(manifest);
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq as number);
+  const invokePort = () => port.invoke({
+    nodeId: input.logicalToolCallId,
+    role: 'foreground',
+    payload,
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq as number,
+      acceptedTaskId,
+    },
+    binding: {
+      capabilityId: entry.capabilityId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      args: payload,
+      account: manifest.accountId,
+      effect: manifest.effect,
+      ...(manifest.destination ? { destination: manifest.destination } : {}),
+      manifestDigest,
+      providerKind: manifest.providerKind,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: port.invoke,
+    },
+  });
+  try {
+    const result = await invokePort();
+    settleCurrentCatalogProductionAttempt({
+      target: manifest.operationId,
+      args: payload,
+      effect: manifest.effect,
+      result,
+    });
+    return result;
+  } catch (error) {
+    settleCurrentCatalogProductionAttempt({
+      target: manifest.operationId,
+      args: payload,
+      effect: manifest.effect,
+      thrown: error,
+    });
+    throw error;
+  }
+}
 
 const DESCRIPTION = [
   'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
@@ -656,6 +817,11 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         ? options.mcpToolScope
         : harnessRunContextStorage.getStore()?.mcpToolScope;
       let exactMcpInputSchema: unknown | null = null;
+      let catalogProductionDispatch: {
+        entry: RegisteredHostCapability;
+        manifest: NonNullable<ReturnType<typeof currentCapabilityManifest>>;
+        port: NonNullable<ReturnType<typeof resolveProductionPortsForManifest>>;
+      } | null = null;
       if (isMcpNamespacedTool(target)) {
         if (_innerDispatchLegacyMcpTestResolverActive()) {
           if (!mcpToolAllowedByScope(target, activeMcpScope)) {
@@ -677,11 +843,34 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           exactMcpInputSchema = exact.binding.inputSchema;
         }
       } else {
-        if (!reachableBuiltinNames.has(target) && !firstClassNames.has(target)) {
+        // A unique current catalog operation with a production port is
+        // already the host's how (reviewed CLI live-reads). Requiring it
+        // also to be a TOOL_REGISTRY builtin bounced the exact name
+        // tool_search/plan_task had just cited, so the model fell through
+        // to run_shell_command (live 2026-08-29: salesforce_sf_soql_query).
+        const catalogOperation = uniqueCurrentCallableCatalogOperation(target);
+        const catalogManifest = catalogOperation
+          ? currentCapabilityManifest(catalogOperation.manifest)
+          : null;
+        const catalogPort = catalogManifest
+          ? resolveProductionPortsForManifest(catalogManifest)
+          : null;
+        if (
+          !reachableBuiltinNames.has(target)
+          && !firstClassNames.has(target)
+          && !catalogPort
+        ) {
           return refuse({
             error: 'not_reachable',
             detail: `"${requestedTarget}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.${boundSourceCorrection(requestedTarget)}`,
           });
+        }
+        if (catalogPort && catalogManifest && catalogOperation) {
+          catalogProductionDispatch = {
+            entry: catalogOperation,
+            manifest: catalogManifest,
+            port: catalogPort,
+          };
         }
       }
 
@@ -748,8 +937,13 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         dispatchArgs = materializeStrictNullableFields(dispatchArgs, strictParameters);
       }
 
-      let exactTargetInputSchema: unknown | null = strictParameters
-        ?? (schema ? z.toJSONSchema(schema) : exactMcpInputSchema);
+      // Local targets execute through the canonical deferred parser above, so
+      // that exact schema owns preparation/evidence too. The provider-strict
+      // projection is a model-facing transport and can lossy-close open JSON
+      // records; it is authority only for non-local core tools.
+      let exactTargetInputSchema: unknown | null = schema
+        ? z.toJSONSchema(schema)
+        : (strictParameters ?? exactMcpInputSchema);
 
       let evidenceArgs: unknown = dispatchArgs;
       let evidenceInputSchema: unknown | undefined;
@@ -812,7 +1006,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       }
       const counter = activeRunContext?.counter ?? new ToolCallsCounter(1000);
       const outerCallId = details?.toolCall?.callId ?? details?.toolCall?.id;
-      if (!isMcpNamespacedTool(target)) {
+      if (!isMcpNamespacedTool(target) && !catalogProductionDispatch) {
         // Capability admission is a PRE-DISPATCH authority boundary. The
         // callback is optional solely for legacy/custom call_tool instances;
         // when production supplies it, throwing or refusing fails closed and
@@ -847,7 +1041,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           }
         }
       }
-      const dispatch = () => dispatchBatchItemTool(
+      const dispatch = () => catalogProductionDispatch
+        ? invokeCurrentCatalogProductionPort({
+            sessionId,
+            sourceUserSeq: activeRunContext?.sourceUserSeq,
+            logicalToolCallId: currentLogicalCall()?.logicalToolCallId ?? outerCallId ?? `catalog-${target}`,
+            target,
+            args: dispatchArgs,
+            dispatch: catalogProductionDispatch,
+          })
+        : dispatchBatchItemTool(
           target,
           dispatchArgs,
           sessionId,
@@ -860,7 +1063,13 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           { accounting: 'transport_mirror', canonicalCallId: outerCallId },
           activeMcpScope,
           undefined,
-          Boolean(options.aroundResolvedDispatch),
+          // A nested one-shot token protects plan-bound work. A graphless
+          // foreground read intentionally has no expected-work row; its exact
+          // source-bound host catalog attestation is reopened instead by the
+          // native-MCP carrier. Treating the mere presence of work_call's
+          // callback as proof of a plan made that valid read demand a token
+          // which, by construction, could never exist.
+          Boolean(options.aroundResolvedDispatch && currentExpectedWorkBinding()),
         );
       let out: unknown;
       try {

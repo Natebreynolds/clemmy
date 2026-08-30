@@ -1900,22 +1900,17 @@ test('queueWorkflowRun: blocks production runs when required workflow capabiliti
   assert.equal(result.readiness?.blockers[0]?.name, 'missing.py');
 });
 
-// RESTORED (2026-08-26): 60db67d8 renamed this from 'queueWorkflowRun:
-// readiness-blocked trigger receipts remain unbound and later each recover
-// exactly once' and inserted a middle assertion that the SAME declaration —
-// script now present on disk — stayed blocked_readiness forever (the
-// retirement), then swapped the workflow to a plain model step before the
-// final 'queued' assertions so a deterministic step could never reach them.
-// Restored to its original scenario: THE READINESS GATE PIN — a scheduled
-// trigger for an enabled deterministic.runner workflow produces a REAL run
-// record once its script exists, not blocked_readiness forever.
+// Recovery uses an installed skill because its presence is a represented,
+// authoritatively checkable dependency. Raw script presence is deliberately
+// not used as a recovery oracle: it cannot attest the effects of its body.
 test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and later each recover exactly once', () => {
+  const skill = 'pending-trigger-recovery-skill';
   writeWorkflow('pending-trigger-flow', {
     name: 'pending-trigger-flow',
-    description: 'Waits for its deterministic helper.',
+    description: 'Waits for an installed represented capability.',
     enabled: true,
     trigger: { manual: true },
-    steps: [{ id: 'merge', prompt: 'Merge evidence.', deterministic: { runner: 'missing.py' } }],
+    steps: [{ id: 'merge', prompt: 'Merge evidence.', usesSkill: skill }],
   });
 
   const blockedA = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-a' });
@@ -1926,9 +1921,13 @@ test('queueWorkflowRun: readiness-blocked trigger receipts remain unbound and la
   assert.equal(readWorkflowTriggerReceiptAcceptance('pending-receipt-b'), null);
   assert.equal(runFiles().length, 0);
 
-  const scriptsDir = path.join(WORKFLOWS_DIR, 'pending-trigger-flow', 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("ready")\n', 'utf-8');
+  const skillDir = path.join(TMP_HOME, 'skills', skill);
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    ['---', `name: ${skill}`, 'description: represented queue recovery capability', '---', '', '# Recovery capability', ''].join('\n'),
+    'utf-8',
+  );
 
   const first = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-a' });
   const second = queueWorkflowRun('pending-trigger-flow', {}, { triggerReceiptId: 'pending-receipt-b' });

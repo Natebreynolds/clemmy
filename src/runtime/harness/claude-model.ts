@@ -24,12 +24,22 @@ import { Agent } from 'undici';
 import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
-import { getClaudeBrainModel, getRuntimeEnv } from '../../config.js';
+import { getClaudeBrainModel, getRuntimeEnv, MODELS } from '../../config.js';
 import { withResilience } from './resilient-model.js';
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { CodexModelProvider } from './codex-model.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
-import { resolveModelCapability, estimateTokens, modelParityEnabled, restoreLegacyInstructionOrder, CACHE_BREAK_SENTINEL, type ModelCapability } from './model-wire-registry.js';
+import {
+  resolveModelCapability,
+  estimateTokens,
+  modelParityEnabled,
+  restoreLegacyInstructionOrder,
+  stripPromptCacheLayerSentinels,
+  CACHE_BREAK_SENTINEL,
+  CACHE_MEMORY_CONTEXT_SENTINEL,
+  CACHE_MEMORY_APPEND_SENTINEL,
+  type ModelCapability,
+} from './model-wire-registry.js';
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
@@ -261,7 +271,9 @@ export function buildClaudeSystemBlocks(
     raw = raw.slice(CLAUDE_CODE_IDENTITY.length).replace(/^\s+/, '');
   }
   const sentIdx = raw.indexOf(CACHE_BREAK_SENTINEL);
-  const stripAll = (s: string): string => s.split(CACHE_BREAK_SENTINEL).join('').trim();
+  const stripAll = (s: string): string => stripPromptCacheLayerSentinels(
+    s.split(CACHE_BREAK_SENTINEL).join(''),
+  ).trim();
   const stable = stripAll(sentIdx >= 0 ? raw.slice(0, sentIdx) : raw);
   const dynamic = stripAll(sentIdx >= 0 ? raw.slice(sentIdx + CACHE_BREAK_SENTINEL.length) : '');
 
@@ -370,7 +382,9 @@ export function logClaudeRequestShape(body: BodyInit | null | undefined): void {
         systemCached: sysBreakpoints > 0,
         toolsCached: toolBreakpoints > 0,
         effort: outputConfig?.effort ?? null,
-        sentinelLeaked: body.includes(CACHE_BREAK_SENTINEL),
+        sentinelLeaked: body.includes(CACHE_BREAK_SENTINEL)
+          || body.includes(CACHE_MEMORY_CONTEXT_SENTINEL)
+          || body.includes(CACHE_MEMORY_APPEND_SENTINEL),
         messageCount: msgs.length,
         roles: roles.join(','),
         systemRoleInMessages: systemRoleIdxs,
@@ -860,7 +874,12 @@ const SONNET_FALLBACK_ID = 'claude-sonnet-4-6';
 function codexFallbackTarget(): FallbackTarget | null {
   try {
     if (!getStoredCodexOAuthTokens()?.accessToken) return null;
-    return { label: 'codex', getModel: () => new CodexModelProvider().getModel() };
+    return {
+      label: 'codex',
+      provider: 'codex',
+      model: MODELS.primary,
+      getModel: () => new CodexModelProvider().getModel(),
+    };
   } catch {
     return null;
   }
@@ -874,9 +893,14 @@ export class ClaudeModelProvider implements ModelProvider {
     const primary = getClaudeModel(id);
     if (!overloadFallbackEnabled()) return primary;
     // Overload chain: primary -> Sonnet (unless already Sonnet) -> Codex (if any).
-    const chain: FallbackTarget[] = [{ label: id, getModel: () => primary }];
+    const chain: FallbackTarget[] = [{ label: id, provider: 'claude', model: id, getModel: () => primary }];
     if (id !== SONNET_FALLBACK_ID) {
-      chain.push({ label: SONNET_FALLBACK_ID, getModel: () => getClaudeModel(SONNET_FALLBACK_ID) });
+      chain.push({
+        label: SONNET_FALLBACK_ID,
+        provider: 'claude',
+        model: SONNET_FALLBACK_ID,
+        getModel: () => getClaudeModel(SONNET_FALLBACK_ID),
+      });
     }
     const codex = codexFallbackTarget();
     if (codex) chain.push(codex);

@@ -15,7 +15,6 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { after, beforeEach, test } from 'node:test';
 import { Agent, type Runner } from '@openai/agents';
-import { HostInterruptState } from './host-turn-runner.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
 import type {
   TerminalDeliveryJudgePort,
@@ -24,6 +23,12 @@ import type {
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-loop-delivery-one-gate-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+
+// Nothing reaching config.js may be imported statically above the
+// CLEMENTINE_HOME assignment: a hoisted import captures BASE_DIR from the
+// REAL home, and the suite then touches the user's live store.
+const { HostInterruptState } = await import('./host-turn-runner.js');
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMMY_VERIFY_DELIVERED = 'off';
 process.env.HARNESS_TOOL_BRACKETS = 'off';
@@ -45,7 +50,15 @@ const audit = await import('./accepted-source-settlement-audit.js');
 const delivery = await import('./delivery-committer.js');
 const resultHandles = await import('./result-handle.js');
 const terminalTools = await import('./terminal-tool.js');
-const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
+const { userChoiceToolUseBehavior } = await import('../../agents/orchestrator.js');
+const { _withHostLocalWriteCommitFactsForTest } = await import('./host-local-write-commit.js');
+const withLocalWriteCommitFixture = (_tool: string, result: string) =>
+  _withHostLocalWriteCommitFactsForTest({
+    createdId: 'daily-digest',
+    handle: 'vault/00-System/workflows/daily-digest/SKILL.md',
+    contentDigest: 'a'.repeat(64),
+    result,
+  });
 
 const ASK = 'Read the source file, then write a local summary report.';
 const ORIGINAL_REPLY = 'The source was read and the summary report is complete.';
@@ -53,6 +66,19 @@ const REPAIRED_REPLY = 'I read the source, but the summary write is still unveri
 const JUDGED_REPLY = 'I read the source successfully. The summary write is not verified, so I am delivering the confirmed read result without claiming that file exists.';
 const RESUME_INSTRUCTION = 'Write the missing summary file from the retained source result, then verify that exact path.';
 const REPEATED_RESUME_ASK = 'I still cannot verify the summary file. Would you like me to retry that write or leave the confirmed read result as-is?';
+
+function assertRetainedReadTerminal(actual: unknown, authoredText: string): void {
+  assert.equal(typeof actual, 'string');
+  const text = actual as string;
+  const escapedAuthoredText = authoredText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  assert.match(text, new RegExp([
+    `^${escapedAuthoredText}`,
+    '',
+    'Retained work \\(durable checkpoint\\):',
+    '- Source/tool read_file: 1 record \\(complete\\) retained as rh_[a-f0-9]+\\.',
+    'External write state: no settled external-write attempt is recorded\\.$',
+  ].join('\\n')), 'the judge-authored paragraph must remain first and the host inventory must appear exactly once');
+}
 
 function makeAgentStub(): Agent<any, any> {
   return {} as Agent<any, any>;
@@ -465,7 +491,7 @@ test('the real Codex hook-to-loop terminal publishes one host-proven workflow cr
         { context: { sessionId: session.id, turn: 1 } },
         { name: 'orchestrator' },
         { name: 'workflow_create' },
-        withTerminalAuthoringEvidenceReceipt(
+        withLocalWriteCommitFixture(
           'workflow_create',
           'Created workflow "daily digest".',
         ),
@@ -560,7 +586,7 @@ test('loop takes the sole deterministic HOLD edge for an irreversible uncertain 
     assert.equal(repairCalls, 1, 'the exact loop terminal must spend the sealed repair');
     assert.equal(result.status, 'blocked');
     assert.equal(result.publicPresentation?.status, 'blocked');
-    assert.equal(result.publicPresentation?.text, hold);
+    assertRetainedReadTerminal(result.publicPresentation?.text, hold);
     const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] }).at(-1);
     assert.equal(terminal?.data.blockedReason, 'authoritative_terminal_verification_incomplete');
     assert.equal(
@@ -593,11 +619,7 @@ test('loop calls terminal repair and takes the disclosure edge after real work s
   // unmanifested completion back to the hold. The returned run status follows
   // that durable authority and the authored text survives.
   assert.equal(result.publicPresentation?.status, 'blocked');
-  assert.equal(
-    result.publicPresentation?.text,
-    REPAIRED_REPLY,
-    'the model-authored disclosure must replace the stale done claim without a canned duplicate',
-  );
+  assertRetainedReadTerminal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
   assert.equal(terminal?.data.deliveryDisclosure, 'state_machine_hold');
 });
@@ -611,7 +633,7 @@ test('approval-resume loop asks the shared gate and takes HOLD for an irreversib
   assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
   assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
-  assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
+  assertRetainedReadTerminal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
   assert.equal(
     terminal?.data.deliveryDisclosure,
@@ -634,7 +656,7 @@ test('approval-resume loop asks the shared gate and takes DISCLOSE after real wo
   assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
   assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
-  assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
+  assertRetainedReadTerminal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
   assert.equal(
     terminal?.data.deliveryDisclosure,
@@ -689,7 +711,7 @@ test('loop carries a different-family DELIVER verdict through the shared commit'
   assert.equal(repairCalls, 0, 'a decided terminal judge must own the words without a second repair model');
   assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
-  assert.equal(result.publicPresentation?.text, JUDGED_REPLY);
+  assertRetainedReadTerminal(result.publicPresentation?.text, JUDGED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
   assert.equal(terminal?.data.terminalJudgeDisposition, 'deliver');
   assert.equal(terminal?.data.terminalJudgeReason, 'the successful read is useful when the missing write is disclosed');
@@ -721,7 +743,7 @@ test('a final-step RESUME verdict cannot consume the loop terminal', async () =>
   assert.equal(repairCalls, 1, 'an impossible RESUME keeps the conservative authored fallback path');
   assert.equal(result.status, 'blocked');
   assert.equal(result.publicPresentation?.status, 'blocked');
-  assert.equal(result.publicPresentation?.text, REPAIRED_REPLY);
+  assertRetainedReadTerminal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminals = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });
   assert.equal(terminals.length, 1, 'the final step must still commit exactly one public terminal');
   assert.equal(terminals[0]?.data.terminalJudgeDisposition, undefined);
@@ -806,7 +828,9 @@ test('terminal RESUME stays inside the accepted turn and does not replay its con
   let runnerCalls = 0;
   let judgeCalls = 0;
   let authorCalls = 0;
-  const painted: string[] = [];
+  // The preamble port delivers a RECORD, not a bare string: the delivery key
+  // and event digest are what make a resume idempotent instead of re-painting.
+  const painted: Array<{ text: string; deliveryKey?: string; eventDigest?: string }> = [];
   _setOpennessJudgeForTests(async () => null);
   try {
     const result = await runConversation({
@@ -833,8 +857,8 @@ test('terminal RESUME stays inside the accepted turn and does not replay its con
           return 'I have the Sheet request and I’m starting it now.';
         },
       },
-      onConversationPreamble: async (text) => {
-        painted.push(text);
+      onConversationPreamble: async (delivery) => {
+        painted.push(delivery as never);
         return { status: 'delivered' };
       },
       terminalPresentationRepairPort: {
@@ -870,7 +894,13 @@ test('terminal RESUME stays inside the accepted turn and does not replay its con
     assert.equal(result.status, 'completed');
     assert.equal(result.publicPresentation?.status, 'done');
     assert.equal(authorCalls, 1, 'only the real accepted user input authors a conversational opening');
-    assert.deepEqual(painted, ['I have the Sheet request and I’m starting it now.']);
+    assert.deepEqual(
+      painted.map((entry) => entry.text),
+      ['I have the Sheet request and I’m starting it now.'],
+      'the accepted turn paints its preamble exactly once and never replays preflight',
+    );
+    assert.ok(painted[0]?.deliveryKey && painted[0]?.eventDigest,
+      'a painted preamble carries the identity that makes a resume idempotent');
     assert.equal(eventlog.listEvents(session.id, { types: ['conversation_preamble'] }).length, 1);
     assert.equal(
       eventlog.listEvents(session.id, { types: ['turn_preflight_decision'] })
@@ -960,6 +990,123 @@ test('a successful background-dispatch control receipt transfers the foreground 
   }
 });
 
+test('a staged tool_search clarification commits one resumable needs-input terminal', async () => {
+  const session = HarnessSession.create({
+    kind: 'chat',
+    channel: 'mobile',
+    title: 'provider-neutral account choice terminal pin',
+  });
+  const question = 'Which connected account should I use?';
+  const choices = ['work@example.com', 'personal@example.com'];
+  const roleKey = 'destination:create-resource';
+  const query = 'create requested resource connected provider account';
+  const requirementText = 'requested resource using one of my connected provider accounts';
+  let runnerCalls = 0;
+
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: session.id,
+    input: 'Create the requested resource using one of my connected provider accounts.',
+    turnEngine: 'host_v1',
+    maxSteps: 2,
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => {
+      runnerCalls += 1;
+      const source = eventlog.listEvents(session.id, { types: ['user_input_received'] }).at(-1)!;
+      const call = eventlog.appendEvent({
+        sessionId: session.id,
+        turn: source.turn,
+        role: 'Clem',
+        type: 'tool_called',
+        data: {
+          sourceUserSeq: source.seq,
+          tool: 'tool_search',
+          callId: 'search-account-choice',
+          effect: 'read',
+          accounting: 'top_level',
+        },
+      });
+      const searchOutput = {
+        query,
+        role_key: roleKey,
+        results: [{
+          name: 'PROVIDER_CREATE_RESOURCE',
+          planningRefStatus: 'account_selection_required',
+          accountChoices: choices,
+        }],
+      };
+      eventlog.appendEvent({
+        sessionId: session.id,
+        turn: source.turn,
+        role: 'Clem',
+        type: 'tool_returned',
+        parentEventId: call.id,
+        data: {
+          sourceUserSeq: source.seq,
+          tool: 'tool_search',
+          callId: 'search-account-choice',
+          effect: 'read',
+          accounting: 'top_level',
+          result: searchOutput,
+        },
+      });
+      const pause = userChoiceToolUseBehavior(
+        { context: { sessionId: session.id, turn: source.turn, sourceUserSeq: source.seq } },
+        [{
+          type: 'function_output',
+          tool: { name: 'tool_search' },
+          output: searchOutput,
+          argumentsJson: JSON.stringify({ query, role_key: roleKey }),
+        }],
+        {
+          actionExpectedWork: true,
+          accountSelectionRequirements: [{ roleKey, text: requirementText, resolved: false }],
+        },
+      );
+      assert.equal(pause.isFinalOutput, true);
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: pause.finalOutput,
+      } as never;
+    },
+    preflightConversationPort: {
+      async render() { return 'I found the matching capability; I may need one account choice.'; },
+    },
+  });
+
+  assert.equal(runnerCalls, 1, 'the staged question halts this provider activation');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.deepEqual({
+    status: result.publicPresentation?.status,
+    kind: result.publicPresentation?.kind,
+    text: result.publicPresentation?.text,
+    resumable: result.publicPresentation?.resumable,
+    needs: result.publicPresentation?.needs,
+  }, {
+    status: 'needs_input',
+    kind: 'question',
+    text: question,
+    resumable: true,
+    needs: { kind: 'input' },
+  });
+
+  const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0]?.data.question, question);
+  assert.deepEqual(asks[0]?.data.options, choices);
+  const terminals = eventlog.listEvents(session.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0]?.data.reason, 'awaiting_user_input');
+  assert.deepEqual(terminals[0]?.data.turnOutcome, {
+    version: 2,
+    id: result.publicPresentation?.outcomeId,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+  });
+});
+
 test('loop turns a second consecutive RESUME into the judge-authored ASK', async () => {
   const session = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'loop terminal two-strike pin' });
   let runnerCalls = 0;
@@ -1003,7 +1150,7 @@ test('loop turns a second consecutive RESUME into the judge-authored ASK', async
   assert.equal(judgeCalls, 2);
   assert.equal(result.status, 'awaiting_user_input');
   assert.equal(result.publicPresentation?.status, 'needs_input');
-  assert.equal(result.publicPresentation?.text, REPEATED_RESUME_ASK);
+  assertRetainedReadTerminal(result.publicPresentation?.text, REPEATED_RESUME_ASK);
   const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] }).at(-1);
   assert.equal(terminal?.data.terminalJudgeDisposition, 'ask');
   assert.equal(terminal?.data.terminalJudgeResumeCount, 0);

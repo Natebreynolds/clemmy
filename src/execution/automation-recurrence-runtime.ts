@@ -12,6 +12,7 @@ import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import { loadCanonicalEntityWorkflowLineageReceipt } from '../spaces/canonical-entity-workflow-lineage-store.js';
 import { finalizeCanonicalEntityWorkflowCompletion } from '../spaces/canonical-entity-workflow-finalizer.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import type { AutomationRecurrenceV1 } from './automation-opportunity.js';
 import {
   automationRecurrenceAuthoritySnapshotFromPreview,
   projectCurrentAutomationPilotAuthority,
@@ -31,7 +32,11 @@ import {
   type AutomationRecurrencePilotSuccessEvidenceV1,
   type AutomationRecurrencePreviewV1,
 } from './automation-recurrence-control-plane.js';
-import { auditWorkflowRunSettlementTruth, type QueuedRunRecord } from './workflow-runner.js';
+import {
+  auditWorkflowRunSettlementTruth,
+  type QueuedRunRecord,
+  type WorkflowRunGoalValidationV1,
+} from './workflow-runner.js';
 import {
   resolveWorkflowRunDefinitionSnapshot,
   type WorkflowRunDefinitionSnapshot,
@@ -60,12 +65,77 @@ function exactId(value: unknown): value is string {
   return typeof value === 'string' && value === value.trim() && ID_RE.test(value);
 }
 
+function exactIso(value: unknown): value is string {
+  if (typeof value !== 'string' || value !== value.trim()) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function satisfiedPilotGoalValidation(input: {
+  value: unknown;
+  objective: string;
+  expectedCriteria: string[];
+  selectedCriteria: Array<{ id: string; description: string }>;
+  finishedAt: string;
+}): {
+  ok: true;
+  validation: WorkflowRunGoalValidationV1;
+  verdictByCriterionId: Map<string, WorkflowRunGoalValidationV1['perCriterion'][number]>;
+} | { ok: false; reason: string } {
+  const value = input.value as WorkflowRunGoalValidationV1 | undefined;
+  if (
+    !value
+    || value.version !== 1
+    || value.objective !== input.objective
+    || value.pass !== true
+    || value.judgeFailedOpen !== false
+    || !Array.isArray(value.successCriteria)
+    || value.successCriteria.length !== input.expectedCriteria.length
+    || value.successCriteria.some((criterion, index) => criterion !== input.expectedCriteria[index])
+    || !Array.isArray(value.perCriterion)
+    || value.perCriterion.length !== input.selectedCriteria.length
+    || !exactIso(value.validatedAt)
+    || Date.parse(value.validatedAt) > Date.parse(input.finishedAt)
+  ) return { ok: false, reason: 'Pilot run has no exact satisfied goal-validation receipt for the reviewed criteria.' };
+
+  const unused = new Set(value.perCriterion.map((_, index) => index));
+  const verdictByCriterionId = new Map<string, WorkflowRunGoalValidationV1['perCriterion'][number]>();
+  for (const selected of input.selectedCriteria) {
+    const verdictIndex = [...unused].find((index) => {
+      const verdict = value.perCriterion[index];
+      return verdict?.criterion === selected.description
+        && verdict.pass === true
+        && (verdict.method === 'deterministic' || verdict.method === 'judge');
+    });
+    if (verdictIndex === undefined) {
+      return { ok: false, reason: `Pilot criterion "${selected.id}" has no exact non-skipped met verdict.` };
+    }
+    unused.delete(verdictIndex);
+    verdictByCriterionId.set(selected.id, value.perCriterion[verdictIndex]!);
+  }
+  if (unused.size !== 0) {
+    return { ok: false, reason: 'Pilot goal-validation receipt contains verdicts outside the reviewed criterion set.' };
+  }
+  return { ok: true, validation: value, verdictByCriterionId };
+}
+
+export interface ApprovedAutomationRecurrenceAuthorityV1 {
+  version: 1;
+  proposal: {
+    proposalId: string;
+    revision: number;
+    digest: string;
+  };
+  recurrence: AutomationRecurrenceV1;
+}
+
 export type ProjectAutomationRecurrencePilotSuccessResultV1 =
   | {
       ok: true;
       evidence: AutomationRecurrencePilotSuccessEvidenceV1;
       sourceDefinition: WorkflowRunDefinitionSnapshot['definition'];
       workflowInputs: Record<string, string>;
+      approvedRecurrence: ApprovedAutomationRecurrenceAuthorityV1;
     }
   | { ok: false; code: string; reason: string };
 
@@ -101,6 +171,32 @@ export function projectAutomationRecurrencePilotSuccess(
   if (!authority.preview) {
     return { ok: false, code: 'pilot_compilation_drift', reason: 'Pilot preview is unavailable.' };
   }
+  const selectedCriterionIds = [...authority.compilation.proposal.opportunity.pilot.successCriterionIds].sort();
+  const selectedIdSet = new Set(selectedCriterionIds);
+  const proposalCriteria = authority.compilation.proposal.opportunity.successCriteria;
+  const selectedCriteria = selectedCriterionIds.map((id) => {
+    const criterion = proposalCriteria.find((candidate) => candidate.id === id);
+    return criterion ? { id, description: criterion.description } : null;
+  });
+  const expectedCriteria = proposalCriteria
+    .filter((criterion) => selectedIdSet.has(criterion.id))
+    .map((criterion) => criterion.description);
+  if (
+    selectedCriterionIds.length < 1
+    || selectedCriteria.some((criterion) => criterion === null)
+    || expectedCriteria.length !== selectedCriterionIds.length
+  ) return { ok: false, code: 'pilot_criteria_missing', reason: 'Reviewed pilot selected no exact success criteria.' };
+  const goalValidation = satisfiedPilotGoalValidation({
+    value: run.goalValidation,
+    objective: authority.compilation.proposal.opportunity.objective,
+    expectedCriteria,
+    selectedCriteria: selectedCriteria as Array<{ id: string; description: string }>,
+    finishedAt: run.finishedAt,
+  });
+  if (!goalValidation.ok) {
+    return { ok: false, code: 'pilot_goal_validation_invalid', reason: goalValidation.reason };
+  }
+  const goalValidationDigest = sha256(goalValidation.validation);
   const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
   if (admitted.status !== 'valid' || admitted.snapshot.version !== 1) {
     return { ok: false, code: 'pilot_snapshot_invalid', reason: 'Pilot run has no exact catalog definition snapshot.' };
@@ -164,8 +260,6 @@ export function projectAutomationRecurrencePilotSuccess(
     || acceptedSourceCount < 1
   ) return { ok: false, code: 'pilot_result_authority_invalid', reason: 'Pilot has no non-vacuous exact closed lineage receipt.' };
 
-  const selected = [...authority.compilation.proposal.opportunity.pilot.successCriterionIds].sort();
-  if (selected.length < 1) return { ok: false, code: 'pilot_criteria_missing', reason: 'Reviewed pilot selected no success criteria.' };
   const terminalReceiptDigest = sha256({
     domain: 'automation-recurrence-pilot-terminal',
     version: 1,
@@ -173,6 +267,7 @@ export function projectAutomationRecurrencePilotSuccess(
     status: run.status,
     terminalOutcome: run.terminalOutcome,
     goalOutcome: run.goalOutcome,
+    goalValidationDigest,
     finishedAt: run.finishedAt,
     claimReceiptDigest: lineageReceipt.receiptDigest,
   });
@@ -235,12 +330,18 @@ export function projectAutomationRecurrencePilotSuccess(
         receiptDigest: settlementReceiptDigest,
         reasons: [],
       },
-      selectedSuccessCriterionIds: selected,
-      criterionEvidence: selected.map((criterionId) => ({
+      selectedSuccessCriterionIds: selectedCriterionIds,
+      criterionEvidence: selectedCriterionIds.map((criterionId) => ({
         criterionId,
         outcome: 'met' as const,
-        evidenceRef: `workflow-terminal:v1:${terminalReceiptDigest}`,
-        evidenceDigest: terminalReceiptDigest,
+        evidenceRef: `workflow-goal-validation:v1:${goalValidationDigest}`,
+        evidenceDigest: sha256({
+          domain: 'automation-pilot-goal-criterion',
+          version: 1,
+          goalValidationDigest,
+          criterionId,
+          verdict: goalValidation.verdictByCriterionId.get(criterionId),
+        }),
       })),
       authoritySnapshot: automationRecurrenceAuthoritySnapshotFromPreview(authority.preview),
       ...(admission.admission.workspaceBinding
@@ -252,6 +353,15 @@ export function projectAutomationRecurrencePilotSuccess(
       evidence,
       sourceDefinition: snapshot.definition,
       workflowInputs: authority.workflowInputs,
+      approvedRecurrence: {
+        version: 1,
+        proposal: {
+          proposalId: authority.compilation.proposal.proposalId,
+          revision: authority.compilation.proposal.revision,
+          digest: authority.compilation.proposal.digest,
+        },
+        recurrence: structuredClone(authority.compilation.proposal.opportunity.recurrence),
+      },
     };
   } catch (error) {
     return { ok: false, code: 'pilot_success_projection_failed', reason: error instanceof Error ? error.message : String(error) };
@@ -268,6 +378,51 @@ export type RequestAutomationRecurrenceActivationResultV1 =
       cardCreated: boolean;
     }
   | { ok: false; code: string; reason: string };
+
+export interface RequestAutomationRecurrenceActivationDependenciesV1 {
+  projectPilotSuccess?: typeof projectAutomationRecurrencePilotSuccess;
+}
+
+function approvedRecurrenceIssue(input: {
+  success: Extract<ProjectAutomationRecurrencePilotSuccessResultV1, { ok: true }>;
+  requested: AutomationRecurrenceCadenceV1;
+}): { code: string; reason: string } | null {
+  const authority = input.success.approvedRecurrence;
+  const evidence = input.success.evidence;
+  if (
+    authority.version !== 1
+    || authority.proposal.proposalId !== evidence.proposalId
+    || authority.proposal.revision !== evidence.proposalRevision
+    || authority.proposal.digest !== evidence.proposalDigest
+    || !exactId(authority.proposal.proposalId)
+    || !Number.isSafeInteger(authority.proposal.revision)
+    || authority.proposal.revision < 1
+    || !DIGEST_RE.test(authority.proposal.digest)
+  ) return {
+    code: 'recurrence_proposal_lineage_mismatch',
+    reason: 'The successful pilot and approved recurrence contract do not share one exact proposal revision and digest.',
+  };
+  const approved = authority.recurrence;
+  if (approved.mode !== 'proposed') return {
+    code: 'recurrence_not_proposed',
+    reason: 'The exact approved proposal did not authorize recurrence.',
+  };
+  if (approved.cadence.kind !== 'interval') return {
+    code: 'recurrence_cadence_unsupported',
+    reason: 'The exact approved proposal uses a calendar cadence; it cannot be converted into interval authority.',
+  };
+  if (
+    approved.activation !== 'requires_pilot_success_and_recurrence_consent'
+    || approved.cadence.every !== input.requested.every
+    || approved.cadence.unit !== input.requested.unit
+    || approved.overlapPolicy !== input.requested.overlapPolicy
+    || approved.catchUpPolicy !== input.requested.catchUpPolicy
+  ) return {
+    code: 'recurrence_contract_mismatch',
+    reason: 'Requested every, unit, overlap, or catch-up fields differ from the exact approved recurrence contract.',
+  };
+  return null;
+}
 
 function registerAndBindConsentCard(activationId: string):
   | { ok: true; card: AtomicResumableApprovalCardResult; activation: AutomationRecurrenceActivationStateV1 }
@@ -303,9 +458,16 @@ export function requestAutomationRecurrenceActivation(input: {
   approvalSessionId: string;
   cadence: AutomationRecurrenceCadenceV1;
   previewedAt?: string;
-}): RequestAutomationRecurrenceActivationResultV1 {
-  const success = projectAutomationRecurrencePilotSuccess(input.pilotRunId);
+}, dependencies: RequestAutomationRecurrenceActivationDependenciesV1 = {}): RequestAutomationRecurrenceActivationResultV1 {
+  const success = (dependencies.projectPilotSuccess ?? projectAutomationRecurrencePilotSuccess)(
+    input.pilotRunId,
+  );
   if (!success.ok) return success;
+  const recurrenceProblem = approvedRecurrenceIssue({
+    success,
+    requested: input.cadence,
+  });
+  if (recurrenceProblem) return { ok: false, ...recurrenceProblem };
   let preview: AutomationRecurrencePreviewV1;
   try {
     preview = createAutomationRecurrencePreview({

@@ -172,6 +172,63 @@ test('ChatEngine send → stream → terminal reconciliation, with streamed text
   engine.dispose();
 });
 
+test('awaiting_user_input renders the question and releases mobile immediately', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({
+    transport,
+    api: {
+      send: async () => ({ sessionId: 's-needs-input', accepted: true }),
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+  });
+  await engine.send('Use whichever connected account I choose.');
+  await wait(10);
+  transport.live!.onEvent(ev(2, 'tool_called', { tool: 'tool_search', callId: 'search-1' }));
+  transport.live!.onEvent(ev(3, 'awaiting_user_input', {
+    question: 'Which connected account should I use?',
+    options: ['work@example.com', 'personal@example.com'],
+  }));
+
+  const snap = engine.snapshot();
+  const reply = snap.messages.find((message) => message.role === 'assistant');
+  assert.equal(reply?.text, 'Which connected account should I use?');
+  assert.equal(reply?.status, 'awaiting-reply');
+  assert.equal(snap.busy, false, 'the composer must return to ordinary send mode');
+  assert.equal(snap.cancelKey, null, 'Stop ownership ends at the user-input pause');
+  engine.dispose();
+});
+
+test('OPEN-THE-GATES 4.2: a send while busy steers the live turn instead of no-oping', async () => {
+  const transport = new FakeTransport();
+  const sent: Array<{ message: string; steerOnly?: boolean }> = [];
+  const engine = new ChatEngine({
+    transport,
+    sessionId: 's-live',
+    api: {
+      send: async (input) => {
+        sent.push({ message: input.message, steerOnly: input.steerOnly });
+        return input.steerOnly
+          ? { sessionId: 's-live', accepted: false, steered: true }
+          : { sessionId: 's-live', accepted: true };
+      },
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+    streamTimings: { reconnectBaseDelayMs: 5 },
+  });
+  await engine.send('first');
+  await wait(10);
+  assert.equal(engine.snapshot().busy, true);
+  await engine.send('nudge while working');
+  const snap = engine.snapshot();
+  assert.equal(snap.busy, true, 'steer must not clear the live turn');
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1]?.steerOnly, true);
+  assert.equal(sent[1]?.message, 'nudge while working');
+  const steer = snap.messages.find((m) => m.steer);
+  assert.equal(steer?.steer, 'delivered');
+  engine.dispose();
+});
+
 test('ChatEngine adopts a server-selected successor for an existing held session', async () => {
   const transport = new FakeTransport();
   const engine = new ChatEngine({
@@ -218,6 +275,43 @@ test('ChatEngine open() reattaches to an in-flight turn', async () => {
   engine.dispose();
 });
 
+test('a host conversation_preamble is the visible opening, not an internal event', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({
+    transport,
+    api: {
+      send: async () => ({ sessionId: 'sess-preamble', accepted: true }),
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+  });
+  const pending = engine.send('how many deals does Tim have');
+  await wait(10);
+  transport.live!.onEvent(ev(1, 'user_input_received', { text: 'how many deals does Tim have' }));
+  transport.live!.onEvent(ev(2, 'tool_called', { tool: 'tool_search', callId: 'c-search' }));
+  transport.live!.onEvent(ev(3, 'tool_returned', { tool: 'tool_search', callId: 'c-search' }));
+  transport.live!.onEvent(ev(4, 'conversation_preamble', {
+    text: "I'll pull Tim's open Salesforce deals with a close date this month.",
+  }));
+  const live = engine.snapshot().messages.find((m) => m.role === 'assistant');
+  assert.equal(
+    live?.text,
+    "I'll pull Tim's open Salesforce deals with a close date this month.",
+  );
+  assert.equal(live?.status, 'thinking');
+  engine.dispose();
+  await pending.catch(() => undefined);
+});
+
+test('foldTranscript keeps a host preamble when the terminal has no other reply', () => {
+  const messages = foldTranscript([
+    ev(1, 'user_input_received', { text: 'how many deals' }),
+    ev(2, 'conversation_preamble', { text: "I'll pull Tim's open deals." }),
+    ev(3, 'conversation_completed', { reply: '' }),
+  ]);
+  const assistant = messages.find((m) => m.role === 'assistant');
+  assert.equal(assistant?.text, "I'll pull Tim's open deals.");
+});
+
 test('inFlightTurnSince and foldTranscript agree on turn boundaries', () => {
   const settled: HarnessEvent[] = [
     ev(1, 'user_input_received', { text: 'q' }),
@@ -228,6 +322,23 @@ test('inFlightTurnSince and foldTranscript agree on turn boundaries', () => {
   assert.equal(inFlightTurnSince(inflight), 2);
   const messages = foldTranscript(settled);
   assert.deepEqual(messages.map((m) => [m.role, m.text]), [['user', 'q'], ['assistant', 'a']]);
+});
+
+test('foldTranscript keeps one canonical bubble for awaiting event plus completion', () => {
+  const question = 'Which connected account should I use?';
+  const messages = foldTranscript([
+    ev(1, 'user_input_received', { text: 'Use my connected account.' }),
+    ev(2, 'awaiting_user_input', { question }),
+    ev(3, 'conversation_completed', {
+      reason: 'awaiting_user_input',
+      awaitingUser: true,
+      reply: question,
+    }),
+  ]);
+  assert.deepEqual(messages.map((message) => [message.role, message.text, message.status]), [
+    ['user', 'Use my connected account.', undefined],
+    ['assistant', question, 'awaiting-reply'],
+  ]);
 });
 
 test('failed send keeps the echo retryable and drops the empty placeholder', async () => {

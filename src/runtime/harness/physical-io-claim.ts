@@ -19,7 +19,10 @@ import {
   workflowReadOnlyPhysicalClaimAttestationMatches,
   workflowV3PhysicalClaimAttestationMatches,
 } from './accepted-turn-call-authority.js';
-import { workflowReadPagePhysicalClaimAttestationMatches } from './workflow-paginated-read-authority.js';
+import {
+  workflowReadPagePhysicalClaimAttestationMatches,
+  workflowReadPagePreparationClaimAttestationMatches,
+} from './workflow-paginated-read-authority.js';
 
 export interface PhysicalIoClaimIdentity {
   sessionId: string;
@@ -280,7 +283,7 @@ export function claimWorkflowPhysicalIo(input: {
 /** Sequential page child of one workflow_v2_paginated_read activation. The
  * page reservation and opaque ALS proof replace graph lease identity; the same
  * physical row CAS remains the only provider-I/O linearization point. */
-export function claimWorkflowPaginatedPhysicalIo(input: {
+function claimWorkflowPaginatedIo(input: {
   identity: PhysicalIoClaimIdentity & {
     authorityRootId: string;
     logicalCallId: string;
@@ -291,9 +294,9 @@ export function claimWorkflowPaginatedPhysicalIo(input: {
   authorityRevision: number;
   pageOrdinal: number;
   toolName: string;
-}): PhysicalIoClaimResult {
+}, relation: 'business' | 'probe'): PhysicalIoClaimResult {
   const { identity } = input;
-  if (!workflowReadPagePhysicalClaimAttestationMatches({
+  const attestationInput = {
     sessionId: identity.sessionId,
     sourceEventSeq: identity.sourceUserSeq,
     authorityRootId: identity.authorityRootId,
@@ -305,13 +308,17 @@ export function claimWorkflowPaginatedPhysicalIo(input: {
     logicalCallId: identity.logicalCallId,
     physicalDispatchId: identity.physicalDispatchId,
     toolName: input.toolName,
-  })) return { claimed: false, reason: 'authority_mismatch' };
+  };
+  const attested = relation === 'probe'
+    ? workflowReadPagePreparationClaimAttestationMatches(attestationInput)
+    : workflowReadPagePhysicalClaimAttestationMatches(attestationInput);
+  if (!attested) return { claimed: false, reason: 'authority_mismatch' };
 
   const db = openEventLog();
   const claimedAt = new Date().toISOString();
   return db.transaction((): PhysicalIoClaimResult => {
     const row = db.prepare(`
-      SELECT p.accepted_task_id, p.logical_tool_call_id, p.tool_name,
+      SELECT p.accepted_task_id, p.logical_tool_call_id, p.tool_name, p.relation,
              p.state AS physical_state, p.io_claimed_at,
              a.authority_kind, a.authority_digest, a.revision,
              a.state AS authority_state, a.workflow_activation_digest,
@@ -338,6 +345,7 @@ export function claimWorkflowPaginatedPhysicalIo(input: {
       accepted_task_id: string;
       logical_tool_call_id: string;
       tool_name: string;
+      relation: string;
       physical_state: string;
       io_claimed_at: string | null;
       authority_kind: string;
@@ -361,11 +369,12 @@ export function claimWorkflowPaginatedPhysicalIo(input: {
       || row.authority_state !== 'open'
       || row.aggregate_state !== 'open'
       || row.page_state !== 'reserved'
+      || (relation === 'probe' ? row.relation !== 'probe' : row.relation === 'probe')
       || row.accepted_task_id !== identity.authorityRootId
       || row.authority_root_id !== identity.authorityRootId
       || row.logical_tool_call_id !== identity.logicalCallId
       || row.page_logical_call_id !== identity.logicalCallId
-      || row.page_physical_dispatch_id !== identity.physicalDispatchId
+      || (relation === 'business' && row.page_physical_dispatch_id !== identity.physicalDispatchId)
       || row.tool_name !== input.toolName
       || row.workflow_activation_digest !== input.activationDigest
       || row.activation_digest !== input.activationDigest
@@ -389,4 +398,14 @@ export function claimWorkflowPaginatedPhysicalIo(input: {
     ).changes;
     return changes === 1 ? { claimed: true } : { claimed: false, reason: 'already_claimed' };
   }).immediate();
+}
+
+export function claimWorkflowPaginatedPhysicalIo(input: Parameters<typeof claimWorkflowPaginatedIo>[0]): PhysicalIoClaimResult {
+  return claimWorkflowPaginatedIo(input, 'business');
+}
+
+export function claimWorkflowPaginatedPreparationPhysicalIo(
+  input: Parameters<typeof claimWorkflowPaginatedIo>[0],
+): PhysicalIoClaimResult {
+  return claimWorkflowPaginatedIo(input, 'probe');
 }

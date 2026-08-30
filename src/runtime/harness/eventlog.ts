@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { BASE_DIR } from '../../config.js';
+import { BASE_DIR, REAL_DEFAULT_CLEMENTINE_HOME } from '../../config.js';
+import { prepareCached } from '../sqlite-statement-cache.js';
 import { actionBus } from '../action-bus.js';
 import { mirrorEventToOperational } from './eventlog-operational-mirror.js';
 import { AUDIT_MIRRORED_EVENT_TYPES, appendAuditRecord } from '../audit-ledger.js';
@@ -537,7 +538,8 @@ export const EVENT_TYPES = [
   // post-truncation union of all three contributors, each descriptor tagged
   // with which leg supplied it, plus whether resolution completed or hit its
   // deadline. Record only; replay never reads it. Carries {sourceUserSeq,
-  // resolution, count, capabilities[{id,effect,source}]}.
+  // resolution, count, ceiling, withheld, frozenCatalogAdvisories,
+  // capabilities[{id,effect,source}]}.
   'planning_catalog_disclosed',
   // What occupied this turn's prompt, split by whether it can be cached.
   // Per-step prompt cost is paid once per step and therefore ~100x per task,
@@ -569,6 +571,12 @@ export const EVENT_TYPES = [
   // invocation. This is a system-owned source event, never a user-input alias
   // and never a fabricated TurnGraph. v51 binds it to the shared logical /
   // physical / settlement kernel through workflow_v1_read_only authority.
+  //
+  // A mutating v3 activation may additionally have one exact canonical-Auto
+  // decision. That decision is a separate, private receipt so ordinary work
+  // never has to masquerade as a hidden human approval. The v3 authority
+  // transaction appends this receipt and the activation atomically.
+  'workflow_v3_auto_consent_decided',
   'workflow_node_invocation_activated',
   // Immutable parent for one provider-neutral paginated workflow read. Every
   // page is a child call of this one activation/node attempt; no page is
@@ -818,8 +826,66 @@ export function workflowPaginatedReadAuthorityRootId(digest: string): string {
   return `workflow-paginated-authority:${digest}`;
 }
 
+/**
+ * Is this process a test runner? Covers both `node --test` and a file executed
+ * directly (`npx tsx src/x.test.ts`), which is how most suites here run.
+ */
+function runningUnderTest(): boolean {
+  if (process.env.NODE_TEST_CONTEXT) return true;
+  return process.argv.some((arg) => /\.(?:red\.)?test\.[cm]?[jt]s$/.test(arg));
+}
+
+/**
+ * LIVE-STORE GUARD: a test process may not open the real harness store.
+ *
+ * Same principle as the destructive-store guard below — protect the store at
+ * the API, not by convention — applied to the other half of the problem. A
+ * test that WRITES into the live store corrupts it by addition rather than
+ * deletion, and does it silently, which is worse: nothing fails until fixed
+ * fixture ids collide months later and the failure looks like a logic bug.
+ *
+ * The cause is almost always import order. A test sets CLEMENTINE_HOME at the
+ * top of the file, but a STATIC import above that line hoists and runs first,
+ * so config.js captures the real home and every later dynamic import reuses
+ * it. The test then believes it is isolated while writing to the user's data.
+ * Measured 2026-08-27: three fixture sessions in the live 1.2 GB harness.db.
+ *
+ * So the error names its own fix rather than merely refusing.
+ */
+function assertNotLiveStoreUnderTest(): void {
+  if (!runningUnderTest()) return;
+  if (process.env.CLEMMY_ALLOW_LIVE_EVENTLOG === '1') return;
+  const resolved = path.resolve(HARNESS_DB_PATH);
+  // Refuse EXACTLY the thing worth refusing: the real user's store.
+  //
+  // The first version of this guard tried to prove the opposite — that the
+  // path was under a temp dir — and got it wrong, because the sanctioned
+  // runner deliberately keeps TMPDIR at <root>/tmp, a SIBLING of the minted
+  // <root>/homes/<name> (a deep TMPDIR pushes tsx's IPC socket past the
+  // 104-byte macOS limit, where it truncates and unrelated processes collide
+  // as EADDRINUSE). A correctly isolated home is therefore NOT under
+  // os.tmpdir(), and 14 typed-execution pins were refused for being safe.
+  //
+  // Proving safety requires knowing every legitimate layout; naming the one
+  // forbidden location requires knowing only that. Test homes may live
+  // anywhere — only the user's own data is off limits.
+  const realHome = process.env.CLEMMY_REAL_USER_HOME
+    ? path.resolve(process.env.CLEMMY_REAL_USER_HOME, '.clementine-next')
+    : REAL_DEFAULT_CLEMENTINE_HOME;
+  const forbidden = [REAL_DEFAULT_CLEMENTINE_HOME, realHome];
+  if (!forbidden.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`))) return;
+  throw new Error(
+    `openEventLog REFUSED: a test process resolved the harness store to ${resolved}, which is the REAL user store.\n`
+    + 'This would read and WRITE the user\'s own data. The usual cause is import order: EVERY static `import` in\n'
+    + 'an ES module hoists above the line that sets process.env.CLEMENTINE_HOME — including imports written BELOW\n'
+    + 'it — so BASE_DIR is captured from the real home before the test can redirect it. Load local modules with\n'
+    + '`await import(...)` after the assignment. Set CLEMMY_ALLOW_LIVE_EVENTLOG=1 only to touch live data on purpose.',
+  );
+}
+
 export function openEventLog(): Database.Database {
   if (cached) return cached;
+  assertNotLiveStoreUnderTest();
   ensureStateDir();
   const db = new Database(HARNESS_DB_PATH);
   try {
@@ -1009,7 +1075,7 @@ export function createSession(input: CreateSessionInput): SessionRow {
 
 export function getSession(sessionId: string): SessionRow | null {
   const db = openEventLog();
-  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as
+  const row = prepareCached(db, 'SELECT * FROM sessions WHERE id = ?').get(sessionId) as
     | RawSessionRow
     | undefined;
   return row ? rowToSession(row) : null;
@@ -3838,7 +3904,7 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
     sql += ` LIMIT ?`;
     params.push(options.limit);
   }
-  const rows = db.prepare(sql).all(...params) as RawEventRow[];
+  const rows = prepareCached(db, sql).all(...params) as RawEventRow[];
   const mapped = rows.map(rowToEvent);
   // For desc + limit: the caller usually wants chronological order
   // back, so reverse the result. The caller can post-reverse if they
@@ -5706,10 +5772,13 @@ function readInvocationOutput(
   sessionId: string,
   callId: string,
   invocationNonce: string,
-): ToolOutputRecord | null {
+): ToolOutputInvocationRecord | null {
   const row = invocationOutputRow(db, sessionId, callId, invocationNonce);
   return row
-    ? hydrateStoredToolOutput(row, invocationOutputChunks(db, sessionId, callId, invocationNonce))
+    ? {
+        invocationNonce,
+        ...hydrateStoredToolOutput(row, invocationOutputChunks(db, sessionId, callId, invocationNonce)),
+      }
     : null;
 }
 
@@ -6043,74 +6112,20 @@ export function reapStaleSessions(maxAgeDays?: number): number {
   if (!Number.isFinite(ttl) || ttl <= 0) return 0;
   const db = openEventLog();
   const cutoff = `-${Math.floor(ttl)} days`;
-  // Replay authority has the same explicit bounded horizon as its terminal
-  // session. During the window, RESTRICT FKs and the queries below keep exact
-  // retries alive. After it expires, remove receipt -> immutable binding ->
-  // pointer in that order, allowing the minimal tombstone session to reap.
-  db.transaction(() => {
+  const reap = db.transaction(() => {
+    // Freeze one exact eligible set before deleting any authority. The fixed-
+    // point pass models which old bindings/pointers this same set can remove;
+    // removing a candidate can only retain more replay authority, so repeated
+    // pruning converges without ever widening retention eligibility.
+    db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS reap_doomed_session_ids (
+        id TEXT PRIMARY KEY
+      ) WITHOUT ROWID;
+      DELETE FROM reap_doomed_session_ids;
+    `);
     db.prepare(`
-      DELETE FROM harness_chat_requests
-       WHERE julianday(created_at) < julianday('now', ?)
-         AND session_id IN (
-           SELECT id FROM sessions
-            WHERE status IN ('completed','failed','cancelled')
-              AND julianday(updated_at) < julianday('now', ?)
-         )
-    `).run(cutoff, cutoff);
-    db.prepare(`
-      DELETE FROM accepted_source_session_bindings
-       WHERE julianday(created_at) < julianday('now', ?)
-         AND session_id IN (
-           SELECT id FROM sessions
-            WHERE status IN ('completed','failed','cancelled')
-              AND julianday(updated_at) < julianday('now', ?)
-         )
-    `).run(cutoff, cutoff);
-    db.prepare(`
-      DELETE FROM accepted_source_session_pointers
-       WHERE julianday(updated_at) < julianday('now', ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM accepted_source_session_bindings b
-            WHERE b.root_session_id = accepted_source_session_pointers.root_session_id
-              AND b.continuity_digest = accepted_source_session_pointers.continuity_digest
-         )
-         AND head_session_id IN (
-           SELECT id FROM sessions
-            WHERE status IN ('completed','failed','cancelled')
-              AND julianday(updated_at) < julianday('now', ?)
-         )
-    `).run(cutoff, cutoff);
-  }).immediate();
-  // Never reap a conversation the user has pinned or archived for keeping
-  // — those are explicit "hold onto this" signals from the Conversations
-  // UI, stored additively in metadata_json. Without this guard a pinned
-  // Discord/workflow conversation would silently vanish after the TTL.
-  const doomed = db.prepare(
-    `SELECT id FROM sessions
-      WHERE status IN ('completed','failed','cancelled')
-        AND julianday(updated_at) < julianday('now', ?)
-        AND metadata_json NOT LIKE '%"pinned":true%'
-        AND (
-          metadata_json NOT LIKE '%"archived":true%'
-          OR metadata_json LIKE '%"acceptedSourceReplayTombstone":true%'
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM accepted_source_session_pointers p
-           WHERE p.head_session_id = sessions.id
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM accepted_source_session_bindings b
-           WHERE b.session_id = sessions.id
-        )`,
-  ).all(cutoff) as Array<{ id: string }>;
-  for (const row of doomed) {
-    db.prepare(`DELETE FROM physical_dispatch_authority_sealed WHERE session_id = ?`).run(row.id);
-    db.prepare(`DELETE FROM physical_dispatch_authority_payload WHERE session_id = ?`).run(row.id);
-    db.prepare(`DELETE FROM physical_dispatch_authority WHERE session_id = ?`).run(row.id);
-  }
-  const result = db
-    .prepare(
-      `DELETE FROM sessions
+      INSERT INTO reap_doomed_session_ids (id)
+      SELECT id FROM sessions
        WHERE status IN ('completed','failed','cancelled')
          AND julianday(updated_at) < julianday('now', ?)
          AND metadata_json NOT LIKE '%"pinned":true%'
@@ -6118,16 +6133,121 @@ export function reapStaleSessions(maxAgeDays?: number): number {
            metadata_json NOT LIKE '%"archived":true%'
            OR metadata_json LIKE '%"acceptedSourceReplayTombstone":true%'
          )
-         AND NOT EXISTS (
-           SELECT 1 FROM accepted_source_session_pointers p
-            WHERE p.head_session_id = sessions.id
+    `).run(cutoff);
+
+    let pruned = 0;
+    do {
+      pruned = db.prepare(`
+        DELETE FROM reap_doomed_session_ids
+         WHERE EXISTS (
+           SELECT 1 FROM harness_chat_requests request
+            WHERE request.session_id = reap_doomed_session_ids.id
+              AND (
+                julianday(request.created_at) IS NULL
+                OR julianday(request.created_at) >= julianday('now', ?)
+              )
          )
+            OR EXISTS (
+              SELECT 1 FROM accepted_source_session_bindings b
+               WHERE b.session_id = reap_doomed_session_ids.id
+                 AND NOT (
+                   julianday(b.created_at) < julianday('now', ?)
+                   AND EXISTS (
+                     SELECT 1 FROM reap_doomed_session_ids binding_owner
+                      WHERE binding_owner.id = b.session_id
+                   )
+                 )
+            )
+            OR EXISTS (
+              SELECT 1 FROM accepted_source_session_pointers p
+               WHERE p.head_session_id = reap_doomed_session_ids.id
+                 AND NOT (
+                   julianday(p.updated_at) < julianday('now', ?)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM accepted_source_session_bindings lineage_binding
+                      WHERE lineage_binding.root_session_id = p.root_session_id
+                        AND lineage_binding.continuity_digest = p.continuity_digest
+                        AND NOT (
+                          julianday(lineage_binding.created_at) < julianday('now', ?)
+                          AND EXISTS (
+                            SELECT 1 FROM reap_doomed_session_ids binding_owner
+                             WHERE binding_owner.id = lineage_binding.session_id
+                          )
+                        )
+                   )
+                 )
+            )
+      `).run(cutoff, cutoff, cutoff, cutoff).changes;
+    } while (pruned > 0);
+
+    const doomedCount = (db.prepare(
+      'SELECT COUNT(*) AS n FROM reap_doomed_session_ids',
+    ).get() as { n: number }).n;
+    if (doomedCount === 0) return 0;
+
+    // Replay authority has the same explicit bounded horizon as its terminal
+    // session. During the window the fixed set excludes it. After expiry,
+    // remove receipt -> immutable binding -> pointer only for that exact set.
+    db.prepare(`
+      DELETE FROM harness_chat_requests
+       WHERE julianday(created_at) < julianday('now', ?)
+         AND session_id IN (SELECT id FROM reap_doomed_session_ids)
+    `).run(cutoff);
+    db.prepare(`
+      DELETE FROM accepted_source_session_bindings
+       WHERE julianday(created_at) < julianday('now', ?)
+         AND session_id IN (SELECT id FROM reap_doomed_session_ids)
+    `).run(cutoff);
+    db.prepare(`
+      DELETE FROM accepted_source_session_pointers
+       WHERE julianday(updated_at) < julianday('now', ?)
+         AND head_session_id IN (SELECT id FROM reap_doomed_session_ids)
          AND NOT EXISTS (
            SELECT 1 FROM accepted_source_session_bindings b
-            WHERE b.session_id = sessions.id
-         )`,
-    )
-    .run(cutoff);
+            WHERE b.root_session_id = accepted_source_session_pointers.root_session_id
+              AND b.continuity_digest = accepted_source_session_pointers.continuity_digest
+         )
+    `).run(cutoff);
+
+    const retainedReplayRows = (db.prepare(`
+      SELECT COUNT(*) AS n FROM reap_doomed_session_ids doomed
+       WHERE EXISTS (
+         SELECT 1 FROM accepted_source_session_pointers p
+          WHERE p.head_session_id = doomed.id
+       )
+          OR EXISTS (
+            SELECT 1 FROM accepted_source_session_bindings b
+             WHERE b.session_id = doomed.id
+          )
+    `).get() as { n: number }).n;
+    if (retainedReplayRows > 0) {
+      throw new Error(`session reaper exact set retained ${retainedReplayRows} replay-authority row(s)`);
+    }
+
+    db.prepare(`
+      DELETE FROM physical_dispatch_authority_sealed
+       WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
+    `).run();
+    db.prepare(`
+      DELETE FROM physical_dispatch_authority_payload
+       WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
+    `).run();
+    db.prepare(`
+      DELETE FROM physical_dispatch_authority
+       WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
+    `).run();
+
+    const result = db.prepare(`
+      DELETE FROM sessions
+       WHERE id IN (SELECT id FROM reap_doomed_session_ids)
+    `).run();
+    if (result.changes !== doomedCount) {
+      throw new Error(`session reaper exact-set mismatch: selected ${doomedCount}, deleted ${result.changes}`);
+    }
+    db.exec('DELETE FROM reap_doomed_session_ids');
+    return result.changes;
+  });
+  const deleted = reap.immediate();
   // Best-effort WAL merge so the on-disk file actually shrinks after a reap.
   // A busy db just retries on the next tick — never let this throw.
   try {
@@ -6135,7 +6255,7 @@ export function reapStaleSessions(maxAgeDays?: number): number {
   } catch {
     // opportunistic; ignore
   }
-  return result.changes;
+  return deleted;
 }
 
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
@@ -6347,7 +6467,7 @@ export function listToolOutputInvocationNonces(
 export type AuthorityToolOutputResolution =
   | {
       status: 'ok';
-      record: ToolOutputRecord;
+      record: ToolOutputRecord & { invocationNonce?: string };
       source: 'exact' | 'legacy';
       /** Effect proven by the sole parented lifecycle. Detached exact rows have
        * no effect authority and therefore expose null. */

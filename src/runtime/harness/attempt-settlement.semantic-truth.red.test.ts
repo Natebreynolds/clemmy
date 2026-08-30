@@ -107,11 +107,16 @@ function successHandleCount(task: ReturnType<typeof accept>): number {
   return row.n;
 }
 
-function settleHostString(task: ReturnType<typeof accept>, callId: string, payload: string) {
+function settleHostString(
+  task: ReturnType<typeof accept>,
+  callId: string,
+  payload: string,
+  toolName = 'plan_task',
+) {
   admitReturnedHostCrossing({
     task,
     logicalToolCallId: callId,
-    tool: 'plan_task',
+    tool: toolName,
     args: { preamble: 'On it.', draft: { criteria: ['x'] } },
   });
   return settlement.settleToolAttempt({
@@ -119,7 +124,7 @@ function settleHostString(task: ReturnType<typeof accept>, callId: string, paylo
     sourceUserSeq: task.sourceUserSeq,
     turn: task.turn,
     lane: 'byo',
-    toolName: 'plan_task',
+    toolName,
     callId,
     args: { preamble: 'On it.', draft: { criteria: ['x'] } },
     mutating: false,
@@ -142,6 +147,56 @@ test('a typed refusal JSON string settles as a typed failure, never success', ()
     'the envelope field in the parsed record is the structured verdict');
   assert.equal(settled.resultHandleId, undefined, 'no success-redeemable handle for a refusal');
   assert.equal(successHandleCount(task), 0, 'no durable handle rows claim success=1');
+});
+
+test('plan_invalid_input repairs arguments without erasing the returned host crossing', () => {
+  const task = accept('typed plan input repair');
+  const callId = 'logical:typed-plan-input-repair';
+  const settled = settleHostString(task, callId, JSON.stringify({
+    ok: false,
+    code: 'plan_invalid_input',
+    detail: 'draft.evidenceRequirements.0 must be a stable identifier',
+    repair: 'Fix exactly the named path and call plan_task again.',
+  }));
+
+  assert.equal(settled.outcome.kind, 'invalid_arguments');
+  assert.equal(settled.outcome.directive.action, 'repair_arguments',
+    'the exact typed schema refusal must return to the model for repair');
+  assert.equal(settled.resultHandleId, undefined,
+    'a repairable refusal is never a success-redeemable result');
+  assert.equal(successHandleCount(task), 0,
+    'no durable handle row may turn the typed refusal into success evidence');
+
+  const durable = eventlog.openEventLog().prepare(`
+    SELECT execution_kind, physical_crossing_count, host_crossing_count
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, callId) as {
+    execution_kind: string;
+    physical_crossing_count: number;
+    host_crossing_count: number;
+  } | undefined;
+  assert.deepEqual(durable, {
+    execution_kind: 'local_execution',
+    physical_crossing_count: 0,
+    host_crossing_count: 1,
+  }, 'argument repair preserves the exact returned host-local crossing and does not claim pre-dispatch');
+});
+
+test('another tool cannot forge plan argument-repair authority with the same code', () => {
+  const task = accept('foreign typed plan input code');
+  const settled = settleHostString(task, 'logical:foreign-plan-input-code', JSON.stringify({
+    ok: false,
+    code: 'plan_invalid_input',
+    detail: 'provider-controlled detail',
+    repair: 'provider-controlled repair',
+  }), 'file_query');
+
+  assert.equal(settled.outcome.kind, 'unknown');
+  assert.equal(settled.outcome.directive.action, 'stop_and_explain',
+    'only the host-owned plan_task result may select argument repair');
+  assert.equal(settled.resultHandleId, undefined);
+  assert.equal(successHandleCount(task), 0);
 });
 
 test('a harness guardrail-block string settles as a typed pre-dispatch refusal', () => {

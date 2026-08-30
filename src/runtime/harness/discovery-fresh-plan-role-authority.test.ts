@@ -2,7 +2,6 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { HOST_UNSCOPED_DISCOVERY_SUBJECT } from './discovery-governor.js';
 import { after, test } from 'node:test';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
@@ -11,6 +10,7 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-fresh-role-authority-
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
+const { HOST_UNSCOPED_DISCOVERY_SUBJECT } = await import('./discovery-governor.js');
 const eventlog = await import('./eventlog.js');
 const { discoveryGovernor } = await import('./discovery-governor.js');
 const {

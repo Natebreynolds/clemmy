@@ -12,7 +12,7 @@
  * with real session rows.
  */
 process.env.CLEMMY_GUARDRAIL_PERSIST = 'off';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   hashToolCall,
@@ -26,6 +26,40 @@ import {
   _resetGuardrailScopeSignals,
   resetTracker,
 } from './tool-guardrail.js';
+import {
+  installCurrentCapabilityManifestFixtures,
+  restoreCurrentCapabilityManifestFixtures,
+} from './current-capability-manifest.fixture.js';
+
+const priorCapabilityFactory = installCurrentCapabilityManifestFixtures([
+  ...[
+    'AIRTABLE_LIST_RECORDS',
+    'AIRTABLE_GET_RECORD',
+    'CRM_GET_ADDRESS',
+    'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID',
+    'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASK_POST',
+    'FIRECRAWL_BATCH_STATUS',
+    'FIRECRAWL_SEARCH',
+    'GOOGLESHEETS_BATCH_GET',
+    'GOOGLESHEETS_GET_SPREADSHEET_INFO',
+    'HUBSPOT_LIST_OFFSET_RECORDS',
+    'OUTLOOK_GET_MAIL_FOLDER',
+    'OUTLOOK_LIST_MESSAGES',
+    'SALESFORCE_GET_RECORD',
+    'SALESFORCE_QUERY',
+    'SLACK_FIND_USER_BY_EMAIL_ADDRESS',
+    'SOMENEWPROVIDER_GET_WORKSPACE_INFO',
+    'SOME_READ',
+    'X_GET_ASSET_LIST',
+  ].map((operationId) => ({ operationId, providerKind: 'composio' as const, effect: 'read' as const })),
+  ...[
+    'dataforseo__serp_organic_live_advanced',
+    'dataforseo__serp_organic',
+    'outlook__list_messages',
+  ].map((operationId) => ({ operationId, providerKind: 'native_mcp' as const, effect: 'read' as const })),
+]);
+
+after(() => restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory));
 
 // ─── hashToolCall — canonical signatures ──────────────────────────
 
@@ -45,6 +79,24 @@ test('hashToolCall: key order in args does not affect hash (canonicalization)', 
   const h1 = hashToolCall('composio_execute_tool', { tool_slug: 'X', arguments: '{"a":1,"b":2}' });
   const h2 = hashToolCall('composio_execute_tool', { arguments: '{"a":1,"b":2}', tool_slug: 'X' });
   assert.equal(h1, h2);
+});
+
+test('hashToolCall: wrapping spellings of the same operation share a loop key', () => {
+  const inner = { spreadsheet_id: '1rpZAgw2lwN-A7gPWIWGLWlQgUZDI5ZBvCcOElMDjZYk', ranges: ['Log!A2:N100'] };
+  const a = hashToolCall('work_call', {
+    name: 'GOOGLESHEETS_BATCH_GET',
+    args_json: JSON.stringify(inner),
+  });
+  const b = hashToolCall('work_call', {
+    name: 'google_sheets__batch_get',
+    args_json: JSON.stringify(inner),
+  });
+  const c = hashToolCall('composio_execute_tool', {
+    tool_slug: 'GOOGLESHEETS_BATCH_GET',
+    arguments: inner,
+  });
+  assert.equal(a, b, 'MCP vs Composio spelling of the same read must count as one loop');
+  assert.equal(a, c, 'trusted Composio gateway unwraps onto the same loop key');
 });
 
 test('hashToolCall: handles primitive args (string, number, null)', () => {
@@ -1230,4 +1282,48 @@ test('a control-plane call repeated with identical arguments reaches the termina
   assert.equal(last?.action, 'escalate',
     'an identical control-plane repeat must terminate the turn rather than spin');
   assert.equal(last?.rule, 'exact_args_repeat');
+});
+
+test('varied plan_task arguments cannot evade an identical semantic refusal backstop', () => {
+  // Live 2026-08-29: the model varied plan prose for 15+ calls while every
+  // result said the same staged capability was not disclosed. Exact-args
+  // signatures changed, but the host consequence did not.
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  const scope = 'sess-semantic-plan-repeat::source:42';
+  const refusal = JSON.stringify({
+    ok: false,
+    code: 'plan_not_admitted',
+    detail: 'primary model proposal cites a capability that was not disclosed to this source',
+    admissibleCapabilities: [],
+    ceiling: 'external_write',
+    withheld: [{ id: 'cap:local:space_save:reversible', effect: 'local_write', reason: 'fresh_planning_card_limit' }],
+    repair: 'Use an admissible capability.',
+  });
+
+  const first = noteGuardrailToolResult(scope, 'plan_task', { draft: { criteria: ['one'] } }, refusal);
+  const second = noteGuardrailToolResult(scope, 'plan_task', { draft: { criteria: ['two'] } }, refusal);
+  const third = noteGuardrailToolResult(scope, 'plan_task', { draft: { criteria: ['three'] } }, refusal);
+  assert.equal(first, undefined);
+  assert.equal(second, undefined);
+  assert.equal(third?.action, 'escalate');
+  assert.equal(third?.rule, 'semantic_result_repeat');
+  assert.equal(third?.count, 3);
+});
+
+test('changed plan consequence and successful progress reset the semantic refusal count', () => {
+  _resetAllTrackersForTests();
+  _resetGuardrailScopeSignals();
+  const scope = 'sess-semantic-plan-progress::source:43';
+  const refusal = (detail: string) => JSON.stringify({
+    ok: false,
+    code: 'plan_not_admitted',
+    detail,
+    repair: 'Correct the named issue.',
+  });
+  assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 1 }, refusal('first issue')), undefined);
+  assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 2 }, refusal('first issue')), undefined);
+  assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 3 }, refusal('different issue')), undefined);
+  assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 4 }, JSON.stringify({ ok: true })), undefined);
+  assert.equal(noteGuardrailToolResult(scope, 'plan_task', { n: 5 }, refusal('first issue')), undefined);
 });

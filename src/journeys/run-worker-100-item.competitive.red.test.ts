@@ -8,9 +8,10 @@
  * pooling, reduction, durable manifests, replay, and gateway denial are the
  * production implementations.
  *
- * A RED is intentional evidence of an architectural gap. The fixture does not
- * locally normalize worker packets or lower the live digest threshold to make
- * current behavior look cacheable; both remain production-owned behavior.
+ * The historical `.red` suffix records the gap this journey originally
+ * exposed; the release gate is now expected to stay green. The fixture does
+ * not locally normalize worker packets or lower the live digest threshold:
+ * both remain production-owned behavior.
  */
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';

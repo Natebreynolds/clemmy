@@ -10,11 +10,13 @@ import type {
   WorkflowStepInputBinding,
   WorkflowStepCall,
   WorkflowStepOutputContract,
+  WorkflowTransformV1,
 } from '../memory/workflow-store.js';
 import {
   parseWorkflowNodeInvocationPlan,
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
+import { validateWorkflowTransform } from './workflow-transform.js';
 
 export type WorkflowGraphNodeType =
   | 'step'
@@ -43,6 +45,7 @@ export interface WorkflowGraphNode {
   tier?: number;
   maxTurns?: number;
   forEach?: string;
+  transform?: WorkflowTransformV1;
   deterministic?: { runner: string };
   call?: WorkflowStepCall;
   invocationPlan?: WorkflowNodeInvocationPlanV1;
@@ -264,7 +267,11 @@ export function compileWorkflowStepsToGraph(
   };
 }
 
-export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowGraphValidation {
+function validateWorkflowGraphWithAuthoredBareCalls(
+  graph: WorkflowGraphDefinition,
+  authoredBareCallNodes: ReadonlySet<WorkflowGraphNode>,
+  authoredTransformNodes: ReadonlySet<WorkflowGraphNode>,
+): WorkflowGraphValidation {
   const errors: string[] = [];
   const warnings: string[] = [];
   const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
@@ -296,8 +303,34 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
     if (node.type === 'side_effect' && !node.sideEffect) {
       errors.push(`Side-effect node "${id}" must declare sideEffect.`);
     }
-    if (node.call !== undefined && node.invocationPlan === undefined) {
+    if (
+      node.call !== undefined
+      && node.invocationPlan === undefined
+      && !authoredBareCallNodes.has(node)
+    ) {
       errors.push(`Node "${id}" structured call is missing its exact invocation plan.`);
+    }
+    if (node.transform !== undefined) {
+      if (!authoredTransformNodes.has(node)) {
+        errors.push(`Node "${id}" transform is not byte-identical authored transform semantics.`);
+      }
+      const transform = validateWorkflowTransform(node.transform);
+      if (!transform.ok) {
+        errors.push(...transform.errors.map((error) => `Node "${id}" ${error}`));
+      }
+      if (node.type !== 'step') errors.push(`Node "${id}" transform must remain a first-class step node.`);
+      if (node.sideEffect !== 'read') errors.push(`Node "${id}" transform must remain read-class.`);
+      const incompatible: string[] = [];
+      if (node.deterministic) incompatible.push('script');
+      if (node.call) incompatible.push('call');
+      if (node.invocationPlan) incompatible.push('invocation plan');
+      if (node.forEach) incompatible.push('fan-out');
+      if ((node.allowedTools?.length ?? 0) > 0) incompatible.push('tool authority');
+      if (node.requiresApproval) incompatible.push('approval');
+      if (node.loopUntil || node.loopSafe) incompatible.push('loop');
+      if (incompatible.length > 0) {
+        errors.push(`Node "${id}" transform cannot combine with ${incompatible.join(', ')}.`);
+      }
     }
     if (node.invocationPlan !== undefined) {
       const parsed = parseWorkflowNodeInvocationPlan(node.invocationPlan);
@@ -334,10 +367,11 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
       }
       if (
         node.deterministic
+        || node.transform
         || node.loopUntil
         || (node.allowedTools?.length ?? 0) > 0
       ) {
-        errors.push(`Node "${id}" invocation plan cannot combine with script, loop, or name-based tool authority.`);
+        errors.push(`Node "${id}" invocation plan cannot combine with script, transform, loop, or name-based tool authority.`);
       }
       if (!exactCallPair && node.requiresApproval) {
         errors.push(`Node "${id}" standalone invocation plan cannot combine with generic approval authority.`);
@@ -346,7 +380,9 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
     if (node.sideEffect === 'send' && node.invocationPlan === undefined && node.requiresApproval !== true) {
       warnings.push(`Send-class node "${id}" has no declarative approval gate.`);
     }
-    if (node.forEach && !nodeIds.has(node.forEach) && !nodes.some((candidate) => candidate.id === node.forEach)) {
+    const forEachUsesInput = typeof node.forEach === 'string'
+      && /^(?:input\.[A-Za-z0-9_-]+|\{\{\s*input\.[A-Za-z0-9_-]+\s*\}\})$/.test(node.forEach.trim());
+    if (node.forEach && !forEachUsesInput && !nodeIds.has(node.forEach) && !nodes.some((candidate) => candidate.id === node.forEach)) {
       errors.push(`Node "${id}" has forEach "${node.forEach}" but no such node exists.`);
     }
   }
@@ -396,6 +432,47 @@ export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowG
     hasCycles,
     entryNodeIds: declaredEntryIds.length > 0 ? declaredEntryIds : computedEntryIds,
   };
+}
+
+/**
+ * The general graph contract remains exact-plan-only. A catalog workflow has
+ * one narrower execution lane: an authored bare call may reach the shared v3
+ * live-catalog compiler, but only while the persisted node is byte-identical
+ * to the node compiled from the admitted authored step. This context never
+ * authorizes graph-added calls or a graph rewrite of an authored call.
+ */
+export function validateWorkflowGraphAgainstAuthoredSteps(
+  graph: WorkflowGraphDefinition,
+  authoredSteps: WorkflowStepInput[],
+): WorkflowGraphValidation {
+  const authoredIds = new Set(authoredSteps.map((step) => step.id));
+  const compiledById = new Map(
+    compileWorkflowStepsToGraph(authoredSteps).nodes.map((node) => [node.id, node]),
+  );
+  const authoredBareCallNodes = new Set<WorkflowGraphNode>();
+  const authoredTransformNodes = new Set<WorkflowGraphNode>();
+  for (const node of graph.nodes) {
+    if (!authoredIds.has(node.id)) continue;
+    const compiled = compiledById.get(node.id);
+    if (
+      compiled?.call !== undefined
+      && compiled.invocationPlan === undefined
+      && JSON.stringify(node) === JSON.stringify(compiled)
+    ) {
+      authoredBareCallNodes.add(node);
+    }
+    if (
+      compiled?.transform !== undefined
+      && JSON.stringify(node) === JSON.stringify(compiled)
+    ) {
+      authoredTransformNodes.add(node);
+    }
+  }
+  return validateWorkflowGraphWithAuthoredBareCalls(graph, authoredBareCallNodes, authoredTransformNodes);
+}
+
+export function validateWorkflowGraph(graph: WorkflowGraphDefinition): WorkflowGraphValidation {
+  return validateWorkflowGraphWithAuthoredBareCalls(graph, new Set(), new Set());
 }
 
 /**
@@ -529,6 +606,7 @@ function stepToGraphNode(step: WorkflowStepInput): WorkflowGraphNode {
     ...(step.tier !== undefined ? { tier: step.tier } : {}),
     ...(step.maxTurns !== undefined ? { maxTurns: step.maxTurns } : {}),
     ...(!isReducer && step.forEach !== undefined ? { forEach: step.forEach } : {}),
+    ...(!isReducer && step.transform !== undefined ? { transform: step.transform } : {}),
     ...(!isReducer && step.deterministic !== undefined ? { deterministic: step.deterministic } : {}),
     ...(!isReducer && step.call !== undefined ? { call: step.call } : {}),
     ...(!isReducer && step.invocationPlan !== undefined ? { invocationPlan: step.invocationPlan } : {}),
@@ -609,6 +687,7 @@ function cloneGraph(graph: WorkflowGraphDefinition): WorkflowGraphDefinition {
 function cloneNode(node: WorkflowGraphNode): WorkflowGraphNode {
   return {
     ...node,
+    transform: node.transform ? structuredClone(node.transform) : undefined,
     deterministic: node.deterministic ? { ...node.deterministic } : undefined,
     call: node.call
       ? { tool: node.call.tool, ...(node.call.args ? { args: structuredClone(node.call.args) } : {}) }

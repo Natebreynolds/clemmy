@@ -63,28 +63,51 @@ test('frozen surface names the host-owned requirement ids and does not invent a 
   assert.doesNotMatch(authorityText, /write_per_record/);
 });
 
-test('a unique documented create-from-set tool binds the write node; two creates do not guess', () => {
+test('a unique generic create descriptor binds only the accepted destination family', () => {
   const { contract } = collectContract();
   const write = contract.operations.find((operation) => operation.effect !== 'read');
   assert.ok(write);
+  const destinationFamily = surface.frozenCreateDestinationFamily(contract);
+  assert.equal(destinationFamily, 'workbook');
+  const descriptor = (
+    identifier: string,
+    bindingIdentity: string,
+    family: string,
+  ): surface.FrozenCatalogBindingDescriptorV1 => ({
+    identifier,
+    bindingIdentity,
+    effect: 'external_write',
+    destinationFamily: family,
+    destinationPosture: 'create_new',
+  });
 
   const unique = surface.resolveFrozenNodeBindings({
     contract,
-    catalogIdentifiers: ['GOOGLESHEETS_SHEET_FROM_JSON', 'FIRECRAWL_SEARCH'],
+    destinationFamily,
+    catalogDescriptors: [
+      descriptor('RANDOM_TABULAR_CREATE_41', 'manifest:a', 'workbook'),
+      descriptor('RANDOM_CHANNEL_CREATE_73', 'manifest:b', 'channel'),
+    ],
   });
   assert.deepEqual(unique, [{
     requirementId: write.id,
-    identifier: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    identifier: 'RANDOM_TABULAR_CREATE_41',
     source: 'catalog_semantic',
   }]);
 
-  const spellings = surface.uniqueCatalogCreateBinding([
-    'GOOGLESHEETS_SHEET_FROM_JSON',
-    'GOOGLE_SHEETS_SHEET_FROM_JSON',
-  ]);
-  assert.equal(spellings, 'GOOGLESHEETS_SHEET_FROM_JSON');
-
-  assert.equal(surface.uniqueCatalogCreateBinding(['FIRECRAWL_SEARCH', 'SLACK_SEND_MESSAGE']), null);
+  assert.equal(surface.uniqueCatalogCreateBinding([
+    descriptor('RANDOM_CHANNEL_CREATE_73', 'manifest:b', 'channel'),
+  ], destinationFamily), null, 'a sole wrong-family create must not bind');
+  for (const candidates of [
+    [descriptor('RANDOM_TABULAR_CREATE_41', 'manifest:a', 'workbook'), descriptor('RANDOM_TABULAR_CREATE_42', 'manifest:c', 'workbook')],
+    [descriptor('RANDOM_TABULAR_CREATE_42', 'manifest:c', 'workbook'), descriptor('RANDOM_TABULAR_CREATE_41', 'manifest:a', 'workbook')],
+  ]) {
+    assert.equal(
+      surface.uniqueCatalogCreateBinding(candidates, destinationFamily),
+      null,
+      'two matching identities must abstain in every catalog order',
+    );
+  }
 });
 
 test('an exact structural pin outranks the catalog and never uses user prose', () => {

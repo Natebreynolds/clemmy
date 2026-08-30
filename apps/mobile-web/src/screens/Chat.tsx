@@ -14,6 +14,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   ChatEngine,
+  liveActivityHeadline,
   narrateActivity,
   renderMarkdown,
   type ActivityItem,
@@ -22,6 +23,8 @@ import {
 } from '@clem/chat-engine';
 import {
   approvePlanProposal,
+  cancelActiveChat,
+  cancelChatRequest,
   createChatStreamTransport,
   freshIdempotencyKey,
   getChatSession,
@@ -29,6 +32,7 @@ import {
   sendChatMessageAsync,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
+import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getModelSettings } from '../lib/api';
 import { BrainSheet } from '../components/BrainSheet';
 
@@ -45,6 +49,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [title, setTitle] = useState(initialTitle ?? '');
   const [draft, setDraft] = useState(initialDraft ?? '');
   const [planActing, setPlanActing] = useState<string | null>(null);
+  const [approvalActing, setApprovalActing] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [planOutcome, setPlanOutcome] = useState<Record<string, 'approved' | 'rejected' | undefined>>({});
   const [error, setError] = useState<string | null>(null);
   // §6a: a compact brain chip in the chat header — the same live catalog
@@ -67,9 +73,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     transport: createChatStreamTransport(),
     sessionId: initialSessionId ?? null,
     api: {
-      send: async ({ message, sessionId, idempotencyKey }) => {
-        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey });
-        return { sessionId: result.sessionId, accepted: result.accepted };
+      send: async ({ message, sessionId, idempotencyKey, steerOnly }) => {
+        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly });
+        return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
       },
       loadSession: async (sessionId) => {
         try {
@@ -119,6 +125,30 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const messages = snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
   const connection = snapshot?.connection ?? 'idle';
+  // Present only while this client owns the in-flight turn. A turn adopted
+  // from another surface has no key here, so the button stays a plain busy
+  // indicator rather than a control that would silently do nothing.
+  const cancelKey = snapshot?.cancelKey ?? null;
+  const canStop = busy && Boolean(snapshot?.sessionId);
+
+  useEffect(() => { if (!busy) setStopping(false); }, [busy]);
+
+  function stopTurn() {
+    const key = cancelKey;
+    const session = snapshot?.sessionId;
+    if (!session || stopping) return;
+    setStopping(true);
+    haptic('light');
+    const stop = key
+      ? cancelChatRequest(session, key)
+      : cancelActiveChat(session);
+    void stop.catch((err) => {
+      // Leaving `stopping` latched would strand the only control the user
+      // has; the turn is still running, so hand the button back.
+      setStopping(false);
+      setError(err instanceof Error ? err.message : 'Could not stop this turn');
+    });
+  }
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -131,7 +161,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   function submitDraft() {
     const text = draft.trim();
-    if (!text || busy) return;
+    if (!text) return;
     setDraft('');
     if (textareaRef.current) {
       textareaRef.current.value = '';
@@ -154,6 +184,30 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       setError((err as Error).message ?? `Failed to ${action} plan`);
     } finally {
       setPlanActing(null);
+    }
+  }
+
+  /**
+   * Decide a tool approval from inside the transcript.
+   *
+   * Sent as ordinary chat text, not through the approval endpoint:
+   * `approval_requested` is TERMINAL for the stream, and only engine.send()
+   * re-attaches it. Resolving via the endpoint would leave the transcript
+   * frozen, so the tap would look like it did nothing.
+   *
+   * No catch — engine.send() does not reject; a failed post marks the user row
+   * failed and the existing retry/discard affordance takes over.
+   */
+  async function actOnApproval(approvalId: string, decision: 'approve' | 'reject') {
+    const reply = chatApprovalReply(decision, approvalId);
+    if (!reply || approvalActing) return;
+    setApprovalActing(approvalId);
+    setError(null);
+    haptic(decision === 'approve' ? 'success' : 'warning');
+    try {
+      await engine.send(reply);
+    } finally {
+      setApprovalActing(null);
     }
   }
 
@@ -204,6 +258,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             planActing={planActing}
             planOutcome={planOutcome}
             onPlanAction={actOnPlan}
+            approvalActing={approvalActing}
+            approvalDecided={chatApprovalDecided(messages, message.approval?.approvalId)}
+            onApprovalAction={actOnApproval}
             onRetry={(id) => void engine.retry(id)}
             onDiscard={(id) => engine.discard(id)}
           />
@@ -228,14 +285,36 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             }
           }}
         />
-        <button
-          class="chat-send"
-          type="submit"
-          disabled={busy || draft.trim().length === 0}
-          aria-label="Send"
-        >
-          {busy ? '…' : '↑'}
-        </button>
+        {canStop ? (
+          <>
+            <button
+              class="chat-send"
+              type="submit"
+              disabled={draft.trim().length === 0}
+              aria-label="Send while she works"
+            >
+              ↑
+            </button>
+            <button
+              class="chat-send chat-stop"
+              type="button"
+              onClick={stopTurn}
+              disabled={stopping}
+              aria-label="Stop"
+            >
+              {stopping ? '…' : '■'}
+            </button>
+          </>
+        ) : (
+          <button
+            class="chat-send"
+            type="submit"
+            disabled={draft.trim().length === 0}
+            aria-label="Send"
+          >
+            ↑
+          </button>
+        )}
       </form>
     </div>
   );
@@ -243,6 +322,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
 function MessageRow({
   message, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
+  approvalActing, approvalDecided, onApprovalAction,
 }: {
   message: ChatMessage;
   planActing: string | null;
@@ -250,6 +330,9 @@ function MessageRow({
   onPlanAction: (id: string, action: 'approve' | 'reject') => void;
   onRetry: (id: string) => void;
   onDiscard: (id: string) => void;
+  approvalActing: string | null;
+  approvalDecided: boolean;
+  onApprovalAction: (approvalId: string, decision: 'approve' | 'reject') => void;
 }) {
   if (message.role === 'user') {
     return (
@@ -274,10 +357,31 @@ function MessageRow({
     : undefined;
 
   if (message.approval) {
+    const approvalId = message.approval.approvalId;
     return (
       <div class="turn turn-approval">
         <div class="approval-head">Waiting on you — {message.approval.subject}</div>
         {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
+        {approvalId && !approvalDecided ? (
+          <div class="plan-actions">
+            <button
+              class="approve"
+              disabled={approvalActing !== null}
+              onClick={() => onApprovalAction(approvalId, 'approve')}
+            >
+              {approvalActing === approvalId ? '…' : 'Approve'}
+            </button>
+            <button
+              class="reject"
+              disabled={approvalActing !== null}
+              onClick={() => onApprovalAction(approvalId, 'reject')}
+            >
+              {approvalActing === approvalId ? '…' : 'Not now'}
+            </button>
+          </div>
+        ) : !approvalId ? (
+          <div class="approval-reason">Open “Needs you” on Home to act on this.</div>
+        ) : null}
       </div>
     );
   }
@@ -338,12 +442,10 @@ function MessageRow({
 function WorkLine({ activity, live }: { activity: ActivityItem[]; live: boolean }) {
   const failed = activity.some((item) => item.status === 'failed');
   const [open, setOpen] = useState(failed);
-  const running = activity.filter((item) => item.status === 'running');
-  const current = running[running.length - 1] ?? activity[activity.length - 1];
   const elapsed = useElapsed(activity, live);
 
   const summary = live
-    ? (current?.label ?? 'Working…')
+    ? liveActivityHeadline(activity)
     : `${failed ? 'Ran into trouble · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
 
   return (

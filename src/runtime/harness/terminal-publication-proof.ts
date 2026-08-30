@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { ObligationManifest } from './obligation-manifest.js';
 import {
+  exactProviderDataEnvelopeAcknowledged,
   exactProviderDataPayload,
   inspectProviderEnvelope,
 } from './provider-read-evidence.js';
@@ -30,6 +31,27 @@ import {
 import { verifyAtomicContentCommit } from './atomic-content-commit-proof.js';
 import type { SealedNodeBinding } from './host-capability-catalog-factory.js';
 import { reopenTypedPhysicalAuthorityInTransaction } from './typed-physical-authority-proof.js';
+import { openCanonicalArguments } from './authority-argument-seal.js';
+import { durableLogicalCallContract } from './logical-call-contract.js';
+import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
+import {
+  exactVerificationContentMatches,
+  mutationVerificationReceiptId,
+  parseMutationVerificationRecipe,
+  projectMutationVerificationIntent,
+  projectReadbackVerificationResult,
+  setVerificationPointer,
+  verificationTargetDigest,
+  verifierLogicalCallId,
+  type MutationVerificationRecipeV1,
+} from './mutation-verification-contract.js';
+import { parseHostLocalWriteCommitFacts } from './host-local-write-commit.js';
+import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { parseCapabilityManifestOperationSemantics } from './capability-manifest.js';
+import {
+  sealedNodeBindingDigestOf,
+  type SealedNodeBindingDigestInput,
+} from './sealed-node-binding-digest.js';
 
 const MAX_DURABLE_CURSOR_BYTES = 65_536;
 
@@ -363,21 +385,12 @@ function sealedBindingDigest(binding: Record<string, unknown>): string | null {
     || !digest64(binding.schemaDigest)
     || !digest64(binding.argumentDigest)
     || typeof binding.effect !== 'string'
+    || (binding.operationSemantics !== undefined
+      && !parseCapabilityManifestOperationSemantics(binding.operationSemantics))
+    || (binding.verification !== undefined
+      && !parseMutationVerificationRecipe(binding.verification))
   ) return null;
-  return sha256Bytes(JSON.stringify({
-    nodeId: binding.nodeId,
-    capabilityId: binding.capabilityId,
-    providerOperationId: binding.providerOperationId,
-    logicalToolName: binding.logicalToolName,
-    toolName: binding.toolName,
-    schemaVersion: binding.schemaVersion,
-    providerInputSchemaDigest: binding.providerInputSchemaDigest ?? null,
-    schemaDigest: binding.schemaDigest,
-    argumentDigest: binding.argumentDigest,
-    account: binding.account ?? null,
-    effect: binding.effect,
-    destination: binding.destination ?? null,
-  }));
+  return sealedNodeBindingDigestOf(binding as unknown as SealedNodeBindingDigestInput);
 }
 
 function exactManifestOperationMapping(input: {
@@ -540,6 +553,65 @@ function exactSuccessfulResult(input: {
     return { ok: false, reason: 'settled result provider envelope is contradictory' };
   }
   return { ok: true, row, raw };
+}
+
+function providerArgumentsForSuccessfulCall(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  physicalDispatchId: string;
+}): Record<string, unknown> | null {
+  const row = input.db.prepare(`
+    SELECT p.accepted_task_id, p.logical_tool_call_id, p.tool_name,
+           p.argument_digest, p.state,
+           lease.recovery_tool_name, lease.recovery_argument_digest,
+           lease.recovery_argument_cipher
+      FROM physical_dispatches p
+      JOIN run_dispatch_leases lease
+        ON lease.session_id = p.session_id
+       AND lease.scope_id = p.lease_scope_id
+       AND lease.lease_id = p.lease_id
+     WHERE p.session_id = ? AND p.source_user_seq = ?
+       AND p.physical_dispatch_id = ?
+  `).get(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.physicalDispatchId,
+  ) as {
+    accepted_task_id: string;
+    logical_tool_call_id: string;
+    tool_name: string;
+    argument_digest: string;
+    state: string;
+    recovery_tool_name: string | null;
+    recovery_argument_digest: string | null;
+    recovery_argument_cipher: string | null;
+  } | undefined;
+  if (
+    !row
+    || row.accepted_task_id !== input.acceptedTaskId
+    || row.logical_tool_call_id !== input.logicalToolCallId
+    || row.state !== 'returned'
+    || row.recovery_tool_name !== row.tool_name
+    || row.recovery_argument_digest !== row.argument_digest
+    || !row.recovery_argument_cipher
+  ) return null;
+  const reopened = openCanonicalArguments(row.recovery_argument_cipher);
+  if (!reopened) return null;
+  const candidates: Record<string, unknown>[] = [reopened];
+  if (
+    Object.keys(reopened).length === 1
+    && reopened.args
+    && typeof reopened.args === 'object'
+    && !Array.isArray(reopened.args)
+  ) candidates.push(reopened.args as Record<string, unknown>);
+  const matching = candidates.filter((candidate) => (
+    durableLogicalCallContract(row.accepted_task_id, row.tool_name, candidate)?.argumentDigest
+      === row.argument_digest
+  ));
+  return matching.length === 1 ? matching[0]! : null;
 }
 
 function recordAtPath(payload: unknown, recordPath: string | null): unknown[] | null {
@@ -1048,6 +1120,202 @@ function createdPayload(raw: unknown): {
   };
 }
 
+/** Re-prove an opt-in external mutation receipt entirely inside the terminal
+ * transaction. This is the cycle-free twin of the runtime verifier: it trusts
+ * neither the issued receipt nor process-local catalog state, only the sealed
+ * recipe plus the existing logical/dispatch/settlement/result authorities. */
+function verifyFrozenMutationWriteReceipt(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  node: ObligationManifest['nodes'][number];
+  receipt: HostWriteReceiptAuthorityRow;
+  mutationResult: Extract<ReturnType<typeof exactSuccessfulResult>, { ok: true }>;
+}): TerminalPublicationProofResult | null {
+  if (input.node.effectKind !== 'external_write') return null;
+  const workRows = input.db.prepare(`
+    SELECT contract_id
+      FROM accepted_task_work_contracts
+     WHERE session_id = ? AND source_user_seq = ? AND accepted_task_id = ?
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.acceptedTaskId,
+  ) as Array<{ contract_id: string }>;
+  if (workRows.length !== 1) {
+    return { ok: false, status: 'conflict', reason: 'frozen mutation receipt has no unique work contract' };
+  }
+  const owner = exactSealedNodeAuthority({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    contractId: workRows[0]!.contract_id,
+    nodeId: input.node.operationId,
+    expectedEffect: 'external_write',
+  });
+  if (!owner.ok) {
+    return { ok: false, status: 'conflict', reason: owner.reason };
+  }
+  if (!owner.binding.verification) return null;
+  const recipe = parseMutationVerificationRecipe(owner.binding.verification);
+  if (!recipe) {
+    return { ok: false, status: 'conflict', reason: 'frozen mutation verification recipe is invalid' };
+  }
+  const bindingRecord = owner.binding as unknown as Record<string, unknown>;
+  const baseBinding = { ...bindingRecord };
+  delete baseBinding.bindingDigest;
+  delete baseBinding.verification;
+  const ownerBaseDigest = sealedBindingDigest(baseBinding);
+  if (
+    !ownerBaseDigest
+    || recipe.acceptedTaskId !== input.acceptedTaskId
+    || recipe.workContractId !== workRows[0]!.contract_id
+    || recipe.ownerRequirementId !== input.node.operationId
+    || recipe.ownerBindingDigest !== ownerBaseDigest
+    || recipe.proof !== recipe.mutation.proof
+    || owner.logicalToolCallId !== input.receipt.logical_tool_call_id
+    || owner.binding.logicalToolName !== input.mutationResult.row.logical_tool_name
+    || owner.binding.account !== recipe.verifier.account
+    || input.mutationResult.row.execution_kind !== 'provider_execution'
+    || input.mutationResult.row.dispatch_execution_site === 'host'
+  ) {
+    return { ok: false, status: 'conflict', reason: 'frozen mutation recipe and owner authority disagree' };
+  }
+  const providerArguments = providerArgumentsForSuccessfulCall({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: owner.logicalToolCallId,
+    physicalDispatchId: input.mutationResult.row.handle_physical_dispatch_id!,
+  });
+  if (!providerArguments) {
+    return { ok: false, status: 'conflict', reason: 'mutation provider-ready arguments are not durably exact' };
+  }
+  const intent = projectMutationVerificationIntent({
+    contract: recipe.mutation,
+    providerArguments,
+    authoritativeResult: exactProviderDataPayload(input.mutationResult.raw),
+    phase: 'settled_result',
+    providerAcknowledged: exactProviderDataEnvelopeAcknowledged(input.mutationResult.raw),
+  });
+  if (!intent.ok) return { ok: false, status: 'conflict', reason: intent.reason };
+  const verifierArgs = JSON.parse(JSON.stringify(recipe.verifierStaticArgs)) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(intent.verifierStaticArgs)) verifierArgs[key] = value;
+  if (!setVerificationPointer(
+    verifierArgs,
+    recipe.verifierContract.requestTargetPointers[0],
+    intent.resourceId,
+  )) {
+    return { ok: false, status: 'conflict', reason: 'frozen verifier target arguments cannot be instantiated' };
+  }
+  const targetDigest = verificationTargetDigest(intent.resourceId);
+  const verifierCallId = verifierLogicalCallId({
+    acceptedTaskId: recipe.acceptedTaskId,
+    workContractId: recipe.workContractId,
+    ownerRequirementId: recipe.ownerRequirementId,
+    ownerBindingDigest: recipe.ownerBindingDigest,
+    recipeDigest: recipe.recipeDigest,
+    proof: recipe.proof,
+    targetDigest,
+  });
+  const logical = durableLogicalCallContract(
+    input.acceptedTaskId,
+    recipe.verifier.operationId,
+    verifierArgs,
+  );
+  if (!logical) return { ok: false, status: 'conflict', reason: 'frozen verifier logical contract is unsafe' };
+  const hostBinding = loadHostCallCapabilityBinding({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    logicalToolCallId: verifierCallId,
+  });
+  if (
+    hostBinding.status !== 'ok'
+    || hostBinding.binding.acceptedTaskId !== input.acceptedTaskId
+    || hostBinding.binding.toolName !== logical.toolName
+    || hostBinding.binding.effectiveArgumentDigest !== logical.argumentDigest
+    || hostBinding.binding.effect !== 'read'
+    || hostBinding.binding.bindingKind !== 'catalog_manifest'
+    || hostBinding.binding.capabilityId !== recipe.verifier.capabilityId
+    || (hostBinding.binding.providerInputSchemaDigest ?? null)
+      !== (recipe.verifier.providerInputSchemaDigest ?? null)
+    || hostBinding.binding.schemaFingerprint !== recipe.verifier.schemaDigest
+    || hostBinding.binding.accountId !== recipe.verifier.account
+    || hostBinding.binding.invokePortId !== recipe.verifier.invokePortId
+    || hostBinding.binding.operationId !== recipe.verifier.operationId
+    || hostBinding.binding.manifestId !== recipe.verifier.manifestId
+    || hostBinding.binding.manifestDigest !== recipe.verifier.manifestDigest
+  ) {
+    return { ok: false, status: 'conflict', reason: 'frozen verifier capability authority is missing or changed' };
+  }
+  const verifierResult = exactSuccessfulResult({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: verifierCallId,
+  });
+  if (!verifierResult.ok) {
+    return { ok: false, status: 'conflict', reason: verifierResult.reason };
+  }
+  if (
+    verifierResult.row.logical_tool_name !== logical.toolName
+    || verifierResult.row.execution_kind !== 'provider_execution'
+    || verifierResult.row.dispatch_execution_site === 'host'
+  ) {
+    return { ok: false, status: 'conflict', reason: 'frozen verifier did not settle through its provider authority' };
+  }
+  const projected = projectReadbackVerificationResult({
+    contract: recipe.verifierContract,
+    providerArguments: verifierArgs,
+    authoritativeResult: exactProviderDataPayload(verifierResult.raw),
+    requireContent: recipe.proof === 'exact_content_v1',
+    providerAcknowledged: exactProviderDataEnvelopeAcknowledged(verifierResult.raw),
+  });
+  if (!projected.ok) return { ok: false, status: 'conflict', reason: projected.reason };
+  if (
+    projected.resourceId !== intent.resourceId
+    || (recipe.proof === 'exact_content_v1'
+      && !exactVerificationContentMatches(intent.expectedContent, projected.observedContent))
+  ) {
+    return { ok: false, status: 'conflict', reason: 'frozen verifier result does not match the exact mutation intent' };
+  }
+  const receiptDigest = recipe.proof === 'exact_content_v1' && intent.expectedContent
+    ? digest(intent.expectedContent)
+    : targetDigest;
+  const supportedKind = input.receipt.kind === 'commit'
+    || input.receipt.kind === 'readback'
+    || (input.receipt.kind === 'content_commit' && recipe.proof === 'exact_content_v1');
+  const expectedReceiptId = mutationVerificationReceiptId({
+    recipe,
+    ownerLogicalToolCallId: owner.logicalToolCallId,
+    ownerPhysicalDispatchId: input.mutationResult.row.handle_physical_dispatch_id!,
+    ownerResultHandleId: input.mutationResult.row.handle_id,
+    ownerResultSha256: input.mutationResult.row.raw_payload_sha256!,
+    verifierLogicalCallId: verifierCallId,
+    verifierPhysicalDispatchId: verifierResult.row.handle_physical_dispatch_id!,
+    verifierResultHandleId: verifierResult.row.handle_id,
+    verifierResultSha256: verifierResult.row.raw_payload_sha256!,
+    resourceId: intent.resourceId,
+    targetDigest,
+  });
+  if (
+    !supportedKind
+    || input.receipt.created_id !== intent.resourceId
+    || input.receipt.handle !== intent.resourceId
+    || input.receipt.provider_receipt !== expectedReceiptId
+    || input.receipt.intended_digest !== receiptDigest
+    || input.receipt.observed_digest !== receiptDigest
+    || input.receipt.physical_dispatch_id !== input.mutationResult.row.handle_physical_dispatch_id
+  ) {
+    return { ok: false, status: 'conflict', reason: 'frozen mutation receipt does not match its exact verifier proof' };
+  }
+  return { ok: true };
+}
+
 function recordsValue(raw: unknown): unknown[] | null {
   const providerPayload = exactProviderDataPayload(raw);
   if (Array.isArray(providerPayload)) return providerPayload;
@@ -1242,6 +1510,46 @@ function verifyHostSealedWriteReceipt(input: {
     logicalToolCallId: receipt.logical_tool_call_id,
   });
   if (!createResult.ok) return { ok: false, status: 'conflict', reason: createResult.reason };
+  const frozenMutation = verifyFrozenMutationWriteReceipt({
+    db: input.db,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    node: input.node,
+    receipt,
+    mutationResult: createResult,
+  });
+  if (frozenMutation) return frozenMutation;
+  // Host-local authoring returns a canonical value-opaque commit marker, not
+  // a provider object. Admit that shape only after the same exact manifest,
+  // logical call, sealed receipt, authoritative result handle, and host-local
+  // execution checks above have all closed. Provider writes continue through
+  // the independent object-payload branch below unchanged.
+  const localCommit = input.node.effectKind === 'local_write'
+    && createResult.row.execution_kind === 'local_execution'
+    && createResult.row.dispatch_execution_site === 'host'
+    && createResult.row.logical_tool_name === input.node.resolvedTool
+    && registeredToolSideEffect(input.node.resolvedTool) === 'write'
+    ? parseHostLocalWriteCommitFacts(createResult.raw)
+    : null;
+  if (localCommit) {
+    if (
+      !['commit', 'readback'].includes(receipt.kind)
+      || localCommit.createdId !== receipt.created_id
+      || localCommit.handle !== receipt.handle
+      || localCommit.receipt !== receipt.provider_receipt
+      || localCommit.contentDigest !== receipt.intended_digest
+      || localCommit.contentDigest !== receipt.observed_digest
+      || createResult.row.handle_physical_dispatch_id !== receipt.physical_dispatch_id
+    ) {
+      return {
+        ok: false,
+        status: 'conflict',
+        reason: 'local authoring commit receipt does not match its exact returned host result',
+      };
+    }
+    return { ok: true };
+  }
   const created = createdPayload(createResult.raw);
   if (
     created.id !== receipt.created_id

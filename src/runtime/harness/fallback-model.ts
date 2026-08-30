@@ -86,6 +86,13 @@ export interface FallbackOptions {
    * budget (the loop's stall watchdog is its backstop). 0/undefined disables.
    */
   firstByteTimeoutMs?: number;
+  /**
+   * Absolute wall for an interactive foreground attempt to produce its first
+   * actionable text/tool item. Unlike firstByteTimeoutMs, private reasoning
+   * does not satisfy or reset this wall. Applies only while a next compatible
+   * rescue target exists; 0/undefined disables it.
+   */
+  preActionableTimeoutMs?: number;
   /** Correlation for the model_fallover telemetry — without these the emit is
    *  session-blind and the dashboard can't attribute a fallover to the run that
    *  triggered it. Threaded from router-model.ts off the active harness run
@@ -127,6 +134,15 @@ class FirstByteTimeoutError extends Error {
   constructor(public readonly ms: number) {
     super(`no first real stream content within ${ms}ms`);
     this.name = 'FirstByteTimeoutError';
+  }
+}
+
+/** A live provider remained entirely private past the foreground UX wall.
+ * Nothing actionable escaped, so replay on the configured rescue is safe. */
+class PreActionableTimeoutError extends Error {
+  constructor(public readonly ms: number) {
+    super(`no actionable stream content within ${ms}ms`);
+    this.name = 'PreActionableTimeoutError';
   }
 }
 
@@ -261,10 +277,30 @@ function genericModelEventHasActionableContent(value: unknown): boolean {
   return false;
 }
 
+/** The OpenAI Agents Chat Completions converter exposes every native SSE frame
+ * as a raw `model` event, but only emits accumulated reasoning on
+ * `response_done`. GLM/Z.ai sends that private work in
+ * `choices[].delta.reasoning_content`; our BYO adapter also lifts it onto the
+ * SDK's `reasoning` spelling. Either is genuine liveness, but neither is an
+ * actionable boundary that may commit the provider before text/tool output. */
+function chatCompletionChunkHasPrivateReasoning(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const chunk = value as StreamRecord;
+  if (chunk.object !== 'chat.completion.chunk' || !Array.isArray(chunk.choices)) return false;
+  return chunk.choices.some((choice) => {
+    if (!choice || typeof choice !== 'object') return false;
+    const delta = (choice as StreamRecord).delta;
+    if (!delta || typeof delta !== 'object') return false;
+    const record = delta as StreamRecord;
+    return nonEmptyString(record.reasoning) || nonEmptyString(record.reasoning_content);
+  });
+}
+
 function genericModelEventHasActivity(value: unknown): boolean {
   if (genericModelEventHasActionableContent(value)) return true;
   if (!value || typeof value !== 'object') return false;
   const event = value as StreamRecord;
+  if (chatCompletionChunkHasPrivateReasoning(event)) return true;
   const type = typeof event.type === 'string' ? event.type.toLowerCase() : '';
   if (genericModelEventIsLifecycleMetadata(type)) return false;
   if (modelItemHasActivity(event.item, type)) return true;
@@ -309,6 +345,15 @@ export function streamEventHasModelActivity(event: StreamEvent): boolean {
 function notePrivateModelActivity(): void {
   const context = harnessRunContextStorage.getStore();
   if (context) context.privateModelActivityAt = Date.now();
+}
+
+function activeBufferedProviderRequestInFlight(): boolean {
+  const requests = harnessRunContextStorage.getStore()?.bufferedProviderRequests;
+  if (!requests) return false;
+  for (const request of requests) {
+    if (request.active) return true;
+  }
+  return false;
 }
 
 function emptyCompletionBoundary(label: string, cause: unknown, sawModelActivity: boolean): BoundaryError {
@@ -583,6 +628,7 @@ export function clearRateLimitedBrainsForTest(): void {
 
 function silentFailureReason(err: unknown): string | null {
   if (err instanceof FirstByteTimeoutError) return 'first-byte-timeout';
+  if (err instanceof PreActionableTimeoutError) return 'pre-actionable-timeout';
   if (err instanceof PreContentStreamEndedError) return 'model.empty_completion';
   const kind = normalizedModelFailureReason(err);
   return kind === 'model.transport_timeout' || kind === 'model.empty_completion' ? kind : null;
@@ -689,6 +735,14 @@ export function isFalloverError(err: unknown): boolean {
 
 export class FallbackModel implements Model {
   constructor(private readonly chain: FallbackTarget[], private readonly opts: FallbackOptions = {}) {}
+
+  /** Return the same fallback policy with each concrete provider target mapped.
+   * Route accounting uses this to instrument paid attempts below the aggregate
+   * replay/fallover boundary, so the winning response is never mirrored into a
+   * second outcome row. */
+  mapAttemptTargets(mapper: (target: FallbackTarget, index: number) => FallbackTarget): FallbackModel {
+    return new FallbackModel(this.chain.map(mapper), this.opts);
+  }
 
   /** Does this error warrant switching brains? Overload/5xx/timeout always; a
    *  429 only when this chain opted in (cross-provider). */
@@ -840,14 +894,33 @@ export class FallbackModel implements Model {
       const firstContentDeadlineAt = !isLast && this.opts.firstByteTimeoutMs && this.opts.firstByteTimeoutMs > 0
         ? Date.now() + this.opts.firstByteTimeoutMs
         : undefined;
+      const preActionableDeadlineAt = !isLast
+        && this.opts.preActionableTimeoutMs
+        && this.opts.preActionableTimeoutMs > 0
+        ? Date.now() + this.opts.preActionableTimeoutMs
+        : undefined;
       try {
         const it = chain[i].getModel().getStreamedResponse(req)[Symbol.asyncIterator]();
         while (true) {
           const next = it.next();
           next.catch(() => {}); // a lost timeout race must not throw unhandled
+          const preActionableNext = committedActionable
+            ? next
+            : this.withPreActionableTimeout(
+                next,
+                isLast,
+                () => cleanup(true),
+                preActionableDeadlineAt,
+              );
+          preActionableNext.catch(() => {}); // first-byte may win the nested race
           const cur = sawModelActivity
-            ? await next
-            : await this.withFirstByteTimeout(next, isLast, () => cleanup(true), firstContentDeadlineAt);
+            ? await preActionableNext
+            : await this.withFirstByteTimeout(
+                preActionableNext,
+                isLast,
+                () => cleanup(true),
+                firstContentDeadlineAt,
+              );
           if (cur.done) {
             if (!committedActionable) throw new PreContentStreamEndedError(sawModelActivity);
             break;
@@ -904,12 +977,14 @@ export class FallbackModel implements Model {
 
   private isFalloverReason(err: unknown): boolean {
     return err instanceof FirstByteTimeoutError
+      || err instanceof PreActionableTimeoutError
       || err instanceof PreContentStreamEndedError
       || this.shouldFallover(err);
   }
 
   private falloverReason(err: unknown): string {
     if (err instanceof FirstByteTimeoutError) return 'first-content-timeout';
+    if (err instanceof PreActionableTimeoutError) return 'pre-actionable-timeout';
     if (err instanceof PreContentStreamEndedError) return 'model.empty_completion';
     return normalizedModelFailureReason(err);
   }
@@ -1056,6 +1131,12 @@ export class FallbackModel implements Model {
   ): Promise<T> {
     const ms = this.opts.firstByteTimeoutMs;
     if (isLast || !ms || ms <= 0) return call;
+    // A compatibility adapter waiting on a paid non-streaming HTTP body is
+    // not silence. First-content fallover here aborted healthy GLM/MiniMax
+    // thinking and handed a half-built tool loop to the rescue brain
+    // (live 2026-08-29: "Something went wrong on that turn"). The host
+    // watchdog already bounds this interval with the full-stream deadline.
+    if (activeBufferedProviderRequestInFlight()) return call;
     const remainingMs = Math.max(0, (deadlineAt ?? Date.now() + ms) - Date.now());
     if (remainingMs <= 0) {
       abort();
@@ -1069,6 +1150,39 @@ export class FallbackModel implements Model {
           timer = setTimeout(() => {
             reject(new FirstByteTimeoutError(ms));
             abort();
+          }, remainingMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Race every pre-commit read against one attempt-absolute UX deadline.
+   * Private reasoning can satisfy transport liveness, but it never moves this
+   * deadline. Once an actionable event wins, the caller stops using this race
+   * and the provider retains the turn without any mid-answer fallover. */
+  private async withPreActionableTimeout<T>(
+    call: Promise<T>,
+    isLast: boolean,
+    abort: () => void,
+    deadlineAt?: number,
+  ): Promise<T> {
+    const ms = this.opts.preActionableTimeoutMs;
+    if (isLast || !ms || ms <= 0 || deadlineAt === undefined) return call;
+    const remainingMs = Math.max(0, deadlineAt - Date.now());
+    if (remainingMs <= 0) {
+      abort();
+      throw new PreActionableTimeoutError(ms);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        call,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            abort();
+            reject(new PreActionableTimeoutError(ms));
           }, remainingMs);
         }),
       ]);

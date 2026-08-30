@@ -18,6 +18,12 @@ const contracts = await import('./logical-call-contract.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const outcomes = await import('./attempt-outcome.js');
 const expectedWork = await import('./expected-work-admission.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
 
 /** The ledger records a gateway call under its EFFECTIVE inner identity, which
  *  is what the live store showed for platform-49 (googlesheets_batch_update,
@@ -33,6 +39,7 @@ function effectiveName(task: { sessionId: string; sourceUserSeq: number }, tool:
 }
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

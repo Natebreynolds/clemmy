@@ -24,9 +24,13 @@ const checkpoints = await import('./accepted-model-batch-checkpoint.js');
 const identities = await import('./attempt-identity.js');
 const contracts = await import('./logical-call-contract.js');
 const hostBindings = await import('./host-call-capability-binding.js');
+const capabilityManifests = await import('./capability-manifest.js');
+const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const leases = await import('./dispatch-lease.js');
 const brackets = await import('./brackets.js');
 const invocation = await import('./host-tool-invocation.js');
+const protocolSession = await import('./conversation-protocol-session.js');
+const logicalResults = await import('./logical-model-result-projection-receipt.js');
 const graphShadow = await import('../graph/turn-graph-shadow.js');
 const toolEffects = await import('./tool-effect.js');
 const restartRecovery = await import('./restart-recovery.js');
@@ -72,6 +76,61 @@ const WRITE_RESULT = {
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex');
 const auditPath = path.join(home, 'state', 'checkpoint-process-audit.log');
 const audit = (line: string): void => appendFileSync(auditPath, `${line}\n`, 'utf8');
+
+function fixtureCapability(
+  operationId: string,
+  effect: 'read' | 'external_write',
+  accountId: string,
+) {
+  const write = effect === 'external_write';
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:checkpoint-process:${operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'composio:checkpoint-process-fixture',
+    providerVersion: 'fixture-v1',
+    operationVersion: '1',
+    definitionFingerprint: digest(`schema:${operationId}`),
+    effect,
+    ...(write ? {
+      operationSemantics: { version: 1 as const, reversibility: 'ordinary_non_destructive' as const },
+      destination: { family: 'workbook', posture: 'create_new' },
+    } : {}),
+    accountId,
+    idempotency: { required: write, policy: write ? 'key_before_dispatch' as const : 'none' as const },
+    reconciliation: { supported: write, policy: write ? 'exact_artifact' as const : 'none' as const },
+    outputContract: { kind: write ? 'created_resource' : 'records' },
+    evidenceContract: {
+      kinds: write ? ['receipt', 'readback'] : ['payload'],
+      readbackRequired: write,
+    },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-29T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: write ? ['destination'] : ['source'],
+  });
+  return {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    destination: manifest.destination,
+    account: manifest.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({}),
+  };
+}
+
+capabilityCatalogs.installHostCapabilityCatalogFactory(
+  capabilityCatalogs.createHostCapabilityCatalogFactory([
+    fixtureCapability(READ_LOGICAL_TOOL, 'read', 'conn-restaurants'),
+    fixtureCapability(WRITE_LOGICAL_TOOL, 'external_write', 'conn-googlesheets'),
+  ]),
+);
 
 function openFrame(callId: string, name: string, args: unknown): AgentInputItem[] {
   return [{
@@ -157,6 +216,15 @@ function attestation(
   );
   assert.ok(contract);
   if (!contract) throw new Error('fixture tool contract is unsafe');
+  const capability = capabilityCatalogs.peekHostCapabilityCatalogFactory()
+    ?.snapshot()
+    .find((entry) => entry.toolName === contract.toolName.toUpperCase());
+  const canonical = capability
+    ? capabilityCatalogs.canonicalCatalogIdentityOf(capability)
+    : null;
+  assert.ok(canonical, 'fixture call requires one current sealed catalog identity');
+  if (!canonical) throw new Error('fixture catalog identity is unsafe');
+  assert.equal(canonical.effect, input.effect);
   const base = {
     sessionId: source.task.sessionId,
     sourceUserSeq: source.task.sourceUserSeq,
@@ -168,13 +236,16 @@ function attestation(
     argumentDigest: contract.argumentDigest,
     effect: input.effect,
     bindingKind: 'catalog_manifest' as const,
-    capabilityId: `cap:${contract.toolName.toLowerCase()}`,
-    schemaFingerprint: digest(`schema:${contract.toolName}`),
-    accountId: input.effect === 'read' ? 'conn-restaurants' : 'conn-googlesheets',
-    invokePortId: 'fixture:provider',
-    operationId: contract.toolName,
-    manifestId: `manifest:${contract.toolName}`,
-    manifestDigest: digest(`manifest:${contract.toolName}`),
+    capabilityId: canonical.capabilityId,
+    ...(canonical.providerInputSchemaDigest
+      ? { providerInputSchemaDigest: canonical.providerInputSchemaDigest }
+      : {}),
+    schemaFingerprint: canonical.schemaDigest,
+    accountId: canonical.account,
+    invokePortId: canonical.invokePortId,
+    operationId: canonical.operationId,
+    manifestId: canonical.manifestId,
+    manifestDigest: canonical.manifestDigest,
     engineVersion: source.root.engineVersion,
     surfaceVersion: source.root.surfaceVersion,
     authorityDigest: source.root.authorityDigest,
@@ -274,13 +345,49 @@ function checkpointIdentity(source: Source, checkpoint: AcceptedModelBatchCheckp
   };
 }
 
+function exactSettledResult(
+  source: Source,
+  callId: string,
+  history: readonly AgentInputItem[],
+): AgentInputItem {
+  const evidence = protocolSession.durableConversationProtocolEvidenceForCall({
+    sessionId: source.task.sessionId,
+    history,
+    callId,
+  });
+  assert.equal(evidence?.kind, 'settled_result');
+  if (!evidence || evidence.kind !== 'settled_result') {
+    throw new Error('fixture has no exact settled model result');
+  }
+  return evidence.result;
+}
+
+function finalizeWithExactResult(
+  admission: ReturnType<typeof refFromAdmission>,
+  resultItem: AgentInputItem,
+): AcceptedModelBatchCheckpoint {
+  const recorded = logicalResults.recordLogicalModelResultProjectionReceipt({
+    admission,
+    resultItem,
+  });
+  assert.ok(
+    recorded.status === 'recorded' || recorded.status === 'existing',
+    `logical projection receipt was ${recorded.status}`,
+  );
+  return checkpointFromFinalization(checkpoints.finalizeAcceptedModelBatch(admission, {
+    committedResultItems: [resultItem],
+  }));
+}
+
 async function executeReadBatch(source: Source, runOwner: ReturnType<typeof owner>) {
   audit('model:response:read');
+  const preHistory = [{ role: 'user', content: PROMPT } as AgentInputItem];
+  const frameHistory = openFrame(READ_CALL_ID, READ_TOOL, READ_ARGS);
   const admitted = refFromAdmission(checkpoints.admitAcceptedModelBatch({
     sessionId: source.task.sessionId,
     sourceUserSeq: source.task.sourceUserSeq,
-    preHistory: [{ role: 'user', content: PROMPT } as AgentInputItem],
-    frameHistory: openFrame(READ_CALL_ID, READ_TOOL, READ_ARGS),
+    preHistory,
+    frameHistory,
     providerResponseId: 'model-response-read',
   }));
   const result = await runCall(source, runOwner, {
@@ -296,7 +403,8 @@ async function executeReadBatch(source: Source, runOwner: ReturnType<typeof owne
     },
   });
   assert.deepEqual(result.value, READ_RESULT);
-  return checkpointFromFinalization(checkpoints.finalizeAcceptedModelBatch(admitted));
+  const resultItem = exactSettledResult(source, READ_CALL_ID, [...preHistory, ...frameHistory]);
+  return finalizeWithExactResult(admitted, resultItem);
 }
 
 async function executeWriteBatch(
@@ -305,11 +413,12 @@ async function executeWriteBatch(
   prior: AcceptedModelBatchCheckpoint,
 ) {
   audit('model:response:write');
+  const frameHistory = openFrame(WRITE_CALL_ID, WRITE_TOOL, WRITE_ARGS);
   const admitted = refFromAdmission(checkpoints.admitAcceptedModelBatch({
     sessionId: source.task.sessionId,
     sourceUserSeq: source.task.sourceUserSeq,
     preHistory: prior.history,
-    frameHistory: openFrame(WRITE_CALL_ID, WRITE_TOOL, WRITE_ARGS),
+    frameHistory,
     previousResponseId: prior.lastResponseId,
     providerResponseId: 'model-response-write',
   }));
@@ -326,7 +435,8 @@ async function executeWriteBatch(
     },
   });
   assert.deepEqual(result.value, WRITE_RESULT);
-  return checkpointFromFinalization(checkpoints.finalizeAcceptedModelBatch(admitted));
+  const resultItem = exactSettledResult(source, WRITE_CALL_ID, [...prior.history, ...frameHistory]);
+  return finalizeWithExactResult(admitted, resultItem);
 }
 
 function recover(source: Source, expectedOrdinal: number) {

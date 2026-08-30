@@ -168,6 +168,18 @@ test('resolveHotSet pins bounded workflow controls when the user uniquely names 
     assert.ok(runHot.has('workflow_run'), 'a uniquely named catalog workflow must advertise workflow_run');
     assert.ok(runHot.has('workflow_get'), 'the same proven workflow match keeps its bounded reader hot');
 
+    const spoken = resolveHotSet(
+      'sess-named-workflow-spoken',
+      'Can you run my platform 49 workflow',
+    );
+    assert.ok(spoken.has('workflow_run'), 'spoken "platform 49 workflow" must still advertise workflow_run');
+
+    const fire = resolveHotSet(
+      'sess-named-workflow-fire',
+      'fire off my platform 49 workflow',
+    );
+    assert.ok(fire.has('workflow_run'), 'fire-off is affirmative execution text');
+
     const readHot = resolveHotSet(
       'canary-claude-workflow-get-20260820-0148',
       'CANARY-CLAUDE-WORKFLOW-20260820-0148: Read only the frontmatter for workflow platform-49-slack-channel-review using the workflow read capability. Do not run or update it, do not use external apps, and return only the schedule cron and timezone.',

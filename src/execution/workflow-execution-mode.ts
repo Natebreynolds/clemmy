@@ -21,7 +21,7 @@ import { classifyStepSideEffect } from './workflow-enforce.js';
 import { isDirectComposioActionSlug } from './workflow-direct-call.js';
 
 export type WorkflowExecutionMode = 'agentless' | 'hybrid' | 'agent' | 'empty';
-export type WorkflowStepExecutor = 'call' | 'deterministic' | 'skill' | 'model';
+export type WorkflowStepExecutor = 'call' | 'transform' | 'deterministic' | 'skill' | 'model';
 
 export interface WorkflowCodifyCandidate {
   stepId: string;
@@ -48,12 +48,13 @@ export interface WorkflowExecutionModeReport {
 
 export function stepExecutor(step: WorkflowStepInput): WorkflowStepExecutor {
   if (step.call?.tool) return 'call';
+  if (step.transform) return 'transform';
   if (step.deterministic?.runner) return 'deterministic';
   if (step.usesSkill) return 'skill';
   return 'model';
 }
 
-const isCode = (e: WorkflowStepExecutor) => e === 'call' || e === 'deterministic';
+const isCode = (e: WorkflowStepExecutor) => e === 'call' || e === 'transform' || e === 'deterministic';
 
 // A model step that reads as a single mechanical operation — a strong candidate
 // to become a `call`/`deterministic` step so the run stops paying for reasoning.

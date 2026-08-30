@@ -47,6 +47,6 @@ test('read-only control chatter still cannot claim business credit', () => {
 
 test('the discharge guard consults the durable-write predicate before refusing control tools', () => {
   const source = readFileSync(new URL('./expected-work-admission.ts', import.meta.url), 'utf8');
-  const guard = /actionTopologyRoleForRuntimeCall\(input\.tool, input\.args\) === 'control'[\s\S]{0,900}?durableControlWrite[\s\S]{0,400}?work_effect_mismatch/;
+  const guard = /runtimeExpectedWorkProjection\(input\.tool, input\.args\)[\s\S]{0,300}?mayBindBusinessWork[\s\S]{0,300}?work_effect_mismatch/;
   assert.match(source, guard, 'the control refusal must fall through for durable control writes');
 });

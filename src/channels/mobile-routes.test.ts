@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
@@ -37,6 +37,7 @@ const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-pres
 const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { createMobilePairingCode } = await import('../runtime/mobile-pairing.js');
+const { listSessions, revokeSessionByDeviceId, rotateSessionToken } = await import('../runtime/mobile-sessions.js');
 const {
   appendEvent,
   beginRunAttempt,
@@ -2400,22 +2401,32 @@ test('workflow detail route is wired and session-gated', async () => {
   } finally { await h.close(); }
 });
 
-test('origin handoff: LAN-minted, single-use, adopts the SAME device at the relay origin', async () => {
+test('origin handoff: LAN-minted, retryable until finalized, adopts the SAME device', async () => {
   // The deadlock this breaks: cookies + device keys are per-origin, so the
   // relay door starts with no credential — and pairing there is refused
   // because it is a LAN ceremony. Without a handoff, off-LAN access is
   // impossible for a phone that paired at home (live defect).
-  _clearOriginHandoffsForTests();
   const h = await startHarness();
   try {
+    await _clearOriginHandoffsForTests({ stateDir: h.stateDir });
     const cookie = await loginMobile(h, 'Handoff phone');
 
     // Mint on the LAN door, authenticated.
     const mint = await fetch(`${h.url}/m/auth/origin-handoff`, { method: 'POST', headers: { cookie } });
     assert.equal(mint.status, 200);
-    const handoff = await mint.json() as { token: string; expiresAt: number };
+    const handoff = await mint.json() as {
+      version: number;
+      token: string;
+      expiresAt: number;
+      handoffId: string;
+      generation: number;
+      deviceId: string;
+    };
+    assert.equal(handoff.version, 2);
     assert.ok(handoff.token && handoff.token.length >= 32, 'a real token');
     assert.ok(handoff.expiresAt > Date.now(), 'not already expired');
+    assert.ok(handoff.handoffId, 'the server supplies exact ACK correlation');
+    assert.ok(handoff.generation > 0, 'the server supplies a durable generation');
 
     // Anonymous callers cannot mint one.
     const anonMint = await fetch(`${h.url}/m/auth/origin-handoff`, { method: 'POST' });
@@ -2426,11 +2437,24 @@ test('origin handoff: LAN-minted, single-use, adopts the SAME device at the rela
     const adopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: handoff.token }),
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
     });
     assert.equal(adopt.status, 200);
-    const adopted = await adopt.json() as { deviceId: string; sessionFingerprint: string };
+    const adopted = await adopt.json() as {
+      deviceId: string;
+      sessionFingerprint: string;
+      originHandoff: { handoffId: string; generation: number };
+    };
     assert.ok(adopted.sessionFingerprint, 'the adopted session can sign proofs');
+    assert.deepEqual(adopted.originHandoff, {
+      handoffId: handoff.handoffId,
+      generation: handoff.generation,
+    }, 'native may clear only after this exact acknowledgement');
     const adoptedCookie = extractCookie(adopt.headers.get('set-cookie'));
     assert.ok(adoptedCookie, 'a session cookie is set for this origin');
 
@@ -2440,13 +2464,64 @@ test('origin handoff: LAN-minted, single-use, adopts the SAME device at the rela
     assert.equal(whoLan.status, 200);
     assert.equal(whoRelay.status, 200, 'the adopted session actually works');
 
-    // Single use: the same token cannot mint a second session.
+    // Lost-response retry: the same token reopens the exact same session and
+    // cookie rather than creating a second relay session or stranding native.
     const replay = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(replay.status, 200);
+    const replayBody = await replay.json() as { sessionFingerprint: string };
+    assert.equal(replayBody.sessionFingerprint, adopted.sessionFingerprint);
+    assert.equal(
+      listSessions({ stateDir: h.stateDir }).filter((row) => row.deviceId === handoff.deviceId).length,
+      2,
+      'LAN plus one relay session; retry appends nothing',
+    );
+
+    const finalize = await fetch(`${h.url}/m/auth/origin-handoff/finalize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: adoptedCookie! },
+      body: JSON.stringify({
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(finalize.status, 200, 'the exact adopted session finalizes its handoff');
+    const finalizeReplay = await fetch(`${h.url}/m/auth/origin-handoff/finalize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: adoptedCookie! },
+      body: JSON.stringify({
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(finalizeReplay.status, 200, 'lost finalization response is idempotently recoverable');
+    const persistedHandoffs = JSON.parse(await readFile(
+      path.join(h.stateDir, 'mobile-origin-handoffs.json'),
+      'utf8',
+    )) as {
+      version: number;
+      entries: Record<string, unknown>;
+      finalizedEntries?: Record<string, unknown>;
+    };
+    const bearerDigest = createHash('sha256').update(handoff.token, 'utf8').digest('hex');
+    assert.equal(persistedHandoffs.version, 1, 'the prior daemon can still parse the envelope');
+    assert.equal(persistedHandoffs.entries[bearerDigest], undefined, 'rollback redeemer cannot see tombstone');
+    assert.ok(persistedHandoffs.finalizedEntries?.[bearerDigest], 'new daemon retains idempotent ACK receipt');
+
+    const finalizedReplay = await fetch(`${h.url}/m/auth/origin-adopt`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ token: handoff.token }),
     });
-    assert.equal(replay.status, 401);
+    assert.equal(finalizedReplay.status, 401, 'finalized bearer cannot reopen a session');
 
     // Garbage is refused.
     const bogus = await fetch(`${h.url}/m/auth/origin-adopt`, {
@@ -2456,7 +2531,399 @@ test('origin handoff: LAN-minted, single-use, adopts the SAME device at the rela
     });
     assert.ok(bogus.status === 401 || bogus.status === 429, `unexpected ${bogus.status}`);
   } finally {
-    _clearOriginHandoffsForTests();
+    await _clearOriginHandoffsForTests({ stateDir: h.stateDir });
+    await h.close();
+  }
+});
+
+test('an adopted handoff cannot create a fresh session after its bearer rotates', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Rotated adoption phone');
+    const mint = await fetch(`${h.url}/m/auth/origin-handoff`, { method: 'POST', headers: { cookie } });
+    assert.equal(mint.status, 200);
+    const handoff = await mint.json() as {
+      token: string;
+      handoffId: string;
+      generation: number;
+      deviceId: string;
+    };
+    const first = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(first.status, 200);
+    assert.ok(await rotateSessionToken(handoff.token, { stateDir: h.stateDir }));
+    const rowsBefore = listSessions({ stateDir: h.stateDir }).length;
+
+    const replay = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(replay.status, 401, 'settled retired bearer is reuse-only, never create-new');
+    assert.equal(listSessions({ stateDir: h.stateDir }).length, rowsBefore, 'no fresh session row');
+  } finally {
+    await h.close();
+  }
+});
+
+test('origin handoff generations fence stale responses without consuming the current lease', async () => {
+  const h = await startHarness();
+  try {
+    await _clearOriginHandoffsForTests({ stateDir: h.stateDir });
+    const cookie = await loginMobile(h, 'Generation phone');
+    const mint = async () => {
+      const response = await fetch(`${h.url}/m/auth/origin-handoff`, {
+        method: 'POST',
+        headers: { cookie },
+      });
+      assert.equal(response.status, 200);
+      return await response.json() as {
+        token: string;
+        handoffId: string;
+        generation: number;
+      };
+    };
+    const concurrent = await Promise.all([mint(), mint()]);
+    const [first, second] = concurrent.sort((a, b) => a.generation - b.generation);
+    assert.ok(first && second);
+    assert.equal(second.generation, first.generation + 1);
+
+    const stale = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: second.token,
+        handoffId: first.handoffId,
+        generation: first.generation,
+      }),
+    });
+    assert.equal(stale.status, 401, 'wrong correlation is refused');
+
+    const activate = await fetch(`${h.url}/m/auth/origin-handoff/activate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        handoffId: second.handoffId,
+        generation: second.generation,
+      }),
+    });
+    assert.equal(activate.status, 200, 'native storage ACK activates the replacement');
+
+    const exact = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: second.token,
+        handoffId: second.handoffId,
+        generation: second.generation,
+      }),
+    });
+    assert.equal(exact.status, 200, 'wrong correlation did not consume the current token');
+
+    const retired = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: first.token }),
+    });
+    assert.equal(retired.status, 401, 'activating a newer generation retires the older bearer');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a replacement dropped before native storage does not retire the parked lease', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Dropped replacement phone');
+    const mint = async () => {
+      const response = await fetch(`${h.url}/m/auth/origin-handoff`, {
+        method: 'POST',
+        headers: { cookie },
+      });
+      assert.equal(response.status, 200);
+      return await response.json() as {
+        version: 2;
+        token: string;
+        handoffId: string;
+        generation: number;
+      };
+    };
+    const parked = await mint();
+    const dropped = await mint();
+    assert.ok(dropped.generation > parked.generation, 'replacement was durably minted');
+
+    // Simulate response/bridge loss: generation B never reaches Keychain and
+    // therefore never calls /activate. Native still owns generation A.
+    const adoptParked = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: parked.token,
+        handoffId: parked.handoffId,
+        generation: parked.generation,
+      }),
+    });
+    assert.equal(adoptParked.status, 200, 'unacknowledged replacement cannot strand the phone');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a delayed older activation cannot retire a newer pending generation', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Delayed activation phone');
+    const mint = async () => {
+      const response = await fetch(`${h.url}/m/auth/origin-handoff`, {
+        method: 'POST',
+        headers: { cookie },
+      });
+      assert.equal(response.status, 200);
+      return await response.json() as {
+        version: 2;
+        token: string;
+        handoffId: string;
+        generation: number;
+      };
+    };
+    const older = await mint();
+    const newer = await mint();
+    assert.equal(newer.generation, older.generation + 1);
+
+    // The older Keychain save finishes after the newer mint. Its delayed ACK
+    // may retire predecessors, but must leave the higher pending lease intact.
+    const activateOlder = await fetch(`${h.url}/m/auth/origin-handoff/activate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        handoffId: older.handoffId,
+        generation: older.generation,
+      }),
+    });
+    assert.equal(activateOlder.status, 200);
+
+    const olderBeforeReplacement = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: older.token,
+        handoffId: older.handoffId,
+        generation: older.generation,
+      }),
+    });
+    assert.equal(olderBeforeReplacement.status, 200, 'older stored lease remains usable');
+
+    const newerBeforeActivation = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: newer.token,
+        handoffId: newer.handoffId,
+        generation: newer.generation,
+      }),
+    });
+    assert.equal(newerBeforeActivation.status, 200, 'delayed older ACK preserved newer bearer');
+
+    const activateNewer = await fetch(`${h.url}/m/auth/origin-handoff/activate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        handoffId: newer.handoffId,
+        generation: newer.generation,
+      }),
+    });
+    assert.equal(activateNewer.status, 200);
+
+    const retiredOlder = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: older.token }),
+    });
+    assert.equal(retiredOlder.status, 401, 'newer activation retires only lower generations');
+
+    const exactNewer = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: newer.token,
+        handoffId: newer.handoffId,
+        generation: newer.generation,
+      }),
+    });
+    assert.equal(exactNewer.status, 200, 'activated newer lease remains retryable');
+  } finally {
+    await h.close();
+  }
+});
+
+test('an origin handoff survives daemon close and reopen on the same state directory', async () => {
+  const first = await startHarness();
+  const stateDir = first.stateDir;
+  let handoff: {
+    token: string;
+    handoffId: string;
+    generation: number;
+  } | undefined;
+  try {
+    const cookie = await loginMobile(first, 'Restart phone');
+    const mint = await fetch(`${first.url}/m/auth/origin-handoff`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(mint.status, 200);
+    handoff = await mint.json() as typeof handoff;
+  } finally {
+    await first.close();
+  }
+
+  const reopened = await startHarness({ stateDir });
+  try {
+    assert.ok(handoff);
+    const adopt = await fetch(`${reopened.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff!.token,
+        handoffId: handoff!.handoffId,
+        generation: handoff!.generation,
+      }),
+    });
+    assert.equal(adopt.status, 200, 'restart must not strand the parked phone');
+    assert.ok(adopt.headers.get('set-cookie'));
+  } finally {
+    await reopened.close();
+  }
+});
+
+test('a pre-v2 token-only handoff remains redeemable during the rolling upgrade', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Legacy handoff phone');
+    const identityMint = await fetch(`${h.url}/m/auth/origin-handoff`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    const identity = await identityMint.json() as { deviceId: string };
+    const legacyToken = 'legacy-origin-handoff-token-with-enough-entropy-for-test';
+    const file = path.join(h.stateDir, 'mobile-origin-handoffs.json');
+    mkdirSync(h.stateDir, { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      entries: {
+        [createHash('sha256').update(legacyToken, 'utf8').digest('hex')]: {
+          deviceId: identity.deviceId,
+          deviceLabel: 'Legacy handoff phone',
+          expiresAt: Date.now() + 60_000,
+        },
+      },
+    }));
+
+    const adopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: legacyToken }),
+    });
+    assert.equal(adopt.status, 200);
+    const body = await adopt.json() as { originHandoff?: unknown };
+    assert.equal(body.originHandoff, undefined, 'legacy adoption has no invented v2 ACK tuple');
+
+    const legacyReplay = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: legacyToken }),
+    });
+    assert.equal(legacyReplay.status, 401, 'legacy token-only compatibility remains single-use');
+
+    const migrated = JSON.parse(await readFile(file, 'utf8')) as {
+      version: number;
+      generations?: Record<string, number>;
+    };
+    assert.equal(migrated.version, 1, 'additive protocol metadata remains readable by the prior daemon');
+    assert.ok(migrated.generations && typeof migrated.generations === 'object');
+    const nextMint = await fetch(`${h.url}/m/auth/origin-handoff`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(nextMint.status, 200);
+    const next = await nextMint.json() as {
+      version: number;
+      token: string;
+      handoffId: string;
+      generation: number;
+    };
+    assert.equal(next.version, 2);
+    assert.ok(next.generation > 0);
+    const nextAdopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: next.token,
+        handoffId: next.handoffId,
+        generation: next.generation,
+      }),
+    });
+    assert.equal(nextAdopt.status, 200, 'the migrated store immediately supports v2 redemption');
+  } finally {
+    await h.close();
+  }
+});
+
+test('an outstanding handoff cannot resurrect a revoked device', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Revoked phone');
+    const mint = await fetch(`${h.url}/m/auth/origin-handoff`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(mint.status, 200);
+    const handoff = await mint.json() as {
+      token: string;
+      handoffId: string;
+      generation: number;
+      deviceId: string;
+    };
+    assert.equal(
+      await revokeSessionByDeviceId(handoff.deviceId, { stateDir: h.stateDir }),
+      true,
+    );
+    const adopt = await fetch(`${h.url}/m/auth/origin-adopt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        token: handoff.token,
+        handoffId: handoff.handoffId,
+        generation: handoff.generation,
+      }),
+    });
+    assert.equal(adopt.status, 401);
+    assert.equal(
+      (await adopt.json() as { error: string }).error,
+      'INVALID_HANDOFF',
+    );
+  } finally {
     await h.close();
   }
 });
@@ -2866,9 +3333,10 @@ test('a retired token WITHOUT a device proof still revokes the whole chain', asy
 // stop() is stream-detach only, so the screen went quiet while the backend
 // kept burning model calls, tool calls, and external writes. Same
 // exact-attempt primitive as the desktop command center, byte-identical stale
-// semantics: attemptId required (400), stale attempt refused (409), and only
-// the currently-active attempt latches + clears its own approvals.
-test('mobile chat cancel requires the exact live attempt and stops it', async () => {
+// semantics when an attempt id is supplied. A refreshed phone may omit that id
+// and stop only the session's currently-active attempt; it never widens into a
+// historical session-wide kill.
+test('mobile chat cancel rejects a stale exact id and stops the exact live attempt', async () => {
   const h = await startHarness();
   try {
     const cookie = await loginMobile(h, 'Stop phone');
@@ -2886,11 +3354,6 @@ test('mobile chat cancel requires the exact live attempt and stops it', async ()
         body: JSON.stringify(body),
       },
     );
-
-    // Missing attemptId → 400, nothing latched.
-    const missing = await post({});
-    assert.equal(missing.status, 400);
-    assert.equal(((await missing.json()) as { code?: string }).code, 'RUN_ATTEMPT_REQUIRED');
 
     // Stale attemptId → 409, and the live attempt survives.
     const stale = await post({ attemptId: 'attempt:not-current' });
@@ -2927,7 +3390,7 @@ test('mobile settings routes are session-gated: anon requests get 401 at every d
       const anon = await fetch(`${h.url}${p}`);
       assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
     }
-    for (const p of ['/m/api/settings/models/brain', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
+    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/codex-rescue', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
       const anon = await fetch(`${h.url}${p}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -2974,6 +3437,102 @@ test('brain switch serves the live catalog and rejects anything not a known mode
       assert.equal(res.status, 409, 'an unavailable brain is refused with the reason');
     }
   } finally { await h.close(); }
+});
+
+test('Codex rescue route exposes exact connected options, persists one id, refreshes immediately, and clears to primary', async () => {
+  const previousPrimary = process.env.OPENAI_MODEL_PRIMARY;
+  const previousRescue = process.env.OPENAI_MODEL_RESCUE;
+  const authFile = path.join(TMP_ROOT, 'state', 'auth.json');
+  mkdirSync(path.dirname(authFile), { recursive: true });
+  writeFileSync(authFile, JSON.stringify({
+    source: 'native',
+    codexOauth: {
+      accessToken: 'mobile-route-test-access',
+      refreshToken: 'mobile-route-test-refresh',
+      accountId: 'mobile-route-test-account',
+      lastRefresh: new Date().toISOString(),
+    },
+  }), 'utf-8');
+  process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.6-sol';
+  delete process.env.OPENAI_MODEL_RESCUE;
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Rescue settings phone');
+    const initial = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
+    assert.equal(initial.status, 200);
+    const initialBody = (await initial.json()) as {
+      codexRescue?: {
+        modelId?: string;
+        inheritedModelId?: string;
+        configured?: boolean;
+        options?: Array<{ id: string; label: string; available: boolean }>;
+      };
+    };
+    assert.equal(initialBody.codexRescue?.configured, false);
+    assert.equal(initialBody.codexRescue?.modelId, 'gpt-5.6-sol');
+    assert.ok((initialBody.codexRescue?.options?.length ?? 0) >= 2,
+      'the phone receives a meaningful connected Codex rescue catalog');
+    assert.ok(initialBody.codexRescue?.options?.every((option) => option.available),
+      'the initial picker catalog contains connected options, not hardcoded unavailable rows');
+    const selected = initialBody.codexRescue?.options
+      ?.find((option) => option.id !== initialBody.codexRescue?.inheritedModelId);
+    assert.ok(selected, 'a cheaper/different exact Codex option is available');
+
+    for (const invalid of ['glm-5.2', 'gpt-5.999-not-in-catalog']) {
+      const rejected = await fetch(`${h.url}/m/api/settings/models/codex-rescue`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ modelId: invalid }),
+      });
+      assert.equal(rejected.status, 400, `${invalid} must not enter the persisted Codex rescue setting`);
+      assert.equal(process.env.OPENAI_MODEL_RESCUE, undefined);
+    }
+
+    const saved = await fetch(`${h.url}/m/api/settings/models/codex-rescue`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ modelId: selected.id }),
+    });
+    assert.equal(saved.status, 200, await saved.clone().text());
+    const savedBody = (await saved.json()) as {
+      codexRescue?: { modelId?: string; inheritedModelId?: string; configured?: boolean };
+    };
+    assert.equal(savedBody.codexRescue?.modelId, selected.id);
+    assert.equal(savedBody.codexRescue?.configured, true);
+    assert.equal(process.env.OPENAI_MODEL_RESCUE, selected.id, 'the live process sees the persisted choice immediately');
+    const persisted = await readFile(path.join(TMP_ROOT, '.env'), 'utf-8');
+    assert.ok(persisted.split(/\r?\n/).includes(`OPENAI_MODEL_RESCUE=${selected.id}`));
+
+    const refreshed = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
+    const refreshedBody = (await refreshed.json()) as { codexRescue?: { modelId?: string; configured?: boolean } };
+    assert.equal(refreshedBody.codexRescue?.modelId, selected.id);
+    assert.equal(refreshedBody.codexRescue?.configured, true);
+
+    const cleared = await fetch(`${h.url}/m/api/settings/models/codex-rescue`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ clear: true }),
+    });
+    assert.equal(cleared.status, 200, await cleared.clone().text());
+    const clearedBody = (await cleared.json()) as {
+      codexRescue?: { modelId?: string; inheritedModelId?: string; configured?: boolean };
+    };
+    assert.equal(clearedBody.codexRescue?.configured, false);
+    assert.equal(clearedBody.codexRescue?.modelId, 'gpt-5.6-sol');
+    assert.equal(clearedBody.codexRescue?.inheritedModelId, 'gpt-5.6-sol');
+    assert.equal(process.env.OPENAI_MODEL_RESCUE, undefined);
+    assert.doesNotMatch(await readFile(path.join(TMP_ROOT, '.env'), 'utf-8'), /^OPENAI_MODEL_RESCUE=/m);
+  } finally {
+    await h.close();
+    const { removeEnvKey } = await import('../tools/shared.js');
+    removeEnvKey('OPENAI_MODEL_RESCUE');
+    rmSync(authFile, { force: true });
+    if (previousPrimary === undefined) delete process.env.OPENAI_MODEL_PRIMARY;
+    else process.env.OPENAI_MODEL_PRIMARY = previousPrimary;
+    if (previousRescue === undefined) delete process.env.OPENAI_MODEL_RESCUE;
+    else process.env.OPENAI_MODEL_RESCUE = previousRescue;
+  }
 });
 
 // D2 pin (adversarial review 2026-08-26), mobile carrier: once session brain
@@ -3082,5 +3641,285 @@ test('devices list names this device, revokes a peer, and revoke-all cuts everyt
     assert.equal(all.status, 200);
     const selfAfter = await fetch(`${h.url}/m/api/devices`, { headers: { cookie } });
     assert.equal(selfAfter.status, 401, 'revoke-all includes this session — an honest sign-out-everywhere');
+  } finally { await h.close(); }
+});
+
+test('mobile chat preserves blocked/uncertain terminals and retains failed-terminal identity on 5xx', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const priorHarness = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const priorEngine = process.env.CLEMMY_TURN_ENGINE;
+  const priorVerify = process.env.CLEMMY_VERIFY_DELIVERED;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on';
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  process.env.CLEMMY_VERIFY_DELIVERED = 'off';
+  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string; sourceUserSeq?: number; input: string }) => {
+      const status = /\buncertain\b/.test(options.input)
+        ? 'uncertain'
+        : /\bfailed\b/.test(options.input)
+          ? 'failed'
+          : 'blocked';
+      const source = listEvents(options.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === options.sourceUserSeq);
+      assert.ok(source);
+      const identity = { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+      const text = `The mobile fixture is ${status}.`;
+      const committed = commitTurnOutcome(status === 'failed'
+        ? {
+            version: 2,
+            id: turnOutcomeId(identity),
+            identity,
+            status: 'failed',
+            resumable: false,
+            presentation: { kind: 'error', text },
+          }
+        : {
+            version: 2,
+            id: turnOutcomeId(identity),
+            identity,
+            status,
+            resumable: true,
+            presentation: { kind: 'blocked', text },
+          }, {
+        legacyReason: status === 'uncertain' ? 'reconciliation_required' : status,
+      });
+      return {
+        sessionId: options.sessionId,
+        status: status === 'failed' ? 'failed' : 'blocked',
+        steps: 1,
+        lastTurn: source.turn,
+        lastDecision: { reply: text },
+        publicPresentation: committed.presentation,
+      };
+    }) as never,
+  });
+  const h = await startHarness({
+    assistant: {
+      async respond() { throw new Error('typed mobile terminal must not enter the legacy assistant'); },
+    } as Parameters<typeof createMobileRouter>[0]['assistant'],
+  });
+  try {
+    const cookie = await loginMobile(h, 'Typed-terminal phone');
+    const send = async (status: 'blocked' | 'uncertain' | 'failed') => {
+      const response = await fetch(`${h.url}/m/api/chat/send`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie,
+          'idempotency-key': `mobile-typed-terminal-${status}`,
+        },
+        body: JSON.stringify({ message: `exercise ${status} terminal` }),
+      });
+      return {
+        response,
+        body: await response.json() as {
+          error?: string;
+          sessionId?: string;
+          stoppedReason?: string;
+          terminal?: { status?: string; identity?: { sessionId?: string } };
+        },
+      };
+    };
+
+    const blocked = await send('blocked');
+    assert.equal(blocked.response.status, 200);
+    assert.equal(blocked.body.stoppedReason, 'blocked');
+    assert.equal(blocked.body.terminal?.status, 'blocked');
+    assert.equal(blocked.body.terminal?.identity?.sessionId, blocked.body.sessionId);
+
+    const uncertain = await send('uncertain');
+    assert.equal(uncertain.response.status, 200);
+    assert.equal(uncertain.body.stoppedReason, 'unverified');
+    assert.equal(uncertain.body.terminal?.status, 'uncertain');
+    assert.equal(uncertain.body.terminal?.identity?.sessionId, uncertain.body.sessionId);
+
+    const failed = await send('failed');
+    assert.equal(failed.response.status, 500);
+    assert.equal(failed.body.error, 'CHAT_SEND_FAILED');
+    assert.equal(failed.body.stoppedReason, 'error');
+    assert.equal(failed.body.terminal?.status, 'failed');
+    assert.equal(failed.body.terminal?.identity?.sessionId, failed.body.sessionId);
+  } finally {
+    _setBridgeImplsForTests({});
+    if (priorHarness === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK;
+    else process.env.CLEMMY_HARNESS_WEBHOOK = priorHarness;
+    if (priorEngine === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = priorEngine;
+    if (priorVerify === undefined) delete process.env.CLEMMY_VERIFY_DELIVERED;
+    else process.env.CLEMMY_VERIFY_DELIVERED = priorVerify;
+    await h.close();
+  }
+});
+
+/**
+ * Stop must be reachable from the phone before a run attempt exists.
+ *
+ * Live 2026-08-28: a mobile turn looped `plan_task` for ~6 minutes. The
+ * composer hard-locks while busy, the Chat screen carries no stop, and the
+ * Activity sheet — the one surface that did — withholds a foreground chat turn
+ * for its first 90 seconds. The attempt-scoped branch of this route cannot
+ * help there: with no registered attempt it can only answer 409. The phone
+ * already mints an Idempotency-Key per send and the host already keys
+ * cancellation on that value, so the gap was one missing branch.
+ */
+test('mobile chat cancel accepts the request identity before any attempt exists', async () => {
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+    const res = await fetch(`${h.url}/m/api/chat/sessions/sess-stop-pre-attempt/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ clientRequestId: 'mobile-stop-before-attempt' }),
+    });
+    // The turn was never registered, so there is nothing to stop yet — but the
+    // request must be ACCEPTED and latched, not refused for a missing attempt.
+    assert.equal(res.status, 200, `expected the latch to be armed, got ${res.status}`);
+    const body = await res.json() as { ok: boolean; pendingAcceptance: boolean };
+    assert.equal(body.ok, true);
+    assert.equal(body.pendingAcceptance, true);
+  } finally { await h.close(); }
+});
+
+test('mobile chat cancel with no identity stops the live attempt or reports none', async () => {
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+    const liveSession = createHarnessSession({ id: 'sess-stop-no-identity-live', kind: 'chat' });
+    const liveAttempt = beginRunAttempt(liveSession.id, { runId: 'run-stop-no-identity-live' });
+    recordRunAttemptUserInput(liveAttempt, {
+      turn: 1, role: 'user', data: { text: 'long job from a refreshed phone' },
+    }, { armRunInFlight: true });
+    const stopped = await fetch(`${h.url}/m/api/chat/sessions/${liveSession.id}/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({}),
+    });
+    assert.equal(stopped.status, 200);
+    const stoppedBody = await stopped.json() as {
+      attemptId: string;
+      stoppedActive: boolean;
+    };
+    assert.equal(stoppedBody.attemptId, liveAttempt.attemptId);
+    assert.equal(stoppedBody.stoppedActive, true);
+    assert.ok(isKillRequested(liveSession.id, {
+      attemptId: liveAttempt.attemptId,
+      sourceUserSeq: 0,
+    }));
+
+    const res = await fetch(`${h.url}/m/api/chat/sessions/sess-stop-no-identity/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({}),
+    });
+    // Live 2026-08-28: a Grok deal turn ran ~5 minutes with no kill_requested
+    // because Stop required a client-minted cancel key. An empty body now
+    // stops the session's currently-active attempt, or 409 if nothing is live.
+    // It is not a historical session-wide kill.
+    assert.equal(res.status, 409);
+    const body = await res.json() as { code: string };
+    assert.equal(body.code, 'NO_ACTIVE_RUN');
+  } finally { await h.close(); }
+});
+
+test('mobile chat cancel rejects a malformed request id rather than latching it', async () => {
+  const h = await startHarness();
+  try {
+    await setPin('TestPin1!', { stateDir: h.stateDir });
+    const login = await fetch(`${h.url}/m/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'TestPin1!' }),
+    });
+    const cookie = extractCookie(login.headers.get('set-cookie'))!;
+    const res = await fetch(`${h.url}/m/api/chat/sessions/sess-stop-bad-id/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ clientRequestId: 'short' }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json() as { code: string };
+    assert.equal(body.code, 'INVALID_CHAT_REQUEST_ID');
+  } finally { await h.close(); }
+});
+
+/**
+ * Stop must cancel the turn the phone actually started.
+ *
+ * The three pins above prove the request-identity BRANCH is reachable, but
+ * they post fabricated ids and so cannot see whether the id is the right one.
+ * /api/chat/send stores its receipt under `mobile:${mobileChatDigest(deviceId,
+ * key)}`, not under the client's raw key — so a cancel that forwards the raw
+ * key finds no receipt, stops nothing, and still answers 200. A Stop button
+ * that reports success while the turn keeps running is worse than the 400 it
+ * replaced, because the user stops looking for a way out.
+ */
+test('mobile chat cancel resolves the receipt the send path actually wrote', async () => {
+  resetEventLog();
+  _clearIdempotencyForTests();
+  _clearMobileChatInFlightForTests();
+  const h = await startHarness({
+    assistant: {
+      // Never settles during the test: the turn must still be in flight when
+      // Stop is pressed, which is the only state worth testing.
+      async respond() {
+        await new Promise((resolve) => { setTimeout(resolve, 60_000); });
+        return { sessionId: 'unused', text: '' };
+      },
+    } as Parameters<typeof createMobileRouter>[0]['assistant'],
+  });
+  try {
+    const cookie = await loginMobile(h, 'Stop key phone');
+    const key = 'mobile-stop-receipt-match';
+
+    const send = fetch(`${h.url}/m/api/chat/send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': key },
+      body: JSON.stringify({ message: 'what is on my calendar' }),
+    }).catch(() => undefined);
+    // Let the route mint its receipt before stopping.
+    await new Promise((resolve) => { setTimeout(resolve, 400); });
+
+    // Read the session the send path actually minted rather than
+    // reconstructing its digest here — a test that recomputes the id would
+    // drift with the formula instead of pinning it.
+    const sessionId = (openEventLog()
+      .prepare("SELECT id FROM sessions WHERE id LIKE 'sess-mob-%' ORDER BY rowid DESC LIMIT 1")
+      .get() as { id: string } | undefined)?.id;
+    assert.ok(sessionId, 'the send path must have written a session to stop against');
+
+    const res = await fetch(`${h.url}/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ clientRequestId: key }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ok: boolean; pendingAcceptance: boolean };
+    assert.equal(body.ok, true);
+    // THE assertion: the receipt was FOUND. Forwarding the raw client key
+    // leaves this true, and Stop silently does nothing.
+    assert.equal(
+      body.pendingAcceptance,
+      false,
+      'cancel must resolve the receipt the send path wrote, not answer ok for a key that matches nothing',
+    );
+    void send;
   } finally { await h.close(); }
 });

@@ -19,7 +19,7 @@ import {
 import type {
   CanonicalEntityWorkflowLineageCompositorV1,
   CanonicalEntityWorkflowLineageReceiptV1,
-  CanonicalEntityWorkflowProjectionClaimV1,
+  CanonicalEntityWorkflowProjectionClaim,
   CanonicalEntityWorkflowProjectionRequestV1,
 } from './canonical-entity-workflow-finalizer.js';
 
@@ -135,7 +135,7 @@ export function loadCanonicalEntityWorkflowLineageReceipt(
 
 /** Production resolver for content-addressed, raw-body-free lineage receipts. */
 export const durableCanonicalEntityWorkflowLineageCompositor: CanonicalEntityWorkflowLineageCompositorV1 = {
-  resolve(claim: CanonicalEntityWorkflowProjectionClaimV1) {
+  resolve(claim: CanonicalEntityWorkflowProjectionClaim) {
     const receipt = loadCanonicalEntityWorkflowLineageReceipt(claim.receiptId);
     if (!receipt) return { status: 'blocked', kind: 'missing' };
     if (

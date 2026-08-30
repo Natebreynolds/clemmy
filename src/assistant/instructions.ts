@@ -12,7 +12,8 @@ import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../me
 import { renderProvenSkillForPrompt } from '../memory/skill-choice-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
 import { renderActiveBackgroundWorkForInstructions } from '../execution/background-task-status.js';
-import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';
+import { findCatalogEntry, readConnectedClis } from '../integrations/cli-catalog/catalog.js';
+import { readPersistedHealth } from '../integrations/cli-catalog/auth-health.js';
 import type { MessageIntent } from './message-intent.js';
 
 
@@ -97,6 +98,12 @@ function buildIntegrationsContext(): string {
   return sections.join('\n\n');
 }
 
+/** Connected catalog CLIs are available. Host refusal of unbounded shell is not evidence they are missing. */
+export const CONNECTED_CLI_AVAILABILITY_DIRECTIVE =
+  'Do not report them as missing or ask the user to reconnect while they remain in this list.';
+export const CONNECTED_CLI_REVIEWED_READ_DIRECTIVE =
+  'Unbounded `run_shell_command` is not a planning capability and cannot prove a connected CLI is unavailable.';
+
 /**
  * Tell the agent which CLIs the user has explicitly connected via the
  * dashboard's CLI catalog. This is a stronger signal than "it's on $PATH"
@@ -107,14 +114,25 @@ function renderConnectedCliForInstructions(): string {
   const connected = readConnectedClis();
   const entries = Object.values(connected);
   if (entries.length === 0) return '';
+  const health = readPersistedHealth();
   const lines = entries.map((c) => {
-    const authHint = c.authCommand ? ` · auth: \`${c.authCommand}\`` : '';
-    return `- \`${c.command}\` — ${c.name} (${c.vendor})${authHint}`;
+    const catalog = findCatalogEntry(c.id);
+    const row = health[c.id];
+    const signedIn = row?.authStatus === 'ok'
+      ? (row.username ? ` · signed in as ${row.username}` : ' · signed in')
+      : row?.authStatus === 'signed_out'
+        ? ' · signed out — run the listed auth command, then retry the reviewed read'
+        : '';
+    const reviewed = catalog?.reviewedRead
+      ? ` · reviewed read \`${catalog.reviewedRead.operationId}\``
+      : '';
+    const authHint = !catalog?.reviewedRead && c.authCommand ? ` · auth: \`${c.authCommand}\`` : '';
+    return `- \`${c.command}\` — ${c.name} (${c.vendor})${signedIn}${reviewed}${authHint}`;
   });
   return [
-    'Connected CLIs (the user wired these via the dashboard — they are intentionally available, not random $PATH noise):',
+    `Connected CLIs (the user wired these via the dashboard — they are intentionally available. ${CONNECTED_CLI_AVAILABILITY_DIRECTIVE})`,
     ...lines,
-    'Call them via `run_shell_command`. If a CLI needs auth, run its auth command first; if that fails, surface the doc link rather than guessing flags.',
+    `When a connected CLI lists a reviewed read, search that operationId and cite the returned live-read capabilityRef. ${CONNECTED_CLI_REVIEWED_READ_DIRECTIVE}`,
   ].join('\n');
 }
 

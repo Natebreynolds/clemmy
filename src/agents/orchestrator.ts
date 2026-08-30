@@ -35,15 +35,32 @@ import { createHash } from 'node:crypto';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import { appendAgentCapabilityBinding, bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, type SealableToolLike } from './capability-envelope.js';
-import { pinnedCalendarRuleLabels } from '../runtime/harness/constraint-guard.js';
+import { composioStandingPolicyCapabilityHints } from '../integrations/composio/standing-policy-adapter.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import type { Tool } from '@openai/agents';
-import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import {
+  appendEvent,
+  listEvents,
+  resolveToolOutputEvidenceExcerptsForAuthority,
+  resolveToolOutputExcerptsForAuthority,
+  type EventRow,
+} from '../runtime/harness/eventlog.js';
+import { getCheckIn } from './check-ins.js';
 import { constrainNeedsInputPresentationForRecovery } from '../runtime/harness/recovery-presentation-truth.js';
+import {
+  unresolvedRecipientClarification,
+  type ExactRecipientActionPath,
+  type RecipientTurnObservation,
+} from '../runtime/harness/unresolved-recipient-clarification.js';
 import { clarificationBlockedByGoal, compileAcceptedGoal } from '../runtime/graph/accepted-goal.js';
 import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
 import { resolveRubricVariant, DEFAULT_RUBRIC_VARIANT } from './rubric-variant.js';
-import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_INSTRUCTIONS_LEAN, ORCHESTRATOR_BEHAVIOR_NATIVE } from './clem-rubric.js';
+import {
+  ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN,
+  ORCHESTRATOR_INSTRUCTIONS,
+  ORCHESTRATOR_INSTRUCTIONS_LEAN,
+  ORCHESTRATOR_BEHAVIOR_NATIVE,
+} from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
 import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog } from './tool-catalog.js';
 import {
@@ -55,8 +72,11 @@ import { actionControlAdmittedForTaskState, actionControlContextFor, actionTopol
 import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildWorkCall, type BuildWorkCallOptions } from '../tools/work-call.js';
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
+import { uniqueWorkflowRunRequest } from '../tools/named-workflow-match.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
+  inspectPrimaryModelPlanningReadCapability,
+  inspectPrimaryModelPlanningSingleActionCapability,
   snapshotPrimaryModelPlanningContext,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
@@ -64,19 +84,28 @@ import { actionExpectedWorkCarrierSelection } from '../runtime/harness/action-ex
 import {
   formatFrozenNodeBindings,
   formatFrozenWorkAuthority,
+  frozenCreateDestinationFamily,
   loadBoundExpectedWorkContract,
   resolveFrozenNodeBindings,
 } from '../runtime/harness/frozen-work-surface.js';
 import { resolveActionTaskState } from '../runtime/harness/action-task-state.js';
 import { factorySkipForCompiledRoute } from '../runtime/graph/turn-graph-compiler.js';
-import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
 import {
-  durableSelectedLocalPlanningMutationNames,
-  isRegistryDeclaredLocalPlanningMutation,
+  buildScopedLocalToolSearch,
+  getLocalToolSchemas,
+} from '../tools/local-runtime-tools.js';
+import {
+  durableSelectedLocalPlanningCapabilityNames,
+  isRegistryDeclaredLocalPlanningCapability,
+  isWorkCallConfiguredLocalPlanningCapability,
 } from '../runtime/harness/local-planning-capability.js';
 import {
+  accountSelectionBlockersFromSearchResult,
   buildAuthorizedToolSearchCandidateSources,
+  connectedAccountExplicitlySelectedInCurrentText,
+  sessionEstablishedConnectedAccountEmail,
   stageDisclosedPlanningProviderCandidates,
+  uniqueConnectedAccountQuestion,
 } from '../tools/tool-search-provider-sources.js';
 import {
   toolSearchBrokerCoverage,
@@ -101,7 +130,6 @@ import {
   type WorkerBatchExecutionLease,
 } from './worker-batch-execution.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
-import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from './worker-model-fallover.js';
 import { maybeHeavyPerItemToolAdvisory } from './fanout-alignment-gate.js';
@@ -138,6 +166,7 @@ import { resolveToolSurface } from '../runtime/harness/tool-surface.js';
 import {
   bareTerminalToolName,
   formatAutoResolvedAskUserQuestionOutput,
+  formatAwaitingUserInputFinalOutput,
   formatControlReceiptFinalOutput,
   isTerminalToolName,
   renderTerminalToolReply,
@@ -454,7 +483,20 @@ type OrchestratorToolResult = {
   type: string;
   tool: { name?: string };
   output?: unknown;
+  argumentsJson?: string;
+  runItem?: unknown;
 };
+
+type AccountSelectionRequirement = Readonly<{
+  roleKey: string;
+  text: string;
+  resolved: boolean;
+}>;
+
+type UserChoiceHaltContext = Readonly<{
+  actionExpectedWork?: boolean;
+  accountSelectionRequirements?: readonly AccountSelectionRequirement[];
+}>;
 
 const ASK_USER_QUESTION_CANDIDATE_KIND = 'clementine.ask_user_question.candidate' as const;
 
@@ -527,17 +569,382 @@ function renderAskUserQuestionCandidates(candidates: AskUserQuestionCandidate[])
   };
 }
 
-function postedQuestionReceipt(question: string): string {
-  // Keep the long-standing single-question receipt byte-for-byte. Bundles end
-  // in a complete sentence already, so do not manufacture a visible ".." in
-  // the internal turn result after the truthful public post.
-  const separator = question.includes('\n') && /[.!?]\s*$/.test(question) ? '' : '.';
-  return `Question posted: ${question}${separator} Awaiting user reply.`;
-}
-
 function stringifyToolOutput(output: unknown): string {
   if (typeof output === 'string') return output;
   try { return JSON.stringify(output); } catch { return String(output ?? ''); }
+}
+
+function toolCallInputOf(result: OrchestratorToolResult): unknown {
+  if (typeof result.argumentsJson !== 'string' || !result.argumentsJson.trim()) return null;
+  try {
+    return JSON.parse(result.argumentsJson) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function questionFromCheckInReceipt(output: string): string | null {
+  const match = /^Check-in created:\s*(chk-[A-Za-z0-9-]+)/i.exec(output.trim());
+  if (!match) return null;
+  try {
+    const question = getCheckIn(match[1]!)?.question?.trim();
+    return question || null;
+  } catch {
+    return null;
+  }
+}
+
+type ExactAcceptedRecipientSource = {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+  text: string;
+};
+
+function exactAcceptedRecipientSource(context: unknown): ExactAcceptedRecipientSource | null {
+  const sessionId = extractSessionId(context);
+  const sourceUserSeq = extractSourceUserSeq(context);
+  if (!sessionId || !sourceUserSeq) return null;
+  const sources = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+  }).filter((event) => event.data.synthetic !== true);
+  const source = sources.find((event) => event.seq === sourceUserSeq);
+  if (!source || sources.some((event) => event.seq > sourceUserSeq)) return null;
+  const displayText = typeof source.data.displayText === 'string'
+    ? source.data.displayText.trim()
+    : '';
+  const text = displayText || (typeof source.data.text === 'string' ? source.data.text.trim() : '');
+  return text ? { sessionId, sourceUserSeq, turn: source.turn, text } : null;
+}
+
+function parsedToolSearchRows(output: unknown, depth = 0): Record<string, unknown>[] {
+  if (depth > 2) return [];
+  let value = output;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) as unknown; } catch { return []; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.results)) {
+    return record.results.filter((row): row is Record<string, unknown> => (
+      Boolean(row) && typeof row === 'object' && !Array.isArray(row)
+    ));
+  }
+  if (!Array.isArray(record.content)) return [];
+  return record.content.flatMap((part) => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return [];
+    const text = (part as Record<string, unknown>).text;
+    return typeof text === 'string' ? parsedToolSearchRows(text, depth + 1) : [];
+  });
+}
+
+type ParsedToolSearchEnvelope = Readonly<{
+  query: string;
+  roleKey: string;
+  rows: readonly Record<string, unknown>[];
+}>;
+
+function parsedToolSearchEnvelope(output: unknown, depth = 0): ParsedToolSearchEnvelope | null {
+  if (depth > 2) return null;
+  let value = output;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) as unknown; } catch { return null; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const query = typeof record.query === 'string' ? record.query : '';
+  const roleKey = typeof record.role_key === 'string' ? record.role_key : '';
+  if (query && roleKey && Array.isArray(record.results)) {
+    return {
+      query,
+      roleKey,
+      rows: record.results.filter((row): row is Record<string, unknown> => (
+        Boolean(row) && typeof row === 'object' && !Array.isArray(row)
+      )),
+    };
+  }
+  if (!Array.isArray(record.content)) return null;
+  for (const part of record.content) {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) continue;
+    const text = (part as Record<string, unknown>).text;
+    if (typeof text !== 'string') continue;
+    const parsed = parsedToolSearchEnvelope(text, depth + 1);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function accountSelectionOperationNamespace(operation: string): string {
+  return operation.trim().toLowerCase().split(/[^a-z0-9]+/).find(Boolean) ?? '';
+}
+
+function textExplicitlyNamesOperationNamespace(text: string, namespace: string): boolean {
+  if (namespace.length < 4) return false;
+  return text.toLowerCase().split(/[^a-z0-9]+/).some((token) => (
+    token === namespace
+  ));
+}
+
+function accountSelectionCandidateMatchesRequiredRole(input: {
+  acceptedText: string;
+  requirementText: string;
+  query: string;
+  operation: string;
+}): boolean {
+  const normalizedAccepted = input.acceptedText.replace(/\s+/g, ' ').trim().toLowerCase();
+  const normalizedRequirement = input.requirementText.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!normalizedRequirement || !normalizedAccepted.includes(normalizedRequirement)) return false;
+  const namespace = accountSelectionOperationNamespace(input.operation);
+  return textExplicitlyNamesOperationNamespace(input.acceptedText, namespace)
+    && textExplicitlyNamesOperationNamespace(input.requirementText, namespace)
+    && textExplicitlyNamesOperationNamespace(input.query, namespace);
+}
+
+/** A host-authored account question is a narrow optimization, not a semantic
+ * router. It needs an exact host-frozen unresolved role, the exact query echoed
+ * by the settled search, and that search's top-ranked matching blocker. If any
+ * link is missing, the complete result remains with the model. */
+function taskRequiredAccountSelectionBlockers(input: {
+  source: ExactAcceptedRecipientSource;
+  result: OrchestratorToolResult;
+  requirements: readonly AccountSelectionRequirement[];
+}): Array<{ name: string; choices: string[] }> {
+  const envelope = parsedToolSearchEnvelope(input.result.output);
+  const invocation = toolCallInputOf(input.result);
+  if (!envelope || !invocation || typeof invocation !== 'object' || Array.isArray(invocation)) return [];
+  const invocationRecord = invocation as Record<string, unknown>;
+  const query = typeof invocationRecord.query === 'string' ? invocationRecord.query : '';
+  const roleKey = typeof invocationRecord.role_key === 'string' ? invocationRecord.role_key : '';
+  if (!query || query !== envelope.query || !roleKey || roleKey !== envelope.roleKey) return [];
+  const requirement = input.requirements.find((candidate) => (
+    candidate.resolved === false && candidate.roleKey === roleKey
+  ));
+  if (!requirement) return [];
+  const topName = typeof envelope.rows[0]?.name === 'string'
+    ? envelope.rows[0].name.trim()
+    : '';
+  if (!topName || !accountSelectionCandidateMatchesRequiredRole({
+    acceptedText: input.source.text,
+    requirementText: requirement.text,
+    query,
+    operation: topName,
+  })) return [];
+  const matching = accountSelectionBlockersFromSearchResult(input.result.output)
+    .filter((blocker) => blocker.name === topName);
+  return uniqueConnectedAccountQuestion(matching) ? matching : [];
+}
+
+function capabilityRecipientPathFromBatch(
+  source: ExactAcceptedRecipientSource,
+  toolResults: readonly OrchestratorToolResult[],
+): ExactRecipientActionPath | null {
+  const publicRows = new Map<string, { capabilityRef: string; identifier: string }>();
+  for (const result of toolResults) {
+    if (result.type !== 'function_output') continue;
+    if (bareTerminalToolName(result.tool.name ?? '') !== 'tool_search') continue;
+    for (const row of parsedToolSearchRows(result.output)) {
+      const capabilityRef = typeof row.capabilityRef === 'string' ? row.capabilityRef.trim() : '';
+      const identifier = typeof row.name === 'string' ? row.name.trim() : '';
+      if (!capabilityRef || !identifier) continue;
+      publicRows.set(JSON.stringify([capabilityRef, identifier.toLowerCase()]), {
+        capabilityRef,
+        identifier,
+      });
+    }
+  }
+  if (publicRows.size === 0) return null;
+
+  const accountsByPublicRow = new Map<string, Set<string>>();
+  for (const event of listEvents(source.sessionId, { types: ['capability_discovered'] })) {
+    if (event.data.sourceUserSeq !== source.sourceUserSeq) continue;
+    const capabilities = Array.isArray(event.data.capabilities) ? event.data.capabilities : [];
+    for (const raw of capabilities) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const row = raw as Record<string, unknown>;
+      const capabilityRef = typeof row.capabilityRef === 'string' ? row.capabilityRef.trim() : '';
+      const identifier = typeof row.identifier === 'string' ? row.identifier.trim() : '';
+      const accountIdentity = typeof row.accountIdentity === 'string' ? row.accountIdentity.trim() : '';
+      if (!capabilityRef || !identifier || !accountIdentity) continue;
+      const publicKey = JSON.stringify([capabilityRef, identifier.toLowerCase()]);
+      if (!publicRows.has(publicKey)) continue;
+      const accounts = accountsByPublicRow.get(publicKey) ?? new Set<string>();
+      accounts.add(accountIdentity);
+      accountsByPublicRow.set(publicKey, accounts);
+    }
+  }
+  if (accountsByPublicRow.size !== publicRows.size) return null;
+  const accounts = [...accountsByPublicRow.values()];
+  if (accounts.some((values) => values.size !== 1)) return null;
+  const accountIdentities = new Set(accounts.map((values) => [...values][0]!));
+  if (accountIdentities.size !== 1) return null;
+  const capabilityRefs = [...publicRows.values()].map((row) => row.capabilityRef);
+  if (new Set(capabilityRefs).size !== capabilityRefs.length) return null;
+  return {
+    kind: 'capability_refs',
+    sourceUserSeq: source.sourceUserSeq,
+    capabilityRefs,
+    accountIdentity: [...accountIdentities][0]!,
+    accountIdentityProvenance: 'same_source_capability_discovered',
+  };
+}
+
+function selectedAccountRecipientPathFromBatch(
+  source: ExactAcceptedRecipientSource,
+  toolResults: readonly OrchestratorToolResult[],
+): ExactRecipientActionPath | null {
+  const blockers = toolResults.flatMap((result) => (
+    result.type === 'function_output'
+    && bareTerminalToolName(result.tool.name ?? '') === 'tool_search'
+      ? accountSelectionBlockersFromSearchResult(result.output)
+      : []
+  ));
+  if (blockers.length === 0 || blockers.some((blocker) => blocker.choices.length < 2)) return null;
+  const choiceSets = new Set(blockers.map((blocker) => JSON.stringify(
+    [...blocker.choices].map((choice) => choice.trim().toLowerCase()).sort(),
+  )));
+  if (choiceSets.size !== 1) return null;
+  const uniqueChoices = uniqueConnectedAccountQuestion(blockers);
+  if (!uniqueChoices) return null;
+  const operations = [...new Set(blockers.map((blocker) => blocker.name.trim()).filter(Boolean))];
+  if (operations.length === 0) return null;
+  const selected = connectedAccountExplicitlySelectedInCurrentText({
+    text: source.text,
+    choices: uniqueChoices.choices,
+  });
+  if (!selected) return null;
+  return {
+    kind: 'selected_account_blockers',
+    sourceUserSeq: source.sourceUserSeq,
+    operationNames: operations,
+    accountChoices: [...uniqueChoices.choices],
+    selectedAccountIdentity: selected,
+  };
+}
+
+function resultBatchCallId(result: OrchestratorToolResult): string | null {
+  if (!result.runItem || typeof result.runItem !== 'object') return null;
+  const rawItem = (result.runItem as { rawItem?: unknown }).rawItem;
+  if (!rawItem || typeof rawItem !== 'object') return null;
+  const callId = (rawItem as { callId?: unknown }).callId;
+  return typeof callId === 'string' && callId.trim() ? callId.trim() : null;
+}
+
+function providerOrderedRecipientObservations(
+  source: ExactAcceptedRecipientSource,
+  toolResults: readonly OrchestratorToolResult[],
+): RecipientTurnObservation[] {
+  const ordered = toolResults.flatMap((result) => {
+    if (result.type !== 'function_output') return [];
+    const callId = resultBatchCallId(result);
+    return callId ? [{ callId, result }] : [];
+  });
+  if (new Set(ordered.map((entry) => entry.callId)).size !== ordered.length) return [];
+  const authorityOptions = {
+    readOrComputeOnly: true,
+    allowedSourceUserSeqs: [source.sourceUserSeq],
+    excerptChars: 100_000,
+  } as const;
+  const automaticEvidence = resolveToolOutputEvidenceExcerptsForAuthority(
+    source.sessionId,
+    ordered,
+    authorityOptions,
+  );
+  const automaticByCallId = new Map(automaticEvidence.map((evidence) => [evidence.callId, evidence]));
+  // Automatic field-authority projection deliberately withholds unstructured
+  // provider prose because request echoes cannot safely establish a value.
+  // This boundary never establishes a value: it uses the complete verified
+  // read only to decide whether to ask a conservative question. A request echo
+  // with no exact target-bound identifier still asks; an identifier can only
+  // suppress that question. Raw bytes never leave this function and cannot
+  // authorize, plan, approve, or dispatch. Incomplete/excerpted bytes abstain.
+  const completeByCallId = new Map(resolveToolOutputExcerptsForAuthority(
+    source.sessionId,
+    ordered,
+    authorityOptions,
+  ).map((evidence) => [evidence.callId, evidence]));
+  return ordered.flatMap(({ callId, result }) => {
+    const automatic = automaticByCallId.get(callId);
+    const complete = completeByCallId.get(callId);
+    if (!automatic || !complete || automatic.excerpted || complete.excerpted) return [];
+    const output = automatic.automaticEvidenceSuppressed
+      ? complete.output
+      : automatic.output;
+    return [{
+      sourceUserSeq: source.sourceUserSeq,
+      toolName: complete.tool ?? result.tool.name ?? '',
+      queryText: typeof result.argumentsJson === 'string' ? result.argumentsJson : '',
+      result: output,
+      settled: true,
+      effect: complete.effect ?? '',
+      evidenceRole: complete.effect === 'read'
+        ? 'source_read'
+        : complete.effect === 'compute' ? 'derivation' : null,
+    } satisfies RecipientTurnObservation];
+  });
+}
+
+function eventBelongsToAcceptedRecipientSource(
+  event: EventRow,
+  source: ExactAcceptedRecipientSource,
+): boolean {
+  const explicitSource = event.data.sourceUserSeq;
+  if (Object.hasOwn(event.data, 'sourceUserSeq')) {
+    return Number.isSafeInteger(explicitSource)
+      && Number(explicitSource) > 0
+      && explicitSource === source.sourceUserSeq;
+  }
+  return event.seq > source.sourceUserSeq && event.turn === source.turn;
+}
+
+function recipientEffectOrApprovalPathEntered(
+  source: ExactAcceptedRecipientSource,
+  toolResults: readonly OrchestratorToolResult[],
+): boolean {
+  if (toolResults.some((result) => (
+    result.type === 'function_output'
+    && bareTerminalToolName(result.tool.name ?? '') === 'request_approval'
+  ))) return true;
+  const events = listEvents(source.sessionId, { sinceSeq: source.sourceUserSeq });
+  return events.some((event) => {
+    if (!eventBelongsToAcceptedRecipientSource(event, source)) return false;
+    if (
+      event.type === 'approval_requested'
+      || event.type === 'approval_resolved'
+      || event.type === 'approval_parked'
+    ) return true;
+    if (/^external_write(?:_|$)/.test(event.type)) return true;
+    if (event.type !== 'tool_called' && event.type !== 'tool_returned') return false;
+    return /^(?:write|local_write|external_write|admin)$/i.test(
+      typeof event.data.effect === 'string' ? event.data.effect.trim() : '',
+    );
+  });
+}
+
+function unresolvedRecipientCandidateFromBatch(
+  context: unknown,
+  toolResults: readonly OrchestratorToolResult[],
+): AskUserQuestionCandidate | null {
+  const source = exactAcceptedRecipientSource(context);
+  if (!source) return null;
+  const currentPath = capabilityRecipientPathFromBatch(source, toolResults)
+    ?? selectedAccountRecipientPathFromBatch(source, toolResults);
+  if (!currentPath) return null;
+  const clarification = unresolvedRecipientClarification({
+    sourceUserSeq: source.sourceUserSeq,
+    acceptedText: source.text,
+    currentPath,
+    observations: providerOrderedRecipientObservations(source, toolResults),
+    effectOrApprovalPathEntered: recipientEffectOrApprovalPathEntered(source, toolResults),
+  });
+  return clarification ? {
+    kind: ASK_USER_QUESTION_CANDIDATE_KIND,
+    status: 'staged',
+    posted: false,
+    question: clarification.question,
+    options: null,
+    purpose: 'clarification',
+  } : null;
 }
 
 /** End a provider turn only after a real user-choice pause. Approval-shaped
@@ -545,7 +952,7 @@ function stringifyToolOutput(output: unknown): string {
 export function userChoiceToolUseBehavior(
   context: unknown,
   toolResults: OrchestratorToolResult[],
-  haltContext: { actionExpectedWork?: boolean } = {},
+  haltContext: UserChoiceHaltContext = {},
 ) {
   // The SDK executes parallel function calls concurrently, then supplies this
   // callback with the COMPLETE result array in provider order. Treat real asks
@@ -563,6 +970,55 @@ export function userChoiceToolUseBehavior(
     if (seenCandidates.has(key)) continue;
     seenCandidates.add(key);
     candidates.push(candidate);
+  }
+  if (candidates.length === 0 && haltContext.actionExpectedWork !== false) {
+    // Which connected account is a fact only the user has, but an incidental
+    // provider row is not proof that this task needs that fact. Keep the fast
+    // path only for an exact host-frozen unresolved role whose exact settled
+    // search ranks the matching blocker first. Everything else goes back to
+    // the model with the complete search result.
+    const source = exactAcceptedRecipientSource(context);
+    const blockers: Array<{ name: string; choices: string[] }> = [];
+    for (const result of toolResults) {
+      if (result.type !== 'function_output') continue;
+      if (bareTerminalToolName(result.tool.name ?? '') !== 'tool_search') continue;
+      if (!source) continue;
+      blockers.push(...taskRequiredAccountSelectionBlockers({
+        source,
+        result,
+        requirements: haltContext.accountSelectionRequirements ?? [],
+      }));
+    }
+    const unique = uniqueConnectedAccountQuestion(blockers);
+    if (unique && source) {
+      const { sessionId, sourceUserSeq } = source;
+      const connectedEmails = new Set(
+        unique.choices.map((choice) => choice.trim().toLowerCase()),
+      );
+      const established = sessionEstablishedConnectedAccountEmail({
+        sessionId,
+        sourceUserSeq,
+        connectedEmails,
+      });
+      const currentSelection = connectedAccountExplicitlySelectedInCurrentText({
+        text: source.text,
+        choices: unique.choices,
+      });
+      if (!established && !currentSelection) {
+        candidates.push({
+          kind: ASK_USER_QUESTION_CANDIDATE_KIND,
+          status: 'staged',
+          posted: false,
+          question: 'Which connected account should I use?',
+          options: [...unique.choices],
+          purpose: 'clarification',
+        });
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    const unresolvedRecipient = unresolvedRecipientCandidateFromBatch(context, toolResults);
+    if (unresolvedRecipient) candidates.push(unresolvedRecipient);
   }
   if (candidates.length > 0) {
     const rendered = renderAskUserQuestionCandidates(candidates);
@@ -597,7 +1053,7 @@ export function userChoiceToolUseBehavior(
       return {
         isFinalOutput: true as const,
         isInterrupted: undefined,
-        finalOutput: postedQuestionReceipt(existingQuestion),
+        finalOutput: formatAwaitingUserInputFinalOutput(existingQuestion),
       };
     }
     const recoveryProjection = sourceUserSeq
@@ -638,12 +1094,16 @@ export function userChoiceToolUseBehavior(
     return {
       isFinalOutput: true as const,
       isInterrupted: undefined,
-      finalOutput: postedQuestionReceipt(recoveryProjection.text),
+      finalOutput: formatAwaitingUserInputFinalOutput(recoveryProjection.text),
     };
   }
 
   // Rolling-upgrade/backward-compatible path for old string receipts. YOLO's
   // machine-readable auto-resolution prefix remains explicitly non-halting.
+  // Live 2026-08-29 mobile: autonomy check-in receipts ("Check-in created:
+  // chk-…") halted the host lane as the chat answer while Discord/Slack
+  // showed the question. Same render as the SDK lane: the question is the
+  // user-facing text.
   for (const result of toolResults) {
     if (result.type !== 'function_output') continue;
     const rawName = result.tool.name ?? '';
@@ -651,7 +1111,16 @@ export function userChoiceToolUseBehavior(
     if (bare !== 'ask_user_question') continue;
     const output = stringifyToolOutput(result.output);
     if (!terminalToolShouldHalt(rawName, output, haltContext)) continue;
-    return { isFinalOutput: true as const, isInterrupted: undefined, finalOutput: output };
+    const rendered = renderTerminalToolReply(rawName, toolCallInputOf(result), output);
+    const recovered = /^Check-in created:/i.test(rendered)
+      ? questionFromCheckInReceipt(output)
+      : null;
+    const question = recovered || rendered;
+    return {
+      isFinalOutput: true as const,
+      isInterrupted: undefined,
+      finalOutput: formatAwaitingUserInputFinalOutput(question),
+    };
   }
   // A successful background-control receipt is itself the answer to the
   // request that invoked it — end the provider turn here on this lane too
@@ -1312,8 +1781,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const declinedParentWithNewTask =
     options.taskContinuation?.disposition === 'declined_with_new_task';
   const parentAuthorityDeclined = declinedContinuation || declinedParentWithNewTask;
+  const plainConversationSurface = options.hostPlainConversation === true;
   const factorySkip = declinedContinuation
-    || options.hostPlainConversation === true
+    || plainConversationSurface
     || factorySkipForCompiledRoute(options.acceptedRoute, options.allowedToolNames);
   const currentUserInput = typeof options.userInput === 'string' ? options.userInput : '';
   // A dual-clause turn remains byte-exact in the provider transcript, while
@@ -1322,8 +1792,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const scopeUserInput = declinedParentWithNewTask
     ? options.taskContinuation?.activeTaskInput ?? currentUserInput
     : currentUserInput;
+  const hostFreshPlanning = options.hostFreshPlanning;
   const actionWork = (() => {
     if (options.acceptedRoute !== 'act') return false;
+    // The host-fresh lane intentionally constructs the model surface before a
+    // durable action graph/expected-work contract exists. Its opaque planning
+    // authority is the carrier; consulting the legacy durable action boundary
+    // here would turn the valid pre-plan state into "missing graph".
+    if (hostFreshPlanning) return false;
     if (
       !options.sessionId
       || !Number.isSafeInteger(options.sourceUserSeq)
@@ -1334,22 +1810,33 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       sourceUserSeq: options.sourceUserSeq as number,
     });
   })();
-  const hostFreshPlanning = options.hostFreshPlanning;
   const carrierWork = Boolean(actionWork || hostFreshPlanning);
-  const durableSelectedLocalPlanningNames = options.sessionId
+  const workCallLocalSchemaNames = carrierWork
+    ? new Set(getLocalToolSchemas().keys())
+    : new Set<string>();
+  // The host's exact plain-conversation proof already seals this turn to a
+  // zero-tool surface. Durable capability selection can only influence an
+  // action carrier, so reading it here cannot change the compiled model surface.
+  const durableSelectedLocalPlanningNames = !plainConversationSurface
+    && options.sessionId
     && Number.isSafeInteger(options.sourceUserSeq)
     && (options.sourceUserSeq ?? 0) > 0
-    ? durableSelectedLocalPlanningMutationNames({
-        sessionId: options.sessionId,
-        sourceUserSeq: options.sourceUserSeq as number,
-      })
-    : new Set<string>();
-  const routesPlanBoundLocalMutation = (name: string): boolean => (
-    isRegistryDeclaredLocalPlanningMutation(name)
+      ? durableSelectedLocalPlanningCapabilityNames({
+          sessionId: options.sessionId,
+          sourceUserSeq: options.sourceUserSeq as number,
+          workCallConfiguredNames: workCallLocalSchemaNames,
+        })
+      : new Set<string>();
+  const routesPlanBoundLocalCapability = (name: string): boolean => (
+    isRegistryDeclaredLocalPlanningCapability(name)
+    && isWorkCallConfiguredLocalPlanningCapability(name, workCallLocalSchemaNames)
     && (Boolean(hostFreshPlanning) || durableSelectedLocalPlanningNames.has(name))
   );
   const frozenContract = actionWork
     ? loadBoundExpectedWorkContract(options.sessionId ?? undefined, options.sourceUserSeq)
+    : null;
+  const frozenDestinationFamily = frozenContract
+    ? frozenCreateDestinationFamily(frozenContract)
     : null;
   const actionTaskState = actionWork
     ? resolveActionTaskState({
@@ -1385,7 +1872,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ...(hostFreshPlanning ? ['plan_task'] : []),
         ])]
       : options.allowedToolNames;
-  const historicalPriorUserInputs = options.sessionId && !parentAuthorityDeclined
+  // Prior-input retrieval here exists only to recover MCP/JIT scope. It is not
+  // the provider transcript: runTurn still supplies the normal conversation
+  // history to the model. An exact plain proof has no MCP/JIT scope to recover.
+  const historicalPriorUserInputs = !plainConversationSurface
+    && options.sessionId
+    && !parentAuthorityDeclined
     ? recentPriorUserInputsForScope(options.sessionId, currentUserInput)
     : [];
   const priorUserInputs = parentAuthorityDeclined
@@ -1396,6 +1888,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.taskContinuation?.parentInput ?? '',
         ...historicalPriorUserInputs,
       ].filter((value, index, all) => value.trim() && all.indexOf(value) === index);
+  const directNamedWorkflowRun = uniqueWorkflowRunRequest(scopeUserInput, priorUserInputs);
+  // A current accepted source that uniquely identifies an existing workflow
+  // already has the complete resource identity needed by workflow_run. Keep
+  // that one control on its ordinary direct admission path; sending it through
+  // local planning would add discovery/work_call while ultimately reopening
+  // the same accepted-source + queue boundary. Prior/LRU promotion alone is
+  // not enough: unrelated turns remain plan-bound.
+  const routesPlanBoundLocalCapabilityForTurn = (name: string): boolean => (
+    routesPlanBoundLocalCapability(name)
+    && !(name === 'workflow_run' && directNamedWorkflowRun)
+  );
   const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
         reason: declinedContinuation
@@ -1413,7 +1916,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ? resolveMcpToolScopeWithRecall({
               userInput: scopeUserInput,
               priorUserInputs,
-              pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+              standingCapabilityHints: composioStandingPolicyCapabilityHints(),
               configuredServerNames: enabledExternalServerNames(),
               // The turn's resolved candidates ride in as advisory matches so
               // the MCP scope sees exactly what the JIT surface sees.
@@ -1435,7 +1938,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 ? { answerDisposition: options.taskContinuation.disposition }
                 : {}),
             })
-          : resolveMcpToolScope({ userInput: scopeUserInput, pinnedCalendarLabels: pinnedCalendarRuleLabels() })
+          : resolveMcpToolScope({
+              userInput: scopeUserInput,
+              standingCapabilityHints: composioStandingPolicyCapabilityHints(),
+            })
       );
   // T1: thread the current input so the fail-open MCP surface can rank the
   // user's connected tools by semantic relevance (run-start only; ignored by
@@ -1450,15 +1956,33 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       )
     : undefined;
   const planningDisclosure = hostFreshPlanning
-    ? async (candidates: readonly ToolSearchPlanningDisclosureCandidate[]) => {
-        await stageDisclosedPlanningProviderCandidates({
+    ? async (
+        candidates: readonly ToolSearchPlanningDisclosureCandidate[],
+        control?: Readonly<{ signal: AbortSignal; deadlineAt: number }>,
+      ) => {
+        const staged = await stageDisclosedPlanningProviderCandidates({
           ...hostFreshPlanning.identity,
           candidates,
+          signal: control?.signal,
+          deadlineAt: control?.deadlineAt,
         });
-        return disclosePrimaryModelPlanningCapabilities({
+        if (control && (control.signal.aborted || Date.now() >= control.deadlineAt)) {
+          return { version: 1 as const, refs: Object.freeze({}), blockers: Object.freeze({}) };
+        }
+        const refs = await disclosePrimaryModelPlanningCapabilities({
           authority: hostFreshPlanning.authority,
           candidates,
+          signal: control?.signal,
+          deadlineAt: control?.deadlineAt,
         });
+        if (control && (control.signal.aborted || Date.now() >= control.deadlineAt)) {
+          return { version: 1 as const, refs: Object.freeze({}), blockers: Object.freeze({}) };
+        }
+        return {
+          version: 1 as const,
+          refs,
+          blockers: staged.blockers,
+        };
       }
     : undefined;
   if (carrierWork) {
@@ -1510,7 +2034,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   // proposal ("research these 18 firms?") answered with a bare "yes"
   // (live 2026-07-07: current-message-only detection serialized 18 firms).
   // '' (byte-identical prompt) on non-data turns or when the kill-switch is off.
-  const multiItem = !declinedContinuation && typeof scopeUserInput === 'string'
+  // Fan-out classification changes only action tools/directives. The exact
+  // plain surface advertises neither, so do not reread conversation events or
+  // classify a batch that cannot be executed on this turn.
+  const multiItem = !plainConversationSurface
+    && !declinedContinuation
+    && typeof scopeUserInput === 'string'
     ? detectMultiItemIntentFromConversation(
         scopeUserInput,
         declinedParentWithNewTask
@@ -1846,7 +2375,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         if (batch.status === 'parked') {
           return [
             ...(heavyAdvisory ? [heavyAdvisory] : []),
-            `Batch parked safely before the unchanged run_worker deadline: ${batch.remainder.settled.length}/${callItems.length} settled; ${batch.remainder.failed.length} failed; ${batch.remainder.in_flight.length} in_flight; ${batch.remainder.pending.length} pending. No worker body remains active. Re-run the exact same items to reuse settled receipts and continue only the remainder.`,
+            `Batch parked safely before the unchanged run_worker deadline: ${batch.remainder.settled.length}/${callItems.length} settled; ${batch.remainder.failed.length} failed; ${batch.remainder.in_flight.length} in_flight; ${batch.remainder.pending.length} pending (not attempted). No worker body remains active. Re-run the exact same items to reuse settled receipts and continue only the remainder.`,
             renderWorkerBatchRemainder(batch.remainder),
             ...batch.items
               .filter((entry) => entry.output !== undefined)
@@ -2104,37 +2633,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             );
           } catch { /* manifest visibility is best-effort */ }
         }
-        // Route-outcome capture (adaptive routing evidence): score WORKER models,
-        // not just the brain. Skipped for pre-run refusals (respawn guard) — those
-        // are not the model's outcome. Fail-open.
+        // Provider-call accounting is owned by the Claude SDK adapter or the
+        // RouterModelProvider target wrapper. This logical worker_result is a
+        // durable UI/restart mirror and must not create a second spend row.
         if (preRun) return;
-        try {
-          const ranModel = data.model || workerModel;
-          const traceSource = route.trace?.source;
-          const source: ModelRouteDecisionSource = traceSource === 'default' || !traceSource
-            ? 'default'
-            : traceSource === 'policy'
-              ? 'policy'
-              : route.trace?.matchedIntent
-                ? 'intent_binding'
-                : 'binding';
-          const decisionId = recordModelRouteDecision({
-            sessionId,
-            role: 'worker',
-            intent: input.intent || undefined,
-            resolvedModel: ranModel,
-            provider: resolveEffectiveProviderForModel(ranModel),
-            source,
-            reason: { lane: 'orchestrator', item: input.item },
-          });
-          recordModelRouteOutcome({
-            decisionId,
-            status: data.ok ? 'success' : 'failed',
-            latencyMs: Date.now() - workerRouteStartedAt,
-            totalTokens: data.tokens,
-            toolSuccess: data.ok,
-          });
-        } catch { /* metrics must never block fan-out */ }
       };
       const workerResultReason = (value: unknown): string => {
         const raw = value instanceof Error ? value.message : typeof value === 'string' ? value : String(value ?? '');
@@ -2762,27 +3264,30 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         .filter((name) => actionTopologyRoleFor(name) === 'business'));
       const actionControlNames = new Set([...policyAllowed]
         .filter((name) => actionTopologyRoleFor(name) === 'control'));
-      // A local authoring mutation can remain an ordinary graph-neutral
-      // control while still using work_call when it is selected into a fresh
-      // plan. work_call owns the exact requirement binding/cardinality
-      // reservation; call_tool deliberately does not. This set is derived
-      // solely from registry semantics and only widens the carrier's reachable
-      // surface — ref issuance still revalidates the current exact schema.
-      const localPlanningMutationNames = new Set([...policyAllowed]
-        .filter((name) => routesPlanBoundLocalMutation(name)));
+      // A reviewed Clementine-local capability can keep its ordinary
+      // graph-neutral topology while using work_call when it is selected into
+      // a fresh plan. That includes exact project reads: work_call owns the
+      // requirement binding/cardinality reservation, while unrelated reads
+      // retain call_tool. Ref issuance still revalidates the current schema.
+      const localPlanningCapabilityNames = new Set([...policyAllowed]
+        .filter((name) => routesPlanBoundLocalCapabilityForTurn(name)));
       const workCallBuiltinNames = new Set([
         ...actionBusinessNames,
-        ...localPlanningMutationNames,
+        ...localPlanningCapabilityNames,
       ]);
       const visibleFirstClassNames = carrierWork
         ? new Set([...firstClassNames].filter((name) => (
             actionControlNames.has(name)
             && actionControlContextFor(name) !== 'task_recovery'
-            && (!hostFreshPlanning || name === 'tool_search')
+            // Planning binds BUSINESS work. Hot-set controls stay first-class:
+            // a uniquely named saved workflow is invoked with workflow_run, not
+            // reconstructed through tool_search (live 2026-08-29: planning
+            // stripped every control except tool_search, so "run my platform 49
+            // workflow" became a Composio hunt).
             // On an action turn these exact mutations must cross work_call's
             // requirement binder. Their ordinary graph-neutral control
             // exposure is unchanged on non-action turns.
-            && !localPlanningMutationNames.has(name)
+            && !localPlanningCapabilityNames.has(name)
           )))
         : firstClassNames;
       const deferredActionControlNames = new Set([...actionControlNames]
@@ -2806,7 +3311,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             ? buildScopedLocalToolSearch(
                 discoverableNames,
                 'work_call',
-                (name) => localPlanningMutationNames.has(name)
+                (name) => localPlanningCapabilityNames.has(name)
                   ? 'work_call'
                   : actionTopologyRoleFor(name) === 'control' || isRegistryDeclaredRead(name)
                     ? 'call_tool'
@@ -2842,8 +3347,31 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
                 return Boolean(planning && planning.capabilities.length > 0);
               },
+              hostPlanningReadCapabilityResolver: (request) => (
+                inspectPrimaryModelPlanningReadCapability({
+                  authority: hostFreshPlanning.authority,
+                  identity: {
+                    sessionId: request.sessionId,
+                    sourceUserSeq: request.sourceUserSeq,
+                  },
+                  operationId: request.operationId,
+                })
+              ),
+              hostSingleActionPlanCapabilityResolver: (request) => (
+                inspectPrimaryModelPlanningSingleActionCapability({
+                  authority: hostFreshPlanning.authority,
+                  identity: {
+                    sessionId: request.sessionId,
+                    sourceUserSeq: request.sourceUserSeq,
+                  },
+                  capabilityRef: request.requirementId,
+                  operationId: request.operationId,
+                  effect: request.effect,
+                })
+              ),
             } : {}),
             catalogIdentifiers: [...workCallBuiltinNames],
+            destinationFamily: frozenDestinationFamily,
             ...(options.turnCandidates?.sourceStrategyBinding
               ? { sourceStrategyBinding: options.turnCandidates.sourceStrategyBinding }
               : {}),
@@ -2855,8 +3383,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ? buildCallTool({
               reachableBuiltinNames: new Set([
                 ...[...deferredActionControlNames]
-                  .filter((name) => !localPlanningMutationNames.has(name)),
-                ...dispatchableActionReadNames,
+                  .filter((name) => !localPlanningCapabilityNames.has(name)),
+                ...[...dispatchableActionReadNames]
+                  .filter((name) => !localPlanningCapabilityNames.has(name)),
               ]),
               firstClassNames: visibleFirstClassNames,
               deniedNames: excludes,
@@ -2869,9 +3398,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               },
               admitBuiltinAcquisition: (targetName) => admitBuiltinAcquisition(targetName),
               controlOnlyBuiltins: true,
-              ...(hostFreshPlanning ? {
-                modelVisibility: () => actionExpectedWorkRequired(hostFreshPlanning.identity),
-              } : {}),
             })
           : buildCallTool(dispatcherOptions);
       const catalogText = buildCompactToolCatalog({ allowedNames: discoverableNames });
@@ -2884,10 +3410,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // impossible to misread as a capability restriction.
         carrierWork
           ? frozenContract
-            ? '[tool-catalog] Full tool access. Hot controls are first-class; deferred controls AND local reads use `call_tool` directly (a read never needs a proposal); business WRITES/MCP/Composio use `work_call`. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null.'
+            ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null.'
             : hostFreshPlanning
-              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If any required ref is absent, use `tool_search` first; its exact results disclose capabilityRef values without business I/O. Once every ref is resolved, call `plan_task` first. It may stand alone, or be followed in that same frame by exactly one proposal-free `work_call` for a dependency-root read/compute operation from the draft. The host activates the plan before admitting that sibling. Afterward, use local reads through `call_tool` and every business operation through the proposal-free `work_call`.'
-              : '[tool-catalog] Full tool access. Hot controls are first-class; deferred controls AND local reads use `call_tool` directly (a read never needs a proposal); business WRITES/MCP/Composio use `work_call`. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
+              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If any required ref is absent, use `tool_search` first; its exact results disclose capabilityRef values without business I/O. When the request is exactly one fully specified, dependency-free, cardinality-once action, emit that one proposal-free `work_call` alone; the host compiles its existing durable one-action contract without another model-authored plan. For compound, dependent, multi-action, ambiguous, each/set, admin, destructive, or unknown-effect work, keep ownership of the topology and call `plan_task` first. It may stand alone, or be followed in that same frame by exactly one proposal-free `work_call` for a dependency-root read/compute operation from the draft. After activation, route every plan-selected local read and business operation through proposal-free `work_call`; keep unrelated graph-neutral reads on `call_tool`. Reads never need approval.'
+              : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
       ].join('\n');
@@ -2908,15 +3434,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         && !excludes.has(name)
         && (!explicitAllowed || explicitAllowed.has(name))
         && actionTopologyRoleFor(name) === 'business'));
-    const localPlanningMutationNames = new Set(actionScopedDiscoveryTools
+    const localPlanningCapabilityNames = new Set(actionScopedDiscoveryTools
       .map((toolRef) => (toolRef as { name?: string }).name ?? '')
       .filter((name) => name
         && !excludes.has(name)
         && (!explicitAllowed || explicitAllowed.has(name))
-        && routesPlanBoundLocalMutation(name)));
+        && routesPlanBoundLocalCapabilityForTurn(name)));
     const workCallBuiltinNames = new Set([
       ...businessNames,
-      ...localPlanningMutationNames,
+      ...localPlanningCapabilityNames,
     ]);
     workCallOptions = {
       reachableBuiltinNames: workCallBuiltinNames,
@@ -2930,8 +3456,31 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           const planning = snapshotPrimaryModelPlanningContext(hostFreshPlanning.authority);
           return Boolean(planning && planning.capabilities.length > 0);
         },
+        hostPlanningReadCapabilityResolver: (request) => (
+          inspectPrimaryModelPlanningReadCapability({
+            authority: hostFreshPlanning.authority,
+            identity: {
+              sessionId: request.sessionId,
+              sourceUserSeq: request.sourceUserSeq,
+            },
+            operationId: request.operationId,
+          })
+        ),
+        hostSingleActionPlanCapabilityResolver: (request) => (
+          inspectPrimaryModelPlanningSingleActionCapability({
+            authority: hostFreshPlanning.authority,
+            identity: {
+              sessionId: request.sessionId,
+              sourceUserSeq: request.sourceUserSeq,
+            },
+            capabilityRef: request.requirementId,
+            operationId: request.operationId,
+            effect: request.effect,
+          })
+        ),
       } : {}),
       catalogIdentifiers: [...workCallBuiltinNames],
+      destinationFamily: frozenDestinationFamily,
       ...(options.turnCandidates?.sourceStrategyBinding
         ? { sourceStrategyBinding: options.turnCandidates.sourceStrategyBinding }
         : {}),
@@ -2943,7 +3492,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           && !excludes.has(name)
           && (!explicitAllowed || explicitAllowed.has(name))
           && actionTopologyRoleFor(name) === 'control'
-          && !localPlanningMutationNames.has(name);
+          && !localPlanningCapabilityNames.has(name);
       })
       .map((toolRef) => (toolRef as { name?: string }).name === 'tool_search'
         ? buildScopedLocalToolSearch(
@@ -2957,11 +3506,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     callTool = null;
   }
 
-  // Keep stable lane rules + the within-run catalog BEFORE the dynamic memory
-  // tail. The previous `[rubric][fresh memory][catalog]` order broke the prompt
-  // cache immediately before a ~3K-token catalog on every model cycle.
-  const staticInstructions = [
-    rubricChoice.instructions,
+  // Every accepted-turn authority/catalog byte is volatile across turns. Keep
+  // it visible and frozen for this Agent activation, but place it AFTER the
+  // identity/rubric cache boundary. Calling this whole block "static" made a
+  // catalog or frozen-plan revision silently revise the stable prefix.
+  const volatileInstructions = [
     batchShapeMandate,
     carrierWork
       ? frozenContract
@@ -2971,20 +3520,25 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             formatFrozenNodeBindings(resolveFrozenNodeBindings({
               contract: frozenContract,
               catalogIdentifiers: workCallOptions?.catalogIdentifiers,
+              destinationFamily: workCallOptions?.destinationFamily,
               sourceStrategyBinding: workCallOptions?.sourceStrategyBinding,
             })),
             'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
           ].filter(Boolean).join('\n')
         : hostFreshPlanning
-          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search`; search is metadata/schema discovery only and returns exact citable capabilityRef values. Then call `plan_task` first with a brief settled conversational preamble and one compact provider-neutral action draft. It may stand alone. To save one foreground step, it may instead have exactly one sibling after it in the same frame: the proposal-free `work_call` bound to a dependency-root read/compute operation declared in that draft. Never combine plan_task with search, writes, admin/unknown effects, dependent work, or additional calls. The host settles, delivers, and activates the plan before it admits the sibling. After success, plan_task disappears and the proposal-free work_call plus run_worker surfaces remain. Direct conversation and independent read-only answers do not need plan_task.'
+          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search`; search is metadata/schema discovery only and returns exact citable capabilityRef values. If the request is exactly one fully specified, dependency-free, cardinality-once local_write or external_write, emit exactly one proposal-free `work_call` alone after resolution. The host compiles that sole action through the existing durable plan_task kernel; do not author plan prose for it. You still own readiness and all compound judgment: for dependent, multi-action, ambiguous, each/set, admin, destructive, or unknown-effect work, call `plan_task` first with a brief settled conversational preamble and one compact provider-neutral draft. It may stand alone. To save one foreground step, it may instead have exactly one sibling after it in the same frame: the proposal-free `work_call` bound to a dependency-root read/compute operation declared in that draft. Never combine plan_task with search, writes, admin/unknown effects, dependent work, or additional calls. After activation, plan_task disappears and the proposal-free work_call plus run_worker surfaces remain. Direct conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) do not need plan_task.'
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,
     renderCapabilityCandidateCard(options.turnCandidates),
   ].filter(Boolean).join('\n\n');
-  const instructions = harnessInstructions(staticInstructions, {
+  const acceptedActionRubric = carrierWork && rubricChoice.variant === 'lean'
+    ? ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN
+    : rubricChoice.instructions;
+  const instructions = harnessInstructions(acceptedActionRubric, {
     sessionId: options.sessionId ?? undefined,
     focusInput: scopeUserInput || undefined,
+    volatileInstructions,
   });
   const structuralTools = factorySkip
     ? []
@@ -3004,11 +3558,25 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         buildAskUserQuestionTool(),
         runWorkerTool,
       ];
+  // Structural capabilities are constructed here because their exact tool
+  // objects carry orchestration-specific pause/continuation behavior. The
+  // registry may also list one of those names on the orchestrator lane so it
+  // remains discoverable to other catalog consumers; that must not put a
+  // second implementation with the same function name on this Agent. Keep the
+  // structural object authoritative and leave the host runner's general
+  // duplicate-name refusal intact for every other malformed surface.
+  const structuralToolNames = new Set(structuralTools
+    .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+    .filter(Boolean));
+  const nonStructuralDiscovery = firstClassDiscovery.filter((toolRef) => {
+    const name = (toolRef as { name?: string }).name ?? '';
+    return !name || !structuralToolNames.has(name);
+  });
   const assembledTools = [
     ...structuralTools,
     ...(carrierWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
     ...(callTool ? [callTool] : []),
-    ...firstClassDiscovery,
+    ...nonStructuralDiscovery,
   ];
   searchFirstClassCount = assembledTools.length;
   searchFirstClassTokens = Math.round(
@@ -3069,6 +3637,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     }
   }
 
+  const accountQuestionActionExpected = Boolean(
+    actionWork || (hostFreshPlanning && options.acceptedRoute === 'act'),
+  );
+  const accountSelectionRequirements: readonly AccountSelectionRequirement[] =
+    accountQuestionActionExpected && hostFreshPlanning && options.acceptedRoute === 'act'
+      ? (options.turnCandidates?.requirements ?? []).map((requirement) => Object.freeze({
+          roleKey: requirement.roleKey,
+          text: requirement.text,
+          resolved: requirement.resolved,
+        }))
+      : [];
+
   const agent = new Agent<RuntimeContextValue, any>({
     name: 'Clem',
     handoffDescription:
@@ -3109,7 +3689,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       ? (context, toolResults) => userChoiceToolUseBehavior(
           context,
           toolResults as OrchestratorToolResult[],
-          { actionExpectedWork: true },
+          // A host-fresh planning surface is also used for catalog-only and read
+          // turns. Only an action carrier plus an exact host-frozen unresolved
+          // requirement may turn a planning blocker into a host-authored account
+          // question; otherwise the complete result stays with the model.
+          {
+            actionExpectedWork: accountQuestionActionExpected,
+            accountSelectionRequirements,
+          },
         )
       : userChoiceToolUseBehavior,
     // Provider-backed MCP servers are deliberately not attached to the model

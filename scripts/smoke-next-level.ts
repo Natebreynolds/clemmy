@@ -12,6 +12,7 @@ import os from 'node:os';
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-nextlevel-smoke-'));
 process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.HARNESS_TOOL_BRACKETS = 'off';
 
 import assert from 'node:assert/strict';

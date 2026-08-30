@@ -597,24 +597,6 @@ function actionFamiliesFromText(text: string, objective: boolean): ConfirmedActi
   return [...new Set(actions)];
 }
 
-function decisionAuthoritySignature(decision: TurnPreflightDecision): string {
-  return JSON.stringify({
-    phase: decision.phase,
-    consequential: decision.consequential,
-    destination: decision.destination,
-    intentKey: decision.intentKey,
-    confirmedIntentKey: decision.confirmedIntentKey,
-    objective: decision.objective,
-    reason: decision.reason,
-    allowedMutationEffects: [...(decision.allowedMutationEffects ?? [])].sort(),
-    allowedDestinations: [...(decision.allowedDestinations ?? [])].sort(),
-    allowedActionFamilies: [...(decision.allowedActionFamilies ?? [])].sort(),
-    sourceStrategyPosture: decision.sourceStrategyPosture,
-    confirmationDisposition: decision.confirmationDisposition,
-    sourceStrategyBinding: decision.sourceStrategyBinding,
-  });
-}
-
 const MAX_SOURCE_BINDING_TEXT_CHARS = 512;
 const MAX_EQUIVALENT_SOURCE_FALLBACKS = 3;
 
@@ -699,12 +681,190 @@ export function renderSourceStrategyConfirmationContext(value: unknown): string 
   ].join('\n');
 }
 
-function sourceStrategyBindingsEqual(left: unknown, right: unknown): boolean {
+function sourceCapabilityBindingsEqual(
+  left: TurnSourceCapabilityBindingV1,
+  right: TurnSourceCapabilityBindingV1,
+): boolean {
+  return left.capabilityId === right.capabilityId
+    && left.accountIdentity === right.accountIdentity
+    && left.schemaFingerprint === right.schemaFingerprint;
+}
+
+/** Exact structural equality for a selector-authored source binding. This is
+ * deliberately field-wise: object serialization order is not authority. */
+export function sourceStrategyBindingsEqual(left: unknown, right: unknown): boolean {
   if (left === undefined && right === undefined) return true;
   const validatedLeft = validatedTurnSourceStrategyBinding(left);
   const validatedRight = validatedTurnSourceStrategyBinding(right);
-  return Boolean(validatedLeft && validatedRight
-    && JSON.stringify(validatedLeft) === JSON.stringify(validatedRight));
+  if (!validatedLeft || !validatedRight) return false;
+  return validatedLeft.version === validatedRight.version
+    && sourceCapabilityBindingsEqual(validatedLeft.primary, validatedRight.primary)
+    && validatedLeft.equivalentFallbacks.length === validatedRight.equivalentFallbacks.length
+    && validatedLeft.equivalentFallbacks.every((entry, index) =>
+      sourceCapabilityBindingsEqual(entry, validatedRight.equivalentFallbacks[index]!))
+    && validatedLeft.topology === validatedRight.topology
+    && validatedLeft.topologyDigest === validatedRight.topologyDigest
+    && validatedLeft.destination.family === validatedRight.destination.family
+    && validatedLeft.destination.posture === validatedRight.destination.posture
+    && validatedLeft.effect === validatedRight.effect;
+}
+
+function canonicalSourceCapabilityBinding(value: TurnSourceCapabilityBindingV1): {
+  capabilityId: string;
+  accountIdentity?: string;
+  schemaFingerprint?: string;
+} {
+  return {
+    capabilityId: value.capabilityId,
+    ...(value.accountIdentity ? { accountIdentity: value.accountIdentity } : {}),
+    ...(value.schemaFingerprint ? { schemaFingerprint: value.schemaFingerprint } : {}),
+  };
+}
+
+/** Reproduce the selector's content digest from typed fields. JSON is used only
+ * as the canonical byte encoding fed into SHA-256; equality never depends on
+ * caller object layout or serialization order. */
+export function sourceStrategyTopologyDigestFor(value: unknown): string | null {
+  const binding = validatedTurnSourceStrategyBinding(value);
+  if (!binding) return null;
+  return createHash('sha256').update(JSON.stringify({
+    topology: binding.topology,
+    primary: canonicalSourceCapabilityBinding(binding.primary),
+    equivalentFallbacks: binding.equivalentFallbacks.map(canonicalSourceCapabilityBinding),
+    destination: {
+      family: binding.destination.family,
+      posture: binding.destination.posture,
+    },
+    effect: binding.effect,
+  })).digest('hex');
+}
+
+/** A replacement is a fresh source choice for the same task, never a way to
+ * amend its destination or effect contract. Its selector digest must cover the
+ * exact replacement bytes, and its primary must not reuse any A identity. */
+export function materialSourceReplacementBindingIsCompatible(input: {
+  parent: unknown;
+  replacement: unknown;
+}): input is {
+  parent: TurnSourceStrategyBindingV1;
+  replacement: TurnSourceStrategyBindingV1;
+} {
+  const parent = validatedTurnSourceStrategyBinding(input.parent);
+  const replacement = validatedTurnSourceStrategyBinding(input.replacement);
+  if (!parent || !replacement) return false;
+  if ([parent.primary, ...parent.equivalentFallbacks]
+    .some((identity) => sourceCapabilityBindingsEqual(identity, replacement.primary))) return false;
+  if (
+    parent.topology !== replacement.topology
+    || parent.destination.family !== replacement.destination.family
+    || parent.destination.posture !== replacement.destination.posture
+    || parent.effect !== replacement.effect
+    || sourceStrategyTopologyDigestFor(replacement) !== replacement.topologyDigest
+  ) return false;
+  const identities = [replacement.primary, ...replacement.equivalentFallbacks];
+  return identities.every((identity, index) =>
+    identities.findIndex((candidate) => sourceCapabilityBindingsEqual(candidate, identity)) === index);
+}
+
+function equalAuthoritySet(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  const l = [...new Set(left ?? [])].sort();
+  const r = [...new Set(right ?? [])].sort();
+  return l.length === r.length && l.every((entry, index) => entry === r[index]);
+}
+
+/** Complete authority comparison for durable decision readback. */
+export function turnPreflightDecisionsEqual(
+  left: TurnPreflightDecision,
+  right: TurnPreflightDecision,
+): boolean {
+  return left.phase === right.phase
+    && left.consequential === right.consequential
+    && left.destination === right.destination
+    && left.destinationInstanceUnstated === right.destinationInstanceUnstated
+    && left.intentKey === right.intentKey
+    && left.confirmedIntentKey === right.confirmedIntentKey
+    && left.objective === right.objective
+    && equalAuthoritySet(left.allowedMutationEffects, right.allowedMutationEffects)
+    && equalAuthoritySet(left.allowedDestinations, right.allowedDestinations)
+    && equalAuthoritySet(left.allowedActionFamilies, right.allowedActionFamilies)
+    && left.sourceStrategyPosture === right.sourceStrategyPosture
+    && left.confirmationDisposition === right.confirmationDisposition
+    && sourceStrategyBindingsEqual(left.sourceStrategyBinding, right.sourceStrategyBinding)
+    && left.reason === right.reason;
+}
+
+function variantIntentKey(input: {
+  parentIntentKey: string;
+  answer: string;
+  binding: TurnSourceStrategyBindingV1;
+}): string {
+  const hash = createHash('sha256');
+  for (const field of [
+    'material-source-variant-alignment-v1',
+    input.parentIntentKey,
+    input.answer,
+    input.binding.topologyDigest,
+  ]) {
+    hash.update(String(Buffer.byteLength(field, 'utf8'))).update(':').update(field).update('\0');
+  }
+  return hash.digest('hex').slice(0, 20);
+}
+
+/** Rebase an exact A/Q/B source correction onto a second *unconfirmed*
+ * alignment decision. This copies the parent task's authority ceiling and
+ * changes only the selector-authored source binding; it grants no consent. */
+export function materiallyVariantSourceStrategyDecision(input: {
+  parentDecision: TurnPreflightDecision;
+  parentBinding: unknown;
+  replacementBinding: unknown;
+  acceptedAnswer: string;
+}): TurnPreflightDecision | null {
+  const parentBinding = validatedTurnSourceStrategyBinding(input.parentBinding);
+  const replacementBinding = validatedTurnSourceStrategyBinding(input.replacementBinding);
+  const answer = input.acceptedAnswer;
+  if (
+    !parentBinding
+    || !replacementBinding
+    || !answer
+    || input.parentDecision.phase !== 'align'
+    || input.parentDecision.consequential !== true
+    || input.parentDecision.reason !== 'collect_then_construct'
+    || input.parentDecision.sourceStrategyPosture !== 'materially_variant'
+    || input.parentDecision.confirmationDisposition !== 'material_source_strategy'
+    || !input.parentDecision.intentKey
+    || !input.parentDecision.objective?.trim()
+    || !sourceStrategyBindingsEqual(input.parentDecision.sourceStrategyBinding, parentBinding)
+    || !materialSourceReplacementBindingIsCompatible({
+      parent: parentBinding,
+      replacement: replacementBinding,
+    })
+  ) return null;
+  return {
+    phase: 'align',
+    consequential: true,
+    ...(input.parentDecision.destination
+      ? { destination: input.parentDecision.destination }
+      : {}),
+    intentKey: variantIntentKey({
+      parentIntentKey: input.parentDecision.intentKey,
+      answer,
+      binding: replacementBinding,
+    }),
+    objective: input.parentDecision.objective,
+    ...(input.parentDecision.allowedMutationEffects
+      ? { allowedMutationEffects: [...input.parentDecision.allowedMutationEffects] }
+      : {}),
+    ...(input.parentDecision.allowedDestinations
+      ? { allowedDestinations: [...input.parentDecision.allowedDestinations] }
+      : {}),
+    ...(input.parentDecision.allowedActionFamilies
+      ? { allowedActionFamilies: [...input.parentDecision.allowedActionFamilies] }
+      : {}),
+    sourceStrategyPosture: 'materially_variant',
+    confirmationDisposition: 'material_source_strategy',
+    sourceStrategyBinding: replacementBinding,
+    reason: 'collect_then_construct',
+  };
 }
 
 function sourceProviderAlias(capabilityId: string): string | null {
@@ -1320,7 +1480,7 @@ export function recordTurnPreflightDecision(
       if (row.type !== 'turn_preflight_decision') return false;
       const data = row.data as unknown as TurnPreflightDecision & { sourceUserSeq?: number };
       return data.sourceUserSeq === exactSourceUserSeq
-        && decisionAuthoritySignature(data) === decisionAuthoritySignature(decision);
+        && turnPreflightDecisionsEqual(data, decision);
     });
     if (!alreadyRecorded) {
       io.append({

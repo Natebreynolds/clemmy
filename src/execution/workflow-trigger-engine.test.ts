@@ -73,6 +73,16 @@ function writeWorkflow(name: string, frontmatterLines: string[]): void {
   );
 }
 
+function installTestSkill(name: string): void {
+  const dir = path.join(TMP_HOME, 'skills', name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    ['---', `name: ${name}`, `description: represented test capability ${name}`, '---', '', '# Test capability', ''].join('\n'),
+    'utf-8',
+  );
+}
+
 function queuedRuns(): Array<{ workflow: string; inputs?: Record<string, string> }> {
   let files: string[] = [];
   try { files = readdirSync(WORKFLOW_RUNS_DIR).filter((f) => f.endsWith('.json')); } catch { return []; }
@@ -213,6 +223,7 @@ test('malformed durable trigger filters fail closed instead of becoming match-al
 });
 
 test('readiness-blocked receipt stays pending and recovers after the capability is restored', () => {
+  const skill = 'readiness-recovery-skill';
   writeWorkflow('on-readiness-block', [
     'trigger:',
     '  events:',
@@ -220,28 +231,25 @@ test('readiness-blocked receipt stays pending and recovers after the capability 
     'steps:',
     '  - id: merge',
     '    prompt: Merge evidence.',
-    '    deterministic:',
-    '      runner: missing.py',
+    `    uses_skill: ${skill}`,
   ]);
   syncWorkflowTriggerRegistry();
 
   const fired = fireWorkflowSystemEvent('crm.readiness.block', { id: 'B-1' });
   const row = fired.find((r) => r.workflowName === 'on-readiness-block');
   assert.equal(row?.status, 'readiness_blocked');
-  assert.match(row?.message ?? '', /missing\.py/);
+  assert.match(row?.message ?? '', new RegExp(skill));
   assert.equal(queuedRuns().filter((r) => r.workflow === 'on-readiness-block').length, 0);
   const pending = triggerEventRows('on-readiness-block');
   assert.equal(pending.length, 1);
   assert.equal(pending[0].state, 'pending');
   assert.equal(pending[0].run_id, null);
   assert.equal(pending[0].attempt_count, 1);
-  assert.match(pending[0].last_error ?? '', /missing\.py/);
+  assert.match(pending[0].last_error ?? '', new RegExp(skill));
 
   // Restore readiness, simulate a process restart, then recover the durable
   // pending receipt without requiring the provider to redeliver the event.
-  const scriptsDir = path.join(WORKFLOWS_DIR, 'on-readiness-block', 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("{}")\n', 'utf-8');
+  installTestSkill(skill);
   closeWorkflowTriggerDbForTest();
   const recovered = recoverPendingWorkflowTriggerEvents({ force: true });
   assert.equal(recovered.find((result) => result.workflowName === 'on-readiness-block')?.status, 'queued');
@@ -263,8 +271,7 @@ test('replacing a trigger terminally cancels its pending receipts instead of exe
     'steps:',
     '  - id: blocked',
     '    prompt: Handle it.',
-    '    deterministic:',
-    '      runner: missing.py',
+    '    uses_skill: obsolete-trigger-skill',
   ]);
   syncWorkflowTriggerRegistry();
   assert.equal(
@@ -590,14 +597,14 @@ test('webhook fire: disabling a workflow stops delivery without deleting its dur
 });
 
 test('a webhook delivered with no daemon persists a durable receipt that boot recovery drains (never a silent drop)', () => {
+  const skill = 'daemon-down-recovery-skill';
   writeWorkflow('on-daemon-down-hook', [
     'trigger:',
     '  webhookPath: daemon-down-hook',
     'steps:',
     '  - id: merge',
     '    prompt: Merge.',
-    '    deterministic:',
-    '      runner: missing.py',
+    `    uses_skill: ${skill}`,
   ]);
   syncWorkflowTriggerRegistry();
 
@@ -619,9 +626,7 @@ test('a webhook delivered with no daemon persists a durable receipt that boot re
 
   // Boot the daemon: capability present, recovery tick drains the durable
   // receipt without the producer having to redeliver the event.
-  const scriptsDir = path.join(WORKFLOWS_DIR, 'on-daemon-down-hook', 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("{}")\n', 'utf-8');
+  installTestSkill(skill);
   closeWorkflowTriggerDbForTest();
   const recovered = recoverPendingWorkflowTriggerEvents({ force: true });
   assert.equal(recovered.find((r) => r.workflowName === 'on-daemon-down-hook')?.status, 'queued');
@@ -632,6 +637,7 @@ test('a webhook delivered with no daemon persists a durable receipt that boot re
 });
 
 test('a redelivery revives a cancelled receipt instead of black-holing its dedupe slot', () => {
+  const skill = 'revived-trigger-skill';
   const eventTrigger = [
     'trigger:',
     '  events:',
@@ -640,8 +646,7 @@ test('a redelivery revives a cancelled receipt instead of black-holing its dedup
     'steps:',
     '  - id: merge',
     '    prompt: Merge.',
-    '    deterministic:',
-    '      runner: missing.py',
+    `    uses_skill: ${skill}`,
   ];
   writeWorkflow('on-revive', eventTrigger);
   syncWorkflowTriggerRegistry();
@@ -662,9 +667,7 @@ test('a redelivery revives a cancelled receipt instead of black-holing its dedup
   // and its capability. A legitimate redelivery of the same dedupe key must NOT
   // ON CONFLICT DO NOTHING onto the cancelled row and be rejected forever; it
   // revives that receipt to a fresh pending delivery and dispatches once.
-  const scriptsDir = path.join(WORKFLOWS_DIR, 'on-revive', 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(path.join(scriptsDir, 'missing.py'), 'print("{}")\n', 'utf-8');
+  installTestSkill(skill);
   writeWorkflow('on-revive', eventTrigger);
   syncWorkflowTriggerRegistry();
 

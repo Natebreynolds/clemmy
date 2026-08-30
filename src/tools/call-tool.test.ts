@@ -49,6 +49,8 @@ const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shad
 const { closeOperationalTelemetryDb } = await import('../runtime/operational-telemetry.js');
 const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
 const { deriveOrchestratorDiscoveryNames } = await import('./tool-registry.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
 const {
   appendAgentCapabilityBinding,
   bindAgentCapabilityEnvelope,
@@ -58,6 +60,92 @@ const {
 } = await import('../agents/capability-envelope.js');
 
 type ToolLike = { invoke?: (ctx: unknown, input: string, details: unknown) => Promise<unknown> };
+
+type FixtureOperationContract = {
+  operationId: string;
+  effect: 'read' | 'external_write';
+  reversibility?: 'reversible' | 'ordinary_non_destructive' | 'irreversible';
+};
+
+/**
+ * Install the same positive authority production consumes at the effect
+ * boundary: one exact, current, digest-valid manifest per fake provider
+ * operation.  Provider/action spelling remains identity only.  Reads are
+ * authorized by manifest.effect; writes additionally carry the sealed generic
+ * reversibility fact used by execution/approval policy.
+ */
+function installFixtureOperationContracts(
+  contracts: readonly FixtureOperationContract[],
+): () => void {
+  const previous = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+  for (const contract of contracts) {
+    if (contract.effect === 'external_write') {
+      assert.ok(contract.reversibility, `${contract.operationId} must declare reversibility`);
+    }
+    const manifest = capabilityManifests.attachSemanticContract({
+      version: 1,
+      manifestId: `cap:fixture:call-tool:${contract.operationId.toLowerCase()}`,
+      providerKind: 'composio',
+      operationId: contract.operationId,
+      providerIdentity: 'fixture:call-tool:configured-provider',
+      providerVersion: '2026-08-27',
+      operationVersion: '1',
+      definitionFingerprint: 'c'.repeat(64),
+      effect: contract.effect,
+      ...(contract.effect === 'external_write'
+        ? {
+            operationSemantics: {
+              version: 1 as const,
+              reversibility: contract.reversibility!,
+            },
+          }
+        : {}),
+      accountId: 'account:fixture:call-tool',
+      idempotency: contract.effect === 'external_write'
+        ? { required: true, policy: 'key_before_dispatch' }
+        : { required: false, policy: 'none' },
+      reconciliation: contract.effect === 'external_write'
+        ? { supported: true, policy: 'exact_provider_readback' }
+        : { supported: false, policy: 'none' },
+      outputContract: { kind: contract.effect === 'read' ? 'records' : 'provider_acknowledgement' },
+      evidenceContract: {
+        kinds: ['receipt'],
+        readbackRequired: contract.effect === 'external_write',
+      },
+      purpose: contract.effect === 'read' ? 'collect_records' : 'persist_collection',
+      provenance: {
+        issuer: 'call-tool:test-fixture',
+        issuedAt: '2026-08-27T00:00:00.000Z',
+        trusted: true,
+      },
+      lifecycle: { state: 'current' },
+    });
+    const entry = {
+      capabilityId: manifest.manifestId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      effect: manifest.effect,
+      account: manifest.accountId,
+      manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => {
+        throw new Error('fixture catalog invoke must remain unreachable');
+      },
+    };
+    factory.register(entry);
+    assert.equal(
+      capabilityCatalogs.isCurrentCallableCatalogEntry(factory.get(manifest.manifestId)!),
+      true,
+      `${contract.operationId} fixture manifest must be current and callable`,
+    );
+  }
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  return () => capabilityCatalogs.installHostCapabilityCatalogFactory(previous);
+}
 
 /**
  * Production no longer lets a bracketed tool mint settlement authority from a
@@ -477,9 +565,8 @@ test('deferred workflow schemas accept lean nested steps and materialize strict 
     name: 'lean-workflow',
     steps: [{
       id: 'define',
-      deterministic: {
-        runner: 'define.mjs',
-        source: 'process.stdout.write("[]")',
+      call: {
+        tool: 'PROOF_READ',
       },
     }],
   };
@@ -497,11 +584,83 @@ test('deferred workflow schemas accept lean nested steps and materialize strict 
   };
   assert.equal(materialized.steps[0].id, 'define');
   assert.equal(materialized.steps[0].prompt, null);
-  assert.equal(materialized.steps[0].call, null);
-  assert.deepEqual(materialized.steps[0].deterministic, {
-    runner: 'define.mjs',
-    source: 'process.stdout.write("[]")',
+  assert.equal(materialized.steps[0].transform, null);
+  assert.deepEqual(materialized.steps[0].call, {
+    tool: 'PROOF_READ',
+    args: null,
   });
+});
+
+test('deferred workflow call arguments preserve provider-native JSON value types', () => {
+  _resetCallToolSchemaCacheForTest();
+  const create = getLocalToolSchemas().get('workflow_create');
+  assert.ok(create);
+  const liveShaped = {
+    name: 'Read Canary',
+    description: 'One exact structured read.',
+    steps: [{
+      id: 'read_latest',
+      call: {
+        tool: 'PROVIDER_QUERY_RECORDS',
+        args: {
+          user_id: 'operator@example.com',
+          folder: 'inbox',
+          top: 1,
+          select: ['subject', 'receivedDateTime'],
+          orderby: 'receivedDateTime desc',
+        },
+      },
+      sideEffect: 'read',
+      output: {
+        type: 'object',
+        required_keys: ['successful', 'data'],
+        non_empty: ['data', 'data.value'],
+        min_items: { 'data.value': 1 },
+        description: 'One source-backed record.',
+      },
+    }],
+    allowSends: false,
+  };
+
+  const parsed = create!.safeParse(liveShaped);
+  assert.equal(parsed.success, true, parsed.success ? '' : JSON.stringify(parsed.error.issues));
+});
+
+test('resolved local workflow authority keeps the canonical deferred schema', async () => {
+  _resetCallToolSchemaCacheForTest();
+  let targetInputSchema: unknown;
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['workflow_create']),
+    aroundResolvedDispatch: async (input) => {
+      targetInputSchema = input.targetInputSchema;
+      return { successful: true };
+    },
+  }) as unknown as ToolLike;
+  const args = {
+    name: 'Deferred Schema Proof',
+    description: 'Preserve mixed structured-call arguments at every boundary.',
+    steps: [{
+      id: 'read_latest',
+      call: {
+        tool: 'PROVIDER_QUERY_RECORDS',
+        args: { top: 1, select: ['subject', 'receivedDateTime'] },
+      },
+      sideEffect: 'read',
+    }],
+  };
+
+  const output = await invokeCallToolFixture(
+    callTool,
+    'sess-local-deferred-authority',
+    JSON.stringify({ name: 'workflow_create', args_json: JSON.stringify(args) }),
+    'call-local-deferred-authority',
+  );
+  assert.deepEqual(JSON.parse(String(output)), { successful: true });
+  const root = targetInputSchema as any;
+  const callArgs = root.properties.steps.items.properties.call.anyOf[0].properties.args.anyOf[0];
+  assert.equal(typeof callArgs.additionalProperties, 'object');
+  assert.notEqual(callArgs.additionalProperties, false,
+    'the resolved work contract must match the deferred parser, not the lossy first-class projection');
 });
 
 test('materialization survives a nullish (double-anyOf) wrapper around a nested array', async () => {
@@ -628,6 +787,10 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
   _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'sent' }]]),
   );
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'GMAIL_SEND_EMAIL', effect: 'external_write', reversibility: 'irreversible' },
+    { operationId: 'GOOGLESHEETS_VALUES_UPDATE', effect: 'external_write', reversibility: 'reversible' },
+  ]);
   try {
     // NEW CONTRACT (2026-07-09 Lane 2): an IRREVERSIBLE SEND via call_tool is
     // REFUSED — call_tool bypasses the approval card, so sends must go through
@@ -654,6 +817,7 @@ test('gate parity: a mutating inner tool routed through call_tool trips the writ
     ));
     assert.ok(writeOut.startsWith('updated'), 'a reversible write routes through the gated inner tool');
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
     process.env.HARNESS_TOOL_BRACKETS = prev.brackets;
     process.env.CLEMMY_CONFIRM_FIRST = prev.confirm;
@@ -685,6 +849,9 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
     buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
   ) as unknown as ToolLike;
   const counter = new ToolCallsCounter(10);
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'GMAIL_SEND_EMAIL', effect: 'external_write', reversibility: 'irreversible' },
+  ]);
   try {
     const output = String(await withHarnessRunContext(
       { sessionId: sess.id, ...accepted, counter },
@@ -726,6 +893,7 @@ test('a wrapped nested irreversible send gives one pending-action recovery, neve
        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
     `).get(sess.id, accepted.sourceUserSeq, 'nested-send-one-recovery') as { n: number }).n, 0);
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
     if (prev.brackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev.brackets;
@@ -753,6 +921,13 @@ test('carrier target policy allows account-scoped social posts but blocks target
   const wrapped = wrapToolForHarness(
     buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
   ) as unknown as ToolLike;
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'INSTAGRAM_CREATE_POST', effect: 'external_write', reversibility: 'irreversible' },
+    { operationId: 'INSTAGRAM_POST_IG_USER_MEDIA_PUBLISH', effect: 'external_write', reversibility: 'irreversible' },
+    { operationId: 'INSTAGRAM_SEND_DM', effect: 'external_write', reversibility: 'irreversible' },
+    { operationId: 'SLACK_CHAT_POST_MESSAGE', effect: 'external_write', reversibility: 'irreversible' },
+    { operationId: 'GMAIL_SEND_EMAIL', effect: 'external_write', reversibility: 'irreversible' },
+  ]);
   const invoke = (toolSlug: string, args: Record<string, unknown>, callId: string) =>
     withHarnessRunContext(
       { sessionId: session.id, ...accepted, counter },
@@ -845,6 +1020,7 @@ test('carrier target policy allows account-scoped social posts but blocks target
       },
     ]);
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
@@ -961,6 +1137,9 @@ test('unknown, denied, and malformed nested sends validate before any pending-ac
 
 test('a successful dispatch records the reached tool to the session hot-set', async () => {
   _resetHotSetForTest();
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'APIFY_GET_DATASET_ITEMS', effect: 'read' },
+  ]);
   // Fake read inner tool (a read slug → no gate) so dispatch is deterministic.
   _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'ok' }]]),
@@ -974,6 +1153,7 @@ test('a successful dispatch records the reached tool to the session hot-set', as
     assert.equal(String(out), 'ok');
     assert.ok(getHotSet('sess-lru').includes('composio_execute_tool'), 'reached tool is promoted to the hot-set');
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -992,6 +1172,9 @@ test('call_tool canonicalizes object-form Composio arguments before one inner di
   const callTool = buildCallTool({
     reachableBuiltinNames: new Set(['composio_execute_tool']),
   }) as unknown as ToolLike;
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'PROOF_LIST_TASKS', effect: 'read' },
+  ]);
   const invoke = (sessionId: string, carrier: Record<string, unknown>, callId: string) =>
     invokeCallToolFixture(
       callTool,
@@ -1035,6 +1218,7 @@ test('call_tool canonicalizes object-form Composio arguments before one inner di
       'canonicalizing the inner payload must preserve an explicit outer account selector',
     );
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1172,6 +1356,9 @@ test('production run context attributes the inner dispatch without a tool-output
   _setInnerDispatchToolsForTests(
     new Map([['composio_execute_tool', { name: 'composio_execute_tool', invoke: async () => 'rows' }]]),
   );
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'APIFY_GET_DATASET_ITEMS', effect: 'read' },
+  ]);
   try {
     const callTool = buildCallTool() as unknown as ToolLike;
     const out = await withHarnessRunContext(
@@ -1192,6 +1379,7 @@ test('production run context attributes the inner dispatch without a tool-output
     assert.equal(innerCalls.length, 1, 'inner dispatch telemetry stays on the active session');
     assert.ok(getHotSet(sess.id).includes('composio_execute_tool'), 'promotion stays on the active session');
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1205,6 +1393,9 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
   const callTool = buildCallTool({
     reachableBuiltinNames: new Set(['composio_execute_tool']),
   }) as unknown as ToolLike;
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'APIFY_GET_DATASET_ITEMS', effect: 'read' },
+  ]);
   const invoke = () => callTool.invoke!(
     { context: { sessionId: 'sess-shared-counter' } },
     JSON.stringify({
@@ -1225,6 +1416,7 @@ test('nested call_tool dispatch reuses the ambient run counter', async () => {
       },
     );
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1311,6 +1503,9 @@ test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per de
   const wrapped = wrapToolForHarness(
     buildCallTool({ reachableBuiltinNames: new Set(['composio_execute_tool']) }) as never,
   ) as unknown as ToolLike;
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'APIFY_GET_DATASET_ITEMS', effect: 'read' },
+  ]);
   try {
     await withHarnessRunContext(
       { sessionId: 'sess-single-charge', ...accepted, counter },
@@ -1328,6 +1523,7 @@ test('a harness-wrapped call_tool charges the ambient budget exactly ONCE per de
       },
     );
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1425,6 +1621,9 @@ test('a sealed built-in acquisition appends once, reuses its revision, and dispa
 
   let dispatches = 0;
   let admissions = 0;
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'APIFY_GET_DATASET_ITEMS', effect: 'read' },
+  ]);
   _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async () => {
@@ -1461,6 +1660,7 @@ test('a sealed built-in acquisition appends once, reuses its revision, and dispa
     assert.equal(admissions, 2, 'each requested dispatch must cross admission exactly once');
     assert.equal(dispatches, 2, 'each admitted call must dispatch its inner tool exactly once');
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1651,6 +1851,9 @@ test('a proven, connected Composio identifier named as the tool lands on the car
   const accepted = acceptedSourceForCallToolFixture(session.id);
   seedProvenCalendarResolution(session.id, accepted.sourceUserSeq);
   const carrierCalls: string[] = [];
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW', effect: 'read' },
+  ]);
   _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async (_ctx: unknown, raw: string) => {
@@ -1685,6 +1888,7 @@ test('a proven, connected Composio identifier named as the tool lands on the car
     assert.match(carrierCalls[0], /OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW/);
     assert.match(carrierCalls[0], /start_date_time/, "the model's arguments ride the carrier envelope");
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1730,6 +1934,9 @@ test('an exact bound source slug reaches the shared Composio carrier without gen
   const exactSlug = 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET';
   const fallbackSlug = 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS';
   const carrierCalls: string[] = [];
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId: exactSlug, effect: 'read' },
+  ]);
   _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
     name: 'composio_execute_tool',
     invoke: async (_ctx: unknown, raw: string) => {
@@ -1784,6 +1991,7 @@ test('an exact bound source slug reaches the shared Composio carrier without gen
     assert.match(typo.detail, /do not rediscover or switch provider families/i);
     assert.equal(carrierCalls.length, 1, 'the typo has zero carrier dispatches');
   } finally {
+    restoreCatalog();
     _setInnerDispatchToolsForTests(null);
   }
 });
@@ -1861,5 +2069,88 @@ test('control-only dispatcher admits registry-declared READS and still refuses b
     assert.deepEqual(dispatched, [], 'the refused write never reaches its tool');
   } finally {
     _setInnerDispatchToolsForTests(null);
+  }
+});
+
+test('a unique current catalog live-read is reachable as an inner work_call target without being a builtin', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
+  const operationId = 'reviewed_cli_live_read_fixture';
+  const previousFactory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:fixture:reviewed-cli:${operationId}`,
+    providerKind: 'reviewed_cli',
+    operationId,
+    providerIdentity: '/usr/bin/fixture-cli',
+    providerVersion: 'fixture-v1',
+    operationVersion: '1',
+    definitionFingerprint: 'd'.repeat(64),
+    effect: 'read',
+    accountId: 'reviewed_cli:host',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    purpose: 'collect_records',
+    provenance: {
+      issuer: 'call-tool:reviewed-cli-fixture',
+      issuedAt: '2026-08-29T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+  });
+  factory.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => {
+      throw new Error('catalog entry invoke is not the production port');
+    },
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  const ports = await import('../runtime/harness/production-capability-ports.js');
+  const identity = ports.productionPortIdentityFromManifest(manifest);
+  let invokedPayload: unknown;
+  const registered = ports.registerFixtureCapabilityPort(identity, {
+    invoke: async (input) => {
+      invokedPayload = input.payload;
+      return { status: 'exited', records: 2 };
+    },
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  try {
+    const callTool = buildCallTool({
+      reachableBuiltinNames: new Set(['work_call']),
+    }) as unknown as ToolLike;
+    const out = await withHarnessRunContext(
+      { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
+      () => withToolOutputContext(
+        { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, callId: 'call-catalog-read', toolName: 'work_call' },
+        () => callTool.invoke!(
+          { context: { sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn } },
+          JSON.stringify({
+            name: operationId,
+            args_json: JSON.stringify({ query: 'SELECT Id FROM Opportunity' }),
+          }),
+          { toolCall: { callId: 'call-catalog-read' } },
+        ) as Promise<unknown>,
+      ),
+    );
+    assert.doesNotMatch(String(out), /not_reachable/, String(out));
+    assert.deepEqual(invokedPayload, { query: 'SELECT Id FROM Opportunity' });
+    assert.deepEqual(JSON.parse(String(out)), { status: 'exited', records: 2 });
+  } finally {
+    ports.clearProductionCapabilityPorts();
+    capabilityCatalogs.installHostCapabilityCatalogFactory(previousFactory);
   }
 });

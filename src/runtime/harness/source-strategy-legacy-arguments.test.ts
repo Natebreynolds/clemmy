@@ -28,11 +28,19 @@ const logicalContracts = await import('./logical-call-contract.js');
 const sourceAdmission = await import('./source-strategy-admission.js');
 const continuityRuntime = await import('./task-continuity-runtime.js');
 const turnControl = await import('./turn-control.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { recordAcceptedSourceGraph } = await import('./record-accepted-source-graph.js');
 
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'SOURCECO_GET_ITEMS',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
+
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
   if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;

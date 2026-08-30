@@ -24,6 +24,9 @@ const definitions = await import('./workflow-run-definition.js');
 const validator = await import('./workflow-validator.js');
 const workflowGraph = await import('./workflow-graph.js');
 const workflowStore = await import('../memory/workflow-store.js');
+const workflowEvents = await import('./workflow-events.js');
+const workflowQueue = await import('../tools/workflow-run-queue.js');
+const composioSchemas = await import('../tools/composio-schema-cache.js');
 
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
 import type { WorkflowNodeInvocationEffectV1 } from '../memory/workflow-node-invocation-plan.js';
@@ -164,13 +167,18 @@ function fixture(label: string, effect: WorkflowNodeInvocationEffectV1 = 'host_o
 function bareFixture(
   label: string,
   effect: WorkflowNodeInvocationEffectV1 = 'external_write',
-  opts?: { requiresApproval?: boolean },
+  opts?: {
+    requiresApproval?: boolean;
+    operationId?: string;
+    providerResult?: unknown;
+    providerErrorAfterBody?: string;
+  },
 ) {
   const manifest = manifests.attachSemanticContract({
     version: 1,
     manifestId: `manifest.${label}`,
     providerKind: 'local_registry',
-    operationId: `operation.${label}`,
+    operationId: opts?.operationId ?? `operation.${label}`,
     providerIdentity: `runtime.${label}`,
     providerVersion: 'runtime.1',
     operationVersion: '1',
@@ -190,17 +198,20 @@ function bareFixture(
     advisoryRoles: ['write'],
   });
   let bodies = 0;
+  const providerArgs: Array<Record<string, unknown>> = [];
   assert.equal(ports.registerFixtureCapabilityPort(
     ports.productionPortIdentityFromManifest(manifest),
     {
-      invoke: async () => {
+      invoke: async (input) => {
         bodies += 1;
+        providerArgs.push(structuredClone(input.binding.args));
+        if (opts?.providerErrorAfterBody) throw new Error(opts.providerErrorAfterBody);
         // compileWorkflowBareCallInvocationPlan hardcodes evidencePaths:
         // ['data'] (the composio-shaped {data: ...} convention
         // acquireWorkflowReadOnlyOperationAuthority's own plans use), unlike
         // fixture()'s plan-carrying manifest above which declares its own
         // evidence contract over 'records'.
-        return { data: { id: label } };
+        return structuredClone(opts?.providerResult ?? { data: { id: label } });
       },
     },
   ).ok, true);
@@ -263,7 +274,7 @@ function bareFixture(
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof runner.executeStep>[1];
-  return { manifest, step, workflow, ctx, bodies: () => bodies };
+  return { manifest, step, workflow, ctx, bodies: () => bodies, providerArgs };
 }
 
 type InstalledFixture = ReturnType<typeof fixture>;
@@ -323,6 +334,7 @@ test.afterEach(() => {
   observations.clearIndependentCapabilityObservations();
   ports.clearProductionCapabilityPorts();
   kernel.setWorkflowCallKernelCrashPointForTests(null);
+  composioSchemas.resetToolSchemaCache();
 });
 
 test('production structured host-safe call enters one exact v3 activation and replays one body', async () => {
@@ -389,9 +401,8 @@ test('exact call+plan validates, survives persistence/graph compilation, and exe
   assert.equal(installed.bodies(), 1);
 
   // Dropping the invocationPlan no longer refuses the step outright: it
-  // downgrades from an exact v3 call to a bare call, which is its own valid,
-  // gated dispatch lane (60db67d8 required an invocationPlan on every call;
-  // restored — see executeWorkflowBareCallNode in workflow-runner.ts).
+  // downgrades from a persisted exact plan to a bare call. Runtime compiles a
+  // fresh exact plan from the live catalog, then uses the same v3 kernel.
   const missingPlan = structuredClone(installed.workflow);
   delete missingPlan.steps[0].invocationPlan;
   const missingValidation = validator.validateWorkflowDefinition(missingPlan);
@@ -495,11 +506,11 @@ test('dropped-invocationPlan call converges (compiled from the live catalog) and
   const legacy = fixture('legacy-refused');
   delete legacy.step.invocationPlan;
   // Dropping the invocationPlan makes this a bare call. It used to dispatch
-  // through the ordinary gated composio gateway (executeWorkflowBareCallNode)
-  // and refuse there for lack of a real composio connection, minting a
+  // through a separate gateway and refuse there for lack of a real composio
+  // connection, minting a
   // FABRICATED user_input_received turn on the way (pre-2026-08-26
   // convergence). Now it compiles its own invocation plan from the live
-  // catalog at execution (compileWorkflowBareCallInvocationPlan) and rides
+  // catalog at execution (compileLiveCatalogWorkflowCallPlan) and rides
   // the exact same kernel a plan-carrying call uses — this fixture's
   // operation IS registered (fixture() installs it), so it DISPATCHES for
   // real, with the kernel's own real activation lineage and no chat turn.
@@ -520,6 +531,30 @@ test('dropped-invocationPlan call converges (compiled from the live catalog) and
   assert.equal((eventlog.openEventLog().prepare(`
     SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?
   `).get(exactSessionId(invalid)) as { n: number }).n, 0);
+});
+
+test('bare call refuses live effect escalation before consent, activation, or provider I/O', async () => {
+  const installed = bareFixture('bare-effect-escalation', 'external_write');
+  installed.step.sideEffect = 'read';
+
+  await assert.rejects(
+    runner.executeStep(installed.step, installed.ctx),
+    (error: unknown) => error instanceof runner.WorkflowHarnessBlockedSignal
+      // Matches the REASON, not one wording of it: an authored read that
+      // resolves to a live write must be refused as an escalation. The gate was
+      // narrowed to refuse escalation ONLY (a live effect smaller than declared
+      // is safer than what was approved), so the message names escalation
+      // explicitly and no longer conflates it with 'drift'.
+      && /escalation refused/i.test(error.reason)
+      && /MORE effect than was declared/i.test(error.reason),
+  );
+  assert.equal(installed.bodies(), 0);
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS n FROM workflow_node_invocation_activations WHERE session_id = ?
+  `).get(sessionId) as { n: number }).n, 0);
+  assert.equal(approvals.listPending({ sessionId, status: 'any' }).length, 0);
 });
 
 test('call-vs-plan and rendered-args drift refuse before any body', async () => {
@@ -643,6 +678,8 @@ test('claimed external write restart holds for reconciliation and never blind-re
 
 test('structured call source contains no direct Composio dispatch or synthetic identity fallback', () => {
   const source = readFileSync(path.join(process.cwd(), 'src/execution/workflow-runner.ts'), 'utf8');
+  assert.doesNotMatch(source, /async function executeWorkflowBareCallNode\(/);
+  assert.doesNotMatch(source, /async function ensureWorkflowCallIdentity\(/);
   const start = source.indexOf('async function executeWorkflowCallNode(');
   const end = source.indexOf('/** Redeem every exact scheduled-send projection', start);
   assert.ok(start >= 0 && end > start);
@@ -661,10 +698,30 @@ test('structured call source contains no direct Composio dispatch or synthetic i
 // reads) and then rides the identical executeExactWorkflowV3CallNode path a
 // plan-carrying step has always used. No chat turn is minted for this lane.
 
-test('BARE CALL CONVERGENCE — the owner\'s shape (autonomous bare write) compiles at execution, dispatches through the one v3 kernel, and mints no synthetic user turn', async () => {
+test('BARE CALL CONSENT — an ungated bare mutation waits on one exact v3 approval, then executes once and replays without a second body', async () => {
   const installed = bareFixture('bare-owner-write', 'external_write');
   const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
 
+  let parked: unknown;
+  try {
+    await runner.executeStep(installed.step, installed.ctx);
+  } catch (error) {
+    parked = error;
+  }
+  assert.ok(parked instanceof runner.ParkRunSignal, String(parked));
+  assert.equal(installed.bodies(), 0, 'no provider body runs before exact human consent');
+
+  const pending = approvals.listPending({ sessionId, status: 'pending' });
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].tool, 'workflow_v3_call');
+  assert.equal(pending[0].args?.operationId, installed.manifest.operationId);
+  assert.equal(pending[0].args?.accountId, installed.manifest.accountId);
+  assert.equal(pending[0].args?.effect, 'external_write');
+  assert.equal(pending[0].resolution, null);
+  assert.equal(pending[0].resolver, null);
+
+  const approved = approvals.resolve(pending[0].approvalId, 'approved', 'runner-v3-integration-test');
+  assert.equal(approved.ok, true, JSON.stringify(approved));
   const result = await runner.executeStep(installed.step, installed.ctx);
   assert.deepEqual(result, { data: { id: 'bare-owner-write' } });
   assert.equal(installed.bodies(), 1);
@@ -682,18 +739,13 @@ test('BARE CALL CONVERGENCE — the owner\'s shape (autonomous bare write) compi
     SELECT COUNT(*) AS n FROM workflow_node_invocation_activations WHERE session_id = ?
   `).get(sessionId) as { n: number }).n, 1);
 
-  // The autonomous grant is real and auditable: a genuinely resolved
-  // pending_approvals row — armWorkflowV3CallAuthority only ever consumes
-  // one of these (consumeOneShotActivationAuthorizationInTransaction) — and
-  // it is resolved by the runtime under a named, disclosed policy, never a
-  // human decision fabricated on their behalf. This preserves the restored
-  // lane's own "autonomous by default unless requiresApproval" policy
-  // instead of newly demanding a human approval the owner's live scheduled
-  // write never needed.
+  // The exact grant is the human-resolved row above. Merely compiling a saved
+  // workflow call is not user/workflow activation authority, so this lane must
+  // never manufacture `system:workflow-autonomous_default_mutation` consent.
   const grants = approvals.listPending({ sessionId, status: 'any' });
   assert.equal(grants.length, 1);
   assert.equal(grants[0].resolution, 'approved');
-  assert.equal(grants[0].resolver, 'system:workflow-autonomous_default_mutation');
+  assert.equal(grants[0].resolver, 'runner-v3-integration-test');
   assert.ok(grants[0].consumedAt);
 
   // Replays without a second body, exactly like a plan-carrying call.
@@ -702,14 +754,284 @@ test('BARE CALL CONVERGENCE — the owner\'s shape (autonomous bare write) compi
   assert.equal(installed.bodies(), 1, 'settled exact result replays without a second body');
 });
 
+test('BARE CALL RECOVERY — a mutating body that commits then loses its response is reconciliation-held and never redispatched', async () => {
+  const installed = bareFixture('bare-lost-response', 'external_write', {
+    providerErrorAfterBody: 'response channel closed after provider commit',
+  });
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+
+  await assert.rejects(
+    runner.executeStep(installed.step, installed.ctx),
+    (error: unknown) => error instanceof runner.ParkRunSignal,
+  );
+  const pending = approvals.listPending({ sessionId, status: 'pending' });
+  assert.equal(pending.length, 1);
+  assert.equal(approvals.resolve(pending[0]!.approvalId, 'approved', 'runner-v3-integration-test').ok, true);
+
+  await assert.rejects(
+    runner.executeStep(installed.step, installed.ctx),
+    (error: unknown) => error instanceof runner.WorkflowHarnessHeldSignal
+      && error.state.hold.wake === 'recovery'
+      && error.state.sourceStatus === 'dispatched',
+  );
+  assert.equal(installed.bodies(), 1, 'the unacknowledged mutation body crossed once');
+
+  const db = eventlog.openEventLog();
+  const durable = db.prepare(`
+    SELECT settlement.outcome_kind,
+           settlement.requires_reconciliation,
+           authority.state AS authority_state,
+           physical.state AS physical_state
+      FROM workflow_node_invocation_activations activation
+      JOIN accepted_turn_call_authorities authority
+        ON authority.workflow_activation_id = activation.activation_id
+      JOIN logical_call_settlements settlement
+        ON settlement.session_id = activation.session_id
+       AND settlement.source_user_seq = activation.source_event_seq
+       AND settlement.logical_tool_call_id = activation.logical_call_id
+      JOIN physical_dispatches physical
+        ON physical.session_id = activation.session_id
+       AND physical.source_user_seq = activation.source_event_seq
+       AND physical.logical_tool_call_id = activation.logical_call_id
+       AND physical.relation != 'probe'
+     WHERE activation.session_id = ?
+  `).get(sessionId) as Record<string, unknown>;
+  assert.equal(durable.outcome_kind, 'uncertain_write');
+  assert.equal(durable.requires_reconciliation, 1);
+  assert.equal(durable.authority_state, 'open', 'recovery authority remains open');
+  assert.equal(durable.physical_state, 'threw');
+
+  eventlog.closeEventLog();
+  await assert.rejects(
+    runner.executeStep(installed.step, installed.ctx),
+    (error: unknown) => error instanceof runner.WorkflowHarnessHeldSignal
+      && error.state.hold.wake === 'recovery',
+  );
+  assert.equal(installed.bodies(), 1, 'durable reentry never repeats the provider mutation');
+});
+
+test('BARE CALL CONSENT — a durable queue source string is presentation metadata, not mutation authority', async () => {
+  const installed = bareFixture('bare-source-string-nonauthority', 'external_write');
+  installed.workflow.enabled = true;
+  workflowStore.writeWorkflow(installed.workflow.name, installed.workflow);
+  const queued = workflowQueue.queueWorkflowRun(
+    installed.workflow.name,
+    installed.ctx.inputs,
+    { source: 'mobile', dedupe: false },
+  );
+  assert.equal(queued.status, 'queued', queued.message);
+  assert.ok(queued.id);
+  installed.ctx.runId = queued.id!;
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+
+  let parked: unknown;
+  try {
+    await runner.executeStep(installed.step, installed.ctx);
+  } catch (error) {
+    parked = error;
+  }
+  assert.ok(parked instanceof runner.ParkRunSignal, String(parked));
+  assert.equal(installed.bodies(), 0);
+  const pending = approvals.listPending({ sessionId, status: 'pending' });
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].resolution, null);
+  assert.equal(pending[0].resolver, null);
+  assert.equal(
+    approvals.listPending({ sessionId, status: 'any' })
+      .some((row) => row.resolver === 'system:workflow-autonomous_default_mutation'),
+    false,
+  );
+});
+
+test('BARE CALL CONSENT — exact scheduled-send authority still crosses once and settled replay adds zero bodies', async () => {
+  const providerResult = { data: { receipt_id: 'raw-provider-only' } };
+  const installed = bareFixture('bare-exact-scheduled-send', 'external_write', {
+    operationId: 'CHATCO_SEND_MESSAGE',
+    providerResult,
+  });
+  installed.step.sideEffect = 'send';
+  installed.step.call!.args = {
+    destination: 'fixed-destination',
+    body: 'Fixed scheduled payload.',
+  };
+  installed.step.output = {
+    type: 'object',
+    required_keys: ['providerResult', 'callEvidence'],
+    non_empty: [
+      'providerResult.kind',
+      'providerResult.resultId',
+      'providerResult.digest',
+      'callEvidence.evidenceId',
+      'callEvidence.mutationReceiptId',
+      'callEvidence.canonicalTool',
+      'callEvidence.kind',
+      'callEvidence.status',
+      'callEvidence.dispatchSchemaFingerprint',
+      'callEvidence.expectedArgsDigest',
+      'callEvidence.providerReadyArgsDigest',
+      'callEvidence.providerResultDigest',
+      'callEvidence.payloadDigest',
+      'callEvidence.target.digest',
+    ],
+  };
+  installed.workflow.enabled = true;
+  installed.workflow.allowSends = true;
+  installed.workflow.trigger = { schedule: '0 9 * * 1-5', timezone: 'UTC' };
+  installed.workflow.inputs = {};
+  installed.workflow.steps = [installed.step];
+  installed.ctx.inputs = {};
+
+  composioSchemas.rememberToolSchema('CHATCO_SEND_MESSAGE', {
+    type: 'object',
+    required: ['destination', 'body'],
+    properties: {
+      destination: { type: 'string' },
+      body: { type: 'string' },
+    },
+  }, Date.now());
+  const persisted = workflowStore.writeWorkflow(installed.workflow.name, installed.workflow);
+  installed.ctx.workflow = persisted.data;
+  installed.ctx.workflowSlug = persisted.name;
+  const occurrenceAtMs = 1_785_000_720_000;
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    source: 'schedule',
+    workflowSlug: persisted.name,
+    triggerReceiptId: `workflow-schedule:v1:${persisted.name}:${occurrenceAtMs}`,
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  assert.ok(queued.id);
+  installed.ctx.runId = queued.id!;
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+
+  const result = await runner.executeStep(installed.step, installed.ctx) as {
+    providerResult: { kind: string; resultId: string; digest: string };
+    callEvidence: { kind: string; mutationReceiptId: string; providerResultDigest: string };
+  };
+  assert.equal(result.providerResult.kind, 'workflow_call_provider_result');
+  assert.match(result.providerResult.resultId, /^workflow-call-result:v1:[a-f0-9]{64}$/);
+  assert.equal(result.providerResult.digest, result.callEvidence.providerResultDigest);
+  assert.equal(result.callEvidence.kind, 'workflow_call_commit');
+  assert.match(result.callEvidence.mutationReceiptId, /^workflow-v3-call:v1:[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(result).includes('raw-provider-only'), false);
+  assert.equal(installed.bodies(), 1);
+  const grants = approvals.listPending({ sessionId, status: 'any' });
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0].resolver, 'system:workflow-scheduled_send_authority');
+  assert.ok(grants[0].consumedAt);
+
+  const replay = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(replay, result);
+  assert.equal(installed.bodies(), 1, 'the exact scheduled occurrence replays its settlement');
+});
+
 test('BARE CALL CONVERGENCE — a bare read compiles and executes through the shared kernel with zero consent friction', async () => {
-  const installed = bareFixture('bare-read', 'read');
+  // GET is affirmative read evidence; a slug ending in READ is deliberately
+  // treated as a possible state mutation (for example MARK_AS_READ).
+  const installed = bareFixture('get-bare-records', 'read');
   const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
   const result = await runner.executeStep(installed.step, installed.ctx);
-  assert.deepEqual(result, { data: { id: 'bare-read' } });
+  assert.deepEqual(result, { data: { id: 'get-bare-records' } });
   assert.equal(installed.bodies(), 1);
   assert.equal(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
   assert.equal(approvals.listPending({ sessionId, status: 'any' }).length, 0, 'a read needs no consent grant, autonomous or otherwise');
+});
+
+test('BARE CALL CONVERGENCE — forEach reads own distinct ordinal-bound v3 occurrences and replay zero provider bodies', async () => {
+  const installed = bareFixture('get-partitioned-records', 'read');
+  installed.step.forEach = 'source';
+  installed.step.dependsOn = ['source'];
+  installed.step.call!.args = { scope: '{{item.scope}}' };
+  installed.ctx.stepOutputs = {
+    source: [
+      { id: 'shared-display-key', scope: 'north' },
+      { id: 'shared-display-key', scope: 'south' },
+    ],
+  };
+
+  const first = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(
+    installed.providerArgs.map((args) => args.scope).sort(),
+    ['north', 'south'],
+  );
+  assert.equal(installed.bodies(), 2);
+  assert.equal(Array.isArray(first), true);
+
+  const db = eventlog.openEventLog();
+  const occurrences = db.prepare(`
+    SELECT session_id, run_occurrence_id, node_id, node_attempt, logical_call_id
+      FROM workflow_node_invocation_activations
+     WHERE workflow_id = ? AND run_id = ?
+     ORDER BY node_id
+  `).all(installed.ctx.workflowSlug, installed.ctx.runId) as Array<Record<string, unknown>>;
+  assert.equal(occurrences.length, 2);
+  assert.equal(new Set(occurrences.map((row) => row.session_id)).size, 2);
+  assert.equal(new Set(occurrences.map((row) => row.node_id)).size, 2);
+  assert.equal(new Set(occurrences.map((row) => row.logical_call_id)).size, 2);
+  assert.deepEqual(new Set(occurrences.map((row) => row.run_occurrence_id)), new Set([installed.ctx.runId]));
+  assert.deepEqual(new Set(occurrences.map((row) => row.node_attempt)), new Set([1]));
+  for (const occurrence of occurrences) {
+    assert.equal(
+      eventlog.listEvents(String(occurrence.session_id), { types: ['user_input_received'] }).length,
+      0,
+      'a partition is a host-derived workflow occurrence, not a fabricated chat turn',
+    );
+  }
+
+  eventlog.closeEventLog();
+  const durableResume = workflowEvents.computeResumeState(
+    installed.ctx.workflowSlug,
+    installed.ctx.runId,
+  );
+  installed.ctx.completedItems = durableResume.completedItems.get(installed.step.id) ?? new Map();
+  assert.equal(installed.ctx.completedItems.size, 2, 'duplicate display keys retain two durable partition completions');
+  const replay = await runner.executeStep(installed.step, installed.ctx);
+  assert.deepEqual(replay, first);
+  assert.equal(installed.bodies(), 2, 'both settled partitions replay after the durable store is reopened');
+});
+
+test('BARE CALL CONVERGENCE — a logically settled forEach read resumes after restart without another provider body', async () => {
+  const installed = bareFixture('get-partition-crash-replay', 'read');
+  installed.step.forEach = 'source';
+  installed.step.dependsOn = ['source'];
+  installed.step.call!.args = { scope: '{{item.scope}}' };
+  installed.ctx.stepOutputs = { source: [{ id: 'one', scope: 'only' }] };
+
+  kernel.setWorkflowCallKernelCrashPointForTests('after_logical_settlement');
+  const interrupted = await runner.executeStep(installed.step, installed.ctx) as {
+    blocked?: unknown;
+    failed_items?: Array<{ error?: unknown }>;
+  };
+  assert.equal(interrupted.blocked, true);
+  assert.match(String(interrupted.failed_items?.[0]?.error), /after_logical_settlement/);
+  assert.equal(installed.bodies(), 1);
+
+  eventlog.closeEventLog();
+  const resumed = await runner.executeStep(installed.step, installed.ctx);
+  assert.equal(Array.isArray(resumed), true);
+  assert.equal(installed.bodies(), 1, 'restart reuses the exact logical settlement for this partition');
+});
+
+test('BARE CALL CONSENT — requiresApproval without a declarative gate refuses before grant, activation, or provider body', async () => {
+  const installed = bareFixture('bare-approval-ungated', 'external_write', { requiresApproval: true });
+  installed.step.sideEffect = 'send';
+  const sessionId = `workflow:${installed.ctx.runId}:${installed.step.id}`;
+  assert.equal(
+    runner.workflowRunnerInternalsForTest.shouldUseDeclarativeStepApproval(installed.workflow, installed.step),
+    false,
+    'fixture must exercise the missing-gate branch rather than a rejected human decision',
+  );
+
+  await assert.rejects(
+    runner.executeStep(installed.step, installed.ctx),
+    (error: unknown) => error instanceof runner.WorkflowHarnessBlockedSignal
+      && /requires_approval_gate_missing/.test(error.reason),
+  );
+  assert.equal(installed.bodies(), 0);
+  assert.equal(approvals.listPending({ sessionId, status: 'any' }).length, 0);
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM workflow_node_invocation_activations WHERE session_id = ?
+  `).get(sessionId) as { n: number }).n, 0);
 });
 
 test('BARE CALL CONVERGENCE — a bare call requiring approval is gated once by the runner\'s existing declarative gate, then dispatches with no second v3 prompt', async () => {

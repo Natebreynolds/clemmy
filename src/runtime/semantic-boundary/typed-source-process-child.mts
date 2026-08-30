@@ -1,7 +1,6 @@
 /** Child worker for process-level typed-source recovery tests. */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { Agent } from '@openai/agents';
 
 const HOME = process.argv[2];
 const command = process.argv[3] ?? 'run';
@@ -60,8 +59,9 @@ const FIVE = [
 ];
 
 const { appendEvent, createSession, resetEventLog, listEvents } = await import('../harness/eventlog.js');
-const { runConversation } = await import('../harness/loop.js');
 const { installTurnSemanticModelPort } = await import('./turn-semantic-port-registry.js');
+const { admitAndCompileAcceptedSource } = await import('./admit-and-compile-accepted-source.js');
+const { dispatchAdmittedSource } = await import('./typed-source-dispatch.js');
 const { catalogFromConstructProviders } = await import('../harness/construct-provider-catalog.fixture.js');
 const { entailedPlanGroundingJudge, fakeSemanticProposal } = await import('./fake-semantic-model.js');
 const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
@@ -173,14 +173,23 @@ catalogFromConstructProviders({
 const sourceSeq = existsSync(path.join(HOME, 'source-seq'))
   ? Number(readFileSync(path.join(HOME, 'source-seq'), 'utf8'))
   : undefined;
-const result = await runConversation({
-  sessionId,
-  input: 'find five widgets and put them in a workbook',
-  ...(Number.isSafeInteger(sourceSeq) && sourceSeq! > 0
-    ? { sourceUserSeq: sourceSeq, reuseRecordedUserInput: true }
-    : {}),
-  agent: new Agent({ name: 'process-child', instructions: 'unused', tools: [] }),
-});
+if (!Number.isSafeInteger(sourceSeq) || sourceSeq! <= 0) {
+  throw new Error('accepted source identity is missing');
+}
+const identity = { sessionId, sourceUserSeq: sourceSeq!, turn: 1 };
+const admitted = await admitAndCompileAcceptedSource({ identity, surface: 'direct' });
+const dispatched = admitted.ok
+  ? await dispatchAdmittedSource(identity)
+  : { kind: 'blocked' as const, text: admitted.reason };
+const result = dispatched.kind === 'typed'
+  ? dispatched.result
+  : dispatched.kind === 'blocked'
+    ? { status: 'blocked' as const, error: dispatched.text }
+    : dispatched.kind === 'needs_input'
+      ? { status: 'blocked' as const, error: dispatched.text }
+      : dispatched.kind === 'held'
+        ? { status: 'blocked' as const, error: dispatched.hold.reason }
+        : { status: 'failed' as const, error: 'typed executor did not accept the persisted graph' };
 const store = loadStore();
 const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
 writeFileSync(resultPath, JSON.stringify({

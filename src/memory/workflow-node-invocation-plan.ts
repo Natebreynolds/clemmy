@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 import {
   parseWorkflowCanonicalEntityResultProjection,
-  type WorkflowCanonicalEntityResultProjectionV1,
+  type WorkflowCanonicalEntityResultProjection,
 } from './workflow-result-projection-contract.js';
 
 /**
@@ -170,7 +170,7 @@ export interface WorkflowNodeInvocationPlanV1 {
   continuation: WorkflowNodeContinuationContractV1;
   /** Optional, separately reviewed interpretation of retained read bytes as
    * canonical entity observations. Absence preserves ordinary read behavior. */
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   bindingDigest: string;
 }
 

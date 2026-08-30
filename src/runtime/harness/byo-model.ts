@@ -237,6 +237,45 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
 
 type CreateFn = (params: Record<string, unknown>, options?: unknown) => Promise<unknown>;
 
+export interface WrapCompletionsCreateOptions {
+  /**
+   * Interactive (non-structured) streams stay SSE on the wire. Default false:
+   * MiniMax-class backends still buffer a full completion and emit one
+   * synthetic chunk so reasoning lift + JSON repair can run.
+   */
+  nativeChatCompletionsStream?: boolean;
+}
+
+/**
+ * xAI and GLM (Z.ai) chat-completions stream cleanly. MiniMax M3 does not —
+ * that is why the adapter historically forced stream:false for every BYO
+ * brain, which made Grok's first token equal the whole answer (live
+ * 2026-08-28 calendar: 17s / 70s of silence, then first-content-timeout).
+ * GLM was collateral of that MiniMax floor: thinking after tools is a
+ * multi-minute buffered HTTP call, so the BYO first-content budget aborted
+ * a still-working request and the rescue brain inherited a half-built
+ * tool loop (live 2026-08-29: "Something went wrong on that turn").
+ * Host match is the authority; the label is a fallback for a mis-copied URL.
+ */
+export function byoBackendStreamsChatCompletions(input: {
+  baseURL?: string;
+  providerLabel?: string;
+}): boolean {
+  const label = (input.providerLabel ?? '').trim().toLowerCase();
+  if (/(?:^|[^a-z])(?:xai|grok)(?:$|[^a-z])/i.test(label)) return true;
+  if (/(?:^|[^a-z])(?:glm|zhipu)(?:$|[^a-z])/i.test(label)) return true;
+  if (label.includes('z.ai')) return true;
+  const raw = (input.baseURL ?? '').trim();
+  if (!raw) return false;
+  try {
+    const host = new URL(raw.includes('://') ? raw : `https://${raw}`).hostname.toLowerCase();
+    return host === 'api.x.ai' || host.endsWith('.x.ai')
+      || host === 'api.z.ai' || host.endsWith('.z.ai');
+  } catch {
+    return false;
+  }
+}
+
 interface CompatCompletion {
   id?: string;
   created?: number;
@@ -353,6 +392,38 @@ export function liftReasoning(completion: CompatCompletion): void {
     }
   }
   if (reasoning) msg.reasoning = reasoning;
+}
+
+/** Same lift, per SSE chunk: GLM/Z.ai thinking arrives as `reasoning_content`
+ *  deltas. Without copying that onto `reasoning`, the SDK (and the fallover
+ *  first-content fence) treats a still-thinking stream as silence. */
+export function liftReasoningChunk(chunk: unknown): unknown {
+  if (!chunk || typeof chunk !== 'object') return chunk;
+  const choices = (chunk as { choices?: unknown }).choices;
+  if (!Array.isArray(choices)) return chunk;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const delta = (choice as { delta?: Record<string, unknown> }).delta;
+    if (!delta || typeof delta !== 'object') continue;
+    if (typeof delta.reasoning === 'string' && delta.reasoning) continue;
+    const reasoningContent = delta.reasoning_content;
+    if (typeof reasoningContent === 'string' && reasoningContent) {
+      delta.reasoning = reasoningContent;
+    }
+  }
+  return chunk;
+}
+
+async function liftReasoningStream(stream: unknown): Promise<unknown> {
+  if (!stream || typeof stream !== 'object' || !(Symbol.asyncIterator in stream)) {
+    return stream;
+  }
+  async function* lifted(): AsyncIterable<unknown> {
+    for await (const chunk of stream as AsyncIterable<unknown>) {
+      yield liftReasoningChunk(chunk);
+    }
+  }
+  return lifted();
 }
 
 /** Repair a structured (downgraded json_object) response's content into
@@ -516,10 +587,10 @@ async function* synthFaithfulStream(completion: CompatCompletion): AsyncGenerato
 
 /** Wrap an OpenAI-compatible `chat.completions.create`: relax the request,
  *  PRESERVE the model's reasoning across turns (critical for interleaved-
- *  thinking models like M3), and repair structured JSON. Every BYO call runs
- *  NON-streaming internally — more reliable for M3 (avoids its stream bugs) and
- *  lets us lift reasoning + repair — then re-emits one SDK-legal chunk.
- *  Exported for unit tests with an injected `original`. */
+ *  thinking models like M3), and repair structured JSON. Backends that cannot
+ *  stream cleanly still run NON-streaming internally and re-emit one SDK-legal
+ *  chunk. xAI keeps the caller's `stream: true` on the wire so first token is
+ *  first token. Exported for unit tests with an injected `original`. */
 // Context-overflow learning (provider phrasings vary: OpenAI-compat
 // `context_length_exceeded`, GLM "context length exceeded", Moonshot "input
 // token length too long"). On a match, ratchet the model's effective window
@@ -537,10 +608,14 @@ function noteContextOverflow(err: unknown, model: unknown): void {
   } catch { /* learning is additive */ }
 }
 
-export function wrapCompletionsCreate(original: CreateFn): CreateFn {
+export function wrapCompletionsCreate(
+  original: CreateFn,
+  wrapOptions: WrapCompletionsCreateOptions = {},
+): CreateFn {
+  const nativeChatCompletionsStream = wrapOptions.nativeChatCompletionsStream === true;
   return async (params: Record<string, unknown>, options?: unknown) => {
     try {
-      return await wrappedCompletionsCreate(original, params, options);
+      return await wrappedCompletionsCreate(original, params, options, nativeChatCompletionsStream);
     } catch (err) {
       noteContextOverflow(err, (params as { model?: unknown }).model);
       throw err;
@@ -551,13 +626,22 @@ export function wrapCompletionsCreate(original: CreateFn): CreateFn {
 async function wrappedCompletionsCreate(
   original: CreateFn,
   params: Record<string, unknown>,
-  options?: unknown,
+  options: unknown,
+  nativeChatCompletionsStream: boolean,
 ): Promise<unknown> {
   {
     const relaxed = relaxRequestForCompatBackend(params) as Record<string, unknown>;
     const structured = downgradedBodies.has(relaxed as object);
 
     if (relaxed.stream === true) {
+      // Structured JSON without tools still buffers: repair runs on a finished
+      // object. Interactive tool turns (calendar, work_call) drop
+      // response_format and must stream — that is the Grok-as-Codex path.
+      const hasTools = Array.isArray(relaxed.tools) && relaxed.tools.length > 0;
+      if (nativeChatCompletionsStream && (!structured || hasTools)) {
+        const stream = await original(relaxed, options);
+        return liftReasoningStream(stream);
+      }
       // This adapter intentionally pays for a full non-streaming completion and
       // only then emits one synthetic SDK chunk. Tell the outer watchdog that a
       // provider request owns this otherwise eventless interval. The marker is
@@ -711,7 +795,9 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   const original = completions.create.bind(completions) as unknown as CreateFn;
   // Shadow the prototype method on this instance: relax the request + repair
   // structured JSON responses. The SDK calls client.chat.completions.create.
-  (completions as unknown as { create: CreateFn }).create = wrapCompletionsCreate(original);
+  (completions as unknown as { create: CreateFn }).create = wrapCompletionsCreate(original, {
+    nativeChatCompletionsStream: byoBackendStreamsChatCompletions(byo),
+  });
   return client;
 }
 

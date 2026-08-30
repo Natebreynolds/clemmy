@@ -54,6 +54,16 @@ export interface HostSemanticAuthorityV1 {
   /** Standing policy maximum. Never evidence that this source requested a write. */
   policyMaxCeiling: RuntimeToolEffect | 'none';
   allowedEffects: ReadonlyArray<RuntimeToolEffect | 'none'>;
+  /**
+   * Exact Clementine-local capability refs that survived current registry,
+   * schema, carrier, and envelope revalidation for this accepted source.
+   *
+   * A local definition edit has no provider destination manifest by design:
+   * its target is carried by the validated tool arguments and reopened again
+   * at dispatch.  This set is therefore the only destinationless-write
+   * exception.  A `cap:local:`-looking model string is never sufficient.
+   */
+  revalidatedLocalCapabilityRefs?: ReadonlySet<string>;
   /** Existing exact mandate on a resumable goal, if any. */
   sourceMandate?: {
     goalId: string;
@@ -86,10 +96,26 @@ function rank(effect: string): number {
   return EFFECT_RANK[effect] ?? EFFECT_RANK.unknown;
 }
 
-/** Shape-only alignment. The proposal's requestedEffect is not proof. */
-function writeAligned(projection: SemanticProjectionV1): boolean {
+/**
+ * Shape-only alignment plus one host-owned local-envelope exception. The
+ * proposal's requestedEffect and capability spelling are never proof.
+ */
+function writeAligned(
+  projection: SemanticProjectionV1,
+  authority: HostSemanticAuthorityV1,
+): boolean {
   const work = projection.goal;
-  return Boolean(work && work.construct !== 'none' && work.destination);
+  if (!work || work.construct === 'none') return false;
+  if (work.destination) return true;
+  if (work.requestedEffect !== 'local_write') return false;
+  const revalidated = authority.revalidatedLocalCapabilityRefs;
+  if (!revalidated || revalidated.size === 0) return false;
+  const writeRefs = work.operations
+    .filter((operation) => WRITE_EFFECTS.has(operation.requestedEffect as RuntimeToolEffect))
+    .map((operation) => operation.capabilityRef);
+  return writeRefs.length > 0 && writeRefs.every((ref) => (
+    typeof ref === 'string' && revalidated.has(ref)
+  ));
 }
 
 function mandateAllowsWrite(authority: HostSemanticAuthorityV1, projection: SemanticProjectionV1): boolean {
@@ -122,7 +148,7 @@ export function clampRequestedEffect(
   if (requested === 'host_only') return { effect: 'host_only' };
   if (requested === 'unknown') return { effect: 'unknown' };
   if (WRITE_EFFECTS.has(requested as RuntimeToolEffect)) {
-    const aligned = writeAligned(projection) || mandateAllowsWrite(authority, projection);
+    const aligned = writeAligned(projection, authority) || mandateAllowsWrite(authority, projection);
     if (!aligned) return { effect: 'none', refuse: 'write_not_aligned' };
     if (!authority.allowedEffects.includes(requested)) {
       return { effect: requested, refuse: 'write_not_in_policy' };

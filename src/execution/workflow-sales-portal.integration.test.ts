@@ -4,7 +4,7 @@
  *
  * Sanitized acceptance proof for the long-running end-of-month sales portal
  * shape. It deliberately drives the production workflow compiler, durable
- * workspace, graph scheduler, deterministic artifact runner, governed call
+ * workspace, graph scheduler, reviewed transform and artifact call, governed
  * node, mutation receipt store, synthesis projection, and terminal publisher.
  * Model/provider boundaries are the only test doubles; no network is used.
  */
@@ -31,8 +31,8 @@ globalThis.fetch = (async () => {
 }) as typeof fetch;
 
 const { readWorkflow, writeWorkflow } = await import('../memory/workflow-store.js');
-const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { executeArtifactBundleSave } = await import('../tools/artifact-bundle-tools.js');
 const {
   _setWorkflowCallNodeForTests,
   _setWorkflowHarnessLoopImplsForTests,
@@ -101,9 +101,9 @@ test('end-of-month sales portal resumes, fans out three analysts, builds artifac
     rep: workflowSubgraphSpecialistNodeId('analyze_sales', 'rep_performance'),
     pipeline: workflowSubgraphSpecialistNodeId('analyze_sales', 'pipeline_risk'),
   };
-  const expectedPortalDir = path.join(WORKFLOWS_DIR, workflowSlug, 'generated', runId);
-  const expectedHtmlPath = path.join(expectedPortalDir, 'index.html');
-  const expectedBackendPath = path.join(expectedPortalDir, 'server.mjs');
+  let expectedPortalDir: string | undefined;
+  let expectedHtmlPath: string | undefined;
+  let expectedBackendPath: string | undefined;
 
   const transactions = Array.from({ length: 1_200 }, (_, index) => ({
     id: `txn-${String(index).padStart(6, '0')}`,
@@ -121,65 +121,21 @@ test('end-of-month sales portal resumes, fans out three analysts, builds artifac
     'the fixture must be large enough to require a durable artifact reference',
   );
 
-  const portalBuilderSource = `
-import { mkdirSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
-
-let raw = '';
-for await (const chunk of process.stdin) raw += chunk;
-const payload = JSON.parse(raw);
-const transactions = payload.stepOutputs.sales_input.transactions;
-const targetDir = path.join(process.cwd(), 'generated', payload.runId);
-mkdirSync(targetDir, { recursive: true });
-
-const regionTotals = {};
-const repTotals = {};
-let totalRevenue = 0;
-for (const row of transactions) {
-  totalRevenue += row.revenue;
-  regionTotals[row.region] = (regionTotals[row.region] || 0) + row.revenue;
-  repTotals[row.rep] = (repTotals[row.rep] || 0) + row.revenue;
-}
-const salesModel = {
-  period: '2026-07',
-  transactionCount: transactions.length,
-  totalRevenue,
-  regionTotals,
-  topReps: Object.entries(repTotals).sort((a, b) => b[1] - a[1]).slice(0, 5),
-  analysis: payload.stepOutputs.analyze_sales,
-};
-
-const htmlPath = path.join(targetDir, 'index.html');
-const backendPath = path.join(targetDir, 'server.mjs');
-const dataPath = path.join(targetDir, 'sales.json');
-const html = [
-  '<!doctype html>',
-  '<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
-  '<title>Sanitized July Sales Portal</title>',
-  '<style>body{font:16px system-ui;margin:2rem;max-width:960px}#regions{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}.card{padding:1rem;border:1px solid #ddd;border-radius:12px}</style></head>',
-  '<body><h1>July sales summary</h1><p id="summary">Loading verified totals...</p><div id="regions"></div>',
-  '<script>fetch("/api/sales").then(r=>r.json()).then(d=>{document.querySelector("#summary").textContent=d.transactionCount+" transactions · $"+d.totalRevenue.toLocaleString();document.querySelector("#regions").innerHTML=Object.entries(d.regionTotals).map(([k,v])=>"<div class=card><strong>"+k+"</strong><br>$"+v.toLocaleString()+"</div>").join("")})</script>',
-  '</body></html>',
-].join('\\n');
-const server = [
-  "import http from 'node:http';",
-  "import { readFileSync } from 'node:fs';",
-  "const port = Number(process.env.PORT || 3000);",
-  "http.createServer((req,res)=>{const file=req.url==='/api/sales'?'sales.json':'index.html';const type=file.endsWith('.json')?'application/json':'text/html;res.writeHead(200,{'content-type':type});res.end(readFileSync(new URL('./'+file,import.meta.url)))}).listen(port);",
-].join('\\n');
-
-writeFileSync(htmlPath, html, 'utf8');
-writeFileSync(backendPath, server, 'utf8');
-writeFileSync(dataPath, JSON.stringify(salesModel, null, 2), 'utf8');
-console.log(JSON.stringify({
-  site_dir: targetDir,
-  html_path: htmlPath,
-  backend_path: backendPath,
-  data_path: dataPath,
-  transaction_count: transactions.length,
-  total_revenue: totalRevenue,
-}));
-`;
+  const portalHtml = [
+    '<!doctype html>',
+    '<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>Sanitized July Sales Portal</title>',
+    '<style>body{font:16px system-ui;margin:2rem;max-width:960px}#regions{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}.card{padding:1rem;border:1px solid #ddd;border-radius:12px}</style></head>',
+    '<body><h1>July sales summary</h1><p id="summary">Loading verified totals...</p><div id="regions"></div>',
+    '<script>fetch("/api/sales").then(r=>r.json()).then(d=>{const total=d.regionTotals.reduce((n,row)=>n+row.sum_revenue,0);document.querySelector("#summary").textContent=d.transactionCount+" transactions · $"+total.toLocaleString();document.querySelector("#regions").innerHTML=d.regionTotals.map(row=>"<div class=card><strong>"+row.region+"</strong><br>$"+row.sum_revenue.toLocaleString()+"</div>").join("")})</script>',
+    '</body></html>',
+  ].join('\n');
+  const portalServer = [
+    "import http from 'node:http';",
+    "import { readFileSync } from 'node:fs';",
+    "const port = Number(process.env.PORT || 3000);",
+    "http.createServer((req,res)=>{const file=req.url==='/api/sales'?'sales.json':'index.html';const type=file.endsWith('.json')?'application/json':'text/html';res.writeHead(200,{'content-type':type});res.end(readFileSync(new URL('./'+file,import.meta.url)))}).listen(port);",
+  ].join('\n');
 
   const authoredWorkflow = {
     name: workflowName,
@@ -189,8 +145,8 @@ console.log(JSON.stringify({
     goal: {
       objective: 'Build the sanitized end-of-month sales portal and its backend artifact.',
       successCriteria: [
-        `The generated HTML exists at ${expectedHtmlPath}.`,
-        `The generated backend exists at ${expectedBackendPath}.`,
+        'The immutable artifact bundle contains index.html, server.mjs, and sales.json.',
+        'The governed deploy consumes the exact directory returned by that artifact bundle.',
       ],
       maxAttempts: 1,
     },
@@ -216,15 +172,75 @@ console.log(JSON.stringify({
         },
       },
       {
-        id: 'build_portal',
-        prompt: 'Materialize the verified local HTML dashboard, JSON data model, and backend server artifact.',
+        id: 'portal_files',
+        prompt: '',
         dependsOn: ['sales_input', 'analyze_sales'],
         sideEffect: 'read' as const,
-        deterministic: { runner: 'build-portal.mjs', source: portalBuilderSource },
+        transform: {
+          version: 1 as const,
+          expression: {
+            op: 'object' as const,
+            fields: [
+              { key: 'index_html', value: { op: 'literal' as const, value: portalHtml } },
+              { key: 'server_mjs', value: { op: 'literal' as const, value: portalServer } },
+              {
+                key: 'sales_json',
+                value: {
+                  op: 'jsonStringify' as const,
+                  value: {
+                    op: 'object' as const,
+                    fields: [
+                      { key: 'period', value: { op: 'literal' as const, value: '2026-07' } },
+                      {
+                        key: 'transactionCount',
+                        value: {
+                          op: 'count' as const,
+                          value: { op: 'get' as const, from: 'steps.sales_input.output.transactions' },
+                        },
+                      },
+                      {
+                        key: 'regionTotals',
+                        value: {
+                          op: 'aggregate' as const,
+                          value: { op: 'get' as const, from: 'steps.sales_input.output.transactions' },
+                          groupBy: ['region'],
+                          metrics: [{ fn: 'count' as const }, { fn: 'sum' as const, column: 'revenue' }],
+                        },
+                      },
+                      { key: 'analysis', value: { op: 'get' as const, from: 'steps.analyze_sales.output' } },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        },
         output: {
           type: 'object' as const,
-          required_keys: ['site_dir', 'html_path', 'backend_path', 'data_path', 'transaction_count', 'total_revenue'],
-          verify: { path_exists: ['site_dir', 'html_path', 'backend_path', 'data_path'] },
+          required_keys: ['index_html', 'server_mjs', 'sales_json'],
+        },
+      },
+      {
+        id: 'build_portal',
+        prompt: 'Commit the exact reviewed portal files as one immutable local artifact revision.',
+        dependsOn: ['portal_files'],
+        sideEffect: 'write' as const,
+        call: {
+          tool: 'artifact_bundle_save',
+          args: {
+            bundle_id: 'sales-portal-sanitized-acceptance',
+            mode: 'content_addressed',
+            files: [
+              { path: 'index.html', content: '{{steps.portal_files.output.index_html}}' },
+              { path: 'server.mjs', content: '{{steps.portal_files.output.server_mjs}}' },
+              { path: 'sales.json', content: '{{steps.portal_files.output.sales_json}}' },
+            ],
+          },
+        },
+        output: {
+          type: 'object' as const,
+          required_keys: ['artifactId', 'directory', 'manifestPath', 'files'],
+          verify: { path_exists: ['directory', 'manifestPath'] },
         },
       },
       {
@@ -236,7 +252,7 @@ console.log(JSON.stringify({
         approvalPreview: 'Deploy the sanitized end-of-month sales portal preview.',
         call: {
           tool: 'NETLIFY_DEPLOY_SITE',
-          args: { directory: '{{steps.build_portal.output.site_dir}}', site_slug: 'sanitized-sales-portal' },
+          args: { directory: '{{steps.build_portal.output.directory}}', site_slug: 'sanitized-sales-portal' },
         },
         output: {
           type: 'object' as const,
@@ -431,9 +447,31 @@ console.log(JSON.stringify({
   });
 
   let providerDispatches = 0;
+  let artifactExecutions = 0;
   let effectStepExecutions = 0;
   let effectReceiptInput: Parameters<typeof executeWorkflowCallMutation>[0] | undefined;
   _setWorkflowCallNodeForTests(async (step, ctx) => {
+    if (step.id === 'build_portal') {
+      artifactExecutions += 1;
+      assert.equal(step.call?.tool, 'artifact_bundle_save');
+      assert.equal(step.sideEffect, 'write');
+      const args = renderCallArgs(step.call.args, ctx.inputs, ctx.stepOutputs);
+      assert.equal(args.bundle_id, 'sales-portal-sanitized-acceptance');
+      assert.equal(args.mode, 'content_addressed');
+      assert.ok(Array.isArray(args.files));
+      const result = executeArtifactBundleSave({
+        bundle_id: String(args.bundle_id),
+        mode: 'content_addressed',
+        files: (args.files as Array<Record<string, unknown>>).map((file) => ({
+          path: String(file.path),
+          content: String(file.content),
+        })),
+      });
+      expectedPortalDir = result.directory;
+      expectedHtmlPath = path.join(result.directory, 'index.html');
+      expectedBackendPath = path.join(result.directory, 'server.mjs');
+      return result;
+    }
     effectStepExecutions += 1;
     assert.equal(step.id, 'deploy_portal');
     assert.equal(step.requiresApproval, true);
@@ -441,7 +479,7 @@ console.log(JSON.stringify({
     const args = renderCallArgs(step.call?.args, ctx.inputs, ctx.stepOutputs);
     assert.equal(
       realpathSync(String(args.directory)),
-      realpathSync(expectedPortalDir),
+      realpathSync(expectedPortalDir!),
       'the rendered deploy input resolves to the verified portal directory (macOS /var and /private/var are aliases)',
     );
     effectReceiptInput = {
@@ -473,11 +511,23 @@ console.log(JSON.stringify({
     _setWorkflowHarnessLoopImplsForTests();
   }
 
+  const terminal = JSON.parse(readFileSync(runFile, 'utf8')) as {
+    status?: string;
+    error?: string;
+    output?: string;
+    reportBack?: { detail?: string };
+  };
+  assert.equal(
+    terminal.status,
+    'completed',
+    terminal.error ?? 'the reviewed workflow did not complete',
+  );
   assert.equal(specialistStarts, 3);
   assert.equal(maxActiveSpecialists, 3, 'all three analytical branches overlap in one scheduler wave');
   assert.deepEqual(queriedOffsets.sort((a, b) => a - b), [0, 500, 1_180]);
   assert.equal(reducerCalls, 1, 'one reducer owns analytical synthesis');
   assert.equal(synthesisCalls, 1, 'one public synthesis owns the terminal response');
+  assert.equal(artifactExecutions, 1, 'the immutable local artifact commits exactly once');
   assert.equal(effectStepExecutions, 1);
   assert.equal(providerDispatches, 1, 'the governed external deployment crosses its provider boundary exactly once');
   assert.ok(effectReceiptInput);
@@ -489,18 +539,23 @@ console.log(JSON.stringify({
   assert.equal(reducerPrompts.length, 1);
   assert.equal(synthesisPrompts.length, 1);
 
+  assert.ok(expectedHtmlPath && expectedBackendPath);
   const html = readFileSync(expectedHtmlPath, 'utf8');
   const backend = readFileSync(expectedBackendPath, 'utf8');
+  const salesModel = JSON.parse(readFileSync(path.join(expectedPortalDir!, 'sales.json'), 'utf8')) as {
+    period: string;
+    transactionCount: number;
+    regionTotals: Array<{ region: string; count: number; sum_revenue: number }>;
+    analysis: string;
+  };
   assert.match(html, /fetch\("\/api\/sales"\)/);
   assert.match(backend, /createServer/);
   assert.match(backend, /\/api\/sales/);
+  assert.equal(salesModel.period, '2026-07');
+  assert.equal(salesModel.transactionCount, 1_200);
+  assert.equal(salesModel.regionTotals.length, 4);
+  assert.equal(salesModel.analysis, reducerResult);
 
-  const terminal = JSON.parse(readFileSync(runFile, 'utf8')) as {
-    status?: string;
-    output?: string;
-    reportBack?: { detail?: string };
-  };
-  assert.equal(terminal.status, 'completed');
   assert.equal(terminal.output, publicReport, 'the canonical terminal is the single public synthesis');
   assert.match(terminal.reportBack?.detail ?? '', /July sales portal is live: 1,200 transactions analyzed/);
   assert.equal(
@@ -521,6 +576,7 @@ console.log(JSON.stringify({
     specialistIds.rep,
     specialistIds.pipeline,
     'analyze_sales',
+    'portal_files',
     'build_portal',
     'deploy_portal',
     '__synthesis__',

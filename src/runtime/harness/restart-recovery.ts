@@ -74,6 +74,34 @@ function autoResumeEnabled(): boolean {
   return (process.env.CLEMMY_CHAT_AUTO_RESUME ?? 'on').toLowerCase() !== 'off';
 }
 
+/** Minimal cycle-free recognition for the private host checkpoint owner.
+ * runTurn performs the full HostRecoveryState parse and exact batch reopen
+ * before adopting or executing anything; this check only decides that generic
+ * restart policy must not turn a bookkeeping state into a user-facing retry
+ * terminal merely because the already-landed call was an external write. */
+function checkpointRecoverySourceUserSeq(
+  session: HarnessSession,
+  sessionId: string,
+): number | null {
+  const blob = session.loadRecoveryState();
+  if (!blob) return null;
+  try {
+    const parsed = JSON.parse(blob) as Record<string, unknown>;
+    const sourceUserSeq = Number(parsed.sourceUserSeq);
+    return parsed.__clemHostRecovery === 1
+      && parsed.sessionId === sessionId
+      && (parsed.phase === 'admit'
+        || parsed.phase === 'finalize'
+        || parsed.phase === 'continue')
+      && Number.isSafeInteger(sourceUserSeq)
+      && sourceUserSeq > 0
+      ? sourceUserSeq
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Interactive surface reconstructed from the durable session. This local
  * union deliberately keeps restart recovery free of the respond-bridge
  * dependency while preventing a chat source from being reopened as a
@@ -901,15 +929,24 @@ export function recoverInterruptedChatRuns(
     // recovery state is published or a manual terminal is committed.
     const ageMs = now() - Date.parse(since);
     const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
+    const checkpointRecoverySource = checkpointRecoverySourceUserSeq(sess, row.id);
+    const exactCheckpointRecovery = Boolean(
+      recoveryIdentity
+      && acceptedInput !== null
+      && checkpointRecoverySource === recoveryIdentity.sourceUserSeq,
+    );
     if (!recoveryIdentity || acceptedInput === null) record.autoResumeSkipped = 'identity_missing';
-    else if (userStopped) record.autoResumeSkipped = 'user_stopped';
-    else if (!autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
     else if (!dispatchResume) record.autoResumeSkipped = 'no_dispatcher';
     else if (autoResumes >= AUTO_RESUME_MAX_PER_BOOT) record.autoResumeSkipped = 'boot_cap';
-    else if (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS) record.autoResumeSkipped = 'too_old';
-    else if (externalWritesSinceInterrupt === null || externalWritesSinceInterrupt > 0) record.autoResumeSkipped = 'external_write';
+    else if (!exactCheckpointRecovery && userStopped) record.autoResumeSkipped = 'user_stopped';
+    else if (!exactCheckpointRecovery && !autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
+    else if (!exactCheckpointRecovery && (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS)) record.autoResumeSkipped = 'too_old';
+    else if (!exactCheckpointRecovery
+      && (externalWritesSinceInterrupt === null || externalWritesSinceInterrupt > 0)) {
+      record.autoResumeSkipped = 'external_write';
+    }
     const willAutoResume = record.autoResumeSkipped === undefined;
-    if (!userStopped) {
+    if (!userStopped && !exactCheckpointRecovery) {
       try {
         record.snapshotItemsBefore = sess.toInputItems().length;
         record.lastResponseIdPresent = !!sess.previousResponseId();
@@ -940,6 +977,7 @@ export function recoverInterruptedChatRuns(
           interruptedAttemptId: interruptedAttempt?.attemptId ?? null,
           interruptedRunId: interruptedAttempt?.runId ?? null,
           externalWritesSinceInterrupt,
+          exactCheckpointRecovery,
           writeCheckFailed: externalWritesSinceInterrupt === null,
           hasDispatcher: !!dispatchResume,
           bootCap: AUTO_RESUME_MAX_PER_BOOT,
@@ -1012,7 +1050,9 @@ export function recoverInterruptedChatRuns(
           role: 'system',
           type: 'run_resumed',
           data: {
-            reason: 'restart_auto_resume',
+            reason: exactCheckpointRecovery
+              ? 'restart_checkpoint_recovery'
+              : 'restart_auto_resume',
             interruptedAt: since,
             autoResume: true,
           },
@@ -1127,6 +1167,13 @@ export function recoverInterruptedChatRuns(
             },
           });
         } catch { /* diagnostics are private and best-effort */ }
+        if (exactCheckpointRecovery) {
+          // The still-armed marker plus HostRecoveryState remain the only
+          // authority. A failed boot dispatch must never publish "retry" after
+          // a write may already have landed; a later in-process/boot wake can
+          // re-enter the same exact batch without rerunning its body.
+          return;
+        }
         try {
           const failedOwnership = readPendingWorkflowChatDispatchOwnership(recoveryIdentity);
           const transferredDispatch = failedOwnership

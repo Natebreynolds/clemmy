@@ -23,10 +23,8 @@ test.after(() => {
 test('v42 additively upgrades an existing lazy continuity table without blessing old rows', () => {
   eventlog.closeEventLog();
   const raw = new Database(eventlog.HARNESS_DB_PATH);
+  eventlog.applyHarnessMigrationsThroughVersionForTests(raw, 41);
   raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at)
-      VALUES (41, '2026-08-13T00:00:00.000Z');
     CREATE TABLE task_continuity_packets (
       packet_id TEXT PRIMARY KEY,
       consumed_at TEXT

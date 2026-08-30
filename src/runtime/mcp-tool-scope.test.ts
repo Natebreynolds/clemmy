@@ -299,11 +299,30 @@ test('resolveMcpToolScope: an explicit external exception remains reachable', ()
   assert.ok((scope.maxTools ?? 0) > 0);
 });
 
+test('OPEN-THE-GATES 5.5: "except be thorough" does not reopen the catalog', () => {
+  const scope = resolveMcpToolScope({
+    userInput: 'Use only local memory, except be thorough.',
+  });
+  assert.equal(scope.authority, 'none');
+  assert.equal(scope.maxTools, 0);
+});
+
 test('resolveMcpToolScope: a pinned-calendar label + date shorthand is treated as Outlook calendar intent', () => {
-  const scope = resolveMcpToolScope({ userInput: 'Check my acme for tomorrow', pinnedCalendarLabels: ['acme'] });
-  assert.ok((scope.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)));
+  const scope = resolveMcpToolScope({
+    userInput: 'Check my acme for tomorrow',
+    standingCapabilityHints: [{
+      adapterId: 'fixture-adapter',
+      intentLabels: ['acme'],
+      requiresTemporalCue: true,
+      allowedServerSlugs: ['fixture-calendar'],
+      toolPatterns: ['calendar'],
+      priorityKeywords: ['list'],
+      maxTools: 8,
+    }],
+  });
+  assert.ok((scope.allowedServerSlugs ?? []).includes('fixture-calendar'));
   assert.ok((scope.toolPatterns ?? []).includes('calendar'));
-  assert.match(scope.reason, /outlook/i);
+  assert.match(scope.reason, /standing-policy/i);
   assert.ok(!scope.failOpenCandidate);
 
   // No pinned calendars → the shorthand never fires; the turn stays generic.
@@ -336,19 +355,62 @@ test('resolveMcpToolScope: the fail-open kill-switch restores the prior maxTools
   }
 });
 
+test('resolveMcpToolScope: a remembered CLI read cannot suppress external discovery for a mixed request', async () => {
+  const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
+  rememberToolChoice({
+    intent: 'quartzvault.records.list',
+    description: 'List current Quartzvault records',
+    choice: {
+      kind: 'cli',
+      identifier: 'quartzvault',
+      invocationTemplate: 'quartzvault records list --json',
+    },
+  });
+
+  const read = resolveMcpToolScope({
+    userInput: 'List current Quartzvault records with quartzvault.',
+  });
+  assert.equal(read.maxTools, 0, 'pure-read CLI fast path is preserved');
+  assert.match(read.reason, /proven local CLI capability/);
+
+  const mixed = resolveMcpToolScope({
+    userInput: 'List current Quartzvault records with quartzvault, then create a new remote entry.',
+  });
+  assert.equal(mixed.failOpenCandidate, true);
+  assert.ok((mixed.maxTools ?? 0) > 0);
+  assert.doesNotMatch(mixed.reason, /proven local CLI capability/);
+});
+
 // ── Recall-aware scope (CANON-RECALL-NATIVE part a) ──────────────────────────
 
-test('resolveMcpToolScopeWithRecall: a proven MCP server promotes a fail-open turn to a PRECISE scope', () => {
-  // Keyword-less prompt → base is fail-open. A HIGH-tier learned mcp choice for
-  // this intent targets the proven server precisely (drops failOpenCandidate).
+test('resolveMcpToolScopeWithRecall: a proven MCP read promotes a pure-read fail-open turn to a PRECISE scope', () => {
+  // Keyword-less pure read → base is fail-open. A HIGH-tier learned mcp choice
+  // for this intent targets the proven server precisely (drops failOpenCandidate).
   const scope = resolveMcpToolScopeWithRecall({
-    userInput: 'create a page in my Notion workspace',
-    learnedMatches: [mcpMatch('notion__create_page')],
+    userInput: 'read a page from my Notion workspace',
+    learnedMatches: [{ ...mcpMatch('notion__get_page'), effectClass: 'read' }],
   });
   assert.ok(!scope.failOpenCandidate, 'precise recall replaces the broad fail-open surface');
   assert.ok((scope.allowedServerSlugs ?? []).includes('notion'));
   assert.ok((scope.maxTools ?? 0) > 0);
   assert.match(scope.reason, /recall/);
+});
+
+test('resolveMcpToolScopeWithRecall: one remembered MCP read never replaces broad discovery for write or mixed work', () => {
+  const rememberedRead = { ...mcpMatch('quartzvault__list_records'), effectClass: 'read' as const };
+  for (const userInput of [
+    'Create a Quartzvault record.',
+    'List the current Quartzvault records, then create a new remote entry.',
+  ]) {
+    const scope = resolveMcpToolScopeWithRecall({
+      userInput,
+      learnedMatches: [rememberedRead],
+    });
+    assert.equal(scope.failOpenCandidate, true, userInput);
+    assert.ok((scope.maxTools ?? 0) > 0, userInput);
+    assert.ok(!(scope.allowedServerSlugs ?? []).includes('quartzvault'), userInput);
+    assert.doesNotMatch(scope.reason, /recall/, userInput);
+  }
 });
 
 test('resolveMcpToolScopeWithRecall: unrelated learned MCP does not widen an existing precise scope', () => {
@@ -405,15 +467,15 @@ test('resolveMcpToolScopeWithRecall: a medium-tier mcp match proposes its server
   // match now proposes its proven server, and the fail-open/explicit-naming
   // guards decide admission. Non-mcp kinds still cannot name an MCP server.
   const medium = resolveMcpToolScopeWithRecall({
-    userInput: 'create a page in my Notion workspace',
-    learnedMatches: [mcpMatch('notion__create_page', 'medium')],
+    userInput: 'read a page from my Notion workspace',
+    learnedMatches: [{ ...mcpMatch('notion__get_page', 'medium'), effectClass: 'read' }],
   });
   assert.ok((medium.allowedServerSlugs ?? []).includes('notion'), 'a medium-tier proven server surfaces');
   assert.ok(!medium.failOpenCandidate);
 
   const composioOnly = resolveMcpToolScopeWithRecall({
-    userInput: 'create a page in my Notion workspace',
-    learnedMatches: [{ ...mcpMatch('notion__create_page', 'medium'), kind: 'composio' as const }],
+    userInput: 'read a page from my Notion workspace',
+    learnedMatches: [{ ...mcpMatch('notion__get_page', 'medium'), kind: 'composio' as const, effectClass: 'read' }],
   });
   assert.equal(composioOnly.failOpenCandidate, true, 'a non-mcp kind never names an MCP server');
 });
@@ -720,19 +782,19 @@ test('awaitingAnswer never over-inherits: a fresh topic still wins', () => {
   assert.ok(!(scope.allowedServerSlugs ?? []).some((slug) => /outlook/.test(slug)));
 });
 
-test('resolveMcpToolScopeWithRecall: a conversational ask reaches its proven server through the REAL matcher (lane parity)', async () => {
+test('resolveMcpToolScopeWithRecall: a conversational read reaches its proven server through the REAL matcher (lane parity)', async () => {
   // The Claude lane's JIT pin got the advertise-tier fix; this lane still ran
   // the bind-tier matcher, so "can you put this in my notion" — no operation
   // token — matched nothing and the turn re-discovered a proven server
   // (2026-08-05). Exercises the real store path, not injected matches.
   const { rememberToolChoice } = await import('../memory/tool-choice-store.js');
   rememberToolChoice({
-    intent: 'notion.page.create',
-    description: 'Create a page in the Notion workspace',
-    choice: { kind: 'mcp', identifier: 'notion__create_page' },
+    intent: 'notion.page.read',
+    description: 'Read a page from the Notion workspace',
+    choice: { kind: 'mcp', identifier: 'notion__get_page' },
   });
   const scope = resolveMcpToolScopeWithRecall({
-    userInput: 'can you put this in my notion for me',
+    userInput: 'can you read a page from my notion for me',
   });
   assert.ok((scope.allowedServerSlugs ?? []).includes('notion'), 'the proven server surfaces for a conversational ask');
   assert.ok(!scope.failOpenCandidate, 'precise recall replaces the broad fail-open surface');

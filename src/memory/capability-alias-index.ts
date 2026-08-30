@@ -69,7 +69,7 @@ export function acceptedPhraseDigest(text: string): string {
  * Spans that carry a PARTICULAR person, place, or secret rather than an intent.
  *
  * These must be removed BEFORE normalization: once punctuation is gone,
- * "dana.wexler@northwind-industries.com" is indistinguishable from five
+ * "casey@northwind-industries.com" is indistinguishable from five
  * ordinary words, and each of those words would become a retrievable feature.
  * Structure is the evidence, so it is read while it still exists.
  */

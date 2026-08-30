@@ -75,6 +75,8 @@ export interface ChatMessage {
   pendingError?: string;
   /** Client idempotency key for retrying a failed send verbatim. */
   idempotencyKey?: string;
+  /** Mid-run steer: text delivered into the live turn, not a new attempt. */
+  steer?: 'pending' | 'delivered' | 'failed';
 }
 
 /** What the transport layer is doing right now, for an honest connection pill. */
@@ -90,6 +92,17 @@ export interface EngineSnapshot {
   messages: ChatMessage[];
   busy: boolean;
   connection: ConnectionState;
+  /**
+   * The idempotency key of the turn currently in flight, or null.
+   *
+   * A surface can hand this straight to the host's request-identity cancel,
+   * which stops the turn whether or not a run attempt exists yet — so a user
+   * is never locked out during the window before one is registered. Null while
+   * idle, and also while a turn that started on ANOTHER surface is being
+   * followed (this client never minted a key for it); a surface that wants
+   * Stop to work there too falls back to the run attempt's own identity.
+   */
+  cancelKey: string | null;
 }
 
 export function isTerminalEvent(type: string): boolean {

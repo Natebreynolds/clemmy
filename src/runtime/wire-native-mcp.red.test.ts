@@ -439,7 +439,11 @@ test('every native MCP carrier preserves one exact accepted-source contract, inc
 test('RED: two settle calls inside ONE real shim dispatch collapse to one settlement', async () => {
   // Enter the REAL shim so the host mints the attempt. A carrier settling the
   // same dispatch a second time must inherit that identity, not mint another.
-  const server = fakeServer('Alpha', 'list_items', async () => okContent);
+  let providerBodies = 0;
+  const server = fakeServer('Alpha', 'list_items', async () => {
+    providerBodies += 1;
+    return okContent;
+  });
   const shim = createMcpNamespaceShim({ servers: [server] });
   const slug = slugifyServerName('Alpha');
   const namespaced = namespaceToolName(slug, 'list_items');
@@ -468,14 +472,20 @@ test('RED: two settle calls inside ONE real shim dispatch collapse to one settle
       // A transport mirror re-settling the same physical dispatch. It carries
       // no call id of its own; the ambient logical owner makes this an exact
       // durable replay rather than an uncorrelated second outcome.
-      settleToolAttempt({
+      const replay = settleToolAttempt({
         sessionId, sourceUserSeq, turn: 1,
         lane: 'native_mcp', toolName: namespaced,
         args,
-        mutating: false, businessCall: true,
+        // This fixture tool has no manifest/annotation-backed read authority,
+        // so the native MCP effect boundary correctly fails closed to an
+        // external write. A replay must carry the same semantic verdict; a
+        // caller claiming `mutating:false` is a conflicting settlement, not an
+        // idempotent duplicate.
+        mutating: true, businessCall: true,
         result: okContent,
         signals: { providerReportedError: false },
       });
+      assert.equal(replay.duplicate, true, 'the exact second settlement is a replay');
     },
   ));
 
@@ -488,6 +498,8 @@ test('RED: two settle calls inside ONE real shim dispatch collapse to one settle
     1,
     `one physical dispatch, one settlement — got ${settlements.length}`,
   );
+  assert.equal(providerBodies, 1, 'settlement replay must never re-enter the provider body');
+  assert.equal(settlements[0]?.mutating, true, 'the durable settlement preserves fail-closed effect truth');
   assert.ok(
     settlements[0]?.logicalToolCallId && settlements[0]?.physicalDispatchId,
     'the settlement must carry both its logical owner and the real provider crossing',

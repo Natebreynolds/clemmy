@@ -44,9 +44,11 @@ import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
+import { registerArtifactBundleTools } from './artifact-bundle-tools.js';
 import {
   registerToolSearchTool,
   type ToolSearchCandidateSource,
+  type ToolSearchPlanningDisclosureOutcome,
   type ToolSearchPlanningDisclosureCandidate,
 } from './tool-search-tool.js';
 import { markFreshPlanDisclosureSearch } from './tool-search-mode.js';
@@ -54,10 +56,15 @@ import { registerHarnessStatusTools } from './harness-status-tools.js';
 import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
-import { ensureToolDirectories, textResult } from './shared.js';
+import {
+  ensureToolDirectories,
+  isInvalidArgumentsTextResult,
+  textResult,
+} from './shared.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
+import { InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 
 type LocalToolHandler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 
@@ -78,6 +85,10 @@ function resultToText(result: unknown): string | ExternalWritePreDispatchResult 
   // this into its model-facing string here would make the outer harness see a
   // normal returned local execution and could incorrectly settle it succeeded.
   if (result instanceof ExternalWritePreDispatchResult) return result;
+  if (isInvalidArgumentsTextResult(result)) {
+    const text = result.content.map((item) => item.text).filter(Boolean).join('\n');
+    return new InvalidArgumentsPreDispatchResult(formatRecallableToolText(text));
+  }
   if (typeof result === 'string') return formatRecallableToolText(result);
   if (result && typeof result === 'object') {
     const content = (result as { content?: unknown }).content;
@@ -264,6 +275,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerProfileTools(server);
   registerRecallTools(server);
   registerWorkspaceArtifactTools(server);
+  registerArtifactBundleTools(server);
   // Schema-on-demand discovery entry — read-only catalog search
   // (SCHEMA-ON-DEMAND-PLAN-2026-07-07). Additive + dormant in Phase 0.
   registerToolSearchTool(server);
@@ -384,6 +396,53 @@ export function getLocalRuntimeTools(): Tool<RuntimeContextValue>[] {
   return captureLocalTools().map(localToolToRuntimeTool);
 }
 
+function canonicalDeferredLocalToolSchema(localTool: CapturedLocalTool): z.ZodTypeAny {
+  // This is the single parser constructor for the args_json carrier. Planning
+  // disclosure/fingerprinting obtains it through getLocalToolSchemas(), and
+  // execution obtains it through the deferred Tool below.
+  return z.strictObject(normalizeShapeForDeferredJson(localTool.parameters));
+}
+
+function localToolToDeferredDispatchTool(localTool: CapturedLocalTool): Tool<RuntimeContextValue> {
+  const canonicalParameters = canonicalDeferredLocalToolSchema(localTool);
+  return tool({
+    name: localTool.name,
+    description: localTool.description,
+    // Internal JSON-string carrier only; this Tool is never advertised to a
+    // model. The SDK parses the envelope, then execute applies the canonical
+    // lossless deferred schema. Provider-strict conversion cannot represent
+    // open JSON records and must not narrow their values to strings.
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: true,
+    },
+    strict: false,
+    needsApproval: needsApprovalFromTaxonomy(localTool.name, {
+      isDestructive: () => Boolean(localTool.approvalRequired),
+    }),
+    execute: async (input, runContext, details) => {
+      const parsed = canonicalParameters.parse(input) as Record<string, unknown>;
+      return withToolOutputContext(
+        toolOutputContextFromSdk(localTool.name, runContext, details),
+        async () => resultToText(await localTool.handler(parsed)),
+      );
+    },
+    errorFunction: buildLocalToolErrorFunction(localTool),
+  });
+}
+
+/**
+ * Execution-only local surface for call_tool/work_call's args_json carrier.
+ * These tools are never advertised directly to a model, so their parsers can
+ * preserve ordinary heterogeneous JSON records instead of inheriting the
+ * lossy provider-strict projection used by first-class tools.
+ */
+export function getLocalDeferredDispatchTools(): Tool<RuntimeContextValue>[] {
+  return captureLocalTools().map(localToolToDeferredDispatchTool);
+}
+
 let cachedLocalToolCatalog: Array<{ name: string; description: string }> | null = null;
 
 /** Lightweight, schema-free inventory for the Console. This is generated from
@@ -409,7 +468,9 @@ export function buildScopedLocalToolSearch(
   candidateSources?: readonly ToolSearchCandidateSource[],
   discloseForPlanning?: (
     candidates: readonly ToolSearchPlanningDisclosureCandidate[],
-  ) => Promise<Readonly<Record<string, string>>> | Readonly<Record<string, string>>,
+  ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
+    | Readonly<Record<string, string>>
+    | ToolSearchPlanningDisclosureOutcome,
 ): Tool<RuntimeContextValue> {
   const captured: CapturedLocalTool[] = [];
   const fakeServer = {
@@ -439,20 +500,18 @@ export function buildScopedLocalToolSearch(
 }
 
 /**
- * Zod schema for every local runtime tool, keyed by name — the SAME schema
- * getLocalRuntimeTools() builds each tool with. call_tool (call-tool.ts) uses this
- * to validate args_json before generic dispatch and to return the schema on a
- * validation miss. Side-effect-free (captureLocalTools registers against a fake
- * server); safe to call on demand.
+ * Canonical deferred Zod schema for every local runtime tool, keyed by name.
+ * call_tool/work_call use this to validate ordinary args_json before generic
+ * dispatch and to return the schema on a validation miss. Side-effect-free
+ * (captureLocalTools registers against a fake server); safe to call on demand.
  */
 export function getLocalToolSchemas(): Map<string, z.ZodTypeAny> {
   const map = new Map<string, z.ZodTypeAny>();
   for (const localTool of captureLocalTools()) {
-    const deferredShape = normalizeShapeForDeferredJson(localTool.parameters);
     // First-class provider schemas already declare additionalProperties:false.
     // Keep it recursively here too: deferred transport may omit nullable
     // optionals, but it may never smuggle stale/unknown keys.
-    map.set(localTool.name, z.strictObject(deferredShape));
+    map.set(localTool.name, canonicalDeferredLocalToolSchema(localTool));
   }
   return map;
 }

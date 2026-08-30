@@ -49,7 +49,19 @@ let serial = 0;
 function acceptStepSource(text: string) {
   serial += 1;
   const sessionId = `workflow:disclosure-run-${serial}:main`;
-  eventlog.createSession({ id: sessionId, kind: 'workflow', title: `step ${serial}` });
+  eventlog.createSession({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: `step ${serial}`,
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Disclosure Gate Fixture',
+      workflowRunId: `disclosure-run-${serial}`,
+      stepId: 'main',
+      sessionIdSuffix: `disclosure-run-${serial}:main`,
+    },
+  });
   const source = eventlog.appendEvent({
     sessionId,
     turn: 1,

@@ -152,7 +152,7 @@ function expectedWorkBinderPresent(
     const session = getSession(sessionId);
     if (!session) return false;
     const sessionKind = session.kind;
-    if (isHostTurnEngine(selectTurnEngine({ sessionKind }))) return true;
+    if (sessionKind === 'chat' && isHostTurnEngine(selectTurnEngine({ sessionKind }))) return true;
     // Background and cron are the two non-interactive surfaces whose
     // execution owner constructs the action expected-work carrier before it
     // exposes business tools (both the standard agent and the full Claude SDK
@@ -173,6 +173,44 @@ function expectedWorkBinderPresent(
   }
 }
 
+/**
+ * Workflow prompt/graph nodes have a different, already-durable execution
+ * owner: getWorkflowHarnessSession stamps the session with the exact workflow
+ * and step identity before the accepted source exists, and the workflow runner
+ * constrains the node's tool/result surface itself. That owner does not write
+ * interactive expected-work bindings, so treating its graph as an unsupported
+ * binderless chat deadlocks every legitimate workflow node at logical-call
+ * admission.
+ *
+ * Session kind alone is deliberately insufficient. A legacy/bare workflow
+ * session (including the binderless fail-closed pin) has none of these
+ * host-authored metadata facts and remains refused.
+ */
+function workflowGraphExecutionOwnerPresent(
+  sessionId: string,
+  graph: TurnGraphIR,
+): boolean {
+  try {
+    const session = getSession(sessionId);
+    const metadata = session?.metadata;
+    return Boolean(
+      session?.kind === 'workflow'
+      && graph.source.sessionKind === 'workflow'
+      && metadata?.source === 'workflow'
+      && typeof metadata.workflowName === 'string'
+      && metadata.workflowName.trim()
+      && typeof metadata.workflowRunId === 'string'
+      && metadata.workflowRunId.trim()
+      && typeof metadata.stepId === 'string'
+      && metadata.stepId.trim()
+      && typeof metadata.sessionIdSuffix === 'string'
+      && metadata.sessionIdSuffix.trim()
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Load the one accepted-source graph and project only its authority fields. */
 export function expectedTaskFor(sessionId: string, sourceUserSeq: number): ExpectedTaskState {
   let graphEvent: EventRow | null;
@@ -188,18 +226,27 @@ export function expectedTaskFor(sessionId: string, sourceUserSeq: number): Expec
   const candidates = workNodes(graph);
   const aggregate = candidates.length > 1 ? aggregateWorkOwner(graph, candidates) : null;
   const nonConversational = graph.classification.route !== 'direct_reply';
-  const binderPresent = !nonConversational || expectedWorkBinderPresent(sessionId, sourceUserSeq, graph);
-  // ARM ONLY WHAT THE LANE CAN DISCHARGE. Where a binding writer exists
-  // (host engines; the background/cron carrier), the full binding-requiring
-  // contract arms and the strict adjudication below owns the close. Where no
-  // writer exists (the workflow surface today), the source projects
-  // conversation-shaped: per-call settlement, effect gates, and approvals
-  // still protect every crossing, and the shadow graph stays recorded.
-  // Refusing instead was tried live (2026-08-26, first post-land smoke) and
-  // killed 100% of workflow runs at admission — a wall, not a verification.
-  // When the workflow surface gains the same carrier, the capability test
-  // above extends the strict path to it with no change here.
-  if (nonConversational && !binderPresent) {
+  const binderPresent = !nonConversational
+    || expectedWorkBinderPresent(sessionId, sourceUserSeq, graph);
+  const workflowExecutionOwner = nonConversational
+    && workflowGraphExecutionOwnerPresent(sessionId, graph);
+  // A missing binder cannot weaken a persisted work graph into conversation.
+  // Conversation has no expected-work obligations; this graph does. Until the
+  // selected engine proves it can write those bindings, or the exact workflow
+  // graph owner proves its separately constrained execution surface, there is
+  // no authority to start execution.
+  if (nonConversational && !binderPresent && !workflowExecutionOwner) {
+    return {
+      status: 'ambiguous',
+      reason: 'non-conversational graph has no expected-work binding writer',
+    };
+  }
+  // The workflow runner, not the interactive work_call binder, owns calls and
+  // settlement for this exact node. Preserve the historical conversation-
+  // shaped resolution projection only for that typed owner; the durable graph
+  // remains recorded and every physical crossing still traverses the ordinary
+  // logical/settlement/approval walls.
+  if (workflowExecutionOwner && !binderPresent) {
     return {
       status: 'ok',
       graph,

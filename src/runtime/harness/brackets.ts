@@ -4,6 +4,8 @@ import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutput
 import type { ConversationPreambleDeliveryCallback } from '../../types.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import {
+  copyHostPlanningReadCapabilityResolver,
+  copyHostSingleActionPlanCapabilityResolver,
   copyHostWorkCallPreparer,
   isHostPlanRequiredWorkCall,
 } from '../../tools/work-call-mode.js';
@@ -64,6 +66,7 @@ import {
   classifyRuntimeToolEffect,
   projectCanonicalTopLevelToolEvents,
   unwrapRuntimeEffectiveToolIdentity,
+  type RuntimeToolEffect,
 } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 import {
@@ -151,17 +154,18 @@ import {
   bindClaimedArtifact,
   claimArtifactSlot,
   extractArtifactResource,
+  extractArtifactResourceFromSuccessfulSettlement,
   markClaimedArtifactUncertain,
   releaseClaimedArtifact,
   resolveArtifactRunScopeId,
   scopeArtifactIntentForObjective,
   verifyArtifactBindingFromToolResult,
   verifyGeneratedArtifactContentFromToolResult,
-  verifyHostSealedArtifactContentFromReadback,
+  verifyHostSealedArtifactContentFromSettledReadback,
   type ArtifactIntent,
 } from './artifact-ledger.js';
-import { exactProviderDataPayload } from './provider-read-evidence.js';
-import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
+import { compileAtomicInputContentContract } from './atomic-input-content-contract.js';
+import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
   assertDispatchLeaseCurrent,
@@ -1147,6 +1151,11 @@ export class RecallBudget {
 
 export interface HarnessRunContext {
   sessionId: string;
+  /** True only for the user-facing chat orchestrator. Router-owned UX timing
+   * policies must require this positive authority rather than inferring from a
+   * session-id spelling; background/workflow/worker work remains unbounded by
+   * foreground latency policy. */
+  interactiveForeground?: boolean;
   /** Exact physical harness turn owning canonical tool and auxiliary evidence. */
   turn?: number;
   counter: ToolCallsCounter;
@@ -1160,6 +1169,10 @@ export interface HarnessRunContext {
    * Nested wrappers must consume that signal and must not create a second
    * timer or settlement owner. */
   hostOwnsToolDeadlineAndSettlement?: boolean;
+  /** Exact effect frozen by invokeHostToolCall for this child generation.
+   * Post-body control code may use it only to preserve an already-observed
+   * non-mutating result; absent/unknown/mutating effects remain fail-closed. */
+  hostOwnedToolEffect?: RuntimeToolEffect;
   /** Exact physical provider/Runner generation allowed to dispatch tools.
    * Transport cancellation is best-effort; this durable lease is checked at
    * tool entry and again immediately before provider/local execution. */
@@ -1280,6 +1293,39 @@ export interface HarnessRunContext {
   resolvedToolkitAccounts?: Map<string, Map<string, { identity?: string; explicit: boolean }>>;
 }
 
+const HOST_POST_RESULT_RECOVERY_EFFECTS = new Set<RuntimeToolEffect>([
+  'read',
+  'compute',
+  'host_only',
+]);
+
+/**
+ * A post-result loop backstop is control flow, not a new statement about the
+ * invocation's effect. Once the host-owned child has observed exact bytes for
+ * a frozen non-mutating effect, return those same bytes to the host so its
+ * normal settlement/checkpoint/no-progress owners can decide the next step.
+ *
+ * This deliberately excludes every pre-body escalation and every local,
+ * external, admin, or unknown mutation. It also requires the guardrail's
+ * independently classified effect to agree with the frozen host contract.
+ */
+export function hostOwnsObservedGuardrailResult(input: Readonly<{
+  hostOwnsToolDeadlineAndSettlement?: boolean;
+  frozenEffect?: RuntimeToolEffect;
+  decision: Readonly<{
+    action: string;
+    rule: string;
+    effect?: RuntimeToolEffect;
+  }>;
+}>): boolean {
+  return input.hostOwnsToolDeadlineAndSettlement === true
+    && input.decision.action === 'escalate'
+    && input.decision.rule === 'semantic_result_repeat'
+    && input.frozenEffect !== undefined
+    && HOST_POST_RESULT_RECOVERY_EFFECTS.has(input.frozenEffect)
+    && input.decision.effect === input.frozenEffect;
+}
+
 /** The tracker scope a call registers under. EXEMPT lanes (nested-dispatch calls,
  *  certified-batch items, workers) get their OWN window so their reads never
  *  inflate the ORCHESTRATOR's direct-read fanout counts — otherwise a batch/
@@ -1391,6 +1437,91 @@ type HarnessBoundToolAttestation = Readonly<{
  */
 const harnessBoundToolAttestations = new WeakMap<object, HarnessBoundToolAttestation>();
 
+export type ToolLocalInputInvalidity = 'invalid' | 'unproven';
+
+export type ToolLocalInputInvalidityValidator = (input: Readonly<{
+  rawInput: unknown;
+  parsedInput: unknown;
+}>) => ToolLocalInputInvalidity;
+
+type ToolLocalInputInvalidityAttestation = Readonly<{
+  name: string;
+  invoke: Function;
+  validate: ToolLocalInputInvalidityValidator;
+}>;
+
+/**
+ * Register one pure, exact-SDK-invoke proof that malformed input will be
+ * refused before any provider/effect body. Local parser/refusal code may still
+ * run so it can return typed repair guidance. The proof can attest only the
+ * negative fact `invalid`: `unproven`, a throw, a copied tool, or executable
+ * mutation keeps every ordinary authority/effect gate in place.
+ *
+ * This is deliberately object-identity authority rather than tool-name or
+ * provider-name inference. It lets local validation report typed repair
+ * guidance before an unknown-effect fail-closed gate, without granting any
+ * valid call permission to dispatch.
+ */
+const toolLocalInputInvalidityAttestations = new WeakMap<object, ToolLocalInputInvalidityAttestation>();
+
+export function attestToolLocalInputInvalidity<T extends object>(
+  tool: T,
+  validate: ToolLocalInputInvalidityValidator,
+): T {
+  const candidate = tool as { name?: unknown; invoke?: unknown };
+  if (typeof candidate.invoke !== 'function') {
+    throw new Error('local input invalidity attestation requires one exact SDK invoke function');
+  }
+  toolLocalInputInvalidityAttestations.set(tool, Object.freeze({
+    name: typeof candidate.name === 'string' ? candidate.name : '',
+    invoke: candidate.invoke,
+    validate,
+  }));
+  return tool;
+}
+
+function currentToolLocalInputInvalidityAttestation(
+  tool: object,
+): ToolLocalInputInvalidityAttestation | null {
+  const attestation = toolLocalInputInvalidityAttestations.get(tool);
+  if (!attestation) return null;
+  const candidate = tool as { name?: unknown; invoke?: unknown };
+  if (
+    attestation.name !== (typeof candidate.name === 'string' ? candidate.name : '')
+    || attestation.invoke !== candidate.invoke
+  ) return null;
+  return attestation;
+}
+
+function exactToolInputIsLocallyInvalid(
+  tool: object,
+  rawInput: unknown,
+  parsedInput: unknown,
+): boolean {
+  const attestation = currentToolLocalInputInvalidityAttestation(tool);
+  if (!attestation) return false;
+  try {
+    return attestation.validate(Object.freeze({ rawInput, parsedInput })) === 'invalid';
+  } catch {
+    return false;
+  }
+}
+
+function copyToolLocalInputInvalidityAttestation<T extends object>(source: object, target: T): T {
+  const sourceAttestation = currentToolLocalInputInvalidityAttestation(source);
+  if (!sourceAttestation) return target;
+  const candidate = target as { name?: unknown; invoke?: unknown };
+  if (typeof candidate.invoke !== 'function') {
+    throw new Error('wrapped local input invalidity attestation lost its SDK invoke function');
+  }
+  toolLocalInputInvalidityAttestations.set(target, Object.freeze({
+    name: typeof candidate.name === 'string' ? candidate.name : '',
+    invoke: candidate.invoke,
+    validate: sourceAttestation.validate,
+  }));
+  return target;
+}
+
 function attestHarnessBoundTool<T extends object>(tool: T): T {
   const candidate = tool as {
     name?: unknown;
@@ -1421,15 +1552,13 @@ export function isHarnessBoundFunctionTool(tool: unknown): boolean {
 }
 
 // Tool reliability brackets — per-tool wall-clock timeout + identical-args
-// loop-guard (soft block@5 through 11, terminal escalate@12) + counter cap. DEFAULT-ON (2026-06-07): the
-// 24/7 audit proved these are the live wedge — a hung external tool had no
-// timeout and a runaway reached 77-81x identical calls because this block was
-// off by default. Timeouts are generous (mcp/shell 10min, externalApi 5min;
-// timeoutForTool) so a legitimate long tool isn't killed, and reads/polls are
-// demoted to warn so only identical-args MUTATING loops hard-stop. Kill-switch:
-// HARNESS_TOOL_BRACKETS=off. Read via getRuntimeEnv so the .env value applies
-// under launchd too (where process.env isn't merged).
+// loop-guard (soft block@5 through 11, terminal escalate@12) + counter cap.
+// Production is unconditionally enabled: a raw tool must never escape because
+// a daemon, channel, workflow, or cron inherited an obsolete env value. The
+// historical flag remains only as a disposable-test seam, and only when the
+// process has explicitly proven it owns an isolated Clementine home.
 export function harnessToolBracketsEnabled(): boolean {
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME !== '1') return true;
   return (getRuntimeEnv('HARNESS_TOOL_BRACKETS', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
@@ -1745,7 +1874,8 @@ function resolvedUserNamedDestinationIds(resultText: string, userBlob: string): 
 
 /**
  * Wrap a tool so its execute fires the three reliability checks at the
- * entry edge. Gated by HARNESS_TOOL_BRACKETS (default ON; =off kill-switch).
+ * entry edge. Production always wraps; an explicitly isolated test process
+ * may set HARNESS_TOOL_BRACKETS=off for a disposable fixture.
  *
  * When disabled, returns the tool unchanged. When on, returns a new object
  * with a wrapped `execute`/`invoke`. The original tool is not mutated.
@@ -2519,6 +2649,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     settlementNonce?: string,
     claimBeforeAccounting?: () => ArtifactAdmission,
     deferDiscoveryAdmission = false,
+    inputLocallyInvalid = false,
   ): Promise<BracketOutcome | undefined> => {
     const ctx = harnessRunContextStorage.getStore();
     if (!ctx) return; // no context = test fixture or out-of-band call; brackets degrade
@@ -2542,7 +2673,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // those structurally invalid envelopes here to retain a deterministic loop
     // ceiling without applying any outer effect/write gate. A valid envelope is
     // charged exactly once by either its validated inner call or execute.refuse.
-    if (isNestedDispatchCarrier(tool.name)) {
+    if (inputLocallyInvalid && !ctx.hostOwnsToolAccounting) {
+      if (ctx.counter.willExceed()) throw new ToolCallsLimitExceeded(ctx.counter.limit);
+      ctx.counter.increment();
+    }
+    const nestedCarrier = isNestedDispatchCarrier(tool.name);
+    if (nestedCarrier) {
       const structurallyValid = nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool);
       if (!structurallyValid) {
         if (!ctx.hostOwnsToolAccounting) {
@@ -2562,7 +2698,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // existing slot therefore refuses a duplicate without pretending another
     // provider mutation was attempted. If a later bracket refuses this newly
     // acquired claim, the wrapper releases it before surfacing the refusal.
-    const artifactAdmission = claimBeforeAccounting?.();
+    const artifactAdmission = inputLocallyInvalid ? undefined : claimBeforeAccounting?.();
     if (artifactAdmission?.deny) throw new ArtifactReuseDenied(artifactAdmission.deny);
     // 2. Counter cap (pre-increment). The call_tool dispatcher is exempt:
     // it delegates to dispatchBatchItemTool, whose INNER tool rides this
@@ -2570,7 +2706,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // bill every deferred action twice, halving the effective budget on the
     // schema-on-demand lane. The inner charge is the real one; loop
     // detection below still evaluates the outer call.
-    if (!ctx.hostOwnsToolAccounting && !isNestedDispatchCarrier(tool.name)) {
+    if (!inputLocallyInvalid && !ctx.hostOwnsToolAccounting && !isNestedDispatchCarrier(tool.name)) {
       if (ctx.counter.willExceed()) {
         throw new ToolCallsLimitExceeded(ctx.counter.limit);
       }
@@ -2721,6 +2857,11 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] tool guardrail evaluation threw (fail-open)', err instanceof Error ? err.message : err);
     }
+    // One exact tool-local proof says only that these bytes cannot reach the
+    // tool's provider/effect body. Keep kill, dispatch-lease, accounting, and
+    // loop protection above; skip the authority/effect gates below, then let
+    // the real SDK validator produce and settle its typed refusal.
+    if (inputLocallyInvalid) return { carrierMalformed: true };
     // A direct, non-poll Composio read that already returned verified data for
     // this EXACT accepted source is settled work. Recover its authoritative
     // bytes instead of paying the provider again. Current production retries
@@ -3732,8 +3873,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
       effectiveTurnObjective(sessionId, recordedObjective, ctx.sourceUserSeq),
       parsedInput,
     );
-    const contentContract = expectedBinding?.generatedArtifactContentContract
-      ?? compileGoogleSheetsSheetFromJsonContract(tool.name, parsedInput);
+    const effective = unwrapRuntimeEffectiveToolIdentity(tool.name, parsedInput);
+    const atomicDeclaration = effective.toolName
+      ? currentManifestOperationSemantics(effective.toolName)?.semantics.atomicInputContent
+      : undefined;
+    const contentContract = expectedBinding
+      ? expectedBinding.generatedArtifactContentContract ?? null
+      : atomicDeclaration
+        ? compileAtomicInputContentContract({
+            declaration: atomicDeclaration,
+            providerArguments: effective.args,
+          })
+        : null;
     const claim = claimArtifactSlot(
       sessionId,
       intent,
@@ -3748,6 +3899,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     dispatch: ArtifactDispatch | undefined,
     result: unknown,
     shellOutcome?: ShellExecutionOutcome,
+    ctx?: HarnessRunContext,
   ): void => {
     if (!dispatch) return;
     try {
@@ -3755,7 +3907,27 @@ export function wrapToolForHarness<T extends WrappableTool>(
         releaseClaimedArtifact(dispatch.artifactId, dispatch.callId);
         return;
       }
-      const resource = extractArtifactResource(dispatch.intent, result);
+      const logical = currentLogicalCall();
+      const settled = logical
+        && ctx?.sessionId === dispatch.sessionId
+        && Number.isSafeInteger(ctx.sourceUserSeq)
+        && (ctx.sourceUserSeq ?? 0) > 0
+        && logical.logicalToolCallId === dispatch.callId
+        ? extractArtifactResourceFromSuccessfulSettlement({
+            intent: dispatch.intent,
+            sessionId: ctx.sessionId,
+            sourceUserSeq: ctx.sourceUserSeq as number,
+            acceptedTaskId: logical.acceptedTaskId,
+            logicalToolCallId: logical.logicalToolCallId,
+          })
+        : { status: 'missing' as const };
+      if (settled.status === 'conflict') {
+        markClaimedArtifactUncertain(dispatch.artifactId, dispatch.callId);
+        return;
+      }
+      const resource = settled.status === 'settled'
+        ? settled.resource
+        : extractArtifactResource(dispatch.intent, result);
       if (resource) {
         bindClaimedArtifact(dispatch.artifactId, dispatch.callId, resource);
       } else {
@@ -3863,28 +4035,19 @@ export function wrapToolForHarness<T extends WrappableTool>(
         && (ctx.sourceUserSeq ?? 0) > 0
       ) {
         const effective = unwrapRuntimeEffectiveToolIdentity(tool.name, parsedInput);
-        const payload = exactProviderDataPayload(result);
         if (
           effective.toolName
           && effective.args
           && typeof effective.args === 'object'
           && !Array.isArray(effective.args)
-          && payload
-          && typeof payload === 'object'
-          && !Array.isArray(payload)
         ) {
-          const readback = payload as { id?: unknown; content?: unknown };
-          if (typeof readback.id === 'string' && readback.content !== undefined) {
-            verifyHostSealedArtifactContentFromReadback({
-              sessionId: ctx.sessionId,
-              sourceUserSeq: ctx.sourceUserSeq as number,
-              verificationLogicalToolCallId: callId,
-              readToolName: effective.toolName,
-              readArgs: effective.args,
-              returnedResourceId: readback.id,
-              readContent: readback.content,
-            });
-          }
+          verifyHostSealedArtifactContentFromSettledReadback({
+            sessionId: ctx.sessionId,
+            sourceUserSeq: ctx.sourceUserSeq as number,
+            verificationLogicalToolCallId: callId,
+            readToolName: effective.toolName,
+            readArgs: effective.args,
+          });
         }
       }
     } catch {
@@ -3938,6 +4101,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           parsedInput = input;
         }
       }
+      const inputLocallyInvalid = exactToolInputIsLocallyInvalid(tool, input, parsedInput);
       // A malformed carrier cannot be admitted under its arbitrary raw bytes:
       // strings and partial envelopes are not callable contracts. Bind the one
       // refusal to a safe host-owned OUTER identity instead. No inner tool is
@@ -3949,7 +4113,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // POISONS this accepted task's resolution: one bad payload would refuse
       // every remaining tool call of the turn instead of returning the ordinary
       // invalid-arguments error and letting the model retype the call.
-      const logicalContractArgs = !logicalCallArgumentsAreContractible(tool.name, parsedInput)
+      const logicalContractArgs = inputLocallyInvalid
+        || !logicalCallArgumentsAreContractible(tool.name, parsedInput)
         || (isNestedDispatchCarrier(tool.name)
           && !nestedDispatchCarrierInputIsStructurallyValid(tool.name, parsedInput, tool))
         ? { carrier: tool.name, malformed: true, version: 1 }
@@ -3971,7 +4136,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // the 2026-07-19 fabricated-recipients incident). No-op for every call
       // without the syntax (all traffic today). Fail-closed: an unresolvable
       // reference returns a soft, recoverable error and the tool does NOT run.
-      if (toolOutputReferenceResolutionEnabled() && hasToolOutputReference(parsedInput)) {
+      if (!inputLocallyInvalid && toolOutputReferenceResolutionEnabled() && hasToolOutputReference(parsedInput)) {
         const refResolution = resolveToolOutputReferences(ctx?.sessionId ?? '', parsedInput);
         if (refResolution.errors.length > 0) {
           return JSON.stringify({
@@ -4020,6 +4185,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
             return artifact;
           },
           true,
+          inputLocallyInvalid,
         );
         fanoutNudge = bracketOutcome?.advisory;
         if (bracketOutcome?.settledReadReplay) {
@@ -4299,7 +4465,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
               : {}),
           });
         }
-        settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome);
+        settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome, ctx);
         settleArtifactReadback(ctx, parsedInput, exactEvidenceResult, invokeCallId);
         recordExternalWriteSettlement(
           ctx?.sessionId,
@@ -4325,7 +4491,18 @@ export function wrapToolForHarness<T extends WrappableTool>(
         // Poll-vs-loop discrimination: record the result fingerprint so the
         // exact-args guardrail can tell a progressing status poll from a
         // genuine loop (live 2026-07-23).
-        if (ctx) { try { noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, outwardResult); } catch { /* advisory */ } }
+        let semanticLoopDecision: ReturnType<typeof noteGuardrailToolResult>;
+        if (ctx) { try { semanticLoopDecision = noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, outwardResult); } catch { /* advisory */ } }
+        if (
+          semanticLoopDecision?.action === 'escalate'
+          && !hostOwnsObservedGuardrailResult({
+            hostOwnsToolDeadlineAndSettlement: ctx?.hostOwnsToolDeadlineAndSettlement,
+            frozenEffect: ctx?.hostOwnedToolEffect,
+            decision: semanticLoopDecision,
+          })
+        ) {
+          throw new ToolGuardrailEscalated(semanticLoopDecision);
+        }
         // OBSERVED COST + REDIRECT HEALTH: the fan-out ladder decides from what
         // calls actually cost and whether the batch program it prescribes is
         // succeeding. Both are facts only the RESULT carries, so they are
@@ -4520,6 +4697,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
       return invokeBody();
     };
     const wrapped = { ...tool, invoke: wrappedInvoke } as T;
+    copyToolLocalInputInvalidityAttestation(tool, wrapped);
+    copyHostPlanningReadCapabilityResolver(tool, wrapped);
+    copyHostSingleActionPlanCapabilityResolver(tool, wrapped);
     copyHostWorkCallPreparer(tool, wrapped);
     copyTerminalPhysicalDispatchOwnership(tool, wrapped);
     return attestHarnessBoundTool(wrapped) as T;
@@ -4810,7 +4990,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : {}),
       });
     }
-    settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome);
+    settleArtifact(artifact.dispatch, exactEvidenceResult, shellOutcome, ctx);
     settleArtifactReadback(ctx, input, exactEvidenceResult, executeCallId);
     recordExternalWriteSettlement(
       ctx?.sessionId,
@@ -4866,6 +5046,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
     return executeBody();
   };
   const wrapped = { ...tool, execute: wrappedExecute } as T;
+  copyHostPlanningReadCapabilityResolver(tool, wrapped);
+  copyHostSingleActionPlanCapabilityResolver(tool, wrapped);
+  copyHostWorkCallPreparer(tool, wrapped);
   copyTerminalPhysicalDispatchOwnership(tool, wrapped);
   return attestHarnessBoundTool(wrapped) as T;
 }

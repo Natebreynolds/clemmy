@@ -698,7 +698,20 @@ async function performFullScan(opts: { concurrency?: number } = {}): Promise<Cli
   // where one that left $PATH stops being one.
   try {
     const { indexDiscoveredClis, scheduleLocalCapabilityIndex } = await import('./local-capability-enumeration.js');
-    scheduleLocalCapabilityIndex(async () => { indexDiscoveredClis(result.clis); });
+    scheduleLocalCapabilityIndex(async () => {
+      indexDiscoveredClis(result.clis);
+      // A PATH row names a binary and can never carry an effect, so it is
+      // findable but never citable. A reviewed catalog read is the same CLI
+      // expressed as ONE operation with a fixed argv and effect:'read' — the
+      // only shape plan_task can admit. Reconciling here means every path that
+      // refreshes the inventory also refreshes what is actually plannable,
+      // which is what this seam already promises above. Best-effort: a
+      // reviewed-read failure must never break CLI discovery.
+      try {
+        const { reconcileCatalogReviewedCliReads } = await import('./harness/catalog-reviewed-cli-reconcile.js');
+        await reconcileCatalogReviewedCliReads({ rehash: false });
+      } catch { /* discovery still stands on its own */ }
+    });
   } catch { /* indexing never blocks discovery */ }
   return result;
 }

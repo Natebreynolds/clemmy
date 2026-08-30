@@ -21,7 +21,7 @@
  * approval gates carry that protection now.)
  */
 
-import { tokenize } from '../shared/workflow-scoring.js';
+import { stemToken } from '../shared/workflow-scoring.js';
 
 /** A workflow as the resolver sees it: just its display name + dir slug. */
 export interface ResolverEntry {
@@ -68,10 +68,35 @@ function compact(value: string): string {
  * one token. Deliberately tiny — enough to bridge the gap between how a user
  * speaks ("prospecting") and how a slug reads ("prospect"), not a real stemmer.
  */
-/** Distinctive, stemmed content tokens of a string (no stopwords/filler).
- *  Uses the canonical tokenizer with this matcher's stopword policy + stemming. */
+/**
+ * Distinctive content tokens, in order.
+ *
+ * Numeric catalog identity ("49" in platform-49) is kept even when shorter
+ * than MIN_TOKEN_LEN — those digits are the name, not filler. Action verbs
+ * and cadence words stay dropped so "Can you run my platform 49 workflow"
+ * compact-matches the slug instead of swallowing it in the whole sentence.
+ */
+function orderedContentTokens(value: string): string[] {
+  const out: string[] = [];
+  for (const raw of (value ?? '').toLowerCase().split(/[^a-z0-9]+/)) {
+    if (!raw || STOPWORDS.has(raw)) continue;
+    if (/^\d+$/.test(raw)) {
+      out.push(raw);
+      continue;
+    }
+    if (raw.length < MIN_TOKEN_LEN) continue;
+    const stemmed = stemToken(raw);
+    if (stemmed.length >= MIN_TOKEN_LEN && !STOPWORDS.has(stemmed)) out.push(stemmed);
+  }
+  return out;
+}
+
 function contentTokens(value: string): Set<string> {
-  return new Set(tokenize(value, { minLen: MIN_TOKEN_LEN, stopwords: STOPWORDS, stem: true }));
+  return new Set(orderedContentTokens(value));
+}
+
+function contentCompact(value: string): string {
+  return orderedContentTokens(value).join('');
 }
 
 /** Tokens that identify an entry: union of its name + slug content tokens. */
@@ -89,35 +114,42 @@ function entryTokens(entry: ResolverEntry): Set<string> {
  *   - otherwise (matched entry-tokens / entry-token count): the share of the
  *     workflow's distinctive words the user actually said.
  */
-function scoreEntry(qTokens: Set<string>, qCompact: string, entry: ResolverEntry): number {
+function scoreEntry(
+  qTokens: Set<string>,
+  qRawCompact: string,
+  qContentCompact: string,
+  entry: ResolverEntry,
+): number {
   const nameCompact = compact(entry.name);
   const slugCompact = compact(entry.slug);
   let containment = 0;
-  if (qCompact.length >= 4) {
-    for (const hay of [nameCompact, slugCompact]) {
-      if (hay.length < 4) continue;
-      // The user said the workflow's compact name/slug.
-      if (qCompact.includes(hay)) {
-        containment = 0.9;
-        break;
-      }
-      // Abbreviation of the name ("prospectprep" ⊂ "morningprospectprep").
-      // A short leftover token ("review" ⊂ "weeklyreview") is not a name.
-      if (qCompact.length >= 8 && hay.includes(qCompact)) {
-        containment = 0.9;
-        break;
-      }
+  for (const hay of [nameCompact, slugCompact]) {
+    if (hay.length < 4) continue;
+    // The user said the workflow's compact name/slug, even inside action
+    // filler ("run my nightly digest" contains "nightlydigest"). Cadence
+    // words are stopwords for TOKEN scoring, but they still appear in the
+    // saved name, so the raw compact must keep them for this direction.
+    if (qRawCompact.includes(hay) || (qContentCompact.length >= 4 && qContentCompact.includes(hay))) {
+      containment = 0.9;
+      break;
+    }
+    // Abbreviation of the name after stripping action filler
+    // ("platform49" ⊂ "platform49slackchannelreview"). A short leftover
+    // token ("review" ⊂ "weeklyreview") is not a name.
+    if (qContentCompact.length >= 8 && hay.includes(qContentCompact)) {
+      containment = 0.9;
+      break;
     }
   }
   const eTokens = entryTokens(entry);
   let tokenScore = 0;
-  // A one-token leftover after cadence stopwords ("weekly-review" → "review")
-  // is not unique identity. "scrape their reviews" must not dispatch that
-  // workflow; "run my facebook trends" still can (2 of 3 name tokens).
+  // A one-token leftover after cadence stopwords ("weekly-review" → "review",
+  // or "digest" against "nightly-digest") is not unique identity. Two of the
+  // workflow's distinctive tokens still can ("run my facebook trends").
   if (eTokens.size >= 2 && qTokens.size > 0) {
     let matched = 0;
     for (const t of eTokens) if (qTokens.has(t)) matched += 1;
-    tokenScore = matched / eTokens.size;
+    if (matched >= 2) tokenScore = matched / eTokens.size;
   }
   return Math.max(containment, tokenScore);
 }
@@ -138,8 +170,9 @@ export function resolveWorkflowName(query: string, entries: ResolverEntry[]): Wo
   }
 
   const qTokens = contentTokens(query);
+  const qContentCompact = contentCompact(query);
   const scored = entries
-    .map((e) => ({ name: e.name, score: scoreEntry(qTokens, qCompact, e) }))
+    .map((e) => ({ name: e.name, score: scoreEntry(qTokens, qCompact, qContentCompact, e) }))
     .sort((a, b) => b.score - a.score);
 
   const viable = scored.filter((s) => s.score >= FUZZY_MIN);

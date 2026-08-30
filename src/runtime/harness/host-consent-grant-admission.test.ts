@@ -57,7 +57,7 @@ function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-test('real prepared host consent grants only A, rejects sibling B, and redeems once', async () => {
+test('once-null transport repair reaches real host consent, grants only A, rejects sibling B, and redeems once', async () => {
   const operationId = 'EXAMPLE_SEND_EMAIL';
   const accountId = 'account:consent:email-owner';
   const capabilityId = 'cap:consent:send-email';
@@ -318,7 +318,9 @@ test('real prepared host consent grants only A, rejects sibling B, and redeems o
   const outerArgs = {
     proposal: null,
     requirement_id: requirement.id,
-    universe_item_id: null,
+    // Live-shaped nullable-control drift: this is normalized only because the
+    // reopened frozen requirement below is cardinality-once.
+    universe_item_id: 'null',
     universe_selector: null,
     seal_amendment: null,
     name: 'composio_execute_tool',

@@ -7,6 +7,14 @@ import {
   getByoProviders, resolveByoProviderForModel, resolveDeclaredByoProviderForModel,
   byoProviderKeyEnvKey, slugifyProviderId, serializeExtraProviders, getByoProviderSnapshots,
   normalizeModelsList, resolveEffectiveProviderForModel, unqualifiedModelCollisionReason,
+  captureByoRoutingSnapshot,
+  configuredByoProvidersForModel,
+  configuredByoProvidersForModelFromSnapshot,
+  getByoProviderSnapshotsFromRoutingSnapshot,
+  resolveByoProviderForModelFromSnapshot,
+  resolveDeclaredByoProviderForModelFromSnapshot,
+  resolveEffectiveProviderForModelFromSnapshot,
+  unqualifiedModelCollisionReasonFromSnapshot,
   recordDiscoveredProviderModels,
   readDiscoveredProviderModels,
 } from './byo-providers.js';
@@ -19,7 +27,7 @@ const ENV_KEYS = [
   'BYO_PROVIDERS', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_JUDGE_ID',
   'BYO_MODEL_API_KEY', 'BYO_MODEL_PROVIDER', 'OPENAI_MODEL_WORKER',
   'BYO_PROVIDER_MINIMAX_API_KEY', 'BYO_PROVIDER_DEEPSEEK_API_KEY',
-  'BYO_PROVIDER_TOGETHER_API_KEY',
+  'BYO_PROVIDER_TOGETHER_API_KEY', 'MODEL_ROUTING_MODE',
 ];
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
   const saved: Record<string, string | undefined> = {};
@@ -49,6 +57,91 @@ const EXTRAS = JSON.stringify([
   { id: 'minimax', label: 'MiniMax', baseURL: MINIMAX, modelIds: ['MiniMax-M3'] },
   { id: 'deepseek', label: 'DeepSeek', baseURL: DEEPSEEK, modelIds: ['deepseek-chat'] },
 ]);
+
+function syncOutcome<T>(fn: () => T): { ok: true; value: T } | { ok: false; message: string } {
+  try {
+    return { ok: true, value: fn() };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+test('canonical routing wrappers and one-snapshot helpers are deeply equivalent across routing modes and collisions', () => {
+  withEnv({
+    BYO_MODEL_BASE_URL: ZAI,
+    BYO_MODEL_ID: 'glm-5.2',
+    BYO_MODEL_JUDGE_ID: 'shared-model',
+    BYO_MODEL_API_KEY: 'zai-key',
+    BYO_MODEL_PROVIDER: 'GLM (Z.ai)',
+    BYO_PROVIDERS: JSON.stringify([
+      {
+        id: 'together',
+        label: 'Together',
+        baseURL: TOGETHER,
+        modelIds: ['together/model', 'gpt-4o', 'claude-custom', 'shared-model'],
+      },
+      {
+        id: 'minimax',
+        label: 'MiniMax',
+        baseURL: MINIMAX,
+        modelIds: ['shared-model'],
+      },
+    ]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
+    BYO_PROVIDER_MINIMAX_API_KEY: 'minimax-key',
+    MODEL_ROUTING_MODE: 'all_in',
+  }, () => {
+    const snapshot = captureByoRoutingSnapshot();
+    const modelIds = [
+      '',
+      'glm-5.2',
+      'together/model',
+      'gpt-4o',
+      'claude-custom',
+      'claude-opus-4-8',
+      'shared-model',
+      'unclaimed-model',
+    ];
+
+    assert.deepEqual(
+      getByoProviderSnapshotsFromRoutingSnapshot(snapshot),
+      getByoProviderSnapshots(),
+      'settings serialization uses the same canonical provider view',
+    );
+
+    for (const modelId of modelIds) {
+      assert.deepEqual(
+        configuredByoProvidersForModelFromSnapshot(modelId, snapshot)
+          .map(({ provider }) => ({ ...provider, modelIds: [...provider.modelIds] })),
+        configuredByoProvidersForModel(modelId),
+        `configured owners agree for ${modelId || '<empty>'}`,
+      );
+      assert.deepEqual(
+        syncOutcome(() => resolveByoProviderForModelFromSnapshot(modelId, snapshot)),
+        syncOutcome(() => resolveByoProviderForModel(modelId)),
+        `BYO resolver agrees for ${modelId || '<empty>'}`,
+      );
+      assert.deepEqual(
+        syncOutcome(() => resolveDeclaredByoProviderForModelFromSnapshot(modelId, snapshot)),
+        syncOutcome(() => resolveDeclaredByoProviderForModel(modelId)),
+        `declared-BYO resolver agrees for ${modelId || '<empty>'}`,
+      );
+
+      for (const mode of ['off', 'worker', 'all_in'] as const) {
+        assert.deepEqual(
+          syncOutcome(() => unqualifiedModelCollisionReasonFromSnapshot(modelId, snapshot, mode)),
+          syncOutcome(() => unqualifiedModelCollisionReason(modelId, mode)),
+          `collision policy agrees for ${modelId || '<empty>'} in ${mode}`,
+        );
+        assert.deepEqual(
+          syncOutcome(() => resolveEffectiveProviderForModelFromSnapshot(modelId, snapshot, mode)),
+          syncOutcome(() => resolveEffectiveProviderForModel(modelId, mode)),
+          `effective provider agrees for ${modelId || '<empty>'} in ${mode}`,
+        );
+      }
+    }
+  });
+});
 
 test('each model id routes to its OWN provider (GLM brain / DeepSeek worker / MiniMax judge)', () => {
   withEnv({

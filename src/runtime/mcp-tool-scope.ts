@@ -1,5 +1,7 @@
 import { listToolChoices, matchToolChoicesForStep, type StepToolChoiceMatch } from '../memory/tool-choice-store.js';
 import { acceptedPhraseDigest } from '../memory/capability-alias-index.js';
+import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
+import { resolveComposioMcpScopeCandidates } from '../integrations/composio/mcp-scope-adapter.js';
 
 /**
  * What this turn is ALLOWED to run — deliberately not the same question as what
@@ -121,11 +123,21 @@ export interface ResolveMcpToolScopeOptions {
   userInput?: string | null;
   configuredServerNames?: string[];
   /**
-   * Distinguishing labels of the user's pinned-calendar rules (from
-   * constraint-guard's pinnedCalendarRuleLabels). Lets a date shorthand that
-   * names the org ("check <org> tomorrow") scope the Outlook tools.
+   * Adapter-compiled, provider-neutral advertisement hints from sealed
+   * standing policies. These may widen the visible catalog; they never grant
+   * execution authority.
    */
-  pinnedCalendarLabels?: string[];
+  standingCapabilityHints?: McpStandingCapabilityHint[];
+}
+
+export interface McpStandingCapabilityHint {
+  adapterId: string;
+  intentLabels: string[];
+  requiresTemporalCue: boolean;
+  allowedServerSlugs: string[];
+  toolPatterns: string[];
+  priorityKeywords: string[];
+  maxTools: number;
 }
 
 /**
@@ -335,81 +347,22 @@ const SEO_RE =
   /\b(seo|audit|ranking|rankings|serp|keyword|keywords|backlink|backlinks|domain authority|organic traffic|search visibility|site health|technical audit|crawl|meta title|meta description|schema markup)\b/i;
 const WEB_RE =
   /\b(scrape|crawl|website|web page|webpage|article|news|browser|search the web|look up|research online|recent article)\b/i;
-const SALESFORCE_STRONG_RE = /\b(salesforce|sf cli|soql)\b/i;
-const SALESFORCE_OBJECT_RE = /\b(opportunit(?:y|ies)|account(?:s)?|lead(?:s)?|contact(?:s)?)\b/i;
-const SALESFORCE_CONTEXT_RE = /\b(crm|sales pipeline|salesforce pipeline|deal(?:s)?|prospect(?:s)?)\b/i;
-const OUTLOOK_RE = /\b(outlook|email|emails|inbox|meeting invite)\b/i;
-// "Calendar" and "draft" are overloaded artifact nouns (content calendar,
-// release calendar, contract draft, post drafts). Calendar access becomes
-// Outlook intent only when the user expresses an operational scheduling cue.
-// Explicit Outlook/email/inbox language remains a strong signal above.
-const CALENDAR_OPERATION_RE =
-  /\b(?:check|show|list|read|open|view|add|put|create|update|edit|delete|remove|schedule|book|move|reschedule|block|clear)\b[^.!?\n]{0,80}\b(?:my|our|team|work|personal)\s+calendar\b|\b(?:add|put|schedule|book|move|reschedule|block)\b[^.!?\n]{0,50}\b(?:to|on)\s+(?:the\s+)?calendar\b|\b(?:my|our|team|work|personal)\s+calendar\b|\bcalendar\s+(?:event|events|invite|invites|meeting|meetings|availability)\b/i;
-const EMAIL_DATA_FIELD_RE =
-  /\b(?:column|columns|field|fields|header|headers|property|properties|key|keys)\b[^.!?\n]{0,80}?\be-?mails?\b|\be-?mail\b\s+(?:column|field|address|value|missing|blank|data)\b/i;
-const EMAIL_DATA_LIST_RE =
-  /([,;|]\s*)e-?mail\b|\be-?mail\b(?=\s*(?:[,;|/]|and\b)\s*(?:company|name|contact|account|domain|phone|title|status|value|field|column|header)\b)/gi;
-const EMAIL_DATA_SHAPE_RE =
-  /\be-?mail[-\s]shaped\s+(?:string|strings|value|values|field|fields|data)\b/gi;
-const QUOTED_EMAIL_FIELD_RE =
-  /(["'])e-?mail\1(?=\s*[,:\]}])/gi;
-const STRUCTURED_TABULAR_CONTEXT_RE =
-  /\b(?:google\s+sheets?|googlesheets?|spreadsheet|worksheet|sheet\s+(?:range|row|rows|tab|cells?)|cell\s+data|matrix|tabular|headers?|columns?|value\s+range)\b/i;
-const CALENDAR_ARTIFACT_RE =
-  /\b(?:social(?:\s+media)?\s+)?(?:content|editorial|marketing|campaign|publishing|post|production|release|launch|roadmap)\s+calendar\b/gi;
-const NEGATED_OUTLOOK_ACTION_RE =
-  /\b(?:do\s+not|don't|dont|never|without)\s+(?:(?:send|sending|draft|drafting|read|reading|search|searching|check|checking|use|using|open|opening|call|calling|contact|contacting|access|accessing|query|querying|invoke|invoking|create|creating|schedule|scheduling)\s+)?(?:any\s+)?(?:outlook|e-?mail(?:s|ing|ed)?|inbox|calendar|meeting\s+invites?)(?:\s+(?:or|and)\s+(?:(?:send|sending|draft|drafting|read|reading|search|searching|check|checking|use|using|open|opening|call|calling|contact|contacting|access|accessing|query|querying|invoke|invoking|create|creating|schedule|scheduling)\s+)?(?:any\s+)?(?:outlook|e-?mail(?:s|ing|ed)?|inbox|calendar|meeting\s+invites?))?/gi;
-const NO_OUTLOOK_ACTION_RE =
-  /\bno\s+(?:outlook|e-?mail|mail|calendar)\s+(?:action|actions|tool|tools|call|calls|send|sends|draft|drafts|access)\b/gi;
-
-/**
- * Remove only email-as-data mentions before selecting Outlook tools. This is
- * intentionally a text projection rather than another broad negative regex:
- * a mixed request keeps its second operational mention ("columns company and
- * email, then email Bob"), while compact Sheet matrices such as
- * "company,email; Acme,acme@example.com" no longer preload an unrelated inbox.
- */
-function withoutStructuredEmailMentions(input: string): string {
-  const projected = STRUCTURED_TABULAR_CONTEXT_RE.test(input)
-    ? input.replace(QUOTED_EMAIL_FIELD_RE, '"structured_field"')
-    : input;
-  return projected
-    .replace(new RegExp(EMAIL_DATA_FIELD_RE.source, 'gi'), ' structured_field ')
-    .replace(EMAIL_DATA_LIST_RE, '$1structured_field')
-    .replace(EMAIL_DATA_SHAPE_RE, ' structured_data ');
-}
-
-/**
- * Project away explicit prohibitions before detecting Outlook intent. A
- * prohibition names a connector precisely so it will *not* be used; treating
- * that noun as positive intent both wastes schema budget and widens authority.
- * Mixed requests remain monotonic: only the negated action is removed, so
- * "do not send yet; draft an Outlook email" still exposes Outlook for the
- * positive draft clause.
- */
-function withoutNegatedOutlookMentions(input: string): string {
-  return withoutStructuredEmailMentions(input)
-    // "Content calendar" is an artifact/domain model, not a request to read or
-    // mutate the user's personal calendar. Project only that phrase away so a
-    // mixed ask ("build a content calendar, then add a meeting to Outlook")
-    // retains its separate operational Outlook clause.
-    .replace(CALENDAR_ARTIFACT_RE, ' planning_artifact ')
-    .replace(NEGATED_OUTLOOK_ACTION_RE, ' prohibited_outlook_action ')
-    .replace(NO_OUTLOOK_ACTION_RE, ' prohibited_outlook_action ');
-}
 const DATEISH_RE =
   /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week)|next (?:week|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|\d{1,2}\/\d{1,2}|\d{4}-\d{2}-\d{2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
-// A shorthand ask that names a pinned calendar's org label ("check <org>
-// tomorrow") is Outlook-calendar intent even without the word "calendar".
-// Labels come from the caller (constraint-guard's pinnedCalendarRuleLabels —
-// the user's own pinned-calendar constraint facts); nothing is hardcoded, and
-// this module stays pure. No pinned calendars → this never fires.
-function namesPinnedCalendarLabel(input: string, labels: string[] | undefined): boolean {
+// Match only adapter-compiled hint data. The shared scope kernel never maps a
+// remembered label to a provider name or tool family itself.
+function matchingStandingCapabilityHints(
+  input: string,
+  hints: McpStandingCapabilityHint[] | undefined,
+): McpStandingCapabilityHint[] {
   try {
-    return (labels ?? []).some((label) =>
-      new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(input));
+    return (hints ?? []).filter((hint) => {
+      if (hint.requiresTemporalCue && !DATEISH_RE.test(input)) return false;
+      return hint.intentLabels.some((label) =>
+        new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(input));
+    });
   } catch {
-    return false;
+    return [];
   }
 }
 // Bare-noun forms ("the sheet", "spreadsheets", "gauntlet sheet") are family
@@ -447,15 +400,25 @@ const NEGATED_EXTERNAL_WINDOW_RE =
   /\b(?:do\s+not|don't|dont|without|no)\s+[^.!?\n]{0,160}\b(?:fresh|new|dataforseo|external\s+mcp|web\s+search|crawl|crawling|scrape|scraping|search|searching|lookup|lookups|look\s+up|audit)\b/i;
 // A user who explicitly constrains a turn to local memory/context has already
 // made the tool-scope decision. Detect this before keyword families: negative
-// phrases such as "names only, no emails" must never open Outlook merely
-// because OUTLOOK_RE sees the noun "emails". An explicit "except <app>" keeps
-// the escape hatch for intentionally mixed requests.
+// Negative data phrases must never open an unrelated external family. Explicit
+// catalog exceptions were already compiled above by compileMcpAccessConstraint.
 const EXPLICIT_LOCAL_ONLY_RE =
   /\b(?:(?:use|using|consult|read|search|check)\s+only\s+(?:clementine(?:'s)?\s+)?local\s+(?:memory|context|files?)|(?:clementine(?:'s)?\s+)?local\s+(?:memory|context|files?)\s+only)\b/i;
 const EXPLICIT_NO_EXTERNAL_TOOLS_RE =
   /\b(?:(?:do\s+not|don't|dont|never)\s+(?:call|use|invoke|open|query|contact)\s+(?:any\s+)?external\s+(?:connector|connectors|tool|tools|mcp|service|services)|no\s+external\s+(?:connector|connectors|tool|tools|mcp|service|services))\b/i;
-const EXTERNAL_SCOPE_EXCEPTION_RE =
-  /\b(?:except|other\s+than)\s+(?:for\s+)?(?:salesforce|outlook|gmail|google|github|slack|notion|airtable|an?\s+external)\b/i;
+const EXPLICIT_EXTERNAL_EXCEPTION_RE =
+  /\b(?:except(?:\s+for)?|other\s+than|apart\s+from)\s+([a-z][a-z0-9_.-]*)\b/i;
+const EXTERNAL_EXCEPTION_FILLER_RE =
+  /^(?:be|being|to|for|if|when|while|as|the|a|an|this|that|it|we|i|you|thorough|careful|sure)$/i;
+
+function hasExplicitExternalException(input: string): boolean {
+  const match = EXPLICIT_EXTERNAL_EXCEPTION_RE.exec(input);
+  if (!match) return false;
+  const token = match[1] ?? '';
+  if (/^an?$/i.test(token) && /\bexternal\b/i.test(input.slice(match.index))) return true;
+  if (EXTERNAL_EXCEPTION_FILLER_RE.test(token)) return false;
+  return token.length >= 3;
+}
 
 // A turn that CONTINUES the active thread rather than opening a new topic — a
 // bare confirmation / go-ahead / anaphoric follow-up ("let's get them ready",
@@ -624,14 +587,13 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   }
 
   const lower = input.toLowerCase();
+  const requestedEffectScope = requestedCapabilityEffectScope(input);
   // Resolved once and attached to every branch below: a refusal must survive
   // whichever route the turn takes through this resolver.
   const deniedRaw = deniedServerSlugsFromInput(input, options.configuredServerNames);
   const denied = deniedRaw.length > 0 ? { deniedServerSlugs: deniedRaw } : {};
-  if (
-    (EXPLICIT_LOCAL_ONLY_RE.test(input) || EXPLICIT_NO_EXTERNAL_TOOLS_RE.test(input))
-    && !EXTERNAL_SCOPE_EXCEPTION_RE.test(input)
-  ) {
+  if ((EXPLICIT_LOCAL_ONLY_RE.test(input) || EXPLICIT_NO_EXTERNAL_TOOLS_RE.test(input))
+    && !hasExplicitExternalException(input)) {
     // The user prohibited external connectors. This is the real thing an empty
     // surface used to be confused with: a decision, not a budget.
     return {
@@ -650,16 +612,12 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const hasNegatedFreshExternalIntent = NEGATED_FRESH_EXTERNAL_RE.test(input) || NEGATED_EXTERNAL_WINDOW_RE.test(input);
   const wantsSeo = SEO_RE.test(input) || (URL_RE.test(input) && /\baudit\b/i.test(input));
   const wantsWeb = WEB_RE.test(input);
-  const wantsSalesforce = SALESFORCE_STRONG_RE.test(input)
-    || (SALESFORCE_OBJECT_RE.test(input) && SALESFORCE_CONTEXT_RE.test(input));
-  const outlookIntentInput = withoutNegatedOutlookMentions(input);
-  const mentionsOutlookFamily = OUTLOOK_RE.test(outlookIntentInput)
-    || CALENDAR_OPERATION_RE.test(outlookIntentInput);
-  const wantsOutlook = mentionsOutlookFamily
-    || (DATEISH_RE.test(input) && namesPinnedCalendarLabel(input, options.pinnedCalendarLabels));
+  const adapterScopeCandidates = resolveComposioMcpScopeCandidates(input);
   const wantsGoogleSheets = GOOGLE_SHEETS_RE.test(input);
   const wantsGithub = GITHUB_RE.test(input);
-  const hasNamedExternalSystemIntent = wantsSalesforce || wantsOutlook || wantsGoogleSheets || wantsGithub;
+  const standingHints = matchingStandingCapabilityHints(input, options.standingCapabilityHints);
+  const hasNamedExternalSystemIntent = adapterScopeCandidates.length > 0 || wantsGoogleSheets || wantsGithub
+    || standingHints.length > 0;
 
   if (
     isLocalContextFollowup
@@ -704,25 +662,18 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     });
   }
 
-  if (wantsSalesforce) {
-    scopes.push({
-      reason: 'salesforce intent',
-      allowedServerSlugs: ['salesforce'],
-      toolPatterns: ['salesforce', 'soql', 'account', 'lead', 'contact', 'opportunit'],
-      priorityKeywords: ['query', 'search', 'list', 'get', 'create', 'update'],
-      maxTools: 8,
-      serverMaxTools: { salesforce: 8 },
-    });
-  }
+  scopes.push(...adapterScopeCandidates);
 
-  if (wantsOutlook) {
+  for (const hint of standingHints) {
     scopes.push({
-      reason: 'outlook/email intent',
-      allowedServerSlugs: ['outlook', 'microsoft_outlook', 'microsoft'],
-      toolPatterns: ['outlook', 'email', 'mail', 'draft', 'message', 'calendar', 'event'],
-      priorityKeywords: ['draft', 'send', 'list', 'search', 'create', 'calendar'],
-      maxTools: 8,
-      serverMaxTools: { outlook: 8, microsoft_outlook: 8, microsoft: 8 },
+      reason: `sealed standing-policy capability hint (${hint.adapterId})`,
+      allowedServerSlugs: hint.allowedServerSlugs,
+      toolPatterns: hint.toolPatterns,
+      priorityKeywords: hint.priorityKeywords,
+      maxTools: hint.maxTools,
+      serverMaxTools: Object.fromEntries(
+        hint.allowedServerSlugs.map((server) => [server, hint.maxTools]),
+      ),
     });
   }
 
@@ -783,19 +734,26 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
     // match (the user named the program/service) or an exact learned phrase
     // may suppress fail-open. Token-overlap advertise hits must not hide
     // every connector on an unrelated turn.
-    try {
-      const localCli = provenLocalCliIdentifiers(input);
-      if (localCli.length > 0) {
-        return {
-          reason: `proven local CLI capability (${[...new Set(localCli)].join(', ')}); no external MCP needed: ${lower.slice(0, 120)}`,
-          authority: 'catalog',
-          ...denied,
-          allowedServerSlugs: [],
-          toolPatterns: [],
-          maxTools: 0,
-        };
-      }
-    } catch { /* store unreadability must not invent MCP authority */ }
+    // One remembered CLI operation is evidence for one operation, not proof
+    // that a write-shaped task's complete capability set is local. In
+    // particular, mixed compatibility deliberately retrieves both read and
+    // write memories; letting the first CLI read take this return would hide an
+    // unresolved external write before the model could discover it.
+    if (requestedEffectScope !== 'write' && requestedEffectScope !== 'mixed') {
+      try {
+        const localCli = provenLocalCliIdentifiers(input);
+        if (localCli.length > 0) {
+          return {
+            reason: `proven local CLI capability (${[...new Set(localCli)].join(', ')}); no external MCP needed: ${lower.slice(0, 120)}`,
+            authority: 'catalog',
+            ...denied,
+            allowedServerSlugs: [],
+            toolPatterns: [],
+            maxTools: 0,
+          };
+        }
+      } catch { /* store unreadability must not invent MCP authority */ }
+    }
     // No keyword family matched. The old behavior returned maxTools:0 — which
     // made ANY connected app outside the 6 hardcoded families (Airtable, Slack,
     // Notion, Stripe, …) silently invisible, so Clem falsely reported "not
@@ -947,7 +905,7 @@ export function resolveMcpToolScopeWithContinuity(
   options: {
     userInput?: string | null;
     priorUserInputs?: Array<string | null | undefined>;
-    pinnedCalendarLabels?: string[];
+    standingCapabilityHints?: McpStandingCapabilityHint[];
     configuredServerNames?: string[];
     /** The previous turn ended by asking this user a question. */
     awaitingAnswer?: boolean;
@@ -968,7 +926,7 @@ export function resolveMcpToolScopeWithContinuity(
   }
   const direct = resolveMcpToolScope({
     userInput: options.userInput,
-    pinnedCalendarLabels: options.pinnedCalendarLabels,
+    standingCapabilityHints: options.standingCapabilityHints,
     configuredServerNames: options.configuredServerNames,
   });
   // A turn that withdrew external access resolves to an empty surface, and an
@@ -991,7 +949,7 @@ export function resolveMcpToolScopeWithContinuity(
   for (const prior of options.priorUserInputs ?? []) {
     const inherited = resolveMcpToolScope({
       userInput: prior,
-      pinnedCalendarLabels: options.pinnedCalendarLabels,
+      standingCapabilityHints: options.standingCapabilityHints,
       configuredServerNames: options.configuredServerNames,
     });
     // Only inherit a CONCRETE keyword scope (maxTools>0) — never a prior allowAll
@@ -1078,7 +1036,7 @@ export function resolveMcpToolScopeWithRecall(
     userInput?: string | null;
     priorUserInputs?: Array<string | null | undefined>;
     learnedMatches?: StepToolChoiceMatch[];
-    pinnedCalendarLabels?: string[];
+    standingCapabilityHints?: McpStandingCapabilityHint[];
     configuredServerNames?: string[];
     /** The previous turn ended by asking this user a question. Threaded to
      *  continuity so a contentless go-ahead keeps the scope its request earned. */
@@ -1097,6 +1055,15 @@ export function resolveMcpToolScopeWithRecall(
   if ((base.maxTools ?? 0) === 0 && !base.failOpenCandidate) return base;
 
   const input = (options.userInput ?? '').trim();
+  const requestedEffectScope = requestedCapabilityEffectScope(input);
+  // A remembered server may rank one operation, but cannot prove completeness
+  // for a write or mixed accepted request. Preserve the bounded configured
+  // catalog so an unresolved write remains discoverable instead of replacing
+  // it with whichever remembered read happened to match first.
+  if (
+    base.failOpenCandidate
+    && (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
+  ) return base;
   let matches: StepToolChoiceMatch[];
   if (options.learnedMatches) {
     matches = options.learnedMatches;

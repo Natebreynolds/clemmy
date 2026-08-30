@@ -20,6 +20,7 @@ const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 const { readWorkflowRunOriginRecords } = await import('./workflow-run-queue.js');
 const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
+const { parseHostLocalWriteCommitFacts } = await import('../runtime/harness/host-local-write-commit.js');
 const {
   _setToolSchemaLoaderForTests,
   resetToolSchemaCache,
@@ -329,8 +330,13 @@ test('workflow_edit_step edits a disabled display-named workflow only at its can
     replace: 'first ten',
   });
   const text = resultText(result);
+  const commit = parseHostLocalWriteCommitFacts(text);
+  assert.ok(commit, 'a successful targeted edit carries the reopened workflow commit');
+  assert.equal(commit!.createdId, slug);
+  assert.equal(commit!.handle, `vault/00-System/workflows/${slug}/SKILL.md`);
   assert.match(text, /Updated "Release Disabled Digest" step "list-files"/);
-  assert.doesNotMatch(text, /release-disabled-digest/);
+  assert.doesNotMatch(text.slice(text.indexOf('\n') + 1), /release-disabled-digest/,
+    'the receipt may carry the durable slug, but user-facing prose retains the display name');
   assert.match(readWorkflow(slug)!.data.steps[0]!.prompt ?? '', /first ten files/);
   assert.equal(readWorkflow(slug)!.data.enabled, false);
   assert.equal(existsSync(path.join(WORKFLOWS_DIR, displayName)), false, 'display prose never becomes a directory identity');
@@ -361,9 +367,14 @@ test('workflow_edit_step re-smokes an enabled display-named workflow under the s
     replace: 'first ten',
   });
   const text = resultText(result);
+  const commit = parseHostLocalWriteCommitFacts(text);
+  assert.ok(commit, 'a successful re-smoked edit carries the final disabled workflow commit');
+  assert.equal(commit!.createdId, slug);
+  assert.equal(commit!.handle, `vault/00-System/workflows/${slug}/SKILL.md`);
   assert.match(text, /Updated "Release Enabled Digest" step "fetch-records"/);
   assert.match(text, /Saved "Release Enabled Digest" as DISABLED and started a creation test/);
-  assert.doesNotMatch(text, /release-enabled-digest/);
+  assert.doesNotMatch(text.slice(text.indexOf('\n') + 1), /release-enabled-digest/,
+    'the receipt may carry the durable slug, but user-facing prose retains the display name');
 
   const saved = readWorkflow(slug)!.data;
   assert.match(saved.steps[0]!.prompt ?? '', /first ten records/);
@@ -399,27 +410,37 @@ test('workflow_create/update tool schemas accept contracts and explain structure
   assert.ok(createSchema?.steps?.parse, 'workflow_create steps schema registered');
   assert.ok(updateSchema?.steps?.parse, 'workflow_update steps schema registered');
   assert.doesNotThrow(() => createSchema.steps.parse([step]));
+  assert.throws(() => createSchema.steps.parse(undefined), 'workflow_create requires a model-authored graph');
+  assert.throws(() => createSchema.steps.parse([]), 'workflow_create rejects an empty graph');
   assert.doesNotThrow(() => updateSchema.steps.parse([step]));
+  const transformStep = {
+    id: 'shape',
+    sideEffect: 'read',
+    transform: JSON.stringify({
+      version: 1,
+      expression: { op: 'literal', value: [{ id: 'a' }] },
+    }),
+  };
+  assert.doesNotThrow(() => createSchema.steps.parse([transformStep]));
+  assert.doesNotThrow(() => updateSchema.steps.parse([transformStep]));
 
   const callDescription = (schema: typeof createSchema) =>
-    ((schema?.steps as unknown as {
-      def?: {
-        innerType?: {
+    (() => {
+      const def = (schema?.steps as unknown as {
+        def?: {
           element?: { shape?: { call?: { description?: string } } };
+          innerType?: { element?: { shape?: { call?: { description?: string } } } };
         };
-      };
-    })?.def?.innerType?.element?.shape?.call?.description ?? '');
+      })?.def;
+      return (def?.element ?? def?.innerType?.element)?.shape?.call?.description ?? '';
+    })();
   assert.match(callDescription(createSchema), /successful, data/);
   assert.match(callDescription(createSchema), /data\.records/);
   assert.match(callDescription(updateSchema), /successful, data/);
   assert.match(callDescription(updateSchema), /data\.records/);
 });
 
-test('workflow_create saves authored step input contracts as a model step — codify-to-call is currently a no-op', async () => {
-  // Regression pin (2026-08-26): codifyMechanicalSteps stands down while a
-  // bare `call` step has no production dispatch authority (see
-  // workflow-codify.ts). This step used to get auto-converted to a `call`
-  // node; it must now stay the working model step it was authored as.
+test('workflow_create codifies an eligible mechanical step while preserving its reversible source', async () => {
   const result = await workflowCreate()({
     name: 'codified-create-flow',
     description: 'Pull domain rank metrics with a direct tool call.',
@@ -436,8 +457,14 @@ test('workflow_create saves authored step input contracts as a model step — co
 
   assert.match(resultText(result), /Created workflow "codified-create-flow"/);
   const saved = readWorkflow('codified-create-flow')!.data.steps[0];
-  assert.equal(saved.call, undefined);
-  assert.equal(saved.codifiedFrom, undefined);
+  assert.deepEqual(saved.call, {
+    tool: 'dataforseo_domain_rank_overview',
+    args: { target: '{{input.domain}}' },
+  });
+  assert.deepEqual(saved.codifiedFrom, {
+    prompt: 'Fetch the domain rank overview.',
+    allowedTools: ['dataforseo_domain_rank_overview'],
+  });
   assert.equal(saved.prompt, 'Fetch the domain rank overview.');
   assert.deepEqual(saved.allowedTools, ['dataforseo_domain_rank_overview']);
 });
@@ -609,6 +636,41 @@ test('workflow_create persists a step OUTPUT contract (declarable verification u
   });
   assert.match(resultText(result), /Created workflow "contract-wf"/);
   assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, contract);
+});
+
+test('workflow_create and workflow_update persist reviewed transform JSON as typed semantics', async () => {
+  const first = {
+    version: 1,
+    expression: { op: 'literal', value: [{ name: 'A' }, { name: 'B' }] },
+  };
+  const created = await workflowCreate()({
+    name: 'reviewed-transform-wf',
+    description: 'Produce an exact configured list without a subprocess.',
+    steps: [{
+      id: 'configured_items',
+      sideEffect: 'read',
+      transform: JSON.stringify(first),
+      output: { type: 'array', min_items: { '': 2 } },
+    }],
+  });
+  assert.doesNotMatch(resultText(created), /NOT created/i);
+  assert.deepEqual(readWorkflow('reviewed-transform-wf')!.data.steps[0].transform, first);
+
+  const second = {
+    version: 1,
+    expression: { op: 'literal', value: [{ name: 'A' }, { name: 'B' }, { name: 'C' }] },
+  };
+  const updated = await workflowUpdate()({
+    name: 'reviewed-transform-wf',
+    steps: [{
+      id: 'configured_items',
+      sideEffect: 'read',
+      transform: JSON.stringify(second),
+      output: { type: 'array', min_items: { '': 3 } },
+    }],
+  });
+  assert.doesNotMatch(resultText(updated), /NOT updated/i);
+  assert.deepEqual(readWorkflow('reviewed-transform-wf')!.data.steps[0].transform, second);
 });
 
 test('workflow_create accepts a call-only read step and queues a creation test', async () => {
@@ -902,21 +964,30 @@ test('workflow_create auto-tags steps from durable intent-scoped worker rules', 
   });
 });
 
-test('workflow_create simple mode generates a design step intent when the description says design', async () => {
-  await withEnv({
-    CLEMMY_MODEL_ROLES_REGISTRY: 'on',
-    CLEMMY_MODEL_ROLES: JSON.stringify([
-      { role: 'worker', modelId: 'claude-opus-4-8', whenIntent: 'design', scope: 'durable', source: 'chat-rule' },
-    ]),
-  }, async () => {
-    const result = await workflowCreate()({
-      name: 'simple-design-wf',
-      description: 'Design a polished landing page hero.',
-    });
-    assert.match(resultText(result), /Created workflow "simple-design-wf"/);
-    const step = readWorkflow('simple-design-wf')!.data.steps.find((s) => s.id === 'design');
-    assert.equal(step?.intent, 'design');
+test('workflow_create refuses a missing graph instead of inventing keyword topology', async () => {
+  const result = await workflowCreate()({
+    name: 'simple-design-wf',
+    description: 'Design a polished landing page hero.',
   });
+  assert.match(resultText(result), /NOT created.*explicit model-authored semantic step/i);
+  assert.equal(readWorkflow('simple-design-wf'), null);
+});
+
+test('workflow_create preserves the primary model authored business graph exactly', async () => {
+  const result = await workflowCreate()({
+    name: 'sheet-header-flow',
+    description: 'Create a sheet, then write its headers.',
+    steps: [
+      { id: 'create_sheet', prompt: 'Create the destination sheet.', sideEffect: 'write' },
+      { id: 'write_headers', prompt: 'Write the requested headers.', dependsOn: ['create_sheet'], sideEffect: 'write' },
+    ],
+  });
+  assert.match(resultText(result), /Created workflow "sheet-header-flow"/);
+  const saved = readWorkflow('sheet-header-flow')!.data.steps;
+  assert.deepEqual(saved.map((step) => step.id), ['create_sheet', 'write_headers']);
+  assert.deepEqual(saved[0].dependsOn ?? [], []);
+  assert.deepEqual(saved[1].dependsOn, ['create_sheet']);
+  assert.equal(saved.some((step) => /^(research|gather|send|deliver)/.test(step.id)), false);
 });
 
 test('workflow_create auto-repairs a missing summary output contract and pinned goal', async () => {
@@ -1162,7 +1233,12 @@ test('workflow_update treats strict-schema null optionals as omitted PATCH field
     clear_goal: null,
   });
 
-  assert.match(resultText(result), /Workflow "nullable-update-wf" updated/);
+  const text = resultText(result);
+  const commit = parseHostLocalWriteCommitFacts(text);
+  assert.ok(commit, 'a successful workflow patch carries the reopened workflow commit');
+  assert.equal(commit!.createdId, 'nullable-update-wf');
+  assert.equal(commit!.handle, 'vault/00-System/workflows/nullable-update-wf/SKILL.md');
+  assert.match(text, /Workflow "nullable-update-wf" updated/);
   const saved = readWorkflow('nullable-update-wf')!.data;
   assert.equal(saved.description, 'After.');
   assert.equal(saved.project, '/tmp/preserved-project');
@@ -1411,7 +1487,7 @@ test('workflow_update accepts an inputs SCHEMA JSON string and updates def.input
   assert.deepEqual(readWorkflow('up-wf')!.data.inputs, { domain: { type: 'string' } });
 });
 
-test('workflow_update can set full loopUntil probe/until config', async () => {
+test('workflow_update refuses a raw loopUntil probe runner without mutating the saved workflow', async () => {
   await workflowCreate()({
     name: 'loop-probe-update-wf',
     description: 'Poll an export until it is done.',
@@ -1428,8 +1504,13 @@ test('workflow_update can set full loopUntil probe/until config', async () => {
     steps: [{ id: 'poll', prompt: 'Start or check the export job.', sideEffect: 'read', loopUntil }],
   });
 
-  assert.match(resultText(result), /updated/);
-  assert.deepEqual(readWorkflow('loop-probe-update-wf')!.data.steps[0].loopUntil, loopUntil);
+  assert.match(resultText(result), /NOT updated/i);
+  assert.match(resultText(result), /workflow_raw_subprocess_authority_unrepresented/);
+  assert.equal(
+    readWorkflow('loop-probe-update-wf')!.data.steps[0].loopUntil,
+    undefined,
+    'the invalid subprocess declaration never reaches durable workflow state',
+  );
 });
 
 test('workflow_update can set webhook and event triggers, and syncs the trigger registry', async () => {
@@ -1517,6 +1598,25 @@ test('bindStepsToToolChoices: HIGH cli match → bakes the command + locks allow
   assert.equal(res.boundNotes.length, 1);
   assert.match(steps[0].prompt, /sf data query/, 'command baked into the prompt');
   assert.deepEqual(steps[0].allowedTools, ['run_shell_command'], 'locked to family, composio dropped');
+});
+
+test('bindStepsToToolChoices: a mixed step keeps discovery open instead of locking to one remembered read', () => {
+  const steps = [
+    {
+      id: 'sync',
+      prompt: 'Query Salesforce for new prospect accounts via a SOQL query, then create a follow-up record.',
+      allowedTools: ['composio_execute_tool', 'run_shell_command'],
+    },
+  ];
+  const before = { prompt: steps[0].prompt, allowedTools: [...steps[0].allowedTools] };
+  const res = bindStepsToToolChoices(steps, { choices: [cliChoice()] });
+
+  assert.equal(res.boundNotes.length, 0);
+  assert.equal(res.advisories.length, 1);
+  assert.match(res.advisories[0] ?? '', /mixed read\/write work/);
+  assert.match(res.advisories[0] ?? '', /keep discovery available/);
+  assert.equal(steps[0].prompt, before.prompt, 'one remembered read is not baked into a compound step');
+  assert.deepEqual(steps[0].allowedTools, before.allowedTools, 'the other effect remains discoverable');
 });
 
 test('bindStepsToToolChoices: a wildcard/undefined allowedTools is locked to the family on auto-bind', () => {
@@ -1666,7 +1766,9 @@ test('draftToDefinition: maps a trace draft to a DISABLED, manual-trigger workfl
   assert.equal(def.enabled, false);                 // saved disabled for review
   assert.equal(def.trigger.manual, true);
   assert.equal(def.steps.length, 2);                 // approval is a gate, not a step
-  assert.deepEqual(def.steps[0].allowedTools, ['composio_execute_tool']);
+  assert.deepEqual(def.steps[0].allowedTools, []);
+  assert.deepEqual(def.steps[0].call, { tool: 'SALESFORCE_GET_RECORDS', args: {} });
+  assert.deepEqual(def.steps[1].call, { tool: 'OUTLOOK_OUTLOOK_SEND_EMAIL', args: {} });
   assert.deepEqual(def.steps[1].dependsOn, [def.steps[0].id]);  // linear chain
   assert.equal(def.steps[1].requiresApproval, true);            // gate preserved
   assert.equal(def.steps[1].approvalPreview, 'Send 5 emails');
@@ -1849,6 +1951,36 @@ function exactOriginChatSourceData(text: string): Record<string, unknown> {
     originReplyTargetDigest: exactOriginDeliveryTargetDigest(TEST_ORIGIN_CHAT_TARGET),
   };
 }
+
+test('workflow_run: a uniquely named accepted turn queues the fuzzy catalog match without a second confirm', async () => {
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'review', prompt: 'Review the Slack channel.' }],
+  });
+  const session = createJourneySession({ kind: 'chat', channel: 'desktop', title: 'platform 49 run' });
+  const source = appendJourneyEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: exactOriginChatSourceData('Can you run my platform 49 workflow'),
+  });
+  const result = await withToolOutputContext({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    callId: 'platform-49-run-1',
+  }, () => workflowRun()({ name: 'platform 49', inputs: '{}' }));
+  const text = resultText(result);
+  assert.doesNotMatch(text, /Just to confirm/, `uniquely named turn must not re-ask, got: ${text.slice(0, 280)}`);
+  assert.match(
+    text,
+    /Prepared "Platform 49 Slack Channel Review"/,
+    `uniquely named turn must dispatch, got: ${text.slice(0, 280)}`,
+  );
+});
 
 test('journey: assistant proposes by name → user says "yes please" → the run QUEUES', async () => {
   writeSlackUpdatesWorkflow();

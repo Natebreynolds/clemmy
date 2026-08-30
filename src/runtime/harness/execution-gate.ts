@@ -24,22 +24,18 @@
  * ignorable; the model can keep writing without wrapping. A hard
  * block forces the audit trail to exist.
  *
- * Env flag (escape hatch): `CLEMMY_EXECUTION_GATE=off` bypasses
- * the gate entirely. Useful for debugging or for users who explicitly
- * want the prior behavior. Default ON.
+ * Production has no environment escape hatch. Isolated repository tests may
+ * disable this one legacy wrapper gate while exercising a narrower boundary;
+ * that seam is inert unless the process owns a disposable test home.
  *
  * Tested as pure logic in execution-gate.test.ts (no SDK, no DB).
  */
 
-import {
-  composioSlugEffectEvidence,
-  composioSlugHasCuratedReadRule,
-} from '../../integrations/composio/slug-effect.js';
 import { declaredMcpToolEffect, type DeclaredMcpToolEffect } from '../mcp-declared-effects.js';
 import {
-  documentedComposioOperationSemantic,
-  type DocumentedComposioReversibility,
-} from '../../integrations/composio/operation-semantics.js';
+  currentManifestOperationContract,
+} from './current-manifest-operation-semantics.js';
+import type { CapabilityOperationReversibilityV1 } from './capability-manifest.js';
 import {
   isClementineLocalToolNamespace as isClementineLocalMcpName,
   isPlainOrClementineLocalTool,
@@ -136,6 +132,8 @@ const COMM_OBJECTS: ReadonlySet<string> = new Set([
 const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND', 'POST']);
 
 interface CanonicalExternalAction {
+  /** Exact operation identity used only to reopen a sealed manifest. */
+  operationId?: string;
   /** Canonical provider action, not its transport wrapper. */
   action?: string;
   /**
@@ -171,10 +169,10 @@ export interface CanonicalExternalEffect {
   irreversible: boolean;
   /**
    * Affirmative operation reversibility. `reversible` is emitted only when a
-   * documented semantic says the exact canonical operation can be corrected;
-   * it is never inferred merely because the action is not a send.
+   * sealed manifest says the exact canonical operation can be corrected; it
+   * is never inferred merely because the action is not a send.
    */
-  reversibility: DocumentedComposioReversibility | 'unknown';
+  reversibility: CapabilityOperationReversibilityV1 | 'read_only' | 'unknown';
   /** False for an external mutation whose effect vocabulary is not understood. */
   classificationKnown: boolean;
 }
@@ -243,7 +241,8 @@ function canonicalExternalAction(
 
   const composioCarrier = isTrustedComposioCarrier(toolName);
   if (composioCarrier) {
-    return { external: true, action: extractToolSlug(args) };
+    const action = extractToolSlug(args);
+    return { external: true, ...(action ? { action, operationId: action } : {}) };
   }
   if (namespaced && (tail === 'composio_execute_tool' || tail === 'execute_tool')) {
     return { external: true };
@@ -251,7 +250,10 @@ function canonicalExternalAction(
 
   if (isTrustedDynamicComposioTool(toolName)) {
     const action = tail.slice(3).trim();
-    return { external: true, ...(action ? { action: action.toUpperCase() } : {}) };
+    return {
+      external: true,
+      ...(action ? { action: action.toUpperCase(), operationId: action.toUpperCase() } : {}),
+    };
   }
   if (namespaced && tail.toLowerCase().startsWith('cx_')) {
     return { external: true };
@@ -266,6 +268,7 @@ function canonicalExternalAction(
     return {
       external: true,
       ...(action ? { action } : {}),
+      ...(normalized ? { operationId: normalized } : {}),
       ...(tail ? { effectToken: tail } : {}),
       ...(declaredEffect ? { declaredEffect } : {}),
     };
@@ -274,73 +277,56 @@ function canonicalExternalAction(
   // Bare native tools are not distinguishable from local runtime tools. Keep
   // the established high-confidence send floor; every namespaced MCP action
   // takes the fail-closed path above.
-  if (isIrreversibleSendSlug(toolName)) return { external: true, action: toolName };
+  if (isIrreversibleSendSlug(toolName)) {
+    return { external: true, action: toolName, operationId: toolName };
+  }
   return { external: false };
 }
 
 /** One shared effect classifier after transport normalization. */
 function canonicalExternalActionWriteClassification(
-  action: string | undefined,
-  /** Heuristic verb evidence is read from THIS token when supplied (the
-   *  operation without its server segment). The CURATED lookup above keeps the
-   *  full provider-qualified identity: `slack_conversations_history` matching
-   *  the documented SLACK_CONVERSATIONS_HISTORY semantic is an exact table hit,
-   *  not an inference. Verb heuristics get the operation only. */
-  effectToken?: string,
+  operationId: string | undefined,
+  _action: string | undefined,
+  _effectToken?: string,
   /** What the owning server declared. Admits a read; never overrides. */
   declaredEffect?: DeclaredMcpToolEffect,
 ): {
   mutating: boolean;
   classificationKnown: boolean;
 } {
-  // A known external carrier with no usable action identity is not provably a
-  // read. This is the safety boundary: malformed wrappers and newly introduced
-  // mutation verbs cannot bypass execution wrapping.
-  if (!action) return { mutating: true, classificationKnown: false };
-  const documented = documentedComposioOperationSemantic(action);
-  if (documented) {
-    return { mutating: documented.effect === 'write', classificationKnown: true };
+  const manifest = currentManifestOperationContract(operationId);
+  if (manifest) {
+    if (manifest.effect === 'read') return { mutating: false, classificationKnown: true };
+    if (
+      manifest.effect === 'external_write'
+      || manifest.effect === 'local_write'
+      || manifest.effect === 'admin'
+    ) return { mutating: true, classificationKnown: true };
+    return { mutating: true, classificationKnown: false };
   }
-  // PRECEDENCE, unchanged from the single-token original:
-  //   1. curated provider rules on the QUALIFIED identity (research families,
-  //      ephemeral compute, documented reads) — exact provider knowledge that
-  //      outranks a generic verb, e.g. DATAFORSEO_CREATE_*_TASK is a research
-  //      read, not a durable write;
-  //   2. an unambiguous WRITE verb from either token — the fail-safe direction;
-  //   3. a READ verb from the OPERATION only. A read verb sitting in an
-  //      arbitrary MCP server name proves nothing and never reaches here.
-  const identityEvidence = composioSlugEffectEvidence(action);
-  const operationEvidence = effectToken
-    ? composioSlugEffectEvidence(effectToken)
-    : identityEvidence;
-  if (identityEvidence === 'read' && composioSlugHasCuratedReadRule(action)) {
-    return { mutating: false, classificationKnown: true };
-  }
-  if (
-    identityEvidence === 'write'
-    || operationEvidence === 'write'
-    // A server declaring its own tool destructive is believed immediately.
-    || declaredEffect?.destructive === true
-  ) {
+  // A server-authored generic effect declaration is positive adapter
+  // authority. Tool/provider vocabulary never substitutes for it.
+  if (declaredEffect?.destructive === true) {
     return { mutating: true, classificationKnown: true };
   }
-  if (operationEvidence === 'read') return { mutating: false, classificationKnown: true };
-  // DECLARED read: believed only once nothing above contradicted it. This is
-  // what makes a freshly connected third-party MCP server usable for reads on
-  // a blank install instead of parking every read for approval.
   if (declaredEffect?.readOnly === true) return { mutating: false, classificationKnown: true };
-  // A connected operation with no documented semantics and no recognized verb
-  // stays a conservative mutation, but remains explicitly UNKNOWN so approval
-  // and workspace consumers can fail closed.
+  // A connected operation with no exact current effect contract stays a
+  // conservative mutation. GET/LIST/CREATE vocabulary is identity only.
   return { mutating: true, classificationKnown: false };
 }
 
 function canonicalExternalActionIsWrite(
+  operationId: string | undefined,
   action: string | undefined,
   effectToken?: string,
   declaredEffect?: DeclaredMcpToolEffect,
 ): boolean {
-  return canonicalExternalActionWriteClassification(action, effectToken, declaredEffect).mutating;
+  return canonicalExternalActionWriteClassification(
+    operationId,
+    action,
+    effectToken,
+    declaredEffect,
+  ).mutating;
 }
 
 /** THE canonical "is this an irreversible external send" predicate — the one
@@ -373,7 +359,12 @@ export function isMutatingExternalWrite(
 
   const canonical = canonicalExternalAction(toolName, rawArgs);
   return canonical.external
-    ? canonicalExternalActionIsWrite(canonical.action, canonical.effectToken, canonical.declaredEffect)
+    ? canonicalExternalActionIsWrite(
+        canonical.operationId,
+        canonical.action,
+        canonical.effectToken,
+        canonical.declaredEffect,
+      )
     : false;
 }
 
@@ -405,29 +396,46 @@ export function classifyCanonicalExternalEffect(
       classificationKnown: true,
     };
   }
-  // CURATED lookups keep the provider-qualified identity; HEURISTIC verb
-  // inference sees the operation only (see effectToken).
-  const verbToken = canonical.effectToken ?? canonical.action;
   const write = canonicalExternalActionWriteClassification(
+    canonical.operationId,
     canonical.action,
     canonical.effectToken,
     canonical.declaredEffect,
   );
-  const documented = canonical.action
-    ? documentedComposioOperationSemantic(canonical.action)
-    : null;
-  const irreversible = documented
-    ? documented.reversibility === 'irreversible'
-    : verbToken
-      ? isIrreversibleSendSlug(verbToken)
-      : false;
-  const reversibility: CanonicalExternalEffect['reversibility'] = documented
-    ? documented.reversibility
-    : irreversible
+  const manifest = currentManifestOperationContract(canonical.operationId);
+  const manifestReversibility = manifest?.effect === 'read'
+    ? 'read_only' as const
+    : manifest?.semantics?.reversibility;
+  // The manifest takes PRECEDENCE over the slug evidence. It does not REPLACE
+  // it.
+  //
+  // This read `: false` when no manifest was installed — and the manifest comes
+  // from peekHostCapabilityCatalogFactory(), a process-wide singleton that is
+  // null unless something materialized that exact operation in-process. So on
+  // any ordinary path with no materialization, NOTHING was irreversible:
+  // outlook_send_mail, VAPI_CREATE_CALL and every other send lost the floor
+  // that holds them for human consent, and `send-trust: the invariant HOLDS
+  // with zero grants` failed with an irreversible send auto-approved.
+  //
+  // Note the asymmetry that made it dangerous: the sibling default above
+  // (`{ mutating: true, classificationKnown: false }`) is conservative, so an
+  // absent manifest OVER-gates ordinary reads while simultaneously
+  // UNDER-gating sends. One missing fallback, harm in both directions.
+  //
+  // isIrreversibleSendSlug remained correct and exported the whole time; it had
+  // simply stopped being consulted. An absent manifest now falls back to it
+  // rather than to a permissive constant.
+  const irreversible = manifest
+    ? manifestReversibility === 'irreversible'
+    : (isIrreversibleSendSlug(canonical.operationId ?? '')
+      || isIrreversibleSendSlug(canonical.action ?? '')
+      || looksLikeNativeMcpSend(canonical.operationId ?? ''));
+  const reversibility: CanonicalExternalEffect['reversibility'] = manifestReversibility
+    ?? (irreversible
       ? 'irreversible'
       : write.classificationKnown && !write.mutating
         ? 'read_only'
-        : 'unknown';
+        : 'unknown');
   return {
     ...(canonical.action ? { action: canonical.action } : {}),
     external: true,
@@ -491,7 +499,7 @@ export class MissingExecutionWrapError extends Error {
     super(
       `EXECUTION_WRAP_REQUIRED: \`${opts.toolName}\`${slugPart} is a mutating external write but this session has no active execution. ` +
         `Before retrying, call \`execution_create\` with a clear objective + criteria so the work is auditable + resumable. ` +
-        `Once the execution exists, re-issue this tool call — it will pass through. Per-tool escape hatch: set env \`CLEMMY_EXECUTION_GATE=off\` if you genuinely need to bypass.`,
+        'Once the execution exists, re-issue this tool call — it will pass through.',
     );
     this.name = 'MissingExecutionWrapError';
     this.toolName = opts.toolName;
@@ -501,11 +509,12 @@ export class MissingExecutionWrapError extends Error {
 }
 
 /**
- * Read the env-flag mode. Defaults to on and disables only for an explicit
- * false value. A typo in a safety flag must preserve the gate, not silently
- * turn external-write protection off.
+ * Production is unconditionally enabled. The historical flag is honored only
+ * inside the process-isolated test harness so existing focused tests can turn
+ * off this wrapper while exercising a different authority boundary.
  */
 export function isGateEnabled(): boolean {
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME !== '1') return true;
   const raw = (process.env.CLEMMY_EXECUTION_GATE ?? 'on').trim().toLowerCase();
   return !['off', 'false', '0', 'no'].includes(raw);
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, type ChatSession } from '../lib/api';
 import { Chat } from './Chat';
 import { relativeTime } from '../components/Approvals';
@@ -13,6 +14,7 @@ interface Props {
 
 export function Chats({ handoff, onHandoffConsumed }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  useBackGesture(selectedId !== null, () => setSelectedId(null));
   const [composing, setComposing] = useState<{ draft?: string } | null>(null);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.

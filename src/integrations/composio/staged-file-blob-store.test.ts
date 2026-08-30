@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   chmodSync,
@@ -11,6 +11,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -264,6 +265,134 @@ function runBlobRaceWriter(input: { store: string; readyFile: string }): Promise
   });
 }
 
+function runPublicationOrderProbe(store: string): Promise<{
+  blobPath: string;
+  sha256: string;
+  md5: string;
+  byteCount: number;
+}> {
+  const moduleUrl = new URL('./staged-file-blob-store.ts', import.meta.url).href;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+
+      const originalLink = fs.linkSync.bind(fs);
+      const originalFchmod = fs.fchmodSync.bind(fs);
+      let publishedLinkCreated = false;
+      fs.linkSync = (...args) => {
+        const result = originalLink(...args);
+        publishedLinkCreated = true;
+        return result;
+      };
+      fs.fchmodSync = (...args) => {
+        if (publishedLinkCreated) {
+          throw new Error('publisher mutated inode metadata after publication');
+        }
+        return originalFchmod(...args);
+      };
+      syncBuiltinESMExports();
+
+      const blobStore = await import(process.env.CLEMMY_STAGED_BLOB_MODULE_URL);
+      const writer = blobStore.createStagedFileBlobWriter({
+        storeDirectory: process.env.CLEMMY_STAGED_BLOB_ORDER_STORE,
+      });
+      writer.write(Buffer.from('publication ordering probe'));
+      const published = blobStore.publishStagedFileBlob({
+        storeDirectory: process.env.CLEMMY_STAGED_BLOB_ORDER_STORE,
+        sealed: writer.seal(),
+      });
+      process.stdout.write(JSON.stringify(published));
+    `], {
+      env: {
+        ...process.env,
+        CLEMMY_STAGED_BLOB_MODULE_URL: moduleUrl,
+        CLEMMY_STAGED_BLOB_ORDER_STORE: store,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      if (code !== 0) {
+        reject(new Error(`staged blob publication-order probe failed (${code}): ${stderr.slice(0, 240)}`));
+        return;
+      }
+      try { resolve(JSON.parse(stdout)); }
+      catch (error) { reject(error); }
+    });
+  });
+}
+
+function releasePublishedBlobHardLinkFromPeer(
+  hardLinkPath: string,
+): { ready: Promise<void>; done: Promise<void> } {
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', `
+    import { unlinkSync } from 'node:fs';
+    const hardLinkPath = process.env.CLEMMY_TEST_TRANSITIONAL_STAGED_BLOB_LINK;
+    if (!hardLinkPath) process.exit(2);
+    process.stdout.write('ready\\n');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+    unlinkSync(hardLinkPath);
+  `], {
+    env: {
+      ...process.env,
+      CLEMMY_TEST_TRANSITIONAL_STAGED_BLOB_LINK: hardLinkPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let readySettled = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+    if (!readySettled && stdout.includes('ready\n')) {
+      readySettled = true;
+      resolveReady();
+    }
+  });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const done = new Promise<void>((resolve, reject) => {
+    child.once('error', (error) => {
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(error);
+      }
+      reject(error);
+    });
+    child.once('exit', (code) => {
+      if (code !== 0) {
+        const error = new Error(`transitional staged blob peer failed (${code}): ${stderr.slice(0, 240)}`);
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(error);
+        }
+        reject(error);
+        return;
+      }
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(new Error('transitional staged blob peer exited before becoming ready'));
+      }
+      resolve();
+    });
+  });
+  return { ready, done };
+}
+
 test('two processes publish one exact content-addressed blob without replacement', async (t) => {
   const { root, store } = fixture();
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -278,6 +407,60 @@ test('two processes publish one exact content-addressed blob without replacement
   assert.equal(lstatSync(left.blobPath).mode & 0o777, 0o600);
   assert.equal(readFileSync(left.blobPath).byteLength, left.byteCount);
   assert.equal(createHash('sha256').update(readFileSync(left.blobPath)).digest('hex'), left.sha256);
+});
+
+test('publication performs no canonical inode metadata mutation after the no-replace link is visible', async (t) => {
+  const { root, store } = fixture();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const published = await runPublicationOrderProbe(store);
+  assert.equal(lstatSync(published.blobPath).nlink, 1);
+  assert.equal(lstatSync(published.blobPath).mode & 0o777, 0o600);
+  assert.equal(createHash('sha256').update(readFileSync(published.blobPath)).digest('hex'), published.sha256);
+});
+
+test('a competing publisher waits out the exact hard-link transition without weakening ordinary reads', async (t) => {
+  if (process.platform === 'win32') return;
+  const { root, store } = fixture();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bytes = Buffer.from('causal staged-blob publication transition');
+
+  const firstWriter = createStagedFileBlobWriter({ storeDirectory: store });
+  firstWriter.write(bytes);
+  const first = publishStagedFileBlob({
+    storeDirectory: store,
+    sealed: firstWriter.seal(),
+  });
+  const transientLink = path.join(store, `.staged-${randomUUID()}.part`);
+  linkSync(first.blobPath, transientLink);
+  assert.equal(lstatSync(first.blobPath).nlink, 2, 'fixture pins post-link/pre-unlink publication');
+
+  const destinationDirectory = path.join(root, 'ordinary-reader');
+  assert.throws(
+    () => materializeStagedFileBlob({
+      blob: first,
+      destinationDirectory,
+      destinationName: 'ordinary-reader.bin',
+    }),
+    (error: unknown) => error instanceof StagedFileBlobError
+      && error.code === 'invalid_staged_blob',
+    'ordinary consumers must keep refusing a multiply-linked canonical blob',
+  );
+
+  const secondWriter = createStagedFileBlobWriter({ storeDirectory: store });
+  secondWriter.write(bytes);
+  const secondSealed = secondWriter.seal();
+  const peer = releasePublishedBlobHardLinkFromPeer(transientLink);
+  await peer.ready;
+  let replay;
+  try {
+    replay = publishStagedFileBlob({ storeDirectory: store, sealed: secondSealed });
+  } finally {
+    await peer.done;
+    if (existsSync(transientLink)) unlinkSync(transientLink);
+  }
+  assert.deepEqual(replay!, first);
+  assert.equal(existsSync(secondSealed.temporaryPath), false);
+  assert.equal(lstatSync(first.blobPath).nlink, 1);
 });
 
 test('publish refuses tampered, linked, or weak-permission temp checkpoints', (t) => {

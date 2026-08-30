@@ -20,6 +20,33 @@ const LIVE_SESSION_IDENTIFIER = /\bsess-m(?=[a-z0-9]{7,}(?:-[a-z0-9]{4,})?\b)(?=
 const AIRTABLE_RESOURCE_ID = /\b(?:app|rec|tbl|viw)[A-Za-z0-9]{14}\b/g;
 const SALESFORCE_RESOURCE_ID = /\b(?:001|003|005|006|00Q|500|701|a0[A-Za-z0-9])[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?\b/g;
 const GOOGLE_RESOURCE_URL = /https?:\/\/(?:docs|drive)\.google\.com\/(?:document|spreadsheets|file)\/d\/([A-Za-z0-9_-]{10,})/g;
+const EMAIL_ADDRESS = /\b([A-Z0-9.!#$%&'*+/=?^_`{|}~-]+)@([A-Z0-9](?:[A-Z0-9.-]*[A-Z0-9])?\.[A-Z]{2,63})\b/gi;
+const NON_PERSONAL_EMAIL_LOCAL_PARTS = new Set([
+  'admin',
+  'billing',
+  'contact',
+  'customer',
+  'developer',
+  'finance',
+  'git',
+  'help',
+  'info',
+  'legal',
+  'mailbox',
+  'marketing',
+  'no',
+  'nobody',
+  'noreply',
+  'notifications',
+  'operations',
+  'ops',
+  'orders',
+  'reply',
+  'sales',
+  'service',
+  'support',
+  'team',
+]);
 
 function isPlaceholder(value) {
   return /(?:\$\{|\{\{|<[^>]+>|%[A-Z][A-Z0-9_]*%)/.test(value)
@@ -87,6 +114,128 @@ function isFixtureResourceId(value) {
     || /^(?:doc|sheet)[-_]/i.test(value);
 }
 
+function isReservedFixtureDomain(value) {
+  const domain = value.toLowerCase().replace(/\.$/, '');
+  if (/^(?:(?:.+\.)?example\.(?:com|net|org)|localhost)$/.test(domain)) return true;
+  const finalLabel = domain.split('.').at(-1);
+  return finalLabel === 'example' || finalLabel === 'invalid' || finalLabel === 'test' || finalLabel === 'localhost';
+}
+
+function normalizedEmailLocal(value) {
+  return value.toLowerCase().split('+', 1)[0];
+}
+
+function personalLocalParts(value) {
+  return normalizedEmailLocal(value).split(/[._-]+/).filter(Boolean);
+}
+
+function looksLikePersonalLocal(value) {
+  const parts = personalLocalParts(value);
+  return parts.length >= 2
+    && parts.every((part) => /^[a-z]{2,}$/.test(part))
+    && !parts.some((part) => NON_PERSONAL_EMAIL_LOCAL_PARTS.has(part));
+}
+
+function normalizePersonalName(value) {
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  const parts = normalized.split(' ');
+  if (parts.length < 2 || parts.length > 6) return undefined;
+  if (parts.some((part) => !/^[\p{L}][\p{L}'’-]*$/u.test(part))) return undefined;
+  if (/\b(?:bot|noreply)\b/i.test(normalized)) return undefined;
+  return normalized;
+}
+
+function contributorIdentityHints(repoRoot) {
+  const names = new Set();
+  const emailLocals = new Set();
+  let output = '';
+  try {
+    output = execFileSync('git', ['log', '--all', '--format=%aN%x09%aE%n%cN%x09%cE'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch {
+    return { personalNames: [], personalEmailLocals: [] };
+  }
+
+  for (const line of output.split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const name = line.slice(0, tab).trim();
+    const email = line.slice(tab + 1).trim().toLowerCase();
+    if (/\b(?:bot|noreply)\b/i.test(`${name} ${email}`)) continue;
+
+    const personalName = normalizePersonalName(name);
+    if (personalName) names.add(personalName);
+
+    const at = email.indexOf('@');
+    if (at <= 0) continue;
+    const local = normalizedEmailLocal(email.slice(0, at));
+    if (/^[a-z][a-z0-9._-]{2,}$/.test(local)
+      && !personalLocalParts(local).some((part) => NON_PERSONAL_EMAIL_LOCAL_PARTS.has(part))) {
+      emailLocals.add(local);
+    }
+  }
+
+  return { personalNames: [...names], personalEmailLocals: [...emailLocals] };
+}
+
+function publicMaintainerMetadataRemoved(filePath, text) {
+  if (filePath.replaceAll('\\', '/') !== 'package.json') return text;
+  try {
+    const manifest = JSON.parse(text);
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || manifest.private === true) return text;
+    const sanitized = { ...manifest };
+    delete sanitized.author;
+    delete sanitized.contributors;
+    delete sanitized.maintainers;
+    return JSON.stringify(sanitized);
+  } catch {
+    return text;
+  }
+}
+
+function escapedRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchesContributorLocal(local, contributorLocals) {
+  const normalized = normalizedEmailLocal(local);
+  const firstPart = personalLocalParts(normalized)[0];
+  return contributorLocals.some((candidate) => normalized === candidate || firstPart === candidate);
+}
+
+function classifyPersonalIdentityText(text, { personalNames = [], personalEmailLocals = [] } = {}) {
+  const categories = new Set();
+  const derivedNames = new Set();
+
+  for (const match of text.matchAll(EMAIL_ADDRESS)) {
+    const [, local, domain] = match;
+    if (isReservedFixtureDomain(domain)) continue;
+    if (!looksLikePersonalLocal(local) && !matchesContributorLocal(local, personalEmailLocals)) continue;
+    categories.add('personal-email-address');
+    const parts = personalLocalParts(local);
+    if (parts.length >= 2 && parts.every((part) => /^[a-z]{2,}$/.test(part))) {
+      derivedNames.add(parts.join(' '));
+    }
+  }
+
+  const candidateNames = new Set([
+    ...personalNames.map((name) => name.toLowerCase()),
+    ...derivedNames,
+  ]);
+  for (const name of candidateNames) {
+    const words = name.split(' ').map(escapedRegExp);
+    if (words.length >= 2 && new RegExp(`\\b${words.join('\\s+')}\\b`, 'iu').test(text)) {
+      categories.add('personal-name');
+      break;
+    }
+  }
+
+  return categories;
+}
+
 function hasProviderResourceId(text) {
   for (const match of text.matchAll(AIRTABLE_RESOURCE_ID)) {
     const value = match[0];
@@ -101,7 +250,7 @@ function hasProviderResourceId(text) {
   return false;
 }
 
-export function classifyText(text) {
+export function classifyText(text, identityOptions = {}) {
   const categories = new Set();
 
   const homePatterns = [
@@ -132,9 +281,15 @@ export function classifyText(text) {
     categories.add('apple-signing-identity');
   }
   if (/\b(?:APPLE_TEAM_ID|APNS_TEAM_ID)\s*[:=]\s*["']?[A-Z0-9]{10}\b/.test(text)
+    || /\bDEVELOPMENT_TEAM\s*[:=]\s*["']?[A-Z0-9]{10}\b/.test(text)
     || /\b--team-id(?:=|\s+)["']?[A-Z0-9]{10}\b/.test(text)) {
     categories.add('apple-signing-identity');
   }
+
+  const identityText = typeof identityOptions.identityText === 'string'
+    ? identityOptions.identityText
+    : text;
+  for (const category of classifyPersonalIdentityText(identityText, identityOptions)) categories.add(category);
 
   return categories;
 }
@@ -146,6 +301,7 @@ export function scanExistingTrackedFiles(repoRoot = process.cwd()) {
     maxBuffer: 64 * 1024 * 1024,
   });
   const findings = [];
+  const identityHints = contributorIdentityHints(repoRoot);
 
   for (const filePath of output.split('\0').filter(Boolean).sort()) {
     const absolutePath = path.resolve(repoRoot, filePath);
@@ -163,7 +319,8 @@ export function scanExistingTrackedFiles(repoRoot = process.cwd()) {
       : readFileSync(absolutePath);
     if (typeof content === 'string' || !content.includes(0)) {
       const text = typeof content === 'string' ? content : content.toString('utf8');
-      for (const category of classifyText(text)) categories.add(category);
+      const identityText = publicMaintainerMetadataRemoved(filePath, text);
+      for (const category of classifyText(text, { ...identityHints, identityText })) categories.add(category);
     }
     for (const category of [...categories].sort()) findings.push({ category, filePath });
   }

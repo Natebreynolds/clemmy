@@ -12,7 +12,17 @@ final class WebViewModel: NSObject, ObservableObject {
     /// Flips when navigation fails for connectivity reasons — the signal for
     /// Bonjour rediscovery, not for auth or page errors.
     @Published var connectionLost = false
+    /// Last navigation failure code. Off-Wi-Fi refusals never reach the
+    /// daemon — a TLS handshake that sends no request leaves no server-side
+    /// trace — so without this the only symptom is a blank view. Lets the
+    /// next real off-Wi-Fi attempt say whether ATS refused (-1200/-1202/-1022)
+    /// or the certificate pin did (-999).
+    @Published private(set) var lastNavigationErrorCode: Int?
     @Published private(set) var hasLoadedOnce = false
+    /// Exact navigation requested by the native shell. Besides being useful
+    /// diagnostics, this gives the hosted tests a causal oracle without
+    /// asking the simulator to contact a real daemon.
+    private(set) var lastRequestedURL: URL?
 
     let webView: WKWebView
     /// Deferred until the page is up so the bridge function exists.
@@ -31,35 +41,31 @@ final class WebViewModel: NSObject, ObservableObject {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
+        // WKWebView copies its configuration during initialization. Install
+        // every JS bridge first, then attach this model after Swift finishes
+        // initializing self; otherwise a copied empty controller can silently
+        // drop the very path-change/handoff messages remote access needs.
+        let scriptProxy = ScriptProxy()
+        for name in [
+            "clemHaptic",
+            "clemRepair",
+            "clemHandoff",
+            "clemHandoffResult",
+            "clemConnectionLost",
+        ] {
+            config.userContentController.add(scriptProxy, name: name)
+        }
         webView = WKWebView(frame: .zero, configuration: config)
         // The app is daylight-only: without this the web view inherits the
         // SYSTEM appearance, so a phone in dark mode summons a dark keyboard
         // and dark form accessories over the light page (live 2026-08-26).
         webView.overrideUserInterfaceStyle = .light
         super.init()
+        scriptProxy.attach(self)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
 
-        // JS → Swift. The web layer is the whole UI, so without this it can
-        // never reach the parts of "feels native" that only the OS can do.
-        // A proxy holds the handler so WKUserContentController's strong
-        // reference doesn't retain this model forever.
-        config.userContentController.add(ScriptProxy(self), name: "clemHaptic")
-        // The web login screen's "Scan a new QR code" button: when the web
-        // session expires inside a paired shell, the page has no way to reach
-        // the native scanner — this is that way. The shell still confirms via
-        // the same dialog as shake-to-unpair before anything is cleared.
-        config.userContentController.add(ScriptProxy(self), name: "clemRepair")
-        // The page hands over a short-lived origin-handoff token while it is
-        // on the LAN; the shell keeps it so the next relay-origin load can
-        // establish a session there. See loadHome().
-        config.userContentController.add(ScriptProxy(self), name: "clemHandoff")
-        // A failed fetch does not trigger WKNavigationDelegate failure
-        // callbacks because the PWA itself is still loaded. Let the page tell
-        // us that its current origin stopped answering so the native reconnect
-        // ladder can switch from LAN to the relay while the app is open.
-        config.userContentController.add(ScriptProxy(self), name: "clemConnectionLost")
         impactLight.prepare()
         impactMedium.prepare()
         notify.prepare()
@@ -75,7 +81,10 @@ final class WebViewModel: NSObject, ObservableObject {
         // 100% light mode (owner directive 2026-08-25): the shell paints the
         // same warm paper the page uses, so there is no dark flash before
         // first paint and no dark halo behind rubber-band overscroll.
-        let paper = UIColor(red: 252 / 255, green: 249 / 255, blue: 244 / 255, alpha: 1)
+        // Matches --bg-0 and the theme-color meta exactly. Any difference here
+        // shows as a tinted flash before first paint and as a tinted band under
+        // the over-scroll bounce, which reads as "the app isn't white".
+        let paper = UIColor.white
         webView.isOpaque = false
         webView.backgroundColor = paper
         webView.underPageBackgroundColor = paper
@@ -88,6 +97,7 @@ final class WebViewModel: NSObject, ObservableObject {
 
     func load(_ url: URL) {
         connectionLost = false
+        lastRequestedURL = url
         webView.load(URLRequest(url: url))
     }
 
@@ -140,13 +150,30 @@ final class WebViewModel: NSObject, ObservableObject {
         // address after DHCP moved it (live 2026-08-25: four re-pairs in
         // four days, one per IP change, because the token was spent only at
         // the relay). The shell is the only thing that survives an origin
-        // switch, so it carries a LAN-minted, single-use handoff token and
+        // switch, so it carries a LAN-minted, durably leased handoff token and
         // offers it on every load; the page spends it only when the origin
         // actually lacks a session, and parks a fresh one right after.
-        if let handoff = OriginHandoffStore.take() {
+        // A legacy token freshly delivered by an older rolled-back daemon must
+        // outrank a stale v2 Keychain lease that daemon cannot understand.
+        // The next successfully parked v2 lease clears this legacy bridge.
+        if let fingerprint = pairing.fingerprint,
+           let legacyToken = OriginHandoffStore.currentLegacyToken(pairingFingerprint: fingerprint) {
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             var items = components?.queryItems ?? []
-            items.append(URLQueryItem(name: "adopt", value: handoff))
+            items.append(URLQueryItem(name: "adopt", value: legacyToken))
+            components?.queryItems = items
+            if let adoptURL = components?.url {
+                load(adoptURL)
+                return
+            }
+        }
+        if let fingerprint = pairing.fingerprint,
+           let handoff = OriginHandoffStore.currentLease(pairingFingerprint: fingerprint) {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            var items = components?.queryItems ?? []
+            items.append(URLQueryItem(name: "adopt", value: handoff.token))
+            items.append(URLQueryItem(name: "handoffId", value: handoff.handoffId))
+            items.append(URLQueryItem(name: "handoffGeneration", value: String(handoff.generation)))
             components?.queryItems = items
             if let adoptURL = components?.url {
                 load(adoptURL)
@@ -168,12 +195,63 @@ final class WebViewModel: NSObject, ObservableObject {
         if isLan { pairing.lanOrigin = origin }
         guard origin != pairing.origin else {
             PairingStore.save(pairing)
+            // A cold process has no failed navigation to set connectionLost.
+            // If the saved origin is already the relay, a successful cellular
+            // probe must still perform the first navigation instead of leaving
+            // a pristine WKWebView blank forever.
+            if !hasLoadedOnce || connectionLost { loadHome() }
             return
         }
+        // Navigate to the new origin either way — but only PERSIST a remote
+        // one once it has actually served a page.
+        //
+        // Saving first meant a single failed relay navigation replaced a
+        // working LAN origin with an unreachable one, permanently: the next
+        // cold start loaded the bad origin, failed again, and the only way out
+        // was to re-pair. The live store shows exactly that treadmill — a new
+        // deviceId on six separate days, and not one session ever established
+        // from off-LAN.
+        //
+        // The LAN path still saves eagerly: it was discovered by Bonjour, so
+        // it is reachable by construction, and eager persistence is what lets a
+        // cold start find the Mac at a new DHCP address.
+        let previousOrigin = pairing.origin
         pairing.origin = origin
-        PairingStore.save(pairing)
+        if isLan {
+            PairingStore.save(pairing)
+            originPendingProof = nil
+        } else {
+            originPendingProof = PendingOrigin(candidate: origin, previous: previousOrigin)
+        }
         loadHome()
     }
+
+    private struct PendingOrigin {
+        let candidate: String
+        let previous: String
+    }
+
+    /// A remote origin navigated to but not yet proven. Promoted on the first
+    /// successful load, rolled back on failure.
+    private var originPendingProof: PendingOrigin?
+
+    /// Persist a remote origin once it has actually served a page, so that
+    /// persistence follows proof rather than preceding it.
+    func confirmPendingOrigin() {
+        guard let pending = originPendingProof else { return }
+        originPendingProof = nil
+        pairing.origin = pending.candidate
+        PairingStore.save(pairing)
+    }
+
+    /// Restore the last working origin after a remote candidate failed to
+    /// load, so a bad door is never what a cold start wakes up on.
+    func discardPendingOrigin() {
+        guard let pending = originPendingProof else { return }
+        originPendingProof = nil
+        pairing.origin = pending.previous
+    }
+
 
     /// Remembers the daemon-published relay door. Silent: it changes nothing
     /// about the current connection, it just makes the next off-LAN attempt
@@ -182,6 +260,58 @@ final class WebViewModel: NSObject, ObservableObject {
         guard pairing.relayOrigin != relayOrigin else { return }
         pairing.relayOrigin = relayOrigin
         PairingStore.save(pairing)
+    }
+
+    @discardableResult
+    fileprivate func parkOriginHandoff(
+        token: String,
+        expiresAtMs: Double,
+        handoffId: String,
+        generation: Int,
+        deviceId: String
+    ) -> Bool {
+        guard let fingerprint = pairing.fingerprint else { return false }
+        let stored = OriginHandoffStore.park(
+            token: token,
+            expiresAtMs: expiresAtMs,
+            handoffId: handoffId,
+            generation: generation,
+            deviceId: deviceId,
+            pairingFingerprint: fingerprint
+        )
+        if stored { publishStoredOriginHandoff(handoffId: handoffId, generation: generation) }
+        return stored
+    }
+
+    fileprivate func acknowledgeOriginHandoff(handoffId: String, generation: Int) {
+        guard let fingerprint = pairing.fingerprint else { return }
+        OriginHandoffStore.acknowledge(
+            handoffId: handoffId,
+            generation: generation,
+            pairingFingerprint: fingerprint
+        )
+    }
+
+    fileprivate func parkLegacyOriginHandoff(token: String, expiresAtMs: Double) {
+        guard let fingerprint = pairing.fingerprint else { return }
+        _ = OriginHandoffStore.parkLegacy(
+            token: token,
+            expiresAtMs: expiresAtMs,
+            pairingFingerprint: fingerprint
+        )
+    }
+
+    /// Native storage is the commit point for replacing an older relay lease.
+    /// Tell the authenticated LAN page only after Keychain accepted the exact
+    /// tuple; the page then activates it server-side and may retire older
+    /// generations without stranding this process on a dropped response.
+    private func publishStoredOriginHandoff(handoffId: String, generation: Int) {
+        guard let payload = try? JSONSerialization.data(
+            withJSONObject: ["handoffId": handoffId, "generation": generation]
+        ), let json = String(data: payload, encoding: .utf8) else { return }
+        webView.evaluateJavaScript(
+            "window.clemNative && window.clemNative.originHandoffStored && window.clemNative.originHandoffStored(\(json))"
+        )
     }
 
     /// Hands the APNs token to the PWA, which registers it over its own
@@ -238,30 +368,75 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         hasLoadedOnce = true
         connectionLost = false
+        // The page loaded, so a remote origin has now earned persistence.
+        confirmPendingOrigin()
         if let token = pendingApnsToken {
             pendingApnsToken = nil
             deliverApnsToken(token)
         }
         publishConnectionState()
+        // If the app was suspended between the Keychain save and the LAN
+        // page's activation request, replay the storage acknowledgement on
+        // the next successful page load. Activation is tuple-idempotent.
+        if let fingerprint = pairing.fingerprint,
+           let lease = OriginHandoffStore.currentLease(pairingFingerprint: fingerprint) {
+            publishStoredOriginHandoff(
+                handoffId: lease.handoffId,
+                generation: lease.generation
+            )
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        // Provisional failure is where a refused TLS handshake lands, which is
+        // exactly the off-Wi-Fi case: roll back before the bad origin can
+        // become what the next cold start wakes up on.
+        discardPendingOrigin()
         markIfConnectivity(error)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        discardPendingOrigin()
         markIfConnectivity(error)
     }
 
     private func markIfConnectivity(_ error: Error) {
-        let code = (error as NSError).code
+        let nsError = error as NSError
+        let code = nsError.code
+
+        // Every navigation failure is recorded, whether or not it starts the
+        // retry ladder. Off-Wi-Fi failures produce NO daemon log line — a TLS
+        // handshake that never sends a request is invisible on the server — so
+        // without this the only symptom was a blank view and a re-pair.
+        lastNavigationErrorCode = code
+        NSLog(
+            "[clem] navigation failed code=%d domain=%@ host=%@",
+            code,
+            nsError.domain,
+            lastRequestedURL?.host ?? "?"
+        )
+
+        // A TLS refusal is a reason to try the NEXT door, exactly like a
+        // refused TCP connection. These were absent, so an off-Wi-Fi TLS
+        // failure never set connectionLost: the retry ladder was never armed
+        // and the view sat blank rather than falling back.
         let connectivityCodes: Set<Int> = [
             NSURLErrorCannotConnectToHost,
             NSURLErrorCannotFindHost,
             NSURLErrorTimedOut,
             NSURLErrorNetworkConnectionLost,
             NSURLErrorNotConnectedToInternet,
+            NSURLErrorSecureConnectionFailed,
+            NSURLErrorServerCertificateUntrusted,
+            NSURLErrorServerCertificateHasBadDate,
+            NSURLErrorServerCertificateNotYetValid,
+            NSURLErrorServerCertificateHasUnknownRoot,
+            NSURLErrorAppTransportSecurityRequiresSecureConnection,
         ]
+        // NSURLErrorCancelled (-999) is deliberately EXCLUDED. That is the pin
+        // itself refusing a certificate it does not recognise, which must stay
+        // a hard stop — retrying another door after a failed pin would be the
+        // one way to weaken the trust decision.
         if connectivityCodes.contains(code) {
             connectionLost = true
         }
@@ -302,34 +477,12 @@ enum CertificatePin {
     }
 }
 
-/// The one credential that must survive an origin switch.
-///
-/// In memory only, single use, and it refuses an expired token — the page
-/// mints a fresh one on every LAN visit, so there is never a reason to keep
-/// one on disk.
-enum OriginHandoffStore {
-    private static var token: String?
-    private static var expiresAt: Date?
-
-    static func park(token newToken: String, expiresAtMs: Double) {
-        token = newToken
-        expiresAt = Date(timeIntervalSince1970: expiresAtMs / 1000)
-    }
-
-    /// Returns the token once, and only while it is still valid.
-    static func take() -> String? {
-        defer { token = nil; expiresAt = nil }
-        guard let token, let expiresAt, expiresAt > Date() else { return nil }
-        return token
-    }
-}
-
 /// Breaks the retain cycle WKUserContentController would otherwise create by
 /// holding its message handler strongly for the life of the configuration.
 private final class ScriptProxy: NSObject, WKScriptMessageHandler {
     private weak var model: WebViewModel?
 
-    init(_ model: WebViewModel) {
+    func attach(_ model: WebViewModel) {
         self.model = model
     }
 
@@ -341,13 +494,42 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
             return
         }
         if message.name == "clemHandoff" {
-            // Opaque single-use token + its expiry. Held only in memory: it is
-            // short-lived by design and a fresh one is minted on every LAN
-            // visit, so persisting it would widen the window for no gain.
+            // Opaque leased token + its expiry. The durable store is
+            // device-only Keychain and remains leased until exact adoption.
             guard let body = message.body as? [String: Any],
                   let token = body["token"] as? String,
-                  let expiresAt = body["expiresAt"] as? Double else { return }
-            OriginHandoffStore.park(token: token, expiresAtMs: expiresAt)
+                  let expiresAt = (body["expiresAt"] as? NSNumber)?.doubleValue else { return }
+            guard (body["version"] as? NSNumber)?.intValue == 2 else {
+                // New shell + old cached page/daemon. Preserve the former
+                // in-memory behavior without inventing v2 correlation facts.
+                MainActor.assumeIsolated {
+                    model?.parkLegacyOriginHandoff(token: token, expiresAtMs: expiresAt)
+                }
+                return
+            }
+            guard let handoffId = body["handoffId"] as? String,
+                  let generation = (body["generation"] as? NSNumber)?.intValue,
+                  let deviceId = body["deviceId"] as? String else { return }
+            MainActor.assumeIsolated {
+                _ = model?.parkOriginHandoff(
+                    token: token,
+                    expiresAtMs: expiresAt,
+                    handoffId: handoffId,
+                    generation: generation,
+                    deviceId: deviceId
+                )
+            }
+            return
+        }
+        if message.name == "clemHandoffResult" {
+            guard let body = message.body as? [String: Any],
+                  let handoffId = body["handoffId"] as? String,
+                  let generation = (body["generation"] as? NSNumber)?.intValue,
+                  let outcome = body["outcome"] as? String,
+                  outcome == "consumed" || outcome == "invalid" else { return }
+            MainActor.assumeIsolated {
+                model?.acknowledgeOriginHandoff(handoffId: handoffId, generation: generation)
+            }
             return
         }
         if message.name == "clemRepair" {

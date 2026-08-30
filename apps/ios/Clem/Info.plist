@@ -31,7 +31,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Clem uses the camera only to scan the pairing QR code shown on your Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Clem connects directly to the Clementine daemon on your Mac over your local network — no cloud relay in between.</string>
+	<string>Clem finds your paired Mac on the local network; away from Wi-Fi, it can use a pinned encrypted relay to that same Mac.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_clemmy._tcp</string>
@@ -41,10 +41,30 @@
 	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<!-- Scoped to local networking only. The connection is still TLS: the
-		     daemon serves its own certificate and the app accepts exactly the
-		     one whose fingerprint arrived inside the pairing QR. -->
+		<!-- The connection is always TLS, and ATS is NOT the trust decision
+		     here: the app accepts exactly the certificate whose fingerprint
+		     arrived inside the pairing QR, and refuses every other — including
+		     certificates a public CA would happily vouch for. That check lives
+		     in PinnedWebView.trustMatches and fails closed.
+
+		     NSAllowsLocalNetworking covers the LAN door (clementine.local).
+
+		     NSAllowsArbitraryLoadsInWebContent covers the relay door. Off the
+		     local network the daemon is reached at a PUBLIC hostname while
+		     still presenting its own self-signed certificate, so ATS refused
+		     the connection before the pin could ever run — the pin was not
+		     failing off-Wi-Fi, it was never consulted. This exemption applies
+		     to WKWebView content only; native URLSession probes keep the full
+		     ATS floor.
+
+		     Deliberately NOT NSExceptionDomains: naming the hosted relay
+		     domain would bake one deployment's hostname into the binary and
+		     break every self-hosted relay. Deliberately NOT
+		     NSAllowsArbitraryLoads: that would lower the floor for native
+		     requests too, which nothing here needs. -->
 		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 	</dict>
 </dict>

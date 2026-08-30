@@ -10,6 +10,8 @@ import {
   isFalloverError,
   fallbackRouteResolution,
   FallbackModel,
+  streamEventHasActionableContent,
+  streamEventHasModelActivity,
   type FallbackTarget,
   __test__,
 } from './fallback-model.js';
@@ -64,6 +66,11 @@ test('isFalloverError: overload/5xx/TRANSPORT-TIMEOUT yes; 429 + 4xx no (the tim
   assert.equal(isFalloverError(new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: '' })), true);
   assert.equal(isFalloverError(new BoundaryError({ kind: 'model.empty_completion', retryable: true, userMessage: '', operatorMessage: '' })), true);
   assert.equal(isFalloverError({ message: 'fetch failed' }), true, 'a transport error classifies as transport_timeout');
+  assert.equal(
+    isFalloverError(new Error('Internal error during token generation')),
+    true,
+    'a provider-internal generation crash is the same class as a 5xx',
+  );
   // Excluded: a 429 is account-wide quota — switching Claude tiers won't help.
   assert.equal(isFalloverError({ statusCode: 429 }), false, '429 not a fallover');
   assert.equal(isFalloverError({ statusCode: 400 }), false, '4xx not a fallover');
@@ -245,6 +252,30 @@ test('first-content deadline is not satisfied or reset by response_started/keepa
   assert.deepEqual(events.map((event) => (event as any).delta), ['deadline rescue']);
 });
 
+test('Chat Completions reasoning chunks are private model activity, never actionable content', () => {
+  for (const field of ['reasoning', 'reasoning_content'] as const) {
+    const event = {
+      type: 'model',
+      event: {
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { [field]: 'active private work' }, finish_reason: null }],
+      },
+    } as any;
+    assert.equal(streamEventHasModelActivity(event), true, `${field} is live model work`);
+    assert.equal(streamEventHasActionableContent(event), false, `${field} stays private`);
+  }
+
+  const metadataOnly = {
+    type: 'model',
+    event: {
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+    },
+  } as any;
+  assert.equal(streamEventHasModelActivity(metadataOnly), false, 'role-only chunks remain metadata');
+  assert.equal(streamEventHasActionableContent(metadataOnly), false);
+});
+
 test('reasoning-only work stays private and may fall over before any actionable output escapes', async () => {
   let rescueCalls = 0;
   const reasoningThenFailure = model({ getStreamedResponse: async function* () {
@@ -376,6 +407,114 @@ test('reasoning may run past the first-byte budget when it eventually yields a t
 
   assert.equal(rescueCalls, 0);
   assert.ok(got.some((event) => (event as any).event?.item?.type === 'function_call'));
+});
+
+test('native Chat Completions reasoning may cross the first-content deadline before text', async () => {
+  let rescueCalls = 0;
+  const glm = model({ getStreamedResponse: async function* () {
+    yield {
+      type: 'model',
+      event: {
+        object: 'chat.completion.chunk',
+        choices: [{
+          index: 0,
+          delta: { reasoning_content: 'working through the request' },
+          finish_reason: null,
+        }],
+      },
+    } as any;
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    yield { type: 'output_text_delta', delta: 'finished on GLM' } as any;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'unexpected rescue' } as any;
+  } });
+
+  const got = await collect(withModelFallback([
+    target('glm-native-reasoning', glm),
+    target('rescue', rescue),
+  ], { firstByteTimeoutMs: 40 }).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 0, 'private GLM activity keeps the original provider lane alive');
+  assert.ok(got.some((event) => (event as any).delta === 'finished on GLM'));
+});
+
+test('continuous private reasoning hits the absolute pre-actionable wall and safely uses the rescue', async () => {
+  let rescueCalls = 0;
+  let primaryObservedAbort = false;
+  const reasoningForever = model({ getStreamedResponse: async function* (request: any) {
+    while (!request.signal.aborted) {
+      yield {
+        type: 'model',
+        event: {
+          object: 'chat.completion.chunk',
+          choices: [{
+            index: 0,
+            delta: { reasoning_content: 'still doing private work' },
+            finish_reason: null,
+          }],
+        },
+      } as any;
+      await new Promise((resolve) => setTimeout(resolve, 8));
+    }
+    primaryObservedAbort = true;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'actionable rescue' } as any;
+  } });
+
+  const startedAt = Date.now();
+  const got = await collect(withModelFallback([
+    target('reasoning-forever', reasoningForever),
+    target('configured-rescue', rescue),
+  ], {
+    firstByteTimeoutMs: 20,
+    preActionableTimeoutMs: 55,
+  }).getStreamedResponse(req()));
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(rescueCalls, 1);
+  assert.ok(elapsedMs >= 35 && elapsedMs < 500, `absolute wall fired in a bounded interval (${elapsedMs}ms)`);
+  assert.deepEqual(
+    got.map((event) => (event as any).delta).filter(Boolean),
+    ['actionable rescue'],
+    'abandoned private reasoning never escapes into the rescued answer',
+  );
+  assert.deepEqual(fallbackRouteResolution(got.at(-1)), {
+    initialLabel: 'reasoning-forever',
+    resolvedLabel: 'configured-rescue',
+    fellOver: true,
+    reason: 'pre-actionable-timeout',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(primaryObservedAbort, true, 'the expired physical request receives cancellation');
+});
+
+test('the absolute pre-actionable wall is permanently disarmed after text commits', async () => {
+  let rescueCalls = 0;
+  const committedPrimary = model({ getStreamedResponse: async function* () {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    yield { type: 'output_text_delta', delta: 'primary started' } as any;
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    yield { type: 'output_text_delta', delta: ' and finished' } as any;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'must not replay' } as any;
+  } });
+
+  const got = await collect(withModelFallback([
+    target('committed-primary', committedPrimary),
+    target('rescue-after-commit', rescue),
+  ], { preActionableTimeoutMs: 35 }).getStreamedResponse(req()));
+
+  assert.equal(rescueCalls, 0, 'actionable output makes cross-provider replay permanently unsafe');
+  assert.deepEqual(got.map((event) => (event as any).delta).filter(Boolean), [
+    'primary started',
+    ' and finished',
+  ]);
 });
 
 test('non-streamed reasoning-only response falls over to an actionable brain', async () => {
@@ -594,6 +733,31 @@ test('firstByteTimeoutMs: a brain that HANGS pre-content falls over to the next 
   const out = await collect(withModelFallback([target('hung', hung), target('codex', codex)], { firstByteTimeoutMs: 50 }).getStreamedResponse(req()));
   assert.equal(nextCalls, 1, 'the hung brain fell over to the next');
   assert.ok((out as any[]).some((e) => e.delta === 'rescued'));
+});
+
+test('first-byte timeout does not abort a buffered non-streaming provider request', async () => {
+  const { withHarnessRunContext } = await import('./brackets.js');
+  let rescueCalls = 0;
+  const slow = model({ getStreamedResponse: async function* () {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    yield { type: 'output_text_delta', delta: 'buffered completion' } as any;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'rescued' } as any;
+  } });
+  const out = await withHarnessRunContext({
+    bufferedProviderRequests: new Set([{
+      kind: 'byo_non_streaming_completion',
+      startedAt: Date.now(),
+      active: true,
+    }]),
+  } as never, () => collect(withModelFallback(
+    [target('slow', slow), target('rescue', rescue)],
+    { firstByteTimeoutMs: 50 },
+  ).getStreamedResponse(req())));
+  assert.equal(rescueCalls, 0, 'an in-flight buffered HTTP body is not pre-content silence');
+  assert.ok((out as any[]).some((e) => e.delta === 'buffered completion'));
 });
 
 test('firstByteTimeoutMs: a brain that answers quickly is NOT falsely failed over', async () => {

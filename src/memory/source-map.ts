@@ -208,13 +208,16 @@ function relevance(objective: Set<string>, p: ResourcePointer): number {
   return hits / t.size;
 }
 
-const SOURCE_MAP_LINE_MAX = 180;
+const SOURCE_MAP_LINE_MAX = 240;
 const SOURCE_MAP_BLOCK_MAX = 1400;
 
 /**
  * Render the landscape as a compact, grouped-by-app block for the per-turn
  * context. Pointer-only (where + what + when), hard token-budget, objective-
- * scoped (on-objective resources first). Returns '' when off or empty.
+ * scoped (on-objective resources first). The durable row already owns exact
+ * ref/provenance/freshness metadata; render it compactly so the model can
+ * navigate and judge a pointer without treating an inferred stale label as a
+ * timeless fact. Returns '' when off or empty.
  */
 export function renderSourceMapForContext(limit = 24, maxChars = SOURCE_MAP_BLOCK_MAX, objective?: string): string {
   if (!isSourceMapEnabled()) return '';
@@ -257,7 +260,13 @@ export function renderSourceMapForContext(limit = 24, maxChars = SOURCE_MAP_BLOC
     for (const p of group) {
       const what = p.whatsHere ? ` — ${p.whatsHere}` : '';
       const when = p.whenToUse ? ` (use for: ${p.whenToUse})` : '';
-      const line = clip(`  - ${p.kind} \`${p.name}\`${what}${when}`);
+      const lastSeen = /^\d{4}-\d{2}-\d{2}/.exec(p.lastSeenAt)?.[0] ?? 'unknown';
+      const trust = typeof p.trust === 'number' && Number.isFinite(p.trust)
+        ? Math.max(0, Math.min(1, p.trust)).toFixed(2)
+        : 'unknown';
+      const parent = p.parentRef ? `; parent=${p.parentRef}` : '';
+      const metadata = `ref=${p.ref}${parent}; trust=${trust}; source=${p.source}; seen=${lastSeen}; mentions=${p.mentionCount}`;
+      const line = clip(`  - ${p.kind} \`${p.name}\` [${metadata}]${what}${when}`);
       if (used + 1 + line.length > maxChars) break outer;
       lines.push(line);
       used += 1 + line.length;

@@ -45,6 +45,7 @@ const {
 const {
   classifyTurnPreflight,
   recordTurnPreflightDecision,
+  sourceStrategyTopologyDigestFor,
 } = await import('./turn-control.js');
 // eslint-disable-next-line import/first
 const { publishPreflightConversation } = await import('./preflight-conversation.js');
@@ -76,6 +77,10 @@ const { turnOutcomeId } = await import('./turn-outcome.js');
 // eslint-disable-next-line import/first
 const { inspectDurableMaterialSourceContinuation } = await import('./task-continuity-runtime.js');
 // eslint-disable-next-line import/first
+const schemaCache = await import('../../tools/composio-schema-cache.js');
+// eslint-disable-next-line import/first
+const semanticDisposition = await import('../semantic-boundary/semantic-disposition.js');
+// eslint-disable-next-line import/first
 const approvalRegistry = await import('./approval-registry.js');
 // eslint-disable-next-line import/first
 const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
@@ -97,6 +102,8 @@ const {
 } = await import('./restart-recovery.js');
 // eslint-disable-next-line import/first
 const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
+// eslint-disable-next-line import/first
+const runtimeConfig = await import('../../config.js');
 // eslint-disable-next-line import/first
 const acceptedCallAuthority = await import('./accepted-turn-call-authority.js');
 // eslint-disable-next-line import/first
@@ -139,6 +146,59 @@ function stubBuildIdentity(opts: { sessionId: string; sourceUserSeq?: number }):
     } catch { /* keep the loop's direct_reply fallback */ }
   }
   return { sessionId: opts.sessionId, sourceUserSeq, route };
+}
+
+/** Install the smallest claim-linked semantic record whose checked projection
+ * says this exact accepted source answered an open slot with a value. The
+ * production bridge reads this durable claim; an unlinked event is ignored. */
+function recordTypedProvidedAnswer(source: import('./eventlog.js').EventRow): void {
+  const inputHash = createHash('sha256').update(`input:${source.id}`).digest('hex');
+  const audienceHash = createHash('sha256').update(`audience:${source.sessionId}`).digest('hex');
+  const policyRevision = createHash('sha256').update('typed-answer-policy').digest('hex');
+  const interpreted = appendEvent({
+    sessionId: source.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'turn_semantics_interpreted',
+    data: {
+      purpose: 'turn_semantics',
+      sourceUserSeq: source.seq,
+      inputHash,
+      audienceHash,
+      policyRevision,
+      payloadHash: 'a'.repeat(64),
+      contextHash: 'b'.repeat(64),
+      modelIdentity: 'typed-slot-fixture',
+      inputTokens: 1,
+      outputTokens: 1,
+      latencyMs: 1,
+      validationOutcome: 'admitted',
+      repairAttempted: false,
+      raw: {
+        relation: 'answer_open_slot',
+        work: null,
+        goal: null,
+        slotAnswers: [{ kind: 'value', value: source.data.text }],
+      },
+    },
+  });
+  openEventLog().prepare(`
+    INSERT INTO turn_semantics_claims
+      (session_id, source_user_seq, owner, created_at, event_id,
+       input_hash, audience_hash, policy_revision)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    source.sessionId,
+    source.seq,
+    `typed-owner:${source.id}`,
+    new Date().toISOString(),
+    interpreted.id,
+    inputHash,
+    audienceHash,
+    policyRevision,
+  );
+  semanticDisposition.recordSemanticParticipation(source.sessionId, source.seq, 'participated');
+  semanticDisposition.recordSemanticDispositionOutcome(source.sessionId, source.seq, 'admitted');
 }
 
 function fakeRun(result: Record<string, unknown>): never {
@@ -271,6 +331,7 @@ function appendActiveWorkflowDispatch(source: import('./eventlog.js').EventRow, 
 
 beforeEach(() => {
   resetEventLog();
+  runtimeConfig._setRuntimeConfigCaptureObserverForTest(null);
   setClaudeAgentSdkBrainRunForTest(null);
   capabilityHealth._resetHarnessCapabilityHealthForTest();
   _setBridgeImplsForTests({});
@@ -300,6 +361,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  runtimeConfig._setRuntimeConfigCaptureObserverForTest(null);
   setClaudeAgentSdkBrainRunForTest(null);
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
@@ -327,6 +389,107 @@ test('harnessSurfaceEnabled: ALL surfaces default ON (FORK-collapse complete); k
   process.env.CLEMMY_HARNESS_DASHBOARD = 'off';
   assert.equal(harnessSurfaceEnabled('dashboard'), false, 'kill-switch disables the lane');
   delete process.env.CLEMMY_HARNESS_DASHBOARD;
+});
+
+test('respondPreferHarness owns one runtime config capture across route, build, and turn work', async () => {
+  const captures: Array<'environment' | 'secret_vault'> = [];
+  runtimeConfig._setRuntimeConfigCaptureObserverForTest((kind) => captures.push(kind));
+  _setBridgeImplsForTests({
+    configure: (async () => {
+      runtimeConfig.getRuntimeEnv('CLEMMY_HARNESS_HOME', 'on');
+      runtimeConfig.getRuntimeEnv('CLEMMY_HARNESS_HOME', 'on');
+      runtimeConfig.getOpenAiApiKey();
+      runtimeConfig.getOpenAiApiKey();
+      return { ok: true };
+    }) as never,
+    resolveTurnCandidates: (async () => ({
+      candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
+    })) as never,
+    buildAgent: (async () => {
+      runtimeConfig.getRuntimeEnv('OPENAI_MODEL_PRIMARY', 'gpt-5.4');
+      runtimeConfig.getOpenAiApiKey();
+      return FAKE_AGENT;
+    }) as never,
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq?: number;
+      buildAgent: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown>;
+    }) => {
+      runtimeConfig.getRuntimeEnv('OPENAI_MODEL_PRIMARY', 'gpt-5.4');
+      await options.buildAgent(stubBuildIdentity(options));
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        publicPresentation: { kind: 'answer', text: 'snapshot-owned' },
+      };
+    }) as never,
+  });
+
+  try {
+    const response = await respondPreferHarness('home', {
+      sessionId: 'bridge-runtime-config-snapshot-owner',
+      message: 'Please answer this ordinary request.',
+    }, async () => { throw new Error('legacy path must not run'); });
+    assert.equal(response.text, 'snapshot-owned');
+    assert.deepEqual(captures, ['environment', 'secret_vault']);
+  } finally {
+    runtimeConfig._setRuntimeConfigCaptureObserverForTest(null);
+  }
+});
+
+test('accepted plain build skips live candidate recall while an unproven direct reply retains it', async () => {
+  const variants = [
+    { label: 'proven-plain', hostPlainConversation: true, expectedResolverCalls: 0 },
+    { label: 'near-action', hostPlainConversation: false, expectedResolverCalls: 1 },
+  ] as const;
+
+  for (const variant of variants) {
+    let resolverCalls = 0;
+    let builtCandidates: unknown;
+    _setBridgeImplsForTests({
+      configure: okConfigure,
+      resolveTurnCandidates: (async () => {
+        resolverCalls += 1;
+        return {
+          candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
+        };
+      }) as never,
+      buildAgent: (async (options: { turnCandidates?: unknown }) => {
+        builtCandidates = options.turnCandidates;
+        return FAKE_AGENT;
+      }) as never,
+      runConversation: (async (options: {
+        sessionId: string;
+        sourceUserSeq?: number;
+        buildAgent: (identity: ReturnType<typeof stubBuildIdentity> & {
+          hostPlainConversation?: true;
+        }) => Promise<unknown>;
+      }) => {
+        await options.buildAgent({
+          ...stubBuildIdentity(options),
+          ...(variant.hostPlainConversation ? { hostPlainConversation: true as const } : {}),
+        });
+        return {
+          sessionId: options.sessionId,
+          status: 'completed',
+          steps: 1,
+          lastTurn: 1,
+          publicPresentation: { kind: 'answer', text: variant.label },
+        };
+      }) as never,
+    });
+
+    const response = await respondViaHarness('home', {
+      sessionId: `bridge-candidate-read-${variant.label}`,
+      message: variant.hostPlainConversation ? 'Hello there.' : 'Could you check my inbox?',
+      channel: 'desktop',
+    }, { turnEngine: 'host_v1' });
+    assert.equal(response.text, variant.label);
+    assert.equal(resolverCalls, variant.expectedResolverCalls, variant.label);
+    assert.equal(builtCandidates === undefined, variant.hostPlainConversation, variant.label);
+  }
 });
 
 test('host chat freezes engine ownership before semantic graph work', async () => {
@@ -1149,7 +1312,7 @@ test('exact-source model directive binds a new attempt without a synthetic user 
   );
 });
 
-test('respondPreferHarness: kill-switch blocks by default, legacy fallback requires explicit break-glass', async () => {
+test('respondPreferHarness: a disabled lane stays under one owner even when the retired legacy flag is set', async () => {
   process.env.CLEMMY_HARNESS_CRON = 'off';
   let legacyCalled = 0;
   const res = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-t1' }, async (req) => {
@@ -1164,12 +1327,14 @@ test('respondPreferHarness: kill-switch blocks by default, legacy fallback requi
   assert.equal(HarnessSession.load('bridge-t1')?.runInFlightSince(), null);
 
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
-  const legacy = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-t1-legacy' }, async (req) => {
+  const stillBlocked = await respondPreferHarness('cron', { message: 'hi', sessionId: 'bridge-t1-legacy' }, async (req) => {
     legacyCalled += 1;
     return { text: 'legacy', sessionId: req.sessionId };
   });
-  assert.equal(legacyCalled, 1);
-  assert.equal(legacy.text, 'legacy');
+  assert.equal(legacyCalled, 0, 'the retired environment flag cannot transfer execution ownership');
+  assert.equal(stillBlocked.stoppedReason, 'blocked');
+  assert.match(stillBlocked.text, /runtime lane is temporarily unavailable/i);
+  assert.equal(listEvents('bridge-t1-legacy', { types: ['conversation_completed'] }).length, 1);
 });
 
 test('respondPreferHarness: preflight blocks are recorded in harness capability health', async () => {
@@ -1551,6 +1716,436 @@ test('respondPreferHarness: shared Claude host binds an exact compound decline w
   );
 });
 
+test('typed materially different source runs one fresh selector and returns a second unconfirmed checkpoint', async () => {
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  const sessionId = 'bridge-material-source-variant-recovery';
+  const objective = 'Find the top 5 restaurants in Pismo Beach and create one new workbook.';
+  const question = 'I will use the exact bound Apify source and create one new workbook. Use that source?';
+  const answerText = 'Use the DataForSEO source instead.';
+  const parentBinding = {
+    version: 1,
+    primary: {
+      capabilityId: 'capability:composio:APIFY_VARIANT_PARENT',
+      schemaFingerprint: 'a'.repeat(64),
+    },
+    equivalentFallbacks: [],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: 'b'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  const parent = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: parent.turn, sourceUserSeq: parent.seq },
+    surface: 'home',
+    acceptedText: objective,
+  });
+  const parentDecision = classifyTurnPreflight({
+    message: objective,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: parent.seq,
+    sourceStrategyBinding: parentBinding,
+  });
+  assert.equal(parentDecision.sourceStrategyPosture, 'materially_variant');
+  recordTurnPreflightDecision(sessionId, parentDecision, parent.seq);
+  appendEvent({
+    sessionId,
+    turn: parent.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: parent.seq,
+      intentKey: parentDecision.intentKey,
+      confirmationDisposition: parentDecision.confirmationDisposition,
+      sourceStrategyBinding: parentBinding,
+    },
+  });
+  const parentIdentity = { sessionId, turn: parent.turn, sourceUserSeq: parent.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(parentIdentity),
+    identity: parentIdentity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  });
+
+  const answerAttempt = beginRunAttempt(sessionId, { runId: 'variant-answer-run' });
+  const answer = recordRunAttemptUserInput(answerAttempt, {
+    turn: 2,
+    role: 'user',
+    data: { text: answerText },
+  });
+  recordTypedProvidedAnswer(answer);
+
+  const replacementSlug = 'DATAFORSEO_VARIANT_REPLACEMENT';
+  schemaCache.rememberToolSchema(replacementSlug, {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }, Date.now());
+  const replacementFingerprint = schemaCache.liveComposioSchemaFingerprint(replacementSlug);
+  assert.ok(replacementFingerprint);
+  const replacementDraft = {
+    version: 1,
+    primary: {
+      capabilityId: `capability:composio:${replacementSlug}`,
+      schemaFingerprint: replacementFingerprint!,
+    },
+    equivalentFallbacks: [],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: '0'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  const replacementBinding = {
+    ...replacementDraft,
+    topologyDigest: sourceStrategyTopologyDigestFor(replacementDraft)!,
+  };
+  const replacementCandidate = {
+    identifier: replacementSlug,
+    kind: 'composio',
+    intent: 'collect the requested records from the freshly selected source',
+    klass: 'capability_only',
+    via: 'exact' as const,
+    score: 1,
+    effectClass: 'read' as const,
+    schemaFingerprint: replacementFingerprint!,
+    schemaAuthority: 'live' as const,
+    roleKey: 'clause-0:read',
+    resolutionRoleKeys: ['clause-0:read'],
+    verifiedReadOrigin: {
+      version: 1 as const,
+      sessionId: 'replacement-origin',
+      sourceUserSeq: 1,
+      receiptId: `rr_${'c'.repeat(32)}`,
+      evidenceDigest: 'd'.repeat(24),
+    },
+    verifiedReadAliasSpecific: true as const,
+    verifiedReadSchemaFingerprint: replacementFingerprint!,
+    sourceStructurallyEligible: true as const,
+  };
+
+  let selectorCalls = 0;
+  let buildCalls = 0;
+  let runEntries = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    resolveTurnCandidates: (async ({ userInput }: { userInput: string }) => {
+      selectorCalls += 1;
+      assert.match(userInput, /Find the top 5 restaurants/);
+      assert.match(userInput, /Use the DataForSEO source instead/);
+      return {
+        candidates: [replacementCandidate],
+        requirements: [{
+          roleKey: 'clause-0:read',
+          clauseIndex: 0,
+          text: 'collect the requested records',
+          effect: 'read',
+          resolved: true,
+          resolvedCapabilities: [replacementCandidate],
+        }],
+        matches: [],
+        pinnedTools: ['composio_execute_tool'],
+        semanticApplied: true,
+        sourceStrategyBinding: replacementBinding,
+      };
+    }) as never,
+    buildAgent: (async () => {
+      buildCalls += 1;
+      throw new Error('Q2 must publish before the business model is built');
+    }) as never,
+    runConversation: (async (options: { sessionId: string; sourceUserSeq?: number }) => {
+      runEntries += 1;
+      const sourceUserSeq = Number(options.sourceUserSeq);
+      const decisionRow = listEvents(sessionId, { types: ['turn_preflight_decision'] })
+        .filter((row) => row.data.sourceUserSeq === sourceUserSeq);
+      assert.equal(decisionRow.length, 1);
+      const decision = decisionRow[0]!.data as never;
+      const published = await publishPreflightConversation({
+        identity: { sessionId, turn: answer.turn, sourceUserSeq },
+        decision,
+        conversationContext: '',
+        memoryContext: '',
+        capabilityContext: '',
+        openness: null,
+        port: {
+          render: async () => 'Should I use the current replacement source for the same workbook task?',
+        },
+        transport: 'host_harness',
+      });
+      assert.equal(published.kind, 'ask');
+      return {
+        sessionId,
+        status: 'awaiting_user_input',
+        steps: 0,
+        lastTurn: answer.turn,
+        lastDecision: {
+          summary: 'replacement source awaits confirmation',
+          reply: published.presentation.text,
+          done: false,
+          nextAction: 'awaiting_user_input',
+          reason: null,
+        },
+      };
+    }) as never,
+  });
+
+  const response = await respondViaHarness('home', {
+    sessionId,
+    sourceUserSeq: answer.seq,
+    runId: answerAttempt.runId ?? undefined,
+    message: answerText,
+    channel: 'desktop',
+    turnCandidates: {
+      candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
+      sourceStrategyBinding: parentBinding,
+    },
+  }, {
+    sourceUserSeq: answer.seq,
+    turnEngine: 'host_v1',
+  });
+
+  assert.equal(selectorCalls, 1, 'the existing fresh selector runs exactly once after lineage proof');
+  assert.equal(runEntries, 1);
+  assert.equal(buildCalls, 0);
+  assert.equal(response.stoppedReason, 'awaiting-input');
+  assert.match(response.text, /replacement source/i);
+  const childDecisions = listEvents(sessionId, { types: ['turn_preflight_decision'] })
+    .filter((row) => row.data.sourceUserSeq === answer.seq);
+  assert.equal(childDecisions.length, 1);
+  assert.equal(childDecisions[0]!.data.phase, 'align');
+  assert.equal(childDecisions[0]!.data.sourceStrategyPosture, 'materially_variant');
+  assert.equal(childDecisions[0]!.data.confirmedIntentKey, undefined);
+  assert.equal(
+    (childDecisions[0]!.data.sourceStrategyBinding as { primary?: { capabilityId?: string } })
+      .primary?.capabilityId,
+    `capability:composio:${replacementSlug}`,
+  );
+  const childAwaiting = listEvents(sessionId, { types: ['awaiting_user_input'] })
+    .filter((row) => row.data.sourceUserSeq === answer.seq);
+  assert.equal(childAwaiting.length, 1);
+  assert.match(String(childAwaiting[0]!.data.question), /replacement source/i);
+  assert.equal(peekTaskContinuityPacket({ sessionId }).status, 'available',
+    'Q2 creates a fresh B-owned packet rather than opening the business gate');
+  const db = openEventLog();
+  for (const table of ['logical_tool_calls', 'physical_dispatches']) {
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM ${table}
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sessionId, answer.seq) as { n: number }).n, 0, table);
+  }
+
+  const confirmationAttempt = beginRunAttempt(sessionId, { runId: 'variant-confirmation-run' });
+  const confirmation = recordRunAttemptUserInput(confirmationAttempt, {
+    turn: 3,
+    role: 'user',
+    data: { text: 'Yes' },
+  });
+  let confirmedRunEntries = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    resolveTurnCandidates: (async () => {
+      selectorCalls += 1;
+      throw new Error('Q2 confirmation must not run the material-variant selector again');
+    }) as never,
+    buildAgent: (async () => FAKE_AGENT) as never,
+    runConversation: (async () => {
+      confirmedRunEntries += 1;
+      return {
+        sessionId,
+        status: 'completed',
+        steps: 0,
+        lastTurn: confirmation.turn,
+        lastDecision: {
+          summary: 'confirmed source is ready for the continuing task',
+          reply: 'The replacement source is confirmed.',
+          done: true,
+          nextAction: null,
+          reason: null,
+        },
+      };
+    }) as never,
+  });
+  const confirmedResponse = await respondViaHarness('home', {
+    sessionId,
+    sourceUserSeq: confirmation.seq,
+    runId: confirmationAttempt.runId ?? undefined,
+    message: 'Yes',
+    channel: 'desktop',
+  }, {
+    sourceUserSeq: confirmation.seq,
+    turnEngine: 'host_v1',
+  });
+  assert.equal(confirmedResponse.text, 'The replacement source is confirmed.');
+  assert.equal(confirmedRunEntries, 1);
+  assert.equal(selectorCalls, 1, 'only B performs fresh material-variant selection');
+  const confirmedDecisions = listEvents(sessionId, { types: ['turn_preflight_decision'] })
+    .filter((row) => row.data.sourceUserSeq === confirmation.seq);
+  assert.equal(confirmedDecisions.length, 1);
+  assert.equal(confirmedDecisions[0]!.data.phase, 'execute');
+  assert.equal(confirmedDecisions[0]!.data.sourceStrategyPosture, 'confirmed_exact');
+  assert.equal(
+    (confirmedDecisions[0]!.data.sourceStrategyBinding as { primary?: { capabilityId?: string } })
+      .primary?.capabilityId,
+    `capability:composio:${replacementSlug}`,
+  );
+  for (const table of ['logical_tool_calls', 'physical_dispatches']) {
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM ${table}
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sessionId, confirmation.seq) as { n: number }).n, 0, table);
+  }
+});
+
+test('stale exact source lineage blocks before selector, model, logical call, or crossing', async () => {
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  const sessionId = 'bridge-material-source-stale-before-selector';
+  const objective = 'Find the top 5 restaurants and create one new workbook.';
+  const question = 'Should I use the exact bound source for the collection?';
+  const slug = 'SOURCE_SCHEMA_DRIFT_BEFORE_SELECTOR';
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }, Date.now() - 1_000);
+  const originalFingerprint = schemaCache.liveComposioSchemaFingerprint(slug);
+  assert.ok(originalFingerprint);
+  const binding = {
+    version: 1,
+    primary: {
+      capabilityId: `capability:composio:${slug}`,
+      schemaFingerprint: originalFingerprint!,
+    },
+    equivalentFallbacks: [],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: 'e'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  const parent = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: objective },
+  });
+  await recordAcceptedSourceGraph({
+    identity: { sessionId, turn: parent.turn, sourceUserSeq: parent.seq },
+    surface: 'home',
+    acceptedText: objective,
+  });
+  const decision = classifyTurnPreflight({
+    message: objective,
+    sessionId,
+    sessionKind: 'chat',
+    sourceUserSeq: parent.seq,
+    sourceStrategyBinding: binding,
+  });
+  assert.equal(decision.sourceStrategyPosture, 'materially_variant');
+  recordTurnPreflightDecision(sessionId, decision, parent.seq);
+  appendEvent({
+    sessionId,
+    turn: parent.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question,
+      purpose: 'clarification',
+      source: 'preflight_alignment',
+      sourceUserSeq: parent.seq,
+      intentKey: decision.intentKey,
+      confirmationDisposition: decision.confirmationDisposition,
+      sourceStrategyBinding: binding,
+    },
+  });
+  const parentIdentity = { sessionId, turn: parent.turn, sourceUserSeq: parent.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(parentIdentity),
+    identity: parentIdentity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: question },
+  });
+  assert.equal(peekTaskContinuityPacket({ sessionId }).status, 'available',
+    'the stale-binding case begins from an exact durable A/Q packet');
+  schemaCache.rememberToolSchema(slug, {
+    type: 'object',
+    properties: {
+      query: { type: 'string' },
+      locale: { type: 'string' },
+    },
+    required: ['query', 'locale'],
+  }, Date.now());
+  assert.notEqual(schemaCache.liveComposioSchemaFingerprint(slug), originalFingerprint);
+  const answerAttempt = beginRunAttempt(sessionId, { runId: 'stale-source-answer-run' });
+  const answer = recordRunAttemptUserInput(answerAttempt, {
+    turn: 2,
+    role: 'user',
+    data: { text: 'Yes' },
+  });
+  let selectorCalls = 0;
+  let buildCalls = 0;
+  let runCalls = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    resolveTurnCandidates: (async () => {
+      selectorCalls += 1;
+      throw new Error('stale binding must stop before selector');
+    }) as never,
+    buildAgent: (async () => { buildCalls += 1; return FAKE_AGENT; }) as never,
+    runConversation: (async () => { runCalls += 1; throw new Error('must not run'); }) as never,
+  });
+  const response = await respondViaHarness('home', {
+    sessionId,
+    sourceUserSeq: answer.seq,
+    runId: answerAttempt.runId ?? undefined,
+    message: 'Yes',
+    channel: 'desktop',
+    turnCandidates: {
+      candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
+      sourceStrategyBinding: binding,
+    },
+  }, { sourceUserSeq: answer.seq, turnEngine: 'host_v1' });
+  assert.equal(response.stoppedReason, 'blocked');
+  assert.equal(inspectDurableMaterialSourceContinuation({
+    sessionId,
+    sourceUserSeq: answer.seq,
+  }).status, 'refused');
+  assert.equal(selectorCalls, 0);
+  assert.equal(buildCalls, 0);
+  assert.equal(runCalls, 0);
+  const child = listEvents(sessionId, { types: ['user_input_received'] })
+    .find((row) => row.seq === answer.seq)!;
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).find((row) =>
+    (row.data.presentation as { identity?: { sourceUserSeq?: unknown } } | undefined)
+      ?.identity?.sourceUserSeq === answer.seq);
+  assert.equal((terminal?.data.presentation as { status?: unknown } | undefined)?.status, 'blocked');
+  const db = openEventLog();
+  for (const table of ['logical_tool_calls', 'physical_dispatches']) {
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM ${table}
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(sessionId, child.seq) as { n: number }).n, 0, table);
+  }
+});
+
 test('source confirmation persists one lineage graph before shared execution and preserves the exact Apify binding', async () => {
   const sessionId = 'bridge-apify-source-confirmation-lineage';
   const objective = 'Find the top 5 restaurants in Pismo Beach by Google review count. Include each restaurant name, review count, and phone number, then create one new Google Sheet containing those 5 rows. Do not email or share it.';
@@ -1895,8 +2490,13 @@ test('wrong-turn or mixed parent source decisions block before agent/model work 
 
       let buildCalls = 0;
       let runCalls = 0;
+      let selectorCalls = 0;
       _setBridgeImplsForTests({
         configure: okConfigure,
+        resolveTurnCandidates: (async () => {
+          selectorCalls += 1;
+          throw new Error('invalid lineage must stop before selector/schema work');
+        }) as never,
         buildAgent: (async () => {
           buildCalls += 1;
           return FAKE_AGENT;
@@ -1917,6 +2517,7 @@ test('wrong-turn or mixed parent source decisions block before agent/model work 
         },
       }, { turnEngine: 'host_v1' });
       assert.equal(response.stoppedReason, 'blocked', JSON.stringify(response));
+      assert.equal(selectorCalls, 0, `${variant}: corrupt/ambiguous A/Q/B never enters the selector`);
       assert.equal(buildCalls, 0);
       assert.equal(runCalls, 0);
       const child = listEvents(sessionId, { types: ['user_input_received'] })
@@ -1936,15 +2537,27 @@ test('wrong-turn or mixed parent source decisions block before agent/model work 
   }
 });
 
-test('active-Claude cron dispatches through the tool-capable SDK lane', async () => {
+test('active-Claude cron stays on the shared host-owned lane', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLAUDE_MODEL = 'claude-sonnet-4-6';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   let sdkCalls = 0;
   let harnessCalls = 0;
+  let selectedEngine: string | undefined;
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
-    runConversation: (async () => { harnessCalls += 1; return { status: 'completed' }; }) as never,
+    runConversation: (async (opts: { sessionId: string; turnEngine?: string }) => {
+      harnessCalls += 1;
+      selectedEngine = opts.turnEngine;
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        publicPresentation: { kind: 'answer', text: 'cron complete' },
+      };
+    }) as never,
     claudeAgentBrain: (async () => {
       sdkCalls += 1;
       return { text: 'cron complete', raw: { transport: 'claude_agent_sdk_brain', model: 'claude-sonnet-4-6', mode: 'full' } };
@@ -1953,9 +2566,11 @@ test('active-Claude cron dispatches through the tool-capable SDK lane', async ()
 
   const res = await respondPreferHarness('cron', { message: 'run scheduled sync', sessionId: 'cron-sdk-route' }, async () => ({ text: 'legacy' }));
   assert.equal(res.text, 'cron complete');
-  assert.equal(res.route?.routeKind, 'claude_agent_sdk_brain');
-  assert.equal(sdkCalls, 1);
-  assert.equal(harnessCalls, 0, 'cron never falls into the tool-bearing headless harness');
+  assert.equal(res.route?.routeKind, 'harness');
+  assert.equal(res.route?.transport, 'host_harness');
+  assert.equal(selectedEngine, 'host_v1');
+  assert.equal(sdkCalls, 0, 'the retired standalone owner is unreachable in production');
+  assert.equal(harnessCalls, 1);
 });
 
 test('stale claude_oauth plus all_in Claude-shaped BYO stays on the harness/BYO lane', async () => {
@@ -2023,9 +2638,9 @@ test('respondPreferHarness: Claude Discord and Slack turns share the host harnes
   }
 });
 
-// The cases below exercise the standalone reducer that cron/background still
-// use in production. They enter through an interactive surface only to isolate
-// that reducer and therefore opt into the production-dead route explicitly.
+// The cases below exercise the retired standalone reducer. They opt into that
+// production-dead route explicitly so rolling-upgrade failure handling remains
+// testable without transferring fresh-turn ownership.
 test('legacy standalone Claude reducer: relays tool/progress events to legacy callbacks', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
@@ -2078,16 +2693,19 @@ test('legacy standalone Claude reducer: relays tool/progress events to legacy ca
   assert.ok(seenReasoning.some((text) => /planning the next step/i.test(text)));
 });
 
-test('respondPreferHarness: Claude SDK brain opt-in routes background, while workflow stays on its dedicated path', async () => {
+test('respondPreferHarness: Claude background and workflow share the host-owned path', async () => {
   process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLAUDE_MODEL = 'claude-sonnet-4-6';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
   const claudeBrainSurfaces: string[] = [];
   let runConversationCalled = 0;
+  const selectedEngines: string[] = [];
   _setBridgeImplsForTests({
     configure: okConfigure,
     buildAgent: fakeAgentBuilder,
-    runConversation: (async (opts: { sessionId: string }) => {
+    runConversation: (async (opts: { sessionId: string; turnEngine?: string }) => {
       runConversationCalled += 1;
+      selectedEngines.push(opts.turnEngine ?? '');
       return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1, lastDecision: { reply: 'harness', summary: 's', done: true, nextAction: 'completed' } };
     }) as never,
     claudeAgentBrain: (async (surface, req) => {
@@ -2105,10 +2723,11 @@ test('respondPreferHarness: Claude SDK brain opt-in routes background, while wor
     sessionId: req.sessionId,
   }));
 
-  assert.equal(background.text, 'claude');
+  assert.equal(background.text, 'harness');
   assert.equal(workflow.text, 'harness');
-  assert.equal(runConversationCalled, 1);
-  assert.deepEqual(claudeBrainSurfaces, ['background']);
+  assert.equal(runConversationCalled, 2);
+  assert.deepEqual(selectedEngines, ['host_v1', 'host_v1']);
+  assert.deepEqual(claudeBrainSurfaces, []);
 });
 
 test('legacy standalone Claude reducer: uncommitted overload falls the turn over to the host harness', async () => {
@@ -3991,13 +4610,22 @@ test('parse-exhaustion completion re-runs ONCE on the next brain instead of ship
     return { sessionId: opts.sessionId, status: 'completed', steps: 3, lastTurn: 3, completedReason: 'no_structured_output', lastDecision: { summary: 'apology', reply: null, done: true, nextAction: 'completed', reason: null } };
   }) as never;
   _setBridgeImplsForTests({ configure: okConfigure, buildAgent: recordingBuilder, runConversation: alwaysDead });
-  await respondViaHarness('webhook', { message: 'do the thing', sessionId: 'parse-exhaustion-no-recurse' });
+  const deadEnd = await respondViaHarness('webhook', {
+    message: 'do the thing',
+    sessionId: 'parse-exhaustion-no-recurse',
+  });
   assert.equal(calls, 2, 'exactly one recovery hop — never a loop');
+  assert.doesNotMatch(deadEnd.text, /ask me|continue|retry|resume/i,
+    'an exhausted cross-brain recovery closes factually instead of assigning a continuation to the user');
   const deadEndCompletions = listEvents('parse-exhaustion-no-recurse', { types: ['conversation_completed'] });
   assert.equal(deadEndCompletions.length, 1, 'the exhausted recovery commits one terminal');
   assert.equal(
     (deadEndCompletions[0].data.presentation as { status?: string }).status,
     'blocked',
+  );
+  assert.equal(
+    (deadEndCompletions[0].data.presentation as { resumable?: unknown }).resumable,
+    false,
   );
 });
 

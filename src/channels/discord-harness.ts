@@ -125,10 +125,12 @@ import {
   publicUserInputText,
 } from '../runtime/harness/public-presentation.js';
 import type {
+  AssistantResponse,
   ConversationPreambleDeliveryCallback,
   ConversationPreambleDeliveryRequest,
   ConversationPreambleDeliveryResult,
 } from '../types.js';
+import type { RunConversationHold } from '../runtime/harness/run-conversation-disposition.js';
 import { clearRunInFlightAfterTerminal } from '../runtime/harness/restart-recovery.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 import {
@@ -774,6 +776,16 @@ function unregisterActiveChannelRun(active: ActiveDiscordHarnessRun, status: 'co
   runs?.delete(active.attemptId);
   if (runs?.size === 0) activeChannelRuns.delete(key);
   try { finishRunAttempt(active, status); } catch { /* control telemetry is best-effort */ }
+}
+
+/** A held bridge response means this transport invocation is only an observer:
+ * the durable attempt is still owned by a peer/recovery activation. Release
+ * the local channel registration without settling that exact shared owner. */
+function releaseHeldChannelObserver(active: ActiveDiscordHarnessRun): void {
+  const key = activeChannelRunKey(active.channel, active.channelId);
+  const runs = activeChannelRuns.get(key);
+  runs?.delete(active.attemptId);
+  if (runs?.size === 0) activeChannelRuns.delete(key);
 }
 
 export function resolveActiveDiscordHarnessRuns(input: {
@@ -2889,6 +2901,9 @@ export interface DisplayState {
   summary: string;
   status: string;
   done: boolean;
+  /** Exact nonterminal owner returned by the shared host bridge. This is never
+   * inferred from acknowledgement prose and never promoted to a terminal. */
+  typedExecutionHold?: RunConversationHold;
   /** Foreground transport released; the logical user intent is still pending. */
   asyncWorkDispatched?: { sourceUserSeq: number; runIds: string[]; sourceGroupId: string };
   /** Complete audit events, but present only generic elapsed progress when quiet. */
@@ -4423,6 +4438,9 @@ export async function runDiscordHarnessConversation(opts: {
   }, PROGRESS_PULSE_MS);
   progressPulse?.unref?.();
 
+  let heldObserver = false;
+  let settleHeldResponse!: (response: AssistantResponse) => Promise<void>;
+
   const finished: Promise<void> = new Promise((resolve) => {
     let unsubscribe: (() => void) | null = null;
     let safetyTimer: NodeJS.Timeout | null = null;
@@ -4448,6 +4466,33 @@ export async function runDiscordHarnessConversation(opts: {
       }
       await finalFlush();
       resolve();
+    };
+
+    settleHeldResponse = async (response): Promise<void> => {
+      const raw = response.raw && typeof response.raw === 'object' && !Array.isArray(response.raw)
+        ? response.raw as Record<string, unknown>
+        : null;
+      const candidate = raw?.typedExecution;
+      const hold = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        ? candidate as Record<string, unknown>
+        : null;
+      const typedHold: RunConversationHold | undefined = hold?.owner === 'host'
+        && (hold.wake === 'peer' || hold.wake === 'recovery')
+        && ((hold.wake === 'peer' && hold.reason === 'peer_in_progress')
+          || (hold.wake === 'recovery' && hold.reason === 'recovery_pending'))
+        ? hold as RunConversationHold
+        : undefined;
+      if (!typedHold) {
+        logger.warn({ sessionId: session.id }, 'host bridge returned in-progress without a typed owner');
+      }
+      state.summary = response.text;
+      state.status = 'held';
+      state.typedExecutionHold = typedHold;
+      // Slack's optional native status sink receives the same typed hold before
+      // the message observer closes. Discord ignores this callback and receives
+      // the canonical acknowledgement through the owned placeholder edit.
+      try { transport.onState?.(state); } catch { /* status delivery is best-effort */ }
+      await settle();
     };
 
     unsubscribe = actionBus.subscribe((bus) => {
@@ -4582,7 +4627,7 @@ export async function runDiscordHarnessConversation(opts: {
         });
       };
       const bridgeSurface: 'discord' | 'slack' = channel === 'slack' ? 'slack' : 'discord';
-      await respondPreferHarness(bridgeSurface, {
+      const response = await respondPreferHarness(bridgeSurface, {
         message: effectiveInput,
         displayMessage: rawPromptForIntent,
         sourceUserSeq: acceptedUserInput.seq,
@@ -4598,6 +4643,14 @@ export async function runDiscordHarnessConversation(opts: {
         await runSharedHarnessPath();
         return { text: '', sessionId: session.id, stoppedReason: 'success' };
       });
+      if (response.stoppedReason === 'in-progress') {
+        // No public event will arrive for this exact source: a peer/recovery
+        // activation still owns it. Close only this transport observer, render
+        // the bridge's canonical acknowledgement, and leave both durable owner
+        // ledgers active for that continuation.
+        heldObserver = true;
+        await settleHeldResponse(response);
+      }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       try {
@@ -4630,19 +4683,23 @@ export async function runDiscordHarnessConversation(opts: {
   try {
     await finished;
   } finally {
-    const outcome = acceptedChannelOutcome(acceptedUserInput);
-    const finalStatus = getHarnessSession(session.id)?.status === 'cancelled'
-      ? 'cancelled'
-      : outcome
-        ? 'completed'
-        : 'failed';
-    unregisterActiveChannelRun(activeRun, finalStatus);
-    if (outcome) {
-      // `completed` here closes the foreground provider attempt. For a
-      // dispatch, async_work_dispatched remains the nonterminal logical edge;
-      // the outer Slack/Discord inbox may mark its ACK `replied` without
-      // claiming the workflow itself has completed.
-      clearChannelRunMarkerIfIdle(session.id, activeRun.attemptId);
+    if (heldObserver) {
+      releaseHeldChannelObserver(activeRun);
+    } else {
+      const outcome = acceptedChannelOutcome(acceptedUserInput);
+      const finalStatus = getHarnessSession(session.id)?.status === 'cancelled'
+        ? 'cancelled'
+        : outcome
+          ? 'completed'
+          : 'failed';
+      unregisterActiveChannelRun(activeRun, finalStatus);
+      if (outcome) {
+        // `completed` here closes the foreground provider attempt. For a
+        // dispatch, async_work_dispatched remains the nonterminal logical edge;
+        // the outer Slack/Discord inbox may mark its ACK `replied` without
+        // claiming the workflow itself has completed.
+        clearChannelRunMarkerIfIdle(session.id, activeRun.attemptId);
+      }
     }
   }
 }

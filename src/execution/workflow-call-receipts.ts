@@ -1069,7 +1069,6 @@ function committedEvidenceFromIntent(
       'Structured workflow call evidence no longer matches the frozen host-rendered arguments/upstream outputs.',
     );
   }
-  const expectedArgsDigest = intent.call.expectedArgsDigest;
   const exactInput = exactInputFromIntent(intent);
   let state = inspectExactState(exactInput, intent.fingerprint);
   if (state.status === 'received') {
@@ -1087,35 +1086,18 @@ function committedEvidenceFromIntent(
       `Structured workflow call evidence requires a committed mutation; found ${state.status}.`,
     );
   }
-  const targets = extractStaticSendTargetValues(intent.call.args);
-  if (targets.length === 0) {
-    throw new WorkflowCallCommitEvidenceError(
-      'Structured workflow call evidence requires a literal provider-ready target.',
-    );
-  }
-  const payload = workflowCallPayloadProjection(intent.call.args);
-  const targetDigest = canonicalJsonDigest(targets, 'call target evidence');
-  const evidenceWithoutId = {
-    protocolVersion: 1 as const,
-    kind: 'workflow_call_commit' as const,
+  const projected = projectWorkflowCallCommitOutput({
     mutationReceiptId: `workflow-call:v1:${intent.fingerprint}`,
     canonicalTool: intent.call.tool,
     dispatchSchemaFingerprint,
-    status: 'committed' as const,
-    expectedArgsDigest,
+    expectedArgs,
+    providerReadyArgs: intent.call.args as Record<string, unknown>,
     providerReadyArgsDigest: canonicalJsonDigest(intent.call.args, 'provider-ready call arguments'),
     providerResultDigest: canonicalJsonDigest(state.result, 'committed provider result'),
-    payloadDigest: canonicalJsonDigest(payload.values, 'provider-ready payload projection'),
-    payloadCharacters: payload.characters,
-    target: {
-      digest: targetDigest,
-      total: targets.length,
-    },
-  };
-  const evidenceId = `workflow-call-evidence:v1:${canonicalJsonDigest(evidenceWithoutId, 'call commit evidence')}`;
+  });
   return {
     result: state.result,
-    evidence: { ...evidenceWithoutId, evidenceId },
+    evidence: projected.callEvidence,
   };
 }
 
@@ -1143,6 +1125,80 @@ export function readCommittedWorkflowCallMutationEvidence(
 export interface WorkflowCallCommitOutputV1 {
   providerResult: WorkflowCallProviderResultProjectionV1;
   callEvidence: WorkflowCallCommitEvidenceV1;
+}
+
+/**
+ * Project an already-redeemed durable call into the bounded public evidence
+ * envelope shared by legacy exact-send receipts and workflow-v3 settlements.
+ * This helper creates no authority: callers must first prove every supplied
+ * digest from their owning immutable ledger. Keeping the projection here gives
+ * both ledgers one target/payload classifier and one content-addressing rule.
+ */
+export function projectWorkflowCallCommitOutput(input: {
+  mutationReceiptId: string;
+  canonicalTool: string;
+  dispatchSchemaFingerprint: string;
+  expectedArgs: Record<string, unknown>;
+  providerReadyArgs: Record<string, unknown>;
+  providerReadyArgsDigest: string;
+  providerResultDigest: string;
+}): WorkflowCallCommitOutputV1 {
+  const canonicalTool = input.canonicalTool.trim();
+  if (!canonicalTool || !input.mutationReceiptId.trim()) {
+    throw new WorkflowCallCommitEvidenceError('Structured workflow call evidence identity is incomplete.');
+  }
+  if (!/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(input.dispatchSchemaFingerprint)) {
+    throw new WorkflowCallCommitEvidenceError(
+      'Structured workflow call evidence dispatch schema fingerprint is invalid.',
+    );
+  }
+  for (const [label, digest] of [
+    ['provider-ready argument digest', input.providerReadyArgsDigest],
+    ['provider result digest', input.providerResultDigest],
+  ] as const) {
+    if (!/^[a-f0-9]{64}$/.test(digest)) {
+      throw new WorkflowCallCommitEvidenceError(`Structured workflow call evidence ${label} is invalid.`);
+    }
+  }
+  const providerReadyArgs = normalizeJson(
+    input.providerReadyArgs,
+    'provider-ready call arguments',
+  ) as { [key: string]: JsonValue };
+  const targets = extractStaticSendTargetValues(providerReadyArgs);
+  if (targets.length === 0) {
+    throw new WorkflowCallCommitEvidenceError(
+      'Structured workflow call evidence requires a literal provider-ready target.',
+    );
+  }
+  const payload = workflowCallPayloadProjection(providerReadyArgs);
+  const evidenceWithoutId = {
+    protocolVersion: 1 as const,
+    kind: 'workflow_call_commit' as const,
+    mutationReceiptId: input.mutationReceiptId,
+    canonicalTool,
+    dispatchSchemaFingerprint: input.dispatchSchemaFingerprint,
+    status: 'committed' as const,
+    expectedArgsDigest: workflowCallExpectedArgsDigest(input.expectedArgs),
+    providerReadyArgsDigest: input.providerReadyArgsDigest,
+    providerResultDigest: input.providerResultDigest,
+    payloadDigest: canonicalJsonDigest(payload.values, 'provider-ready payload projection'),
+    payloadCharacters: payload.characters,
+    target: {
+      digest: canonicalJsonDigest(targets, 'call target evidence'),
+      total: targets.length,
+    },
+  };
+  const evidenceId = `workflow-call-evidence:v1:${canonicalJsonDigest(evidenceWithoutId, 'call commit evidence')}`;
+  const evidence: WorkflowCallCommitEvidenceV1 = { ...evidenceWithoutId, evidenceId };
+  return {
+    providerResult: {
+      protocolVersion: 1,
+      kind: 'workflow_call_provider_result',
+      resultId: `workflow-call-result:v1:${input.providerResultDigest}`,
+      digest: input.providerResultDigest,
+    },
+    callEvidence: evidence,
+  };
 }
 
 /** Stable, bounded output envelope for the exact scheduled-send class. Raw

@@ -33,6 +33,42 @@ function propertyType(property: Record<string, unknown> | undefined): string {
   return typeof property?.type === 'string' ? property.type : '';
 }
 
+function providerReadyValueMatchesSchema(value: unknown, schema: Record<string, unknown> | undefined): boolean {
+  if (!schema) return false;
+  switch (propertyType(schema)) {
+    case 'string': return typeof value === 'string';
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'integer': return Number.isSafeInteger(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'array': return Array.isArray(value);
+    case 'object': return isRecord(value);
+    case '': return value !== undefined;
+    default: return false;
+  }
+}
+
+/** Closed host-only projection for an already recipe-instantiated verifier.
+ * The adapter still validates the exact current provider schema; no operation
+ * name, role label, description, or id-looking field nominates a verifier. */
+function exactProviderReadyArgs(
+  schema: Record<string, unknown>,
+  payload: unknown,
+): Record<string, unknown> | null {
+  if (!isRecord(payload)) return null;
+  const { required, properties } = schemaShape(schema);
+  if (required.some((key) => !Object.prototype.hasOwnProperty.call(payload, key))) return null;
+  if (schema.additionalProperties === false
+    && Object.keys(payload).some((key) => !Object.prototype.hasOwnProperty.call(properties, key))) return null;
+  if (Object.entries(payload).some(([key, value]) => !providerReadyValueMatchesSchema(value, properties[key]))) {
+    return null;
+  }
+  try {
+    return structuredClone(payload);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Schema-grounded argument compiler for a proof-provisioned operation. The
  * model's args never cross this boundary: values come from the immutable
@@ -47,6 +83,9 @@ export function compileProofProviderArgs(input: {
   payload: unknown;
   envelope?: GraphNodeInvocationEnvelopeV1;
 }): Record<string, unknown> | null {
+  if (input.role === 'host_verification') {
+    return exactProviderReadyArgs(input.schema, input.payload);
+  }
   const { required, properties } = schemaShape(input.schema);
   const args: Record<string, unknown> = {};
   const predecessorValues = (input.envelope?.predecessors ?? [])
@@ -107,4 +146,3 @@ export function compileProofProviderArgs(input: {
   const unmet = required.filter((key) => !(key in args));
   return unmet.length === 0 ? args : null;
 }
-

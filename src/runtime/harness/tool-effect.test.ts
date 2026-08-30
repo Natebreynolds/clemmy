@@ -1,5 +1,19 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
+import {
+  attachSemanticContract,
+  capabilityManifestDigest,
+  type CapabilityManifestV1,
+  type CapabilityProviderKind,
+  type ManifestEffect,
+} from './capability-manifest.js';
+import {
+  createHostCapabilityCatalogFactory,
+  installHostCapabilityCatalogFactory,
+  peekHostCapabilityCatalogFactory,
+  type RegisteredHostCapability,
+} from './host-capability-catalog-factory.js';
 import {
   classifyRuntimeToolEffect,
   isDelegationPrimitiveRuntimeCall,
@@ -11,6 +25,106 @@ import {
   runtimeToolAuthorityBinding,
   unwrapRuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
+
+type ExternalProviderKind = Extract<CapabilityProviderKind, 'composio' | 'native_mcp' | 'reviewed_cli'>;
+
+function digest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+/**
+ * Production effect authority is a current, registration-attested manifest
+ * row. Provider/tool spelling is identity only, so read fixtures must install
+ * the same positive authority production receives from capability discovery.
+ */
+function externalEffectManifest(input: {
+  operationId: string;
+  providerKind: ExternalProviderKind;
+  effect: Extract<ManifestEffect, 'read' | 'external_write'>;
+}): CapabilityManifestV1 {
+  const write = input.effect === 'external_write';
+  const identity = `${input.providerKind}:${input.operationId}`;
+  const providerInputSchemaDigest = digest(`provider-input:${identity}`);
+  return attachSemanticContract({
+    version: 1,
+    manifestId: `cap:tool-effect:${digest(identity).slice(0, 24)}`,
+    providerKind: input.providerKind,
+    operationId: input.operationId,
+    providerIdentity: `fixture:${input.providerKind}:connected`,
+    providerVersion: digest(`provider:${input.providerKind}`),
+    operationVersion: digest(`operation:${identity}`),
+    definitionFingerprint: digest(`definition:${identity}`),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest,
+      semanticName: input.operationId,
+      behaviorHints: {
+        readOnly: !write,
+        destructive: write ? false : null,
+        idempotent: !write,
+        openWorld: false,
+      },
+    },
+    effect: input.effect,
+    ...(write ? { destination: { family: 'fixture-provider', posture: 'create_new' } } : {}),
+    accountId: `account:${input.providerKind}:fixture`,
+    idempotency: write
+      ? { required: true, policy: 'key_before_dispatch' }
+      : { required: false, policy: 'none' },
+    reconciliation: write
+      ? { supported: true, policy: 'exact_artifact' }
+      : { supported: false, policy: 'none' },
+    outputContract: { kind: write ? 'created_resource' : 'records' },
+    evidenceContract: {
+      kinds: write ? ['receipt', 'readback'] : ['records'],
+      readbackRequired: write,
+    },
+    provenance: {
+      issuer: `host:${input.providerKind}:fixture-materializer:v1`,
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+    advisoryRoles: write ? ['destination'] : ['source'],
+  });
+}
+
+function registeredCapability(manifest: CapabilityManifestV1): RegisteredHostCapability {
+  return {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    ...(manifest.destination ? { destination: manifest.destination } : {}),
+    account: manifest.accountId,
+    manifestDigest: capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerInputSchemaDigest: manifest.externalDefinition?.providerInputSchemaDigest,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({ successful: true }),
+  };
+}
+
+function withCurrentExternalEffects<T>(
+  effects: readonly Array<{
+    operationId: string;
+    providerKind: ExternalProviderKind;
+    effect: Extract<ManifestEffect, 'read' | 'external_write'>;
+  }>,
+  run: () => T,
+): T {
+  const prior = peekHostCapabilityCatalogFactory();
+  installHostCapabilityCatalogFactory(createHostCapabilityCatalogFactory(
+    effects.map((effect) => registeredCapability(externalEffectManifest(effect))),
+  ));
+  try {
+    return run();
+  } finally {
+    installHostCapabilityCatalogFactory(prior);
+  }
+}
 
 test('delegation primitive classification is exact registry authority, not a name heuristic', () => {
   assert.equal(isDelegationPrimitiveRuntimeCall('run_worker', { item: 'x' }), true);
@@ -133,18 +247,14 @@ test('transport pairing normalizes production-shaped inputs and skips resolved i
 });
 
 test('native MCP production names distinguish sends from reads', () => {
-  for (const name of [
+  const writes = [
     'outlook__send_mail',
     'outlook__outlook_send_email',
     'mcp__gmail__reply_to_thread',
     'mcp__googledocs__create_document',
     'mcp__hubspot__find_or_create_contact',
-  ]) {
-    const effect = classifyRuntimeToolEffect(name, {});
-    assert.equal(effect.effect, 'external_write', name);
-    assert.equal(effect.dangerousWrite, true, name);
-  }
-  for (const name of [
+  ];
+  const reads = [
     'outlook__list_messages',
     'mcp__gmail__get_thread',
     'mcp__googledocs__get_document',
@@ -152,76 +262,135 @@ test('native MCP production names distinguish sends from reads', () => {
     'mcp__vapi__retrieve_call',
     'mcp__twilio__list_calls',
     'dataforseo__serp_organic_live_advanced',
-  ]) {
-    const effect = classifyRuntimeToolEffect(name, {});
-    assert.equal(effect.effect, 'read', name);
-    assert.equal(effect.dangerousWrite, false, name);
-  }
+  ];
+  withCurrentExternalEffects([
+    ...writes.map((name) => ({
+      operationId: name.replace(/^mcp__/, ''),
+      providerKind: 'native_mcp' as const,
+      effect: 'external_write' as const,
+    })),
+    ...reads.map((name) => ({
+      operationId: name.replace(/^mcp__/, ''),
+      providerKind: 'native_mcp' as const,
+      effect: 'read' as const,
+    })),
+  ], () => {
+    for (const name of writes) {
+      const effect = classifyRuntimeToolEffect(name, {});
+      assert.equal(effect.effect, 'external_write', name);
+      assert.equal(effect.dangerousWrite, true, name);
+      assert.equal(effect.source, 'native_mcp', name);
+    }
+    for (const name of reads) {
+      const effect = classifyRuntimeToolEffect(name, {});
+      assert.equal(effect.effect, 'read', name);
+      assert.equal(effect.dangerousWrite, false, name);
+      assert.equal(effect.source, 'native_mcp', name);
+    }
+  });
 });
 
-test('unfamiliar native MCP mutations fail closed at the runtime effect boundary', () => {
-  for (const name of [
-    'mcp__stripe__refund_payment',
-    'mcp__aws__reboot_instance',
-    'mcp__cloudflare__purge_cache',
-    'mcp__acme__transact',
-    'mcp__github__merge_pull_request',
-    'mcp__secrets__rotate_key',
-    'mcp__billing__charge_customer',
-    // The SDK also emits this carrier-less namespace shape.
-    'stripe__refund_payment',
-  ]) {
-    const effect = classifyRuntimeToolEffect(name, {});
-    assert.equal(effect.effect, 'external_write', name);
-    assert.equal(effect.mutating, true, name);
-    assert.equal(effect.dangerousWrite, true, name);
-    assert.equal(effect.source, 'native_mcp', name);
-  }
+test('unattested native MCP operations fail closed at the runtime effect boundary', () => {
+  withCurrentExternalEffects([], () => {
+    for (const name of [
+      'mcp__stripe__refund_payment',
+      'mcp__aws__reboot_instance',
+      'mcp__cloudflare__purge_cache',
+      'mcp__acme__transact',
+      'mcp__github__merge_pull_request',
+      'mcp__secrets__rotate_key',
+      'mcp__billing__charge_customer',
+      // Read-shaped provider names are also identities, never effect proof.
+      'mcp__outlook__list_messages',
+      'mcp__dataforseo__serp_organic_live_advanced',
+      'mcp__firecrawl__scrape',
+      // The SDK also emits this carrier-less namespace shape.
+      'stripe__refund_payment',
+    ]) {
+      const effect = classifyRuntimeToolEffect(name, {});
+      assert.equal(effect.effect, 'external_write', name);
+      assert.equal(effect.mutating, true, name);
+      assert.equal(effect.dangerousWrite, true, name);
+      assert.equal(effect.source, 'native_mcp', name);
+    }
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{}',
+    }).effect, 'external_write');
+    assert.equal(classifyRuntimeToolEffect('call_tool', {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' }),
+    }).effect, 'external_write');
+  });
 });
 
 test('native MCP provider read jobs stay reads but explicit mutations win', () => {
-  for (const name of [
+  const reads = [
     'mcp__dataforseo__serp_organic_live_advanced',
     'mcp__dataforseo__create_serp_google_organic_task_post',
     'mcp__dataforseo__DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
     'mcp__firecrawl__scrape',
     'mcp__firecrawl__batch_scrape',
     'mcp__firecrawl__FIRECRAWL_SCRAPE',
-  ]) {
-    assert.equal(classifyRuntimeToolEffect(name, {}).effect, 'read', name);
-  }
-  for (const name of [
+  ];
+  const writes = [
     'mcp__dataforseo__delete_account',
     'mcp__dataforseo__publish_report',
     'mcp__firecrawl__scrape_and_publish',
     'mcp__firecrawl__crawl_and_delete',
-  ]) {
-    assert.equal(classifyRuntimeToolEffect(name, {}).effect, 'external_write', name);
-  }
+  ];
+  withCurrentExternalEffects([
+    ...reads.map((name) => ({
+      operationId: name.replace(/^mcp__/, ''),
+      providerKind: 'native_mcp' as const,
+      effect: 'read' as const,
+    })),
+    ...writes.map((name) => ({
+      operationId: name.replace(/^mcp__/, ''),
+      providerKind: 'native_mcp' as const,
+      effect: 'external_write' as const,
+    })),
+  ], () => {
+    for (const name of reads) {
+      assert.equal(classifyRuntimeToolEffect(name, {}).effect, 'read', name);
+    }
+    for (const name of writes) {
+      assert.equal(classifyRuntimeToolEffect(name, {}).effect, 'external_write', name);
+    }
+  });
 });
 
 test('Composio gateways classify the inner operation rather than the wrapper', () => {
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}',
-  }).dangerousWrite, true);
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{}',
-  }).effect, 'read');
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}',
-  }).effect, 'external_write', 'a read verb cannot hide a mixed-action write');
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', arguments: '{}',
-  }).effect, 'read');
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'GONG_GET_CALL_TRANSCRIPT', arguments: '{}',
-  }).effect, 'read', 'CALL is the object of GET, not a telephony dispatch verb');
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'GONG_GET_CALL_AND_UPDATE_CONTACT', arguments: '{}',
-  }).effect, 'external_write', 'a real mutation token still wins over the call-read shape');
-  assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
-    tool_slug: 'FIRECRAWL_SCRAPE_AND_PUBLISH', arguments: '{}',
-  }).effect, 'external_write', 'a read-job prefix cannot hide an explicit publish');
+  withCurrentExternalEffects([
+    { operationId: 'OUTLOOK_SEND_EMAIL', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'OUTLOOK_LIST_MESSAGES', providerKind: 'composio', effect: 'read' },
+    { operationId: 'HUBSPOT_FIND_OR_CREATE_CONTACT', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', providerKind: 'composio', effect: 'read' },
+    { operationId: 'GONG_GET_CALL_TRANSCRIPT', providerKind: 'composio', effect: 'read' },
+    { operationId: 'GONG_GET_CALL_AND_UPDATE_CONTACT', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'FIRECRAWL_SCRAPE_AND_PUBLISH', providerKind: 'composio', effect: 'external_write' },
+  ], () => {
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}',
+    }).dangerousWrite, true);
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{}',
+    }).effect, 'read');
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}',
+    }).effect, 'external_write', 'a read verb cannot hide a mixed-action write');
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST', arguments: '{}',
+    }).effect, 'read');
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'GONG_GET_CALL_TRANSCRIPT', arguments: '{}',
+    }).effect, 'read', 'CALL is the object of GET, not a telephony dispatch verb');
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'GONG_GET_CALL_AND_UPDATE_CONTACT', arguments: '{}',
+    }).effect, 'external_write', 'a real mutation token still wins over the call-read shape');
+    assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+      tool_slug: 'FIRECRAWL_SCRAPE_AND_PUBLISH', arguments: '{}',
+    }).effect, 'external_write', 'a read-job prefix cannot hide an explicit publish');
+  });
 });
 
 test('trusted carriers preserve the exact direct-call digest and keep ordinary inner carrier-shaped fields as data', () => {
@@ -322,30 +491,154 @@ test('only the exact host unreadable-arguments sentinel owns a durable outer ref
   }
 });
 
+test('work_call wrapping a unique current catalog CLI read is a reviewed_cli read, not unknown', () => {
+  const operationId = 'salesforce_sf_soql_query';
+  const definitionFingerprint = digest(`definition:reviewed_cli:${operationId}`);
+  const manifest = attachSemanticContract({
+    version: 1,
+    manifestId: `cap:tool-effect:${digest(`reviewed_cli:${operationId}`).slice(0, 24)}`,
+    providerKind: 'reviewed_cli',
+    operationId,
+    providerIdentity: '/usr/local/bin/sf',
+    providerVersion: digest('provider:reviewed_cli'),
+    operationVersion: '1',
+    definitionFingerprint,
+    effect: 'read',
+    accountId: 'reviewed_cli:host',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: 'lookup',
+    acceptedInputKinds: ['arguments'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: {
+      issuer: 'host:reviewed-cli-materializer:v1',
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source'],
+    argumentCompiler: { id: 'compile:reviewed-cli-argv:v1', version: '1' },
+    invokePortId: `host:reviewed-cli:${digest(`port:${operationId}`)}`,
+  });
+  const prior = peekHostCapabilityCatalogFactory();
+  installHostCapabilityCatalogFactory(createHostCapabilityCatalogFactory([
+    registeredCapability(manifest),
+  ]));
+  try {
+    const decision = classifyRuntimeToolEffect('work_call', {
+      name: 'salesforce_sf_soql_query',
+      args_json: JSON.stringify({ query: 'SELECT Id FROM Opportunity' }),
+    });
+    assert.equal(decision.effect, 'read');
+    assert.equal(decision.source, 'reviewed_cli');
+  } finally {
+    installHostCapabilityCatalogFactory(prior);
+  }
+});
+
 test('call_tool accounting follows the inner tool and never labels a failed guessed read as a local write', () => {
-  assert.equal(classifyRuntimeToolEffect('call_tool', {
-    name: 'read_file',
-    args_json: JSON.stringify({ path: '/tmp/report.txt' }),
-  }).effect, 'read');
-  assert.equal(classifyRuntimeToolEffect('call_tool', {
-    name: 'composio_execute_tool',
-    args_json: JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: '{}' }),
-  }).effect, 'external_write');
-  assert.equal(classifyRuntimeToolEffect('call_tool', {
-    name: 'http_fetch',
-    args_json: JSON.stringify({ url: 'https://example.com/posts/1' }),
-  }).effect, 'compute');
-  assert.equal(classifyRuntimeToolEffect('call_tool', {
-    name: 'made_up_reader',
-    args_json: '{}',
-  }).effect, 'unknown');
-  assert.equal(runtimeToolAccountingMetadata(
-    'call_tool',
-    JSON.stringify({
+  withCurrentExternalEffects([
+    { operationId: 'GMAIL_SEND_EMAIL', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'GOOGLESHEETS_BATCH_GET', providerKind: 'composio', effect: 'read' },
+  ], () => {
+    assert.equal(classifyRuntimeToolEffect('call_tool', {
+      name: 'read_file',
+      args_json: JSON.stringify({ path: '/tmp/report.txt' }),
+    }).effect, 'read');
+    assert.equal(classifyRuntimeToolEffect('call_tool', {
       name: 'composio_execute_tool',
-      args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' }),
+      args_json: JSON.stringify({ tool_slug: 'GMAIL_SEND_EMAIL', arguments: '{}' }),
+    }).effect, 'external_write');
+    assert.equal(classifyRuntimeToolEffect('call_tool', {
+      name: 'http_fetch',
+      args_json: JSON.stringify({ url: 'https://example.com/posts/1' }),
+    }).effect, 'compute');
+    assert.equal(classifyRuntimeToolEffect('call_tool', {
+      name: 'made_up_reader',
+      args_json: '{}',
+    }).effect, 'unknown');
+    assert.equal(runtimeToolAccountingMetadata(
+      'call_tool',
+      JSON.stringify({
+        name: 'composio_execute_tool',
+        args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' }),
+      }),
+    ).effect, 'read');
+  });
+});
+
+test('static Workspace runner inspection stays read-only through direct and deferred dispatch', () => {
+  const expected = {
+    effect: 'read',
+    mutating: false,
+    dangerousWrite: false,
+    source: 'registry',
+  };
+  assert.deepEqual(classifyRuntimeToolEffect('space_try_runner', {
+    slug: 'friday-team-dashboard',
+    runner_path: 'pull.mjs',
+    payload_json: null,
+  }), expected);
+  assert.deepEqual(classifyRuntimeToolEffect('call_tool', {
+    name: 'space_try_runner',
+    args_json: JSON.stringify({
+      slug: 'friday-team-dashboard',
+      runner_path: 'pull.mjs',
+      payload_json: null,
     }),
-  ).effect, 'read');
+  }), expected);
+});
+
+test('an inert automation proposal stays host-only through the deferred control carrier', () => {
+  assert.deepEqual(classifyRuntimeToolEffect('call_tool', {
+    name: 'automation_opportunity_propose',
+    args_json: JSON.stringify({ proposal_key: 'review-only', opportunity: {} }),
+  }), {
+    effect: 'host_only',
+    mutating: true,
+    dangerousWrite: false,
+    source: 'registry',
+  });
+});
+
+test('pending-action staging stays host-only through call_tool while execution remains a mutation', () => {
+  const expectedStaging = {
+    effect: 'host_only' as const,
+    mutating: true,
+    dangerousWrite: false,
+    source: 'registry' as const,
+  };
+  const exactPayload = {
+    title: 'Review one exact outbound action',
+    kind: 'external_send',
+    toolName: 'composio_execute_tool',
+    payloadJson: JSON.stringify({
+      tool_slug: 'MAIL_SEND',
+      arguments: { to: 'recipient@example.test', body: 'Exact body' },
+    }),
+    approvalIntent: 'request_now',
+  };
+
+  assert.deepEqual(
+    classifyRuntimeToolEffect('pending_action_queue', exactPayload),
+    expectedStaging,
+  );
+  assert.deepEqual(classifyRuntimeToolEffect('call_tool', {
+    name: 'pending_action_queue',
+    args_json: JSON.stringify(exactPayload),
+  }), expectedStaging);
+
+  assert.deepEqual(classifyRuntimeToolEffect('pending_action_execute', {
+    id: 'pending-exact',
+  }), {
+    effect: 'local_write',
+    mutating: true,
+    dangerousWrite: false,
+    source: 'registry',
+  });
 });
 
 test('run_batch read proposals account as reads while mutating proposals remain local writes', () => {
@@ -446,21 +739,26 @@ test('shell effects inspect only literal sh/bash/zsh command payloads', () => {
 });
 
 test('accounting metadata decodes hook arguments and exposes the inner provider action', () => {
-  assert.deepEqual(runtimeToolAccountingMetadata(
-    'composio_execute_tool',
-    JSON.stringify({ tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}' }),
-  ), {
-    effect: 'external_write',
-    effectiveTool: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
-    toolSlug: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+  withCurrentExternalEffects([
+    { operationId: 'HUBSPOT_FIND_OR_CREATE_CONTACT', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'DATAFORSEO_CREATE_SERP_TASK_POST', providerKind: 'composio', effect: 'read' },
+  ], () => {
+    assert.deepEqual(runtimeToolAccountingMetadata(
+      'composio_execute_tool',
+      JSON.stringify({ tool_slug: 'HUBSPOT_FIND_OR_CREATE_CONTACT', arguments: '{}' }),
+    ), {
+      effect: 'external_write',
+      effectiveTool: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+      toolSlug: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+    });
+    assert.deepEqual(runtimeToolAccountingMetadata(
+      'mcp__clementine-local__composio_execute_tool',
+      { tool_slug: 'DATAFORSEO_CREATE_SERP_TASK_POST' },
+    ), {
+      effect: 'read',
+      toolSlug: 'DATAFORSEO_CREATE_SERP_TASK_POST',
+    }, 'a current manifest supplies effect, while missing inner arguments mint no execution identity');
   });
-  assert.deepEqual(runtimeToolAccountingMetadata(
-    'mcp__clementine-local__composio_execute_tool',
-    { tool_slug: 'DATAFORSEO_CREATE_SERP_TASK_POST' },
-  ), {
-    effect: 'read',
-    toolSlug: 'DATAFORSEO_CREATE_SERP_TASK_POST',
-  }, 'missing inner arguments do not mint an effective execution identity');
 });
 
 test('effective lifecycle identity collapses only trusted local carriers', () => {

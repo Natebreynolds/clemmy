@@ -33,7 +33,7 @@
  * harness hands over at turn start — the part we control and can cut.
  */
 import { estimateTokens } from './budget.js';
-import { CACHE_BREAK_SENTINEL } from './model-wire-registry.js';
+import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext } from './model-wire-registry.js';
 import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 
@@ -122,7 +122,10 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
   const instructionsText = input.instructions ?? '';
   const sentinelAt = instructionsText.indexOf(CACHE_BREAK_SENTINEL);
   const staticInstructions = sentinelAt >= 0 ? instructionsText.slice(0, sentinelAt) : instructionsText;
-  const memoryContext = sentinelAt >= 0 ? instructionsText.slice(sentinelAt + CACHE_BREAK_SENTINEL.length) : '';
+  const dynamicInstructions = sentinelAt >= 0
+    ? instructionsText.slice(sentinelAt + CACHE_BREAK_SENTINEL.length)
+    : '';
+  const dynamicLayers = splitCacheDynamicContext(dynamicInstructions);
   const measuredTools = Number.isFinite(input.measuredToolSchemaTokens)
     ? Math.max(0, Math.trunc(input.measuredToolSchemaTokens as number))
     : null;
@@ -136,7 +139,8 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     // STABLE: same bytes every turn for a given session, so the provider keeps
     // them warm. Large is FINE here — that is the whole point of the split.
     ['instructions', estimateTokens(staticInstructions), 'stable', staticInstructions],
-    ['memoryContext', estimateTokens(memoryContext), 'variable', memoryContext],
+    ['turnContext', estimateTokens(dynamicLayers.turnContext), 'variable', dynamicLayers.turnContext],
+    ['memoryContext', estimateTokens(dynamicLayers.memoryContext), 'variable', dynamicLayers.memoryContext],
     // The measured serialized schemas win; the names x 120 guess is only for
     // callers that never had the real schemas in hand.
     ['toolSchemas', measuredTools ?? toolNames.length * perSchema, 'stable', null],

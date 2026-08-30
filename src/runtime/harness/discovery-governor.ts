@@ -775,6 +775,9 @@ function decisionTelemetry(input: {
   consumedBudget: boolean;
   policy: DiscoveryTaskPolicy | null;
   claim: DiscoveryClaim | null;
+  /** Outcome that causally authorized a claim transfer. The transferred claim
+   * is already pending, so reading `claim.outcome` would erase that fact. */
+  priorOutcome?: DiscoveryAttemptOutcome | 'pending';
 }): DiscoveryGovernorTelemetry {
   const available = allowance(input.policy, input.category);
   const used = input.claim ? 1 : 0;
@@ -795,7 +798,11 @@ function decisionTelemetry(input: {
       knownCapability: input.policy?.knownCapability ?? null,
       allowance: available,
       used,
-      ...(input.claim ? { priorOutcome: input.claim.outcome } : {}),
+      ...(input.priorOutcome
+        ? { priorOutcome: input.priorOutcome }
+        : input.claim
+          ? { priorOutcome: input.claim.outcome }
+          : {}),
     },
     metric: {
       name: 'discovery_governor_decisions_total',
@@ -823,6 +830,7 @@ function buildDecision(input: {
   consumedBudget: boolean;
   policy: DiscoveryTaskPolicy | null;
   claim: DiscoveryClaim | null;
+  priorOutcome?: DiscoveryAttemptOutcome | 'pending';
   advisory?: string;
 }): DiscoveryDecision {
   const common = {
@@ -1409,6 +1417,7 @@ export class DiscoveryGovernor {
           consumedBudget: true,
           policy,
           claim: continuationClaim,
+          priorOutcome: existing.outcome,
           ...(roleAdvisory ? { advisory: roleAdvisory } : {}),
         });
       }

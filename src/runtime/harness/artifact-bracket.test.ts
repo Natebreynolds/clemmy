@@ -12,13 +12,111 @@ const ledger = await import('./artifact-ledger.js');
 const brackets = await import('./brackets.js');
 const { ExternalWritePreDispatchError } = await import('./external-write-admission.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const currentCapabilities = await import('./current-capability-manifest.fixture.js');
+
+const GOOGLE_DOC_CREATE_VERIFICATION = {
+  mutation: {
+    version: 1,
+    resourceFamily: 'google_doc',
+    producedHandleKind: 'created_resource',
+    proof: 'resource_identity_v1',
+    target: {
+      source: 'authoritative_result',
+      pointers: ['/document_id'],
+    },
+    resultEnvelope: 'successful_data_envelope_v1',
+  },
+} as const;
+const GOOGLE_DOC_READBACK_VERIFICATION = {
+  readback: {
+    version: 1,
+    resourceFamily: 'google_doc',
+    acceptedHandleKind: 'created_resource',
+    requestTargetPointers: ['/document_id'],
+    responseTargetPointers: ['/document_id'],
+    resultEnvelope: 'successful_data_envelope_v1',
+  },
+} as const;
+const NETLIFY_SITE_CREATE_VERIFICATION = {
+  mutation: {
+    version: 1,
+    resourceFamily: 'netlify_site',
+    producedHandleKind: 'created_resource',
+    proof: 'resource_identity_v1',
+    target: {
+      source: 'authoritative_result',
+      pointers: ['/id'],
+    },
+    resultEnvelope: 'successful_data_envelope_v1',
+  },
+} as const;
+const NETLIFY_SITE_READBACK_VERIFICATION = {
+  readback: {
+    version: 1,
+    resourceFamily: 'netlify_site',
+    acceptedHandleKind: 'created_resource',
+    requestTargetPointers: ['/site_id'],
+    responseTargetPointers: ['/id'],
+    resultEnvelope: 'successful_data_envelope_v1',
+  },
+} as const;
+const priorCapabilityCatalog = currentCapabilities.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'googledocs__create_document',
+    providerKind: 'native_mcp',
+    effect: 'external_write',
+    destination: { family: 'google_doc', posture: 'create_new' },
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+    verification: GOOGLE_DOC_CREATE_VERIFICATION,
+  },
+  {
+    operationId: 'googledocs__get_document',
+    providerKind: 'native_mcp',
+    effect: 'read',
+    destination: { family: 'google_doc', posture: 'named_existing' },
+    verification: GOOGLE_DOC_READBACK_VERIFICATION,
+  },
+  {
+    operationId: 'netlify__sites_create',
+    providerKind: 'native_mcp',
+    effect: 'external_write',
+    destination: { family: 'netlify_site', posture: 'create_new' },
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+    verification: NETLIFY_SITE_CREATE_VERIFICATION,
+  },
+  {
+    operationId: 'netlify__api_create_site',
+    providerKind: 'native_mcp',
+    effect: 'external_write',
+    destination: { family: 'netlify_site', posture: 'create_new' },
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+    verification: NETLIFY_SITE_CREATE_VERIFICATION,
+  },
+  {
+    operationId: 'netlify__status',
+    providerKind: 'native_mcp',
+    effect: 'read',
+    destination: { family: 'netlify_site', posture: 'named_existing' },
+  },
+  {
+    operationId: 'netlify__get_site',
+    providerKind: 'native_mcp',
+    effect: 'read',
+    destination: { family: 'netlify_site', posture: 'named_existing' },
+    verification: NETLIFY_SITE_READBACK_VERIFICATION,
+  },
+]);
 
 beforeEach(() => {
   eventlog.resetEventLog();
   ledger._resetArtifactLedgerForTests();
 });
 
-after(() => rmSync(home, { recursive: true, force: true }));
+after(() => {
+  currentCapabilities.restoreCurrentCapabilityManifestFixtures(priorCapabilityCatalog);
+  eventlog.closeEventLog();
+  rmSync(home, { recursive: true, force: true });
+});
 
 /** The settlement spine refuses wrapped-tool dispatch without an accepted
  *  source AND a persisted turn graph — anchor both on a chat session and
@@ -87,8 +185,11 @@ test('the tool bracket binds one create and reuses it across renamed retries in 
     async execute() {
       dispatches += 1;
       return {
-        documentId: 'doc_bound_123456789',
-        display_url: 'https://docs.google.com/document/d/doc_bound_123456789/edit',
+        successful: true,
+        data: {
+          document_id: 'doc_bound_123456789',
+          display_url: 'https://docs.google.com/document/d/doc_bound_123456789/edit',
+        },
       };
     },
   });
@@ -124,7 +225,7 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
         throw new ExternalWritePreDispatchError('Missing title; provider dispatch did not start.');
       }
       if (mode === 'ambiguous') return 'provider connection closed before a response; creation is unknown';
-      return { documentId: 'doc_retry_123456789' };
+      return { successful: true, data: { document_id: 'doc_retry_123456789' } };
     },
   });
   const invoke = (scope: string, taskAnchor = anchor) => brackets.withHarnessRunContext(
@@ -153,38 +254,61 @@ test('a proven pre-dispatch block releases the slot, while an ambiguous failure 
   assert.equal(dispatches, 3, 'an uncertain write is never blindly replayed');
 });
 
-test('Netlify API create shares the site slot and cannot bypass an uncertain sites:create claim', async () => {
+test('manifest-bound Netlify API creates share one slot and cannot bypass an uncertain claim', async () => {
   const anchor = anchoredChatSession('Create the rc-proof site.');
   const sessionId = anchor.sessionId;
   const runScope = 'run:netlify-api-create';
   let dispatches = 0;
-  let first = true;
-  const tool = brackets.wrapToolForHarness({
-    name: 'run_shell_command',
+  const sitesCreate = brackets.wrapToolForHarness({
+    name: 'netlify__sites_create',
     async execute() {
       dispatches += 1;
-      if (first) {
-        first = false;
-        return 'Netlify CLI terminated during an interactive team prompt; outcome unknown';
-      }
+      return 'Netlify provider connection closed before a response; outcome unknown';
+    },
+  });
+  const apiCreate = brackets.wrapToolForHarness({
+    name: 'netlify__api_create_site',
+    async execute() {
+      dispatches += 1;
       return {
-        id: 'site_api_123456789',
-        ssl_url: 'https://rc-proof.netlify.app',
+        successful: true,
+        data: {
+          id: 'site_api_123456789',
+          ssl_url: 'https://rc-proof.netlify.app',
+        },
       };
     },
   });
-  const invoke = (command: string) => brackets.withHarnessRunContext(
+  const getSite = brackets.wrapToolForHarness({
+    name: 'netlify__get_site',
+    async execute() {
+      return {
+        successful: true,
+        data: {
+          id: 'site_api_123456789',
+          ssl_url: 'https://rc-proof.netlify.app',
+        },
+      };
+    },
+  });
+  const invokeSitesCreate = () => brackets.withHarnessRunContext(
     runContext(anchor, runScope),
-    () => tool.execute!({ command }),
+    () => sitesCreate.execute!({ name: 'rc-proof' }),
+  );
+  const invokeApiCreate = () => brackets.withHarnessRunContext(
+    runContext(anchor, runScope),
+    () => apiCreate.execute!({ account_slug: 'team', name: 'rc-proof' }),
+  );
+  const invokeGetSite = () => brackets.withHarnessRunContext(
+    runContext(anchor, runScope),
+    () => getSite.execute!({ site_id: 'site_api_123456789' }),
   );
 
-  await invoke('netlify sites:create --name rc-proof');
+  await invokeSitesCreate();
   const [uncertain] = ledger.listRunArtifacts(sessionId, runScope);
   assert.equal(uncertain?.status, 'uncertain');
 
-  const denied = await invoke(
-    `netlify api createSite --data '{"account_slug":"team","body":{"name":"rc-proof"}}'`,
-  );
+  const denied = await invokeApiCreate();
   assert.match(String(denied), new RegExp(`artifactId ${uncertain!.id}`));
   assert.equal(dispatches, 1, 'the alternate Netlify API spelling cannot bypass the claim');
 
@@ -196,15 +320,13 @@ test('Netlify API create shares the site slot and cannot bypass an uncertain sit
     true,
     'a read-only absence proof releases the exact claim',
   );
-  await invoke(
-    `netlify api createSite --data '{"account_slug":"team","body":{"name":"rc-proof"}}'`,
-  );
+  await invokeApiCreate();
   let [bound] = ledger.listRunArtifacts(sessionId, runScope);
   assert.equal(dispatches, 2, 'the resolved claim permits exactly one fresh create');
   assert.equal(bound?.status, 'bound');
   assert.equal(bound?.resourceId, 'site_api_123456789');
 
-  await invoke(`netlify api getSite --data '{"site_id":"site_api_123456789"}'`);
+  await invokeGetSite();
   [bound] = ledger.listRunArtifacts(sessionId, runScope);
   assert.ok(bound?.bindingVerifiedAt, 'the exact read-back closes the artifact verification node');
   assert.equal(ledger.listUnresolvedCreateClaims(sessionId, runScope).length, 0);
@@ -215,7 +337,7 @@ test('execute wrapper records an exact Google Docs provider read-back but ignore
   const sessionId = anchor.sessionId;
   const runScope = 'run:verify-doc';
   const intent = {
-    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
+    kind: 'resource', provider: 'google_doc', slotKey: 'resource:primary',
     title: 'Firm brief', createShape: 'CREATE',
   } as const;
   ledger.claimArtifactSlot(sessionId, intent, 'create-doc', runScope);
@@ -228,7 +350,13 @@ test('execute wrapper records an exact Google Docs provider read-back but ignore
   const getter = brackets.wrapToolForHarness({
     name: 'googledocs__get_document',
     async execute() {
-      return { data: { document_id: responseId, display_url: `https://docs.google.com/document/d/${responseId}/edit` } };
+      return {
+        successful: true,
+        data: {
+          document_id: responseId,
+          display_url: `https://docs.google.com/document/d/${responseId}/edit`,
+        },
+      };
     },
   });
   const invoke = () => brackets.withHarnessRunContext(
@@ -242,16 +370,16 @@ test('execute wrapper records an exact Google Docs provider read-back but ignore
   await invoke();
   const verified = ledger.listRunArtifacts(sessionId, runScope)[0];
   assert.ok(verified?.bindingVerifiedAt);
-  assert.equal(verified?.verificationShape, 'GOOGLEDOCS_GET_DOCUMENT');
+  assert.equal(verified?.verificationShape, 'googledocs__get_document');
 });
 
-test('invoke wrapper records a Netlify getSite shell envelope and never treats status as proof', async () => {
+test('invoke wrapper records an exact Netlify getSite readback and never treats status as proof', async () => {
   const anchor = anchoredChatSession('Verify the asset site.');
   const sessionId = anchor.sessionId;
   const runScope = 'run:verify-site';
   const siteId = '00000000-0000-4000-8000-000000000001';
   const intent = {
-    kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
+    kind: 'resource', provider: 'netlify_site', slotKey: 'resource:primary',
     title: 'asset-site', createShape: 'NETLIFY_SITE_CREATE',
   } as const;
   ledger.claimArtifactSlot(sessionId, intent, 'create-site', runScope);
@@ -259,24 +387,33 @@ test('invoke wrapper records a Netlify getSite shell envelope and never treats s
     resourceId: siteId, uri: 'https://asset-site.netlify.app',
   }, 'create-site', runScope);
 
-  const shell = brackets.wrapToolForHarness({
-    name: 'run_shell_command',
-    async invoke(_runContext: unknown, input: unknown) {
-      const command = String((input as { command?: unknown }).command ?? '');
-      if (/\bstatus\b/i.test(command)) {
-        return `exit_code: 0\n\nstdout:\n{"id":"${siteId}"}`;
-      }
-      return `exit_code: 0\n\nstdout:\n{"id":"${siteId}","ssl_url":"https://asset-site.netlify.app"}`;
+  const status = brackets.wrapToolForHarness({
+    name: 'netlify__status',
+    async invoke() {
+      return { successful: true, data: { id: siteId, state: 'ready' } };
     },
   });
-  const invoke = (command: string, callId: string) => brackets.withHarnessRunContext(
+  const getSite = brackets.wrapToolForHarness({
+    name: 'netlify__get_site',
+    async invoke() {
+      return {
+        successful: true,
+        data: { id: siteId, ssl_url: 'https://asset-site.netlify.app' },
+      };
+    },
+  });
+  const invoke = (
+    tool: typeof status,
+    args: Record<string, unknown>,
+    callId: string,
+  ) => brackets.withHarnessRunContext(
     runContext(anchor, runScope),
-    () => shell.invoke!({}, { command }, { toolCall: { callId } }),
+    () => tool.invoke!({}, args, { toolCall: { callId } }),
   );
 
-  await invoke('netlify status --json', 'status-read');
+  await invoke(status, { site_id: siteId }, 'status-read');
   assert.equal(ledger.listRunArtifacts(sessionId, runScope)[0]?.bindingVerifiedAt, null);
-  await invoke(`netlify api getSite --data '{"site_id":"${siteId}"}'`, 'get-site');
+  await invoke(getSite, { site_id: siteId }, 'get-site');
   const verified = ledger.listRunArtifacts(sessionId, runScope)[0];
   assert.ok(verified?.bindingVerifiedAt);
   assert.equal(verified?.verificationCallId, 'get-site');

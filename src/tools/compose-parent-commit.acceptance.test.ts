@@ -25,6 +25,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'compose-parent-commit
 
 const {
   __test__: composioClientTest,
+  listUsableConnectedToolkits,
   resetComposioClient,
 } = await import('../integrations/composio/client.js');
 const { createClementineMcpServer } = await import('./mcp-server.js');
@@ -250,15 +251,15 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
   const loadAccounts = (): Promise<Array<Record<string, unknown>>> =>
     Promise.resolve([account(liveConnectionId)]);
   composioClientTest.setConnectedAccountsLoader(loadAccounts);
-  composioClientTest.setComposioClient({
-    tools: {
-      execute: async (slug: string, body: Record<string, unknown>) => {
+  const executeProvider = async (slug: string, body: Record<string, unknown>) => {
         const args = body.arguments && typeof body.arguments === 'object' && !Array.isArray(body.arguments)
           ? body.arguments as Record<string, unknown>
           : {};
-        const connectedAccountId = typeof body.connectedAccountId === 'string'
-          ? body.connectedAccountId
-          : null;
+        const connectedAccountId = typeof body.connected_account_id === 'string'
+          ? body.connected_account_id
+          : typeof body.connectedAccountId === 'string'
+            ? body.connectedAccountId
+            : null;
         const run = harnessRunContextStorage.getStore();
         const observation: ProviderObservation = {
           slug,
@@ -300,8 +301,17 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
           };
         }
         throw new Error(`Unexpected provider slug in hermetic acceptance: ${slug}`);
-      },
+  };
+  composioClientTest.setComposioClient({
+    tools: {
+      execute: executeProvider,
     },
+    getClient: () => ({
+      withOptions: (options: { maxRetries?: number }) => {
+        assert.equal(options.maxRetries, 0, 'prepared batch uses the exact no-retry transport');
+        return { tools: { execute: executeProvider } };
+      },
+    }),
   });
 
   rememberAccountAlias({
@@ -319,8 +329,15 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
       body: { type: 'string' },
     },
   };
-  rememberToolSchema(CREATE_DRAFT, draftSchema, Date.now());
-  rememberToolSchema(LIST_DRAFTS, { type: 'object', properties: {} }, Date.now());
+  const definitionObservedAt = Date.now();
+  rememberToolSchema(CREATE_DRAFT, draftSchema, definitionObservedAt, 'fixture-operation-v1', null);
+  rememberToolSchema(
+    LIST_DRAFTS,
+    { type: 'object', properties: {} },
+    definitionObservedAt,
+    'fixture-operation-v1',
+    null,
+  );
 
   // The real batch runner resolves its local tool through this map. The tool is
   // production composio_execute_tool; only the surrounding provider is fake.
@@ -342,6 +359,15 @@ test('five workers compose, one parent batch commits, and stable mailbox routing
     expectedConnectionId: string,
     expectedReadback: StoredDraft[],
   ): Promise<BatchRunLedger> => {
+    // Prepared business execution consumes the current account observation
+    // published by discovery/status. It deliberately does not hide a fresh
+    // account-list crossing inside dispatch, so the acceptance fixture must
+    // perform the same explicit preparation step as production.
+    const preparedAccounts = await listUsableConnectedToolkits();
+    assert.ok(
+      preparedAccounts.some((entry) => entry.connectionId === expectedConnectionId),
+      `${phase}: exact current mailbox observation was published before execution`,
+    );
     const expected = fixtures(phase);
     const source = acceptUserTurn(
       session.id,

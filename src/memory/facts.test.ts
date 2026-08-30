@@ -1060,7 +1060,7 @@ test('dispatch-enforced constraints are never elided from the standing block', (
   const filler = 'The dispatch gate verifies the connected mailbox and routes to the compliant connection automatically, regardless of which account the draft was authored under, and never falls back silently. ';
   rememberFact({
     kind: 'constraint',
-    content: `Email sending constraint: ALWAYS send email via the Scorpion Outlook mailbox nathan.reynolds@scorpion.co. NEVER send from any other connected mailbox unless explicitly directed in the current conversation. ${filler}${filler}${filler}`,
+    content: `Email sending constraint: ALWAYS send email via the Scorpion Outlook mailbox blake@scorpion.co. NEVER send from any other connected mailbox unless explicitly directed in the current conversation. ${filler}${filler}${filler}`,
   });
   rememberFact({
     kind: 'constraint',

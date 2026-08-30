@@ -7,6 +7,31 @@ import Foundation
 /// Mac's certificate — so every probe here uses the SAME pin as the direct
 /// door. Nothing about "which origin" changes what we trust.
 enum RelayDiscovery {
+    /// True when URLSession is allowed to consult the pairing pin.
+    ///
+    /// LAN addresses are covered by `NSAllowsLocalNetworking`. The relay door
+    /// is a PUBLIC hostname that still presents this Mac's self-signed cert.
+    /// ATS refuses that on URLSession before `PinnedSessionDelegate` runs —
+    /// live 2026-08-27: 131 handoff mints, zero origin adoptions, every
+    /// session from 192.168.x. WKWebView has `NSAllowsArbitraryLoadsInWebContent`
+    /// so the pin can actually run there. A native health probe must not veto
+    /// a door whose only honest proof is the web view.
+    static func nativeHealthProbeCanRun(on origin: String) -> Bool {
+        guard let host = URL(string: origin)?.host?.lowercased(), !host.isEmpty else {
+            return false
+        }
+        if host == "localhost" || host.hasSuffix(".local") { return true }
+        if host.hasPrefix("127.") { return true }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return false }
+        let a = parts[0], b = parts[1]
+        if a == 10 { return true }
+        if a == 192 && b == 168 { return true }
+        if a == 172 && (16...31).contains(b) { return true }
+        if a == 169 && b == 254 { return true }
+        return false
+    }
+
     /// Anonymous endpoint: the daemon publishes its own relay origin so an
     /// already-paired phone gains remote access without re-scanning a QR.
     static func fetchRelayOrigin(from origin: String, fingerprint: String?, completion: @escaping (String?) -> Void) {
@@ -33,6 +58,13 @@ enum RelayDiscovery {
     /// True when /m/health answers on this origin under our pin. Used to pick
     /// the LAN door when it is available and fall back to the relay when not.
     static func probe(origin: String, fingerprint: String?, timeout: TimeInterval = 4, completion: @escaping (Bool) -> Void) {
+        if !nativeHealthProbeCanRun(on: origin) {
+            // Do not ATS-fail the relay before WKWebView can apply the pin.
+            // Hop to main like the URLSession path so callers never see a
+            // synchronous completion mixed with an asynchronous one.
+            DispatchQueue.main.async { completion(true) }
+            return
+        }
         guard let url = URL(string: origin + "/m/health") else { completion(false); return }
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout

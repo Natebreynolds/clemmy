@@ -496,7 +496,7 @@ test('Claude accepted action reconciles background status and continues to work_
   assert.equal(result.text, 'Continued the accepted action after reconciliation.');
 });
 
-test('Claude work_call resolves an exact authorized external MCP schema and lets the host read outrank binding-plan ambiguity', async () => {
+test('standalone Claude turn_graph resolves an exact external MCP schema but refuses the missing host-v1 binding before I/O', async () => {
   const mcpDir = path.join(TMP_HOME, 'mcp');
   const mcpFile = path.join(mcpDir, 'servers.json');
   mkdirSync(mcpDir, { recursive: true });
@@ -516,6 +516,12 @@ test('Claude work_call resolves an exact authorized external MCP schema and lets
       return [{
         name: 'alpha__list_records',
         description: 'Read an exact accepted set.',
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
         inputSchema: {
           type: 'object',
           properties: {
@@ -554,18 +560,32 @@ test('Claude work_call resolves an exact authorized external MCP schema and lets
       agentic: true,
       directOrchestrator: true,
       allowedLocalMcpTools: ['mcp_list_tools'],
+      mcpToolAllowlist: ['mcp_list_tools'],
       localMcpToolUniverse: ['mcp_list_tools'],
       nativeMcpToolScope: {
         authority: 'server_set',
         reason: 'exact test server authority',
         allowedServerSlugs: ['alpha'],
-        // Deliberately advertise zero tools. Exact named authority must still
-        // resolve the callable schema from the connected server catalog.
+        // Advertisement may remain zero-width. An explicitly named operation
+        // is resolved against this authorized server's exact catalog without
+        // widening the model-visible inventory.
         maxTools: 0,
       },
     });
     const registered = (capture.params.options.mcpServers['clementine-local']
       .instance._registeredTools) as Record<string, any>;
+    const searched = await registered.tool_search.handler({
+      query: 'alpha__list_records',
+      limit: 1,
+    });
+    const searchBody = JSON.parse(String(searched.content[0]?.text ?? '')) as {
+      results?: Array<{ name?: string; carrier?: string }>;
+      schemas?: Record<string, unknown>;
+    };
+    assert.equal(searchBody.results?.[0]?.name, 'alpha__list_records');
+    assert.equal(searchBody.results?.[0]?.carrier, 'work_call');
+    assert.ok(searchBody.schemas?.alpha__list_records,
+      'the production action broker returns the exact connected schema before work_call');
     const input = {
       proposal: {
         version: 1,
@@ -606,17 +626,27 @@ test('Claude work_call resolves an exact authorized external MCP schema and lets
     assert.equal(permission.behavior, 'allow');
     const result = await registered.work_call.handler(input);
     const body = String(result.content[0].text ?? '');
-    assert.match(body, /never.*reached/,
-      'the exact uncapped external schema resolved and the host-classified read reached its provider');
-    assert.doesNotMatch(body, /work_cardinality_mismatch|finite_selector_is_ambiguous/,
-      'binding-plan ambiguity cannot veto an objectively non-mutating host call');
-    assert.equal(providerCrossings, 1);
+    const refusal = JSON.parse(body) as { error?: string; reason?: string; detail?: string };
+    assert.equal(refusal.error, 'not_reachable');
+    assert.equal(refusal.reason, 'exact_mcp_binding_missing');
+    assert.match(refusal.detail ?? '', /no exact catalog-manifest attestation/);
+    assert.equal(providerCrossings, 0,
+      'turn_graph cannot invent the host-v1 catalog attestation needed to cross the provider boundary');
     const db = eventlog.openEventLog();
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM expected_work_call_bindings WHERE session_id = ? AND source_user_seq = ?`)
       .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0,
     'the read dispatched without fabricating a binding from the ambiguous plan');
     assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?`)
       .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 1);
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?`)
+      .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0,
+    'the refusal settles without allocating a physical dispatch');
+    assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM host_call_capability_bindings WHERE session_id = ? AND source_user_seq = ?`)
+      .get(task.sessionId, task.sourceUserSeq) as { n: number }).n, 0,
+    'a legacy turn_graph root cannot mint a host-v1 exact capability binding');
+    assert.equal((db.prepare(`SELECT authority_kind FROM accepted_turn_call_authorities
+      WHERE session_id = ? AND source_user_seq = ?`)
+      .get(task.sessionId, task.sourceUserSeq) as { authority_kind: string }).authority_kind, 'turn_graph');
   } finally {
     restore();
     rmSync(mcpFile, { force: true });

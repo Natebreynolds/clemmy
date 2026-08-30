@@ -27,7 +27,7 @@ import { expectedTaskFor } from './resolution-ledger.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
   localPlanningArgumentsMatch,
-  observeCurrentLocalPlanningDefinition,
+  observeCurrentLocalPlanningDefinitions,
   type AuthorizedLocalPlanningDefinitionV1,
 } from './local-planning-capability.js';
 import {
@@ -620,9 +620,18 @@ function localRisk(definition: AuthorizedLocalPlanningDefinitionV1): {
   consequence: InteractiveConsentConsequence;
   destructive: boolean;
 } {
+  if (definition.descriptor.effect === 'read') {
+    return {
+      reversibility: 'read_only',
+      consequence: 'read',
+      destructive: false,
+    };
+  }
   const posture = definition.descriptor.destinationPosture;
   return {
-    reversibility: 'reversible',
+    reversibility: definition.reversibility === 'irreversible'
+      ? 'irreversible'
+      : 'reversible',
     consequence: posture === 'create_new'
       ? 'create'
       : posture === 'named_existing'
@@ -777,17 +786,18 @@ async function semanticBasisForPrepared(input: {
   const binding = input.prepared.hostCapabilityBinding;
   if (binding.bindingKind === 'local_envelope') {
     const local = await exactLocalDefinitionForPrepared(input);
+    const effect = local?.definition.descriptor.effect;
     if (
       !local
       || !localPlanningArgumentsMatch(local.definition, input.prepared.targetArgs)
-      || local.definition.descriptor.effect !== input.prepared.binding.effect
-      || input.prepared.binding.effect !== 'local_write'
+      || effect !== input.prepared.binding.effect
+      || (effect !== 'read' && effect !== 'local_write')
     ) return null;
     return {
       nodeId: local.nodeId,
       operationId: local.definition.capabilityRef,
       schemaFingerprint: local.definition.schemaFingerprint,
-      effect: 'local_write',
+      effect,
       accountId: local.definition.accountIdentity,
       destination: localDestinationFor({
         graphHash: input.graph.graph.compiler.graphHash,
@@ -1096,13 +1106,16 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     digest: attestation.sourceEventDigest,
   };
   const currentLocal = attestation.bindingKind === 'local_envelope'
-    ? await observeCurrentLocalPlanningDefinition({
+    ? await observeCurrentLocalPlanningDefinitions({
         name: attestation.operationId,
         carrier: 'work_call',
       })
     : null;
-  const definition = currentLocal?.ok ? currentLocal.definition : null;
-  const safeMode = definition ? localPlanningArgumentsMatch(definition, input.args) : false;
+  const matchingDefinitions = currentLocal?.ok
+    ? currentLocal.definitions.filter((definition) => localPlanningArgumentsMatch(definition, input.args))
+    : [];
+  const definition = matchingDefinitions.length === 1 ? matchingDefinitions[0]! : null;
+  const safeMode = definition !== null;
   const destination: InteractiveConsentDestination = definition
     ? {
         posture: definition.descriptor.destinationPosture ?? 'not_applicable',

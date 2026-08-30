@@ -7,6 +7,37 @@ import {
   interactiveToolEconomyPolicy,
   isFinishPhaseTool,
 } from './tool-economy.js';
+import {
+  installCurrentCapabilityManifestFixtures,
+  restoreCurrentCapabilityManifestFixtures,
+} from './current-capability-manifest.fixture.js';
+
+const priorCapabilityFactory = installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+    providerKind: 'native_mcp',
+    effect: 'read',
+  },
+  {
+    operationId: 'FIRECRAWL_SEARCH',
+    providerKind: 'composio',
+    effect: 'read',
+  },
+  {
+    operationId: 'googledocs__get_document',
+    providerKind: 'native_mcp',
+    effect: 'read',
+  },
+  {
+    operationId: 'googledocs__get_documents_list',
+    providerKind: 'native_mcp',
+    effect: 'read',
+  },
+]);
+
+test.after(() => {
+  restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
+});
 
 test('interactive economy is default-on with an emergency kill switch', () => {
   const prior = process.env.CLEMMY_INTERACTIVE_TOOL_ECONOMY;

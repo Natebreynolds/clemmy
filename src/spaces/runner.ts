@@ -84,6 +84,8 @@ export interface SpaceSharedDurableComposioAuthority {
 
 export interface SpaceDataSourceRunOptions {
   composioAuthority?: SpaceSharedDurableComposioAuthority;
+  /** A foreground user refresh may ask again after reject/expiry/cancel. */
+  requestFreshTrustApproval?: boolean;
 }
 
 type RetiredSpaceComposioDispatchCanary = (
@@ -242,7 +244,9 @@ export async function runSpaceDataSource(
   opts: SpaceDataSourceRunOptions = {},
 ): Promise<RunSourceResult> {
   if (source.runner?.trim()) {
-    const trust = authorizeInstalledDataRunner(slug, source);
+    const trust = authorizeInstalledDataRunner(slug, source, {
+      requestFreshApproval: opts.requestFreshTrustApproval === true,
+    });
     if (trust.state !== 'approved') {
       return {
         ok: false,
@@ -259,7 +263,9 @@ export async function runSpaceDataSource(
     );
   }
   if (source.cliArgv?.length) {
-    const trust = authorizeCliDataSource(slug, source);
+    const trust = authorizeCliDataSource(slug, source, {
+      requestFreshApproval: opts.requestFreshTrustApproval === true,
+    });
     if (trust.state !== 'approved') {
       return {
         ok: false,
@@ -306,7 +312,17 @@ export async function runSpaceAction(
       callerArgs,
     })
     : { ok: false, error: 'approval id is missing' };
-  if (requiresApproval && !authority.ok) {
+  // Canonical Auto ordinary work has no human row by design. Its opaque
+  // decision is consumed while arming the same durable workflow_v3_call root;
+  // this address grants nothing by itself, and runSpaceComposio reopens the
+  // exact operation/effect/arguments before any provider body can start.
+  const hasSharedAutoAuthority = Boolean(
+    action.composioSlug?.trim()
+    && opts.composioAuthority?.version === 1
+    && opts.composioAuthority.kernel === 'workflow_v3_call'
+    && opts.composioAuthority.activationId.trim(),
+  );
+  if (requiresApproval && !authority.ok && !hasSharedAutoAuthority) {
     return {
       ok: false,
       error: `action "${action.id}" requires exact human approval before execution (${authority.error ?? 'authority check failed'}); invoke it through the Workspace action approval path.`,
@@ -474,7 +490,10 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
       if (minted.ok) composioAuthority = minted.authority;
       else mintRefusal = minted.error;
     }
-    const run = await runSpaceDataSource(slug, source, { composioAuthority });
+    const run = await runSpaceDataSource(slug, source, {
+      composioAuthority,
+      requestFreshTrustApproval: cause === 'manual',
+    });
     if (!run.ok && mintRefusal) {
       run.error = `${run.error} Durable read authority could not be minted: ${mintRefusal}`;
     }

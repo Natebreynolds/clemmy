@@ -14,6 +14,10 @@ import type {
   AttestedTransportReconcile,
   AttestedTransportReconcileResult,
 } from './attested-transport.js';
+import {
+  executeReviewedCliRead,
+  observeReviewedCliReadTransport,
+} from '../reviewed-cli-read-transport.js';
 
 void SHIPPED_ISOLATED_TRANSPORT_SUPPORT_MARK;
 
@@ -85,6 +89,10 @@ export function isolatedTransportCalls(): AttestedTransportCall[] {
 export async function executeAttestedTransport(call: AttestedTransportCall): Promise<unknown> {
   const state = loadState();
   state.calls.push(call);
+  if (call.expected?.providerKind === 'reviewed_cli') {
+    saveState(state);
+    return executeReviewedCliRead(call);
+  }
   if (!isolatedHandler) {
     saveState(state);
     throw new Error(`${call.operationId} isolated transport has no handler`);
@@ -128,6 +136,12 @@ export async function refreshAttestedTransportObservation(input: {
   operationId: string;
   accountId: string;
 }): Promise<AttestedTransportObservation | null> {
+  if (input.accountId === 'reviewed_cli:host') {
+    const observation = observeReviewedCliReadTransport(input.operationId, input.accountId);
+    if (!observation) return null;
+    registerIsolatedObservation(observation);
+    return observation;
+  }
   return observeAttestedTransport(input);
 }
 

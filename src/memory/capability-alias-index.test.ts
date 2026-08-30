@@ -185,7 +185,7 @@ test('one phrase may prove many capabilities and many accounts, each its own row
 });
 
 test('the accepted phrase is never recoverable from the index', async () => {
-  const phrase = 'email the Q3 renewal quote to dana.wexler@northwind-industries.com order 884213307 token sk_live_9fJq2mNz8Xa4';
+  const phrase = 'email the Q3 renewal quote to casey@northwind-industries.com order 884213307 token sk_live_9fJq2mNz8Xa4';
   const terms = boundedAliasTerms(phrase);
   for (const leaked of ['dana', 'wexler', 'northwind', 'industries', 'com', '884213307', 'sk_live_9fJq2mNz8Xa4']) {
     // Address and identifier fragments are exactly what must not become

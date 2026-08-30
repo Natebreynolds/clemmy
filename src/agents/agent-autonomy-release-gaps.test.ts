@@ -392,6 +392,7 @@ test('runtime cycle timeout actively cancels the underlying Claude turn', async 
   let releaseRuntime: (() => void) | undefined;
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
+    allowStandaloneClaudeInteractiveBrainForTests: true,
     claudeAgentBrain: (async (_surface: string, request: {
       sessionId?: string;
       shouldCancel?: () => boolean | Promise<boolean>;

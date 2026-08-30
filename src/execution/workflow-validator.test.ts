@@ -26,6 +26,92 @@ test('clean workflow → ok=true, no errors, no warnings', () => {
   assert.deepEqual(result.errors, []);
 });
 
+test('reviewed promptless transform is valid only as closed read-class computation', () => {
+  const transform = {
+    version: 1,
+    expression: {
+      op: 'object',
+      fields: [
+        { key: 'rows', value: { op: 'get', from: 'steps.pull.output.records' } },
+        {
+          key: 'count',
+          value: { op: 'count', value: { op: 'get', from: 'steps.pull.output.records' } },
+        },
+      ],
+    },
+  };
+  const valid = validateWorkflowDefinition({
+    name: 'closed-transform',
+    description: 'Shape exact provider rows.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Pull records.', sideEffect: 'read' },
+      { id: 'shape', prompt: '', dependsOn: ['pull'], sideEffect: 'read', transform },
+    ],
+  });
+  assert.equal(valid.ok, true, valid.errors.join('\n'));
+
+  const effectful = validateWorkflowDefinition({
+    name: 'effectful-transform',
+    description: 'Reject mixed authority.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'shape',
+      prompt: '',
+      sideEffect: 'write',
+      transform: { version: 1, expression: { op: 'literal', value: true } },
+      call: { tool: 'FILES_WRITE' },
+      allowedTools: ['run_shell_command'],
+    }],
+  });
+  assert.equal(effectful.ok, false);
+  assert.match(effectful.errors.join(' '), /must explicitly declare sideEffect: read/);
+  assert.match(effectful.errors.join(' '), /cannot combine with.*call.*allowedTools/);
+});
+
+test('transform source lineage is dependency- and declared-input-bound', () => {
+  const transform = {
+    version: 1,
+    expression: {
+      op: 'array',
+      items: [
+        { op: 'get', from: 'steps.pull.output' },
+        { op: 'get', from: 'input.segment' },
+      ],
+    },
+  };
+  const missing = validateWorkflowDefinition({
+    name: 'unbound-transform',
+    description: 'Reject unbound transform sources.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Pull records.', sideEffect: 'read' },
+      { id: 'shape', prompt: '', sideEffect: 'read', transform },
+    ],
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.errors.join(' '), /does not depend on "pull"/);
+  assert.match(missing.errors.join(' '), /undeclared workflow input "segment"/);
+
+  const invalidOp = validateWorkflowDefinition({
+    name: 'source-code-transform',
+    description: 'Reject executable source.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'shape',
+      prompt: '',
+      sideEffect: 'read',
+      transform: { version: 1, expression: { op: 'javascript', source: 'return process.env' } },
+    }],
+  });
+  assert.equal(invalidOp.ok, false);
+  assert.match(invalidOp.errors.join(' '), /not a reviewed transform operation/);
+});
+
 // ── Pre-existing structural checks survived the extract ───────────────
 
 test('missing name → error', () => {
@@ -582,14 +668,7 @@ test('deterministic config without runner → warning', () => {
   );
 });
 
-// Regression pin (2026-08-26): 60db67d8 refused a declared deterministic.runner
-// / loopUntil.probe.runner outright ("raw workflow subprocess execution is
-// retired until this executor compiles to shared exact authority"), breaking
-// 5 of the owner's live workflows at authoring time. Restored: it is a fixed,
-// author-declared script under the workflow's own scripts/ directory (see
-// checkDeterministicRunner above and its shape checks), not a live model
-// choosing arguments at runtime — that is a fully supported, dispatchable lane.
-test('deterministic.runner and loopUntil.probe.runner validate — a fixed author-declared script, not a retired lane', () => {
+test('raw deterministic and loop-probe subprocesses refuse until represented by shared exact authority', () => {
   const deterministic = validateWorkflowDefinition({
     name: 'owner-deterministic-shape',
     description: 'Run the local helper.',
@@ -597,12 +676,16 @@ test('deterministic.runner and loopUntil.probe.runner validate — a fixed autho
     trigger: { manual: true },
     steps: [{
       id: 'run_script',
-      prompt: '',
+      prompt: 'Run the local helper.',
       sideEffect: 'read',
       deterministic: { runner: 'run.mjs' },
     }],
   });
-  assert.equal(deterministic.ok, true, deterministic.errors.join('\n'));
+  assert.equal(deterministic.ok, false);
+  assert.ok(
+    deterministic.errors.some((error) => error.includes('workflow_raw_subprocess_authority_unrepresented')),
+    deterministic.errors.join('\n'),
+  );
 
   const loopProbe = validateWorkflowDefinition({
     name: 'owner-loop-probe-shape',
@@ -619,7 +702,32 @@ test('deterministic.runner and loopUntil.probe.runner validate — a fixed autho
       },
     }],
   });
-  assert.equal(loopProbe.ok, true, loopProbe.errors.join('\n'));
+  assert.equal(loopProbe.ok, false);
+  assert.ok(
+    loopProbe.errors.some((error) => error.includes('workflow_raw_subprocess_authority_unrepresented')),
+    loopProbe.errors.join('\n'),
+  );
+});
+
+test('promptless raw subprocess declarations cannot bypass the retirement boundary', () => {
+  const result = validateWorkflowDefinition({
+    name: 'promptless-owner-shape',
+    description: 'A legacy promptless script step.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'run_script',
+      prompt: '',
+      sideEffect: 'read',
+      deterministic: { runner: 'scripts/run.mjs' },
+    }],
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes('workflow_raw_subprocess_authority_unrepresented')),
+    result.errors.join('\n'),
+  );
 });
 
 test('tool slug catalog check — unknown slug → warning', () => {
@@ -1122,6 +1230,39 @@ test('forEach over a declared dependency output path → ok', () => {
 });
 
 // ── {{steps.X.output}} must reference a dependency ───────────────────
+
+test('forEach over a declared JSON-list workflow input → ok; undeclared input refuses', () => {
+  const valid = validateWorkflowDefinition({
+    name: 'fe-input-ok',
+    description: 'Fan out over a declared workflow input.',
+    enabled: true,
+    inputs: { competitors: { type: 'string', default: '[{"name":"A"}]' } },
+    steps: [{ id: 'research', prompt: 'Research each competitor.', forEach: 'input.competitors' }],
+  });
+  assert.ok(!valid.errors.some((error) => /forEach/.test(error)), valid.errors.join('\n'));
+
+  const missing = validateWorkflowDefinition({
+    name: 'fe-input-missing',
+    description: 'Reject undeclared workflow input.',
+    enabled: true,
+    steps: [{ id: 'research', prompt: 'Research each competitor.', forEach: '{{input.competitors}}' }],
+  });
+  assert.match(missing.errors.join(' '), /workflow input "competitors" is not declared/);
+
+  const promptlessExactRead = validateWorkflowDefinition({
+    name: 'fe-input-call-missing',
+    description: 'Promptless exact reads use the same fan-out source contract.',
+    enabled: true,
+    steps: [{
+      id: 'lookup',
+      prompt: '',
+      sideEffect: 'read',
+      forEach: 'input.ids',
+      call: { tool: 'CRM_GET_RECORD', args: { id: '{{item.id}}' } },
+    }],
+  });
+  assert.match(promptlessExactRead.errors.join(' '), /workflow input "ids" is not declared/);
+});
 
 test('steps.X.output referencing a non-dependency step → error', () => {
   const result = validateWorkflowDefinition({

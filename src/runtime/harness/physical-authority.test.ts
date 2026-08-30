@@ -13,7 +13,15 @@ process.env.CLEMENTINE_HOME = HOME;
 
 const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 const { typedExecutionCatalogRefusals } = await import('../semantic-boundary/configure-typed-execution-runtime.js');
-const { appendEvent, closeEventLog, createSession, openEventLog, resetEventLog, HARNESS_DB_PATH } = await import('./eventlog.js');
+const {
+  appendEvent,
+  applyHarnessMigrationsThroughVersionForTests,
+  closeEventLog,
+  createSession,
+  openEventLog,
+  resetEventLog,
+  HARNESS_DB_PATH,
+} = await import('./eventlog.js');
 const {
   callAuthorityDigestOf,
   deriveRetryCallAuthority,
@@ -865,31 +873,7 @@ test('interrupted v45-shaped databases apply migration 47 and keep reconstructab
   closeEventLog();
   try { unlinkSync(HARNESS_DB_PATH); } catch { /* missing is fine */ }
   const raw = new Database(HARNESS_DB_PATH);
-  raw.exec(`
-    CREATE TABLE schema_version (
-      version INTEGER PRIMARY KEY,
-      applied_at TEXT NOT NULL
-    );
-    INSERT INTO schema_version (version, applied_at) VALUES (45, '2026-08-16T00:00:00.000Z');
-    CREATE TABLE physical_dispatches (
-      session_id TEXT NOT NULL,
-      source_user_seq INTEGER NOT NULL,
-      accepted_task_id TEXT NOT NULL,
-      logical_tool_call_id TEXT NOT NULL,
-      physical_dispatch_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL,
-      relation TEXT NOT NULL,
-      retry_of TEXT,
-      tool_name TEXT NOT NULL,
-      argument_digest TEXT NOT NULL,
-      state TEXT NOT NULL DEFAULT 'started',
-      started_at TEXT NOT NULL,
-      settled_at TEXT,
-      start_event_id TEXT,
-      settle_event_id TEXT,
-      PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
-    );
-  `);
+  applyHarnessMigrationsThroughVersionForTests(raw, 45);
   raw.close();
   const migrated = openEventLog();
   assert.equal(
@@ -1184,27 +1168,7 @@ test('schema 47 plaintext secrets are scrubbed by migration 48', () => {
   closeEventLog();
   try { unlinkSync(HARNESS_DB_PATH); } catch { /* missing is fine */ }
   const raw = new Database(HARNESS_DB_PATH);
-  raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (47, '2026-08-16T00:00:00.000Z');
-    CREATE TABLE physical_dispatch_authority_payload (
-      session_id TEXT NOT NULL,
-      source_user_seq INTEGER NOT NULL,
-      physical_dispatch_id TEXT NOT NULL,
-      authority_digest TEXT NOT NULL,
-      provider_argument_digest TEXT NOT NULL,
-      authority_json TEXT NOT NULL,
-      PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
-    );
-    CREATE TABLE physical_dispatch_authority (
-      session_id TEXT NOT NULL,
-      source_user_seq INTEGER NOT NULL,
-      physical_dispatch_id TEXT NOT NULL,
-      authority_digest TEXT NOT NULL,
-      provider_argument_digest TEXT NOT NULL,
-      authority_json TEXT
-    );
-  `);
+  applyHarnessMigrationsThroughVersionForTests(raw, 47);
   raw.prepare(`
     INSERT INTO physical_dispatch_authority_payload
       (session_id, source_user_seq, physical_dispatch_id, authority_digest, provider_argument_digest, authority_json)
@@ -2166,15 +2130,18 @@ test('logical and provider digests bind separately and admit one non-mutating re
 });
 
 test('MIXED PROVENANCE: host write judge with model grounding (or the reverse) refuses at mint', () => {
+  const observation = { ...mintBase.observation, observedAt: Date.now() };
   assert.equal(mintResolvedCallAuthority({
     ...mintBase,
     manifest: writeManifest(),
+    observation,
     writeJudge: { identity: HOST_BIND_IDENTITY, digest: 'e'.repeat(64) },
     groundingIdentity: 'ground-1',
   }).reason, 'write_judge_mismatch');
   assert.equal(mintResolvedCallAuthority({
     ...mintBase,
     manifest: writeManifest(),
+    observation,
     writeJudge: { identity: 'judge-1', digest: 'e'.repeat(64) },
     groundingIdentity: HOST_BIND_IDENTITY,
   }).reason, 'write_judge_mismatch');

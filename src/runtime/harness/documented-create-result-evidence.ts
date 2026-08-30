@@ -8,9 +8,12 @@
  * model-visible provider output remains the raw provider response.
  */
 import { createHash } from 'node:crypto';
-import { documentedAtomicInputContentCommit } from '../../integrations/composio/operation-semantics.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
-import { extractGoogleSheetsSheetFromJsonTarget } from './sheet-from-json-content-contract.js';
+import {
+  parseAtomicResultIdentityProjection,
+  projectAtomicCreatedResourceIdentity,
+  type AtomicResultIdentityProjectionV1,
+} from './atomic-input-content-contract.js';
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
@@ -32,6 +35,7 @@ export interface DocumentedCreateResultAuthorityV1 {
   providerInputSchemaDigest: string;
   argumentDigest: string;
   submittedContentDigest: string;
+  resultIdentity: AtomicResultIdentityProjectionV1;
   effect: 'external_write';
 }
 
@@ -43,6 +47,7 @@ export interface DocumentedCreateResultActualCallV1 {
   providerInputSchemaDigest: string;
   argumentDigest: string;
   submittedContentDigest: string;
+  resultIdentity: AtomicResultIdentityProjectionV1;
   effect: 'external_write';
 }
 
@@ -67,6 +72,7 @@ export type DocumentedCreateResultAdmission =
         | 'schema_mismatch'
         | 'argument_mismatch'
         | 'submitted_content_mismatch'
+        | 'result_identity_mismatch'
         | 'effect_mismatch';
     };
 
@@ -80,6 +86,7 @@ function validAuthority(input: DocumentedCreateResultAuthorityV1): boolean {
     && SHA256_RE.test(input.providerInputSchemaDigest)
     && SHA256_RE.test(input.argumentDigest)
     && SHA256_RE.test(input.submittedContentDigest)
+    && Boolean(parseAtomicResultIdentityProjection(input.resultIdentity))
     && input.effect === 'external_write';
 }
 
@@ -91,19 +98,20 @@ function validActual(input: DocumentedCreateResultActualCallV1): boolean {
     && SHA256_RE.test(input.providerInputSchemaDigest)
     && SHA256_RE.test(input.argumentDigest)
     && SHA256_RE.test(input.submittedContentDigest)
+    && Boolean(parseAtomicResultIdentityProjection(input.resultIdentity))
     && input.effect === 'external_write';
 }
 
 /**
- * Freeze the exact call identity before provider I/O.  Documented operation
- * semantics decide applicability; no provider/tool name substring can turn a
- * lookalike into a create projection.
+ * Freeze the exact call identity before provider I/O. A sealed generic result
+ * projection decides applicability; no provider/tool name substring can turn
+ * a lookalike into a create projection.
  */
 export function admitDocumentedCreateResultProjection(input: {
   authority: DocumentedCreateResultAuthorityV1;
   actual: DocumentedCreateResultActualCallV1;
 }): DocumentedCreateResultAdmission {
-  if (!documentedAtomicInputContentCommit(input.actual.operationId)) {
+  if (!parseAtomicResultIdentityProjection(input.actual.resultIdentity)) {
     return { status: 'not_applicable', reason: 'operation_is_not_a_documented_root_create' };
   }
   if (!validAuthority(input.authority)) {
@@ -132,6 +140,10 @@ export function admitDocumentedCreateResultProjection(input: {
   }
   if (input.authority.submittedContentDigest !== input.actual.submittedContentDigest) {
     return { status: 'refused', reason: 'submitted_content_mismatch' };
+  }
+  if (closedCanonicalJson(input.authority.resultIdentity)
+    !== closedCanonicalJson(input.actual.resultIdentity)) {
+    return { status: 'refused', reason: 'result_identity_mismatch' };
   }
   if (input.authority.effect !== input.actual.effect) {
     return { status: 'refused', reason: 'effect_mismatch' };
@@ -186,8 +198,8 @@ export function documentedProviderAcknowledgementReceipt(
 }
 
 /**
- * Project only response shapes documented by the operation-specific target
- * extractor.  A returned provider acknowledgement with no single exact
+ * Project only response shapes admitted by the sealed pointer projection. A
+ * returned provider acknowledgement with no single exact
  * resource identity is an uncertain write: it never falls back to title
  * lookup, guessed ids, or a second create.
  */
@@ -206,10 +218,11 @@ export function projectDocumentedCreateResult(
     };
   }
 
-  const sheet = documentedAtomicInputContentCommit(admission.authority.operationId)
-    ? extractGoogleSheetsSheetFromJsonTarget(rawProviderResult)
-    : null;
-  if (!sheet) {
+  const created = projectAtomicCreatedResourceIdentity({
+    projection: admission.authority.resultIdentity,
+    authoritativeResult: rawProviderResult,
+  });
+  if (!created) {
     return {
       status: 'uncertain',
       reason: 'artifact_identity_missing_or_ambiguous',
@@ -217,8 +230,6 @@ export function projectDocumentedCreateResult(
     };
   }
 
-  const handle = sheet.spreadsheetUrl
-    ?? `https://docs.google.com/spreadsheets/d/${encodeURIComponent(sheet.spreadsheetId)}/edit`;
   const binding = admission.authority;
   const rawProviderDigest = sha256(rawCanonical);
   // This is an acknowledgement receipt, not an invented provider identifier:
@@ -231,8 +242,8 @@ export function projectDocumentedCreateResult(
       kind: 'documented_provider_create_result',
       binding,
       created: {
-        id: sheet.spreadsheetId,
-        handle,
+        id: created.id,
+        handle: created.handle,
         receipt,
         writtenDigest: binding.submittedContentDigest,
       },
@@ -273,10 +284,9 @@ export function verifyCanonicalDocumentedCreateResult(input: {
     || !exactRecord(value.binding, [
       'version', 'acceptedTaskId', 'logicalToolCallId', 'requirementId',
       'operationId', 'accountId', 'providerInputSchemaDigest',
-      'argumentDigest', 'submittedContentDigest', 'effect',
+      'argumentDigest', 'submittedContentDigest', 'resultIdentity', 'effect',
     ])
     || !validAuthority(value.binding)
-    || !documentedAtomicInputContentCommit(value.binding.operationId)
     || !exactRecord(value.created, ['id', 'handle', 'receipt', 'writtenDigest'])
     || !exactRecord(value.contentCommit, ['kind', 'submittedContentDigest'])
     || value.contentCommit.kind !== 'provider_acknowledged_atomic_input_v1'
@@ -294,14 +304,15 @@ export function verifyCanonicalDocumentedCreateResult(input: {
   if (value.rawProviderDigest !== sha256(rawCanonical)) {
     return { status: 'refused', reason: 'raw provider result digest changed' };
   }
-  const target = extractGoogleSheetsSheetFromJsonTarget(value.rawProviderResult);
-  if (!target || target.spreadsheetId !== value.created.id) {
-    return { status: 'refused', reason: 'provider result no longer identifies one exact Sheet' };
+  const target = projectAtomicCreatedResourceIdentity({
+    projection: value.binding.resultIdentity,
+    authoritativeResult: value.rawProviderResult,
+  });
+  if (!target || target.id !== value.created.id) {
+    return { status: 'refused', reason: 'provider result no longer identifies one exact resource' };
   }
-  const expectedHandle = target.spreadsheetUrl
-    ?? `https://docs.google.com/spreadsheets/d/${encodeURIComponent(target.spreadsheetId)}/edit`;
-  if (value.created.handle !== expectedHandle) {
-    return { status: 'refused', reason: 'created Sheet handle changed' };
+  if (value.created.handle !== target.handle) {
+    return { status: 'refused', reason: 'created resource handle changed' };
   }
   if (value.created.receipt !== documentedProviderAcknowledgementReceipt(
     value.binding,

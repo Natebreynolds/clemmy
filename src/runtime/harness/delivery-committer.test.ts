@@ -18,6 +18,9 @@ const {
   listEvents,
 } = await import('./eventlog.js');
 const { commitTurnOutcome, completionDataForTurnOutcome } = await import('./delivery-committer.js');
+const turnGraph = await import('../graph/turn-graph-shadow.js');
+const expectedWork = await import('./expected-work-contract.js');
+const acceptedAuthority = await import('./accepted-task-authority.js');
 const {
   InvalidTurnOutcomeError,
   UnsafePresentationError,
@@ -68,6 +71,47 @@ function acceptedAnswer(
     id: turnOutcomeId(identity),
     identity,
   };
+}
+
+function acceptedFailedDiscoveryRead(sessionId: string) {
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Read the single most recent message in my Outlook Inbox and return its subject.',
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'tool_search',
+      callId: 'failed-discovery',
+      canonicalCallId: 'failed-discovery',
+      accounting: 'top_level',
+      topologyRole: 'control',
+      effect: 'read',
+      effectiveTool: 'tool_search',
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: source.seq,
+      callId: 'failed-discovery',
+      outcome: 'timed_out',
+    },
+  });
+  return { sessionId, turn: 1, sourceUserSeq: source.seq } as const;
 }
 
 function verifiedReadReceipt(outcome: TurnOutcome, salt = 'a'): Record<string, unknown> {
@@ -176,6 +220,114 @@ test('the committer persists and publishes exactly one winning public answer', (
   } finally {
     detach();
   }
+});
+
+test('failed discovery for a current-state read is durably held instead of stamped success/done', () => {
+  const identity = acceptedFailedDiscoveryRead('failed-discovery-current-read');
+  const committed = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: {
+      kind: 'answer',
+      text: 'I cannot complete this read here. ASK: Could you re-run it?',
+    },
+  });
+
+  assert.equal(committed.presentation.status, 'blocked');
+  assert.equal(committed.presentation.kind, 'blocked');
+  assert.equal(committed.event.data.reason, 'verification_required');
+  assert.equal((committed.event.data.turnOutcome as { status?: unknown }).status, 'blocked');
+  assert.equal(committed.event.data.delivered, false);
+  assert.deepEqual(committed.event.data.verificationMissing, [
+    'discovery_attempted_without_business_evidence',
+  ]);
+});
+
+test('a judge cannot stamp success after plan_task accepted a read but no downstream operation ran', () => {
+  const sessionId = 'accepted-read-plan-zero-downstream';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Read the single most recent message in my Outlook Inbox and return its subject.',
+    },
+  });
+  assert.ok(turnGraph.recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  }));
+  acceptedAuthority.requireAcceptedTaskAuthority({
+    sessionId,
+    sourceUserSeq: source.seq,
+  });
+  const frozen = expectedWork.freezeActionExpectedWorkContract({
+    sessionId,
+    sourceUserSeq: source.seq,
+    proposal: {
+      version: 1,
+      operations: [{
+        id: 'read-latest-inbox',
+        effect: 'read',
+        coverage: 'single',
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' },
+      }],
+      universes: [],
+    },
+  });
+  assert.equal(frozen.status, 'fixed', JSON.stringify(frozen));
+  const identity = { sessionId, sourceUserSeq: source.seq, turn: source.turn } as const;
+  const committed = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: {
+      kind: 'answer',
+      text: 'I could not read the mailbox, so I do not have a source-backed subject yet.',
+    },
+  }, {
+    presentationAlreadyDiscloses: true,
+    terminalJudgeDisposition: 'deliver',
+    legacyReason: 'success',
+  });
+
+  assert.equal(committed.presentation.status, 'blocked');
+  assert.equal(committed.presentation.kind, 'blocked');
+  assert.equal(committed.presentation.resumable, true);
+  assert.equal(committed.event.data.reason, 'verification_required');
+  assert.equal(committed.event.data.delivered, false);
+  assert.notEqual(committed.event.data.reason, 'success');
+  assert.deepEqual(committed.event.data.verificationMissing, ['requirement_unobserved']);
+});
+
+test('an authored ASK after failed discovery keeps its existing needs_input terminal', () => {
+  const identity = acceptedFailedDiscoveryRead('failed-discovery-authored-ask');
+  const committed = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: {
+      kind: 'question',
+      text: 'The Outlook read could not start. Would you like me to retry?',
+    },
+  });
+
+  assert.equal(committed.presentation.status, 'needs_input');
+  assert.equal(committed.presentation.kind, 'question');
+  assert.equal(committed.event.data.reason, 'awaiting_user_input');
+  assert.equal((committed.event.data.turnOutcome as { status?: unknown }).status, 'needs_input');
+  assert.equal(committed.event.data.awaitingUser, true);
 });
 
 test('verified read receipt is strictly validated and atomically follows the winning answer', () => {

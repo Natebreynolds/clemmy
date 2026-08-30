@@ -67,6 +67,15 @@ test('splitCodexInstructions splits role (stable) from dynamic ctx on the sentin
   assert.deepEqual(splitCodexInstructions('just role, no sentinel'), { instructions: 'just role, no sentinel', trailingContext: '' });
 });
 
+test('splitCodexInstructions preserves turn then memory bytes but strips the internal memory marker', async () => {
+  const { CACHE_MEMORY_CONTEXT_DELIM, CACHE_MEMORY_CONTEXT_SENTINEL } = await import('./model-wire-registry.js');
+  const raw = `ROLE${INSTRUCTION_CACHE_DELIM}TURN${CACHE_MEMORY_CONTEXT_DELIM}MEMORY`;
+  const split = splitCodexInstructions(raw);
+  assert.equal(split.instructions, 'ROLE');
+  assert.equal(split.trailingContext, 'TURN\n\nMEMORY');
+  assert.equal(split.trailingContext.includes(CACHE_MEMORY_CONTEXT_SENTINEL), false);
+});
+
 test('Codex wire (default): instructions is the STABLE role only; dynamic ctx re-homed as a trailing input system message', () => {
   const body = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`));
   // instructions must NOT contain the per-turn ctx (so instructions+tools caches).

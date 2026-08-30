@@ -53,6 +53,11 @@ const IMPORT_EXCEPTIONS: Record<string, string[]> = {
   // The accepted-goal compiler is the same deterministic string classifier
   // the turn-graph compiler already uses. It does not call providers or IO.
   'accepted-goal.ts': ['../../assistant/external-effect-taxonomy.js'],
+  // Work topology owns both the strict model-facing wire grammar and the
+  // bounded canonical digest of that grammar. Zod and the shared closed-JSON
+  // encoder are pure, deterministic validation/encoding seams: neither reads
+  // runtime state nor reverses a dependency into the harness or a provider.
+  'work-topology.ts': ['zod', '../../shared/closed-canonical-json.js'],
 };
 
 const AMBIENT_FORBIDDEN = ['process.env', 'Date.now', 'Math.random', 'fetch('];

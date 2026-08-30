@@ -40,6 +40,10 @@ struct RootView: View {
                 }
             } else {
                 ScannerScreen { newPairing, newLaunchURL in
+                    // A handoff belongs to one exact paired daemon. Never
+                    // carry a credential from the previous pairing into the
+                    // newly scanned origin.
+                    OriginHandoffStore.clear()
                     PairingStore.save(newPairing)
                     launchURL = newLaunchURL
                     model = WebViewModel(pairing: newPairing)
@@ -76,6 +80,7 @@ struct RootView: View {
     }
 
     private func unpair() {
+        OriginHandoffStore.clear()
         PairingStore.clear()
         launchURL = nil
         model = nil
@@ -90,6 +95,11 @@ private struct CommandCenterView: View {
     let onUnpair: () -> Void
 
     @State private var rediscovery = Rediscovery()
+    @StateObject private var connectionCoordinator = ConnectionCoordinator()
+    @State private var reconnectGate = ReconnectAttemptGate()
+    @State private var initialNavigationStarted = false
+    @State private var relayRetryAttempt = 0
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         // Full-bleed: the web layer owns the header, tabs, and safe-area
@@ -120,7 +130,14 @@ private struct CommandCenterView: View {
                 Text("You'll scan a fresh QR code from the desktop Mobile panel to reconnect.")
             }
             .onAppear {
-                model.load(launchURL ?? model.pairing.homeURL!)
+                connectionCoordinator.start { update in
+                    handlePathUpdate(update)
+                }
+            }
+            .onDisappear {
+                reconnectGate.cancel()
+                initialNavigationStarted = false
+                connectionCoordinator.stop()
             }
             .onChange(of: model.hasLoadedOnce) { _, loaded in
                 guard loaded else { return }
@@ -137,8 +154,27 @@ private struct CommandCenterView: View {
             }
             .onChange(of: model.connectionLost) { _, lost in
                 guard lost, !searching else { return }
-                searching = true
-                reconnect()
+                guard connectionCoordinator.currentKind != .unavailable else { return }
+                let preferRelay = connectionCoordinator.currentKind?.prefersRelay == true
+                if preferRelay {
+                    // Public relay hosts skip URLSession (ATS would veto the
+                    // Mac's self-signed cert before the pin). WKWebView is the
+                    // proof; a failed navigation must back off instead of
+                    // re-entering the ladder on the same run loop.
+                    scheduleRelayRetry(afterGeneration: reconnectGate.generation)
+                    return
+                }
+                reconnect(preferRelay: false)
+            }
+            .onChange(of: scenePhase) { _, phase in
+                // A cached web shell can resume successfully while still
+                // pointing at yesterday's LAN address. Foregrounding is a
+                // transport boundary, so re-probe instead of waiting for an
+                // unbounded fetch timeout to notice.
+                guard phase == .active,
+                      let kind = connectionCoordinator.currentKind,
+                      kind.isReachable else { return }
+                reconnect(preferRelay: kind.prefersRelay)
             }
             .onReceive(NotificationCenter.default.publisher(for: AppDelegate.tokenNotification)) { note in
                 if let token = note.userInfo?["token"] as? String {
@@ -167,34 +203,112 @@ private struct CommandCenterView: View {
     ///   3. the relay — we are off the LAN entirely.
     /// Every rung enforces the same certificate pin, so "which door" never
     /// widens what the app trusts.
-    private func reconnect() {
+    private func handlePathUpdate(_ update: ConnectionPathUpdate) {
+        guard update.kind.isReachable else {
+            reconnectGate.cancel()
+            searching = false
+            model.connectionLost = true
+            return
+        }
+        if !initialNavigationStarted {
+            initialNavigationStarted = true
+            // A fresh QR must be redeemed at its exact LAN URL. On an ordinary
+            // cold launch, however, do not even start a dead RFC1918 request
+            // when iOS already says the phone is on cellular.
+            if let launchURL, !model.hasLoadedOnce {
+                model.load(launchURL)
+            } else if update.kind.prefersRelay {
+                reconnect(preferRelay: true)
+            } else if let home = model.pairing.homeURL {
+                model.load(home)
+            }
+            return
+        }
+        // Every later path transition is an explicit reason to choose the
+        // right door now; no failed WK navigation is required first.
+        reconnect(preferRelay: update.kind.prefersRelay)
+    }
+
+    private func reconnect(preferRelay: Bool, resetBackoff: Bool = true) {
+        if resetBackoff { relayRetryAttempt = 0 }
         let pairing = model.pairing
-        RelayDiscovery.firstReachable(pairing.candidateOrigins, fingerprint: pairing.fingerprint) { reachable in
+        // RFC1918 probes and Bonjour cannot succeed on a cellular path;
+        // spending their timeouts first is why remote access felt dead.
+        let kind: ConnectionPathKind = preferRelay ? .cellular : .wifi
+        guard let generation = reconnectGate.begin(kind) else { return }
+        searching = true
+        let candidates = ConnectionRoutePolicy.candidates(for: kind, pairing: pairing)
+        RelayDiscovery.firstReachable(candidates, fingerprint: pairing.fingerprint) { reachable in
+            guard reconnectGate.isCurrent(generation) else { return }
             if let reachable {
+                relayRetryAttempt = 0
+                _ = reconnectGate.finish(generation)
                 searching = false
                 model.adoptOrigin(reachable, isLan: reachable != pairing.relayOrigin)
+                if reachable != pairing.relayOrigin {
+                    refreshRelayOrigin(from: reachable)
+                }
+                return
+            }
+            if preferRelay {
+                _ = reconnectGate.finish(generation)
+                searching = false
+                scheduleRelayRetry(afterGeneration: generation)
                 return
             }
             guard let fp = pairing.fingerprint else {
+                _ = reconnectGate.finish(generation)
                 searching = false
                 return
             }
             rediscovery = Rediscovery()
             rediscovery.findMac(fingerprint: fp) { origin in
+                guard reconnectGate.isCurrent(generation) else { return }
                 if let origin {
+                    _ = reconnectGate.finish(generation)
                     searching = false
                     model.adoptOrigin(origin)
+                    refreshRelayOrigin(from: origin)
                     return
                 }
                 guard let relay = pairing.relayOrigin else {
+                    _ = reconnectGate.finish(generation)
                     searching = false
                     return
                 }
                 RelayDiscovery.probe(origin: relay, fingerprint: fp, timeout: 8) { ok in
+                    guard reconnectGate.isCurrent(generation) else { return }
+                    _ = reconnectGate.finish(generation)
                     searching = false
                     if ok { model.adoptOrigin(relay, isLan: false) }
                 }
             }
+        }
+    }
+
+    private func scheduleRelayRetry(afterGeneration generation: Int) {
+        // A path transition is only an edge; iOS will not emit another
+        // "cellular" event when a briefly unavailable relay recovers. Keep a
+        // single fenced health probe alive, backing off to 30 seconds, until a
+        // path/foreground event supersedes it or the relay answers.
+        let exponent = min(relayRetryAttempt, 4)
+        let delay = min(30.0, pow(2.0, Double(exponent)))
+        relayRetryAttempt = min(relayRetryAttempt + 1, 5)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard generation == reconnectGate.generation,
+                  reconnectGate.activeIntent == nil,
+                  scenePhase == .active,
+                  connectionCoordinator.currentKind?.prefersRelay == true else { return }
+            reconnect(preferRelay: true, resetBackoff: false)
+        }
+    }
+
+    private func refreshRelayOrigin(from origin: String) {
+        RelayDiscovery.fetchRelayOrigin(
+            from: origin,
+            fingerprint: model.pairing.fingerprint
+        ) { relay in
+            if let relay { model.rememberRelayOrigin(relay) }
         }
     }
 }
@@ -208,6 +322,22 @@ extension Notification.Name {
 }
 
 extension UIWindow {
+    /// Force every live window to light.
+    ///
+    /// The on-screen keyboard is rendered by a separate remote text-input
+    /// process that reads the WINDOW's trait collection. A web view that
+    /// overrides its own style does not reach it, which is why a phone in dark
+    /// mode kept showing a dark keyboard under Clem's light surface. Applying it
+    /// at the window is the level the keyboard actually observes.
+    static func forceLightInterfaceStyle() {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows {
+                window.overrideUserInterfaceStyle = .light
+            }
+        }
+    }
+
     open override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
         if motion == .motionShake {
             NotificationCenter.default.post(name: .deviceDidShake, object: nil)

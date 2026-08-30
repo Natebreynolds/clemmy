@@ -32,7 +32,7 @@ import type {
 } from '../dashboard/workflow-execution-plan.js';
 
 export type WorkflowDryRunVerdict = 'ready' | 'needs_inputs' | 'blocked';
-export type WorkflowDryRunExecutor = 'model' | 'skill' | 'deterministic' | 'call';
+export type WorkflowDryRunExecutor = 'model' | 'skill' | 'transform' | 'deterministic' | 'call';
 /** What the step does to the OUTSIDE world when the workflow runs for real. */
 export type WorkflowDryRunEffect = 'external_send' | 'external_write' | 'read_only' | 'internal';
 

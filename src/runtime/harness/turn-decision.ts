@@ -17,7 +17,10 @@ import { listEvents, type EventRow } from './eventlog.js';
 import { isToolSurfaceProbeTool } from './tool-evidence.js';
 import { isCanonicalTopLevelToolEvent, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 import { scrubInternalNarration } from './scrub-internal-narration.js';
-import { parseControlReceiptFinalOutput } from './terminal-tool.js';
+import {
+  parseAwaitingUserInputFinalOutput,
+  parseControlReceiptFinalOutput,
+} from './terminal-tool.js';
 import { looksLikeToolUnavailableSelfReport } from './tool-unavailable-text.js';
 // Type-only import — erased at compile time, so there is no runtime cycle
 // with loop.ts (which imports this module's values).
@@ -467,6 +470,20 @@ function parseDecisionText(text: string): OrchestratorDecisionShape | null {
 }
 
 export function toOrchestratorDecision(value: unknown): OrchestratorDecisionShape | null {
+  // A provider activation halts after posting a real question, but the
+  // foreground request remains resumably owned by the conversation. Decode
+  // that pause before the completed-control-receipt contract below so the two
+  // terminal meanings can never collapse into the same public status.
+  const awaitingUserInput = parseAwaitingUserInputFinalOutput(value);
+  if (awaitingUserInput) {
+    return {
+      summary: awaitingUserInput,
+      reply: awaitingUserInput,
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'awaiting_user_input',
+    };
+  }
   // A halting control receipt carries its machine-readable prefix so it can
   // never re-enter prose parsing ("reports back when it finishes" reads as
   // an announcement stall — live 2026-08-10, the 58-status-call loop). The
@@ -554,7 +571,7 @@ export const STALL_OUTPUT_PATTERN = /^(continuing|ok|okay|done|sure|got it|worki
 //
 // Boundary anchors (\b) prevent substring matches; the Unicode-
 // apostrophe class catches curly quotes models love to emit.
-const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|calling\s|pulling\s|querying\s|checking\s|retrieving\s|processing\s|attempting\s|trying\s|configuring\s|preparing\s|setting up\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
+const STALL_ANNOUNCEMENT_PATTERN = /\b(I[\u2018\u2019\u02bc' ]?ll\s|let me\s|executing\s|fetching\s|running\s|calling\s|pulling\s|reading\s|querying\s|checking\s|retrieving\s|processing\s|attempting\s|trying\s|configuring\s|preparing\s|setting up\s|about to\s|going to\s|on the way|in progress|kicking off|starting now|handed off\s|handing off\s|completed the\s|sent the\s|updated the\s|searched\s|pulled the\s|posted the\s|created the\s|drafted the\s|saved the\s|loaded the\s|fetched\s|queried\s|ran the\s|transferred to\s|transferring to\s|routed to\s|routing to\s|dispatched the\s|dispatching the\s|delegated to\s|delegating to\s|kicked off\s|invoked the\s|invoking the\s|launched the\s|launching the\s|triggered the\s|triggering the\s|forwarded to\s|forwarding to\s)/i;
 const STRUCTURED_TOOL_UNAVAILABLE_PATTERN = /\b(tool[- ]?enabled run|tool runtime|tool access|tool surface.{0,80}not available|tools? (?:were|was|are|is) (?:not )?available|no (?:commentary\/)?tool calls? (?:were|was|are|is) available|no executable tool results|no completed tool results|handoff summary|without tool access|resend ["“]?continue["”]?.*tool|please resend.*tool[- ]?enabled|cannot (?:create|read|write|search|execute|run).{0,80}(?:this turn|without tools?))\b/i;
 // A zero-tool turn that AGREES with a correction, reflects on future behavior,
 // or admits it isn't done is a legitimate CONVERSATIONAL reply — not a false

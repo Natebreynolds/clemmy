@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { after, beforeEach, test } from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -9,41 +10,242 @@ process.env.CLEMENTINE_HOME = home;
 
 const eventlog = await import('./eventlog.js');
 const ledger = await import('./artifact-ledger.js');
-const { formatComposioExecuteOutput } = await import('../../tools/composio-tools.js');
+const catalogs = await import('./host-capability-catalog-factory.js');
+const manifests = await import('./capability-manifest.js');
+const composioSemantics = await import('../../integrations/composio/operation-semantics.js');
+
+import type { CapabilityManifestV1 } from './capability-manifest.js';
+import type { RegisteredHostCapability } from './host-capability-catalog-factory.js';
+import type { OperationVerificationContractV1 } from './mutation-verification-contract.js';
+
+const OPAQUE_CREATE = 'OP_QZKVBJ_17';
+const OPAQUE_READBACK = 'OP_VBJQZK_29';
+const OPAQUE_FAMILY = 'artifact:qzkvbj';
+
+const OPAQUE_CREATE_VERIFICATION = {
+  mutation: {
+    version: 1,
+    resourceFamily: OPAQUE_FAMILY,
+    producedHandleKind: 'created_resource',
+    proof: 'resource_identity_v1',
+    target: { source: 'authoritative_result', pointers: ['/resourceId'] },
+  },
+} as const satisfies OperationVerificationContractV1;
+
+const OPAQUE_READBACK_VERIFICATION = {
+  readback: {
+    version: 1,
+    resourceFamily: OPAQUE_FAMILY,
+    acceptedHandleKind: 'created_resource',
+    requestTargetPointers: ['/resourceId'],
+    responseTargetPointers: ['/resourceId'],
+  },
+} as const satisfies OperationVerificationContractV1;
+
+function digest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function operationManifest(input: {
+  operationId: string;
+  effect: 'read' | 'external_write';
+  family?: string;
+  verification?: OperationVerificationContractV1;
+  operationSemantics?: CapabilityManifestV1['operationSemantics'];
+}): CapabilityManifestV1 {
+  const family = input.family ?? OPAQUE_FAMILY;
+  const write = input.effect === 'external_write';
+  const atomic = input.operationSemantics?.atomicInputContent;
+  return manifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:test:${digest(input.operationId).slice(0, 24)}`,
+    providerKind: 'composio',
+    operationId: input.operationId,
+    providerIdentity: 'provider:opaque-fixture',
+    providerVersion: 'surface-v1',
+    operationVersion: '1',
+    definitionFingerprint: digest(`definition:${input.operationId}`),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: digest(`input:${input.operationId}`),
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: digest(`output:${input.operationId}`),
+      semanticName: input.operationId,
+      ...(input.verification ? { verification: input.verification } : {}),
+      behaviorHints: {
+        readOnly: !write,
+        destructive: false,
+        idempotent: write,
+        openWorld: false,
+      },
+    },
+    effect: input.effect,
+    ...(input.operationSemantics ? { operationSemantics: input.operationSemantics } : {}),
+    destination: { family, posture: write ? 'create_new' : 'named_existing' },
+    accountId: 'account:opaque-fixture',
+    idempotency: { required: write, policy: write ? 'key_before_dispatch' : 'none' },
+    reconciliation: { supported: write, policy: write ? 'exact_artifact' : 'none' },
+    outputContract: { kind: write ? 'created_resource' : 'records' },
+    evidenceContract: {
+      kinds: atomic?.evidence ?? (write ? ['receipt', 'readback'] : ['payload']),
+      readbackRequired: atomic ? false : write,
+    },
+    provenance: { issuer: 'test:artifact-ledger', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: write ? ['destination'] : ['readback'],
+  });
+}
+
+function registered(manifest: CapabilityManifestV1): RegisteredHostCapability {
+  return {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    destination: manifest.destination,
+    account: manifest.accountId,
+    advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerInputSchemaDigest: manifest.externalDefinition?.providerInputSchemaDigest,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({}),
+  };
+}
+
+function withManifests<T>(definitions: readonly CapabilityManifestV1[], run: () => T): T {
+  catalogs.installHostCapabilityCatalogFactory(
+    catalogs.createHostCapabilityCatalogFactory(definitions.map(registered)),
+  );
+  try {
+    return run();
+  } finally {
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
+}
+
+function withOpaqueArtifactCatalog<T>(run: () => T): T {
+  return withManifests([
+    operationManifest({
+      operationId: OPAQUE_CREATE,
+      effect: 'external_write',
+      verification: OPAQUE_CREATE_VERIFICATION,
+      operationSemantics: { version: 1, reversibility: 'reversible' },
+    }),
+    operationManifest({
+      operationId: OPAQUE_READBACK,
+      effect: 'read',
+      verification: OPAQUE_READBACK_VERIFICATION,
+    }),
+  ], run);
+}
+
+function opaqueCreateArgs(args: Record<string, unknown>): Record<string, unknown> {
+  return { tool_slug: OPAQUE_CREATE, arguments: JSON.stringify(args) };
+}
+
+function opaqueReadbackArgs(resourceId: string): Record<string, unknown> {
+  return {
+    tool_slug: OPAQUE_READBACK,
+    arguments: JSON.stringify({ resourceId }),
+  };
+}
+
+function sheetCreateManifest(): CapabilityManifestV1 {
+  return operationManifest({
+    operationId: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    effect: 'external_write',
+    family: 'googlesheets',
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+    verification: {
+      mutation: {
+        version: 1,
+        resourceFamily: 'googlesheets',
+        producedHandleKind: 'created_resource',
+        proof: 'resource_identity_v1',
+        target: { source: 'authoritative_result', pointers: ['/spreadsheetId'] },
+      },
+    },
+  });
+}
+
+function sheetReadbackManifest(): CapabilityManifestV1 {
+  return operationManifest({
+    operationId: 'GOOGLESHEETS_BATCH_GET',
+    effect: 'read',
+    family: 'googlesheets',
+    verification: {
+      readback: {
+        version: 1,
+        resourceFamily: 'googlesheets',
+        acceptedHandleKind: 'created_resource',
+        requestTargetPointers: ['/spreadsheet_id'],
+        responseTargetPointers: ['/spreadsheetId'],
+      },
+    },
+  });
+}
+
+function sheetFromJsonManifest(): CapabilityManifestV1 {
+  const semantics = composioSemantics.documentedComposioManifestOperationSemantics(
+    'GOOGLESHEETS_SHEET_FROM_JSON',
+  );
+  assert.ok(semantics?.atomicInputContent);
+  return operationManifest({
+    operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    effect: 'external_write',
+    family: 'googlesheets',
+    operationSemantics: semantics,
+  });
+}
 
 beforeEach(() => {
   eventlog.resetEventLog();
   ledger._resetArtifactLedgerForTests();
+  catalogs.installHostCapabilityCatalogFactory(null);
 });
 
-after(() => rmSync(home, { recursive: true, force: true }));
+after(() => {
+  catalogs.installHostCapabilityCatalogFactory(null);
+  rmSync(home, { recursive: true, force: true });
+});
 
 function session(): string {
   return eventlog.createSession({ kind: 'chat' }).id;
 }
 
-test('classifies Google Docs create calls across Composio and native MCP names', () => {
-  const gateway = ledger.artifactIntentForTool('composio_execute_tool', {
+test('local control names without a current artifact descriptor stay inert', () => {
+  assert.equal(ledger.artifactIntentForTool('plan_task', {
+    objective: 'coordinate the accepted plan',
+  }), null);
+  assert.equal(ledger.artifactIntentForTool('PLAN_TASK', {
+    destination: { posture: 'create_new', family: 'document' },
+  }), null, 'request-shaped destination prose cannot replace a current callable manifest');
+});
+
+test('familiar provider create names without descriptors cannot gain artifact authority', () => {
+  assert.equal(ledger.artifactIntentForTool('composio_execute_tool', {
     tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
     arguments: JSON.stringify({ title: 'Client snapshot', markdown_text: '# Hi' }),
-  });
-  assert.deepEqual(gateway, {
-    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
-    title: 'Client snapshot', createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-  });
-
-  const native = ledger.artifactIntentForTool('mcp__googledocs__create_document', {
+  }), null);
+  assert.equal(ledger.artifactIntentForTool('mcp__googledocs__create_document', {
     title: 'Second', artifact_key: 'appendix',
-  });
-  assert.equal(native?.slotKey, 'google_doc:appendix');
-  assert.equal(native?.title, 'Second');
+  }), null);
+  assert.equal(ledger.artifactIntentForTool('run_shell_command', {
+    command: 'netlify sites:create --name client-snapshot',
+  }), null);
 });
 
 test('explicit multi-document objectives receive deterministic distinct slots while ordinary renamed retries stay primary', () => {
   const firstRaw = { title: 'Client brief' };
   const secondRaw = { title: 'Technical appendix' };
-  const first = ledger.artifactIntentForTool('mcp__googledocs__create_document', firstRaw)!;
-  const second = ledger.artifactIntentForTool('mcp__googledocs__create_document', secondRaw)!;
+  const first: ledger.ArtifactIntent = {
+    kind: 'google_doc', provider: 'fixture', slotKey: 'google_doc:primary',
+    title: firstRaw.title, createShape: 'SEALED_CREATE',
+  };
+  const second: ledger.ArtifactIntent = { ...first, title: secondRaw.title };
   const objective = 'Create two separate Google Docs: a client brief and a technical appendix.';
   assert.equal(
     ledger.scopeArtifactIntentForObjective(first, objective, firstRaw).slotKey,
@@ -59,7 +261,10 @@ test('explicit multi-document objectives receive deterministic distinct slots wh
     'a renamed retry in a single-artifact objective must not mint a sibling',
   );
   const siteRaw = { command: 'netlify sites:create --name client-portal' };
-  const site = ledger.artifactIntentForTool('run_shell_command', siteRaw)!;
+  const site: ledger.ArtifactIntent = {
+    kind: 'site', provider: 'fixture', slotKey: 'site:primary',
+    title: 'client-portal', createShape: 'SEALED_CREATE',
+  };
   assert.equal(
     ledger.scopeArtifactIntentForObjective(site, 'Create two separate sites for the client.', siteRaw).slotKey,
     'site:client-portal',
@@ -71,13 +276,17 @@ test('titleless multi-artifact retries fail closed on primary despite changed mu
   const objective = 'Create two separate Google Docs for the client.';
   const firstRaw = { markdown_text: '# Draft one' };
   const retryRaw = { markdown_text: '# Rewritten draft with different formatting' };
+  const base: ledger.ArtifactIntent = {
+    kind: 'google_doc', provider: 'fixture', slotKey: 'google_doc:primary',
+    createShape: 'SEALED_CREATE',
+  };
   const first = ledger.scopeArtifactIntentForObjective(
-    ledger.artifactIntentForTool('mcp__googledocs__create_document', firstRaw)!,
+    base,
     objective,
     firstRaw,
   );
   const retry = ledger.scopeArtifactIntentForObjective(
-    ledger.artifactIntentForTool('mcp__googledocs__create_document', retryRaw)!,
+    base,
     objective,
     retryRaw,
   );
@@ -139,33 +348,36 @@ test('guarded additive migration upgrades the original artifact table without lo
   ]) assert.ok(columns.some((column) => column.name === name), name);
 });
 
-test('classifies only exact-id Google Docs read-backs', () => {
-  const gateway = ledger.artifactVerificationIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-    arguments: JSON.stringify({ document_id: 'doc_exact_123456789' }),
+test('only an exact current readback descriptor can identify verification work', () => {
+  withOpaqueArtifactCatalog(() => {
+    const exact = ledger.artifactVerificationIntentForTool(
+      'composio_execute_tool',
+      opaqueReadbackArgs('resource_exact_123456789'),
+    );
+    assert.deepEqual(exact, {
+      kind: 'resource',
+      provider: OPAQUE_FAMILY,
+      resourceId: 'resource_exact_123456789',
+      verificationShape: OPAQUE_READBACK,
+      readback: OPAQUE_READBACK_VERIFICATION.readback,
+    });
+    assert.equal(ledger.artifactVerificationIntentForTool('composio_execute_tool', {
+      tool_slug: OPAQUE_READBACK,
+      arguments: JSON.stringify({ resourceId: '' }),
+    }), null);
+    assert.equal(ledger.artifactVerificationIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+      arguments: JSON.stringify({ document_id: 'doc' }),
+    }), null);
   });
-  assert.deepEqual(gateway, {
-    kind: 'google_doc', provider: 'Google Docs', resourceId: 'doc_exact_123456789',
-    verificationShape: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-  });
-  assert.equal(
-    ledger.artifactVerificationIntentForTool('mcp__googledocs__get_document', { document_id: 'native_doc_123456789' })?.resourceId,
-    'native_doc_123456789',
-  );
-  assert.equal(ledger.artifactVerificationIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_END_INDEX', arguments: '{"document_id":"doc"}',
-  }), null);
-  assert.equal(ledger.artifactVerificationIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLEDOCS_SEARCH_DOCUMENTS', arguments: '{"query":"title"}',
-  }), null);
 });
 
 test('an artifact slot is claimed once and remains reusable after binding', () => {
   const sid = session();
-  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-    arguments: JSON.stringify({ title: 'One document' }),
-  })!;
+  const intent: ledger.ArtifactIntent = {
+    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
+    title: 'One document', createShape: 'SEALED_CREATE',
+  };
   const first = ledger.claimArtifactSlot(sid, intent, 'call-1');
   assert.equal(first.acquired, true);
   const bound = ledger.bindArtifactSlot(sid, intent.slotKey, {
@@ -178,7 +390,7 @@ test('an artifact slot is claimed once and remains reusable after binding', () =
   assert.equal(retry.acquired, false, 'a changed title cannot mint a second primary document');
   assert.equal(retry.artifact.resourceId, 'doc_1234567890');
   const reuse = ledger.artifactReuseMessage(retry.artifact);
-  assert.match(reuse, /Reconcile this create claim to existing document doc_1234567890/i);
+  assert.match(reuse, /reconcile the existing create claim; do not create another/i);
   assert.match(reuse, /Update it only under a separately declared authorized operation or turn/i);
   assert.doesNotMatch(reuse, /reuse or update/i);
 });
@@ -418,308 +630,167 @@ test('only the immediate reply to a typed awaiting-input terminal inherits its e
   );
 });
 
-test('Google Docs binding verifies only when request and successful response identify the exact bound document', () => {
-  const sid = session();
-  const runScope = 'run:google-readback';
-  const intent = {
-    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
-    title: 'Exact doc', createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-  } as const;
-  ledger.claimArtifactSlot(sid, intent, 'create-doc', runScope);
-  ledger.bindArtifactSlot(sid, intent.slotKey, {
-    resourceId: 'doc_exact_123456789',
-    uri: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
-  }, 'create-doc', runScope);
+test('descriptor-bound verification requires an exact request/result identity and clean success', () => {
+  withOpaqueArtifactCatalog(() => {
+    const sid = session();
+    const runScope = 'run:opaque-readback';
+    const resourceId = 'resource_exact_123456789';
+    const intent: ledger.ArtifactIntent = {
+      kind: 'resource', provider: OPAQUE_FAMILY, slotKey: 'resource:primary',
+      title: 'Exact resource', createShape: OPAQUE_CREATE,
+    };
+    ledger.claimArtifactSlot(sid, intent, 'create-resource', runScope);
+    ledger.bindArtifactSlot(sid, intent.slotKey, { resourceId }, 'create-resource', runScope);
+    const getter = opaqueReadbackArgs(resourceId);
 
-  const getter = {
-    tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-    arguments: JSON.stringify({ document_id: 'doc_exact_123456789' }),
-  };
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool',
-    { ...getter, arguments: JSON.stringify({ document_id: 'other_doc_123456789' }) },
-    { data: { document_id: 'other_doc_123456789' } }, 'wrong-request',
-  ), null, 'a read of a different document cannot verify this slot');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    { data: { document_id: 'other_doc_123456789' } }, 'wrong-response',
-  ), null, 'a mismatched provider response is not proof');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    { successful: false, data: { document_id: 'doc_exact_123456789' }, error: 'not found' }, 'failed-read',
-  ), null, 'a failed response cannot verify even when it echoes the id');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    { data: { document_id: 'doc_exact_123456789' } }, 'native-error', false,
-  ), null, 'the native SDK is_error bit is authoritative');
-  const contradictorySuccess = {
-    successful: true,
-    status_code: 404,
-    error: 'Document doc_exact_123456789 not found',
-    data: {
-      documentId: 'doc_exact_123456789',
-      display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
-    },
-  };
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    contradictorySuccess, 'contradictory-object-read',
-  ), null, 'successful:true cannot override an explicit 4xx/error contradiction');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    JSON.stringify(contradictorySuccess), 'contradictory-json-read',
-  ), null, 'the same contradiction is rejected after JSON formatting');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    {
-      successful: true,
-      response: {
-        successful: 'false',
-        documentId: 'doc_exact_123456789',
-        display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
-      },
-    },
-    'nested-string-false-read',
-  ), null, 'nested provider string flags cannot bypass the contradiction check');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    {
-      successful: true,
-      data: {
-        failed: 'yes',
-        documentId: 'doc_exact_123456789',
-        display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
-      },
-    },
-    'nested-string-failed-read',
-  ), null, 'nested provider failed=yes cannot certify an artifact');
-  const formattedNotFound = formatComposioExecuteOutput({
-    successful: false,
-    status_code: 404,
-    error: 'Document doc_exact_123456789 not found',
-    data: {
-      documentId: 'doc_exact_123456789',
-      display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
-    },
-  }, {
-    toolName: 'composio_execute_tool',
-    toolSlug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+    assert.equal(ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', opaqueReadbackArgs('other-resource'),
+      { data: { resourceId: 'other-resource' } }, 'wrong-request',
+    ), null);
+    assert.equal(ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', getter,
+      { data: { resourceId: 'other-resource' } }, 'wrong-response',
+    ), null);
+    assert.equal(ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', getter,
+      { successful: false, data: { resourceId }, error: 'not found' }, 'failed-read',
+    ), null);
+    assert.equal(ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', getter,
+      { data: { resourceId } }, 'native-error', false,
+    ), null);
+
+    const verified = ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', getter,
+      { successful: true, data: { resourceId } }, 'readback-resource',
+    );
+    assert.ok(verified?.bindingVerifiedAt);
+    assert.equal(verified?.verificationCallId, 'readback-resource');
+    assert.equal(verified?.verificationShape, OPAQUE_READBACK);
+    assert.match(verified?.verificationFingerprint ?? '', /^[a-f0-9]{16}$/);
+    assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
+    assert.match(ledger.artifactReuseMessage(verified!), /provider-verified/i);
   });
-  assert.match(formattedNotFound, /NOT FOUND/i, 'fixture uses the production formatter shape');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    formattedNotFound, 'formatted-failed-read',
-  ), null, 'a production-formatted read failure cannot certify its echoed id or URL');
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'composio_execute_tool', getter,
-    'Not found: https://docs.google.com/document/d/doc_exact_123456789/edit', 'raw-failed-read',
-  ), null, 'failure prose containing the exact URL cannot certify a read');
-
-  const verified = ledger.verifyArtifactBindingFromToolResult(
-    sid,
-    runScope,
-    'composio_execute_tool',
-    getter,
-    {
-      successful: true,
-      error: 'deprecation notice',
-      data: {},
-      response: {
-        display_url: 'https://docs.google.com/document/d/doc_exact_123456789/edit',
-        plain_text: 'Finished brief: the appendix discusses a NOT FOUND status from an earlier audit.',
-      },
-    },
-    'readback-doc',
-  );
-  assert.ok(verified?.bindingVerifiedAt);
-  assert.equal(verified?.verificationCallId, 'readback-doc');
-  assert.equal(verified?.verificationShape, 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT');
-  assert.match(verified?.verificationFingerprint ?? '', /^[a-f0-9]{16}$/);
-  assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
-  const reuse = ledger.artifactReuseMessage(verified!);
-  assert.match(reuse, /provider-verified/i);
-  assert.match(reuse, /Use that existing resource; do not create another/i);
-  assert.match(reuse, /Update it only under a separately declared authorized operation or turn/i);
-  assert.doesNotMatch(reuse, /reuse or update/i);
 });
 
-test('provider verification survives expiry of the raw tool result', () => {
-  const sid = session();
-  const runScope = 'run:durable-readback';
-  const documentId = 'doc_durable_123456789';
-  const intent = {
-    kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary',
-    title: 'Durable proof', createShape: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-  } as const;
-  ledger.claimArtifactSlot(sid, intent, 'create-durable-doc', runScope);
-  ledger.bindArtifactSlot(sid, intent.slotKey, {
-    resourceId: documentId,
-    uri: `https://docs.google.com/document/d/${documentId}/edit`,
-  }, 'create-durable-doc', runScope);
+test('provider-neutral verification survives expiry of the raw tool result', () => {
+  withOpaqueArtifactCatalog(() => {
+    const sid = session();
+    const runScope = 'run:durable-readback';
+    const resourceId = 'resource_durable_123456789';
+    const intent: ledger.ArtifactIntent = {
+      kind: 'resource', provider: OPAQUE_FAMILY, slotKey: 'resource:primary',
+      title: 'Durable proof', createShape: OPAQUE_CREATE,
+    };
+    ledger.claimArtifactSlot(sid, intent, 'create-durable-resource', runScope);
+    ledger.bindArtifactSlot(sid, intent.slotKey, { resourceId }, 'create-durable-resource', runScope);
+    const output = JSON.stringify({ successful: true, data: { resourceId } });
+    eventlog.writeToolOutput({
+      sessionId: sid,
+      callId: 'readback-durable-resource',
+      tool: OPAQUE_READBACK,
+      output,
+    });
+    const verified = ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', opaqueReadbackArgs(resourceId),
+      output, 'readback-durable-resource',
+    );
+    assert.ok(verified?.bindingVerifiedAt);
 
-  const output = JSON.stringify({
-    successful: true,
-    data: { document_id: documentId, plain_text: 'Verified provider contents' },
+    eventlog.openEventLog().prepare(
+      'DELETE FROM tool_outputs WHERE session_id = ? AND call_id = ?',
+    ).run(sid, 'readback-durable-resource');
+    ledger._resetArtifactLedgerForTests();
+    const [durable] = ledger.listRunArtifacts(sid, runScope);
+    assert.equal(durable?.verificationCallId, 'readback-durable-resource');
+    assert.equal(durable?.verificationShape, OPAQUE_READBACK);
+    assert.match(durable?.verificationFingerprint ?? '', /^[a-f0-9]{16}$/);
+    assert.ok(durable?.bindingVerifiedAt);
   });
-  eventlog.writeToolOutput({
-    sessionId: sid,
-    callId: 'readback-durable-doc',
-    tool: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-    output,
-  });
-  const verified = ledger.verifyArtifactBindingFromToolResult(
-    sid,
-    runScope,
-    'composio_execute_tool',
-    {
-      tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
-      arguments: JSON.stringify({ document_id: documentId }),
-    },
-    output,
-    'readback-durable-doc',
-  );
-  assert.ok(verified?.bindingVerifiedAt);
-
-  eventlog.openEventLog().prepare(
-    'DELETE FROM tool_outputs WHERE session_id = ? AND call_id = ?',
-  ).run(sid, 'readback-durable-doc');
-  ledger._resetArtifactLedgerForTests();
-
-  const [durable] = ledger.listRunArtifacts(sid, runScope);
-  assert.equal(durable?.verificationCallId, 'readback-durable-doc');
-  assert.equal(durable?.verificationShape, 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT');
-  assert.match(durable?.verificationFingerprint ?? '', /^[a-f0-9]{16}$/);
-  assert.ok(durable?.bindingVerifiedAt, 'the compact proof lives independently of raw tool-output TTL');
 });
 
 test('Google Sheets create extracts its root id and an exact range read verifies the binding', () => {
-  const sid = session();
-  const runScope = 'run:sheets-readback';
-  const spreadsheetId = 'sheet_exact_123456789';
-  const createArgs = {
-    tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
-    arguments: JSON.stringify({ title: 'Exact release sheet' }),
-  };
-  const intent = ledger.artifactIntentForTool('composio_execute_tool', createArgs);
-  assert.deepEqual(intent, {
-    kind: 'resource',
-    provider: 'googlesheets',
-    slotKey: 'resource:primary',
-    title: 'Exact release sheet',
-    createShape: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
-  });
-  const createOutput = {
-    successful: true,
-    data: {
-      spreadsheetId,
-      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
-    },
-  };
-  const resource = ledger.extractArtifactResource(intent!, createOutput);
-  assert.deepEqual(resource, {
-    resourceId: spreadsheetId,
-    uri: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
-    title: 'Exact release sheet',
-  });
-  ledger.claimArtifactSlot(sid, intent!, 'create-sheet', runScope);
-  ledger.bindArtifactSlot(sid, intent!.slotKey, resource!, 'create-sheet', runScope);
-
-  const getter = {
-    tool_slug: 'GOOGLESHEETS_BATCH_GET',
-    arguments: JSON.stringify({ spreadsheet_id: spreadsheetId, ranges: ['Sheet1!A1:C4'] }),
-  };
-  assert.deepEqual(
-    ledger.artifactVerificationIntentForTool('composio_execute_tool', getter),
-    {
-      kind: 'resource',
-      provider: 'googlesheets',
-      resourceId: spreadsheetId,
-      verificationShape: 'GOOGLESHEETS_BATCH_GET',
-    },
-  );
-  assert.equal(
-    ledger.artifactVerificationIntentForTool('composio_execute_tool', {
-      tool_slug: 'GOOGLESHEETS_LIST_SPREADSHEETS',
-      arguments: '{}',
-    }),
-    null,
-    'broad catalog reads cannot certify a binding',
-  );
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid,
-    runScope,
-    'composio_execute_tool',
-    getter,
-    { successful: true, data: { spreadsheetId: 'different_sheet', valueRanges: [] } },
-    'wrong-sheet-read',
-  ), null);
-
-  const verified = ledger.verifyArtifactBindingFromToolResult(
-    sid,
-    runScope,
-    'composio_execute_tool',
-    getter,
-    {
+  withManifests([sheetCreateManifest(), sheetReadbackManifest()], () => {
+    const sid = session();
+    const runScope = 'run:sheets-readback';
+    const spreadsheetId = 'sheet_exact_123456789';
+    const createArgs = {
+      tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+      arguments: JSON.stringify({ title: 'Exact release sheet' }),
+    };
+    const intent = ledger.artifactIntentForTool('composio_execute_tool', createArgs);
+    assert.equal(intent?.provider, 'googlesheets');
+    assert.equal(intent?.createShape, 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1');
+    assert.deepEqual(ledger.extractArtifactResource(intent!, {
       successful: true,
-      data: {
-        display_url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
-        spreadsheetId,
-        valueRanges: [{ range: 'Sheet1!A1:C4', values: [['verified']] }],
-      },
-    },
-    'readback-sheet',
-  );
-  assert.ok(verified?.bindingVerifiedAt);
-  assert.equal(verified?.verificationCallId, 'readback-sheet');
-  assert.equal(verified?.verificationShape, 'GOOGLESHEETS_BATCH_GET');
-  assert.deepEqual(ledger.listUnverifiedRunArtifacts(sid, runScope), []);
+      data: { spreadsheetId },
+    }), { resourceId: spreadsheetId, title: 'Exact release sheet' });
+    ledger.claimArtifactSlot(sid, intent!, 'create-sheet', runScope);
+    ledger.bindArtifactSlot(sid, intent!.slotKey, { resourceId: spreadsheetId }, 'create-sheet', runScope);
+
+    const getter = {
+      tool_slug: 'GOOGLESHEETS_BATCH_GET',
+      arguments: JSON.stringify({ spreadsheet_id: spreadsheetId, ranges: ['Sheet1!A1:C4'] }),
+    };
+    assert.equal(
+      ledger.artifactVerificationIntentForTool('composio_execute_tool', getter)?.resourceId,
+      spreadsheetId,
+    );
+    assert.equal(ledger.artifactVerificationIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_LIST_SPREADSHEETS', arguments: '{}',
+    }), null);
+    assert.equal(ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', getter,
+      { successful: true, data: { spreadsheetId: 'different_sheet' } }, 'wrong-sheet-read',
+    ), null);
+    const verified = ledger.verifyArtifactBindingFromToolResult(
+      sid, runScope, 'composio_execute_tool', getter,
+      { successful: true, data: { spreadsheetId } }, 'readback-sheet',
+    );
+    assert.ok(verified?.bindingVerifiedAt);
+    assert.equal(verified?.verificationCallId, 'readback-sheet');
+    assert.equal(verified?.verificationShape, 'GOOGLESHEETS_BATCH_GET');
+  });
 });
 
 test('Google Sheets create never binds an ambient account id ahead of the spreadsheet id', () => {
-  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
-    arguments: JSON.stringify({
-      title: 'Top 5 Ventura Restaurants',
-      sheet_name: 'Restaurants',
-      sheet_json: [{ name: 'Lure Fish House', rating: 4.6, address: 'Ventura, CA' }],
-    }),
-  });
-  assert.ok(intent);
-
-  const spreadsheetId = 'ventura_sheet_exact_123456789';
-  const resource = ledger.extractArtifactResource(intent!, {
-    successful: true,
-    data: {
-      account: { id: 'ambient_google_account_987654321' },
-      spreadsheet: {
+  withManifests([sheetFromJsonManifest()], () => {
+    const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+      arguments: JSON.stringify({
+        title: 'Top 5 Ventura Restaurants',
+        sheet_name: 'Restaurants',
+        sheet_json: [{ name: 'Lure Fish House', rating: 4.6, address: 'Ventura, CA' }],
+      }),
+    });
+    assert.ok(intent);
+    const spreadsheetId = 'ventura_sheet_exact_123456789';
+    assert.deepEqual(ledger.extractArtifactResource(intent!, {
+      successful: true,
+      data: {
+        account: { id: 'ambient_google_account_987654321' },
         spreadsheetId,
-        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
       },
-    },
-  });
-
-  assert.deepEqual(resource, {
-    resourceId: spreadsheetId,
-    uri: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
-    title: 'Top 5 Ventura Restaurants',
+    }), {
+      resourceId: spreadsheetId,
+      uri: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      title: 'Top 5 Ventura Restaurants',
+    });
   });
 });
 
-test('Google Sheets SHEET_FROM_JSON is a root create even without CREATE in the slug', () => {
-  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
-    arguments: JSON.stringify({
-      title: 'RC evidence',
-      sheet_name: 'Evidence',
-      sheet_json: [{ Check: 'candidate', Status: 'PASS' }],
-    }),
-  });
-  assert.deepEqual(intent, {
-    kind: 'resource',
-    provider: 'googlesheets',
-    slotKey: 'resource:primary',
-    title: 'RC evidence',
-    createShape: 'GOOGLESHEETS_SHEET_FROM_JSON',
+test('Sheets atomic adapter declaration, not CREATE vocabulary, establishes its root artifact', () => {
+  withManifests([sheetFromJsonManifest()], () => {
+    const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+      arguments: JSON.stringify({
+        title: 'RC evidence', sheet_name: 'Evidence',
+        sheet_json: [{ Check: 'candidate', Status: 'PASS' }],
+      }),
+    });
+    assert.equal(intent?.provider, 'googlesheets');
+    assert.equal(intent?.createShape, 'GOOGLESHEETS_SHEET_FROM_JSON');
+    assert.ok(intent?.resultIdentity);
   });
 });
 
@@ -750,17 +821,15 @@ test('a dispatched create with no ID becomes uncertain and cannot be retried bli
   assert.equal(ledger.claimArtifactSlot(sid, intent, 'shell-2').acquired, false);
 });
 
-test('extracts stable Google Doc IDs from object and formatted provider output', () => {
+test('familiar provider output fields cannot mint identity without a sealed projection', () => {
   const intent = { kind: 'google_doc', provider: 'Google Docs', slotKey: 'google_doc:primary', title: 'Snapshot', createShape: 'CREATE' } as const;
-  assert.deepEqual(ledger.extractArtifactResource(intent, {
+  assert.equal(ledger.extractArtifactResource(intent, {
     data: { documentId: 'fixture_google_doc_0000000001', display_url: 'https://docs.google.com/document/d/fixture_google_doc_0000000001/edit' },
-  }), {
-    resourceId: 'fixture_google_doc_0000000001',
-    uri: 'https://docs.google.com/document/d/fixture_google_doc_0000000001/edit',
-    title: 'Snapshot',
-  });
-  const loose = ledger.extractArtifactResource(intent, 'data: { "documentId": "fixture_google_doc_0000000002" }');
-  assert.equal(loose?.resourceId, 'fixture_google_doc_0000000002');
+  }), null);
+  assert.equal(ledger.extractArtifactResource(
+    intent,
+    'data: { "documentId": "fixture_google_doc_0000000002" }',
+  ), null);
 });
 
 test('provider prose and provider-shaped objects can never release an artifact claim', () => {
@@ -824,15 +893,15 @@ test('typed shell outcome releases only local pre-spawn failures', async () => {
   }), false, 'a provider-phase typed object cannot masquerade as a local spawn failure');
 });
 
-test('classifies Netlify site creation but not deploy/status commands', () => {
-  const create = ledger.artifactIntentForTool('run_shell_command', { command: 'npx netlify-cli sites:create --name client-snapshot' });
-  assert.equal(create?.slotKey, 'site:primary');
-  assert.equal(create?.title, 'client-snapshot');
+test('CLI command vocabulary cannot classify an artifact without a current descriptor', () => {
+  assert.equal(ledger.artifactIntentForTool('run_shell_command', {
+    command: 'npx netlify-cli sites:create --name client-snapshot',
+  }), null);
   assert.equal(ledger.artifactIntentForTool('run_shell_command', { command: 'netlify deploy --prod --dir dist' }), null);
   assert.equal(ledger.artifactIntentForTool('run_shell_command', { command: 'netlify status' }), null);
 });
 
-test('Netlify binding requires an exact getSite request and matching successful top-level site id', () => {
+test('CLI getter vocabulary cannot independently verify an artifact', () => {
   const sid = session();
   const runScope = 'run:netlify-readback';
   const siteId = '00000000-0000-4000-8000-000000000001';
@@ -848,60 +917,30 @@ test('Netlify binding requires an exact getSite request and matching successful 
   const getter = { command: `netlify api getSite --data '{"site_id":"${siteId}"}'` };
   assert.equal(ledger.artifactVerificationIntentForTool('run_shell_command', { command: 'netlify status --json' }), null);
   assert.equal(ledger.artifactVerificationIntentForTool('run_shell_command', { command: 'netlify sites:list --json' }), null);
-  assert.equal(ledger.artifactVerificationIntentForTool('run_shell_command', {
-    command: `${getter.command} && netlify deploy --prod --site ${siteId}`,
-  }), null, 'a compound read+write is not independent proof');
   assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'run_shell_command', getter,
-    `exit_code: 0\n\nstdout:\n{"id":"wrong-site-id","ssl_url":"https://other.netlify.app"}`,
-    'wrong-site-read',
-  ), null);
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid, runScope, 'run_shell_command', getter,
-    `exit_code: 1\n\nstderr:\nNot found ${siteId}`,
-    'failed-site-read',
-  ), null);
-
-  const verified = ledger.verifyArtifactBindingFromToolResult(
     sid, runScope, 'run_shell_command', getter,
     `exit_code: 0\n\nstdout:\n{"id":"${siteId}","name":"snapshot-assets","ssl_url":"https://snapshot-assets.netlify.app"}`,
     'readback-site',
-  );
-  assert.ok(verified?.bindingVerifiedAt);
-  assert.equal(verified?.verificationShape, 'NETLIFY_API_GETSITE');
-  assert.match(ledger.artifactReuseMessage(verified!), /provider-verified/i);
+  ), null);
+  assert.equal(ledger.listUnverifiedRunArtifacts(sid, runScope).length, 1);
 });
 
-test('resolves a simple Netlify name variable instead of recording the literal shell token', () => {
-  const intent = ledger.artifactIntentForTool('run_shell_command', {
+test('shell variables cannot manufacture artifact classification', () => {
+  assert.equal(ledger.artifactIntentForTool('run_shell_command', {
     command: 'NAME="client-snapshot"; npx netlify-cli sites:create --name "$NAME"',
-  });
-  assert.equal(intent?.title, 'client-snapshot');
+  }), null);
 });
 
-test('extracts Netlify CLI Project ID and gives a repairable reuse instruction', () => {
+test('CLI prose cannot supply artifact identity without a sealed result projection', () => {
   const intent = {
     kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
     title: 'client-snapshot', createShape: 'NETLIFY_SITE_CREATE',
   } as const;
   const resource = ledger.extractArtifactResource(intent, `Success! Site created\n\nProject ID: 00000000-0000-4000-8000-000000000001\nWebsite URL: https://fixture-client-snapshot.netlify.app\nAdmin URL: https://app.netlify.com/projects/fixture-client-snapshot`);
-  assert.deepEqual(resource, {
-    resourceId: '00000000-0000-4000-8000-000000000001',
-    uri: 'https://fixture-client-snapshot.netlify.app',
-    title: 'client-snapshot',
-  });
-  const sid = session();
-  ledger.claimArtifactSlot(sid, intent, 'site-1', 'run:one');
-  const bound = ledger.bindArtifactSlot(sid, intent.slotKey, resource!, 'site-1', 'run:one');
-  const reuse = ledger.artifactReuseMessage(bound);
-  assert.match(reuse, /getSite.*00000000-0000-4000-8000-000000000001/);
-  assert.match(reuse, /reconcile this create claim to that existing site/i);
-  assert.match(reuse, /do not run sites:create again/i);
-  assert.match(reuse, /Update it only under a separately declared authorized operation or turn/i);
-  assert.doesNotMatch(reuse, /reuse or update|--site/i);
+  assert.equal(resource, null);
 });
 
-test('extracts the current colorized Netlify CLI Project ID', () => {
+test('colorized CLI prose also cannot supply artifact identity', () => {
   const intent = {
     kind: 'site', provider: 'Netlify', slotKey: 'site:primary',
     title: 'colorized-site', createShape: 'NETLIFY_SITE_CREATE',
@@ -917,14 +956,10 @@ test('extracts the current colorized Netlify CLI Project ID', () => {
     '\x1B[32mURL: \x1B[39m       https://colorized-site.netlify.app',
     '\x1B[32mProject ID: \x1B[39m00000000-0000-4000-8000-000000000099',
   ].join('\n'));
-  assert.deepEqual(resource, {
-    resourceId: '00000000-0000-4000-8000-000000000099',
-    uri: 'https://colorized-site.netlify.app',
-    title: 'colorized-site',
-  });
+  assert.equal(resource, null);
 });
 
-test('exact Netlify getSite readback promotes one matching URL-only binding', () => {
+test('a familiar CLI read cannot promote a URL-only binding without a descriptor', () => {
   const sid = session();
   const runScope = 'run:netlify-url-only';
   const siteId = '00000000-0000-4000-8000-000000000098';
@@ -937,7 +972,7 @@ test('exact Netlify getSite readback promotes one matching URL-only binding', ()
     uri: 'https://url-only-site.netlify.app/',
   }, 'create-url-only', runScope);
 
-  const verified = ledger.verifyArtifactBindingFromToolResult(
+  assert.equal(ledger.verifyArtifactBindingFromToolResult(
     sid,
     runScope,
     'run_shell_command',
@@ -946,74 +981,37 @@ test('exact Netlify getSite readback promotes one matching URL-only binding', ()
     },
     `exit_code: 0\n\nstdout:\n{"id":"${siteId}","name":"url-only-site","ssl_url":"https://url-only-site.netlify.app"}`,
     'readback-url-only',
-  );
-  assert.equal(verified?.resourceId, siteId);
-  assert.ok(verified?.bindingVerifiedAt);
-
-  const mismatchScope = 'run:netlify-url-mismatch';
-  ledger.claimArtifactSlot(sid, intent, 'create-url-mismatch', mismatchScope);
-  ledger.bindArtifactSlot(sid, intent.slotKey, {
-    uri: 'https://different-site.netlify.app',
-  }, 'create-url-mismatch', mismatchScope);
-  assert.equal(ledger.verifyArtifactBindingFromToolResult(
-    sid,
-    mismatchScope,
-    'run_shell_command',
-    {
-      command: `netlify api getSite --data '{"site_id":"${siteId}"}' | jq '{id,name,ssl_url}'`,
-    },
-    `exit_code: 0\n\nstdout:\n{"id":"${siteId}","name":"url-only-site","ssl_url":"https://url-only-site.netlify.app"}`,
-    'readback-url-mismatch',
-  ), null, 'an exact ID read cannot attach to a different bound URL');
+  ), null);
+  assert.equal(ledger.listUnverifiedRunArtifacts(sid, runScope).length, 1);
 });
 
-test('synthetic retry replay permits one Google Doc and one asset container despite renamed retries', () => {
-  const sid = session();
-  const runScope = 'run:multi-artifact-retry';
-  let providerCreates = 0;
-
-  const docCalls = [
-    {
-      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-      arguments: JSON.stringify({ title: 'Metro Live Search Snapshot — Harbor Law Group (Jul 16, 2026)', markdown_text: '# Snapshot' }),
-    },
-    {
-      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
-      arguments: JSON.stringify({ title: 'Metro Live Search Snapshot — Harbor Law Group (Jul 16, 2026)', markdown_text: '# Snapshot' }),
-    },
-    {
-      tool_slug: 'GOOGLEDOCS_CREATE_DOCUMENT',
-      arguments: JSON.stringify({ title: 'Metro Injury — Live Search Snapshot (for Harbor Law)', text: '' }),
-    },
-  ];
-  for (const [index, args] of docCalls.entries()) {
-    const intent = ledger.artifactIntentForTool('composio_execute_tool', args)!;
-    const claim = ledger.claimArtifactSlot(sid, intent, `doc-${index + 1}`, runScope);
-    if (!claim.acquired) continue;
-    providerCreates += 1;
-    const resource = ledger.extractArtifactResource(intent, `{
-      data: { "display_url": "https://docs.google.com/document/d/fixture_google_doc_0000000003/edit", "documentId": "fixture_google_doc_0000000003" }
-    }`)!;
-    ledger.bindArtifactSlot(sid, intent.slotKey, resource, `doc-${index + 1}`, runScope);
-  }
-
-  for (let index = 0; index < 7; index += 1) {
-    const intent = ledger.artifactIntentForTool('run_shell_command', {
-      command: `npx netlify-cli sites:create --name snapshot-assets-${index}`,
-    })!;
-    const claim = ledger.claimArtifactSlot(sid, intent, `site-${index + 1}`, runScope);
-    if (!claim.acquired) continue;
-    providerCreates += 1;
-    ledger.bindArtifactSlot(sid, intent.slotKey, {
-      resourceId: 'site_fixture_snapshot', uri: 'https://fixture-snapshot-assets.netlify.app',
-    }, `site-${index + 1}`, runScope);
-  }
-
-  assert.equal(providerCreates, 2, 'only one create may cross each provider boundary');
-  assert.deepEqual(
-    ledger.listRunArtifacts(sid, runScope).map((artifact) => [artifact.kind, artifact.status]),
-    [['google_doc', 'bound'], ['site', 'bound']],
-  );
+test('opaque generated create retries cross the provider boundary only once', () => {
+  withOpaqueArtifactCatalog(() => {
+    const sid = session();
+    const runScope = 'run:opaque-retry';
+    let providerCreates = 0;
+    for (const [index, title] of ['Initial title', 'Renamed retry', 'Third title'].entries()) {
+      const intent = ledger.artifactIntentForTool(
+        'composio_execute_tool',
+        opaqueCreateArgs({ title }),
+      );
+      assert.ok(intent);
+      const claim = ledger.claimArtifactSlot(sid, intent!, `opaque-${index + 1}`, runScope);
+      if (!claim.acquired) continue;
+      providerCreates += 1;
+      const resource = ledger.extractArtifactResource(intent!, {
+        successful: true,
+        data: { resourceId: 'opaque-resource-1' },
+      });
+      assert.ok(resource);
+      ledger.bindArtifactSlot(sid, intent!.slotKey, resource!, `opaque-${index + 1}`, runScope);
+    }
+    assert.equal(providerCreates, 1);
+    assert.deepEqual(
+      ledger.listRunArtifacts(sid, runScope).map((artifact) => [artifact.kind, artifact.status]),
+      [['resource', 'bound']],
+    );
+  });
 });
 
 test('partitionSupersededPendingClaims: a dead mid-flight claim is superseded only by a VERIFIED same-kind sibling', async () => {
@@ -1244,15 +1242,17 @@ test('resolveUncertainArtifactClaim never releases a claim from truncated absenc
   `).run(truncatedSession.id, 'truncated-absence-proof', 'nonce-truncated-absence');
 
   const authority = resolveToolOutputForAuthority(truncatedSession.id, 'truncated-absence-proof');
-  assert.equal(authority.status, 'ok');
-  if (authority.status === 'ok') assert.equal(authority.record.truncatedAtWrite, true);
+  assert.equal(authority.status, 'failed');
+  if (authority.status === 'failed') {
+    assert.match(authority.reason, /incomplete.*truncation/i);
+  }
 
   const resolution = resolveUncertainArtifactClaim(truncatedSession.id, 'art-truncated-absence', {
     kind: 'absent',
     verificationCallId: 'truncated-absence-proof',
   });
   assert.equal(resolution.ok, false);
-  assert.match(resolution.reason ?? '', /truncated.*cannot prove.*absence/i);
+  assert.match(resolution.reason ?? '', /verification output is failed.*fresh provider read/i);
   assert.deepEqual(
     db.prepare('SELECT status FROM run_artifacts WHERE id = ?').get('art-truncated-absence'),
     { status: 'uncertain' },
@@ -1260,65 +1260,51 @@ test('resolveUncertainArtifactClaim never releases a claim from truncated absenc
   );
 });
 
-test('effect-anchored generic classifier: any CLI create and any root provider create claim; item-level creates never do', async () => {
-  const { artifactIntentForTool, extractArtifactResource } = await import('./artifact-ledger.js');
-  const { equal, ok } = await import('node:assert/strict');
+test('permuted opaque manifests classify and project artifacts without provider vocabulary', () => {
+  const alphabet = 'QZXJKVBP';
+  for (let seed = 1; seed <= 8; seed += 1) {
+    const token = Array.from({ length: 6 }, (_, index) =>
+      alphabet[(seed * 5 + index * 3) % alphabet.length]).join('');
+    const operationId = `OP_${token}_${seed}`;
+    const family = `artifact:${token.toLowerCase()}`;
+    const verification = {
+      mutation: {
+        version: 1,
+        resourceFamily: family,
+        producedHandleKind: 'created_resource',
+        proof: 'resource_identity_v1',
+        target: { source: 'authoritative_result', pointers: ['/opaqueKey'] },
+      },
+    } as const satisfies OperationVerificationContractV1;
+    withManifests([operationManifest({
+      operationId,
+      effect: 'external_write',
+      family,
+      verification,
+      operationSemantics: { version: 1, reversibility: 'reversible' },
+    })], () => {
+      const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+        tool_slug: operationId,
+        arguments: JSON.stringify({ title: `Artifact ${seed}` }),
+      });
+      assert.equal(intent?.provider, family);
+      assert.equal(intent?.createShape, operationId);
+      assert.deepEqual(ledger.extractArtifactResource(intent!, {
+        successful: true,
+        data: { opaqueKey: `resource-${seed}` },
+      }), { resourceId: `resource-${seed}`, title: `Artifact ${seed}` });
+    });
+  }
 
-  // ANY installed CLI with a create-verb subcommand claims — no product list.
-  const supabase = artifactIntentForTool('run_shell_command', { command: 'supabase projects:create my-landing' });
-  equal(supabase?.kind, 'resource'); equal(supabase?.provider, 'supabase'); equal(supabase?.title, 'my-landing');
-  // Deploy/publish target EXISTING resources — deliberately NOT claimed
-  // (that ambiguity belongs to the duplicate-write wall, not the slot model).
-  equal(artifactIntentForTool('run_shell_command', { command: 'vercel deploy --prod' }), null);
-  const gh = artifactIntentForTool('run_shell_command', { command: 'CI=1 npx --yes gh repo create acme-site --public' });
-  equal(gh?.provider, 'gh'); equal(gh?.title, 'acme-site');
-  const wrangler = artifactIntentForTool('run_shell_command', { command: 'wrangler init worker-thing' });
-  equal(wrangler?.provider, 'wrangler');
-  // Reads and plumbing commands never claim.
-  equal(artifactIntentForTool('run_shell_command', { command: 'gh repo list' }), null);
-  equal(artifactIntentForTool('run_shell_command', { command: 'git checkout -b create-fix' }), null);
-  equal(artifactIntentForTool('run_shell_command', { command: 'echo create' }), null);
-
-  // Root provider create (no parent reference) claims with a derived label…
-  const base = artifactIntentForTool('composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_BASE', arguments: '{"name":"PI Intel"}' });
-  equal(base?.kind, 'resource'); equal(base?.provider, 'airtable'); equal(base?.title, 'PI Intel');
-  // …item-level creates (parent-container reference) never claim.
-  equal(artifactIntentForTool('composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_RECORDS', arguments: '{"baseId":"appX","name":"row"}' }), null);
-  equal(artifactIntentForTool('composio_execute_tool', { tool_slug: 'TRELLO_CREATE_CARD', arguments: '{"name":"c","board_id":"b1"}' }), null);
-
-  // Account-scoping ids (workspaceId) do NOT demote a root deliverable —
-  // an Airtable base created in a workspace claims (live 2026-07-22 gap).
-  const atBase = artifactIntentForTool('composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_BASE', arguments: '{"name":"AI Tooling Intel","workspaceId":"wspX"}' });
-  equal(atBase?.kind, 'resource'); equal(atBase?.provider, 'airtable');
-
-  // Local first-class tools NEVER claim — session bookkeeping is not a
-  // provider resource (live 2026-07-22: execution_create claimed and would
-  // have parked the run on a phantom artifact).
-  equal(artifactIntentForTool('execution_create', { title: 'Deploy intel pipeline', objective: 'x' }), null);
-  equal(artifactIntentForTool('workflow_create', { name: 'daily-brief' }), null);
-  // …but namespaced MCP creates DO (external surface).
-  const linear = artifactIntentForTool('mcp__linear__create_project', { name: 'Q3 Launch' });
-  equal(linear?.kind, 'resource'); equal(linear?.provider, 'linear');
-
-  // Existing precise branches keep their richer kinds (regression).
-  const netlify = artifactIntentForTool('run_shell_command', { command: 'netlify sites:create --name harness-viz' });
-  equal(netlify?.kind, 'site'); equal(netlify?.provider, 'Netlify');
-  const netlifyApi = artifactIntentForTool('run_shell_command', {
-    command: `CI=1 netlify api createSite --data '{"account_slug":"team","body":{"name":"rc-proof-site"}}'`,
-  });
-  equal(netlifyApi?.kind, 'site');
-  equal(netlifyApi?.provider, 'Netlify');
-  equal(netlifyApi?.slotKey, 'site:primary');
-  equal(netlifyApi?.title, 'rc-proof-site');
-  equal(netlifyApi?.createShape, 'NETLIFY_API_CREATE_SITE');
-
-  // Generic extraction proves success from id/url evidence.
-  const bound = extractArtifactResource(
-    { kind: 'resource', provider: 'vercel', slotKey: 'resource:primary', createShape: 'CLI_VERCEL_DEPLOY' },
-    JSON.stringify({ id: 'prj_123', url: 'https://my-landing.vercel.app' }),
-  );
-  equal(bound?.resourceId, 'prj_123');
-  ok(bound?.uri?.includes('vercel.app'));
+  for (const [tool, args] of [
+    ['run_shell_command', { command: 'supabase projects:create my-landing' }],
+    ['run_shell_command', { command: 'netlify sites:create --name harness-viz' }],
+    ['composio_execute_tool', { tool_slug: 'AIRTABLE_CREATE_BASE', arguments: '{"name":"PI Intel"}' }],
+    ['mcp__linear__create_project', { name: 'Q3 Launch' }],
+    ['execution_create', { title: 'Deploy intel pipeline' }],
+  ] as const) {
+    assert.equal(ledger.artifactIntentForTool(tool, args), null);
+  }
 });
 
 test('host-sealed graph artifacts retain the exact id and non-HTTP provider handle', () => {
@@ -1350,9 +1336,10 @@ test('host-sealed graph artifacts retain the exact id and non-HTTP provider hand
 
 test('an unresolved artifact denial carries the exact repair claim id', () => {
   const sid = session();
-  const intent = ledger.artifactIntentForTool('run_shell_command', {
-    command: 'netlify sites:create --name repairable-site',
-  })!;
+  const intent: ledger.ArtifactIntent = {
+    kind: 'resource', provider: OPAQUE_FAMILY, slotKey: 'resource:primary',
+    title: 'repairable-resource', createShape: OPAQUE_CREATE,
+  };
   const claim = ledger.claimArtifactSlot(sid, intent, 'call-create-site');
   ledger.markArtifactUncertain(sid, intent.slotKey, 'call-create-site');
   const message = ledger.artifactReuseMessage(claim.artifact);
@@ -1429,21 +1416,19 @@ test('question-store unification: answering the check-in copy resumes the linked
 // deliverable; only truly-unresolved dispatch outcomes (pending/uncertain)
 // belong in the double-create park set.
 test('bound-but-unverified claims are deliverable — only pending/uncertain park', () => {
-  const sid = session();
-  const intent = ledger.artifactIntentForTool('composio_execute_tool', {
-    tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
-    arguments: JSON.stringify({ title: 'Firm Outreach Drafts — Jul 23' }),
-  })!;
-  const claim = ledger.claimArtifactSlot(sid, intent, 'call-sheet-1');
-  assert.equal(claim.acquired, true);
-
-  // Outcome unknown → truly unresolved → in the park set.
-  assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 1);
-
-  // The provider responded: bound with a URI (read-back verification NOT run).
-  ledger.bindArtifactSlot(sid, intent.slotKey, {
+  withManifests([sheetCreateManifest()], () => {
+    const sid = session();
+    const intent = ledger.artifactIntentForTool('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+      arguments: JSON.stringify({ title: 'Firm Outreach Drafts — Jul 23' }),
+    })!;
+    const claim = ledger.claimArtifactSlot(sid, intent, 'call-sheet-1');
+    assert.equal(claim.acquired, true);
+    assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 1);
+    ledger.bindArtifactSlot(sid, intent.slotKey, {
       uri: 'https://docs.google.com/spreadsheets/d/fixture_sheet_00000001/edit',
-  }, 'call-sheet-1');
-  assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 0, 'bound = deliverable, never parks');
-  assert.equal(ledger.listUnverifiedRunArtifacts(sid).length, 1, 'verification advisory still reports it');
+    }, 'call-sheet-1');
+    assert.equal(ledger.listUnresolvedCreateClaims(sid).length, 0, 'bound = deliverable, never parks');
+    assert.equal(ledger.listUnverifiedRunArtifacts(sid).length, 1, 'verification advisory still reports it');
+  });
 });

@@ -1,29 +1,45 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { Component } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useBackGesture } from './lib/back-gesture';
 import {
   adoptOriginSession,
+  finalizeOriginHandoff,
+  activateOriginHandoff,
   api,
   getAuthStatus,
+  isInvalidOriginHandoffError,
   logout,
   mintOriginHandoff,
   pairDevice,
   type AuthStatus,
   type ChatSession,
 } from './lib/api';
-import { CONNECTION_EVENT, connectionDoor, haptic, parkOriginHandoff, type ConnectionDoor } from './lib/native-bridge';
+import {
+  CONNECTION_EVENT,
+  ORIGIN_HANDOFF_STORED_EVENT,
+  connectionDoor,
+  haptic,
+  inNativeShell,
+  parkOriginHandoff,
+  reportOriginHandoffResult,
+  type ConnectionDoor,
+} from './lib/native-bridge';
+import { originHandoffMintCoordinator } from './lib/origin-handoff-mint';
+import { runOriginHandoffAdoption } from './lib/origin-handoff-adoption';
 import { authBootstrapMode } from './lib/auth-bootstrap';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
 import { Chats } from './screens/Chats';
+import { Agents } from './screens/Agents';
 import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
 import { Workspaces } from './screens/Workspaces';
 import { Settings } from './screens/Settings';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 
-type Tab = 'home' | 'chats' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
+type Tab = 'home' | 'chats' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
 
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
@@ -53,6 +69,19 @@ export function App() {
     const onDoor = (event: Event) => setDoor((event as CustomEvent<ConnectionDoor>).detail);
     window.addEventListener(CONNECTION_EVENT, onDoor);
     return () => window.removeEventListener(CONNECTION_EVENT, onDoor);
+  }, []);
+
+  useEffect(() => {
+    const activate = (event: Event) => {
+      const detail = (event as CustomEvent<{ handoffId?: string; generation?: number }>).detail;
+      if (!detail?.handoffId || !Number.isSafeInteger(detail.generation) || Number(detail.generation) <= 0) return;
+      // Best effort here is safe: older generations remain valid until this
+      // exact activation lands, and native repeats the acknowledgement after
+      // every successful page load.
+      void activateOriginHandoff(detail.handoffId, Number(detail.generation)).catch(() => undefined);
+    };
+    window.addEventListener(ORIGIN_HANDOFF_STORED_EVENT, activate);
+    return () => window.removeEventListener(ORIGIN_HANDOFF_STORED_EVENT, activate);
   }, []);
 
   // Drawer dialog contract: Escape closes, focus lands inside on open and is
@@ -127,6 +156,12 @@ export function App() {
     if (authBootstrapMode(window.location.search) !== 'adopt') return;
     const token = params.get('adopt');
     if (!token) return;
+    const handoffId = params.get('handoffId') || undefined;
+    const rawGeneration = Number(params.get('handoffGeneration'));
+    const generation = Number.isSafeInteger(rawGeneration) && rawGeneration > 0
+      ? rawGeneration
+      : undefined;
+    const hasCorrelation = Boolean(handoffId && generation);
     let cancelled = false;
     const cleanUrl = () => {
       const clean = `${window.location.pathname}${window.location.hash || ''}`;
@@ -136,22 +171,40 @@ export function App() {
       try {
         // The shell now appends ?adopt= on EVERY origin change (relay OR a
         // new LAN address). If this origin already holds a live session, the
-        // single-use token must not be spent on nothing — the park effect
+        // leased token must not be adopted on nothing — the park effect
         // will re-mint moments after auth confirms.
-        const already = await fetch('/m/auth/status', { credentials: 'include' })
-          .then((r) => (r.ok ? r.json() as Promise<{ authenticated?: boolean }> : null))
-          .catch(() => null);
-        if (already?.authenticated) {
+        const outcome = await runOriginHandoffAdoption(
+          {
+            token,
+            ...(hasCorrelation ? { handoffId, generation } : {}),
+          },
+          {
+            alreadyAuthenticated: async () => {
+              // getAuthStatus also installs the session fingerprint needed to
+              // proof-sign the authenticated finalization request after a
+              // cold JS reload. A raw fetch would observe the cookie but leave
+              // the very next request unable to prove it owns that session.
+              const already = await getAuthStatus().catch(() => null);
+              return Boolean(already?.authenticated);
+            },
+            adopt: async (value) => { await adoptOriginSession(value); },
+            finalize: async (id, version) => { await finalizeOriginHandoff(id, version); },
+            isExplicitlyInvalid: isInvalidOriginHandoffError,
+            report: (id, version, result) => {
+              reportOriginHandoffResult(id, version, result);
+            },
+          },
+        );
+        if (outcome === 'already_authenticated') {
           if (cancelled) return;
           cleanUrl();
           await refreshAuth();
           return;
         }
-        await adoptOriginSession(token);
         if (cancelled) return;
         cleanUrl();
         await refreshAuth();
-      } catch {
+      } catch (error) {
         // A spent or expired handoff is not an error the user can act on
         // remotely — fall through to the normal unauthenticated screen.
         if (cancelled) return;
@@ -167,11 +220,14 @@ export function App() {
   useEffect(() => {
     if (!authStatus?.authenticated) return;
     if (door === 'relay') return; // already remote — this origin can't mint
+    if (!inNativeShell()) return; // browsers do not need a cross-origin shell credential
     let cancelled = false;
     const park = async (): Promise<void> => {
       try {
-        const handoff = await mintOriginHandoff();
-        if (!cancelled) parkOriginHandoff(handoff.token, handoff.expiresAt);
+        await originHandoffMintCoordinator.ensure(
+          mintOriginHandoff,
+          (handoff) => !cancelled && parkOriginHandoff(handoff),
+        );
       } catch { /* best effort — absence just means re-pair on the next LAN visit */ }
     };
     void park();
@@ -256,6 +312,11 @@ export function App() {
     setHandoff(payload);
     setTab('chats');
   };
+
+  // An open drawer is depth: a back swipe should close it rather than
+  // leaving the app. Registered before the deep views inside a screen so
+  // the innermost layer always unwinds first.
+  useBackGesture(drawerOpen && !drawerClosing, () => closeDrawer());
 
   const closeDrawer = () => {
     if (drawerClosingRef.current) return;
@@ -389,6 +450,15 @@ export function App() {
             />
           ) : tab === 'chats' ? (
             <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
+          ) : tab === 'agents' ? (
+            <Agents
+              onMessage={(agent) => {
+                // Messaging an agent is an ORDINARY chat turn. The agent's name
+                // opens the draft so the turn carries its standing context; no
+                // separate lane, no extra authority.
+                goToChat({ draft: `@${agent.name} ` });
+              }}
+            />
           ) : tab === 'workflows' ? <Workflows />
             : tab === 'spaces' ? <Workspaces />
             : tab === 'memory' ? <Memory />
@@ -450,6 +520,7 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Clementine',
   chats: 'Chats',
+  agents: 'Agents',
   spaces: 'Workspaces',
   workflows: 'Flows',
   memory: 'Memory',
@@ -475,6 +546,17 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'agents',
+    label: 'Agents',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+        <circle cx="9" cy="7" r="4" />
+        <path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
       </svg>
     ),
   },

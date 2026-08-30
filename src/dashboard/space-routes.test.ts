@@ -644,7 +644,7 @@ test('iframe-authored correction kinds remain Workspace-local and cannot poison 
   assert.equal(count, 0, 'an authored iframe label is not human authority');
 });
 
-test('manual refresh contains a read-only Composio source until shared durable authority is wired', async () => {
+test('manual refresh refuses a read-looking Composio source without a current read manifest', async () => {
   const slug = 'refresh-rt';
   store.spaceStore.save({ id: slug, title: 'Refresh RT', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }] });
   let providerBodies = 0;
@@ -663,7 +663,7 @@ test('manual refresh contains a read-only Composio source until shared durable a
     }));
     assert.equal(ref.status, 200);
     assert.equal(ref.body.results[0].ok, false);
-    assert.match(ref.body.results[0].error, /no shared durable call authority/i);
+    assert.match(ref.body.results[0].error, /not provably read-only/i);
     assert.equal(providerBodies, 0);
     assert.equal(Object.hasOwn(ref.body.data, 'pull'), false);
     assert.equal(ref.body.data._meta.pull.ok, false);
@@ -716,7 +716,7 @@ test('paused workspace rejects data writes (423) but still serves the view', asy
   assert.equal(view.status, 200); // read-only cached view still serves
 });
 
-test('action route contains even a READ-class Composio action without shared durable authority', async () => {
+test('action route stages approval for a read-looking Composio action without a current read manifest', async () => {
   const slug = 'action-rt';
   store.spaceStore.save({
     id: slug, title: 'Action RT',
@@ -742,13 +742,16 @@ test('action route contains even a READ-class Composio action without shared dur
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
     }));
-    assert.equal(res.status, 502);
-    assert.equal(res.body.ok, false);
-    assert.match(res.body.error, /no shared durable call authority/i);
+    assert.equal(res.status, 202);
+    assert.equal(res.body.pending, true);
+    assert.match(res.body.approvalId, /^apr-/);
     assert.equal(providerBodies, 0);
 
     const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
-    assert.ok(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list.*failed/i.test(n.text)));
+    assert.equal(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list.*failed/i.test(n.text)), false);
+    assert.ok(approvalRegistry.listPending({ status: 'pending' }).some(
+      (row) => row.approvalId === res.body.approvalId && row.tool === 'space_execute_action',
+    ));
   } finally {
     spaceRunner._setSpaceComposioDispatchForTests(null);
   }

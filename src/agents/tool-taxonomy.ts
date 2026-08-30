@@ -117,6 +117,8 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'memory_remember',
   'source_map_upsert',
   'memory_forget',
+  'memory_pin',
+  'memory_restore',
   'memory_embed_backfill',
   'working_memory',
   'note_create',
@@ -150,6 +152,12 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'execution_update_step',
   'execution_complete',
   'execution_mark_blocked',
+  // Queueing a workflow is an honest local WRITE, but the user has already
+  // requested that dispatch and every external step keeps its own exact
+  // consent/settlement boundary. Do not buy no-double-approval by calling the
+  // queue mutation a read.
+  'workflow_run',
+  'workflow_rerun_failed_items',
   // Plan surfacing — local write, the user approves the plan as a whole
   // via the plan-surface flow, not per-step.
   'surface_plan',
@@ -170,8 +178,11 @@ const NEVER_GATE_LOCAL_MEMORY = new Set<string>([
   'space_edit_runner',
   'space_revert_runner',
   'space_refresh',
-  'space_try_runner',
   'space_set_data',
+  // A bounded, create-only, content-addressed bundle is the local artifact the
+  // user requested. It cannot overwrite an existing revision; external deploys
+  // and sends remain separately governed at their own exact call boundary.
+  'artifact_bundle_save',
   // Creates/reuses the action's exact durable approval card only. The existing
   // Workspace action gate owns any later external dispatch after resolution.
   'space_action_prepare',
@@ -296,6 +307,9 @@ const ALWAYS_READ = new Set<string>([
   'local_cli_list',
   'list_files',
   'read_file',
+  // Static runner inspection reads source/provenance only and never executes
+  // or rewrites the runner.
+  'space_try_runner',
   // Team-agent inspection tools are pure local reads.
   'team_list',
   'team_pending_requests',
@@ -328,12 +342,6 @@ const ALWAYS_READ = new Set<string>([
   'share_plan',
   'surface_plan',
   'propose_check_in_template',
-  // workflow_run only queues a local workflow run record. The workflow
-  // runner still gates external writes/sends inside the workflow, so
-  // approving the queue action itself created duplicate approval noise
-  // without adding safety.
-  'workflow_run',
-  'workflow_rerun_failed_items',
 ]);
 
 /**

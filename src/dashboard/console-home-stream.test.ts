@@ -394,11 +394,13 @@ test('command center keeps limit-exceeded harness sessions working until complet
     const activeBody = await first.json() as {
       presence: { status: string };
       counts: { active: number };
-      workingNow: Array<{ sessionId?: string }>;
     };
     assert.equal(activeBody.presence.status, 'working');
     assert.equal(activeBody.counts.active, 1);
-    assert.ok(activeBody.workingNow.some((item) => item.sessionId === session.id));
+    const activeActivity = await (
+      await fetch(`${h.url}/api/console/activity/v2?workingNow=1`)
+    ).json() as { entries?: Array<{ sessionId?: string }> };
+    assert.ok((activeActivity.entries ?? []).some((item) => item.sessionId === session.id));
 
     appendEvent({
       sessionId: session.id,
@@ -412,10 +414,12 @@ test('command center keeps limit-exceeded harness sessions working until complet
     assert.equal(second.status, 200);
     const completedBody = await second.json() as {
       counts: { active: number };
-      workingNow: Array<{ sessionId?: string }>;
     };
     assert.equal(completedBody.counts.active, 0);
-    assert.equal(completedBody.workingNow.some((item) => item.sessionId === session.id), false);
+    const completedActivity = await (
+      await fetch(`${h.url}/api/console/activity/v2?workingNow=1`)
+    ).json() as { entries?: Array<{ sessionId?: string }> };
+    assert.equal((completedActivity.entries ?? []).some((item) => item.sessionId === session.id), false);
   } finally {
     await h.close();
   }

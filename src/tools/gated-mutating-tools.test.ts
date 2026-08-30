@@ -31,6 +31,12 @@ const {
   recordClaudeLocalPermissionAdmission,
 } = await import('../runtime/harness/claude-local-tool-correlation.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const currentCapabilityFixtures = await import('../runtime/harness/current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'PROOF_LIST_TASKS',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
 
 /** The settlement spine refuses dispatch without an accepted source AND a
  *  persisted turn graph — every fixture that drives a wrapped tool anchors
@@ -411,5 +417,6 @@ test('Claude local correlation fails open when identical permission admissions a
 });
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   rmSync(TMP, { recursive: true, force: true });
 });

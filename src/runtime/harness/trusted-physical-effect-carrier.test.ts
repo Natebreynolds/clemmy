@@ -22,9 +22,28 @@ const brackets = await import('./brackets.js');
 const composio = await import('../../tools/composio-tools.js');
 const { buildWorkerAgent } = await import('../../agents/sub-agents.js');
 const { _setInnerDispatchToolsForTests } = await import('../../tools/inner-dispatch.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'alpha__records_list',
+    providerKind: 'native_mcp',
+    effect: 'read',
+  },
+  {
+    operationId: 'APIFY_ACTOR_RUNS_GET',
+    providerKind: 'composio',
+    effect: 'read',
+  },
+  {
+    operationId: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+    providerKind: 'composio',
+    effect: 'read',
+  },
+]);
 
 test.after(() => {
   _setInnerDispatchToolsForTests(null);
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

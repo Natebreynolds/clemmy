@@ -156,7 +156,10 @@ function exactScheduledSend(overrides: Record<string, unknown> = {}) {
   const source = {
     id: 'render_message',
     prompt: '',
-    deterministic: { runner: 'render-message.mjs' },
+    call: {
+      tool: 'MESSAGING_GET_SCHEDULED_MESSAGE',
+      args: { templateId: 'weekday-status' },
+    },
     sideEffect: 'read',
     output: {
       type: 'object',
@@ -371,7 +374,7 @@ test('SEND-CALL GATE: one fixed scheduled direct send is autonomous, but every d
   assert.ok(multipleSendsResult.errors.some((error) => /multiple_autonomous_send_steps/.test(error)));
 
   const modelSource = exactScheduledSend() as unknown as { steps: Array<Record<string, unknown>> };
-  delete modelSource.steps[0].deterministic;
+  delete modelSource.steps[0].call;
   modelSource.steps[0].prompt = 'Write the message.';
   const modelResult = validateExactScheduledSend(modelSource);
   assert.ok(modelResult.errors.some((error) => /template_source_not_host_owned/.test(error)));

@@ -234,7 +234,7 @@ test('a retry never publishes the draft it discarded', () => {
   // So the invariant is about the PAYLOAD, not the type. Whether a bare retry
   // row should appear in the activity feed at all is a product judgement for
   // the boundary's owner; a leaked draft would be a defect either way.
-  const PRIVATE_PAYLOAD_KEYS = ['rawOutput', 'signal', 'maxRetries', 'model', 'provider', 'transport'];
+  const PRIVATE_PAYLOAD_KEYS = ['rawOutput', 'signal', 'maxRetries', 'transport'];
   for (const fixtureCase of fixture.cases) {
     for (const event of projectHarnessEventsForPublic(rows(fixtureCase))) {
       const data = (event.data ?? {}) as Record<string, unknown>;

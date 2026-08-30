@@ -52,7 +52,7 @@ const DIRECT_SEND = {
     arguments: JSON.stringify({
       subject: 'Deal analysis',
       body: 'Here you go.',
-      to_recipients: [{ emailAddress: { address: 'nathan@example.ai' } }],
+      to_recipients: [{ emailAddress: { address: 'avery@example.ai' } }],
       from: { emailAddress: { address: 'clem@corp.example.com' } },
     }),
     connected_account_id: 'ca_fixture',
@@ -61,7 +61,7 @@ const DIRECT_SEND = {
 
 test('a YOLO send always parks for a fresh human decision, even when the user typed the recipient', () => {
   const sessionId = chatWithAsk(
-    'Analyze the deals and then send me an email to nathan@example.ai please.',
+    'Analyze the deals and then send me an email to avery@example.ai please.',
   );
   assert.equal(
     policy.pendingActionRequiresHumanApproval(DIRECT_SEND, { sessionId }),
@@ -91,7 +91,7 @@ test('a YOLO send always parks for a fresh human decision, even when the user ty
 
 test('a two-step send-draft also always parks for the fresh human decision', () => {
   const sessionId = chatWithAsk(
-    'Pull the opportunities, analyze them, and then send me an email to nathan@example.ai please.',
+    'Pull the opportunities, analyze them, and then send me an email to avery@example.ai please.',
   );
   const messageId = 'AAMkADExOGRmNmY1LWQ1MmEtNGUwMi05fixture0';
   eventlog.writeToolOutput({
@@ -104,7 +104,7 @@ test('a two-step send-draft also always parks for the fresh human decision', () 
       data: {
         id: messageId,
         subject: 'Deal analysis',
-        toRecipients: [{ emailAddress: { address: 'nathan@example.ai', name: 'Nathan' } }],
+        toRecipients: [{ emailAddress: { address: 'avery@example.ai', name: 'Nathan' } }],
         from: { emailAddress: { address: 'clem@corp.example.com' } },
       },
     }),
@@ -157,7 +157,7 @@ test('a two-step send-draft also always parks for the fresh human decision', () 
 });
 
 test('outside YOLO scope the card always stays', () => {
-  const sessionId = chatWithAsk('Send me an email to nathan@example.ai please.');
+  const sessionId = chatWithAsk('Send me an email to avery@example.ai please.');
   const saved = proactivity.loadProactivityPolicy();
   writeFileSync(
     path.join(TMP_HOME, 'state', 'proactivity-policy.json'),

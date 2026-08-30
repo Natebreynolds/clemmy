@@ -244,7 +244,7 @@ test('unknown tool planning may resolve to reads or writes, but an affirmative a
     'external_write',
   );
 
-  const action = accept('Create a new artifact.');
+  const action = accept('Create a new file.');
   assert.equal(action.graph.classification.messageIntent, 'action');
   assert.equal(action.graph.classification.route, 'act');
   const weakened = contracts.freezeActionExpectedWorkContract({
@@ -355,6 +355,32 @@ test('an external action cannot be weakened to a local write effect', () => {
   assert.equal(result.status, 'invalid');
   assert.match(result.status === 'invalid' ? result.reason : '', /external-write/);
   assert.equal(contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq).status, 'missing');
+});
+
+test('a local-write ceiling accepts its exact local outcome without requiring an external write', () => {
+  const task = accept('Create one simple Workspace called Inline Proof.');
+  const graph = {
+    ...task.graph,
+    effectCeiling: 'local_write' as const,
+    classification: {
+      ...task.graph.classification,
+      route: 'act' as const,
+      messageIntent: 'action' as const,
+      externalEffectRequested: true,
+    },
+  };
+  const errors = contracts.validateActionProposalForGraph({
+    version: 1,
+    operations: [{
+      id: 'author_workspace',
+      effect: 'local_write',
+      dependsOn: [],
+      dataFrom: [],
+      cardinality: { kind: 'once' },
+    }],
+    universes: [],
+  }, graph);
+  assert.deepEqual(errors, [], 'the exact local-write ceiling owns the outcome effect');
 });
 
 test('strict validation rejects unknown fields, dangling/cyclic lineage, and invalid universe cardinality', () => {

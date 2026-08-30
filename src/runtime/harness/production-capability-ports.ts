@@ -20,6 +20,18 @@ import {
   shippedImplementationDigest,
 } from './shipped-implementation-identity.js';
 
+/** Nominal host-owned proof that a fresh definition observation no longer
+ * matches the immutable capability selected for this call. Provider prose can
+ * never manufacture this class. The settled attempt may retire that stale
+ * candidate and reopen bounded discovery, but it authorizes no business I/O. */
+export class CurrentCapabilityDefinitionUnavailableError extends Error {
+  override readonly name = 'CurrentCapabilityDefinitionUnavailableError';
+
+  constructor(message = 'the current capability definition is unavailable') {
+    super(message);
+  }
+}
+
 export interface ProductionPortIdentity {
   manifestId: string;
   manifestDigest: string;

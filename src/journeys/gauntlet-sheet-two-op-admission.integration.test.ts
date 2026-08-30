@@ -27,47 +27,59 @@ import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gauntlet-sheet-two-op-'));
 const PROMPT = 'make me a new google sheet called Clem Release Gate 0826 with a header row: check, result, timestamp';
-const SHEET_URL = 'https://docs.google.com/spreadsheets/d/two-op-sheet/edit';
+const SHEET_ID = 'fixture-two-op-sheet';
+const SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 const SUCCESS = `Created the sheet with its header row: ${SHEET_URL}`;
 const PREAMBLE = 'I’m creating the new sheet and adding its three-column header row.';
 const CREATE_OPERATION = 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1';
-const UPDATE_OPERATION = 'GOOGLESHEETS_BATCH_UPDATE';
+const UPDATE_OPERATION = 'GOOGLESHEETS_VALUES_UPDATE';
+const READ_OPERATION = 'GOOGLESHEETS_BATCH_GET';
 const PLAN_CONTROL = 'plan_task';
 const CREATE_NODE = 'create_sheet';
 const WRITE_NODE = 'write_headers';
 const CREATE_REF = 'cap:resolved:googlesheets_create_google_sheet1';
-const UPDATE_REF = 'cap:resolved:googlesheets_batch_update';
+const UPDATE_REF = 'cap:resolved:googlesheets_values_update';
+const HEADER_RANGE = 'Sheet1!A1:C1';
 
 const CREATE_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['title'],
-  properties: { title: { type: 'string' } },
+  required: [],
+  properties: {
+    title: { type: 'string' },
+    folder_id: { type: 'string' },
+    folder_name: { type: 'string' },
+  },
 });
-const CREATE_OUTPUT_SCHEMA = Object.freeze({
+const PROVIDER_ENVELOPE_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['successful', 'spreadsheetId', 'spreadsheetUrl'],
+  required: ['data', 'successful'],
   properties: {
+    data: { type: 'object' },
+    error: {},
     successful: { type: 'boolean' },
-    spreadsheetId: { type: 'string' },
-    spreadsheetUrl: { type: 'string' },
   },
 });
 const UPDATE_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['spreadsheetId', 'requests'],
+  required: ['spreadsheet_id', 'range', 'values'],
   properties: {
-    spreadsheetId: { type: 'string' },
-    requests: { type: 'array', items: { type: 'object' } },
+    spreadsheet_id: { type: 'string' },
+    range: { type: 'string' },
+    values: { type: 'array', items: { type: 'array' } },
+    value_input_option: { type: 'string' },
   },
 });
-const UPDATE_OUTPUT_SCHEMA = Object.freeze({
+const READ_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['successful'],
-  properties: { successful: { type: 'boolean' } },
+  required: ['spreadsheet_id'],
+  properties: {
+    spreadsheet_id: { type: 'string' },
+    ranges: { type: 'array', items: { type: 'string' } },
+  },
 });
 
 process.env.CLEMENTINE_HOME = HOME;
@@ -107,6 +119,7 @@ const discord = await import('../channels/discord-harness.js');
 const bridge = await import('../runtime/harness/respond-bridge.js');
 const { configureHarnessRuntime, resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { buildOrchestratorAgent } = await import('../agents/orchestrator.js');
+
 const eventlog = await import('../runtime/harness/eventlog.js');
 const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const productionPorts = await import('../runtime/harness/production-capability-ports.js');
@@ -200,8 +213,28 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
   const configured = await configureHarnessRuntime();
   assert.equal(configured.ok, true, configured.ok ? '' : configured.reason);
 
-  productionAdapters.installProductionTransport(async () => {
-    throw new Error('journey forbids direct catalog execution outside work_call');
+  const providerWrites: Array<{ operation: string; args: Record<string, unknown> }> = [];
+  const providerCalls: Array<{
+    operation: string;
+    args: Record<string, unknown>;
+    via: 'work_call' | 'catalog';
+  }> = [];
+  const headerValues = new Map<string, string[]>();
+  productionAdapters.installProductionTransport(async (call) => {
+    assert.equal(call.operationId, READ_OPERATION,
+      'only the frozen verifier may use the direct catalog transport');
+    assert.equal(call.accountId, 'conn-googlesheets');
+    const args = structuredClone(call.args);
+    const spreadsheetId = String(args.spreadsheet_id ?? '');
+    const observed = headerValues.get(spreadsheetId);
+    providerCalls.push({ operation: call.operationId, args, via: 'catalog' });
+    return {
+      data: {
+        valueRanges: observed ? [{ range: HEADER_RANGE, values: [observed] }] : [],
+      },
+      error: null,
+      successful: true,
+    };
   });
 
   const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
@@ -213,6 +246,7 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
     tools: [
       { slug: CREATE_OPERATION, schema: CREATE_SCHEMA as unknown as Record<string, unknown> },
       { slug: UPDATE_OPERATION, schema: UPDATE_SCHEMA as unknown as Record<string, unknown> },
+      { slug: READ_OPERATION, schema: READ_SCHEMA as unknown as Record<string, unknown> },
     ],
   }));
 
@@ -223,24 +257,32 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
       description: 'Create one new Google Sheet.',
       toolkit: { slug: 'googlesheets' },
       inputParameters: CREATE_SCHEMA,
-      outputParameters: CREATE_OUTPUT_SCHEMA,
+      outputParameters: PROVIDER_ENVELOPE_OUTPUT_SCHEMA,
       version: 'fixture-googlesheets-create-v1',
     },
     {
       slug: UPDATE_OPERATION,
-      name: 'Batch update Google Sheet values',
-      description: 'Write values into an existing Google Sheet.',
+      name: 'Update Google Sheet values',
+      description: 'Write one exact range into an existing Google Sheet.',
       toolkit: { slug: 'googlesheets' },
       inputParameters: UPDATE_SCHEMA,
-      outputParameters: UPDATE_OUTPUT_SCHEMA,
+      outputParameters: PROVIDER_ENVELOPE_OUTPUT_SCHEMA,
       version: 'fixture-googlesheets-update-v1',
+    },
+    {
+      slug: READ_OPERATION,
+      name: 'Read Google Sheet values',
+      description: 'Read values back from an existing Google Sheet by exact id.',
+      toolkit: { slug: 'googlesheets' },
+      inputParameters: READ_SCHEMA,
+      outputParameters: PROVIDER_ENVELOPE_OUTPUT_SCHEMA,
+      version: 'fixture-googlesheets-read-v1',
     },
   ];
   composioClient.__test__.setComposioApiKeyOverride('fixture-composio-key');
   composioClient.__test__.setConnectedAccountsLoader(async () => [
     { id: 'conn-googlesheets', status: 'ACTIVE', user_id: 'fixture-user', toolkit: { slug: 'googlesheets' } },
   ]);
-  const providerWrites: Array<{ operation: string; args: Record<string, unknown> }> = [];
   composioClient.__test__.setComposioClient({
     client: { baseURL: 'https://backend.composio.dev' },
     getClient: () => ({
@@ -252,11 +294,11 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
           ) => {
             const args = body.arguments as Record<string, unknown>;
             providerWrites.push({ operation, args: structuredClone(args) });
+            providerCalls.push({ operation, args: structuredClone(args), via: 'work_call' });
             if (operation === CREATE_OPERATION) {
               return {
                 data: {
-                  successful: true,
-                  spreadsheetId: 'two-op-sheet',
+                  spreadsheetId: SHEET_ID,
                   spreadsheetUrl: SHEET_URL,
                 },
                 error: null,
@@ -264,8 +306,11 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
                 log_id: `fixture-write-${providerWrites.length}`,
               };
             }
+            if (operation === UPDATE_OPERATION) {
+              headerValues.set(String(args.spreadsheet_id ?? ''), ['check', 'result', 'timestamp']);
+            }
             return {
-              data: { successful: true },
+              data: { updatedCells: 3 },
               error: null,
               successful: true,
               log_id: `fixture-write-${providerWrites.length}`,
@@ -331,18 +376,14 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
       } else if (primaryStep === 2) {
         assert.match(serialized, new RegExp(CREATE_OPERATION),
           'foreground discovery returns the sheet-create operation');
-        output = [functionCall('discover-sheet-update', 'tool_search', {
-          query: 'write values into a google sheet header row',
-          role_key: discoveredRoleKey,
-          limit: 8,
-        })];
-      } else if (primaryStep === 3) {
         assert.match(serialized, new RegExp(UPDATE_OPERATION),
-          'foreground discovery returns the sheet-update operation');
+          'the bounded discovery card also returns the sheet-update operation');
+        assert.match(serialized, new RegExp(READ_OPERATION),
+          'the bounded discovery card also publishes the exact host-owned readback verifier');
         assert.match(serialized, new RegExp(CREATE_REF.replace(/[:.]/g, '\\$&')),
           'the create ref stays disclosed on this same turn');
         assert.match(serialized, new RegExp(UPDATE_REF.replace(/[:.]/g, '\\$&')),
-          'the update ref is now disclosed on this same turn');
+          'the update ref is disclosed on the same bounded card');
         assert.ok(tools.includes(PLAN_CONTROL), 'disclosure exposes plan_task on the next model surface');
         output = [functionCall('admit-two-op-plan', PLAN_CONTROL, {
           preamble: PREAMBLE,
@@ -383,7 +424,7 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
             evidenceRequirements: [],
           },
         })];
-      } else if (primaryStep === 4) {
+      } else if (primaryStep === 3) {
         const planRecord = eventlog.getToolOutput(session.id, 'admit-two-op-plan') as { output?: unknown } | null;
         const planText = String(planRecord?.output ?? '');
         assert.match(planText, /"ok":\s*true/, `plan_task must admit the two-op write: ${planText}`);
@@ -400,7 +441,7 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
             connected_account_id: 'conn-googlesheets',
           }),
         })];
-      } else if (primaryStep === 5) {
+      } else if (primaryStep === 4) {
         output = [functionCall('two-op-write', 'work_call', {
           requirement_id: WRITE_NODE,
           universe_item_id: null,
@@ -410,8 +451,10 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
           args_json: JSON.stringify({
             tool_slug: UPDATE_OPERATION,
             arguments: JSON.stringify({
-              spreadsheetId: 'two-op-sheet',
-              requests: [{ range: 'A1:C1', values: [['check', 'result', 'timestamp']] }],
+              spreadsheet_id: SHEET_ID,
+              range: HEADER_RANGE,
+              values: [['check', 'result', 'timestamp']],
+              value_input_option: 'RAW',
             }),
             connected_account_id: 'conn-googlesheets',
           }),
@@ -502,13 +545,27 @@ test('two-op plan: create-then-write-headers selects two composio capabilities i
   assert.ok(sealedWrite, 'the write-headers node received one exact durable node seal');
   assert.equal(sealedCreate!.capabilityId, CREATE_REF);
   assert.equal(sealedWrite!.capabilityId, UPDATE_REF);
+  assert.ok(sealedCreate!.verification, 'the create seal carries its digest-covered identity recipe');
+  assert.ok(sealedWrite!.verification, 'the update seal carries its digest-covered content recipe');
 
   assert.equal(providerWrites.length, 2, 'both the create and the header write crossed the provider wire');
   assert.equal(sha256(JSON.stringify(providerWrites[0]!.operation)), sha256(JSON.stringify(CREATE_OPERATION)));
   assert.equal(sha256(JSON.stringify(providerWrites[1]!.operation)), sha256(JSON.stringify(UPDATE_OPERATION)));
+  assert.deepEqual(providerCalls.map((call) => call.operation), [
+    CREATE_OPERATION,
+    READ_OPERATION,
+    UPDATE_OPERATION,
+    READ_OPERATION,
+  ], 'two model-authored business calls produce four durable provider phases');
+  assert.deepEqual(providerCalls.map((call) => call.via), [
+    'work_call', 'catalog', 'work_call', 'catalog',
+  ], 'the model never emits a verifier read; both readbacks are host-owned child calls');
+  assert.ok(providerCalls.filter((call) => call.operation === READ_OPERATION)
+    .every((call) => call.args.spreadsheet_id === SHEET_ID),
+  'both frozen verifier recipes use the exact created resource id');
 });
 
-test('two-op plan REPLAYED on the same long-running daemon: a second turn selecting the SAME already-registered composio capabilities', { timeout: 120_000 }, async () => {
+test('two-op plan re-admitted on the same long-running daemon reuses current exact definitions', { timeout: 120_000 }, async () => {
   // Deliberately does NOT call eventlog.resetEventLog() or
   // resetHarnessRuntimeConfig(): production is one long-running daemon whose
   // capability_manifests table and in-memory HostCapabilityCatalogFactory
@@ -516,7 +573,7 @@ test('two-op plan REPLAYED on the same long-running daemon: a second turn select
   // (sess-desktop-117cf0fdc389f60519f0ffd7) was NOT this daemon's first-ever
   // Google Sheets turn — the durable capability_manifests table already held
   // "current" entries for both googlesheets_create_google_sheet1 and
-  // googlesheets_batch_update under this exact account before that turn ran.
+  // googlesheets_values_update under this exact account before that turn ran.
   // This subtest reuses the manifest store and factory the FIRST subtest just
   // populated (same account) and asks the exact same thing again, to find out
   // whether a REPEAT registration against an already-"current" durable
@@ -549,14 +606,10 @@ test('two-op plan REPLAYED on the same long-running daemon: a second turn select
       } else if (primaryStep === 2) {
         assert.match(serialized, new RegExp(CREATE_OPERATION),
           'foreground discovery returns the sheet-create operation');
-        output = [functionCall('discover-sheet-update-2', 'tool_search', {
-          query: 'write values into a google sheet header row',
-          role_key: discoveredRoleKey,
-          limit: 8,
-        })];
-      } else if (primaryStep === 3) {
         assert.match(serialized, new RegExp(UPDATE_OPERATION),
-          'foreground discovery returns the sheet-update operation');
+          'the repeated bounded card republishes the sheet-update operation');
+        assert.match(serialized, new RegExp(READ_OPERATION),
+          'the repeated bounded card republishes the exact compatible verifier');
         assert.ok(tools.includes(PLAN_CONTROL), 'disclosure exposes plan_task on the next model surface');
         output = [functionCall('admit-two-op-plan-2', PLAN_CONTROL, {
           preamble: PREAMBLE,

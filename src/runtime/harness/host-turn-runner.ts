@@ -37,7 +37,7 @@ import {
 import { toSmartString } from '@openai/agents-core/utils';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
-import type { Agent, AgentInputItem } from '@openai/agents';
+import type { Agent, AgentInputItem, ModelRequest } from '@openai/agents';
 import {
   boundAgentCapabilityEnvelope,
   boundAgentCapabilityRevision,
@@ -45,8 +45,13 @@ import {
 } from '../../agents/capability-envelope.js';
 import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
-import { durableLogicalCallContract } from './logical-call-contract.js';
+import {
+  durableLogicalCallContract,
+  durableLogicalCallRecoveryMaterial,
+} from './logical-call-contract.js';
+import { settleAdmittedLogicalCallPreDispatchRefusal } from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
+import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import {
   KillRequested,
   ToolCallsLimitExceeded,
@@ -62,13 +67,14 @@ import {
   type DispatchLeaseRef,
 } from './dispatch-lease.js';
 import pino from 'pino';
-import { getSession, isKillRequested, openEventLog } from './eventlog.js';
+import { getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
 
 const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
 import {
   ModelStreamStalledError,
   modelFirstByteStallMs,
   modelStreamStallMs,
+  modelStreamStallRetries,
 } from './model-stall-policy.js';
 import {
   actionTopologyRoleForRuntimeCall,
@@ -82,7 +88,10 @@ import {
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
 import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
-import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
+import {
+  catalogOperationIdentitiesEqual,
+  isPlainOrClementineLocalTool,
+} from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
 import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool } from '../../tools/tool-registry.js';
 import { readPersistedHealth } from '../../integrations/cli-catalog/auth-health.js';
@@ -90,7 +99,13 @@ import {
   isHostPlanRequiredWorkCall,
   releasePreparedHostWorkCallForRepair,
 } from '../../tools/work-call.js';
-import { prepareHostWorkCall } from '../../tools/work-call-mode.js';
+import { tryHostDispatchNamedWorkflow } from './named-workflow-host-dispatch.js';
+import {
+  prepareHostWorkCall,
+  resolveHostPlanningReadCapability,
+  resolveHostSingleActionPlanCapability,
+} from '../../tools/work-call-mode.js';
+import { hostSingleActionPlanTaskInput } from '../../tools/plan-tools.js';
 import {
   acceptedTurnCallAuthorityFor,
   armHostCallAuthority,
@@ -105,11 +120,15 @@ import {
 import {
   invokeHostToolCall,
 } from './host-tool-invocation.js';
+import { executeFrozenMutationVerification } from './mutation-verification-executor.js';
 import type { HostTurnEngineMode } from './turn-engine-selection.js';
 import {
   canonicalCatalogIdentityOf,
+  canonicalResolvedCapabilityId,
   freezeCatalogSnapshotForSource,
+  isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
+  resolveProvenLiveReadCatalogEntry,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
 import {
@@ -129,6 +148,10 @@ import {
 } from './host-model-frame-policy.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import { inspectDurableMaterialSourceContinuation } from './task-continuity-runtime.js';
+import {
+  sourceStrategyBindingsEqual,
+  turnPreflightDecisionsEqual,
+} from './turn-control.js';
 import {
   admitSourceStrategyPhysicalDispatch,
   classifyMaterialSourceManifestPurpose,
@@ -152,13 +175,109 @@ import {
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
+import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
+import {
+  recordModelRequestDispatchProvenance,
+} from './model-request-provenance.js';
+import { canonicalPromptCacheRequest } from './prompt-cache-observation.js';
+import {
+  acceptedModelBatchHistoryDigest,
+  admitAcceptedModelBatch,
+  finalizeAcceptedModelBatch,
+  reopenAcceptedModelBatch,
+  type AcceptedModelBatchRef,
+} from './accepted-model-batch-checkpoint.js';
+import {
+  buildHostToolDispositionResult,
+  buildUserRejectedHostResult,
+  describeCanonicalHostModelResult,
+  HOST_TOOL_DISPOSITION_PROTOCOL,
+  recordHostModelResultReceipts,
+  type HostToolDisposition,
+  type HostToolDispositionOutput,
+} from './host-model-result-receipt.js';
+import {
+  recordLogicalModelResultProjectionReceipt,
+} from './logical-model-result-projection-receipt.js';
+import {
+  AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
+  currentLiveReadPlanningDefinitionFromEntry,
+} from './live-read-planning-authority.js';
 import {
   evaluateQuantifiedWorkManifestGate,
   type QuantifiedWorkManifestGateInput,
 } from './quantified-work-manifest.js';
-const HOST_STATE_VERSION = 3;
+import { bareTerminalToolName } from './terminal-tool.js';
+import {
+  initializeNoProgressGovernor,
+  isCanonicalNoProgressAskArguments,
+  observeNoProgress,
+  parseNoProgressGovernorState,
+  type NoProgressGovernorState,
+} from './no-progress-governor.js';
+import { toOrchestratorDecision } from './turn-decision.js';
+import {
+  projectHostNoProgressAttempt,
+  projectHostNoProgressAuthority,
+} from './host-no-progress-projection.js';
+import { inspectConversationProtocol } from './conversation-protocol.js';
+const HOST_STATE_VERSION = 5;
 const HOST_STATE_KEY = '__clemHostInterrupt';
+const HOST_RECOVERY_STATE_VERSION = 1;
+const HOST_RECOVERY_STATE_KEY = '__clemHostRecovery';
 const HOST_READ_ONLY_SURFACE_VERSION = 'configured_harness_function_surface_v1';
+const HOST_PREPARATION_REPAIR_DIAGNOSTIC_MAX_CHARS = 8_192;
+
+/** Preserve a host-owned preparation repair for the next model step without
+ * interpreting provider/tool vocabulary or admitting unbounded result bytes.
+ * Keeping both ends retains the envelope's error/detail prefix and its repair
+ * suffix when an unusually large frozen-plan card must be clipped. */
+export function boundedHostPreparationRepairDiagnostic(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const diagnostic = value.trim();
+  if (!diagnostic) return undefined;
+  if (diagnostic.length <= HOST_PREPARATION_REPAIR_DIAGNOSTIC_MAX_CHARS) return diagnostic;
+  const marker = '\n...[host preparation diagnostic truncated]...\n';
+  const retained = HOST_PREPARATION_REPAIR_DIAGNOSTIC_MAX_CHARS - marker.length;
+  const head = Math.ceil(retained / 2);
+  const tail = Math.floor(retained / 2);
+  return `${diagnostic.slice(0, head)}${marker}${diagnostic.slice(-tail)}`;
+}
+
+/** Separate argument repair from capability retirement. The work-call
+ * admission kernel owns the bounded attempt/repair budget; the no-progress
+ * capability governor must not reinterpret a current schema repair as proof
+ * that the selected capability is unavailable. */
+export function hostPreparationRefusalProgress(
+  recovery: 'repair_arguments' | 'stop_and_explain',
+): { countsCapabilityRefusal: boolean; retireSemanticFrame: boolean } {
+  return recovery === 'repair_arguments'
+    ? { countsCapabilityRefusal: false, retireSemanticFrame: false }
+    : { countsCapabilityRefusal: true, retireSemanticFrame: true };
+}
+
+export function aggregateHostPreparationRefusalProgress(
+  refusals: ReadonlyArray<{
+    callId: string;
+    recovery: 'repair_arguments' | 'stop_and_explain';
+  }>,
+): {
+  hasTypedRefusal: boolean;
+  countingCallIds: string[];
+  retireSemanticFrame: boolean;
+} {
+  const countingCallIds = refusals
+    .filter((entry) => hostPreparationRefusalProgress(entry.recovery).countsCapabilityRefusal)
+    .map((entry) => entry.callId)
+    .sort();
+  return {
+    hasTypedRefusal: refusals.length > 0,
+    countingCallIds,
+    // An untyped conflict retains the old fail-closed retirement. For typed
+    // refusals, aggregation is any-stop and therefore sibling-order neutral.
+    retireSemanticFrame: refusals.length === 0 || countingCallIds.length > 0,
+  };
+}
 
 /**
  * Public copy for a durable stop-and-explain settlement. It is deliberately
@@ -186,8 +305,110 @@ export const HOST_TOOL_DEADLINE_BLOCKED_TEXT =
 export const HOST_TOOL_UNCERTAIN_BLOCKED_TEXT =
   'The tool stopped after execution may have begun. I preserved the call as uncertain and blocked replay; its effect must be reconciled before continuing.';
 
+export const HOST_RESULT_CHECKPOINT_BLOCKED_TEXT =
+  'I completed the bounded tool attempt, but its durable tool-result checkpoint could not be verified. I stopped before sending those result bytes to another model or starting another step. The recorded call state must be reconciled, then this task can resume.';
+
+export const HOST_LOCAL_CONTINUATION_UNAVAILABLE_TEXT =
+  'I could not durably finish this local step after a bounded internal retry. No uncertain external action is pending. Please retry this request.';
+
+export const HOST_NO_PROGRESS_BLOCKED_TEXT =
+  'I hit a bounded internal host error. Any completed work and retained results remain preserved, and no uncertain external change is pending.';
+
+export const HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT =
+  'I could not complete this step after bounded automatic recovery. The prior attempt has a known terminal result, and no uncertain external change is pending.';
+
+function hostNoProgressBlockedText(state: NoProgressGovernorState | null): string {
+  return state?.lastConsequence?.effectState === 'known_terminal'
+    ? HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT
+    : HOST_NO_PROGRESS_BLOCKED_TEXT;
+}
+
+export const HOST_PROGRESS_PROJECTION_BLOCKED_TEXT =
+  'I couldn\'t verify whether this task made progress, so I stopped before another model or tool step. Please retry this turn.';
+
+export const HOST_DUPLICATE_MODEL_CALL_BLOCKED_TEXT =
+  'The model repeated an already-committed tool call identifier. I kept the first durable result and stopped before preparing or executing the duplicate. Retry this request from the saved checkpoint; no second effect was started.';
+
+const HOST_NO_PROGRESS_RECOVERY_DIRECTIVE = [
+  'BOUNDED CONTROL RECOVERY — the prior fully settled control step did not establish a new executable path.',
+  'Use the results already present to call one available planning control, ask for the missing input, or explain the blocker.',
+  'Do not perform another discovery, dependency, provider, or business call, and do not combine planning with work.',
+].join(' ');
+
+function hostNoProgressRecoveryDirective(state: NoProgressGovernorState): string {
+  const consequence = state.lastConsequence;
+  if (!consequence) return HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
+  if (consequence.recovery === 'ask_user' && consequence.userInput) {
+    return [
+      'EXACT USER INPUT REQUIRED — the host proved that only the user can supply this value.',
+      `Ask exactly: ${consequence.userInput.question}`,
+      consequence.userInput.choices.length > 0
+        ? `Offer only these choices: ${JSON.stringify(consequence.userInput.choices)}.`
+        : 'Do not invent choices.',
+      'Use ask_user_question once with purpose exactly "clarification". Do not call discovery, planning, provider, or business tools.',
+    ].join(' ');
+  }
+  if (consequence.recovery === 'stop_factual') {
+    return [
+      `FACTUAL RESULT — the host validated consequence stage ${consequence.stage}.`,
+      'Give one concise factual answer from the exact result already present.',
+      'Do not call a tool, ask the user to continue an internal repair, or claim an unobserved effect.',
+    ].join(' ');
+  }
+  return [
+    `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
+    'Use the exact result already present and make one corrective call from the restricted tool surface.',
+    'Do not repeat discovery or claim that the user must continue an internal repair.',
+  ].join(' ');
+}
+
 export const HOST_CAPABILITY_UNAVAILABLE_TEXT =
   'That exact capability is unavailable for this request after two safe, no-effect attempts. I kept the conversation intact; choose another available capability or adjust the request before trying again.';
+
+/** Work-queue carriers that already started the nominated run. Inspect
+ * (`workflow_get`) and ask (`ask_user_question`) are not these. Live
+ * 2026-08-29 seq 97439: ask_user_question after plan_not_required spent the
+ * continuation and the user saw a check-in receipt instead of workflow_run.
+ * Live sess-desktop-39e981: dispatch_background_task DID queue work — spending
+ * on that carrier still forbids a second injection. */
+function uniqueRunQueueCarrierIssued(item: unknown): boolean {
+  const row = item as { type?: unknown; name?: unknown; arguments?: unknown };
+  if (row.type !== 'function_call' || typeof row.name !== 'string') return false;
+  const unwrapped = unwrapRuntimeEffectiveToolIdentity(row.name, row.arguments);
+  const name = unwrapped.toolName ?? row.name;
+  const tail = name.split('__').at(-1) ?? name;
+  return tail === 'workflow_run' || tail === 'dispatch_background_task';
+}
+
+/** After plan_task uniquely names an existing workflow, the model must call
+ * workflow_run — not complete, inspect, or invent a gate. Live OPEN-THE-GATES C:
+ * sess-desktop-ca4779 returned plan_not_required with the exact name, then
+ * zero workflow_run. */
+export function pendingUniqueWorkflowNameFromHistory(
+  history: readonly AgentInputItem[],
+): string | null {
+  let workflowName: string | null = null;
+  let queued = false;
+  for (const item of history) {
+    if (workflowName && uniqueRunQueueCarrierIssued(item)) queued = true;
+    const text = functionResultText(item as AgentInputItem);
+    if (!text) continue;
+    try {
+      const parsed = JSON.parse(text) as { code?: unknown; workflowName?: unknown };
+      if (
+        parsed.code === 'plan_not_required'
+        && typeof parsed.workflowName === 'string'
+        && parsed.workflowName.trim()
+      ) {
+        workflowName = parsed.workflowName.trim();
+        queued = false;
+      }
+    } catch {
+      // Opaque tool output is not a unique-workflow nomination.
+    }
+  }
+  return queued ? null : workflowName;
+}
 
 /**
  * The write operations this turn's accepted graph actually bound.
@@ -284,27 +505,6 @@ export function capabilityUnavailableTextFor(
   return parts.join(' ');
 }
 
-const HOST_TOOL_DISPOSITION_PROTOCOL = 'host_tool_disposition_v1' as const;
-
-type HostToolDisposition =
-  | 'refused_pre_dispatch'
-  | 'not_started'
-  | 'effect_unknown';
-
-interface HostToolDispositionOutput {
-  protocol: typeof HOST_TOOL_DISPOSITION_PROTOCOL;
-  disposition: HostToolDisposition;
-  frameDigest: string;
-  frameIndex: number;
-  frameSize: number;
-  /** Exactly one result in a refused frame carries the restart counter. */
-  countsRefusal?: true;
-  effect: 'none' | 'may_have_started';
-  retry: 'replan' | 'do_not_retry';
-  requiresReconciliation: boolean;
-  message: string;
-}
-
 class UnsupportedHostCapabilityError extends Error {
   constructor(readonly capabilityKind: string) {
     super(`unsupported host-runner capability surface: ${capabilityKind}`);
@@ -329,6 +529,222 @@ interface PendingHostCall {
   consentSubject?: HostInteractiveConsentSubjectV1;
 }
 
+export interface HostNoProgressCheckpoint {
+  state: NoProgressGovernorState;
+  /** First history item not yet reduced. An approval pause may leave an open
+   * admitted call at this index; its result is paired before reduction. */
+  historyCursor: number;
+  recoveryOnly: boolean;
+  recoveryDirectiveWritten: boolean;
+}
+
+function parseHostNoProgressCheckpoint(
+  value: unknown,
+  historyLength: number,
+): HostNoProgressCheckpoint | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('paused host state has an invalid no-progress checkpoint');
+  }
+  const candidate = value as Record<string, unknown>;
+  const state = parseNoProgressGovernorState(candidate.state);
+  const historyCursor = Number(candidate.historyCursor);
+  if (
+    !state
+    || !Number.isSafeInteger(historyCursor)
+    || historyCursor < 0
+    || historyCursor > historyLength
+    || typeof candidate.recoveryOnly !== 'boolean'
+    || typeof candidate.recoveryDirectiveWritten !== 'boolean'
+    || (candidate.recoveryOnly && state.retriesRemaining !== 0)
+  ) throw new Error('paused host state has an invalid no-progress checkpoint');
+  return {
+    state,
+    historyCursor,
+    recoveryOnly: candidate.recoveryOnly,
+    recoveryDirectiveWritten: candidate.recoveryDirectiveWritten,
+  };
+}
+
+function parseAcceptedModelBatchRef(value: unknown): AcceptedModelBatchRef | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('paused host state has an invalid accepted model-batch reference');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.sessionId !== 'string' || !candidate.sessionId
+    || !Number.isSafeInteger(candidate.sourceUserSeq) || Number(candidate.sourceUserSeq) <= 0
+    || typeof candidate.acceptedTaskId !== 'string' || !candidate.acceptedTaskId
+    || !Number.isSafeInteger(candidate.batchOrdinal) || Number(candidate.batchOrdinal) <= 0
+    || typeof candidate.batchId !== 'string' || !/^[a-f0-9]{64}$/.test(candidate.batchId)
+    || typeof candidate.authorityDigest !== 'string'
+    || !/^[a-f0-9]{64}$/.test(candidate.authorityDigest)
+  ) throw new Error('paused host state has an invalid accepted model-batch reference');
+  return {
+    sessionId: candidate.sessionId,
+    sourceUserSeq: Number(candidate.sourceUserSeq),
+    acceptedTaskId: candidate.acceptedTaskId,
+    batchOrdinal: Number(candidate.batchOrdinal),
+    batchId: candidate.batchId,
+    authorityDigest: candidate.authorityDigest,
+  };
+}
+
+type HostRecoveryPhase = 'admit' | 'finalize' | 'continue';
+
+/**
+ * Private host-owned recovery state.  It is deliberately a different wire
+ * type from HostInterruptState: no approval card, user decision, or
+ * interruption API can be minted from local checkpoint bookkeeping.
+ */
+export class HostRecoveryState {
+  constructor(
+    public readonly sessionId: string,
+    public readonly sourceUserSeq: number,
+    public readonly phase: HostRecoveryPhase,
+    /** Balanced history before the accepted call-bearing frame. */
+    public readonly history: AgentInputItem[],
+    /** Exact already-accepted model frame; never re-requested from a model. */
+    public readonly frameHistory: AgentInputItem[],
+    /** Exact already-built results for finalize recovery. */
+    public readonly resultItems: AgentInputItem[],
+    public readonly lastResponseId: string | undefined,
+    public readonly responseId: string | undefined,
+    public readonly turnEngine: HostTurnEngineMode,
+    public readonly noProgressCheckpoint: HostNoProgressCheckpoint | undefined,
+    public readonly stepIndex: number,
+    public readonly acceptedModelBatchRef?: AcceptedModelBatchRef,
+  ) {}
+
+  static isHostState(blob: string): boolean {
+    return blob.trimStart().startsWith(`{"${HOST_RECOVERY_STATE_KEY}"`);
+  }
+
+  static fromString(blob: string): HostRecoveryState {
+    const parsed = JSON.parse(blob) as Record<string, unknown>;
+    if (parsed[HOST_RECOVERY_STATE_KEY] !== HOST_RECOVERY_STATE_VERSION) {
+      throw new Error('recovery state is not a host-owned checkpoint recovery');
+    }
+    const sessionId = typeof parsed.sessionId === 'string' && parsed.sessionId
+      ? parsed.sessionId
+      : null;
+    const sourceUserSeq = Number(parsed.sourceUserSeq);
+    const phase = parsed.phase === 'admit'
+      || parsed.phase === 'finalize'
+      || parsed.phase === 'continue'
+      ? parsed.phase
+      : null;
+    const history = Array.isArray(parsed.history) ? parsed.history as AgentInputItem[] : null;
+    const frameHistory = Array.isArray(parsed.frameHistory)
+      ? parsed.frameHistory as AgentInputItem[]
+      : null;
+    const resultItems = Array.isArray(parsed.resultItems)
+      ? parsed.resultItems as AgentInputItem[]
+      : null;
+    const lastResponseId = typeof parsed.lastResponseId === 'string' && parsed.lastResponseId
+      ? parsed.lastResponseId
+      : undefined;
+    const responseId = typeof parsed.responseId === 'string' && parsed.responseId
+      ? parsed.responseId
+      : undefined;
+    const turnEngine = parsed.turnEngine === 'host_v1'
+      || parsed.turnEngine === 'host_v1_read_only'
+      ? parsed.turnEngine
+      : null;
+    const stepIndex = Number(parsed.stepIndex);
+    if (
+      !sessionId
+      || !Number.isSafeInteger(sourceUserSeq)
+      || sourceUserSeq <= 0
+      || !phase
+      || !history
+      || !frameHistory
+      || !resultItems
+      || !turnEngine
+      || !Number.isSafeInteger(stepIndex)
+      || stepIndex < 0
+      || inspectConversationProtocol(history).status !== 'valid'
+    ) throw new Error('host checkpoint recovery state is malformed');
+    const callIds = frameHistory.flatMap((item) => {
+      const row = item as unknown as { type?: unknown; callId?: unknown };
+      return row.type === 'function_call' && typeof row.callId === 'string' && row.callId
+        ? [row.callId]
+        : [];
+    });
+    const ref = parseAcceptedModelBatchRef(parsed.acceptedModelBatchRef);
+    if (phase === 'continue') {
+      if (
+        frameHistory.length !== 0
+        || resultItems.length !== 0
+        || !ref
+        || ref.sessionId !== sessionId
+        || ref.sourceUserSeq !== sourceUserSeq
+      ) throw new Error('host checkpoint continuation payload is inconsistent');
+    } else {
+      if (
+        callIds.length === 0
+        || new Set(callIds).size !== callIds.length
+        || frameHistory.some((item) => (
+          (item as unknown as { type?: unknown }).type === 'function_call_result'
+        ))
+      ) throw new Error('host checkpoint recovery frame is not one exact open model batch');
+      const openInspection = inspectConversationProtocol([...history, ...frameHistory]);
+      const unmatched = openInspection.issues.filter((issue) => issue.code === 'unmatched_function_call');
+      if (
+        unmatched.length !== callIds.length
+        || openInspection.issues.length !== callIds.length
+        || callIds.some((callId) => !unmatched.some((issue) => issue.callId === callId))
+      ) throw new Error('host checkpoint recovery frame does not exactly extend its balanced history');
+      if (
+        phase === 'admit'
+          ? resultItems.length !== 0 || ref !== undefined
+          : !ref
+            || ref.sessionId !== sessionId
+            || ref.sourceUserSeq !== sourceUserSeq
+            || resultItems.length !== callIds.length
+            || inspectConversationProtocol([...history, ...frameHistory, ...resultItems]).status !== 'valid'
+      ) throw new Error('host checkpoint recovery phase payload is inconsistent');
+    }
+    return new HostRecoveryState(
+      sessionId,
+      sourceUserSeq,
+      phase,
+      history,
+      frameHistory,
+      resultItems,
+      lastResponseId,
+      responseId,
+      turnEngine,
+      parseHostNoProgressCheckpoint(parsed.noProgressCheckpoint, history.length),
+      stepIndex,
+      ref,
+    );
+  }
+
+  toString(): string {
+    return JSON.stringify({
+      [HOST_RECOVERY_STATE_KEY]: HOST_RECOVERY_STATE_VERSION,
+      sessionId: this.sessionId,
+      sourceUserSeq: this.sourceUserSeq,
+      phase: this.phase,
+      history: this.history,
+      frameHistory: this.frameHistory,
+      resultItems: this.resultItems,
+      ...(this.lastResponseId ? { lastResponseId: this.lastResponseId } : {}),
+      ...(this.responseId ? { responseId: this.responseId } : {}),
+      turnEngine: this.turnEngine,
+      ...(this.noProgressCheckpoint
+        ? { noProgressCheckpoint: this.noProgressCheckpoint }
+        : {}),
+      stepIndex: this.stepIndex,
+      ...(this.acceptedModelBatchRef
+        ? { acceptedModelBatchRef: this.acceptedModelBatchRef }
+        : {}),
+    });
+  }
+}
+
 /**
  * Host-native paused-turn state. Duck-typed to the exact surface the
  * approval-resume owner already consumes from the SDK's RunState:
@@ -350,6 +766,10 @@ export class HostInterruptState {
     /** Exact host mode owns resume. V1 blobs predate the production host and
      * therefore decode to the read-only engine. */
     public readonly turnEngine: HostTurnEngineMode = 'host_v1_read_only',
+    /** V4: exact accepted-source progress budget and unreduced history edge. */
+    public readonly noProgressCheckpoint?: HostNoProgressCheckpoint,
+    /** V5: the exact still-open model batch that owns a paused approval. */
+    public readonly acceptedModelBatchRef?: AcceptedModelBatchRef,
   ) {}
 
   static isHostState(blob: string): boolean {
@@ -363,9 +783,11 @@ export class HostInterruptState {
       pending?: PendingHostCall[];
       lastResponseId?: unknown;
       turnEngine?: unknown;
+      noProgressCheckpoint?: unknown;
+      acceptedModelBatchRef?: unknown;
     };
     const version = parsed[HOST_STATE_KEY];
-    if (version !== 1 && version !== 2 && version !== 3 && version !== HOST_STATE_VERSION) {
+    if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== HOST_STATE_VERSION) {
       throw new Error('paused state is not a host-owned interrupt state');
     }
     // Backward compatible: accepted response identity was optional in V1, and
@@ -381,7 +803,7 @@ export class HostInterruptState {
           ? 'host_v1_read_only'
           : (() => { throw new Error('paused host state has no exact engine identity'); })();
     const pending = parsed.pending ?? [];
-    if (version === HOST_STATE_VERSION) {
+    if (version >= 3) {
       for (const call of pending) {
         if (call.consentSubject !== undefined) {
           const parsedSubject = parseHostInteractiveConsentSubjectV1(call.consentSubject);
@@ -401,6 +823,15 @@ export class HostInterruptState {
       pending,
       accepted,
       turnEngine,
+      version >= 4
+        ? parseHostNoProgressCheckpoint(
+            parsed.noProgressCheckpoint,
+            (parsed.history ?? []).length,
+          )
+        : undefined,
+      version === HOST_STATE_VERSION
+        ? parseAcceptedModelBatchRef(parsed.acceptedModelBatchRef)
+        : undefined,
     );
   }
 
@@ -411,6 +842,12 @@ export class HostInterruptState {
       pending: this.pending,
       turnEngine: this.turnEngine,
       ...(this.lastResponseId !== undefined ? { lastResponseId: this.lastResponseId } : {}),
+      ...(this.noProgressCheckpoint
+        ? { noProgressCheckpoint: this.noProgressCheckpoint }
+        : {}),
+      ...(this.acceptedModelBatchRef
+        ? { acceptedModelBatchRef: this.acceptedModelBatchRef }
+        : {}),
     });
   }
 
@@ -1016,6 +1453,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const signal = (opts as { signal?: AbortSignal }).signal;
   const requestedHostEngine = (opts as { hostTurnEngine?: unknown }).hostTurnEngine;
   const resumedTurnEngine = itemsOrState instanceof HostInterruptState
+    || itemsOrState instanceof HostRecoveryState
     ? itemsOrState.turnEngine
     : undefined;
   const optionTurnEngine: HostTurnEngineMode | undefined = requestedHostEngine === 'host_v1'
@@ -1470,14 +1908,31 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const history: AgentInputItem[] = [];
   let pendingFromResume: PendingHostCall[] = [];
   const resumedHostState = itemsOrState instanceof HostInterruptState;
+  const resumedRecoveryState = itemsOrState instanceof HostRecoveryState
+    ? itemsOrState
+    : undefined;
   let resumedResponseId: string | undefined;
+  let resumedAcceptedModelBatchRef: AcceptedModelBatchRef | undefined;
   if (resumedHostState) {
     history.push(...itemsOrState.history);
     pendingFromResume = itemsOrState.pending;
     // A pause does not discard what was already accepted.
     resumedResponseId = itemsOrState.lastResponseId;
+    resumedAcceptedModelBatchRef = itemsOrState.acceptedModelBatchRef;
+  } else if (resumedRecoveryState) {
+    history.push(...resumedRecoveryState.history);
+    resumedResponseId = resumedRecoveryState.lastResponseId;
+    resumedAcceptedModelBatchRef = resumedRecoveryState.acceptedModelBatchRef;
   } else {
     history.push(...(itemsOrState as AgentInputItem[]));
+  }
+  if (resumedRecoveryState) {
+    const identity = exactHostIdentity();
+    if (
+      !hostProduction
+      || resumedRecoveryState.sessionId !== identity.sessionId
+      || resumedRecoveryState.sourceUserSeq !== identity.sourceUserSeq
+    ) throw new HostCallAuthorityBoundaryError('checkpoint_recovery_source_mismatch');
   }
   const zeroCrossingRefusalCounts = priorZeroCrossingRefusalCounts(history);
   const retiredZeroCrossingFrames = new Set(
@@ -1485,8 +1940,34 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       .filter(([, count]) => count >= 2)
       .map(([digest]) => digest),
   );
+  // A successful plan_task followed by prose is not a completed host turn.
+  // Give the already-bound read carrier one deterministic model step before
+  // terminal reduction; a second stop is handled by the delivery hold floor.
+  let acceptedReadPlanContinuationUsed = false;
+  let acceptedUniqueWorkflowContinuationUsed = false;
+  let pendingHostModelDirective: string | undefined;
+  const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
+    || itemsOrState instanceof HostRecoveryState
+    ? itemsOrState.noProgressCheckpoint
+    : undefined;
+  let noProgressState = resumedNoProgressCheckpoint?.state ?? null;
+  let noProgressHistoryCursor = resumedNoProgressCheckpoint?.historyCursor
+    ?? history.length;
+  let noProgressRecoveryOnly = resumedNoProgressCheckpoint?.recoveryOnly ?? false;
+  let noProgressRecoveryDirectiveWritten =
+    resumedNoProgressCheckpoint?.recoveryDirectiveWritten ?? false;
+  const currentNoProgressCheckpoint = (): HostNoProgressCheckpoint | undefined => (
+    noProgressState
+      ? {
+          state: noProgressState,
+          historyCursor: noProgressHistoryCursor,
+          recoveryOnly: noProgressRecoveryOnly,
+          recoveryDirectiveWritten: noProgressRecoveryDirectiveWritten,
+        }
+      : undefined
+  );
 
-  if (!resumedHostState) await runInputGuardrails(history);
+  if (!resumedHostState && !resumedRecoveryState) await runInputGuardrails(history);
 
   emit('agent_start', runContext, agent);
 
@@ -1494,6 +1975,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // reports the identity this host last ACCEPTED. Only an admitted response
   // may replace it; a rejected one leaves it exactly as it was.
   let lastResponseId: string | undefined = resumedResponseId ?? hostPreviousResponseId;
+  let latestAcceptedModelBatchRef = resumedAcceptedModelBatchRef;
+  let currentHostStepIndex = resumedRecoveryState?.stepIndex ?? 0;
   const propagateToolCallsLimit = (error: ToolCallsLimitExceeded): never => {
     hostToolCallsLimitCheckpoints.set(error, {
       history: [...history],
@@ -1504,16 +1987,133 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const blockedOutcome = (
     text = HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT,
     reason = 'durable_stop_and_explain',
+    resumable = true,
   ): RunOutcome => {
-    emit('agent_end', runContext, agent, text);
+    const renderedText = hostProduction
+      ? (() => {
+          const identity = exactHostIdentity();
+          return renderFailureWithRetainedWork({
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+            fallbackText: text,
+          });
+        })()
+      : text;
+    emit('agent_end', runContext, agent, renderedText);
     return {
       history,
       lastResponseId,
-      finalOutput: text,
+      finalOutput: renderedText,
       terminal: {
         status: 'blocked',
         reason,
+        ...(resumable ? {} : { resumable: false as const }),
       },
+    } satisfies RunOutcome;
+  };
+
+  const recoveryOutcome = (input: {
+    phase: Exclude<HostRecoveryPhase, 'continue'>;
+    baseHistory: AgentInputItem[];
+    frameHistory: readonly AgentInputItem[];
+    resultItems?: readonly AgentInputItem[];
+    responseId?: string;
+    acceptedModelBatchRef?: AcceptedModelBatchRef;
+    stepIndexOverride?: number;
+    reason: string;
+  }): RunOutcome => {
+    const identity = exactHostIdentity();
+    if (input.phase === 'finalize' && !input.acceptedModelBatchRef) {
+      throw new HostCallAuthorityBoundaryError('checkpoint_recovery_batch_ref_missing');
+    }
+    const state = new HostRecoveryState(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      input.phase,
+      [...input.baseHistory],
+      [...input.frameHistory],
+      [...(input.resultItems ?? [])],
+      lastResponseId,
+      input.responseId,
+      hostTurnEngine ?? 'host_v1',
+      currentNoProgressCheckpoint(),
+      input.stepIndexOverride
+        ?? (input.phase === 'finalize' ? currentHostStepIndex + 1 : currentHostStepIndex),
+      input.acceptedModelBatchRef,
+    );
+    hostTurnLogger.error({
+      reason: input.reason,
+      phase: input.phase,
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      batchOrdinal: input.acceptedModelBatchRef?.batchOrdinal ?? null,
+    }, 'host retained exact checkpoint recovery ownership');
+    return {
+      history: [...input.baseHistory],
+      lastResponseId,
+      finalOutput: undefined,
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      serializedRecoveryState: state.toString(),
+    } satisfies RunOutcome;
+  };
+
+  const recoveryContinuationOutcome = (
+    ref: AcceptedModelBatchRef | undefined,
+    reason: string,
+  ): RunOutcome => {
+    if (!ref) {
+      throw new HostCallAuthorityBoundaryError('checkpoint_recovery_batch_ref_missing');
+    }
+    const identity = exactHostIdentity();
+    const state = new HostRecoveryState(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      'continue',
+      [...history],
+      [],
+      [],
+      lastResponseId,
+      undefined,
+      hostTurnEngine ?? 'host_v1',
+      currentNoProgressCheckpoint(),
+      currentHostStepIndex + 1,
+      ref,
+    );
+    hostTurnLogger.info({
+      reason,
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      batchOrdinal: ref.batchOrdinal,
+    }, 'host checkpoint recovery is ready for ordinary same-source continuation');
+    return {
+      history: [...history],
+      lastResponseId,
+      finalOutput: undefined,
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      serializedRecoveryState: state.toString(),
+    } satisfies RunOutcome;
+  };
+
+  const approvalRecoveryOutcome = (
+    reason: string,
+    ref: AcceptedModelBatchRef | undefined = resumedAcceptedModelBatchRef,
+  ): RunOutcome => {
+    hostTurnLogger.error({ reason }, 'host retained paused approval during local checkpoint recovery');
+    return {
+      history,
+      lastResponseId,
+      finalOutput: undefined,
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      // This is the same already-existing approval state, not a newly minted
+      // card. The owner persists it without emitting approval_requested.
+      serializedState: new HostInterruptState(
+        history,
+        pendingFromResume,
+        lastResponseId,
+        hostTurnEngine ?? 'host_v1_read_only',
+        currentNoProgressCheckpoint(),
+        ref,
+      ).toString(),
     } satisfies RunOutcome;
   };
 
@@ -1541,6 +2141,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const runOneModelStep = async (
     modelInput: AgentInputItem[],
     instructions: string | undefined,
+    modelSchemas: readonly unknown[] = schemas,
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
     const ambient = harnessRunContextStorage.getStore();
     const killTarget = ambient?.runAttemptId
@@ -1624,17 +2225,46 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (signal.aborted) rejectAbort();
       else signal.addEventListener('abort', rejectAbort, { once: true });
     });
+    const hostProjection = canonicalPromptCacheRequest({
+      ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
+      input: modelInput,
+      modelSettings,
+      tools: modelSchemas as never,
+      toolsExplicitlyProvided: true,
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    });
     try {
       return await Promise.race([
         codexOneStep({
           input: modelInput,
-          tools: schemas as never,
+          tools: modelSchemas as never,
           ...(modelId !== undefined ? { modelId } : {}),
           ...(resolveModel ? { resolveModel } : {}),
           ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
           modelSettings,
           signal: controller.signal,
           stream: true,
+          ...(hostProduction
+            ? {
+                beforeModelDispatch: (request: ModelRequest) => {
+                  const identity = exactHostIdentity();
+                  const provenance = recordModelRequestDispatchProvenance({
+                    sessionId: identity.sessionId,
+                    sourceUserSeq: identity.sourceUserSeq,
+                    request,
+                    hostProjection,
+                  });
+                  if (provenance.removedOptionalLayer) {
+                    console.warn(
+                      '[clem] model_request_optional_layer_removed:',
+                      provenance.removedOptionalLayer,
+                    );
+                  }
+                },
+              }
+            : {}),
           onActivity: (activity) => {
             lastSemanticActivityAt = Date.now();
             if (activity === 'actionable') sawActionableActivity = true;
@@ -1728,31 +2358,162 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
    * the target it must plan against (GOOGLEDRIVE_FIND_FILE, effect 'read',
    * refused live at this exact wall). Writes keep the full wall unchanged.
    */
+  interface LiveReadDiscoveryNomination {
+    manifestDigest: string;
+    accountIdentity: string;
+    providerKind: string;
+    providerInputSchemaDigest: string;
+    definitionFingerprint: string;
+    providerOperationVersion: string;
+    providerOutputSchemaDigest: string | null;
+    invokePortId: string;
+  }
+
   const provenTurnReadDescent = (
     name: string,
     args: Record<string, unknown> | null,
-  ): { effectiveName: string } | null => {
-    const dbg = (why: string, extra?: unknown) => { if (process.env.CLEM_READ_DESCENT_DEBUG) console.error('READ_DESCENT', why, name, JSON.stringify(extra ?? null)); };
-    if (!hostProduction || !args) { dbg('no-prod-or-args'); return null; }
-    const decision = classifyRuntimeToolEffect(name, args);
-    if (decision.effect !== 'read') { dbg('effect', decision); return null; }
-    // Only provider carriers whose effect provenance is the trusted adapter
-    // classification participate; shell/unknown sources never descend.
-    if (decision.source !== 'composio' && decision.source !== 'native_mcp') { dbg('source', decision); return null; }
+    tool?: FunctionToolLike,
+  ): {
+    effectiveName: string;
+    capabilityId: string;
+    accountIdentity?: string;
+    liveReadDiscovery?: LiveReadDiscoveryNomination;
+    planningManifestDigest?: string;
+  } | null => {
+    if (!hostProduction || !args) return null;
     const effectiveName = unwrapRuntimeEffectiveToolIdentity(name, args).toolName?.trim() ?? '';
-    if (!effectiveName) { dbg('no-effective'); return null; }
+    if (!effectiveName) return null;
     try {
       const identity = exactHostIdentity();
       const entries = provenCapabilityEntriesForTurn({
         sessionId: identity.sessionId,
         sourceUserSeq: identity.sourceUserSeq,
       });
-      const proven = entries.some((entry) => entry.effectClass === 'read'
-        && entry.identifier.trim().toLowerCase() === effectiveName.toLowerCase());
-      if (!proven) dbg('not-proven', { identity, entries });
-      return proven ? { effectiveName } : null;
-    } catch (error) {
-      dbg('threw', String(error));
+      const proven = entries.find((entry) => entry.effectClass === 'read'
+        && catalogOperationIdentitiesEqual(entry.identifier, effectiveName));
+      if (proven) {
+        return {
+          effectiveName,
+          capabilityId: canonicalResolvedCapabilityId(
+            proven.identifier.trim().toLowerCase(),
+            proven.accountIdentity,
+          ),
+          ...(proven.accountIdentity ? { accountIdentity: proven.accountIdentity } : {}),
+        };
+      }
+
+      // Provider-neutral live-read acquisition records its exact same-turn
+      // registry nomination as capability_discovered rather than fabricating
+      // a provider-shaped capability_resolution row. Accept only one
+      // self-consistent opaque ref from this accepted source. The caller below
+      // must still reopen that exact current catalog entry and match its
+      // manifest, effect, account, definition, schema and immutable invoke
+      // port before dispatch.
+      const discovered = new Map<string, LiveReadDiscoveryNomination>();
+      let conflictingDiscovery = false;
+      for (const event of listEvents(identity.sessionId, { types: ['capability_discovered'] })) {
+        if (event.data.sourceUserSeq !== identity.sourceUserSeq) continue;
+        const rows = Array.isArray(event.data.capabilities) ? event.data.capabilities : [];
+        for (const raw of rows) {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+          const row = raw as Record<string, unknown>;
+          const descriptor = row.descriptor;
+          const providerDefinition = row.providerDefinition;
+          const definition = providerDefinition as Record<string, unknown> | null;
+          const providerOutputSchemaDigest = definition?.providerOutputSchemaDigest;
+          if (
+            row.kind !== AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE
+            || typeof row.providerKind !== 'string'
+            || !row.providerKind.trim()
+            || row.effectClass !== 'read'
+            || typeof row.identifier !== 'string'
+            || !catalogOperationIdentitiesEqual(row.identifier, effectiveName)
+            || typeof row.capabilityRef !== 'string'
+            || !row.capabilityRef.trim()
+            || typeof row.manifestDigest !== 'string'
+            || !/^[a-f0-9]{64}$/.test(row.manifestDigest)
+            || typeof row.accountIdentity !== 'string'
+            || !row.accountIdentity.trim()
+            || !descriptor
+            || typeof descriptor !== 'object'
+            || Array.isArray(descriptor)
+            || (descriptor as Record<string, unknown>).id !== row.capabilityRef
+            || (descriptor as Record<string, unknown>).effect !== 'read'
+            || (descriptor as Record<string, unknown>).manifestDigest !== row.manifestDigest
+            || (descriptor as Record<string, unknown>).accountScope !== row.accountIdentity
+            || !providerDefinition
+            || typeof providerDefinition !== 'object'
+            || Array.isArray(providerDefinition)
+            || (providerDefinition as Record<string, unknown>).version !== 1
+            || typeof (providerDefinition as Record<string, unknown>).providerInputSchemaDigest !== 'string'
+            || !/^[a-f0-9]{64}$/.test(
+              (providerDefinition as Record<string, unknown>).providerInputSchemaDigest as string,
+            )
+            || typeof (providerDefinition as Record<string, unknown>).definitionFingerprint !== 'string'
+            || !/^[a-f0-9]{64}$/.test(
+              (providerDefinition as Record<string, unknown>).definitionFingerprint as string,
+            )
+            || typeof (providerDefinition as Record<string, unknown>).providerOperationVersion !== 'string'
+            || !((providerDefinition as Record<string, unknown>).providerOperationVersion as string).trim()
+            || (providerOutputSchemaDigest !== null
+              && (
+                typeof providerOutputSchemaDigest !== 'string'
+                || !/^[a-f0-9]{64}$/.test(providerOutputSchemaDigest)
+              ))
+            || typeof (providerDefinition as Record<string, unknown>).invokePortId !== 'string'
+            || !((providerDefinition as Record<string, unknown>).invokePortId as string).trim()
+          ) continue;
+          const nomination: LiveReadDiscoveryNomination = {
+            manifestDigest: row.manifestDigest,
+            accountIdentity: row.accountIdentity,
+            providerKind: row.providerKind,
+            providerInputSchemaDigest:
+              (providerDefinition as Record<string, unknown>).providerInputSchemaDigest as string,
+            definitionFingerprint:
+              (providerDefinition as Record<string, unknown>).definitionFingerprint as string,
+            providerOperationVersion:
+              (providerDefinition as Record<string, unknown>).providerOperationVersion as string,
+            providerOutputSchemaDigest: providerOutputSchemaDigest as string | null,
+            invokePortId: (providerDefinition as Record<string, unknown>).invokePortId as string,
+          };
+          const prior = discovered.get(row.capabilityRef);
+          if (prior && JSON.stringify(prior) !== JSON.stringify(nomination)) {
+            conflictingDiscovery = true;
+            continue;
+          }
+          discovered.set(row.capabilityRef, nomination);
+        }
+      }
+      if (conflictingDiscovery || discovered.size > 1) return null;
+      if (discovered.size === 1) {
+        const [capabilityId, liveReadDiscovery] = [...discovered.entries()][0]!;
+        return {
+          effectiveName,
+          capabilityId,
+          accountIdentity: liveReadDiscovery.accountIdentity,
+          liveReadDiscovery,
+        };
+      }
+
+      // Cross-turn warm reads have no same-source discovery row by design:
+      // the exact current manifest is instead revalidated onto this source's
+      // opaque bounded foreground planning card. Only the exact configured
+      // work_call object can reopen that nomination. Final authority remains
+      // below, where the catalog entry and every manifest identity field are
+      // checked again before dispatch.
+      const planning = resolveHostPlanningReadCapability(tool, {
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        operationId: effectiveName,
+      });
+      return planning
+        ? {
+            effectiveName,
+            capabilityId: planning.capabilityId,
+            planningManifestDigest: planning.manifestDigest,
+          }
+        : null;
+    } catch {
       return null;
     }
   };
@@ -1770,6 +2531,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     invoke: (signal: AbortSignal) => Promise<unknown>;
   }
 
+  let lastExactProductionMiss = '';
   const exactProductionHostCall = (
     name: string,
     args: Record<string, unknown> | null,
@@ -1779,21 +2541,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     runContextForCall: RunContext<unknown>,
     details: unknown,
   ): ExactProductionHostCall | null => {
-    if (!hostProduction || !args || !tool) return null;
+    const miss = (reason: string): null => {
+      lastExactProductionMiss = reason;
+      return null;
+    };
+    lastExactProductionMiss = '';
+    if (!hostProduction || !args || !tool) return miss('host_or_args_or_tool_missing');
     if (
       !harnessToolBracketsEnabled()
       || tool.name !== name
       || logicalToolCallId !== logicalToolCallId.trim()
       || !logicalToolCallId
       || logicalToolCallId.length > 512
-    ) return null;
+    ) return miss('harness_bound_identity_mismatch');
     // Carrier provenance: the wrapToolForHarness-attested configured object is
     // the ordinary bar. A read-effect call whose exact operation this turn
     // proved may descend without it (read-fast-path); every mutation keeps the
     // attested-carrier requirement.
     const attestedCarrier = configuredToolRefs.has(tool) && isHarnessBoundFunctionTool(tool);
-    const readDescent = provenTurnReadDescent(name, args);
-    if (!attestedCarrier && !readDescent) return null;
+    const readDescent = provenTurnReadDescent(name, args, tool);
+    if (!attestedCarrier && !readDescent) return miss('attested_carrier_and_proven_read_descent_missing');
     const identity = exactHostIdentity();
     const surface = currentProductionHostSurface();
     const envelope = surface.envelope;
@@ -1812,23 +2579,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       && root.authority.bindingRevisionDigest === surface.bindingRevisionDigest
       && root.authority.graphEventId === undefined
       && root.authority.graphHash === undefined;
-    if (
-      !envelope
-      || !revision
-      || envelope.attemptId !== identity.sessionId
-      || revision.envelopeDigest !== envelope.envelopeDigest
-      || !revision.bound.includes(name)
-      || capability.length !== 1
-      || capability[0]!.accountIdentity !== ''
-      || capability[0]!.schemaFingerprint !== toolSchemaFingerprint(tool)
-      || decision.effect === 'unknown'
-      || !effectiveName
-      || root.status !== 'ok'
-      || !exactHostRoot
-      || root.authority.state !== 'open'
-      || root.authority.identity.acceptedTaskId !== acceptedTaskId
-      || !contract
-    ) return null;
+    if (!envelope) return miss('envelope_missing');
+    if (!revision) return miss('revision_missing');
+    if (envelope.attemptId !== identity.sessionId) return miss('envelope_attempt_mismatch');
+    if (revision.envelopeDigest !== envelope.envelopeDigest) return miss('revision_envelope_digest_mismatch');
+    if (!revision.bound.includes(name)) return miss(`wrapper_not_bound:${name}`);
+    if (capability.length !== 1) return miss(`wrapper_capability_count:${capability.length}`);
+    if (capability[0]!.accountIdentity !== '') return miss('wrapper_account_identity_not_empty');
+    if (capability[0]!.schemaFingerprint !== toolSchemaFingerprint(tool)) return miss('wrapper_schema_fingerprint_mismatch');
+    if (!effectiveName) return miss('effective_inner_name_missing');
+    if (root.status !== 'ok') return miss(`accepted_turn_authority:${root.status}`);
+    if (!exactHostRoot) return miss('host_v1_root_mismatch');
+    if (root.authority.state !== 'open') return miss(`authority_state:${root.authority.state}`);
+    if (root.authority.identity.acceptedTaskId !== acceptedTaskId) return miss('accepted_task_mismatch');
+    if (!contract) return miss('logical_call_contract_missing');
 
     const exactEntryMatches = (entry: RegisteredHostCapability): boolean => {
       const manifest = currentCapabilityManifest(entry.manifest);
@@ -1847,26 +2611,86 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && canonical.invokePortId === manifest.invokePortId
       );
     };
-    const candidates = surface.snapshot.entries.filter(exactEntryMatches);
-    if (candidates.length > 1) return null;
+    // LIVE-READ identity: the catalog entry is the effect authority, not the
+    // model's spelling or a fail-closed name classifier. Writes still require
+    // the frozen-snapshot nine-way match above. A previously observed current
+    // catalog read was refused when a conservative name classifier disagreed
+    // with its sealed effect and the model used an alternate tool spelling.
+    const liveReadEntryDispatchable = (entry: RegisteredHostCapability): boolean => {
+      const manifest = currentCapabilityManifest(entry.manifest);
+      const canonical = canonicalCatalogIdentityOf(entry);
+      return Boolean(
+        manifest
+        && canonical
+        && isCurrentCallableCatalogEntry(entry)
+        && entry.effect === 'read'
+        && manifest.effect === 'read'
+        && entry.schemaDigest === manifest.definitionFingerprint
+        && entry.manifestDigest === capabilityManifestDigest(manifest)
+        && (entry.account ?? manifest.accountId) === manifest.accountId
+        && canonical.invokePortId === manifest.invokePortId
+        && (
+          catalogOperationIdentitiesEqual(manifest.operationId, effectiveName)
+          || catalogOperationIdentitiesEqual(entry.toolName, effectiveName)
+        )
+      );
+    };
+    const candidates = decision.effect === 'unknown'
+      ? []
+      : surface.snapshot.entries.filter(exactEntryMatches);
+    if (candidates.length > 1) return miss('catalog_snapshot_ambiguous');
     // READ-FAST-PATH (2026-08-26 gauntlet, hole 12): before plan activation
     // the frozen host surface is deliberately graph-neutral/empty, which made
     // every read-effect provider call structurally undispatchable — the model
     // could not even LOOK at the target it must plan against. A read whose
     // exact operation this turn PROVED may bind the LIVE proof-provisioned
-    // catalog entry instead: the same attested manifest, canonical identity,
-    // effect and invoke-port checks apply, and the full catalog_manifest
-    // attestation still travels with the call. Frozen-snapshot membership
-    // remains the WRITE bar (decision.effect gates this to reads only).
+    // catalog entry instead. Frozen-snapshot membership remains the WRITE bar.
     const liveProvenReadEntry = candidates.length === 0
-      && decision.effect === 'read'
-      && readDescent
-      ? peekHostCapabilityCatalogFactory()
-          ?.get(`cap:resolved:${readDescent.effectiveName.toLowerCase()}`)
+      ? resolveProvenLiveReadCatalogEntry({
+          capabilityId: readDescent?.capabilityId
+            ?? canonicalResolvedCapabilityId(effectiveName.trim().toLowerCase()),
+          effectiveName: readDescent?.effectiveName ?? effectiveName,
+          accountIdentity: readDescent?.accountIdentity
+            ?? readDescent?.liveReadDiscovery?.accountIdentity,
+        }) ?? undefined
       : undefined;
-    const provenReadCandidate = liveProvenReadEntry && exactEntryMatches(liveProvenReadEntry)
+    const liveReadDiscoveryMatches = liveProvenReadEntry && readDescent?.liveReadDiscovery
+      ? (() => {
+          const manifest = currentCapabilityManifest(liveProvenReadEntry.manifest);
+          const definition = currentLiveReadPlanningDefinitionFromEntry(liveProvenReadEntry);
+          const nomination = readDescent.liveReadDiscovery;
+          return Boolean(
+            manifest
+            && definition
+            && liveProvenReadEntry.manifestDigest === nomination.manifestDigest
+            && capabilityManifestDigest(manifest) === nomination.manifestDigest
+            && manifest.providerKind === nomination.providerKind
+            && manifest.accountId === nomination.accountIdentity
+            && definition.providerInputSchemaDigest === nomination.providerInputSchemaDigest
+            && definition.definitionFingerprint === nomination.definitionFingerprint
+            && definition.providerOperationVersion === nomination.providerOperationVersion
+            && definition.providerOutputSchemaDigest === nomination.providerOutputSchemaDigest
+            && definition.invokePortId === nomination.invokePortId
+          );
+        })()
+      : true;
+    const planningReadMatches = liveProvenReadEntry && readDescent?.planningManifestDigest
+      ? liveProvenReadEntry.manifestDigest === readDescent.planningManifestDigest
+      : true;
+    const provenReadCandidate = liveProvenReadEntry
+      && liveReadDiscoveryMatches
+      && planningReadMatches
+      && liveReadEntryDispatchable(liveProvenReadEntry)
       ? liveProvenReadEntry
       : undefined;
+    const dispatchEffect: HostCallAttestation['effect'] | null = provenReadCandidate
+      ? 'read'
+      : decision.effect === 'unknown'
+        ? null
+        : decision.effect;
+    if (!dispatchEffect) {
+      return miss(`effect_unknown:${effectiveName || name}:${decision.source}`);
+    }
 
     const common = {
       sessionId: identity.sessionId,
@@ -1877,7 +2701,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       logicalToolCallId,
       toolName: contract.toolName,
       argumentDigest: contract.argumentDigest,
-      effect: decision.effect,
+      effect: dispatchEffect,
       engineVersion: root.authority.engineVersion,
       surfaceVersion: root.authority.surfaceVersion,
       authorityDigest: root.authority.authorityDigest,
@@ -1889,15 +2713,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
 
     // Adapter provenance is translated before it reaches this shared kernel.
     // Unknown authority classes are refused at this boundary; they never
-    // inherit the local envelope as a fallback.
-    const authorityBinding = runtimeToolAuthorityBinding(decision);
-    if (authorityBinding === 'unknown') return null;
+    // inherit the local envelope as a fallback. A same-turn proven live read
+    // carries catalog-manifest authority even when the name classifier could
+    // not decide (OPEN-THE-GATES live miss: effect_unknown then catalog miss).
+    const authorityBinding = provenReadCandidate
+      ? 'catalog_manifest' as const
+      : runtimeToolAuthorityBinding(decision);
+    if (authorityBinding === 'unknown') return miss(`authority_binding_unknown:${decision.source}`);
     const catalogEntry = candidates[0] ?? provenReadCandidate;
     if (authorityBinding === 'catalog_manifest' || catalogEntry) {
       const manifest = currentCapabilityManifest(catalogEntry?.manifest);
-      if (!catalogEntry || !manifest) return null;
+      if (!catalogEntry || !manifest) {
+        return miss(
+          `catalog_entry_or_manifest_missing:candidates=${candidates.length}`
+          + `:proven=${readDescent ? readDescent.capabilityId : 'none'}`,
+        );
+      }
       const port = resolveProductionPortsForManifest(manifest);
-      if (!port || manifest.invokePortId !== canonicalCatalogIdentityOf(catalogEntry)?.invokePortId) return null;
+      if (!port || manifest.invokePortId !== canonicalCatalogIdentityOf(catalogEntry)?.invokePortId) {
+        return miss('production_port_or_invoke_identity_mismatch');
+      }
       const manifestDigest = capabilityManifestDigest(manifest);
       const binding = {
         bindingKind: 'catalog_manifest' as const,
@@ -1912,7 +2747,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         manifestId: manifest.manifestId,
         manifestDigest,
       };
-      const bindingDigest = hostSurfaceDigest({ version: 1, ...binding, effect: decision.effect });
+      const bindingDigest = hostSurfaceDigest({ version: 1, ...binding, effect: dispatchEffect });
       const effectiveArgs = effective.args && typeof effective.args === 'object' && !Array.isArray(effective.args)
         ? effective.args as Record<string, unknown>
         : {};
@@ -1937,7 +2772,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       return {
         attestation,
         manifest,
-        effect: decision.effect,
+        effect: dispatchEffect,
         boundary: preserveExternalCarrier ? 'nested_owned' : 'host_owned_external',
         logicalToolName: manifest.operationId,
         logicalArgs: effectiveArgs,
@@ -1987,13 +2822,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
     }
 
-    if (authorityBinding !== 'local_envelope') return null;
+    if (authorityBinding !== 'local_envelope') return miss(`authority_binding:${authorityBinding}`);
     const effectClass = capability[0]!.effectClass;
-    const localEffectFits = decision.effect === 'read'
+    const localEffect: HostCallAttestation['effect'] | null = decision.effect === 'read'
       || decision.effect === 'compute'
       || decision.effect === 'host_only'
-      || (decision.effect === 'local_write' && (effectClass === 'write' || effectClass === 'send'));
-    if (!localEffectFits) return null;
+      || (decision.effect === 'local_write' && (effectClass === 'write' || effectClass === 'send'))
+      ? decision.effect
+      : null;
+    if (!localEffect) return miss(`local_effect_mismatch:${decision.effect}:${effectClass}`);
     const binding = {
       bindingKind: 'local_envelope' as const,
       capabilityId: capability[0]!.name,
@@ -2004,12 +2841,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       manifestId: '',
       manifestDigest: '',
     };
-    const bindingDigest = hostSurfaceDigest({ version: 1, ...binding, effect: decision.effect });
+    const bindingDigest = hostSurfaceDigest({ version: 1, ...binding, effect: localEffect });
     const preserveLocalCarrier = isPlainOrClementineLocalTool(name, 'call_tool')
       || isPlainOrClementineLocalTool(name, 'work_call');
     return {
       attestation: { ...common, ...binding, bindingDigest },
-      effect: decision.effect,
+      effect: localEffect,
       boundary: preserveLocalCarrier ? 'nested_owned' : 'host_owned_local',
       logicalToolName: name,
       logicalArgs: args,
@@ -2065,6 +2902,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           reason: `material_source_continuation_${materialSource.reason}`,
         };
       }
+      if (materialSource.status === 'variant') {
+        return {
+          status: 'refused',
+          reason: 'material_source_variant_unconfirmed',
+        };
+      }
+      // No durable A/Q/B lineage means this is an ordinary exact current read,
+      // not a material-source continuation. Provider purpose vocabulary is
+      // descriptive here and cannot manufacture (or withhold) authority: the
+      // catalog/manifest/account/schema/port proof above remains the complete
+      // dispatch bar. Any malformed, variant, or verified continuation was
+      // already separated above and still traverses the full binding gate.
+      if (materialSource.status === 'not_applicable') {
+        return { status: 'unscoped' };
+      }
       const structuralRole = exactProduction.sourcePurpose.status === 'source_requirement'
         ? exactProduction.sourcePurpose.role
         : undefined;
@@ -2075,43 +2927,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (decisionInspection.status === 'invalid') {
         return { status: 'refused', reason: 'material_source_decision_invalid' };
       }
-      if (materialSource.status === 'not_applicable') {
-        if (!structuralRole) {
-          return exactProduction.sourcePurpose.status === 'unknown'
-            ? { status: 'refused', reason: 'material_source_manifest_purpose_unknown' }
-            : { status: 'unscoped' };
-        }
-        const identityAdmission = evaluateSourceStrategyIdentityAdmission({
-          requirementEffect: 'read',
-          requirementRole: structuralRole,
-          decision: decisionInspection.status === 'ok' ? decisionInspection.decision : null,
-          ...(exactProduction.sourceCapability
-            ? { capability: exactProduction.sourceCapability }
-            : {}),
-          bindingRequired: false,
-        });
-        if (
-          identityAdmission.status !== 'not_applicable'
-          || identityAdmission.reason !== 'no_binding'
-        ) {
-          return {
-            status: 'refused',
-            reason: identityAdmission.status === 'refused'
-              ? `material_source_${identityAdmission.kind}`
-              : 'material_source_ordinary_identity_changed',
-          };
-        }
-        return {
-          status: 'delegated',
-          requirement: { role: structuralRole, effect: 'read', bindingRequired: false },
-        };
-      }
       if (!exactProduction.sourceCapability) {
         return { status: 'refused', reason: 'material_source_physical_identity_missing' };
       }
       if (
         decisionInspection.status !== 'ok'
-        || JSON.stringify(decisionInspection.decision) !== JSON.stringify(materialSource.decision)
+        || !turnPreflightDecisionsEqual(decisionInspection.decision, materialSource.decision)
       ) {
         return { status: 'refused', reason: 'material_source_consuming_decision_mismatch' };
       }
@@ -2129,7 +2950,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       if (
         admission.status !== 'admitted'
-        || JSON.stringify(admission.binding) !== JSON.stringify(materialSource.binding)
+        || !sourceStrategyBindingsEqual(admission.binding, materialSource.binding)
       ) {
         return {
           status: 'refused',
@@ -2210,7 +3031,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // proved (capability_resolution ledger) is never killed at the
         // provenance wall — the effect classification this boundary already
         // computed IS the read bar. Mutations keep the full wall.
-        && !provenTurnReadDescent(name, args)
+        && !provenTurnReadDescent(name, args, tool)
       )
     ) {
       return `Tool '${name}' was refused before dispatch because the selected host engine only admits configured harness-bounded tools. No local or external mutation was attempted.`;
@@ -2245,7 +3066,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
         : '';
-      return `Tool '${name}' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed. No local or external mutation was attempted.${repair}`;
+      const miss = lastExactProductionMiss ? ` Failed check: ${lastExactProductionMiss}.` : '';
+      return `Tool '${name}' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed.${miss} No local or external mutation was attempted.${repair}`;
     }
     // The first live host cut dispatches only a direct, active capability whose
     // exact configured object, callable schema, immutable envelope and current
@@ -2264,6 +3086,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     historyItem: AgentInputItem;
     tool?: FunctionToolLike;
     output: unknown;
+    argumentsJson: string;
+    effect: RuntimeToolEffect;
+    hostRefusal?: string;
+    settlementRequiresReconciliation?: true;
   }> => {
     const executionContext = harnessRunContextStorage.getStore();
     if (executionContext?.hostOwnsToolAccounting) {
@@ -2279,6 +3105,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const tool = toolByName.get(call.name);
     const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
     const parsedArguments = parsedArgs(argumentsJson);
+    let admittedEffect: RuntimeToolEffect = parsedArguments
+      ? classifyRuntimeToolEffect(call.name, parsedArguments).effect
+      : 'unknown';
     const canaryRefusal = readOnlyCanaryRefusal(
       call.name,
       parsedArguments,
@@ -2303,14 +3132,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       : { type: 'allow' as const };
     emit('agent_tool_start', runContext, agent, tool ?? { name: call.name }, details);
     let output: unknown;
+    let hostRefusal: string | undefined;
+    let settlementRequiresReconciliation = false;
     if (canaryRefusal) {
       output = canaryRefusal;
+      hostRefusal = canaryRefusal;
     } else if (!tool || typeof tool.invoke !== 'function') {
       output = `Tool '${call.name}' not found. Use tool_search to retrieve the current schema, then invoke it through the advertised carrier.`;
+      hostRefusal = String(output);
     } else if (!parsedArguments) {
       output = `Tool '${call.name}' received invalid arguments. Supply exactly one JSON object that matches the advertised schema before retrying.`;
+      hostRefusal = String(output);
     } else if (inputGuardrail.type === 'reject') {
       output = inputGuardrail.message;
+      hostRefusal = String(output);
     } else {
       // FunctionTool.invoke already applies that tool's errorFunction. Any
       // error still escaping invoke is fatal authority/control data (kill,
@@ -2358,6 +3193,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           );
           throw new HostCallAuthorityBoundaryError('call_binding_changed_before_body');
         }
+        admittedEffect = exactProduction.effect;
       }
       const ambient = harnessRunContextStorage.getStore();
       const exactSource = ambient
@@ -2500,7 +3336,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                     const confirmedSource = materialGate.requirement.bindingRequired === true
                       && admission.status === 'admitted'
                       && Boolean(materialGate.expectedBinding)
-                      && JSON.stringify(admission.binding) === JSON.stringify(materialGate.expectedBinding);
+                      && sourceStrategyBindingsEqual(admission.binding, materialGate.expectedBinding);
                     if (!ordinarySource && !confirmedSource) {
                       throw new HostCallAuthorityBoundaryError(
                         admission.status === 'refused'
@@ -2519,6 +3355,35 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                   { ...details, signal: callSignal },
                 ),
           });
+          // Nested carriers can return an SDK-laundered error value after the
+          // exact inner settlement has already proved that a mutation is
+          // uncertain. The immutable settlement, never returned provider
+          // prose, owns that effect decision. Carry it to frame pairing so the
+          // model receives the canonical effect_unknown marker and cannot
+          // reason from (or retry after) a misleading ordinary result.
+          settlementRequiresReconciliation =
+            invoked.settlement.outcome.directive.requiresReconciliation === true;
+          if (
+            preserveWorkCallCarrier
+            && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
+            && (invoked.settlement.outcome.kind === 'succeeded'
+              || invoked.settlement.outcome.kind === 'empty_result')
+          ) {
+            // Verification is host-derived runtime work. It gets its own
+            // deterministic logical call and traverses this same kernel after
+            // the mutation has durably settled; the model emits no readback
+            // node or tool call and receives no second dispatch authority.
+            await executeFrozenMutationVerification({
+              sessionId: exactSource.sessionId,
+              sourceUserSeq: exactSource.sourceUserSeq,
+              ownerLogicalToolCallId: call.callId,
+              parentLease: exactSource.parentLease,
+              turn: exactAmbient.turn,
+              deadlineMs,
+              callerSignal: signal,
+              isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
+            });
+          }
           return invoked.value;
         };
         if (
@@ -2565,6 +3430,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       historyItem: functionResultItem(call.callId, call.name, output),
       ...(tool ? { tool } : {}),
       output,
+      argumentsJson: call.argumentsJson,
+      effect: admittedEffect,
+      ...(hostRefusal ? { hostRefusal } : {}),
+      ...(settlementRequiresReconciliation
+        ? { settlementRequiresReconciliation: true as const }
+        : {}),
     };
   };
 
@@ -2724,28 +3595,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     frameSize: number;
     retired?: boolean;
     countsRefusal?: boolean;
+    diagnostic?: string;
   }): AgentInputItem => {
-    const unknown = input.disposition === 'effect_unknown';
-    const retired = input.retired === true;
-    const output: HostToolDispositionOutput = {
-      protocol: HOST_TOOL_DISPOSITION_PROTOCOL,
+    return buildHostToolDispositionResult({
+      callId: input.call.callId,
+      toolName: input.call.name,
       disposition: input.disposition,
       frameDigest: input.frameDigest,
       frameIndex: input.frameIndex,
       frameSize: input.frameSize,
-      ...(input.countsRefusal ? { countsRefusal: true as const } : {}),
-      effect: unknown ? 'may_have_started' : 'none',
-      retry: unknown || retired ? 'do_not_retry' : 'replan',
-      requiresReconciliation: unknown,
-      message: unknown
-        ? 'Execution may have started. Do not retry this call; reconciliation is required.'
-        : retired
-          ? 'This exact call is unavailable for this request. Do not retry it; use another capability or explain the limitation.'
-          : input.disposition === 'not_started'
-            ? 'This call was not started because another call in the same frame could not safely proceed. No effect occurred; replan from the paired results.'
-            : 'This call was refused before execution. No effect occurred; correct the call or choose another capability.',
-    };
-    return functionResultItem(input.call.callId, input.call.name, output);
+      countsRefusal: input.countsRefusal,
+      retired: input.retired,
+      diagnostic: input.diagnostic,
+    });
   };
 
   const executeCallAttempts = async (
@@ -2790,13 +3652,47 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       (attempt): attempt is Extract<HostCallExecutionAttempt<ExecutedHostCall>, { status: 'tool_calls_limit' }> =>
         attempt?.status === 'tool_calls_limit',
     )?.error;
-    const effectUnknown = crossings.some((crossing) => crossing === 'effect_may_have_started');
+    const settlementReconciliation = attempts.map((attempt) => (
+      attempt?.status === 'returned'
+      && attempt.value.settlementRequiresReconciliation === true
+    ));
+    const effectUnknown = crossings.some((crossing) => crossing === 'effect_may_have_started')
+      || settlementReconciliation.some(Boolean);
+    const hostRefusals = attempts.map((attempt) => (
+      attempt?.status === 'returned' && attempt.value.hostRefusal
+        ? attempt.value.hostRefusal
+        : null
+    ));
     const zeroCrossingRefusal = !effectUnknown
-      && crossings.some((crossing) => crossing === 'zero_crossing');
+      && (crossings.some((crossing) => crossing === 'zero_crossing')
+        || hostRefusals.some((refusal) => refusal !== null));
     let refusalMarkerWritten = false;
     const returned: ExecutedHostCall[] = [];
     const resultItems = calls.map((call, index) => {
       const attempt = attempts[index];
+      const hostRefusal = hostRefusals[index];
+      if (settlementReconciliation[index]) {
+        return dispositionResult({
+          call,
+          disposition: 'effect_unknown',
+          frameDigest,
+          frameIndex: index,
+          frameSize: calls.length,
+        });
+      }
+      if (hostRefusal) {
+        const countsRefusal = !effectUnknown && !refusalMarkerWritten;
+        refusalMarkerWritten = true;
+        return dispositionResult({
+          call,
+          disposition: 'refused_pre_dispatch',
+          frameDigest,
+          frameIndex: index,
+          frameSize: calls.length,
+          countsRefusal,
+          diagnostic: hostRefusal,
+        });
+      }
       if (attempt?.status === 'returned') {
         returned.push(attempt.value);
         return attempt.value.historyItem;
@@ -2844,8 +3740,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const pairLocallyRefusedFrame = (
     calls: readonly CanonicalHostCall[],
     retired = false,
+    diagnosticsByCallId?: ReadonlyMap<string, string>,
+    countingCallIds?: ReadonlySet<string>,
   ): PairedCallAttempts => {
     const frameDigest = semanticFrameDigest(calls);
+    const explicitCountingIndex = countingCallIds
+      ? calls.findIndex((call) => countingCallIds.has(call.callId))
+      : 0;
+    const countingIndex = explicitCountingIndex < 0 && (countingCallIds?.size ?? 0) > 0
+      ? 0
+      : explicitCountingIndex;
     return {
       frameDigest,
       zeroCrossingRefusal: true,
@@ -2858,18 +3762,290 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         frameIndex: index,
         frameSize: calls.length,
         retired,
-        countsRefusal: index === 0,
+        // A typed repair_arguments preparation result is instruction for a
+        // current capability, not evidence that the capability is absent.
+        // The caller disables this marker for that exact recovery class.
+        countsRefusal: index === countingIndex,
+        ...(diagnosticsByCallId?.get(call.callId)
+          ? { diagnostic: diagnosticsByCallId.get(call.callId)! }
+          : {}),
       })),
     };
   };
 
+  /**
+   * Every accepted call-bearing response is admitted before classification,
+   * consent, preparation, or execution.  This is the common lifecycle parent
+   * for local tools, host controls, external carriers, workflows, and
+   * Spaces; result kind never decides whether the frame gets a checkpoint.
+   */
+  type OpenAcceptedToolFrame = {
+    ref?: AcceptedModelBatchRef;
+  };
+
+  type AcceptedFrameAdmission =
+    | { status: 'ready'; frame: OpenAcceptedToolFrame }
+    | { status: 'held'; outcome: RunOutcome };
+
+  const preAdmitAcceptedToolFrame = (input: {
+    frameHistory: readonly AgentInputItem[];
+    responseId?: string;
+  }): AcceptedFrameAdmission => {
+    if (!hostProduction) return { status: 'ready', frame: {} };
+    const identity = exactHostIdentity();
+    const request = {
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      preHistory: history,
+      frameHistory: input.frameHistory,
+      ...(lastResponseId ? { previousResponseId: lastResponseId } : {}),
+      ...(input.responseId ? { providerResponseId: input.responseId } : {}),
+    };
+    let admitted = admitAcceptedModelBatch(request);
+    if (admitted.status === 'unavailable') {
+      // The retry is exact and idempotent.  No classification or body edge has
+      // happened, so a transient local transaction failure cannot create a
+      // duplicate effect.
+      admitted = admitAcceptedModelBatch(request);
+    }
+    if (admitted.status === 'admitted' || admitted.status === 'existing') {
+      return { status: 'ready', frame: { ref: admitted.admission } };
+    }
+    hostTurnLogger.error({
+      status: admitted.status,
+      reason: 'reason' in admitted ? admitted.reason : 'accepted model batch has no reference',
+    }, 'accepted model batch pre-admission failed before tool execution');
+    return {
+      status: 'held',
+      outcome: recoveryOutcome({
+        phase: 'admit',
+        baseHistory: [...history],
+        frameHistory: input.frameHistory,
+        responseId: input.responseId,
+        reason: 'host_model_batch_admission_unavailable',
+      }),
+    };
+  };
+
+  type HostResultCommit =
+    | { status: 'committed' }
+    | {
+        status: 'reconciliation_required';
+        reason: 'host_result_checkpoint_reconciliation_required';
+      }
+    | {
+        status: 'safe_stop';
+        reason:
+          | 'host_result_receipt_commit_failed'
+          | 'host_result_checkpoint_unavailable'
+          | 'host_result_checkpoint_mismatch';
+      };
+
+  const commitAcceptedToolFrameResults = (input: {
+    frame: OpenAcceptedToolFrame;
+    resultItems: readonly AgentInputItem[];
+    expectedHistory: readonly AgentInputItem[];
+  }): HostResultCommit => {
+    if (!hostProduction || !input.frame.ref) return { status: 'committed' };
+    const ref = input.frame.ref;
+    const hostReceiptItems: AgentInputItem[] = [];
+    for (const item of input.resultItems) {
+      let projection = recordLogicalModelResultProjectionReceipt({
+        admission: ref,
+        resultItem: item,
+      });
+      if (projection.status === 'unavailable') {
+        // Exact idempotent metadata insert/readback only.  Result bytes and
+        // tool bodies already exist outside this retry and cannot re-enter.
+        projection = recordLogicalModelResultProjectionReceipt({
+          admission: ref,
+          resultItem: item,
+        });
+      }
+      if (projection.status === 'recorded' || projection.status === 'existing') {
+        continue;
+      }
+      if (projection.status === 'not_applicable') {
+        // Only a canonical host-authored no-effect result with no logical or
+        // observer identity may use the older host receipt lane.  An ordinary
+        // result missing its settlement is unavailable evidence, never an
+        // ambient host result.
+        if (!describeCanonicalHostModelResult(item)) {
+          hostTurnLogger.error({ status: projection.status, reason: projection.reason },
+            'non-logical model result is not an exact host projection');
+          return { status: 'safe_stop', reason: 'host_result_receipt_commit_failed' };
+        }
+        hostReceiptItems.push(item);
+        continue;
+      }
+      hostTurnLogger.error({
+        status: projection.status,
+        reason: 'reason' in projection
+          ? projection.reason
+          : 'logical result projection receipt did not settle',
+      },
+        'logical model result projection receipt is unavailable before checkpoint');
+      return { status: 'safe_stop', reason: 'host_result_receipt_commit_failed' };
+    }
+    if (hostReceiptItems.length > 0) {
+      let receiptError: unknown;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          recordHostModelResultReceipts({ admission: ref, resultItems: hostReceiptItems });
+          receiptError = undefined;
+          break;
+        } catch (error) {
+          receiptError = error;
+        }
+      }
+      if (receiptError !== undefined) {
+        hostTurnLogger.error({
+          err: receiptError instanceof Error
+            ? { message: receiptError.message, stack: receiptError.stack }
+            : String(receiptError),
+        }, 'host model result receipt commit failed after exact retry');
+        return { status: 'safe_stop', reason: 'host_result_receipt_commit_failed' };
+      }
+    }
+
+    let finalized = finalizeAcceptedModelBatch(ref, { committedResultItems: input.resultItems });
+    if (finalized.status !== 'committed' && finalized.status !== 'existing') {
+      // A second exact finalization is a readback-safe retry only.  Tool bodies
+      // are outside this block and can never be re-entered from bookkeeping.
+      finalized = finalizeAcceptedModelBatch(ref, { committedResultItems: input.resultItems });
+    }
+    if (finalized.status !== 'committed' && finalized.status !== 'existing') {
+      // Read back only.  Generic restart recovery is allowed to synthesize a
+      // missing result from durable evidence; this live commit owns exact
+      // already-built result bytes and must never replace them with a different
+      // immutable checkpoint after a transient insert/readback error.
+      const reopened = reopenAcceptedModelBatch(ref);
+      if (reopened.status === 'checkpointed') {
+        finalized = { status: 'existing', checkpoint: reopened.checkpoint };
+      }
+    }
+    if (finalized.status !== 'committed' && finalized.status !== 'existing') {
+      hostTurnLogger.error({
+        status: finalized.status,
+        reason: 'reason' in finalized
+          ? finalized.reason
+          : 'accepted model batch has no checkpoint',
+      }, 'accepted model batch finalization failed after exact retry/readback');
+      return { status: 'safe_stop', reason: 'host_result_checkpoint_unavailable' };
+    }
+    if (
+      finalized.checkpoint.historyDigest
+      !== acceptedModelBatchHistoryDigest(input.expectedHistory)
+    ) {
+      return {
+        status: 'safe_stop',
+        reason: 'host_result_checkpoint_mismatch',
+      };
+    }
+    if (finalized.checkpoint.disposition !== 'ready') {
+      return {
+        status: 'reconciliation_required',
+        reason: 'host_result_checkpoint_reconciliation_required',
+      };
+    }
+    return { status: 'committed' };
+  };
+
+  let checkpointRecoveryFrameInProgress = false;
   const commitAdmittedToolFrame = (input: {
+    acceptedFrame: OpenAcceptedToolFrame;
     frameHistory: readonly AgentInputItem[];
     resultItems?: readonly AgentInputItem[];
     responseId?: string;
-  }): void => {
+  }): RunOutcome | undefined => {
+    if (input.resultItems && input.resultItems.length > 0) {
+      const committed = commitAcceptedToolFrameResults({
+        frame: input.acceptedFrame,
+        resultItems: input.resultItems,
+        expectedHistory: [...history, ...input.frameHistory, ...input.resultItems],
+      });
+      if (committed.status === 'reconciliation_required') {
+        // The checkpoint already sealed these exact balanced bytes.  Adopt
+        // them into the public outcome before blocking, but never dispatch a
+        // second model step for an uncertain effect.
+        history.push(...input.frameHistory, ...input.resultItems);
+        if (input.responseId !== undefined) lastResponseId = input.responseId;
+        return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+      }
+      if (committed.status === 'safe_stop') {
+        return recoveryOutcome({
+          phase: 'finalize',
+          baseHistory: [...history],
+          frameHistory: input.frameHistory,
+          resultItems: input.resultItems,
+          responseId: input.responseId,
+          acceptedModelBatchRef: input.acceptedFrame.ref,
+          reason: committed.reason,
+        });
+      }
+    }
     history.push(...input.frameHistory, ...(input.resultItems ?? []));
+    latestAcceptedModelBatchRef = input.acceptedFrame.ref;
     if (input.responseId !== undefined) lastResponseId = input.responseId;
+    if (checkpointRecoveryFrameInProgress && (input.resultItems?.length ?? 0) > 0) {
+      return recoveryContinuationOutcome(
+        input.acceptedFrame.ref,
+        'accepted_frame_checkpoint_recovered',
+      );
+    }
+    return undefined;
+  };
+
+  const commitResultsForResumedFrame = (
+    acceptedFrame: OpenAcceptedToolFrame,
+    resultItems: readonly AgentInputItem[],
+  ): RunOutcome | undefined => {
+    const committed = commitAcceptedToolFrameResults({
+      frame: acceptedFrame,
+      resultItems,
+      expectedHistory: [...history, ...resultItems],
+    });
+    if (committed.status === 'reconciliation_required') {
+      // The paused frame is already in history; append only its exact sealed
+      // results before returning the reconciliation-owned terminal.
+      history.push(...resultItems);
+      return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+    }
+    if (committed.status === 'safe_stop') {
+      const resultCallIds = new Set(resultItems.flatMap((item) => {
+        const row = item as unknown as { type?: unknown; callId?: unknown };
+        return row.type === 'function_call_result' && typeof row.callId === 'string'
+          ? [row.callId]
+          : [];
+      }));
+      const firstCallIndex = history.findIndex((item) => {
+        const row = item as unknown as { type?: unknown; callId?: unknown };
+        return row.type === 'function_call'
+          && typeof row.callId === 'string'
+          && resultCallIds.has(row.callId);
+      });
+      if (firstCallIndex < 0) {
+        throw new HostCallAuthorityBoundaryError('resumed_host_result_call_lineage_missing');
+      }
+      let frameStart = firstCallIndex;
+      while (frameStart > 0) {
+        const prior = history[frameStart - 1] as unknown as { type?: unknown };
+        if (prior.type !== 'reasoning') break;
+        frameStart -= 1;
+      }
+      return recoveryOutcome({
+        phase: 'finalize',
+        baseHistory: history.slice(0, frameStart),
+        frameHistory: history.slice(frameStart),
+        resultItems,
+        responseId: resumedResponseId,
+        acceptedModelBatchRef: acceptedFrame.ref,
+        reason: committed.reason,
+      });
+    }
+    history.push(...resultItems);
+    latestAcceptedModelBatchRef = acceptedFrame.ref;
+    return undefined;
   };
 
   const recordZeroCrossingRefusal = (frameDigest: string): number => {
@@ -2889,6 +4065,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         tool: result.tool,
         output: result.output,
         runItem: { rawItem: result.historyItem },
+        ...('argumentsJson' in result && typeof result.argumentsJson === 'string'
+          ? { argumentsJson: result.argumentsJson }
+          : {}),
       }));
     if (callableResults.length === 0) return undefined;
     const behavior = (agent as { toolUseBehavior?: unknown }).toolUseBehavior ?? 'run_llm_again';
@@ -2921,6 +4100,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     throw new Error('Invalid agent toolUseBehavior.');
   };
 
+  const terminalBehaviorEligibleMixedResults = (
+    results: readonly ExecutedHostCall[],
+  ): boolean => results.length > 0 && results.every(
+    (result) => result.effect === 'read' || result.effect === 'compute',
+  );
+
   const executeCalls = async (
     calls: readonly CanonicalHostCall[],
   ): Promise<PairedCallAttempts> => {
@@ -2936,6 +4121,112 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     HostModelFrameDisposition,
     { kind: 'fresh_plan_then_root_read' }
   >;
+
+  type HostOwnedSingleActionFrame = Extract<
+    HostModelFrameDisposition,
+    { kind: 'host_owned_single_action_plan' }
+  >;
+
+  const activatedSingleActionRequirement = (
+    frame: HostOwnedSingleActionFrame,
+  ): boolean => {
+    try {
+      const identity = exactHostIdentity();
+      if (
+        !actionExpectedWorkRequired(identity)
+        || !settledFreshPlanControl(identity)
+      ) return false;
+      const loaded = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
+      if (loaded.status !== 'ok' || loaded.contract.operations.length !== 1) return false;
+      const operation = loaded.contract.operations[0]!;
+      return operation.id === frame.requirementId
+        && operation.effect === frame.effect
+        && operation.dependsOn.length === 0
+        && operation.dataFrom.length === 0
+        && operation.cardinality.kind === 'once';
+    } catch {
+      return false;
+    }
+  };
+
+  /** Compile the sole exact Auto candidate by invoking the configured
+   * plan_task object as an internal control. The synthetic result never enters
+   * model history; its ordinary durable logical settlement/preamble/activation
+   * receipts are the only facts that may phase the host surface. */
+  const activateHostOwnedSingleActionPlan = async (
+    frame: HostOwnedSingleActionFrame,
+  ): Promise<boolean> => {
+    const workTool = toolByName.get(frame.call.name);
+    const outerArgs = frame.call.argumentsValue;
+    if (!workTool || !outerArgs || !freshPlanControlConfigured()) return false;
+    const identity = exactHostIdentity();
+    const resolved = await resolveHostSingleActionPlanCapability(workTool, {
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      requirementId: frame.requirementId,
+      operationId: frame.call.effectiveName ?? '',
+      effect: frame.effect,
+      outerArgs,
+    });
+    if (!resolved) return false;
+    const planInput = hostSingleActionPlanTaskInput(resolved);
+    if (!planInput) return false;
+    const planTool = toolByName.get('plan_task');
+    if (!planTool) return false;
+    const logicalToolCallId = `host-auto-plan-${createHash('sha256')
+      .update(JSON.stringify({
+        version: 1,
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        capabilityRef: resolved.capabilityRef,
+        operationId: resolved.operationId,
+        effect: resolved.effect,
+      }), 'utf8')
+      .digest('hex')}`;
+    const planCall: CanonicalHostCall = {
+      callId: logicalToolCallId,
+      name: 'plan_task',
+      argumentsJson: JSON.stringify(planInput),
+    };
+    let planReady = false;
+    try {
+      const exactPlan = exactProductionHostCall(
+        planCall.name,
+        planInput,
+        planCall.argumentsJson,
+        planTool,
+        planCall.callId,
+        runContext,
+        {
+          toolCall: {
+            type: 'function_call',
+            callId: planCall.callId,
+            name: planCall.name,
+            arguments: planCall.argumentsJson,
+          },
+        },
+      );
+      planReady = Boolean(
+        exactPlan
+        && exactPlan.effect === 'host_only'
+        && exactPlan.boundary === 'host_owned_local',
+      );
+      if (planReady && typeof planTool.needsApproval === 'function') {
+        planReady = await planTool.needsApproval(
+          runContext,
+          planInput,
+          planCall.callId,
+        ) !== true;
+      }
+    } catch {
+      planReady = false;
+    }
+    if (!planReady) return false;
+    const attempt = await executeCallAttempt(planCall);
+    return attempt.status === 'returned'
+      && !attempt.value.hostRefusal
+      && activatedSingleActionRequirement(frame);
+  };
 
   const activatedRootRequirement = (
     frame: FreshPlanReadFrame,
@@ -3106,11 +4397,310 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     return pairCallAttempts(calls, [planAttempt, siblingAttempt]);
   };
 
+  let recoveredToolFrame = resumedRecoveryState?.phase === 'admit'
+    ? {
+        history: resumedRecoveryState.frameHistory,
+        calls: resumedRecoveryState.frameHistory.flatMap((item) => {
+          const row = item as unknown as {
+            type?: unknown;
+            callId?: unknown;
+            name?: unknown;
+            arguments?: unknown;
+          };
+          return row.type === 'function_call'
+            && typeof row.callId === 'string'
+            && typeof row.name === 'string'
+            && typeof row.arguments === 'string'
+            ? [{
+                callId: row.callId,
+                name: row.name,
+                argumentsJson: row.arguments,
+              }]
+            : [];
+        }),
+        responseId: resumedRecoveryState.responseId,
+      }
+    : undefined;
+  let recoveredAcceptedFrame: OpenAcceptedToolFrame | undefined;
+  if (recoveredToolFrame) {
+    const preAdmission = preAdmitAcceptedToolFrame({
+      frameHistory: recoveredToolFrame.history,
+      responseId: recoveredToolFrame.responseId,
+    });
+    if (preAdmission.status === 'held') return preAdmission.outcome;
+    recoveredAcceptedFrame = preAdmission.frame;
+  }
+
+  if (resumedRecoveryState?.phase === 'finalize') {
+    const ref = resumedRecoveryState.acceptedModelBatchRef!;
+    const openHistory = [...history, ...resumedRecoveryState.frameHistory];
+    const expectedHistory = [...openHistory, ...resumedRecoveryState.resultItems];
+    let reopened = reopenAcceptedModelBatch(ref, { openHistory });
+    if (reopened.status === 'unavailable') {
+      reopened = reopenAcceptedModelBatch(ref, { openHistory });
+    }
+    if (reopened.status === 'checkpointed') {
+      if (reopened.checkpoint.disposition === 'reconciliation_required') {
+        // The reconciliation checkpoint already owns one exact balanced
+        // call/result transcript.  Recovery must expose those sealed bytes to
+        // the caller before returning the block; otherwise a restart appears
+        // to lose the result even though the durable checkpoint retained it.
+        history.splice(0, history.length, ...reopened.checkpoint.history);
+        lastResponseId = reopened.checkpoint.lastResponseId ?? lastResponseId;
+        return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+      }
+      if (
+        reopened.checkpoint.historyDigest
+        !== acceptedModelBatchHistoryDigest(expectedHistory)
+      ) {
+        return recoveryOutcome({
+          phase: 'finalize',
+          baseHistory: [...history],
+          frameHistory: resumedRecoveryState.frameHistory,
+          resultItems: resumedRecoveryState.resultItems,
+          responseId: resumedRecoveryState.responseId,
+          acceptedModelBatchRef: ref,
+          stepIndexOverride: resumedRecoveryState.stepIndex,
+          reason: 'host_result_checkpoint_mismatch',
+        });
+      }
+      history.splice(0, history.length, ...reopened.checkpoint.history);
+      lastResponseId = reopened.checkpoint.lastResponseId ?? lastResponseId;
+    } else if (reopened.status === 'open') {
+      const committed = commitAcceptedToolFrameResults({
+        frame: { ref },
+        resultItems: resumedRecoveryState.resultItems,
+        expectedHistory,
+      });
+      if (committed.status === 'reconciliation_required') {
+        history.splice(0, history.length, ...expectedHistory);
+        if (resumedRecoveryState.responseId !== undefined) {
+          lastResponseId = resumedRecoveryState.responseId;
+        }
+        return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+      }
+      if (committed.status === 'safe_stop') {
+        return recoveryOutcome({
+          phase: 'finalize',
+          baseHistory: [...history],
+          frameHistory: resumedRecoveryState.frameHistory,
+          resultItems: resumedRecoveryState.resultItems,
+          responseId: resumedRecoveryState.responseId,
+          acceptedModelBatchRef: ref,
+          stepIndexOverride: resumedRecoveryState.stepIndex,
+          reason: committed.reason,
+        });
+      }
+      history.push(...resumedRecoveryState.frameHistory, ...resumedRecoveryState.resultItems);
+      if (resumedRecoveryState.responseId !== undefined) {
+        lastResponseId = resumedRecoveryState.responseId;
+      }
+    } else {
+      return recoveryOutcome({
+        phase: 'finalize',
+        baseHistory: [...history],
+        frameHistory: resumedRecoveryState.frameHistory,
+        resultItems: resumedRecoveryState.resultItems,
+        responseId: resumedRecoveryState.responseId,
+        acceptedModelBatchRef: ref,
+        stepIndexOverride: resumedRecoveryState.stepIndex,
+        reason: 'reason' in reopened ? reopened.reason : 'accepted batch reopen unavailable',
+      });
+    }
+    return recoveryContinuationOutcome(ref, 'accepted_result_checkpoint_recovered');
+  }
+
   // Resume: settle the user's decisions FIRST — the approved tool executes
   // exactly once, a rejection becomes a visible tool result, and only then
   // may the model take its next step. There is no replay path here, so an
   // approved external write can never fire twice from this runner.
+  let resumedAcceptedFrame: OpenAcceptedToolFrame = {
+    ...(resumedAcceptedModelBatchRef ? { ref: resumedAcceptedModelBatchRef } : {}),
+  };
+  let resumedAdmissionCallIds: readonly string[] | undefined;
+  let resumedFrameArgumentsEdited = false;
+  if (hostProduction && pendingFromResume.length > 0) {
+    if (resumedAcceptedFrame.ref) {
+      let reopened = reopenAcceptedModelBatch(resumedAcceptedFrame.ref, { openHistory: history });
+      if (reopened.status === 'unavailable') {
+        reopened = reopenAcceptedModelBatch(resumedAcceptedFrame.ref, { openHistory: history });
+      }
+      if (reopened.status === 'checkpointed') {
+        if (reopened.checkpoint.disposition === 'reconciliation_required') {
+          history.splice(0, history.length, ...reopened.checkpoint.history);
+          lastResponseId = reopened.checkpoint.lastResponseId ?? lastResponseId;
+          return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+        }
+        history.splice(0, history.length, ...reopened.checkpoint.history);
+        lastResponseId = reopened.checkpoint.lastResponseId ?? lastResponseId;
+        pendingFromResume = [];
+      } else if (reopened.status !== 'open') {
+        hostTurnLogger.error({
+          status: reopened.status,
+          reason: reopened.reason,
+        }, 'paused accepted model batch could not be reopened before approval resume');
+        return approvalRecoveryOutcome(
+          'host_result_checkpoint_unavailable',
+          resumedAcceptedFrame.ref,
+        );
+      } else {
+        resumedAdmissionCallIds = reopened.admission.callIds;
+      }
+    } else {
+      // V1–V4 compatibility: those blobs predate the out-of-band batch ref.
+      // Reconstruct the exact call-bearing tail and admit it now, still before
+      // approval revalidation, preparation, or body execution.
+      const pendingIds = new Set(pendingFromResume.map((pending) => pending.callId));
+      const firstCallIndex = history.findIndex((item) => {
+        const row = item as unknown as { type?: unknown; callId?: unknown };
+        return row.type === 'function_call'
+          && typeof row.callId === 'string'
+          && pendingIds.has(row.callId);
+      });
+      if (firstCallIndex < 0) {
+        throw new HostCallAuthorityBoundaryError('resumed_host_result_call_lineage_missing');
+      }
+      let frameStart = firstCallIndex;
+      while (frameStart > 0) {
+        const prior = history[frameStart - 1] as unknown as { type?: unknown };
+        if (prior.type !== 'reasoning') break;
+        frameStart -= 1;
+      }
+      const identity = exactHostIdentity();
+      const request = {
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        preHistory: history.slice(0, frameStart),
+        frameHistory: history.slice(frameStart),
+        ...(lastResponseId ? { providerResponseId: lastResponseId } : {}),
+      };
+      let admitted = admitAcceptedModelBatch(request);
+      if (admitted.status === 'unavailable') admitted = admitAcceptedModelBatch(request);
+      if (admitted.status !== 'admitted' && admitted.status !== 'existing') {
+        hostTurnLogger.error({
+          status: admitted.status,
+          reason: 'reason' in admitted ? admitted.reason : 'accepted model batch has no reference',
+        },
+          'legacy paused frame could not be pre-admitted before approval resume');
+        return approvalRecoveryOutcome('host_model_batch_admission_unavailable');
+      }
+      resumedAcceptedFrame = { ref: admitted.admission };
+      resumedAdmissionCallIds = admitted.admission.callIds;
+    }
+
+    if (pendingFromResume.length > 0) {
+      const callIds = resumedAdmissionCallIds ?? [];
+      const admittedCalls = callIds.map((callId) => history.filter((item) => {
+        const row = item as unknown as { type?: unknown; callId?: unknown };
+        return row.type === 'function_call' && row.callId === callId;
+      }));
+      if (
+        callIds.length !== pendingFromResume.length
+        || admittedCalls.some((matches) => matches.length !== 1)
+      ) {
+        return approvalRecoveryOutcome(
+          'host_result_checkpoint_mismatch',
+          resumedAcceptedFrame.ref,
+        );
+      }
+      for (let index = 0; index < pendingFromResume.length; index += 1) {
+        const pending = pendingFromResume[index]!;
+        const admitted = admittedCalls[index]![0] as unknown as {
+          callId?: unknown;
+          name?: unknown;
+          arguments?: unknown;
+        };
+        if (
+          pending.callId !== callIds[index]
+          || pending.rawItem.callId !== admitted.callId
+          || pending.name !== admitted.name
+          || pending.rawItem.name !== admitted.name
+        ) {
+          return approvalRecoveryOutcome(
+            'host_result_checkpoint_mismatch',
+            resumedAcceptedFrame.ref,
+          );
+        }
+        if (pending.rawItem.arguments !== admitted.arguments) {
+          // An approval edit is input for a NEW model frame, not authority to
+          // execute different bytes under the old accepted batch.  Pair the
+          // old frame as no-effect below and let the model reissue the edit.
+          resumedFrameArgumentsEdited = true;
+          pendingHostModelDirective = [
+            'APPROVAL EDIT — the user changed the arguments after the prior model frame was admitted.',
+            `Issue one fresh ${pending.name} call with these exact approved argument bytes: ${pending.rawItem.arguments}`,
+            'Do not reuse the prior call id.',
+          ].join(' ');
+          pending.rawItem.arguments = String(admitted.arguments);
+        }
+      }
+    }
+  }
   let resumeSurfaceFallback = false;
+  const settlePendingCallBeforeDispatch = (
+    pending: PendingHostCall,
+    reason: string,
+  ): boolean => {
+    try {
+      const identity = exactHostIdentity();
+      const acceptedTaskId = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
+      const row = openEventLog().prepare(`
+        SELECT accepted_task_id, tool_name, argument_digest, state
+          FROM logical_tool_calls
+         WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+      `).get(identity.sessionId, identity.sourceUserSeq, pending.callId) as {
+        accepted_task_id: string;
+        tool_name: string;
+        argument_digest: string;
+        state: 'open' | 'settled';
+      } | undefined;
+      // A call refused before the common logical admission wall is owned by
+      // the host-result receipt lane. There is no durable identity to settle.
+      if (!row) return true;
+      if (row.accepted_task_id !== acceptedTaskId) return false;
+      if (row.state === 'settled') return true;
+      if (row.state !== 'open') return false;
+      const args = parsedArgs(pending.rawItem.arguments);
+      if (!args) return false;
+      // Reconstruct only the contract already present in the accepted outer
+      // bytes. This handles direct calls and trusted work_call/provider-gateway
+      // carriers without consulting a refreshed tool surface or inventing new
+      // provider arguments after an approval pause.
+      const recovery = durableLogicalCallRecoveryMaterial(
+        acceptedTaskId,
+        pending.name,
+        args,
+      );
+      if (
+        !recovery
+        || recovery.toolName !== row.tool_name
+        || recovery.argumentDigest !== row.argument_digest
+      ) return false;
+      const work = loadExpectedWorkCallBindingState({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        logicalToolCallId: pending.callId,
+      });
+      const effect = work.status === 'ok'
+        ? work.binding.effect
+        : classifyRuntimeToolEffect(recovery.toolName, recovery.args).effect;
+      settleAdmittedLogicalCallPreDispatchRefusal({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        logicalToolCallId: pending.callId,
+        toolName: recovery.toolName,
+        args: recovery.args,
+        lane: 'agents_runner',
+        mutating: effect === 'local_write'
+          || effect === 'external_write'
+          || effect === 'admin',
+        reason,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
   if (resumedToolSurfaceUnavailable) {
     const calls = pendingFromResume.map((pending): CanonicalHostCall => ({
       callId: pending.callId,
@@ -3118,8 +4708,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       argumentsJson: pending.rawItem.arguments,
     }));
     if (calls.length > 0) {
+      const settled = pendingFromResume.every((pending) => (
+        settlePendingCallBeforeDispatch(pending, 'approved_tool_surface_unavailable_before_dispatch')
+      ));
+      if (!settled) {
+        return approvalRecoveryOutcome(
+          'resumed_pre_dispatch_settlement_unavailable',
+          resumedAcceptedFrame.ref,
+        );
+      }
       const paired = pairLocallyRefusedFrame(calls);
-      history.push(...paired.resultItems);
+      const resultCommitBlock = commitResultsForResumedFrame(
+        resumedAcceptedFrame,
+        paired.resultItems,
+      );
+      if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
     }
     pendingFromResume = [];
@@ -3152,6 +4755,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         pendingFromResume,
         lastResponseId,
         hostTurnEngine ?? 'host_v1_read_only',
+        currentNoProgressCheckpoint(),
+        resumedAcceptedFrame.ref,
       ).toString(),
     } satisfies RunOutcome;
   }
@@ -3163,7 +4768,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }));
 
     const preparedMutations: Array<{ pending: PendingHostCall; preparation: object }> = [];
-    let resumeFrameRepair = false;
+    let resumeFrameRepair = resumedFrameArgumentsEdited;
     let resumeFrameRejected = pendingFromResume.some((pending) => pending.decision === 'rejected');
 
     // Every mutation in a paused frame is re-materialized under the original
@@ -3185,6 +4790,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const effect = args ? classifyRuntimeToolEffect(pending.name, args).effect : 'unknown';
       const mutation = effect === 'local_write' || effect === 'external_write' || effect === 'admin';
       if (!mutation) continue;
+      // Legacy/non-production HostInterruptState remains a pure SDK resume:
+      // it has no accepted source or durable logical row to re-materialize.
+      // A rejection is still paired visibly below and never executes a body.
+      if (!hostProduction) continue;
       if (!tool || !args) {
         resumeFrameRepair = true;
         break;
@@ -3311,38 +4920,52 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
 
     if (resumeFrameRepair || resumeFrameRejected) {
-      const released = preparedMutations.every(({ preparation }) => (
+      const released = !hostProduction || (preparedMutations.every(({ preparation }) => (
         releasePreparedHostWorkCallForRepair(
           preparation,
           resumeFrameRejected
             ? 'user_rejected_before_dispatch'
             : 'approval_scope_changed_before_dispatch',
         )
-      ));
+      )) && pendingFromResume.every((pending) => (
+        settlePendingCallBeforeDispatch(
+          pending,
+          resumeFrameRejected
+            ? 'user_rejected_before_dispatch'
+            : 'approval_scope_changed_before_dispatch',
+        )
+      )));
       for (const pending of pendingFromResume) nestedCallAdmissions.delete(pending.callId);
       if (!released) {
-        throw new HostCallAuthorityBoundaryError('resumed_prepared_frame_release_failed');
+        return approvalRecoveryOutcome(
+          'resumed_prepared_frame_release_failed',
+          resumedAcceptedFrame.ref,
+        );
       }
       if (resumeFrameRejected && !resumeFrameRepair) {
         const frameDigest = semanticFrameDigest(calls);
-        history.push(...pendingFromResume.map((pending, index) => (
-          pending.decision === 'rejected'
-            ? functionResultItem(
-                pending.callId,
-                pending.name,
-                'The user rejected this action. Do not retry it; continue without it or explain what changes.',
-              )
-            : dispositionResult({
-                call: calls[index]!,
-                disposition: 'not_started',
-                frameDigest,
-                frameIndex: index,
-                frameSize: calls.length,
-              })
-        )));
+        const resultCommitBlock = commitResultsForResumedFrame(
+          resumedAcceptedFrame,
+          pendingFromResume.map((pending, index) => (
+            pending.decision === 'rejected'
+              ? buildUserRejectedHostResult(pending.callId, pending.name)
+              : dispositionResult({
+                  call: calls[index]!,
+                  disposition: 'not_started',
+                  frameDigest,
+                  frameIndex: index,
+                  frameSize: calls.length,
+                })
+          )),
+        );
+        if (resultCommitBlock) return resultCommitBlock;
       } else {
         const paired = pairLocallyRefusedFrame(calls);
-        history.push(...paired.resultItems);
+        const resultCommitBlock = commitResultsForResumedFrame(
+          resumedAcceptedFrame,
+          paired.resultItems,
+        );
+        if (resultCommitBlock) return resultCommitBlock;
         recordZeroCrossingRefusal(paired.frameDigest);
       }
       pendingFromResume = [];
@@ -3353,27 +4976,79 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     } else {
       const approvedAttempts = await executeCallAttempts(calls);
       const paired = pairCallAttempts(calls, approvedAttempts);
-      history.push(...paired.resultItems);
+      const resultCommitBlock = commitResultsForResumedFrame(
+        resumedAcceptedFrame,
+        paired.resultItems,
+      );
+      if (resultCommitBlock) return resultCommitBlock;
       if (paired.effectUnknown) {
         return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
       }
       if (paired.toolCallsLimit) propagateToolCallsLimit(paired.toolCallsLimit);
       if (paired.zeroCrossingRefusal) recordZeroCrossingRefusal(paired.frameDigest);
       const finalOutput = !paired.zeroCrossingRefusal
+        || terminalBehaviorEligibleMixedResults(paired.returned)
         ? await finalOutputFromToolBehavior(paired.returned)
         : undefined;
       if (finalOutput !== undefined) return await completedOutcome(finalOutput);
     }
   }
 
-  for (let stepIndex = 0; ; stepIndex += 1) {
-    if (stepIndex >= maxTurns) {
+  if (hostProduction && !resumedHostState && !resumedRecoveryState) {
+    try {
+      const identity = exactHostIdentity();
+      const accepted = listEvents(identity.sessionId, {
+        sinceSeq: identity.sourceUserSeq - 1,
+        types: ['user_input_received'],
+        limit: 1,
+      }).find((event) => event.seq === identity.sourceUserSeq);
+      const display = typeof accepted?.data.displayText === 'string'
+        ? accepted.data.displayText.trim()
+        : '';
+      const text = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
+      const userText = display || text;
+      if (userText) {
+        const uniqueDispatch = tryHostDispatchNamedWorkflow({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          userText,
+          route: 'act',
+        });
+        if (uniqueDispatch.status === 'dispatched' || uniqueDispatch.status === 'blocked') {
+          return await completedOutcome(uniqueDispatch.message);
+        }
+      }
+    } catch {
+      // Isolated runner fixtures have no accepted-source identity.
+    }
+  }
+
+  let remainingPreContentStallRetries = modelStreamStallRetries();
+  for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
+    currentHostStepIndex = stepIndex;
+    const recoveryFrameThisStep = recoveredToolFrame;
+    const consumingRecoveredFrame = recoveryFrameThisStep !== undefined;
+    checkpointRecoveryFrameInProgress = consumingRecoveredFrame;
+    if (!consumingRecoveredFrame && stepIndex >= maxTurns) {
       return blockedOutcome(HOST_MODEL_LIMIT_BLOCKED_TEXT, 'max_turns');
     }
     try {
       await refreshTools();
     } catch (error) {
-      if (resumeSurfaceFallback) {
+      if (consumingRecoveredFrame) {
+        // This is bookkeeping for an already-accepted model response, not a
+        // fresh attempt. Keep the exact frame privately owned if its callable
+        // surface cannot be reconstructed yet; never expose a public authority
+        // or retry terminal, and never ask a model to emit the call again.
+        return recoveryOutcome({
+          phase: 'admit',
+          baseHistory: [...history],
+          frameHistory: recoveryFrameThisStep.history,
+          responseId: recoveryFrameThisStep.responseId,
+          stepIndexOverride: resumedRecoveryState?.stepIndex ?? currentHostStepIndex,
+          reason: 'recovery_surface_unavailable',
+        });
+      } else if (resumeSurfaceFallback) {
         // The pending approval frame has already been paired as a proven
         // no-effect refusal. Give the model its ordinary bounded response path
         // with an empty callable surface; a later refresh may recover, but an
@@ -3393,6 +5068,158 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         throw error;
       }
     }
+    let modelStepSchemas: readonly unknown[] = schemas;
+    let permittedNoProgressRecoveryToolNames: ReadonlySet<string> | null = null;
+    let modelInputDirective = pendingHostModelDirective;
+    let writingNoProgressRecoveryDirective = false;
+    if (!consumingRecoveredFrame) {
+      if (
+        hostProduction
+        && !actionExpectedWorkRequired(exactHostIdentity())
+      ) {
+      const identity = exactHostIdentity();
+      const taskKey = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
+      if (noProgressState && noProgressState.taskKey !== taskKey) {
+        return blockedOutcome(
+          hostNoProgressBlockedText(noProgressState),
+          'control_no_progress_exhausted',
+          false,
+        );
+      }
+      const authority = projectHostNoProgressAuthority(identity);
+      if (authority.status === 'ok') {
+        if (!noProgressState) {
+          noProgressState = initializeNoProgressGovernor({
+            taskKey,
+            authority: authority.authority,
+          });
+          noProgressHistoryCursor = history.length;
+        } else if (noProgressHistoryCursor < history.length) {
+          const historyDelta = history.slice(noProgressHistoryCursor);
+          const attempt = projectHostNoProgressAttempt({
+            ...identity,
+            historyDelta,
+          });
+          if (attempt.status === 'ok') {
+            // Advance exactly once, and only after every call in the delta has
+            // a committed paired result. Arbitrary new call/result handles do
+            // not appear in the authority projection.
+            noProgressHistoryCursor = history.length;
+            const decision = observeNoProgress(noProgressState, {
+              taskKey,
+              attemptClass: attempt.attemptClass,
+              authority: authority.authority,
+              ...(attempt.consequence ? { consequence: attempt.consequence } : {}),
+            });
+            noProgressState = decision.state;
+            if (decision.action === 'terminalize') {
+              return blockedOutcome(
+                hostNoProgressBlockedText(decision.state),
+                'control_no_progress_exhausted',
+                false,
+              );
+            }
+            if (decision.action === 'reconcile') {
+              return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+            }
+            if (decision.action === 'recover') {
+              noProgressRecoveryOnly = true;
+              noProgressRecoveryDirectiveWritten = false;
+              if (!latestAcceptedModelBatchRef) {
+                return blockedOutcome(
+                  hostNoProgressBlockedText(decision.state),
+                  'control_no_progress_exhausted',
+                  false,
+                );
+              }
+              return recoveryContinuationOutcome(
+                latestAcceptedModelBatchRef,
+                `no_progress_host_recovery:${decision.state.lastConsequence?.stage ?? 'unknown'}`,
+              );
+            }
+            if (
+              decision.reason === 'retry_available'
+              || decision.reason === 'consequence_progress'
+              || decision.reason === 'user_input_required'
+            ) {
+              // A consequence-free dependency lookup is already-landed data,
+              // not a new provider/execution path.  Keep the ordinary model
+              // surface for its one bounded synthesis step so the model can
+              // read/query that result or simply answer.  Restricting this
+              // case to plan/ask controls caused a successful calendar read's
+              // file_query result to disappear from the usable surface and
+              // forced the model into an unrelated plan_task.  Discovery and
+              // every typed repair/ask consequence remain recovery-only; the
+              // governor still terminalizes the next no-gain attempt.
+              noProgressRecoveryOnly = !(
+                decision.reason === 'retry_available'
+                && attempt.attemptClass === 'dependency_lookup'
+                && attempt.consequence === undefined
+              );
+              if (!noProgressRecoveryOnly) {
+                noProgressRecoveryDirectiveWritten = false;
+              }
+            } else if (decision.reason === 'authority_progress') {
+              noProgressRecoveryOnly = false;
+              noProgressRecoveryDirectiveWritten = false;
+            }
+          } else if (attempt.status === 'unavailable') {
+            hostTurnLogger.error({ reason: attempt.reason }, 'no-progress attempt projection unavailable');
+            return blockedOutcome(
+              HOST_PROGRESS_PROJECTION_BLOCKED_TEXT,
+              'control_progress_projection_unavailable',
+            );
+          } else if (!historyDelta.some((item) => (
+            (item as { type?: unknown } | null)?.type === 'function_call'
+          ))) {
+            // Host-authored continuation/directive items are not attempts and
+            // must not be reconsidered with the next paired tool frame.
+            noProgressHistoryCursor = history.length;
+          } else {
+            hostTurnLogger.error('no-progress history delta was not fully paired');
+            return blockedOutcome(
+              HOST_PROGRESS_PROJECTION_BLOCKED_TEXT,
+              'control_progress_projection_unavailable',
+            );
+          }
+        }
+      } else {
+        hostTurnLogger.error({ reason: authority.reason }, 'no-progress authority projection unavailable');
+        return blockedOutcome(
+          HOST_PROGRESS_PROJECTION_BLOCKED_TEXT,
+          'control_progress_projection_unavailable',
+        );
+      }
+
+      if (noProgressRecoveryOnly) {
+        const consequence = noProgressState?.lastConsequence;
+        const exactRecoveryToolNames = new Set(consequence?.recoveryToolNames ?? []);
+        const recoveryTools = tools.filter((tool) => consequence?.recovery === 'ask_user'
+          ? bareTerminalToolName(tool.name) === 'ask_user_question'
+          : consequence?.recovery === 'stop_factual'
+            ? false
+            : exactRecoveryToolNames.size > 0
+              ? exactRecoveryToolNames.has(tool.name)
+              : hostControlFrameFor(tool.name) === 'sole'
+                || bareTerminalToolName(tool.name) === 'ask_user_question');
+        permittedNoProgressRecoveryToolNames = new Set(recoveryTools.map((tool) => tool.name));
+        modelStepSchemas = serializedTools(recoveryTools);
+        if (!noProgressRecoveryDirectiveWritten) {
+          modelInputDirective = noProgressState
+            ? hostNoProgressRecoveryDirective(noProgressState)
+            : HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
+          writingNoProgressRecoveryDirective = true;
+        }
+      }
+      } else {
+        // A settled plan phases the surface into admitted task work. The
+        // discovery governor no longer owns that graph and cannot meter it.
+        noProgressState = null;
+        noProgressHistoryCursor = history.length;
+        noProgressRecoveryOnly = false;
+        noProgressRecoveryDirectiveWritten = false;
+      }
+    }
     // THE MODEL NEVER RECEIVES CANONICAL HISTORY, filter or no filter.
     //
     // The filtered branch already cloned; the unfiltered branch aliased, so on
@@ -3401,43 +5228,90 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // normalises, annotates or truncates its input in place would then be
     // editing history that has already been accepted — silently, and only on
     // the configuration that looks simplest.
-    let modelInput: AgentInputItem[] = structuredClone(history);
-    // Match Agent.getSystemPrompt semantics: dynamic instructions are
-    // re-evaluated before EVERY model step so newly written memory/context is
-    // visible without restarting the daemon.
-    let instructions = await resolveInstructions();
-    if (inputFilter) {
-      // Context projection is an authority boundary. If it cannot be built,
-      // stop the step: dispatching the unfiltered history would silently
-      // remove constraints and private/contextual overlays.
-      const filtered = await inputFilter({
-        // Match the SDK boundary: filters receive a clone and cannot mutate
-        // the canonical history that will be persisted/replayed.
-        modelData: {
-          input: structuredClone(history),
-          ...(instructions !== undefined ? { instructions } : {}),
-        },
-        agent,
-        context: contextValue,
-      });
-      if (!filtered || !Array.isArray(filtered.input)) {
-        throw new Error('callModelInputFilter must return a model input object with an input array.');
+    let modelInput: AgentInputItem[] = [];
+    let instructions: string | undefined;
+    if (!consumingRecoveredFrame) {
+      modelInput = structuredClone(history);
+      // Match Agent.getSystemPrompt semantics: dynamic instructions are
+      // re-evaluated before EVERY model step so newly written memory/context is
+      // visible without restarting the daemon.
+      instructions = await resolveInstructions();
+      if (inputFilter) {
+        // Context projection is an authority boundary. If it cannot be built,
+        // stop the step: dispatching the unfiltered history would silently
+        // remove constraints and private/contextual overlays.
+        const filtered = await inputFilter({
+          // Match the SDK boundary: filters receive a clone and cannot mutate
+          // the canonical history that will be persisted/replayed.
+          modelData: {
+            input: structuredClone(history),
+            ...(instructions !== undefined ? { instructions } : {}),
+          },
+          agent,
+          context: contextValue,
+        });
+        if (!filtered || !Array.isArray(filtered.input)) {
+          throw new Error('callModelInputFilter must return a model input object with an input array.');
+        }
+        // The model also receives a clone: mutations in a provider adapter may
+        // not flow backwards into the filter output or durable host history.
+        modelInput = structuredClone(filtered.input);
+        instructions = typeof filtered.instructions === 'undefined'
+          ? instructions
+          : filtered.instructions;
       }
-      // The model also receives a clone: mutations in a provider adapter may
-      // not flow backwards into the filter output or durable host history.
-      modelInput = structuredClone(filtered.input);
-      instructions = typeof filtered.instructions === 'undefined'
-        ? instructions
-        : filtered.instructions;
+      if (modelInputDirective) {
+        // Host recovery/continuation guidance is a one-shot request layer.  It is
+        // never canonical conversation history, so it cannot create an
+        // uncheckpointed edge between two accepted tool batches.
+        modelInput.push({ role: 'user', content: modelInputDirective });
+      }
     }
     let step: Awaited<ReturnType<typeof codexOneStep>>;
-    try {
-      step = await runOneModelStep(modelInput, instructions);
+    let ranModelStep = false;
+    if (recoveryFrameThisStep) {
+      step = {
+        text: '',
+        toolCalls: recoveryFrameThisStep.calls,
+        output: recoveryFrameThisStep.history as never,
+        limitHit: false,
+        stopReason: 'tool_calls',
+        terminationEvidence: 'recognized',
+        ...(recoveryFrameThisStep.responseId
+          ? { responseId: recoveryFrameThisStep.responseId }
+          : {}),
+      };
+      recoveredToolFrame = undefined;
+    } else try {
+      step = await runOneModelStep(modelInput, instructions, modelStepSchemas);
+      ranModelStep = true;
     } catch (error) {
+      // Match loop.ts: a pre-content stall with no paid request in flight is
+      // retryable. Swallowing it as blockedOutcome killed the rescue brain
+      // after GLM/Grok first-content-timeout (OPEN-THE-GATES 5.1, live
+      // sess-desktop-8e7470 / 2bc15b). The silenced brain is already marked,
+      // so the next step preselects rescue. Mid-stream stalls and buffered
+      // paid requests still fail closed.
+      if (
+        error instanceof ModelStreamStalledError
+        && error.preContent
+        && !error.bufferedProviderRequestInFlight
+        && remainingPreContentStallRetries > 0
+      ) {
+        remainingPreContentStallRetries -= 1;
+        stepIndex -= 1;
+        continue;
+      }
       if (error instanceof ModelStreamStalledError) {
         return blockedOutcome(HOST_MODEL_STALL_BLOCKED_TEXT, 'model_stalled');
       }
       throw error;
+    }
+    if (ranModelStep && writingNoProgressRecoveryDirective) {
+      noProgressRecoveryDirectiveWritten = true;
+    }
+    if (ranModelStep && pendingHostModelDirective === modelInputDirective) {
+      pendingHostModelDirective = undefined;
     }
     // ADMIT BEFORE COMMIT.
     //
@@ -3466,20 +5340,139 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // split-brain bug where validation inspected one normalization while the
     // host consumed another.
     if (admission.frame.kind === 'completed') {
+      const noProgressRecovery = noProgressRecoveryOnly
+        ? noProgressState?.lastConsequence?.recovery
+        : undefined;
+      if (noProgressRecovery === 'ask_user') {
+        // Exact user-input authority belongs to one canonical
+        // ask_user_question call. Prose cannot substitute a broader question
+        // or publish before the call boundary validates options and purpose.
+        return blockedOutcome(
+          hostNoProgressBlockedText(noProgressState),
+          'control_no_progress_exhausted',
+          false,
+        );
+      }
+      if (noProgressRecovery === 'stop_factual') {
+        const decision = toOrchestratorDecision(admission.frame.text);
+        if (
+          decision?.nextAction === 'awaiting_user_input'
+          || decision?.nextAction === 'awaiting_approval'
+        ) {
+          // A known terminal may be explained once, but it cannot convert
+          // itself into new user work or resumable authority.
+          return blockedOutcome(
+            hostNoProgressBlockedText(noProgressState),
+            'control_no_progress_exhausted',
+            false,
+          );
+        }
+      }
+      if (hostProduction && !acceptedReadPlanContinuationUsed) {
+        const identity = exactHostIdentity();
+        const pendingReadPlan = pendingAcceptedReadPlan(identity);
+        if (pendingReadPlan) {
+          acceptedReadPlanContinuationUsed = true;
+          pendingHostModelDirective = [
+            'ACCEPTED PLAN EXECUTION — the exact read-only plan is already pinned.',
+            `Call work_call now for the ready requirement${pendingReadPlan.readyRequirementIds.length === 1 ? '' : 's'}: ${pendingReadPlan.readyRequirementIds.join(', ')}.`,
+            'Do not call tool_search or plan_task again. Do not answer or declare completion until the bound read settles and you can report its actual result.',
+          ].join(' ');
+          continue;
+        }
+      }
+      if (hostProduction && !acceptedUniqueWorkflowContinuationUsed) {
+        const workflowName = pendingUniqueWorkflowNameFromHistory(history);
+        if (workflowName) {
+          acceptedUniqueWorkflowContinuationUsed = true;
+          pendingHostModelDirective = [
+            'ACCEPTED WORKFLOW — this request uniquely names an existing workflow.',
+            `Call workflow_run now with name "${workflowName}".`,
+            'Do not plan_task. Do not workflow_get. Do not answer or declare completion until workflow_run settles.',
+          ].join(' ');
+          continue;
+        }
+      }
       history.push(...admission.frame.history);
       if (step.responseId !== undefined) lastResponseId = step.responseId;
       return await completedOutcome(admission.frame.text);
     }
 
     const canonicalCalls = admission.frame.calls;
-    const canonicalFrameDigest = semanticFrameDigest(canonicalCalls);
-    if (retiredZeroCrossingFrames.has(canonicalFrameDigest)) {
-      const paired = pairLocallyRefusedFrame(canonicalCalls, true);
-      commitAdmittedToolFrame({
+    const repeatsCommittedCallId = canonicalCalls.some((call) => history.some((item) => {
+      const row = item as unknown as { type?: unknown; callId?: unknown };
+      return (row.type === 'function_call' || row.type === 'function_call_result')
+        && row.callId === call.callId;
+    }));
+    // A call id is one canonical conversation edge. Even an exact settled
+    // replay cannot append a second call/result pair: the next model request
+    // would have two visible result owners for one id. Keep the already-
+    // checkpointed pair as the sole truth and stop before preparation, consent,
+    // execution, transcript mutation, or adoption of this duplicate response.
+    if (repeatsCommittedCallId) {
+      return blockedOutcome(
+        HOST_DUPLICATE_MODEL_CALL_BLOCKED_TEXT,
+        'model_reused_committed_call_id',
+      );
+    }
+    const batchAdmission: AcceptedFrameAdmission = recoveredAcceptedFrame
+      ? { status: 'ready', frame: recoveredAcceptedFrame }
+      : preAdmitAcceptedToolFrame({
+          frameHistory: admission.frame.history,
+          responseId: step.responseId,
+        });
+    recoveredAcceptedFrame = undefined;
+    if (batchAdmission.status === 'held') return batchAdmission.outcome;
+    const acceptedFrame = batchAdmission.frame;
+    const exactAskInput = noProgressRecoveryOnly
+      && noProgressState?.lastConsequence?.recovery === 'ask_user'
+      ? noProgressState.lastConsequence.userInput
+      : undefined;
+    const nonCanonicalNoProgressAsk = exactAskInput !== undefined && (
+      canonicalCalls.length !== 1
+      || bareTerminalToolName(canonicalCalls[0]!.name) !== 'ask_user_question'
+      || !isCanonicalNoProgressAskArguments(
+        parsedArgs(canonicalCalls[0]!.argumentsJson),
+        exactAskInput,
+      )
+    );
+    if (
+      permittedNoProgressRecoveryToolNames
+      && (
+        nonCanonicalNoProgressAsk
+        || canonicalCalls.some((call) => !permittedNoProgressRecoveryToolNames!.has(call.name))
+      )
+    ) {
+      // The recovery request exposed no dependency/provider/business schema.
+      // A model-authored call outside that exact subset is paired locally and
+      // terminalized before approval, preparation, or body invocation.
+      const paired = pairLocallyRefusedFrame(canonicalCalls);
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
+      recordZeroCrossingRefusal(paired.frameDigest);
+      return blockedOutcome(
+        hostNoProgressBlockedText(noProgressState),
+        'control_no_progress_exhausted',
+        false,
+      );
+    }
+    const canonicalFrameDigest = semanticFrameDigest(canonicalCalls);
+    if (retiredZeroCrossingFrames.has(canonicalFrameDigest)) {
+      // A semantically repeated frame with fresh ids takes the ordinary
+      // admitted/receipt path. Reused ids were already stopped above.
+      const paired = pairLocallyRefusedFrame(canonicalCalls, true);
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
+        frameHistory: admission.frame.history,
+        resultItems: paired.resultItems,
+        responseId: step.responseId,
+      });
+      if (resultCommitBlock) return resultCommitBlock;
       return await completedOutcome(capabilityUnavailableTextFor(canonicalCalls));
     }
     let frameDisposition: HostModelFrameDisposition;
@@ -3516,23 +5509,48 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
     } catch {
       const paired = pairLocallyRefusedFrame(canonicalCalls);
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
       continue;
     }
     if (frameDisposition.kind === 'refused') {
       const paired = pairLocallyRefusedFrame(canonicalCalls);
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
       continue;
+    }
+    if (frameDisposition.kind === 'host_owned_single_action_plan') {
+      const activated = hostProduction
+        ? await activateHostOwnedSingleActionPlan(frameDisposition)
+        : false;
+      if (!activated) {
+        const paired = pairLocallyRefusedFrame(canonicalCalls);
+        const resultCommitBlock = commitAdmittedToolFrame({
+          acceptedFrame,
+          frameHistory: admission.frame.history,
+          resultItems: paired.resultItems,
+          responseId: step.responseId,
+        });
+        if (resultCommitBlock) return resultCommitBlock;
+        recordZeroCrossingRefusal(paired.frameDigest);
+        continue;
+      }
+      // From here onward the original model call uses the ordinary common
+      // preparation/consent/lease/execution path under the newly activated
+      // durable graph. The hidden control result is intentionally not history.
+      frameDisposition = { kind: 'ordinary' };
     }
     /* Retain the legacy direct/effective policy assertion as a consistency
      * check for registry classes not yet migrated to hostModelFrameClass. */
@@ -3553,21 +5571,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
     } catch {
       const paired = pairLocallyRefusedFrame(canonicalCalls);
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
       continue;
     }
     if (soleControls.some((entry) => entry.carried)) {
       const paired = pairLocallyRefusedFrame(canonicalCalls);
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
       continue;
     }
@@ -3577,28 +5599,36 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       && (soleControls.length !== 1 || canonicalCalls.length !== 1)
     ) {
       const paired = pairLocallyRefusedFrame(canonicalCalls);
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
       continue;
     }
 
     if (frameDisposition.kind === 'fresh_plan_then_root_read') {
       const frame = await executeFreshPlanThenRootRead(frameDisposition);
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: frame.resultItems,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       if (frame.effectUnknown) {
         return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
       }
       if (frame.toolCallsLimit) propagateToolCallsLimit(frame.toolCallsLimit);
       if (frame.zeroCrossingRefusal) {
         recordZeroCrossingRefusal(frame.frameDigest);
+        if (terminalBehaviorEligibleMixedResults(frame.returned)) {
+          const finalOutput = await finalOutputFromToolBehavior(frame.returned);
+          if (finalOutput !== undefined) return await completedOutcome(finalOutput);
+        }
         continue;
       }
       const finalOutput = await finalOutputFromToolBehavior(frame.returned);
@@ -3611,6 +5641,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // has never run.
     const pendingBatch: PendingHostCall[] = [];
     const preparedInBatch: object[] = [];
+    const preApprovalRepairDiagnostics = new Map<string, string>();
+    const preApprovalTypedRefusals = new Map<
+      string,
+      'repair_arguments' | 'stop_and_explain'
+    >();
     let preApprovalRefused = false;
     for (const call of canonicalCalls) {
       try {
@@ -3728,7 +5763,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                   },
                 }),
               );
-              if (prepared.status !== 'prepared') return null;
+              if (prepared.status !== 'prepared') {
+                if (prepared.status === 'refused') {
+                  const diagnostic = boundedHostPreparationRepairDiagnostic(prepared.output);
+                  if (diagnostic) preApprovalRepairDiagnostics.set(call.callId, diagnostic);
+                  preApprovalTypedRefusals.set(call.callId, prepared.recovery);
+                }
+                return null;
+              }
               preparedInBatch.push(prepared.preparation);
               const evaluated = await evaluatePreparedHostWorkCallConsent({
                 preparation: prepared.preparation,
@@ -3797,6 +5839,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
     }
     if (preApprovalRefused) {
+      const refusalProgress = aggregateHostPreparationRefusalProgress(
+        [...preApprovalTypedRefusals].map(([callId, recovery]) => ({ callId, recovery })),
+      );
+      const countingCallIds = refusalProgress.hasTypedRefusal
+        ? new Set(refusalProgress.countingCallIds)
+        : undefined;
       const released = preparedInBatch.every((candidate) => (
         releasePreparedHostWorkCallForRepair(candidate, 'sibling_frame_replanned_before_dispatch')
       ));
@@ -3804,26 +5852,39 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (!released) {
         throw new HostCallAuthorityBoundaryError('prepared_frame_release_failed');
       }
-      const paired = pairLocallyRefusedFrame(canonicalCalls);
-      commitAdmittedToolFrame({
+      const paired = pairLocallyRefusedFrame(
+        canonicalCalls,
+        false,
+        preApprovalRepairDiagnostics,
+        countingCallIds,
+      );
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         resultItems: paired.resultItems,
         responseId: step.responseId,
       });
-      recordZeroCrossingRefusal(paired.frameDigest);
+      if (resultCommitBlock) return resultCommitBlock;
+      if (refusalProgress.retireSemanticFrame) {
+        recordZeroCrossingRefusal(paired.frameDigest);
+      }
       continue;
     }
     const approvals = pendingBatch.filter((pending) => !pending.decision);
     if (approvals.length > 0) {
-      commitAdmittedToolFrame({
+      const resultCommitBlock = commitAdmittedToolFrame({
+        acceptedFrame,
         frameHistory: admission.frame.history,
         responseId: step.responseId,
       });
+      if (resultCommitBlock) return resultCommitBlock;
       const state = new HostInterruptState(
         history,
         pendingBatch,
         lastResponseId,
         hostTurnEngine ?? 'host_v1_read_only',
+        currentNoProgressCheckpoint(),
+        acceptedFrame.ref,
       );
       return {
         history,
@@ -3846,17 +5907,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
 
     const frame = await executeCalls(canonicalCalls);
-    commitAdmittedToolFrame({
+    const resultCommitBlock = commitAdmittedToolFrame({
+      acceptedFrame,
       frameHistory: admission.frame.history,
       resultItems: frame.resultItems,
       responseId: step.responseId,
     });
+    if (resultCommitBlock) return resultCommitBlock;
     if (frame.effectUnknown) {
       return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
     }
     if (frame.toolCallsLimit) propagateToolCallsLimit(frame.toolCallsLimit);
     if (frame.zeroCrossingRefusal) {
       recordZeroCrossingRefusal(frame.frameDigest);
+      if (terminalBehaviorEligibleMixedResults(frame.returned)) {
+        const finalOutput = await finalOutputFromToolBehavior(frame.returned);
+        if (finalOutput !== undefined) return await completedOutcome(finalOutput);
+      }
       continue;
     }
     const finalOutput = await finalOutputFromToolBehavior(frame.returned);

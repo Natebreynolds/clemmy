@@ -31,7 +31,20 @@ const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js'
 const { activateDispatchLease } = await import('./dispatch-lease.js');
 const { settledReadRepeatReplayMarker } = await import('./settled-read-repeat.js');
 const { projectCanonicalTopLevelToolEvents } = await import('./tool-effect.js');
-const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'PROOF_LIST_TASKS',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
+const { _withHostLocalWriteCommitFactsForTest } = await import('./host-local-write-commit.js');
+const withLocalWriteCommitFixture = (_tool: string, result: string) =>
+  _withHostLocalWriteCommitFactsForTest({
+    createdId: 'hook-workflow',
+    handle: 'vault/00-System/workflows/hook-workflow/SKILL.md',
+    contentDigest: 'a'.repeat(64),
+    result,
+  });
 type RunHooksLike = import('./hooks.js').RunHooksLike;
 
 test('effectiveReflectionTool unwraps composio_execute_tool to its action slug', () => {
@@ -112,6 +125,7 @@ test('effectiveReflectionTool falls back to the wrapper name when the slug is mi
 });
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
   try {
     rmSync(TMP_HOME, { recursive: true, force: true });
   } catch {
@@ -625,7 +639,7 @@ test('Codex hooks grant workflow-create evidence only to an exact paired admitte
     ctx(sess.id),
     { name: 'orchestrator' },
     { name: 'workflow_create' },
-    withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "daily-digest".'),
+    withLocalWriteCommitFixture('workflow_create', 'Created workflow "daily-digest".'),
     direct,
   );
 
@@ -644,7 +658,7 @@ test('Codex hooks grant workflow-create evidence only to an exact paired admitte
     ctx(sess.id),
     { name: 'orchestrator' },
     { name: 'call_tool' },
-    withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "weekly-digest".'),
+    withLocalWriteCommitFixture('workflow_create', 'Created workflow "weekly-digest".'),
     carried,
   );
 
@@ -685,7 +699,7 @@ test('Codex hooks reject orphan and error-like workflow-create returns as termin
     ctx(sess.id),
     { name: 'orchestrator' },
     { name: 'workflow_create' },
-    withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "orphan-digest".'),
+    withLocalWriteCommitFixture('workflow_create', 'Created workflow "orphan-digest".'),
     orphan,
   );
 
@@ -701,7 +715,7 @@ test('Codex hooks reject orphan and error-like workflow-create returns as termin
     ctx(sess.id),
     { name: 'orchestrator' },
     { name: 'workflow_create' },
-    withTerminalAuthoringEvidenceReceipt('workflow_create', 'ERROR: workflow creation failed before commit.'),
+    withLocalWriteCommitFixture('workflow_create', 'ERROR: workflow creation failed before commit.'),
     errored,
   );
 

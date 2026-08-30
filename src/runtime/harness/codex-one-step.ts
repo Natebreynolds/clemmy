@@ -76,6 +76,9 @@ export interface CodexOneStepInput {
   stream?: boolean;
   /** Semantic stream activity. Handshake/keepalive metadata never calls it. */
   onActivity?: (activity: ModelStepActivity) => void;
+  /** Final provider-neutral request boundary. A rejection here stops before
+   * either streaming or non-streaming model I/O. */
+  beforeModelDispatch?: (request: ModelRequest) => Promise<void> | void;
   /** Test seam: model resolution injection. Production always resolves
    *  through codex-client's credential router (OAuth wallet). */
   resolveModel?: (modelId?: string) => Promise<Model> | Model;
@@ -783,6 +786,10 @@ export async function codexOneStep(input: CodexOneStepInput): Promise<CodexOneSt
       ? { previousResponseId: input.previousResponseId }
       : {}),
   };
+  const inspected = input.beforeModelDispatch?.(request);
+  // The production recorder is synchronous, so do not introduce a microtask
+  // window in which shared request inputs could change after they were sealed.
+  if (inspected !== undefined) await inspected;
   const streamed = input.stream === true
     ? await streamedResponse(model, request, input.onActivity)
     : undefined;

@@ -5,7 +5,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildPlannerPrompt,
-  detectAmbiguousAction,
   planRequiresUserApproval,
   renderPlanFirstFailureReply,
   renderPlanNeedsInputReply,
@@ -17,17 +16,18 @@ import type { Plan } from '../../agents/planner.js';
 const VAGUE_DEAL_REQUEST =
   'can you get me a list of the deals we closed recently and put it somewhere i can look at it';
 
-// ─── priorAnswers default-resource guard (cross-session drift) ───────────────
+// ─── priorAnswers never invent provider/resource defaults ───────────────────
 
-test('buildPlannerPrompt: priorAnswers with NO named resource keeps the NEW-sheet default', () => {
+test('buildPlannerPrompt: prior answers never inject a provider-specific destination default', () => {
   const prompt = buildPlannerPrompt('pull the closed deals', 'put them in a sheet');
-  assert.match(prompt, /create a NEW Google Sheet/);
+  assert.doesNotMatch(prompt, /Google Sheet/);
+  assert.match(prompt, /Do not substitute a provider, resource, destination, account/i);
 });
 
-test('buildPlannerPrompt: priorAnswers naming an existing resource suppresses the default', () => {
+test('buildPlannerPrompt: prior answers naming an existing resource preserve the accepted answer', () => {
   const prompt = buildPlannerPrompt('update the deals tracker', 'use the existing sheet');
   assert.doesNotMatch(prompt, /create a NEW Google Sheet/);
-  assert.match(prompt, /Use the resource the user named/);
+  assert.match(prompt, /use the existing sheet/);
 });
 
 test('buildPlannerPrompt: a sheet URL in the request suppresses the default', () => {
@@ -219,7 +219,7 @@ test('renderPlanReply: keeps blocking plans conversational and compact', () => {
   assert.doesNotMatch(reply, /^Plan:/m);
 });
 
-test('planRequiresUserApproval: safe local markdown reports do not block on approval', () => {
+test('planRequiresUserApproval: an explicitly requested plan is surfaced even when its work is local', () => {
   const plan = makePlan({
     objective: 'Create a short, reviewable local markdown SEO opportunity brief with no external sends or updates.',
     steps: [
@@ -238,7 +238,7 @@ test('planRequiresUserApproval: safe local markdown reports do not block on appr
     ],
   });
 
-  assert.equal(planRequiresUserApproval(plan, 'Create a local markdown report only; do not send or update external systems.'), false);
+  assert.equal(planRequiresUserApproval(plan, 'Create a local markdown report only; do not send or update external systems.'), true);
 });
 
 test('planRequiresUserApproval: external writes and large tracked work still block', () => {
@@ -258,28 +258,6 @@ test('planRequiresUserApproval: external writes and large tracked work still blo
     estimatedComplexity: 'large',
     recommendsTrackedExecution: true,
   }), 'prepare a multi-day research project'), true);
-});
-
-test('detectAmbiguousAction: the vague deal request is ambiguous and missing source + destination', () => {
-  const result = detectAmbiguousAction(VAGUE_DEAL_REQUEST);
-  assert.equal(result.ambiguous, true);
-  assert.ok(result.missing.includes('source'), 'expected source missing');
-  assert.ok(result.missing.includes('destination'), 'expected destination missing');
-  // "recently" with no concrete window should also flag scope.
-  assert.ok(result.missing.includes('scope'), 'expected scope missing');
-});
-
-test('detectAmbiguousAction: a simple clear question is not an ambiguous action', () => {
-  const result = detectAmbiguousAction("what's on my calendar today");
-  assert.equal(result.ambiguous, false);
-  assert.deepEqual(result.missing, []);
-});
-
-test('detectAmbiguousAction: a concrete batch send is an action but not ambiguous', () => {
-  const result = detectAmbiguousAction('send these 40 emails to the list');
-  assert.equal(typeof result.ambiguous, 'boolean');
-  // Concrete count + named target → no missing slots.
-  assert.equal(result.ambiguous, false);
 });
 
 test('shouldUsePlanFirst: vague deal request stays in the orchestrator even if old converse flag is on', () => {
@@ -327,7 +305,6 @@ test('shouldUsePlanFirst: flag off is byte-identical (vague deal request stays f
 test('shouldUsePlanFirst: short vague actions stay conversational', () => {
   const shortVague = 'get me the deals we closed somewhere';
   assert.ok(shortVague.length < 80, 'precondition: message is under the size floor');
-  assert.equal(detectAmbiguousAction(shortVague).ambiguous, true);
   const prev = process.env.CLEMMY_CHAT_CONVERSE;
   try {
     process.env.CLEMMY_CHAT_CONVERSE = 'on';

@@ -32,13 +32,23 @@ const {
 const { rememberFact, listConstraints } = await import('../../memory/facts.js');
 // eslint-disable-next-line import/first
 const {
-  findEmailDraftAuthoringPreference,
-  findEmailSendConstraint,
-  findOutlookCalendarReadConstraint,
-  checkConstraintViolation,
-  constraintsForToolkit,
-  renderToolkitConstraintBanner,
-} = await import('./constraint-guard.js');
+  findComposioEmailDraftAuthoringPreference: findEmailDraftAuthoringPreference,
+  findComposioEmailSendConstraint: findEmailSendConstraint,
+  findComposioConnectionReadConstraint: findOutlookCalendarReadConstraint,
+  checkComposioConstraintViolation,
+  constraintsForComposioToolkit: constraintsForToolkit,
+  renderComposioToolkitConstraintBanner: renderToolkitConstraintBanner,
+} = await import('../../integrations/composio/standing-policy-adapter.js');
+const checkConstraintViolation = (
+  toolName: string,
+  args: Record<string, unknown>,
+  options: { emailHandledExternally?: boolean } = {},
+) => checkComposioConstraintViolation(
+  toolName,
+  String(args.action ?? ''),
+  args,
+  { senderIdentityHandledExternally: options.emailHandledExternally },
+);
 // eslint-disable-next-line import/first
 const { verifyOutlookSender, extractMailboxEmails, clearSenderVerificationCache, resolveCompliantSenderConnection } = await import('./sender-verify.js');
 
@@ -265,7 +275,7 @@ test('compiled Salesforce CLI-only policy blocks the forbidden Composio route', 
   `).get(saved.id) as { policy_type: string; enforcement: string; applies_to_json: string };
   assert.equal(policy.policy_type, 'hard_constraint');
   assert.equal(policy.enforcement, 'dispatch');
-  assert.equal(JSON.parse(policy.applies_to_json).family, 'salesforce_cli_only');
+  assert.equal(JSON.parse(policy.applies_to_json).policyClass, 'route_denial');
 
   const violation = checkConstraintViolation('composio_execute_tool', {
     action: 'SALESFORCE_EXECUTE_SOQL_QUERY',
@@ -378,7 +388,7 @@ test('tool-bound rules: constraints ride with the toolkit they name, globally', 
   assert.equal(bound.length >= 1, true, 'rule naming a toolkit must bind to it');
 
   const banner = renderToolkitConstraintBanner('outlook');
-  assert.ok(banner?.includes('STANDING RULES'), 'banner must render for a bound toolkit');
+  assert.ok(banner?.includes('SEALED STANDING POLICIES'), 'banner must render for a bound toolkit');
   assert.ok(banner?.includes('alex.chen@legacy.example'));
 
   // Unrelated toolkits carry NO banner — zero noise where no rule binds.

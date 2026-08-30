@@ -7,18 +7,19 @@
  *
  * Unlike platform49-effect-matrix.integration.test.ts (the pure ledger
  * characterization), this file drives the production run queue, workflow
- * runner, Composio gateway, CLI client, exact-call receipt store, cross-run
- * watermark, report envelope, notification, and terminal journal. The only
- * fake is a local provider process. It never calls a live account.
+ * runner, exact live catalog, immutable production capability ports, workflow-
+ * v3 activation/dispatch/settlement store, cross-run watermark, report
+ * envelope, notification, and terminal journal. The only fake is the provider
+ * body behind an isolated fixture port. It never calls a live account.
  *
  * The provider identifiers are deliberately opaque strings. In particular,
  * `1785000000.000500` must never pass through a numeric type: doing so changes
  * the destination identity to `1785000000.0005`.
  */
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
-  chmodSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -33,7 +34,6 @@ import { pathToFileURL } from 'node:url';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-platform49-effect-runtime-'));
 const PROVIDER_STATE_FILE = path.join(TMP_HOME, 'provider-state.json');
-const PROVIDER_SHIM_FILE = path.join(TMP_HOME, 'platform49-provider-shim.mjs');
 
 const FINAL_PAGE_ITEM_ID = '1785000000.000499';
 const NEW_ITEM_ID = '1785000000.000500';
@@ -90,129 +90,10 @@ function initialProviderState(): ProviderState {
 
 mkdirSync(TMP_HOME, { recursive: true });
 writeFileSync(PROVIDER_STATE_FILE, JSON.stringify(initialProviderState(), null, 2), 'utf-8');
-writeFileSync(PROVIDER_SHIM_FILE, `
-import { readFileSync, writeFileSync } from 'node:fs';
-
-const argv = process.argv.slice(2);
-if (argv[0] === '--version') {
-  console.log('platform49-provider-shim 1.0.0');
-  process.exit(0);
-}
-if (argv[0] === 'whoami') {
-  console.log('sanitized-platform49-operator');
-  process.exit(0);
-}
-if (argv[0] !== 'execute') {
-  console.error('unsupported provider shim command');
-  process.exit(2);
-}
-
-const stateFile = process.env.CLEMENTINE_PLATFORM49_PROVIDER_STATE;
-if (!stateFile) throw new Error('missing provider state path');
-const state = JSON.parse(readFileSync(stateFile, 'utf-8'));
-const slug = String(argv[1] ?? '');
-const args = JSON.parse(String(argv[3] ?? '{}'));
-state.invocations.push({ slug, args });
-
-const exactId = () => {
-  const value = args.item_id ?? args.cursor;
-  if (typeof value !== 'string' || !value) throw new Error('provider requires an exact string identity');
-  return value;
-};
-const persist = () => writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
-
-if (slug === 'DESTPROOF_APPEND_RECORD') {
-  const id = exactId();
-  state.counters.append += 1;
-  if (state.destination[id]) {
-    persist();
-    console.log(JSON.stringify({ successful: false, error: 'duplicate destination identity' }));
-    process.exit(0);
-  }
-  state.destination[id] = { id, value: String(args.value ?? '') };
-  persist();
-  console.log(JSON.stringify(state.destination[id]));
-  process.exit(0);
-}
-
-if (slug === 'DESTPROOF_UPDATE_RECORD') {
-  const id = exactId();
-  state.counters.update += 1;
-  if (!state.destination[id]) {
-    persist();
-    console.log(JSON.stringify({ successful: false, error: 'destination identity not found' }));
-    process.exit(0);
-  }
-  state.destination[id] = { id, value: String(args.value ?? '') };
-  persist();
-  console.log(JSON.stringify(state.destination[id]));
-  process.exit(0);
-}
-
-if (slug === 'DESTPROOF_GET_RECORD') {
-  const id = exactId();
-  state.counters.readback += 1;
-  const record = state.destination[id];
-  persist();
-  console.log(JSON.stringify(record ? [record] : []));
-  process.exit(0);
-}
-
-if (slug === 'DESTPROOF_GET_SCAN_CURSOR') {
-  const cursor = exactId();
-  state.counters.scan += 1;
-  persist();
-  console.log(JSON.stringify([{ id: cursor, kind: 'scan_cursor' }]));
-  process.exit(0);
-}
-
-if (slug === 'SOURCEPROOF_UPDATE_RECORD') {
-  const id = exactId();
-  state.counters.sourceMutation += 1;
-  state.source[id] = { id, value: String(args.value ?? '') };
-  persist();
-  console.log(JSON.stringify(state.source[id]));
-  process.exit(0);
-}
-
-if (slug === 'ORPHANPROOF_APPEND_RECORD') {
-  const id = exactId();
-  state.counters.orphan += 1;
-  state.destination[id] = { id, value: String(args.value ?? '') };
-  persist();
-  console.error('response channel closed after provider commit');
-  process.exit(41);
-}
-
-if (slug === 'EXACTPROOF_SEND_MESSAGE') {
-  const channel = args.channel;
-  const markdownText = args.markdown_text;
-  if (typeof channel !== 'string' || !channel || typeof markdownText !== 'string' || !markdownText) {
-    persist();
-    console.log(JSON.stringify({ successful: false, error: 'exact channel and markdown_text are required' }));
-    process.exit(0);
-  }
-  state.counters.send += 1;
-  persist();
-  // A real provider need not echo message content. The host receipt binds the
-  // frozen provider-ready args independently from this acknowledgement.
-  console.log(JSON.stringify({
-    successful: true,
-    data: { receipt_id: 'exact-provider-receipt-' + state.counters.send },
-  }));
-  process.exit(0);
-}
-
-persist();
-console.error('unknown provider shim tool: ' + slug);
-process.exit(3);
-`, 'utf-8');
-chmodSync(PROVIDER_SHIM_FILE, 0o755);
 
 process.env.CLEMENTINE_HOME = TMP_HOME;
-process.env.CLEMENTINE_PLATFORM49_PROVIDER_STATE = PROVIDER_STATE_FILE;
-process.env.COMPOSIO_BACKEND = 'cli';
-process.env.COMPOSIO_CLI_PATH = PROVIDER_SHIM_FILE;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMMY_WATCHER_JUDGE = 'off';
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 process.env.CLEMMY_FAILURE_LEARNING = 'off';
@@ -229,7 +110,6 @@ delete process.env.COMPOSIO_API_KEY;
 const { test } = await import('node:test');
 const assert = (await import('node:assert/strict')).default;
 const { writeWorkflow } = await import('../memory/workflow-store.js');
-const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const {
   queueWorkflowRun,
@@ -240,9 +120,7 @@ const { processWorkflowSchedules } = await import('./workflow-scheduler.js');
 const {
   processWorkflowRuns,
   reapCapabilityBlockedRuns,
-  reapMutationBlockedRuns,
   resumeCapabilityBlockedWorkflowRun,
-  resumeMutationBlockedWorkflowRun,
   _setBeforeWorkflowCallGatewayForTests,
   _setBeforeWorkflowGraphFinalizationForTests,
 } = await import('./workflow-runner.js');
@@ -251,26 +129,20 @@ const {
   readWorkflowEvents,
 } = await import('./workflow-events.js');
 const {
-  executeWorkflowCallMutation,
-  inspectWorkflowCallMutation,
-  workflowCallExpectedArgsDigest,
-  workflowCallMutationFingerprint,
-  workflowCallMutationSlotHasLedger,
-  WorkflowCallMutationAmbiguousError,
-} = await import('./workflow-call-receipts.js');
+  assessWorkflowV3RunMutationRequeue,
+  inspectWorkflowV3Call,
+} = await import('./workflow-v3-call-evidence.js');
 const { readSeenItemKeys } = await import('./workflow-watermark-store.js');
 const { loadNotifications } = await import('../runtime/notifications.js');
-const { closeEventLog } = await import('../runtime/harness/eventlog.js');
-const {
-  grantComposioCliDefaultAccountAuthority,
-  revokeComposioCliDefaultAccountAuthority,
-} = await import('../integrations/composio/cli-default-account-authority.js');
-const { resetComposioClient } = await import('../integrations/composio/client.js');
-const { executeComposioCliTool } = await import('../integrations/composio/cli.js');
+const { closeEventLog, openEventLog } = await import('../runtime/harness/eventlog.js');
+const manifests = await import('../runtime/harness/capability-manifest.js');
+const catalog = await import('../runtime/harness/host-capability-catalog-factory.js');
+const observations = await import('../runtime/harness/independent-capability-observation.js');
+const ports = await import('../runtime/harness/production-capability-ports.js');
+const kernel = await import('../runtime/harness/workflow-read-only-call-kernel.js');
 const {
   _clearToolSchemaCacheForTest,
   _setToolSchemaLoaderForTests,
-  liveComposioSchemaFingerprint,
   rememberToolSchema,
   resetToolSchemaCache,
 } = await import('../tools/composio-schema-cache.js');
@@ -308,10 +180,195 @@ type RunRecord = {
     state?: string;
     providerRedispatched?: boolean;
   };
+  heldExecution?: {
+    stepId?: string;
+    sourceStatus?: string;
+    hold?: { owner?: string; wake?: string; reason?: string };
+  };
 };
 
 function readProviderState(): ProviderState {
   return JSON.parse(readFileSync(PROVIDER_STATE_FILE, 'utf-8')) as ProviderState;
+}
+
+function persistProviderState(state: ProviderState): void {
+  writeFileSync(PROVIDER_STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+async function invokeFixtureProvider(
+  slug: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const state = readProviderState();
+  state.invocations.push({ slug, args: structuredClone(args) });
+  const exactId = (): string => {
+    const value = args.item_id ?? args.cursor;
+    if (typeof value !== 'string' || !value) {
+      throw new Error('provider requires an exact string identity');
+    }
+    return value;
+  };
+  if (slug === 'DESTPROOF_APPEND_RECORD') {
+    const id = exactId();
+    state.counters.append += 1;
+    if (state.destination[id]) {
+      persistProviderState(state);
+      return { data: { successful: false, error: 'duplicate destination identity' } };
+    }
+    state.destination[id] = { id, value: String(args.value ?? '') };
+    persistProviderState(state);
+    return { data: structuredClone(state.destination[id]) };
+  }
+  if (slug === 'DESTPROOF_UPDATE_RECORD') {
+    const id = exactId();
+    state.counters.update += 1;
+    if (!state.destination[id]) {
+      persistProviderState(state);
+      return { data: { successful: false, error: 'destination identity not found' } };
+    }
+    state.destination[id] = { id, value: String(args.value ?? '') };
+    persistProviderState(state);
+    return { data: structuredClone(state.destination[id]) };
+  }
+  if (slug === 'DESTPROOF_GET_RECORD') {
+    const id = exactId();
+    state.counters.readback += 1;
+    const record = state.destination[id];
+    persistProviderState(state);
+    return { data: record ? [structuredClone(record)] : [] };
+  }
+  if (slug === 'DESTPROOF_GET_SCAN_CURSOR') {
+    const cursor = exactId();
+    state.counters.scan += 1;
+    persistProviderState(state);
+    return { data: [{ id: cursor, kind: 'scan_cursor' }] };
+  }
+  if (slug === 'SOURCEPROOF_UPDATE_RECORD') {
+    const id = exactId();
+    state.counters.sourceMutation += 1;
+    state.source[id] = { id, value: String(args.value ?? '') };
+    persistProviderState(state);
+    return { data: structuredClone(state.source[id]) };
+  }
+  if (slug === 'ORPHANPROOF_APPEND_RECORD') {
+    const id = exactId();
+    state.counters.orphan += 1;
+    state.destination[id] = { id, value: String(args.value ?? '') };
+    persistProviderState(state);
+    throw new Error('response channel closed after provider commit');
+  }
+  if (slug === 'EXACTPROOF_SEND_MESSAGE') {
+    const channel = args.channel;
+    const markdownText = args.markdown_text;
+    if (typeof channel !== 'string' || !channel || typeof markdownText !== 'string' || !markdownText) {
+      persistProviderState(state);
+      return { data: { successful: false, error: 'exact channel and markdown_text are required' } };
+    }
+    state.counters.send += 1;
+    persistProviderState(state);
+    return {
+      data: { receipt_id: `exact-provider-receipt-${state.counters.send}` },
+    };
+  }
+  persistProviderState(state);
+  throw new Error(`unknown fixture provider tool: ${slug}`);
+}
+
+const CAPABILITY_EFFECTS = {
+  DESTPROOF_APPEND_RECORD: 'external_write',
+  DESTPROOF_UPDATE_RECORD: 'external_write',
+  DESTPROOF_GET_RECORD: 'read',
+  DESTPROOF_GET_SCAN_CURSOR: 'read',
+  SOURCEPROOF_UPDATE_RECORD: 'external_write',
+  ORPHANPROOF_APPEND_RECORD: 'external_write',
+  EXACTPROOF_SEND_MESSAGE: 'external_write',
+} as const;
+
+function capabilityDigest(label: string): string {
+  return createHash('sha256').update(label, 'utf8').digest('hex');
+}
+
+function installProviderCapabilities(
+  operationIds: Array<keyof typeof CAPABILITY_EFFECTS>,
+  revision = '1',
+): void {
+  catalog.installHostCapabilityCatalogFactory(null);
+  observations.clearIndependentCapabilityObservations();
+  ports.clearProductionCapabilityPorts();
+  const entries: Array<import('../runtime/harness/host-capability-catalog-factory.js').RegisteredHostCapability> = [];
+  for (const operationId of operationIds) {
+    const family = operationId.split('_')[0]!.toLowerCase();
+    const definitionFingerprint = capabilityDigest(`platform49:${operationId}:schema:${revision}`);
+    const manifest = manifests.attachSemanticContract({
+      version: 1,
+      manifestId: `manifest.platform49.${operationId}.${revision}`,
+      providerKind: 'local_registry',
+      operationId,
+      providerIdentity: `platform49.${family}`,
+      providerVersion: `fixture.${revision}`,
+      operationVersion: revision,
+      definitionFingerprint,
+      effect: CAPABILITY_EFFECTS[operationId],
+      accountId: `account.platform49.${family}`,
+      idempotency: { required: false, policy: 'none' },
+      reconciliation: { supported: false, policy: 'none' },
+      outputContract: { kind: 'records' },
+      purpose: CAPABILITY_EFFECTS[operationId] === 'read' ? 'bounded_read' : 'exact_mutation',
+      acceptedInputKinds: ['scope'],
+      producedOutputKinds: ['records'],
+      applicableDeliverableKinds: ['records'],
+      evidenceContract: { kinds: ['records'], readbackRequired: false },
+      provenance: {
+        issuer: 'platform49.effect.runtime.test',
+        issuedAt: '2026-08-27T00:00:00.000Z',
+        trusted: true,
+      },
+      lifecycle: { state: 'current' },
+      advisoryRoles: CAPABILITY_EFFECTS[operationId] === 'read' ? ['read'] : ['write'],
+    });
+    assert.equal(ports.registerFixtureCapabilityPort(
+      ports.productionPortIdentityFromManifest(manifest),
+      {
+        invoke: async (input) => invokeFixtureProvider(
+          operationId,
+          input.binding.args as Record<string, unknown>,
+        ),
+      },
+    ).ok, true);
+    const entry: import('../runtime/harness/host-capability-catalog-factory.js').RegisteredHostCapability = {
+      capabilityId: `capability.platform49.${operationId}.${revision}`,
+      toolName: operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      effect: manifest.effect,
+      account: manifest.accountId,
+      advisoryRoles: manifest.advisoryRoles,
+      manifestDigest: manifests.capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => { throw new Error('catalog callback cannot own Platform49 provider I/O'); },
+    };
+    entries.push(entry);
+    assert.equal(observations.registerIndependentCapabilityObservation({
+      operationId,
+      accountId: manifest.accountId,
+      definitionFingerprint: manifest.definitionFingerprint,
+      providerVersion: manifest.providerVersion,
+      operationVersion: manifest.operationVersion,
+      observedAt: Date.now(),
+      origin: 'independent',
+      observe: () => ({
+        operationId,
+        accountId: manifest.accountId,
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion,
+        operationVersion: manifest.operationVersion,
+        observedAt: Date.now(),
+      }),
+    }).ok, true);
+  }
+  catalog.installHostCapabilityCatalogFactory(catalog.createHostCapabilityCatalogFactory(entries));
 }
 
 function readRun(runId: string): RunRecord {
@@ -450,43 +507,65 @@ async function raceScheduleAdmission(workflowName: string, receiptId: string) {
   }
 }
 
-function mutationInput(
+function assertCommittedV3Call(
   workflowSlug: string,
   runId: string,
   stepId: string,
   tool: string,
   args: Record<string, unknown>,
-  schemaFingerprint?: string,
-) {
-  return {
-    workflowSlug,
-    runId,
-    stepId,
-    tool,
-    ...(schemaFingerprint ? {
-      schemaFingerprint,
-      expectedArgsDigest: workflowCallExpectedArgsDigest(args),
-    } : {}),
-    account: {},
-    args,
-  };
-}
-
-function assertCommittedMutationPhases(input: ReturnType<typeof mutationInput>): void {
-  const fingerprint = workflowCallMutationFingerprint(input);
-  assert.equal(inspectWorkflowCallMutation(input).status, 'committed');
-  const phaseDir = path.join(
-    WORKFLOWS_DIR,
-    input.workflowSlug,
-    'runs',
-    input.runId,
-    'call-mutations',
-    fingerprint,
+): void {
+  const inspected = inspectWorkflowV3Call(
+    { workflowSlug, runId, stepId },
+    { tool, args },
   );
-  const phases = new Set(readdirSync(phaseDir));
-  for (const phase of ['intent.json', 'started.json', 'receipt.json', 'commit.json']) {
-    assert.equal(phases.has(phase), true, `durable mutation phase ${phase}`);
-  }
+  assert.equal(inspected.status, 'committed', JSON.stringify(inspected));
+  const db = openEventLog();
+  const row = db.prepare(`
+    SELECT activation.activation_id,
+           activation.logical_call_id,
+           binding.effect,
+           authority.authority_kind,
+           authority.state AS authority_state,
+           logical.state AS logical_state,
+           settlement.outcome_kind,
+           settlement.requires_reconciliation,
+           (SELECT COUNT(*)
+              FROM physical_dispatches physical
+             WHERE physical.session_id = activation.session_id
+               AND physical.source_user_seq = activation.source_event_seq
+               AND physical.logical_tool_call_id = activation.logical_call_id
+               AND physical.relation != 'probe'
+               AND physical.execution_site IS NULL) AS provider_crossings,
+           (SELECT COUNT(*)
+              FROM physical_dispatches physical
+             WHERE physical.session_id = activation.session_id
+               AND physical.source_user_seq = activation.source_event_seq
+               AND physical.logical_tool_call_id = activation.logical_call_id
+               AND physical.relation != 'probe'
+               AND physical.execution_site IS NULL
+               AND physical.state = 'returned') AS returned_crossings
+      FROM workflow_node_invocation_activations activation
+      JOIN workflow_v3_call_activation_bindings binding USING (activation_id)
+      JOIN accepted_turn_call_authorities authority
+        ON authority.workflow_activation_id = activation.activation_id
+      JOIN logical_tool_calls logical
+        ON logical.session_id = activation.session_id
+       AND logical.source_user_seq = activation.source_event_seq
+       AND logical.logical_tool_call_id = activation.logical_call_id
+      JOIN logical_call_settlements settlement
+        ON settlement.session_id = activation.session_id
+       AND settlement.source_user_seq = activation.source_event_seq
+       AND settlement.logical_tool_call_id = activation.logical_call_id
+     WHERE activation.workflow_id = ? AND activation.run_id = ? AND activation.node_id = ?
+  `).get(workflowSlug, runId, stepId) as Record<string, unknown> | undefined;
+  assert.ok(row, 'one canonical workflow-v3 call row exists');
+  assert.equal(row.authority_kind, 'workflow_v3_call');
+  assert.equal(row.authority_state, 'closed');
+  assert.equal(row.logical_state, 'settled');
+  assert.ok(row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result');
+  assert.equal(row.requires_reconciliation, 0);
+  assert.equal(row.provider_crossings, 1);
+  assert.equal(row.returned_crossings, 1);
 }
 
 test.after(async () => {
@@ -494,10 +573,10 @@ test.after(async () => {
   _setBeforeWorkflowGraphFinalizationForTests(null);
   _setToolSchemaLoaderForTests(null);
   resetToolSchemaCache();
-  for (const toolkit of ['destproof', 'sourceproof', 'orphanproof', 'exactproof']) {
-    try { await revokeComposioCliDefaultAccountAuthority(toolkit); } catch { /* best effort */ }
-  }
-  try { resetComposioClient(); } catch { /* best effort */ }
+  catalog.installHostCapabilityCatalogFactory(null);
+  observations.clearIndependentCapabilityObservations();
+  ports.clearProductionCapabilityPorts();
+  kernel.setWorkflowCallKernelCrashPointForTests(null);
   try { closeEventLog(); } catch { /* best effort */ }
   try { if (!process.env.CLEM_TEST_KEEP_HOME) rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
@@ -505,16 +584,15 @@ test.after(async () => {
 test('racing schedule admission creates one run, one append, verified readback, checkpoint, report, and terminal', async () => {
   const workflowSlug = 'platform49-new-runtime';
   const receiptId = 'workflow-schedule:v1:platform49-new-runtime:1785000060000';
-  await grantComposioCliDefaultAccountAuthority({
-    toolkit: 'destproof',
-    label: 'sanitized Platform 49 destination',
-    grantedBy: 'test',
-  });
+  installProviderCapabilities([
+    'DESTPROOF_APPEND_RECORD',
+    'DESTPROOF_GET_RECORD',
+  ]);
   writeWorkflow(workflowSlug, {
     name: workflowSlug,
     description: 'Append one new opaque item, verify it, then checkpoint it.',
     enabled: true,
-    trigger: { manual: true },
+    trigger: { manual: true, schedule: '1 9 * * *', timezone: 'UTC' },
     steps: [
       {
         id: 'append_destination',
@@ -586,13 +664,13 @@ test('racing schedule admission creates one run, one append, verified readback, 
   assert.equal(Object.hasOwn(after.destination, String(Number(NEW_ITEM_ID))), false, 'numeric normalization never creates a second identity');
   assert.deepEqual([...readSeenItemKeys(workflowSlug, 'checkpoint_verified_item')], [NEW_ITEM_ID]);
 
-  assertCommittedMutationPhases(mutationInput(
+  assertCommittedV3Call(
     workflowSlug,
     runId,
     'append_destination',
     'DESTPROOF_APPEND_RECORD',
     { item_id: NEW_ITEM_ID, value: 'new-item-value' },
-  ));
+  );
 
   await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
   const afterReplayTick = readProviderState();
@@ -603,11 +681,12 @@ test('racing schedule admission creates one run, one append, verified readback, 
 
 test('a no-op poll performs no mutation and checkpoints one exact scan cursor', async () => {
   const workflowSlug = 'platform49-noop-runtime';
+  installProviderCapabilities(['DESTPROOF_GET_SCAN_CURSOR']);
   writeWorkflow(workflowSlug, {
     name: workflowSlug,
     description: 'Read a no-change scan cursor and checkpoint the verified cursor.',
     enabled: true,
-    trigger: { manual: true },
+    trigger: { manual: true, schedule: '1 9 * * *', timezone: 'UTC' },
     steps: [
       {
         id: 'scan_no_changes',
@@ -671,11 +750,15 @@ test('a no-op poll performs no mutation and checkpoints one exact scan cursor', 
 
 test('a changed record at item 499 updates its exact destination identity and never appends', async () => {
   const workflowSlug = 'platform49-final-page-update-runtime';
+  installProviderCapabilities([
+    'DESTPROOF_UPDATE_RECORD',
+    'DESTPROOF_GET_RECORD',
+  ]);
   writeWorkflow(workflowSlug, {
     name: workflowSlug,
     description: 'Update the changed item on the final source page, verify, and checkpoint it.',
     enabled: true,
-    trigger: { manual: true },
+    trigger: { manual: true, schedule: '1 9 * * *', timezone: 'UTC' },
     steps: [
       {
         id: 'update_destination',
@@ -730,24 +813,24 @@ test('a changed record at item 499 updates its exact destination identity and ne
     value: 'changed-at-record-499',
   });
   assert.deepEqual([...readSeenItemKeys(workflowSlug, 'checkpoint_updated_item')], [FINAL_PAGE_ITEM_ID]);
-  assertCommittedMutationPhases(mutationInput(
+  assertCommittedV3Call(
     workflowSlug,
     queued.id!,
     'update_destination',
     'DESTPROOF_UPDATE_RECORD',
     { item_id: FINAL_PAGE_ITEM_ID, value: 'changed-at-record-499' },
-  ));
+  );
 });
 
 test('unauthorized source dispatch stays zero while an authorized sibling commits once; same-run resume never repeats it', async () => {
   const workflowSlug = 'platform49-source-authority-runtime';
   const destinationId = '1785000000.000777';
-  await revokeComposioCliDefaultAccountAuthority('sourceproof');
+  installProviderCapabilities(['DESTPROOF_APPEND_RECORD']);
   writeWorkflow(workflowSlug, {
     name: workflowSlug,
     description: 'Prove destination authority is independent from prohibited source mutation authority.',
     enabled: true,
-    trigger: { manual: true },
+    trigger: { manual: true, schedule: '1 9 * * *', timezone: 'UTC' },
     steps: [
       {
         id: 'write_destination',
@@ -792,24 +875,23 @@ test('unauthorized source dispatch stays zero while an authorized sibling commit
     1,
     'one user-visible capability intervention is durable',
   );
-  assertCommittedMutationPhases(mutationInput(
+  assertCommittedV3Call(
     workflowSlug,
     queued.id!,
     'write_destination',
     'DESTPROOF_APPEND_RECORD',
     { item_id: destinationId, value: 'authorized-destination-value' },
-  ));
-  assert.equal(workflowCallMutationSlotHasLedger({
+  );
+  assert.equal(inspectWorkflowV3Call({
     workflowSlug,
     runId: queued.id!,
     stepId: 'mutate_source',
-  }), false, 'a pre-dispatch gateway block creates no false started receipt');
+  }).status, 'missing', 'a pre-dispatch capability block creates no false v3 activation');
 
-  await grantComposioCliDefaultAccountAuthority({
-    toolkit: 'sourceproof',
-    label: 'sanitized Platform 49 source',
-    grantedBy: 'test',
-  });
+  installProviderCapabilities([
+    'DESTPROOF_APPEND_RECORD',
+    'SOURCEPROOF_UPDATE_RECORD',
+  ]);
   assert.equal(resumeCapabilityBlockedWorkflowRun(queued.id!), true);
   await drainUntil(queued.id!, (run) => run.status === 'completed');
   assertOneSuccessfulTerminal(workflowSlug, queued.id!);
@@ -821,28 +903,24 @@ test('unauthorized source dispatch stays zero while an authorized sibling commit
     id: FINAL_PAGE_ITEM_ID,
     value: 'authorized-after-resume',
   });
-  assertCommittedMutationPhases(mutationInput(
+  assertCommittedV3Call(
     workflowSlug,
     queued.id!,
     'mutate_source',
     'SOURCEPROOF_UPDATE_RECORD',
     { item_id: FINAL_PAGE_ITEM_ID, value: 'authorized-after-resume' },
-  ));
+  );
 });
 
 test('provider commit with a lost response becomes ambiguous and is never blindly re-dispatched', async () => {
   const workflowSlug = 'platform49-orphan-runtime';
   const orphanId = '1785000000.000888';
-  await grantComposioCliDefaultAccountAuthority({
-    toolkit: 'orphanproof',
-    label: 'sanitized Platform 49 uncertain provider',
-    grantedBy: 'test',
-  });
+  installProviderCapabilities(['ORPHANPROOF_APPEND_RECORD']);
   writeWorkflow(workflowSlug, {
     name: workflowSlug,
     description: 'Refuse a second mutation when the provider response is lost after commit.',
     enabled: true,
-    trigger: { manual: true },
+    trigger: { manual: true, schedule: '1 9 * * *', timezone: 'UTC' },
     steps: [{
       id: 'append_uncertain',
       prompt: 'Append once through the uncertain provider.',
@@ -860,114 +938,67 @@ test('provider commit with a lost response becomes ambiguous and is never blindl
     triggerReceiptId: 'workflow-schedule:v1:platform49-orphan-runtime:1785000360000',
   });
   assert.equal(queued.status, 'queued', queued.message);
-  const blocked = await drainUntil(queued.id!, (run) => run.status === 'blocked_mutation');
-  assert.equal(blocked.terminalOutcome, undefined);
-  assert.equal(blocked.reportBack, undefined);
-  assert.equal(blocked.mutationBlock?.workflowSlug, workflowSlug);
-  assert.equal(blocked.mutationBlock?.stepId, 'append_uncertain');
-  assert.equal(blocked.mutationBlock?.tool, 'ORPHANPROOF_APPEND_RECORD');
-  assert.equal(blocked.mutationBlock?.state, 'awaiting_reconciliation');
-  assert.equal(blocked.mutationBlock?.providerRedispatched, false);
+  const held = await drainUntil(queued.id!, (run) => (
+    run.status === 'running'
+    && run.heldExecution?.stepId === 'append_uncertain'
+    && run.heldExecution?.hold?.wake === 'recovery'
+  ));
+  assert.equal(held.terminalOutcome, undefined);
+  assert.equal(held.reportBack, undefined);
+  assert.equal(held.heldExecution?.sourceStatus, 'dispatched');
+  assert.equal(held.heldExecution?.hold?.owner, 'host');
+  assert.equal(held.heldExecution?.hold?.reason, 'recovery_pending');
   assert.equal(terminalJournalCount(workflowSlug, queued.id!), 0);
 
   const afterFailure = readProviderState();
   assert.equal(afterFailure.counters.orphan - before.counters.orphan, 1, 'provider boundary crossed once');
   assert.deepEqual(afterFailure.destination[orphanId], { id: orphanId, value: 'may-have-landed' });
-  const input = mutationInput(
-    workflowSlug,
-    queued.id!,
-    'append_uncertain',
-    'ORPHANPROOF_APPEND_RECORD',
-    { item_id: orphanId, value: 'may-have-landed' },
+  const uncertain = inspectWorkflowV3Call(
+    { workflowSlug, runId: queued.id!, stepId: 'append_uncertain' },
+    {
+      tool: 'ORPHANPROOF_APPEND_RECORD',
+      args: { item_id: orphanId, value: 'may-have-landed' },
+    },
   );
-  assert.equal(inspectWorkflowCallMutation(input).status, 'ambiguous');
-
-  let blindRedispatches = 0;
-  await assert.rejects(
-    executeWorkflowCallMutation(input, async () => {
-      blindRedispatches += 1;
-      return { duplicate: true };
-    }),
-    (error: unknown) => error instanceof WorkflowCallMutationAmbiguousError,
-  );
-  assert.equal(blindRedispatches, 0, 'the ambiguous started boundary refuses before provider invocation');
-  assert.equal(resumeMutationBlockedWorkflowRun(queued.id!), false, 'an uncommitted started slot stays parked');
-  assert.equal(reapMutationBlockedRuns(), 0, 'the ledger-only reaper does not invent reconciliation');
+  assert.equal(uncertain.status, 'uncertain', JSON.stringify(uncertain));
+  const durable = openEventLog().prepare(`
+    SELECT settlement.outcome_kind,
+           settlement.requires_reconciliation,
+           authority.state AS authority_state,
+           physical.state AS physical_state
+      FROM workflow_node_invocation_activations activation
+      JOIN accepted_turn_call_authorities authority
+        ON authority.workflow_activation_id = activation.activation_id
+      JOIN logical_call_settlements settlement
+        ON settlement.session_id = activation.session_id
+       AND settlement.source_user_seq = activation.source_event_seq
+       AND settlement.logical_tool_call_id = activation.logical_call_id
+      JOIN physical_dispatches physical
+        ON physical.session_id = activation.session_id
+       AND physical.source_user_seq = activation.source_event_seq
+       AND physical.logical_tool_call_id = activation.logical_call_id
+       AND physical.relation != 'probe'
+     WHERE activation.workflow_id = ? AND activation.run_id = ? AND activation.node_id = ?
+  `).get(workflowSlug, queued.id!, 'append_uncertain') as Record<string, unknown>;
+  assert.equal(durable.outcome_kind, 'uncertain_write');
+  assert.equal(durable.requires_reconciliation, 1);
+  assert.equal(durable.authority_state, 'open');
+  assert.equal(durable.physical_state, 'threw');
+  assert.deepEqual(assessWorkflowV3RunMutationRequeue({ workflowSlug, runId: queued.id! }).blocking.map(
+    (item) => ({ stepId: item.stepId, status: item.status }),
+  ), [{ stepId: 'append_uncertain', status: 'uncertain' }]);
 
   const runCountBeforeRequeue = runFiles().length;
   const requeue = requeueWorkflowFromRun(queued.id!);
   assert.equal(requeue.status, 'ambiguous');
-  assert.match(requeue.message, /no overlapping rerun was queued/i);
+  assert.match(requeue.message, /not terminal|no overlapping rerun was queued/i);
   assert.equal(runFiles().length, runCountBeforeRequeue);
 
   await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
   const afterReplayTick = readProviderState();
   assert.equal(afterReplayTick.counters.orphan, afterFailure.counters.orphan);
   assert.equal(terminalJournalCount(workflowSlug, queued.id!), 0);
-  assert.equal(
-    workflowNotifications(queued.id!).filter((item) => item.id === `workflow-${queued.id}-mutation-review-append_uncertain`).length,
-    1,
-    'one needs-review notification without a false terminal',
-  );
-
-  // Positive reconciliation: an out-of-band verifier has durably committed
-  // the exact same-run slot. The ledger-only reaper may now readmit it, and the
-  // production call node replays without invoking the uncertain provider.
-  const reconciledWorkflowSlug = 'platform49-reconciled-runtime';
-  writeWorkflow(reconciledWorkflowSlug, {
-    name: reconciledWorkflowSlug,
-    description: 'Resume only from a committed same-run mutation receipt.',
-    enabled: true,
-    trigger: { manual: true },
-    steps: [{
-      id: 'append_reconciled',
-      prompt: 'Replay the already reconciled mutation.',
-      sideEffect: 'write',
-      call: {
-        tool: 'ORPHANPROOF_APPEND_RECORD',
-        args: { item_id: orphanId, value: 'may-have-landed' },
-      },
-    }],
-  });
-  const reconciled = queueWorkflowRun(reconciledWorkflowSlug, {}, { source: 'manual' });
-  assert.equal(reconciled.status, 'queued', reconciled.message);
-  const reconciledInput = mutationInput(
-    reconciledWorkflowSlug,
-    reconciled.id!,
-    'append_reconciled',
-    'ORPHANPROOF_APPEND_RECORD',
-    { item_id: orphanId, value: 'may-have-landed' },
-  );
-  await executeWorkflowCallMutation(reconciledInput, async () => ({
-    successful: true,
-    data: { receipt_id: 'out-of-band-reconciled-receipt' },
-  }));
-  const reconciledFingerprint = workflowCallMutationFingerprint(reconciledInput);
-  const reconciledPath = path.join(WORKFLOW_RUNS_DIR, `${reconciled.id}.json`);
-  const reconciledRecord = readRun(reconciled.id!);
-  writeFileSync(reconciledPath, JSON.stringify({
-    ...reconciledRecord,
-    status: 'blocked_mutation',
-    mutationBlock: {
-      workflowSlug: reconciledWorkflowSlug,
-      stepId: 'append_reconciled',
-      tool: 'ORPHANPROOF_APPEND_RECORD',
-      fingerprint: reconciledFingerprint,
-      blockedAt: new Date().toISOString(),
-      state: 'awaiting_reconciliation',
-      providerRedispatched: false,
-    },
-  }, null, 2), 'utf-8');
-  const beforeLedgerResume = readProviderState();
-  assert.equal(reapMutationBlockedRuns(), 1);
-  assert.equal(readRun(reconciled.id!).status, 'running');
-  await drainUntil(reconciled.id!, (run) => run.status === 'completed');
-  assert.equal(
-    readProviderState().counters.orphan,
-    beforeLedgerResume.counters.orphan,
-    'committed same-run reconciliation replays with zero provider redispatch',
-  );
-  assertOneSuccessfulTerminal(reconciledWorkflowSlug, reconciled.id!);
+  assert.equal(workflowNotifications(queued.id!).filter((item) => item.id.includes('-completed')).length, 0);
 });
 
 test('an exact scheduled direct send crosses once and terminal truth redeems only host commit evidence', async () => {
@@ -984,16 +1015,20 @@ test('an exact scheduled direct send crosses once and terminal truth redeems onl
       markdown_text: { type: 'string' },
     },
   }, Date.now());
-  await grantComposioCliDefaultAccountAuthority({
-    toolkit: 'exactproof',
-    label: 'sanitized exact-send provider',
-    grantedBy: 'test',
-  });
+  installProviderCapabilities([
+    'DESTPROOF_APPEND_RECORD',
+    'DESTPROOF_UPDATE_RECORD',
+    'DESTPROOF_GET_RECORD',
+    'DESTPROOF_GET_SCAN_CURSOR',
+    'SOURCEPROOF_UPDATE_RECORD',
+    'ORPHANPROOF_APPEND_RECORD',
+    'EXACTPROOF_SEND_MESSAGE',
+  ]);
   writeWorkflow(workflowSlug, {
     // Deliberately differs from the catalog/directory slug. The mutation ledger
     // and terminal redemption must use workflowSlug, never this display text.
     name: displayName,
-    description: 'Render one deterministic update and send it to one fixed destination.',
+    description: 'Render one reviewed update and send it to one fixed destination.',
     enabled: true,
     allowSends: true,
     trigger: { manual: true, schedule: '0 9 * * 1-5', timezone: 'UTC' },
@@ -1002,12 +1037,9 @@ test('an exact scheduled direct send crosses once and terminal truth redeems onl
         id: 'render_message',
         prompt: '',
         sideEffect: 'read',
-        deterministic: {
-          runner: 'render-message.mjs',
-          source: `
-process.stdin.resume();
-process.stdin.on('end', () => process.stdout.write(JSON.stringify({ summary: ${JSON.stringify(exactBody)} })));
-`,
+        transform: {
+          version: 1,
+          expression: { op: 'literal', value: { summary: exactBody } },
         },
         output: {
           type: 'object',
@@ -1094,61 +1126,21 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ summary: ${J
   assert.equal(publicEvidence.includes('exact-provider-receipt-'), false, 'raw provider receipt remains ledger-only');
   assert.equal(publicEvidence.includes(destination), false, 'public host evidence contains only the target digest');
   assert.equal(publicEvidence.includes(exactBody), false, 'public host evidence contains only the payload digest');
-  assertCommittedMutationPhases(mutationInput(
+  assertCommittedV3Call(
     workflowSlug,
     queuedRunId,
     'deliver_message',
     tool,
     { channel: destination, markdown_text: exactBody },
-    liveComposioSchemaFingerprint(tool),
-  ));
+  );
 
-  // Simulate a daemon crash after the provider result + durable commit but
-  // before the step completion journal existed. The real production call node
-  // must replay that slot and project evidence without a second crossing.
-  const beforeCrashReplay = readProviderState();
-  const crashReplay = queueWorkflowRun(workflowSlug, {}, {
-    source: 'schedule',
-    workflowSlug,
-    triggerReceiptId: 'workflow-schedule:v1:platform49-exact-scheduled-send-runtime:1785000540000',
-  });
-  assert.equal(crashReplay.status, 'queued', crashReplay.message);
-  const crashArgs = { channel: destination, markdown_text: exactBody };
-  const crashMutation = mutationInput(
-    workflowSlug,
-    crashReplay.id!,
-    'deliver_message',
-    tool,
-    crashArgs,
-    liveComposioSchemaFingerprint(tool),
-  );
-  await executeWorkflowCallMutation(
-    crashMutation,
-    () => executeComposioCliTool(tool, crashArgs),
-  );
-  assert.equal(readProviderState().counters.send - beforeCrashReplay.counters.send, 1);
-  const realDateNow = Date.now;
-  Date.now = () => realDateNow() + (31 * 60_000);
-  _clearToolSchemaCacheForTest();
-  try {
-    await drainUntil(crashReplay.id!, (run) => run.status === 'completed');
-  } finally {
-    Date.now = realDateNow;
-  }
-  assertOneSuccessfulTerminal(workflowSlug, crashReplay.id!);
+  closeEventLog();
+  await processWorkflowRuns({ respond: async () => ({ text: 'must not run' }) } as never);
   assert.equal(
-    readProviderState().counters.send - beforeCrashReplay.counters.send,
-    1,
-    'same-run crash replay projects the committed result with zero duplicate provider sends',
+    readProviderState().counters.send,
+    after.counters.send,
+    'a closed/reopened durable store and later drain do not repeat the settled send',
   );
-  rememberToolSchema(tool, {
-    type: 'object',
-    required: ['channel', 'markdown_text'],
-    properties: {
-      channel: { type: 'string' },
-      markdown_text: { type: 'string' },
-    },
-  }, Date.now());
 
   // A second real run crosses once, then a deterministic pre-terminal race
   // replaces only the journal projection with forged evidence. Output-contract
@@ -1246,11 +1238,11 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ summary: ${J
       false,
       'schema preflight parks before the exact send lifecycle begins',
     );
-    assert.equal(workflowCallMutationSlotHasLedger({
+    assert.equal(inspectWorkflowV3Call({
       workflowSlug,
       runId: schemaOutage.id!,
       stepId: 'deliver_message',
-    }), false, 'proven-pre-dispatch schema park owns no mutation intent or receipt');
+    }).status, 'missing', 'proven-pre-dispatch schema park owns no v3 activation');
     assert.equal(
       readProviderState().counters.send - beforeSchemaOutage.counters.send,
       0,
@@ -1261,7 +1253,7 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ summary: ${J
         event.kind === 'step_completed' && event.stepId === 'render_message'
       )).length,
       1,
-      'prior deterministic completion is preserved while parked',
+      'prior transform completion is preserved while parked',
     );
 
     _setToolSchemaLoaderForTests(async (requested) => {
@@ -1321,69 +1313,4 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ summary: ${J
     'manual occurrence is refused before provider I/O',
   );
 
-  // A provider-boundary schema change after the runner captured its exact
-  // fingerprint remains a nonterminal dependency pause. Repeat the mismatch
-  // across an automatic same-run retry to prove it never becomes an
-  // uncertain write and never calls the physical provider.
-  rememberToolSchema(tool, {
-    type: 'object',
-    required: ['channel', 'markdown_text'],
-    properties: {
-      channel: { type: 'string' },
-      markdown_text: { type: 'string' },
-    },
-  }, Date.now());
-  const schemaMismatch = queueWorkflowRun(workflowSlug, {}, {
-    source: 'schedule',
-    workflowSlug,
-    triggerReceiptId: 'workflow-schedule:v1:platform49-exact-scheduled-send-runtime:1785000660000',
-  });
-  assert.equal(schemaMismatch.status, 'queued', schemaMismatch.message);
-  appendWorkflowEventDurably(workflowSlug, schemaMismatch.id!, {
-    kind: 'step_completed',
-    stepId: 'render_message',
-    output: { summary: exactBody },
-  });
-  let schemaRevision = 0;
-  _setBeforeWorkflowCallGatewayForTests(({ workflowName, runId, stepId, tool: requestedTool }) => {
-    if (workflowName !== workflowSlug || runId !== schemaMismatch.id || stepId !== 'deliver_message') return;
-    schemaRevision += 1;
-    assert.equal(requestedTool, tool);
-    rememberToolSchema(tool, {
-      type: 'object',
-      required: ['channel', 'markdown_text'],
-      properties: {
-        channel: { type: 'string' },
-        markdown_text: { type: 'string' },
-        [`provider_revision_${schemaRevision}`]: { type: 'string' },
-      },
-    }, Date.now());
-  });
-  const beforeSchemaMismatch = readProviderState();
-  try {
-    const firstPark = await drainUntil(schemaMismatch.id!, (run) => run.status === 'blocked_capability');
-    assert.equal(firstPark.capabilityBlock?.reason, 'exact_schema_boundary_mismatch');
-    assert.equal(firstPark.capabilityBlock?.provenNoDispatch, true);
-    assert.equal(firstPark.terminalOutcome, undefined);
-    assert.equal(workflowCallMutationSlotHasLedger({
-      workflowSlug,
-      runId: schemaMismatch.id!,
-      stepId: 'deliver_message',
-    }), false, 'boundary mismatch occurs before mutation intent/started');
-    assert.equal(reapCapabilityBlockedRuns(Date.now() + 3_600_000), 1);
-    const secondPark = await drainUntil(schemaMismatch.id!, (run) => (
-      run.status === 'blocked_capability' && run.capabilityBlock?.reason === 'exact_schema_boundary_mismatch'
-    ));
-    assert.equal(secondPark.capabilityBlock?.state, 'blocked');
-    assert.equal(secondPark.terminalOutcome, undefined);
-    assert.equal(secondPark.reportBack, undefined);
-    assert.equal(terminalJournalCount(workflowSlug, schemaMismatch.id!), 0);
-    assert.equal(
-      readProviderState().counters.send - beforeSchemaMismatch.counters.send,
-      0,
-      'persistent boundary mismatch remains parked with zero physical crossings',
-    );
-  } finally {
-    _setBeforeWorkflowCallGatewayForTests(null);
-  }
 });

@@ -133,6 +133,33 @@ test('an exact source binding renders its work_call carrier even when advisory c
   assert.match(card, /Do not rediscover it/);
 });
 
+test('one warm capability stays compact without weakening its advisory boundary', () => {
+  const card = renderCapabilityCandidateCard({
+    candidates: [{
+      kind: 'composio',
+      identifier: 'RESTAURANTS_SEARCH',
+      intent: 'find restaurants',
+      klass: 'capability_only',
+      via: 'exact',
+      score: 1,
+      accountIdentity: 'conn-restaurants',
+      schemaAuthority: 'live',
+      requiredFields: ['location', 'category', 'limit'],
+      roleKey: 'clause-0:read',
+    }],
+    requirements: [],
+    matches: [],
+    pinnedTools: [],
+    semanticApplied: false,
+  } as never);
+
+  assert.ok(Buffer.byteLength(card, 'utf8') <= 512, 'one warm path must fit in a small volatile card');
+  assert.match(card, /nothing here is pre-authorized/);
+  assert.match(card, /Intent is metadata, never a tool name/);
+  assert.match(card, /Live schema requires: location, category, limit/);
+  assert.match(card, /use `composio_execute_tool` with exact `tool_slug`/);
+});
+
 test('every resolved requirement descriptor carries its own current contract', async () => {
   const schemas: Array<[string, string[]]> = [
     ['SOURCEHUB_FETCH_RECORDS', ['query', 'limit']],

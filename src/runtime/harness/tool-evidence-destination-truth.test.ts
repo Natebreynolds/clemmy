@@ -14,11 +14,18 @@ import path from 'node:path';
 import os from 'node:os';
 
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'destination-truth-test-'));
+process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const { appendEvent, createSession } = await import('./eventlog.js');
+const graphCompiler = await import('../graph/turn-graph-compiler.js');
+const graphShadow = await import('../graph/turn-graph-shadow.js');
+const proactivity = await import('../../agents/proactivity-policy.js');
+const workAdmission = await import('./expected-work-admission.js');
+const workContracts = await import('./expected-work-contract.js');
 const {
   freshExternalWriteRequirement,
   objectiveRequiresFreshExternalWrite,
@@ -58,6 +65,87 @@ function sessionWith(effects: Array<string | { type: string }>): { sessionId: st
     });
   }
   return { sessionId: sess.id, sourceUserSeq: source.seq };
+}
+
+let structuralSerial = 0;
+
+function generatedOpaqueName(seed: number): string {
+  const alphabet = 'QZXJKVBP';
+  let remaining = seed;
+  const uniquePrefix = Array.from({ length: 4 }, () => {
+    const character = alphabet[remaining % alphabet.length];
+    remaining = Math.floor(remaining / alphabet.length);
+    return character;
+  }).join('');
+  return `${uniquePrefix}VQBKZ`;
+}
+
+function structuralChatSource(input: {
+  text: string;
+  graphEffect: 'external_write' | 'local_write' | 'unknown';
+  contractEffect?: 'external_write' | 'admin' | 'local_write';
+}): { sessionId: string; sourceUserSeq: number } {
+  const session = createSession({
+    id: `destination-truth-structural-${++structuralSerial}`,
+    kind: 'chat',
+  });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: input.text },
+  });
+  const compiled = graphCompiler.compileTurnGraph({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    input: input.text,
+    sessionKind: 'chat',
+    surface: 'discord',
+    policy: graphCompiler.snapshotTurnGraphPolicy(proactivity.getProactivityPolicySnapshot()),
+    signals: {
+      intent: { intent: 'action', confidence: 1, reasons: ['generated_causal_cohort'] },
+      externalEffect: {
+        requested: input.graphEffect === 'external_write',
+        kinds: [],
+      },
+    },
+  });
+  assert.equal(compiled.validation.ok, true, compiled.validation.errors.join('; '));
+  assert.equal(compiled.graph.effectCeiling, input.graphEffect);
+  const recorded = graphShadow.recordTurnGraphShadowChecked({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    surface: 'discord',
+    graph: compiled.graph,
+  });
+  assert.equal(recorded.ok, true, recorded.ok ? '' : recorded.reason);
+
+  if (input.contractEffect) {
+    const activated = workAdmission.activateActionExpectedWork({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+    });
+    assert.ok(
+      activated.status === 'activated' || activated.status === 'replayed',
+      JSON.stringify(activated),
+    );
+    const frozen = workContracts.freezeActionExpectedWorkContract({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      proposal: {
+        version: 1,
+        operations: [{
+          id: `generated-requirement-${structuralSerial}`,
+          effect: input.contractEffect,
+          dependsOn: [],
+          dataFrom: [],
+          cardinality: { kind: 'once' },
+        }],
+        universes: [],
+      },
+    });
+    assert.ok(frozen.status === 'fixed' || frozen.status === 'replayed', JSON.stringify(frozen));
+  }
+  return { sessionId: session.id, sourceUserSeq: source.seq };
 }
 
 test('FAILS-ON-OLD-CODE: the live text still classifies external by text alone', () => {
@@ -138,6 +226,105 @@ test('a missing session or ledger error falls to text, never throws, never waive
   });
   assert.equal(requirement.basis, 'objective_text');
   assert.equal(requirement.required, true);
+});
+
+test('generated ordinary-chat cohort: opaque admitted external writes survive zero calls', () => {
+  for (let seed = 1; seed <= 12; seed += 1) {
+    const destination = generatedOpaqueName(seed);
+    const objectiveText = `Update the accepted record inside ${destination}.`;
+    assert.equal(
+      objectiveRequiresFreshExternalWrite(objectiveText),
+      false,
+      `${destination}: precondition — no provider vocabulary recognizes the generated destination`,
+    );
+    const source = structuralChatSource({
+      text: objectiveText,
+      graphEffect: 'external_write',
+    });
+    assert.deepEqual(freshExternalWriteRequirement({
+      objectiveText,
+      ...source,
+    }), {
+      required: true,
+      basis: 'accepted_graph',
+      touchedTotal: 0,
+      touchedExternal: 0,
+    }, destination);
+  }
+});
+
+test('an admitted external outcome dominates an observed local side task', () => {
+  const destination = generatedOpaqueName(41);
+  const objectiveText = `Update the accepted record inside ${destination}.`;
+  const source = structuralChatSource({
+    text: objectiveText,
+    graphEffect: 'external_write',
+    contractEffect: 'external_write',
+  });
+  appendEvent({
+    sessionId: source.sessionId,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: source.sourceUserSeq,
+      tool: 'write_file',
+      callId: 'local-side-task',
+      canonicalCallId: 'local-side-task',
+      accounting: 'top_level',
+      effect: 'local_write',
+    },
+  });
+  assert.deepEqual(freshExternalWriteRequirement({
+    objectiveText,
+    ...source,
+  }), {
+    required: true,
+    basis: 'expected_work',
+    touchedTotal: 1,
+    touchedExternal: 0,
+  });
+});
+
+test('generated local/text artifacts never acquire an external receipt requirement', () => {
+  for (let seed = 60; seed < 72; seed += 1) {
+    const subject = generatedOpaqueName(seed);
+    const objectiveText = `Create a local text file comparing ${subject} records; keep it on this machine.`;
+    assert.equal(objectiveRequiresFreshExternalWrite(objectiveText), false, subject);
+    const source = structuralChatSource({
+      text: objectiveText,
+      graphEffect: 'local_write',
+      contractEffect: 'local_write',
+    });
+    assert.deepEqual(freshExternalWriteRequirement({
+      objectiveText,
+      ...source,
+    }), {
+      required: false,
+      basis: 'objective_text',
+      touchedTotal: 0,
+      touchedExternal: 0,
+    }, subject);
+  }
+});
+
+test('an under-scoped non-external proposal cannot waive the zero-call text safety floor', () => {
+  const objectiveText = 'Send the accepted payload to the release owner now.';
+  assert.equal(objectiveRequiresFreshExternalWrite(objectiveText), true);
+  const source = structuralChatSource({
+    text: objectiveText,
+    graphEffect: 'unknown',
+    contractEffect: 'local_write',
+  });
+  assert.deepEqual(freshExternalWriteRequirement({
+    objectiveText,
+    ...source,
+  }), {
+    required: true,
+    basis: 'objective_text',
+    touchedTotal: 0,
+    touchedExternal: 0,
+  });
 });
 
 test.after(() => {

@@ -21,7 +21,6 @@ import { processMonitors } from '../agents/monitors.js';
 import { getProactivityPolicySnapshot } from '../agents/proactivity-policy.js';
 import { processProactiveBriefs } from '../agents/proactive-briefs.js';
 import { ensureSeedTemplates, processProactiveCheckIns } from '../agents/check-in-templates.js';
-import { reconcileWorkerBatchDurableOwnershipAtBoot } from '../agents/worker-batch-execution.js';
 import { MODELS, getActiveAuthMode, getByoBackendConfig, getModelRoutingMode, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { warmCapabilityRetrieval } from '../runtime/read-path/capability-candidates.js';
@@ -66,6 +65,7 @@ import {
   installAutomationPilotProductionConvergenceListener,
   reconcileAutomationPilotProductionConvergence,
 } from '../execution/automation-pilot-production-convergence.js';
+import { reconcileAutomationPartitionRuns } from '../execution/automation-partition-authority.js';
 import {
   registerWorkflowRunDrainKick,
 } from '../execution/workflow-origin-group.js';
@@ -107,6 +107,7 @@ import {
   getLatestRunAttemptByRunId,
   interruptOrphanedRunAttemptsAtBoot,
 } from '../runtime/harness/eventlog.js';
+import { reconcileTerminalRunAttemptDispatchLeasesAtBoot } from '../runtime/harness/dispatch-lease.js';
 import { reconcileHistoricalHarnessStateOnBoot } from '../runtime/harness/historical-state-reconciler.js';
 import { reconcileDormantTerminalWorkSessions } from '../runtime/harness/session-reconcile.js';
 import { withHarnessRunContext, ToolCallsCounter } from '../runtime/harness/brackets.js';
@@ -177,6 +178,20 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
+
+function reconcileAutomationPartitionsOnDaemon(context: string): void {
+  try {
+    const reconciled = reconcileAutomationPartitionRuns();
+    if (reconciled.admitted > 0 || reconciled.replayed > 0 || reconciled.failed > 0) {
+      logger.info(reconciled, `Reconciled normalized automation partitions ${context}`);
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      `Normalized automation partition reconciliation ${context} failed`,
+    );
+  }
+}
 const STATE_FILE = path.join(path.dirname(CRON_RUNS_DIR), 'daemon-state.json');
 
 let deliverNotificationToDestinationImpl: typeof deliverNotificationToDestination =
@@ -188,6 +203,25 @@ export function _setNotificationDeliveryForTests(
   fn: typeof deliverNotificationToDestination | null,
 ): void {
   deliverNotificationToDestinationImpl = fn ?? deliverNotificationToDestination;
+}
+
+type CronResponseExecutor = (
+  assistant: ClementineAssistant,
+  request: Parameters<typeof respondPreferHarness>[1],
+) => Promise<AssistantResponse>;
+
+const defaultCronResponseExecutor: CronResponseExecutor = (assistant, request) =>
+  respondPreferHarness('cron', request, (nextRequest) => assistant.respond(nextRequest));
+
+let cronResponseExecutor: CronResponseExecutor = defaultCronResponseExecutor;
+
+/** Narrow worker-response seam for cron lifecycle tests. Production always
+ * retains the canonical harness bridge; disabling a lane never restores the
+ * retired legacy executor. */
+export function _testOnly_setCronResponseExecutor(
+  executor: CronResponseExecutor | null,
+): void {
+  cronResponseExecutor = executor ?? defaultCronResponseExecutor;
 }
 
 interface CronJobRecord {
@@ -545,6 +579,50 @@ function cronRouteMetadata(response: Pick<AssistantResponse, 'route' | 'raw'>): 
   };
 }
 
+interface CronHeldNonterminal {
+  version: 1;
+  kind: 'held';
+  terminal: false;
+  stoppedReason: 'in-progress';
+  ownership: {
+    owner: 'host';
+    wake: 'peer' | 'recovery';
+    reason: 'peer_in_progress' | 'recovery_pending';
+  } | null;
+}
+
+/** Provider-neutral projection of a bridge-owned nonterminal. The stop reason
+ * is the control signal; raw acknowledgement prose is never classified. */
+function cronHeldNonterminal(
+  response: Pick<AssistantResponse, 'stoppedReason' | 'raw'>,
+): CronHeldNonterminal | null {
+  if (response.stoppedReason !== 'in-progress') return null;
+  const raw = response.raw && typeof response.raw === 'object' && !Array.isArray(response.raw)
+    ? response.raw as Record<string, unknown>
+    : null;
+  const candidate = raw?.typedExecution;
+  const hold = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+    ? candidate as Record<string, unknown>
+    : null;
+  const ownership: CronHeldNonterminal['ownership'] = hold?.owner === 'host'
+    && (hold.wake === 'peer' || hold.wake === 'recovery')
+    && ((hold.wake === 'peer' && hold.reason === 'peer_in_progress')
+      || (hold.wake === 'recovery' && hold.reason === 'recovery_pending'))
+    ? {
+        owner: hold.owner,
+        wake: hold.wake,
+        reason: hold.reason,
+      }
+    : null;
+  return {
+    version: 1,
+    kind: 'held',
+    terminal: false,
+    stoppedReason: 'in-progress',
+    ownership,
+  };
+}
+
 // Per-cron wall-clock budget. Unleashed/background jobs are allowed
 // more headroom because they're often the ones doing real research
 // (proposal briefs, audits). job.max_hours is honored if set; otherwise
@@ -622,6 +700,7 @@ async function runCronJob(
     ? `cron-occurrence:v1:${job.name}:${Math.floor(identity.occurrenceAtMs / 60_000) * 60_000}`
     : `cron-manual:v1:${job.name}:${startMs}`;
   const stopHeartbeat = startCronHeartbeat(job, startedAt, startMs);
+  let preserveHeldOwnership = false;
   recordOperationalEvent({
     source: 'scheduler',
     type: 'cron_job_started',
@@ -656,14 +735,48 @@ async function runCronJob(
 
     // CANON-ONE-LOOP: cron jobs run unattended — exactly where the harness
     // write gates matter most. Kill-switch CLEMMY_HARNESS_CRON=off.
-    const response = await respondPreferHarness('cron', {
+    const response = await cronResponseExecutor(assistant, {
       sessionId: cronSessionId,
       runId: cronRunId,
       channel: 'cron',
       message: prompt,
       model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
       maxWallClockMs: cronBudgetMs,
-    }, (req) => assistant.respond(req));
+    });
+
+    const route = cronRouteMetadata(response);
+    const held = cronHeldNonterminal(response);
+    if (held) {
+      // A peer/recovery activation still owns this exact source. Persist the
+      // typed nonterminal report, but do not run the completion verifier, mark
+      // the occurrence ok/failed, close its authority scope, or settle its
+      // durable attempt merely because this scheduler observer returned.
+      preserveHeldOwnership = true;
+      const observedAt = new Date().toISOString();
+      appendRunLog(job.name, {
+        status: 'held',
+        startedAt,
+        observedAt,
+        durationMs: Date.now() - startMs,
+        source,
+        response: response.text,
+        nonterminal: held,
+        ...(route ? { route } : {}),
+      });
+      addNotification({
+        id: identity
+          ? `cron-occurrence-${job.name}-${Math.floor(identity.occurrenceAtMs / 60_000) * 60_000}-held`
+          : `${Date.now()}-cron-${job.name}-held`,
+        kind: 'cron',
+        title: `Cron job remains active: ${job.name}`,
+        body: response.text,
+        createdAt: observedAt,
+        read: false,
+        metadata: { job: job.name, source, status: 'held', nonterminal: held, ...(route ? { route } : {}) },
+      });
+      logger.info({ job: job.name, source, nonterminal: held, route }, 'Cron job remains held by an active owner');
+      return;
+    }
 
     // Report-back honesty: a non-throwing respond() can still be a blocked /
     // promised / errored run. Fail-open + suspicious-only, so this only ever
@@ -679,8 +792,6 @@ async function runCronJob(
           () => verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason }),
         )
       : await verifyDelivered(prompt, response.text, { stoppedReason: response.stoppedReason });
-    const route = cronRouteMetadata(response);
-
     appendRunLog(job.name, {
       status: verdict.delivered ? 'ok' : 'blocked',
       startedAt,
@@ -747,7 +858,7 @@ async function runCronJob(
       payload: { job: job.name, source, durationMs: Date.now() - startMs, error: error instanceof Error ? error.message : String(error) },
     });
   } finally {
-    closePlanScope(cronSessionId, 'cron-run-finished');
+    if (!preserveHeldOwnership) closePlanScope(cronSessionId, 'cron-run-finished');
     stopHeartbeat();
   }
 }
@@ -761,6 +872,11 @@ async function runCronJob(
 // catch-up on next-boot is fine — no make-up scheduling needed.
 const RECURSIVE_REFLECTION_LOCAL_HOUR = 3;
 
+export function daemonRecursiveReflectionEnabled(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
+  return raw !== 'off' && raw !== 'false' && raw !== '0';
+}
+
 function localDayKey(at: Date): string {
   const y = at.getFullYear();
   const m = String(at.getMonth() + 1).padStart(2, '0');
@@ -769,6 +885,11 @@ function localDayKey(at: Date): string {
 }
 
 async function processRecursiveReflectionTick(state: DaemonState): Promise<void> {
+  // The operator kill-switch owns the entire nightly lifecycle, including its
+  // day stamp and operational telemetry. Stamping first would make "off"
+  // perform durable work and turn boot behavior into a wall-clock-dependent
+  // side effect even though the inner reflection call later declines.
+  if (!daemonRecursiveReflectionEnabled()) return;
   const now = new Date();
   if (now.getHours() < RECURSIVE_REFLECTION_LOCAL_HOUR) return;
   const day = localDayKey(now);
@@ -2033,11 +2154,11 @@ export async function startDaemon(
     if (orphanedAttempts > 0) {
       logger.warn({ orphanedAttempts }, 'Interrupted orphaned run attempts from the previous process on boot');
     }
-    const reconciledWorkerBatchOwners = reconcileWorkerBatchDurableOwnershipAtBoot();
-    if (reconciledWorkerBatchOwners > 0) {
+    const quarantinedDispatchLeases = reconcileTerminalRunAttemptDispatchLeasesAtBoot();
+    if (quarantinedDispatchLeases > 0) {
       logger.warn(
-        { reconciledWorkerBatchOwners },
-        'Revoked worker-batch owners from terminal predecessor attempts on boot',
+        { quarantinedDispatchLeases },
+        'Quarantined dispatch leases owned by terminal predecessor attempts on boot',
       );
     }
   } catch (err) {
@@ -2414,6 +2535,9 @@ export async function startDaemon(
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Pending workflow run reconcile failed');
   }
+  // A previous process can stop after the exact recurring enumeration settles
+  // but before its normalized partition authority reaches durable fan-out.
+  reconcileAutomationPartitionsOnDaemon('on boot');
 
   // Start the approval reaper. Every 60s it expires past-due rows in
   // pending_approvals (default TTL 24h), clears the orphan session's
@@ -2835,6 +2959,7 @@ export async function startDaemon(
           );
         }
         await processWorkflowRuns(assistant);
+        reconcileAutomationPartitionsOnDaemon('after workflow drain');
       }).catch((err) => {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
@@ -3048,6 +3173,7 @@ export async function startDaemon(
           );
         }
         await processWorkflowRuns(assistant);
+        reconcileAutomationPartitionsOnDaemon('after inline workflow drain');
       });
     }
     const proactivity = getProactivityPolicySnapshot();

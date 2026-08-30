@@ -281,6 +281,8 @@ test('invalid observations fail open; non-chat sessions persist their graph', ()
   assert.ok(persisted, 'a non-chat observation persists its graph');
   assert.equal(listEvents('shadow-execution', { types: ['turn_graph_compiled'] }).length, 1);
 
+  // OPEN-THE-GATES 5.6 / G17: an executing-turn identity must not invent
+  // source_missing. The source row is present; persist against its own turn.
   const wrongTurn = recordTurnGraphShadow({
     identity: {
       sessionId: 'shadow-invalid',
@@ -289,7 +291,8 @@ test('invalid observations fail open; non-chat sessions persist their graph', ()
     },
     surface: 'home',
   });
-  assert.equal(wrongTurn, null);
+  assert.ok(wrongTurn, 'a present accepted source persists even when the caller passed the executing turn');
+  assert.equal(wrongTurn?.turn, chatSource.turn);
 });
 
 test('a contended eventlog writer cannot add the normal lock wait to a live turn', () => {
@@ -454,10 +457,10 @@ test('a clarification answer inherits the parent ask: composite text, act route,
 
 test('production A/Q/B lineage compiles the exact live confirmation as B-owned action authority, not retrieve/zero-op', async () => {
   const sessionId = 'shadow-live-confirmation-lineage';
-  const liveParent = 'Pull the top five restaurants in Ventura, California using amplify put them in a new Google sheet with their name rating address and the most recent review if possible and then go ahead and email me a link nathan@scorpion..co';
+  const liveParent = 'Pull the top five restaurants in Ventura, California using amplify put them in a new Google sheet with their name rating address and the most recent review if possible and then go ahead and email me a link blake@scorpion..co';
   const parent = `${'Background restaurant-selection context before the consequential clause. '.repeat(18)}${liveParent} ${'Additional constraints after the consequential clause that formerly pushed it into the omitted middle. '.repeat(18)}`;
   assert.ok(parent.length > 1_600, 'fixture exercises positional parent projection loss');
-  const question = 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "nathan@scorpion..co"; I\'ll send to your Scorpion mailbox nathan.reynolds@scorpion.co unless you want a different one.';
+  const question = 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "blake@scorpion..co"; I\'ll send to your Scorpion mailbox blake@scorpion.co unless you want a different one.';
   const source = acceptedTurn({ sessionId, text: parent });
   appendEvent({
     sessionId,
@@ -516,11 +519,11 @@ test('production A/Q/B lineage compiles the exact live confirmation as B-owned a
   assert.ok(canonicalAqb);
   assert.doesNotMatch(canonicalAqb, /parent task bounded/);
   assert.match(canonicalAqb, /Apify \(the Google Maps scraper/);
-  assert.match(canonicalAqb, /nathan\.reynolds@scorpion\.co/);
+  assert.match(canonicalAqb, /blake@scorpion\.co/);
   assert.ok(canonicalAqb.endsWith(answerText), 'B is the final, untruncated capsule member');
   assert.match(
     canonicalAqb,
-    /go ahead and email me a link nathan@scorpion\.\.co/,
+    /go ahead and email me a link blake@scorpion\.\.co/,
     'a consequential clause in the middle of long A remains in semantic/effect authority',
   );
   assert.equal(
@@ -664,12 +667,12 @@ test('the workflow prompt-step lane no longer persists a pre-model graph', async
     'utf-8',
   );
   const calls = source.match(/recordTurnGraphShadow\(\{/g) ?? [];
-  // Exactly ONE writer remains: ensureWorkflowCallIdentity, for structured
-  // CALL nodes, which never enter the typed lane. A second call site here is
-  // the collision coming back.
+  // No workflow-runner writer remains. Structured calls now derive exact v3
+  // execution identity directly, so a pre-model graph shadow would be a
+  // competing source of authority.
   assert.equal(
     calls.length,
-    1,
+    0,
     'a new pre-model graph persist in the step lane will collide with the typed lane again',
   );
 });

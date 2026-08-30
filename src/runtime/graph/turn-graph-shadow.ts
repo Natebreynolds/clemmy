@@ -253,7 +253,7 @@ function graphSemanticText(
   // affirmed / selected / provided: the answer resolves the parent ask's open
   // slot, so THE TASK IS THE CANONICAL A/Q/B CAPSULE. In particular Q may
   // contain the model's corrected interpretation or destination (live:
-  // "amplify" meant Apify and Nate meant nathan.reynolds@scorpion.co). Omitting
+  // "amplify" meant Apify, and a bare first name meant a specific address). Omitting
   // it would correctly recover the action ceiling while still executing the
   // wrong task. Classifying the bare answer routed a
   // full action turn as a zero-op retrieve — "Highest value would be perfect"
@@ -345,7 +345,18 @@ export function recordTurnGraphShadowChecked(
     // the graph itself is lane-neutral dispatch admission.
     if (!session) return { ok: false, reason: 'session_missing' };
     const source = acceptedSource(input.identity);
-    if (!source || source.turn !== input.identity.turn) return { ok: false, reason: 'source_missing' };
+    if (!source) return { ok: false, reason: 'source_missing' };
+    // The accepted source row is the turn authority. Callers used to pass the
+    // EXECUTING turn (follow-up = N while the source is still stamped with the
+    // turn that was open when it arrived). That comparison invented
+    // `source_missing` for a row this function had just loaded — OPEN-THE-GATES
+    // 5.6 / G17, 11+ times in 24h after plan-tools already took source.turn.
+    // Persist against the source's own turn; do not refuse a present source.
+    const identity = {
+      sessionId: input.identity.sessionId,
+      sourceUserSeq: input.identity.sourceUserSeq,
+      turn: source.turn,
+    };
     const sourceText = acceptedText(source);
     const verifiedContinuation = input.verifiedTaskContinuation
       ? verifyDurableClarificationContext({
@@ -399,7 +410,7 @@ export function recordTurnGraphShadowChecked(
       if (input.graph) {
         if (!suppliedGraphMatchesAcceptedSource({
           graph: input.graph,
-          identity: input.identity,
+          identity,
           graphId,
           sourceText,
         })) return { ok: false, reason: 'prior_source_mismatch' };
@@ -422,7 +433,7 @@ export function recordTurnGraphShadowChecked(
 
     const text = graphSemanticText(
       sourceText,
-      input.identity,
+      identity,
       verifiedContinuation ?? undefined,
       source,
     );
@@ -438,7 +449,7 @@ export function recordTurnGraphShadowChecked(
           graph: input.graph,
           validation: suppliedGraphMatchesAcceptedSource({
             graph: input.graph,
-            identity: input.identity,
+            identity,
             graphId,
             sourceText,
           })
@@ -452,7 +463,7 @@ export function recordTurnGraphShadowChecked(
               },
         }
       : compileTurnGraph({
-          identity: input.identity,
+          identity,
           input: text,
           sessionKind: session.kind,
           surface: input.surface ?? 'direct',
@@ -477,9 +488,9 @@ export function recordTurnGraphShadowChecked(
       .flatMap((node) => node.capabilities.map((capability) => capability.kind)))].sort();
 
     const appended = appendTurnGraphEventOnce({
-      sessionId: input.identity.sessionId,
-      turn: input.identity.turn,
-      sourceUserSeq: input.identity.sourceUserSeq,
+      sessionId: identity.sessionId,
+      turn: identity.turn,
+      sourceUserSeq: identity.sourceUserSeq,
       data: {
         shadow: true,
         graphId: graph.graphId,

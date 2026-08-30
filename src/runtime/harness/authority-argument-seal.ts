@@ -8,7 +8,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BASE_DIR } from '../../config.js';
+import { BASE_DIR, invalidateRuntimeConfigSnapshot } from '../../config.js';
 
 const SEAL_VERSION = 2;
 export const AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES = 32_000;
@@ -64,6 +64,7 @@ function writeVaultEntry(name: string, value: string): void {
     encoding: 'utf8',
     mode: 0o600,
   });
+  invalidateRuntimeConfigSnapshot('secret_vault');
 }
 
 function keyForId(id: string): Buffer | null {

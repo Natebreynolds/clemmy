@@ -21,7 +21,11 @@ import {
   getOrCreateExternalMcpServerForTool,
   getOrCreateExternalMcpServers,
 } from '../mcp-servers.js';
-import { parseNamespacedTool, slugifyServerName } from '../mcp-namespace-shim.js';
+import {
+  parseNamespacedTool,
+  slugifyServerName,
+  withAcceptedExactMcpTransportHandoff,
+} from '../mcp-namespace-shim.js';
 import {
   attestLiveExternalCapabilityDefinition,
   attestLiveReadDefinition,
@@ -40,6 +44,7 @@ import {
   type IndependentCapabilityObservation,
 } from './independent-capability-observation.js';
 import {
+  CurrentCapabilityDefinitionUnavailableError,
   productionPortIdentityFromManifest,
   registerProductionCapabilityPort,
   resolveProductionPortsForManifest,
@@ -103,6 +108,15 @@ export interface ProductionMcpRuntime {
   configuredServers(): readonly ManagedMcpServer[];
   serverForEnumeration(serverSlug: string): Pick<MCPServer, 'listTools' | 'callTool' | 'invalidateToolsCache'>;
   serverForOperation(operationId: string): Pick<MCPServer, 'listTools' | 'callTool' | 'invalidateToolsCache'>;
+  /** Production's namespace shim historically owns its own logical/physical
+   * wrapper. The exact carrier has already admitted that work, so production
+   * redeems a one-shot raw-route hand-off instead. Generated direct runtimes
+   * omit this method and remain ordinary adapter-shaped fakes. */
+  invokePreparedOperation?(
+    server: Pick<MCPServer, 'callTool'>,
+    operationId: string,
+    args: Record<string, unknown>,
+  ): Promise<unknown>;
   /** Test/build-generation seam. Production always uses shipped artifact IDs. */
   portIdentity?(): { portId: string; compiler: { id: string; version: string } };
 }
@@ -157,6 +171,7 @@ export interface ProductionMcpReadCarrier {
   materialize(
     objective: string,
     expectedIdentity?: AttestedLiveReadCapabilityIdentity,
+    publicationGuard?: () => boolean,
   ): Promise<MaterializeLiveReadCapabilityResult>;
   refreshIndependentObservation(input: {
     operationId: string;
@@ -310,6 +325,12 @@ function productionRuntime(): ProductionMcpRuntime {
       allowedServerSlugs: [serverSlug],
     }),
     serverForOperation: (operationId) => getOrCreateExternalMcpServerForTool(operationId),
+    invokePreparedOperation: (server, operationId, args) => (
+      withAcceptedExactMcpTransportHandoff(
+        { toolName: operationId, args },
+        () => server.callTool(operationId, args),
+      )
+    ),
   };
 }
 
@@ -679,7 +700,9 @@ export async function prepareProductionMcpInvocation(
     operationId: current.manifest.operationId,
   });
   if (!snapshotMatchesManifest(snapshot, current.manifest)) {
-    throw new Error('native MCP preparation refused: live definition drifted');
+    throw new CurrentCapabilityDefinitionUnavailableError(
+      'native MCP preparation refused: live definition drifted',
+    );
   }
   const proof = Object.freeze({ version: 1 as const });
   preparedInvocations.set(proof, {
@@ -775,10 +798,30 @@ async function executeWithRuntime(
   }
   prepared.used = true;
   void runtime;
-  const result = await prepared.snapshot.server.callTool(call.operationId, call.args);
+  const result = runtime.invokePreparedOperation
+    ? await runtime.invokePreparedOperation(prepared.snapshot.server, call.operationId, call.args)
+    : await prepared.snapshot.server.callTool(call.operationId, call.args);
   const metadata = result as unknown as { isError?: unknown };
   if (metadata?.isError === true) throw new Error('native MCP operation returned isError');
-  return result;
+  if (!Array.isArray(result)) return result;
+  // The Agents SDK represents tools/call content as an Array with MCP result
+  // metadata assigned as own properties. JSON serialization would retain the
+  // blocks but silently discard `structuredContent`, `isError`, and `_meta`.
+  // Return one ordinary envelope so the durable result handle stores the
+  // exact current MCP members and can select one business-payload owner.
+  const own = result as unknown as Record<string, unknown>;
+  return {
+    content: Array.from(result),
+    ...(Object.prototype.hasOwnProperty.call(own, 'structuredContent')
+      ? { structuredContent: own.structuredContent }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(own, 'isError')
+      ? { isError: own.isError }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(own, '_meta')
+      ? { _meta: own._meta }
+      : {}),
+  };
 }
 
 /** Production transport hook, loaded lazily by the shipped artifact. */
@@ -1297,13 +1340,14 @@ export function createProductionMcpReadCarrier(input: {
     carrier,
     refreshIndependentObservation,
     materializeExact,
-    materialize(objective, expectedIdentity) {
+    materialize(objective, expectedIdentity, publicationGuard) {
       return materializeLiveReadCapability({
         objective,
         carrier,
         registerPort,
         refreshIndependentObservation,
         ...(expectedIdentity ? { expectedIdentity } : {}),
+        ...(publicationGuard ? { publicationGuard } : {}),
       });
     },
   };

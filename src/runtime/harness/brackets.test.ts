@@ -22,10 +22,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
+import type { CapabilityManifestV1 } from './capability-manifest.js';
+import type { OperationVerificationContractV1 } from './mutation-verification-contract.js';
 
 // Dynamic imports — see eventlog.test.ts for why.
 const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput, listEvents, openEventLog } = await import('./eventlog.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
+const capabilityManifests = await import('./capability-manifest.js');
 const { formatRecallableToolText } = await import('./tool-output-format.js');
 const { getToolOutputContext } = await import('./tool-output-context.js');
 const {
@@ -50,6 +54,7 @@ const {
   wrapToolForHarness,
   withHarnessRunContext,
   harnessToolBracketsEnabled,
+  isHarnessBoundFunctionTool,
   softToolError,
   parallelPreWriteGatesEnabled,
   startGate,
@@ -60,7 +65,156 @@ const {
   buildPublishProvenance,
 } = await import('./brackets.js');
 
+type FixtureOperationContract = {
+  operationId: string;
+  effect: 'read' | 'external_write';
+  reversibility?: 'reversible' | 'ordinary_non_destructive' | 'irreversible';
+  destination?: { family: string; posture: string };
+  verification?: OperationVerificationContractV1;
+};
+
+const GOOGLE_DOC_CREATE_VERIFICATION = {
+  mutation: {
+    version: 1,
+    resourceFamily: 'google_doc',
+    producedHandleKind: 'created_resource',
+    proof: 'resource_identity_v1',
+    target: { source: 'authoritative_result', pointers: ['/document_id'] },
+  },
+} as const satisfies OperationVerificationContractV1;
+
+const GOOGLE_DOC_READBACK_VERIFICATION = {
+  readback: {
+    version: 1,
+    resourceFamily: 'google_doc',
+    acceptedHandleKind: 'created_resource',
+    requestTargetPointers: ['/document_id'],
+    responseTargetPointers: ['/document_id'],
+  },
+} as const satisfies OperationVerificationContractV1;
+
+/**
+ * These tests inject fake provider bodies directly.  The production effect,
+ * approval and artifact boundaries no longer infer facts from action names,
+ * so the fixture also installs the exact current manifests a real adapter
+ * would have materialized from provider definitions.
+ */
+const BRACKET_FIXTURE_OPERATIONS: readonly FixtureOperationContract[] = [
+  { operationId: 'AIRTABLE_CREATE_RECORD', effect: 'external_write', reversibility: 'reversible' },
+  { operationId: 'AIRTABLE_CREATE_TABLE', effect: 'external_write', reversibility: 'reversible' },
+  { operationId: 'AIRTABLE_UPDATE_RECORD', effect: 'external_write', reversibility: 'reversible' },
+  { operationId: 'AIRTABLE_LIST_RECORDS', effect: 'read' },
+  { operationId: 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET', effect: 'read' },
+  { operationId: 'APIFY_GET_DATASET_ITEMS', effect: 'read' },
+  { operationId: 'APIFY_RUN_ACTOR', effect: 'read' },
+  { operationId: 'DATAFORSEO_SERP_TASK_POST', effect: 'read' },
+  { operationId: 'GMAIL_SEND_EMAIL', effect: 'external_write', reversibility: 'irreversible' },
+  {
+    operationId: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    effect: 'external_write',
+    reversibility: 'reversible',
+    destination: { family: 'google_doc', posture: 'create_new' },
+    verification: GOOGLE_DOC_CREATE_VERIFICATION,
+  },
+  {
+    operationId: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
+    effect: 'read',
+    destination: { family: 'google_doc', posture: 'named_existing' },
+    verification: GOOGLE_DOC_READBACK_VERIFICATION,
+  },
+  { operationId: 'GOOGLESHEETS_BATCH_GET', effect: 'read' },
+  { operationId: 'INSTAGRAM_CREATE_POST', effect: 'external_write', reversibility: 'irreversible' },
+  { operationId: 'OUTLOOK_CREATE_DRAFT', effect: 'external_write', reversibility: 'reversible' },
+  { operationId: 'OUTLOOK_LIST_MESSAGES', effect: 'read' },
+  { operationId: 'OUTLOOK_OUTLOOK_SEND_EMAIL', effect: 'external_write', reversibility: 'irreversible' },
+  { operationId: 'OUTLOOK_SEND_EMAIL', effect: 'external_write', reversibility: 'irreversible' },
+  { operationId: 'PROOF_LIST_TASKS', effect: 'read' },
+];
+
+const priorCapabilityCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+const bracketFixtureCatalog = capabilityCatalogs.createHostCapabilityCatalogFactory();
+for (const [index, contract] of BRACKET_FIXTURE_OPERATIONS.entries()) {
+  if (contract.effect === 'external_write') {
+    assert.ok(contract.reversibility, `${contract.operationId} must declare reversibility`);
+  }
+  const write = contract.effect === 'external_write';
+  const manifest: CapabilityManifestV1 = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:fixture:brackets:${contract.operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId: contract.operationId,
+    providerIdentity: 'fixture:brackets:configured-provider',
+    providerVersion: '2026-08-27',
+    operationVersion: '1',
+    definitionFingerprint: (index + 1).toString(16).padStart(64, '0'),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: (index + 101).toString(16).padStart(64, '0'),
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: (index + 201).toString(16).padStart(64, '0'),
+      semanticName: contract.operationId,
+      ...(contract.verification ? { verification: contract.verification } : {}),
+      behaviorHints: {
+        readOnly: !write,
+        destructive: contract.reversibility === 'irreversible',
+        idempotent: write ? true : null,
+        openWorld: false,
+      },
+    },
+    effect: contract.effect,
+    ...(write
+      ? {
+          operationSemantics: {
+            version: 1 as const,
+            reversibility: contract.reversibility!,
+          },
+        }
+      : {}),
+    ...(contract.destination ? { destination: contract.destination } : {}),
+    accountId: 'account:fixture:brackets',
+    idempotency: write
+      ? { required: true, policy: 'key_before_dispatch' }
+      : { required: false, policy: 'none' },
+    reconciliation: write
+      ? { supported: true, policy: 'exact_provider_readback' }
+      : { supported: false, policy: 'none' },
+    outputContract: { kind: write ? 'provider_acknowledgement' : 'records' },
+    evidenceContract: { kinds: ['receipt'], readbackRequired: write },
+    purpose: write ? 'persist_collection' : 'collect_records',
+    provenance: {
+      issuer: 'brackets:test-fixture',
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+  });
+  bracketFixtureCatalog.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    ...(manifest.destination ? { destination: manifest.destination } : {}),
+    account: manifest.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerInputSchemaDigest: manifest.externalDefinition?.providerInputSchemaDigest,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => {
+      throw new Error('brackets fixture catalog invoke must remain unreachable');
+    },
+  });
+  assert.equal(
+    capabilityCatalogs.isCurrentCallableCatalogEntry(bracketFixtureCatalog.get(manifest.manifestId)!),
+    true,
+    `${contract.operationId} fixture manifest must be current and callable`,
+  );
+}
+capabilityCatalogs.installHostCapabilityCatalogFactory(bracketFixtureCatalog);
+
 test.after(() => {
+  capabilityCatalogs.installHostCapabilityCatalogFactory(priorCapabilityCatalog);
   try {
     rmSync(TMP_HOME, { recursive: true, force: true });
   } catch {
@@ -229,20 +383,24 @@ test('startGate: the awaiter still sees the real value/rejection (the pass path)
   await assert.rejects(startGate(Promise.reject(new Error('judge errored'))), /judge errored/);
 });
 
-test('harnessToolBracketsEnabled: DEFAULT-ON (keystone flip) with =off kill-switch', () => {
+test('harnessToolBracketsEnabled: the off seam exists only in an explicitly isolated test home', () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
+  const prevIsolated = process.env.CLEMMY_TEST_ISOLATED_HOME;
   try {
+    process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
     delete process.env.HARNESS_TOOL_BRACKETS;
     assert.equal(harnessToolBracketsEnabled(), true, 'unset → ON (the 24/7 keystone default)');
     process.env.HARNESS_TOOL_BRACKETS = 'on';
     assert.equal(harnessToolBracketsEnabled(), true);
     process.env.HARNESS_TOOL_BRACKETS = 'off';
-    assert.equal(harnessToolBracketsEnabled(), false, 'kill-switch honored');
+    assert.equal(harnessToolBracketsEnabled(), false, 'isolated test seam honored');
     process.env.HARNESS_TOOL_BRACKETS = 'OFF';
-    assert.equal(harnessToolBracketsEnabled(), false, 'case-insensitive kill-switch');
+    assert.equal(harnessToolBracketsEnabled(), false, 'isolated test seam is case-insensitive');
   } finally {
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
+    if (prevIsolated === undefined) delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+    else process.env.CLEMMY_TEST_ISOLATED_HOME = prevIsolated;
   }
 });
 
@@ -264,17 +422,28 @@ test('softToolError: a recoverable gate throw → soft string; hard ceilings/unk
   assert.equal(softToolError({ statusCode: 500 }), null);
 });
 
-test('wrapToolForHarness: default-ON wraps the tool; =off returns it unchanged', () => {
+test('wrapToolForHarness: production ignores off and returns only a harness-attested tool identity', () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
-  const raw = { name: 'demo', execute: async () => 'ok' };
+  const prevIsolated = process.env.CLEMMY_TEST_ISOLATED_HOME;
+  const raw = tool({
+    name: 'production_bracket_identity_fixture',
+    description: 'Proves the production wrapper cannot be disabled by environment.',
+    parameters: z.object({}),
+    execute: async () => 'ok',
+  });
   try {
-    delete process.env.HARNESS_TOOL_BRACKETS;
-    assert.notEqual(wrapToolForHarness(raw), raw, 'default-on → wrapped (new object)');
+    delete process.env.CLEMMY_TEST_ISOLATED_HOME;
     process.env.HARNESS_TOOL_BRACKETS = 'off';
-    assert.equal(wrapToolForHarness(raw), raw, 'kill-switch → unchanged');
+    assert.equal(harnessToolBracketsEnabled(), true, 'obsolete production-off value is ignored');
+    const wrapped = wrapToolForHarness(raw);
+    assert.notEqual(wrapped, raw, 'the raw executable identity cannot escape the wrapper factory');
+    assert.equal(isHarnessBoundFunctionTool(raw), false, 'the caller-supplied raw object has no harness attestation');
+    assert.equal(isHarnessBoundFunctionTool(wrapped), true, 'only the returned wrapped object is harness-attested');
   } finally {
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
+    if (prevIsolated === undefined) delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+    else process.env.CLEMMY_TEST_ISOLATED_HOME = prevIsolated;
   }
 });
 
@@ -725,8 +894,10 @@ test('ToolCallsCounter.willExceed is non-mutating + reports correctly', () => {
   assert.equal(counter.currentCount, 3); // willExceed didn't mutate
 });
 
-test('wrapToolForHarness: no-op when HARNESS_TOOL_BRACKETS is off', () => {
+test('wrapToolForHarness: the isolated-test seam may return a disposable raw fixture unchanged', () => {
   const prev = process.env.HARNESS_TOOL_BRACKETS;
+  const prevIsolated = process.env.CLEMMY_TEST_ISOLATED_HOME;
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
   process.env.HARNESS_TOOL_BRACKETS = 'off';
   try {
     const original = {
@@ -736,7 +907,10 @@ test('wrapToolForHarness: no-op when HARNESS_TOOL_BRACKETS is off', () => {
     const wrapped = wrapToolForHarness(original);
     assert.equal(wrapped, original, 'returns the same reference when flag is off');
   } finally {
-    process.env.HARNESS_TOOL_BRACKETS = prev;
+    if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = prev;
+    if (prevIsolated === undefined) delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+    else process.env.CLEMMY_TEST_ISOLATED_HOME = prevIsolated;
   }
 });
 
@@ -903,7 +1077,7 @@ test('artifact admission: a duplicate create neither executes nor records/counts
   }
 });
 
-test('artifact settlement: only a typed local spawn failure releases; provider rejection remains uncertain', async () => {
+test('unmanifested shell create: typed spawn failure is local; provider rejection remains an orphan without minting artifact authority', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
     CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
@@ -988,8 +1162,16 @@ test('artifact settlement: only a typed local spawn failure releases; provider r
       );
 
       assert.match(String(await invoke('account-rejected')), /404/);
-      assert.equal(listRunArtifacts(sess.id).length, 1, 'provider-phase rejection keeps one conservative claim');
-      assert.equal(listRunArtifacts(sess.id)[0]?.status, 'uncertain');
+      assert.equal(
+        listRunArtifacts(sess.id).length,
+        0,
+        'raw shell command text cannot mint a provider artifact manifest or claim',
+      );
+      assert.equal(
+        listEvents(sess.id, { types: ['external_write_orphaned'] }).length,
+        1,
+        'provider-phase rejection remains conservative in the generic write ledger',
+      );
       assert.equal(
         peekToolChoice(procedureIntent)?.choice?.failureCount ?? 0,
         1,
@@ -998,7 +1180,7 @@ test('artifact settlement: only a typed local spawn failure releases; provider r
 
       assert.match(
         String(await invoke('blind-retry-refused')),
-        /unresolved uncertain create claim|Do not create another resource blindly/i,
+        /DUPLICATE_EXTERNAL_WRITE|ALREADY sent|ORPHANED_WRITE_RETRY|READ THE TARGET BACK|verify/i,
       );
     });
     assert.equal(attempt, 2, 'the unresolved provider attempt blocks a blind third dispatch');
@@ -1142,7 +1324,7 @@ test('artifact lineage: create/readback stay on the context-bound source when a 
   }
 });
 
-test('artifact objective: a legacy go-ahead retains the aligned multi-document intent', async () => {
+test('artifact objective: a legacy go-ahead retains the aligned multi-resource intent', async () => {
   const saved = {
     HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
     CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
@@ -1153,7 +1335,7 @@ test('artifact objective: a legacy go-ahead retains the aligned multi-document i
   process.env.CLEMMY_CONFIRM_FIRST = 'off';
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  const objective = 'Create a Google Doc set with two separate documents: a client brief and a technical appendix.';
+  const objective = 'Create two separate resources: a client brief and a technical appendix.';
   const request = appendEvent({
     sessionId: sess.id,
     turn: 1,
@@ -1217,7 +1399,7 @@ test('artifact objective: a legacy go-ahead retains the aligned multi-document i
     assert.equal(counter.currentCount, 2);
     assert.deepEqual(
       artifacts.map((artifact) => artifact.slotKey).sort(),
-      ['google_doc:client-brief', 'google_doc:technical-appendix'],
+      ['resource:client-brief', 'resource:technical-appendix'],
       'the low-information approval turn must not collapse the aligned outputs into one primary slot',
     );
   } finally {
@@ -3217,7 +3399,7 @@ test('exact artifact readback idempotently settles its original ambiguous create
         successful: true,
         data: {
           plain_text: 'Report body '.repeat(2_000),
-          documentId,
+          document_id: documentId,
         },
       });
       return formatRecallableToolText(exactReadback, {
@@ -3248,11 +3430,25 @@ test('exact artifact readback idempotently settles its original ambiguous create
     // Simulate the crash window: exact provider verification became durable,
     // but the process died before the external-write settlement append.
     const {
+      bindArtifactSlot,
       listRunArtifacts,
       verifyArtifactBindingFromToolResult,
     } = await import('./artifact-ledger.js');
     const claimed = listRunArtifacts(session.id)[0];
     assert.ok(claimed?.runScopeId);
+    // Seed the exact provider identity as the durable half of the simulated
+    // crash window. The ambiguous prose above must not be parsed into binding
+    // authority merely because it happens to contain a provider-shaped URL.
+    bindArtifactSlot(
+      session.id,
+      claimed.slotKey,
+      {
+        resourceId: documentId,
+        uri: `https://docs.google.com/document/d/${documentId}/edit`,
+      },
+      claimed.sourceCallId ?? 'ambiguous-create-call',
+      claimed.runScopeId,
+    );
     const verifiedBeforeCrash = verifyArtifactBindingFromToolResult(
       session.id,
       claimed.runScopeId,
@@ -3261,7 +3457,7 @@ test('exact artifact readback idempotently settles its original ambiguous create
         tool_slug: 'GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT',
         arguments: JSON.stringify({ document_id: documentId }),
       },
-      { successful: true, data: { documentId, plain_text: 'durable provider proof' } },
+      { successful: true, data: { document_id: documentId, plain_text: 'durable provider proof' } },
       'lost-read-before-settlement',
     );
     assert.equal(verifiedBeforeCrash?.verificationCallId, 'lost-read-before-settlement');
@@ -3327,7 +3523,7 @@ test('artifact readback does not duplicate a prior exact reconciliation settleme
       const input = JSON.parse(String(rawInput)) as { tool_slug?: string };
       return input.tool_slug === 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN'
         ? `[provider-dispatch:uncertain]\nhttps://docs.google.com/document/d/${documentId}/edit`
-        : JSON.stringify({ successful: true, data: { documentId, plain_text: 'verified' } });
+        : JSON.stringify({ successful: true, data: { document_id: documentId, plain_text: 'verified' } });
     },
   });
   const invoke = (callId: string, input: unknown) => (wrapped as unknown as {
@@ -3416,7 +3612,7 @@ test('reused SDK call ids cannot attach verified artifact settlement to another 
         return JSON.stringify({
           successful: true,
           data: {
-            documentId,
+            document_id: documentId,
             document_url: `https://docs.google.com/document/d/${documentId}/edit`,
             text: 'Verified report',
           },
@@ -4031,7 +4227,7 @@ test('Layer 1: a $fromToolOutput reference is resolved to REAL store values befo
   assert.ok(recordTurnGraphShadow({
     identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 },
   }));
-  const roster = { result: { records: [{ Email: 'real1@scorpion.co' }, { Email: 'real2@scorpion.co' }] } };
+  const roster = { result: { records: [{ Email: 'owner@example.com' }, { Email: 'owner@example.com' }] } };
   writeAuthoritativeToolOutput({
     sessionId: sess.id,
     callId: 'call_sf',
@@ -4048,7 +4244,7 @@ test('Layer 1: a $fromToolOutput reference is resolved to REAL store values befo
     attendees: { $fromToolOutput: { callId: 'call_sf', path: 'result.records[*].Email' } },
   }));
   assert.equal(result, 'ok');
-  assert.deepEqual(received.attendees, ['real1@scorpion.co', 'real2@scorpion.co'], 'the tool got the REAL resolved values, not the reference');
+  assert.deepEqual(received.attendees, ['owner@example.com', 'owner@example.com'], 'the tool got the REAL resolved values, not the reference');
   assert.equal(received.subject, 'Team sync', 'non-reference fields untouched');
   const authority = openEventLog().prepare(`
     SELECT argument_digest, raw_argument_digest, effective_argument_digest

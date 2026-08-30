@@ -30,6 +30,23 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
+function createWorkflowStepSession(runId: string, stepId: string): string {
+  const sessionId = `workflow:${runId}:${stepId}`;
+  eventlog.createSession({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Settlement Identity Fixture',
+      workflowRunId: runId,
+      stepId,
+      sessionIdSuffix: `${runId}:${stepId}`,
+    },
+  });
+  return sessionId;
+}
+
 function settleBusinessCall(input: {
   sessionId: string;
   turn: number;
@@ -53,6 +70,7 @@ function settleBusinessCall(input: {
       turn: source.turn,
       sourceUserSeq: source.seq,
     },
+    surface: 'workflow',
   }));
   const acceptedTaskId = identities.acceptedTaskIdFor(input.sessionId, source.seq);
   const begun = dispatch.beginPhysicalDispatch({
@@ -104,8 +122,7 @@ function settleBusinessCall(input: {
 
 test('success for requirement B cannot erase failure for requirement A; exact A recovery can', () => {
   const runId = 'requirement-identity-recovery';
-  const sessionId = `workflow:${runId}:sync_records`;
-  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const sessionId = createWorkflowStepSession(runId, 'sync_records');
   settleBusinessCall({
     sessionId,
     turn: 1,
@@ -147,8 +164,7 @@ test('success for requirement B cannot erase failure for requirement A; exact A 
 
 test('legacy unbound recovery requires the exact durable logical call identity, not any successful call', () => {
   const runId = 'call-contract-identity-recovery';
-  const sessionId = `workflow:${runId}:read_record`;
-  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const sessionId = createWorkflowStepSession(runId, 'read_record');
   settleBusinessCall({
     sessionId,
     turn: 1,

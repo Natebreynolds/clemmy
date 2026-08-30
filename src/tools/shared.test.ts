@@ -10,7 +10,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR, DEFAULT_TOOL_RESULT_MAX_CHARS, isHarnessRefusalText, resolveMemoryTarget, textResult, truncateToolText, updateEnvKey } from './shared.js';
+import {
+  BASE_DIR,
+  DEFAULT_TOOL_RESULT_MAX_CHARS,
+  invalidArgumentsTextResult,
+  isHarnessRefusalText,
+  isInvalidArgumentsTextResult,
+  resolveMemoryTarget,
+  textResult,
+  truncateToolText,
+  updateEnvKey,
+} from './shared.js';
 import { getRuntimeEnv } from '../config.js';
 import { VAULT_DIR } from '../memory/vault.js';
 
@@ -58,6 +68,20 @@ test('textResult: respects explicit maxChars option for callers that need raw fi
   const result = textResult(big, { maxChars: 50000 });
   // No truncation when explicit cap exceeds input length.
   assert.equal(result.content[0].text, big);
+});
+
+test('invalidArgumentsTextResult carries MCP failure shape plus non-forgeable process identity', () => {
+  const marked = invalidArgumentsTextResult('repair these arguments');
+  assert.equal(marked.isError, true);
+  assert.equal(isInvalidArgumentsTextResult(marked), true);
+  assert.equal(isInvalidArgumentsTextResult(structuredClone(marked)), false,
+    'serialization-compatible copies cannot forge the in-process marker');
+  assert.equal(isInvalidArgumentsTextResult(textResult('ordinary tool failure', { isError: true })), false,
+    'arbitrary MCP isError results are not reclassified as invalid arguments');
+  assert.equal(isInvalidArgumentsTextResult({
+    isError: true,
+    content: [{ type: 'text', text: 'repair these arguments' }],
+  }), false, 'a provider/model lookalike is not nominal host truth');
 });
 
 test('truncateToolText: marker mentions the total length', () => {

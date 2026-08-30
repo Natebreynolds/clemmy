@@ -511,6 +511,11 @@ test('progressLabel names the live work, not the compiled topology', () => {
   );
   assert.equal(progressLabel(ev('tool_called', { tool: 'tool_search' })), 'Finding the right tool…');
   assert.equal(
+    progressLabel(ev('tool_returned', { tool: 'tool_search' })),
+    'Working on it…',
+    'a finished lookup is not still finding a tool',
+  );
+  assert.equal(
     progressLabel(ev('tool_called', { tool: 'composio_execute_tool', publicSlug: 'OUTLOOK_LIST_MESSAGES' })),
     'Using outlook list messages…',
   );

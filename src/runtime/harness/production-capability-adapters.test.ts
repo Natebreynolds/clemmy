@@ -24,6 +24,7 @@ const { sealGraphNodeInvocationEnvelope } = await import('./graph-node-envelope.
 const { saveToolContract } = await import('../../tools/tool-contract-store.js');
 const { rememberToolSchema } = await import('../../tools/composio-schema-cache.js');
 const { productionCapabilityManifests } = await import('./production-capability-catalog.js');
+const { attachSemanticContract, capabilityManifestDigest } = await import('./capability-manifest.js');
 
 const identity = { sessionId: 'sess-adapter', sourceUserSeq: 1, acceptedTaskId: 'task-1' };
 const FIVE = [
@@ -74,6 +75,97 @@ function envelopeFor(role: string, predecessors: Array<{ role: string; value: un
       effect: manifest.effect,
     },
   });
+}
+
+function opaqueExternalWriteManifest() {
+  return attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:q7x9:k2m4',
+    providerKind: 'composio',
+    operationId: 'Q7X9_K2M4',
+    providerIdentity: 'carrier:q7x9:k2m4',
+    providerVersion: 'surface:q7x9:v1',
+    operationVersion: 'definition:k2m4:v3',
+    definitionFingerprint: '3'.repeat(64),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: '4'.repeat(64),
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: '5'.repeat(64),
+      semanticName: 'Q7X9_K2M4',
+      behaviorHints: {
+        readOnly: false,
+        destructive: null,
+        idempotent: null,
+        openWorld: null,
+      },
+    },
+    effect: 'external_write',
+    destination: { family: 'q7x9', posture: 'named_existing' },
+    accountId: 'acct:q7x9:k2m4',
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: false, policy: 'uncertain_if_absent' },
+    outputContract: { kind: 'opaque_result' },
+    purpose: 'q7x9_k2m4',
+    acceptedInputKinds: ['opaque_input'],
+    producedOutputKinds: ['opaque_result'],
+    applicableDeliverableKinds: ['opaque_result'],
+    evidenceContract: { kinds: ['receipt', 'readback'], readbackRequired: true },
+    provenance: {
+      issuer: 'host:test:opaque-write',
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+    argumentCompiler: { id: 'compile:q7x9:k2m4', version: '1' },
+    invokePortId: 'port:q7x9:k2m4',
+    reconcilePortId: 'reconcile:q7x9:k2m4',
+  });
+}
+
+function opaqueWriteInvocation(
+  manifest: ReturnType<typeof opaqueExternalWriteManifest>,
+  canonicalArgs: Record<string, unknown>,
+  authorityOverrides: Record<string, unknown> = {},
+) {
+  return {
+    nodeId: 'op-q7x9',
+    role: 'opaque_role',
+    payload: { ambient: 'must-not-cross' },
+    identity,
+    binding: {
+      capabilityId: manifest.manifestId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      args: canonicalArgs,
+      account: manifest.accountId,
+      effect: manifest.effect,
+      manifestDigest: capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => ({}),
+    },
+    authority: {
+      version: 2,
+      operationId: manifest.operationId,
+      capabilityRef: manifest.manifestId,
+      manifestId: manifest.manifestId,
+      manifestDigest: capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      providerIdentity: manifest.providerIdentity,
+      operationVersion: manifest.operationVersion,
+      liveProviderVersion: manifest.providerVersion,
+      canonicalArgs,
+      accountId: manifest.accountId,
+      resolvedEffect: manifest.effect,
+      argumentCompiler: manifest.argumentCompiler,
+      invokePortId: manifest.invokePortId,
+      liveFingerprint: manifest.definitionFingerprint,
+      ...authorityOverrides,
+    } as never,
+  };
 }
 
 test.afterEach(() => {
@@ -321,6 +413,92 @@ test('changing role does not select another sealed provider operation', async ()
   assert.equal(source.operationId, 'TAVILY_TAVILY_SEARCH');
 });
 
+test('opaque current external write crosses its exact sealed port once without provider-name semantics', async () => {
+  const manifest = opaqueExternalWriteManifest();
+  const canonicalArgs = {
+    q7: 'sealed-value',
+    k2: { m4: 17 },
+  };
+  assert.doesNotMatch(
+    `${manifest.operationId} ${manifest.purpose} ${manifest.externalDefinition?.semanticName ?? ''}`,
+    /create|update|delete|write|send|sheet|mail|slack|outlook|airtable|calendar/i,
+  );
+  const calls: Array<{
+    operationId: string;
+    args: Record<string, unknown>;
+    accountId: string;
+    expected?: unknown;
+  }> = [];
+  installProductionTransport(async (call) => {
+    calls.push(call);
+    return { q7: 'provider-result', receipt: 'receipt:q7x9:k2m4' };
+  });
+  const result = await invokeForSealedManifest(manifest)(opaqueWriteInvocation(manifest, canonicalArgs));
+  assert.deepEqual(result, { q7: 'provider-result', receipt: 'receipt:q7x9:k2m4' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.operationId, manifest.operationId);
+  assert.equal(calls[0]?.accountId, manifest.accountId);
+  assert.deepEqual(calls[0]?.args, canonicalArgs);
+  assert.deepEqual(calls[0]?.expected, {
+    manifestId: manifest.manifestId,
+    manifestDigest: capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerIdentity: manifest.providerIdentity,
+    providerVersion: manifest.providerVersion,
+    operationVersion: manifest.operationVersion,
+    definitionFingerprint: manifest.definitionFingerprint,
+    providerInputSchemaDigest: manifest.externalDefinition?.providerInputSchemaDigest,
+    providerOutputSchemaObserved: true,
+    providerOutputSchemaDigest: manifest.externalDefinition?.providerOutputSchemaDigest,
+    invokePortId: manifest.invokePortId,
+    argumentCompiler: manifest.argumentCompiler,
+  });
+});
+
+test('opaque external write refuses stale manifests and identity drift before transport', async () => {
+  const current = opaqueExternalWriteManifest();
+  const canonicalArgs = { q7: 'sealed-value' };
+  let calls = 0;
+  installProductionTransport(async () => {
+    calls += 1;
+    return { unexpected: true };
+  });
+  const stale = {
+    ...current,
+    lifecycle: { state: 'revoked' as const },
+  };
+  await assert.rejects(
+    () => invokeForSealedManifest(stale)(opaqueWriteInvocation(stale, canonicalArgs)),
+    /requires a current sealed manifest/,
+  );
+  await assert.rejects(
+    () => invokeForSealedManifest(current)(opaqueWriteInvocation(current, canonicalArgs, {
+      providerIdentity: 'carrier:drifted',
+    })),
+    /does not match the current sealed manifest port/,
+  );
+  assert.equal(calls, 0);
+});
+
+test('opaque timeout stays uncertain, invokes once, and cannot trigger a generic reconcile retry', async () => {
+  const manifest = opaqueExternalWriteManifest();
+  let calls = 0;
+  installProductionTransport(async () => {
+    calls += 1;
+    throw new Error('opaque transport timeout; outcome uncertain');
+  });
+  await assert.rejects(
+    () => invokeForSealedManifest(manifest)(opaqueWriteInvocation(manifest, { q7: 'sealed-value' })),
+    /timeout; outcome uncertain/,
+  );
+  const recovered = await reconcileForSealedManifest(manifest)({
+    intendedDigest: '6'.repeat(64),
+    artifactId: 'opaque-resource-q7x9',
+  });
+  assert.deepEqual(recovered, { exists: false });
+  assert.equal(calls, 1);
+});
+
 test('sheet adapters refuse to cross when outbound is denied or uncredentialed', async () => {
   const previous = process.env.HTTPS_PROXY;
   process.env.HTTPS_PROXY = 'http://127.0.0.1:9';
@@ -348,4 +526,33 @@ test('sheet adapters refuse to cross when outbound is denied or uncredentialed',
     if (previous === undefined) delete process.env.HTTPS_PROXY;
     else process.env.HTTPS_PROXY = previous;
   }
+});
+
+test('an arbitrary external write cannot inherit the transport\'s Sheets-shaped reconcile', async () => {
+  const manifest = {
+    ...opaqueExternalWriteManifest(),
+    reconciliation: { supported: true as const, policy: 'exact_artifact' as const },
+  };
+  const { bindAttestedTransport } = await import('./implementation-artifacts/attested-transport.js');
+  let executes = 0;
+  let reconciles = 0;
+  bindAttestedTransport({
+    digest: 'fixture:opaque-reconcile',
+    execute: async () => {
+      executes += 1;
+      return {};
+    },
+    observe: () => null,
+    reconcile: async () => {
+      reconciles += 1;
+      return { exists: true, artifactId: 'opaque-resource-q7x9' };
+    },
+  });
+  const result = await reconcileForSealedManifest(manifest)({
+    intendedDigest: '7'.repeat(64),
+    artifactId: 'opaque-resource-q7x9',
+  });
+  assert.deepEqual(result, { exists: false });
+  assert.equal(executes, 0);
+  assert.equal(reconciles, 0);
 });

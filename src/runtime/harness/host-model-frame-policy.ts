@@ -3,6 +3,7 @@ import {
   hostModelFrameClassFor,
   type HostModelFrameClass,
 } from '../../tools/tool-registry.js';
+import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 
 /** Immutable facts projected from one admitted model frame before any tool
@@ -40,7 +41,65 @@ export type HostModelFrameDisposition =
       prePlanEffect: 'read' | 'compute';
       requirementId: string;
     }
+  | {
+      /** Scheduling eligibility only. The runner must still reopen the exact
+       * configured work_call's opaque, source-bound disclosure capability and
+       * compile through plan_task before this call receives any authority. */
+      kind: 'host_owned_single_action_plan';
+      call: HostModelFrameCall;
+      requirementId: string;
+      effect: 'local_write' | 'external_write';
+    }
   | { kind: 'refused'; reason: HostModelFrameRefusal };
+
+const SINGLE_ACTION_WORK_CALL_FIELDS = new Set([
+  'requirement_id',
+  'universe_item_id',
+  'universe_selector',
+  'seal_amendment',
+  'name',
+  'args_json',
+]);
+
+function exactSingleActionMutation(
+  call: HostModelFrameCall,
+): { requirementId: string; effect: 'local_write' | 'external_write' } | null {
+  if (
+    !call.proposalFreeWorkCarrier
+    || !isPlainOrClementineLocalTool(call.name, 'work_call')
+    || (call.effect !== 'local_write' && call.effect !== 'external_write')
+    || !call.effectiveName
+    || call.effectiveName !== call.effectiveName.trim()
+    || !call.argumentsValue
+  ) return null;
+  const value = call.argumentsValue;
+  if (
+    Object.keys(value).some((key) => !SINGLE_ACTION_WORK_CALL_FIELDS.has(key))
+    || Object.prototype.hasOwnProperty.call(value, 'proposal')
+    || (value.universe_item_id !== undefined && value.universe_item_id !== null)
+    || (value.universe_selector !== undefined && value.universe_selector !== null)
+    || (value.seal_amendment !== undefined && value.seal_amendment !== null)
+  ) return null;
+  const requirementId = typeof value.requirement_id === 'string'
+    ? value.requirement_id.trim()
+    : '';
+  const innerName = typeof value.name === 'string' ? value.name.trim() : '';
+  const argsJson = typeof value.args_json === 'string' ? value.args_json : '';
+  if (
+    !requirementId.startsWith('cap:')
+    || requirementId !== value.requirement_id
+    || !innerName
+    || innerName !== value.name
+    || !argsJson
+  ) return null;
+  try {
+    const args = JSON.parse(argsJson) as unknown;
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  } catch {
+    return null;
+  }
+  return { requirementId, effect: call.effect };
+}
 
 function declaredFrameClass(name: string | null): HostModelFrameClass {
   if (!name) return 'ordinary';
@@ -120,7 +179,36 @@ export function classifyHostModelFrame(input: {
       : { kind: 'refused', reason: 'host_control_requires_sole_call_frame' };
   }
   if (freshPlans.length === 0) {
-    if (!input.planActivated && input.calls.some((call) => call.proposalFreeWorkCarrier)) {
+    const directWorkCallLookalike = input.calls.some((call) => (
+      isPlainOrClementineLocalTool(call.name, 'work_call')
+      && !call.proposalFreeWorkCarrier
+    ));
+    if (directWorkCallLookalike) {
+      return { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' };
+    }
+    if (!input.planActivated && input.calls.length === 1) {
+      const exact = exactSingleActionMutation(input.calls[0]!);
+      if (exact) {
+        return {
+          kind: 'host_owned_single_action_plan',
+          call: input.calls[0]!,
+          requirementId: exact.requirementId,
+          effect: exact.effect,
+        };
+      }
+    }
+    // A proposal-free carrier is also the only foreground door for an exact
+    // live provider read. Reads/compute do not acquire graph authority merely
+    // by crossing that carrier: the inner dispatcher still re-proves the
+    // current operation, account, schema and effect under the host root. A
+    // sole, structurally exact once-mutation may ask the host to compile that
+    // same contract above; every other mutation/unknown shape still fails
+    // closed before call admission.
+    if (!input.planActivated && input.calls.some((call) => (
+      call.proposalFreeWorkCarrier
+      && call.effect !== 'read'
+      && call.effect !== 'compute'
+    ))) {
       return { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' };
     }
     return { kind: 'ordinary' };

@@ -48,7 +48,9 @@ test('buildWorkspaceContextPrimer tells the brain to edit via space_* (never a s
   assert.match(primer!, /Salesforce remains read-only/);
   assert.match(primer!, /space_edit_view\('deal-risk'/);
   assert.match(primer!, /space_refresh\('deal-risk'/);
-  assert.match(primer!, /NEVER write the workspace HTML to a sandbox/i);
+  assert.match(primer!, /NEVER write ordinary Workspace HTML to a sandbox/i);
+  assert.match(primer!, /view_html in one space_save call/i);
+  assert.doesNotMatch(primer!, /write_file \+ space_save/i);
   assert.match(primer!, /\bdeals\b/); // the data source id is surfaced
   // The view-read instruction points at space_get_view (which returns the HTML),
   // NOT the old false "space_get('<slug>') first for the exact current text" — that

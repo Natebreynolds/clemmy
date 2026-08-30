@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks';
+import { useBackGesture } from '../lib/back-gesture';
 import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
 import { presentWorkingNow } from '@clem/chat-engine';
 import { mobileRunControl } from '../lib/running-tasks';
@@ -10,6 +11,7 @@ import { Run } from './Run';
 
 export function Activity() {
   const [openRun, setOpenRun] = useState<string | null>(null);
+  useBackGesture(openRun !== null, () => setOpenRun(null));
   // "Happening now" reads the canonical server-owned working-now projection —
   // the same one the running-tasks sheet and desktop read — so a workflow
   // dispatched from chat appears here and its Stop targets the right route.

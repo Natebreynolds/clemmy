@@ -2,8 +2,10 @@
  * Durable control-plane projection for the first exact automation read pilot.
  *
  * An AutomationOpportunity remains inert. This module can project only an
- * already-reviewed, exact one-phase read proposal plus one explicitly selected
- * live materialized capability into a formal pilot approval card. Resolution
+ * already-reviewed, exact single read target plus one explicitly selected live
+ * materialized capability into a formal pilot approval card. The target is
+ * either the whole single-item proposal or the sole closed enumeration source
+ * of an otherwise partitioned finite proposal. Resolution
  * of that exact card is then reconciled into the existing one-shot pilot queue.
  * No prose, catalog order, remembered alias, cadence, or recurrence field is
  * consulted for execution authority.
@@ -17,7 +19,7 @@ import type {
   WorkflowNodeContinuationContractV1,
   WorkflowNodeEvidenceContractV1,
 } from '../memory/workflow-node-invocation-plan.js';
-import type { WorkflowCanonicalEntityResultProjectionV1 } from '../memory/workflow-result-projection-contract.js';
+import type { WorkflowCanonicalEntityResultProjection } from '../memory/workflow-result-projection-contract.js';
 import {
   canonicalEntityWorkspaceSelectionDigest,
   parseCanonicalEntityWorkspaceBindingApproval,
@@ -42,6 +44,7 @@ import {
   loadAutomationOpportunityProposal,
   type AutomationOpportunityProposalRecordV1,
 } from './automation-opportunity-store.js';
+import { selectAutomaticReadPilotTarget } from './automation-pilot-target.js';
 import {
   queueApprovedAutomationReadPilot,
   requestAutomationReadPilotApproval,
@@ -90,7 +93,7 @@ export interface AutomationReadPilotTypedContractV1 {
   evidence: WorkflowNodeEvidenceContractV1;
   completeness: WorkflowNodeCompletenessContractV1;
   continuation?: WorkflowNodeContinuationContractV1;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBindingSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
 }
 
@@ -611,18 +614,9 @@ function proposalIssue(input: {
     return { code: 'proposal_not_approved', reason: 'Only a separately reviewed and approved proposal can request a pilot.' };
   }
   const opportunity = input.proposal.opportunity;
-  if (
-    opportunity.phases.length !== 1
-    || opportunity.capabilityRequirements.length !== 1
-    || opportunity.partition.mode !== 'single'
-  ) {
-    return {
-      code: 'pilot_shape_unsupported',
-      reason: 'The first pilot supports exactly one unpartitioned phase and one capability.',
-    };
-  }
-  const phase = opportunity.phases[0]!;
-  const requirement = opportunity.capabilityRequirements[0]!;
+  const target = selectAutomaticReadPilotTarget(opportunity);
+  if (!target.ok) return { code: 'pilot_shape_unsupported', reason: target.reason };
+  const { phase, requirement } = target;
   if (
     phase.id !== input.contract.phaseId
     || requirement.id !== input.contract.requirementId
@@ -672,6 +666,8 @@ function prepareProjection(
     contract: input.contract,
   });
   if (proposalProblem) return proposalProblem;
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  if (!target.ok) return { code: 'pilot_shape_unsupported', reason: target.reason };
 
   const selected = exactCurrentCapability({ selection: input.selections[0]! });
   if (!selected.ok) return selected;
@@ -693,9 +689,7 @@ function prepareProjection(
     identity: selected.identity,
     matches: [{
       requirementId: input.contract.requirementId,
-      requirementDigest: automationCapabilityRequirementDigest(
-        proposal.opportunity.capabilityRequirements[0]!,
-      ),
+      requirementDigest: automationCapabilityRequirementDigest(target.requirement),
     }],
   };
   const readPilotContract: AutomationSingleReadPilotContractV1 = {
@@ -959,7 +953,11 @@ export async function acquireAndRegisterAutomationReadPilotProjection(
       reason: 'No provider-neutral live capability acquisition port owns this request.',
     };
   }
-  const requirement = proposal.opportunity.capabilityRequirements[0]!;
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  if (!target.ok) {
+    return { ok: false, code: 'pilot_shape_unsupported', reason: target.reason };
+  }
+  const { requirement } = target;
   let acquired: MaterializeLiveReadCapabilityResult;
   try {
     acquired = await input.acquisition.acquire({

@@ -173,6 +173,112 @@ function approvedReview(label: string, dataset = true): {
   };
 }
 
+function finiteEnumerationOpportunity(label: string): AutomationOpportunityV1 {
+  const base = opportunity(label);
+  return opportunities.parseAutomationOpportunity({
+    ...base,
+    objective: `Enumerate and process every reviewed ${label} partition.`,
+    partition: {
+      mode: 'finite',
+      keyFields: ['key'],
+      dimensions: ['record'],
+      checkpointEvery: 2,
+      completion: { kind: 'exact_count', expected: 4 },
+    },
+    capabilityRequirements: [
+      ...base.capabilityRequirements,
+      {
+        id: 'partition-read',
+        description: `read one exact ${label} partition`,
+        minimumEffect: 'read',
+        constraints: ['Use the normalized partition identity.'],
+      },
+    ],
+    phases: [
+      { ...base.phases[0]!, id: 'enumerate', objective: 'Enumerate the exact closed partition scope.' },
+      {
+        id: 'process-partition',
+        objective: 'Process one exact normalized partition.',
+        dependsOn: ['enumerate'],
+        capabilityRequirementIds: ['partition-read'],
+        effect: { class: 'read', approval: 'not_required', maxOperationsPerRun: 4 },
+        partitioned: true,
+        outputEvidence: ['The exact partition has a durable settlement.'],
+      },
+    ],
+    effectCeiling: { class: 'read', maxOperationsPerRun: 5 },
+    successCriteria: [
+      {
+        id: 'enumeration-closed',
+        description: 'Step "enumerate" output includes required keys: version, kind, activationId, authorityRootId, logicalCallId',
+        evidence: ['The pilot enumeration has one exact closed result authority.'],
+      },
+      {
+        id: 'complete',
+        description: 'All four normalized partitions settle.',
+        evidence: ['The partition ledger contains four unique terminal partitions.'],
+      },
+    ],
+    pilot: {
+      ...base.pilot,
+      successCriterionIds: ['enumeration-closed'],
+    },
+    budgets: {
+      ...base.budgets,
+      maxConcurrentPartitions: 2,
+      maxAttemptsPerPartition: 2,
+      maxPartitionsPerRun: 4,
+      maxRecordsPerRun: 10,
+      maxOperationsPerRun: 5,
+      reserveOperations: 1,
+    },
+  });
+}
+
+function approvedReviewForOpportunity(
+  label: string,
+  reviewedOpportunity: AutomationOpportunityV1,
+): {
+  sessionId: string;
+  proposal: AutomationOpportunityProposalRecordV1;
+  projection: review.AutomationOpportunityReviewProjectionV1;
+} {
+  const sessionId = unique('chat');
+  eventlog.createSession({ id: sessionId, kind: 'chat' });
+  const created = opportunityStore.createAutomationOpportunityProposal({
+    proposalId: unique('proposal').replaceAll('.', '_'),
+    opportunity: reviewedOpportunity,
+    actorRef: `accepted-source:${sessionId}#1`,
+  });
+  assert.equal(created.ok, true, JSON.stringify(created));
+  if (!created.ok) throw new Error(created.message);
+  const requested = review.registerAutomationOpportunityReviewProjection({
+    proposalId: created.record.proposalId,
+    expectedProposalRevision: created.record.revision,
+    expectedProposalDigest: created.record.digest,
+    approvalSessionId: sessionId,
+    requestSourceUserSeq: 1,
+  });
+  assert.equal(requested.ok, true, JSON.stringify(requested));
+  if (!requested.ok) throw new Error(requested.reason);
+  assert.equal(approvals.resolve(
+    requested.approval.approvalId,
+    'approved',
+    `human.${label}`,
+  ).ok, true);
+  const reconciled = review.reconcileAutomationOpportunityReviewProjection(
+    requested.projection.projectionId,
+  );
+  assert.equal(reconciled.ok, true, JSON.stringify(reconciled));
+  if (!reconciled.ok) throw new Error(reconciled.reason);
+  assert.equal(reconciled.state, 'approved');
+  return {
+    sessionId,
+    proposal: reconciled.proposal,
+    projection: reconciled.projection,
+  };
+}
+
 function approvalCardCount(sessionId: string): number {
   return (eventlog.openEventLog().prepare(`
     SELECT COUNT(*) AS count FROM events
@@ -462,6 +568,80 @@ test('zero-Workspace approval advances automatically to authoring, then stages e
   assert.equal(live.businessInvokes(), 0, 'queue admission is not a provider business read');
 });
 
+test('a finite proposal pilots only its sole closed enumeration before partition fan-out', async () => {
+  spaces.spaceStore.save({ id: 'finite-enumeration-workspace', title: 'Finite enumeration' });
+  const source = approvedReviewForOpportunity(
+    'finite-enumeration',
+    finiteEnumerationOpportunity('finite-enumeration'),
+  );
+  const live = acquisitionFixture('finite-enumeration');
+  const registered = advancement.registerAutomationPilotAdvancement({
+    reviewProjectionId: source.projection.projectionId,
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  if (!registered.ok) return;
+  assert.equal(registered.projection.stage, 'workspace_destination_required');
+  const option = registered.projection.workspaceOptions?.find(
+    (candidate) => candidate.workspaceId === 'finite-enumeration-workspace',
+  );
+  assert.ok(option);
+  const selected = advancement.recordAutomationPilotWorkspaceDestination({
+    advancementId: registered.projection.advancementId,
+    receipt: {
+      version: 1,
+      advancementId: registered.projection.advancementId,
+      expectedStateRevision: registered.projection.stateRevision,
+      expectedStateDigest: registered.projection.stateDigest,
+      choice: { kind: 'existing', workspace: structuredClone(option!) },
+      actorRef: 'human.finite-enumeration',
+      decidedAt: new Date().toISOString(),
+      nonce: unique('choice'),
+    },
+    authority: trustedAuthority(),
+  });
+  assert.equal(selected.ok, true, JSON.stringify(selected));
+  if (!selected.ok) return;
+  const authored = await advancement.reconcileAutomationPilotAdvancement(
+    selected.projection.advancementId,
+    { acquisition: live.acquisition },
+  );
+  assert.equal(authored.ok, true, JSON.stringify(authored));
+  if (!authored.ok) return;
+  assert.equal(authored.projection.stage, 'authoring_required');
+  assert.equal(authored.projection.authoringRequest?.requirement.phaseId, 'enumerate');
+  assert.equal(authored.projection.authoringRequest?.requirement.requirementId, 'bounded-read');
+  const claimed = advancement.claimAutomationPilotAuthoringRequest({
+    advancementId: authored.projection.advancementId,
+    expectedStateRevision: authored.projection.stateRevision,
+    expectedStateDigest: authored.projection.stateDigest,
+    workerId: 'worker.finite-enumeration',
+    leaseMs: 60_000,
+  });
+  assert.equal(claimed.ok, true, JSON.stringify(claimed));
+  if (!claimed.ok) return;
+  const submitted = advancement.submitAutomationPilotAuthoringResult({
+    advancementId: claimed.projection.advancementId,
+    expectedStateRevision: claimed.projection.stateRevision,
+    expectedStateDigest: claimed.projection.stateDigest,
+    claimId: claimed.claim.claimId,
+    result: authoringResult(claimed),
+  });
+  assert.equal(submitted.ok, true, JSON.stringify(submitted));
+  if (!submitted.ok) return;
+  const pilotPending = await advancement.reconcileAutomationPilotAdvancement(
+    submitted.projection.advancementId,
+    { acquisition: live.acquisition },
+  );
+  assert.equal(pilotPending.ok, true, JSON.stringify(pilotPending));
+  if (!pilotPending.ok) return;
+  assert.equal(
+    pilotPending.projection.stage,
+    'pilot_approval_pending',
+    JSON.stringify(pilotPending.projection),
+  );
+  assert.equal(live.businessInvokes(), 0, 'source pilot registration still performs no business read');
+});
+
 test('existing Workspaces require an exact verified human choice and never select by title or order', async () => {
   spaces.spaceStore.save({ id: 'zeta-workspace', title: 'Same title' });
   spaces.spaceStore.save({ id: 'alpha-workspace', title: 'Same title' });
@@ -569,6 +749,7 @@ test('missing and ambiguous registry-wide acquisition fail closed with no author
       if (!reconciled.ok) return;
       assert.equal(reconciled.projection.stage, 'blocked');
       assert.equal(reconciled.projection.blocked?.code, `capability_acquisition_${reason}`);
+      assert.equal(reconciled.projection.blocked?.detail, `${reason} exact read`);
       assert.equal(reconciled.projection.authoringRequest, undefined);
     });
   }

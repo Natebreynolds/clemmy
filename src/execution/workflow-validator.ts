@@ -47,6 +47,11 @@ import {
   type WorkflowNodeArgumentSourceV1,
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
+import {
+  workflowRawSubprocessDeclarations,
+  workflowRawSubprocessRetirementReason,
+} from './workflow-raw-subprocess-policy.js';
+import { validateWorkflowTransform } from './workflow-transform.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -76,6 +81,7 @@ export interface WorkflowStepShape {
       max_turns?: number;
     }>;
   };
+  transform?: unknown;
   deterministic?: { runner?: string };
   call?: { tool?: string; args?: Record<string, unknown> };
   invocationPlan?: unknown;
@@ -340,6 +346,14 @@ function forEachSourceStepId(expr: string | undefined): string | null {
   const directPath = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.[a-zA-Z0-9_.-]+)?$/.exec(raw);
   if (directPath) return directPath[1];
   return /^[a-zA-Z0-9_-]+$/.test(raw) ? raw : null;
+}
+
+function forEachSourceInputKey(expr: string | undefined): string | null {
+  const raw = (expr ?? '').trim();
+  const templated = /^\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}$/.exec(raw);
+  if (templated) return templated[1];
+  const direct = /^input\.([a-zA-Z0-9_-]+)$/.exec(raw);
+  return direct?.[1] ?? null;
 }
 
 function invocationPlanSourceReferences(
@@ -694,9 +708,8 @@ function checkParallelismHint(step: WorkflowStepShape): string | null {
   return `Step "${step.id}" looks like multi-item work but has no forEach — it will run serially in one context. To parallelize safely, have the upstream step emit an ARRAY and add \`forEach: <upstreamStepId>\` to this step; the runner then fans out per item with bounded concurrency and keeps each item's context lean. (run_worker is not the path — it's unavailable inside a workflow step; forEach is the fan-out primitive.)`;
 }
 
-/** T2.4: the parallelism-hint predicate, exported so auto-repair
- *  (workflow-enforce.ts) can mechanically FIX the class it detects —
- *  multi-item prose without a forEach — instead of only warning. */
+/** Parallelism-hint predicate. This remains advisory: only the authoring model
+ *  may add semantic fan-out topology; the host never turns prose into N calls. */
 export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boolean {
   if (step.forEach) return false;
   if (ROW_BOOKKEEPING_RE.test(step.prompt)) return false;
@@ -877,6 +890,20 @@ function hostOwnsExactTemplateSource(step: WorkflowStepShape): boolean {
   // Raw deterministic subprocess output has no production accepted-source or
   // logical/physical owner, so it cannot authorize a downstream exact send.
   if (step.deterministic?.runner?.trim()) return false;
+  // A reviewed transform is an in-process, closed computation owned by the
+  // workflow runner. Its definition and upstream references are frozen with
+  // the scheduled workflow, and its declared output contract still has to
+  // prove the referenced payload path non-empty below. Mixed executor shapes
+  // remain ineligible even if the transform AST itself validates.
+  if (step.transform !== undefined) {
+    return (step.sideEffect ?? step.side_effect) === 'read'
+      && !step.call
+      && !step.subgraph
+      && !step.forEach
+      && !step.loopUntil
+      && !step.loop_until
+      && validateWorkflowTransform(step.transform).ok;
+  }
   if (!step.call?.tool) return false;
   const declared = step.sideEffect ?? step.side_effect;
   return structuredCallSideEffectClass({ ...step, sideEffect: declared }) === 'read';
@@ -1022,26 +1049,10 @@ export function exactScheduledSendCallEligibility(
   return { eligible: true };
 }
 
-// A deterministic.runner (and its loopUntil.probe.runner twin, checked the
-// same way in workflow-runner.ts's resolveDeterministicRunner) is a fixed
-// script path the workflow's AUTHOR declared at save time — never an argument
-// a live model chooses at call time. It is confined to the workflow's own
-// scripts/ directory (checked again, against the real filesystem, at
-// runtime), launched through an interpreter ALLOWLIST (never a shell — no
-// injection surface), with a scrubbed child environment, a hard timeout, an
-// output-size cap, and secret-redacted output; assertAdmittedWorkflowCodeRevision
-// additionally refuses to run if the script bundle drifted after the run was
-// admitted. That is a fundamentally different risk shape from
-// src/tools/dynamic-tools.ts's installed MCP scripts, where a live model
-// supplies arguments at runtime — those genuinely need the "shared exact
-// authority" kernel before they can run; this lane already had its own,
-// narrower authority and ran safely for months before 60db67d8 retired it
-// wholesale (breaking 5 of the owner's live workflows, 3 on live cron
-// schedules) without a replacement existing. Do not re-block this class
-// without building that replacement first, and without checking whether the
-// case you're worried about is actually author-fixed (this) or
-// model-chosen-at-runtime (dynamic-tools.ts) — conflating them is the exact
-// mistake that broke this the first time.
+// Legacy raw-runner declarations remain parseable so existing workflow files
+// can be inspected and migrated without rewriting or deleting user scripts.
+// This check validates their stored path shape only; the authority policy
+// below independently refuses execution before any subprocess can start.
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   if (!step.deterministic) return null;
   const runner = typeof step.deterministic.runner === 'string' ? step.deterministic.runner.trim() : '';
@@ -1071,6 +1082,7 @@ function workflowHasGoal(data: WorkflowFrontmatter): boolean {
 function checkOutputContractHint(step: WorkflowStepShape): string | null {
   if (step.output && Object.keys(step.output).length > 0) return null;
   if (step.forEach) return null; // the fan-out wrapper aggregates; per-item shape is what matters
+  if (step.transform) return null; // the closed expression is its executable data contract
   if (step.deterministic) return null; // deterministic steps are handled by checkDeterministicRunner
   const prompt = step.prompt ?? '';
   if (!stepLooksDeliverable(step)) return null;
@@ -1158,13 +1170,51 @@ export function validateWorkflowDefinition(
   let duplicates = 0;
   for (const step of steps) {
     if (!step.id) errors.push('A step is missing an id.');
+    // Raw subprocess authority is a structural property, independent of
+    // whether the step also has model prose. Check it before the semantic
+    // prompt-only pass so a promptless legacy runner cannot bypass retirement.
+    const deterministicIssue = checkDeterministicRunner(step);
+    if (deterministicIssue) {
+      if (step.deterministic?.runner?.trim()) errors.push(deterministicIssue);
+      else warnings.push(deterministicIssue);
+    }
+    for (const declaration of workflowRawSubprocessDeclarations(step)) {
+      errors.push(workflowRawSubprocessRetirementReason(declaration));
+    }
     // A structured call step (or deterministic runner) needs no prompt — its
     // action is the tool call / script, not a model instruction.
     const stepHasCall = Boolean(step.call && typeof step.call === 'object' && typeof step.call.tool === 'string' && step.call.tool.trim());
+    const stepHasTransform = step.transform !== undefined;
     const rawInvocationPlan = step.invocationPlan ?? step.invocation_plan;
     const stepHasInvocationPlan = rawInvocationPlan !== undefined;
-    if (!stepHasCall && !stepHasInvocationPlan && !step.deterministic && (!step.prompt || step.prompt.trim().length < 3)) {
+    if (!stepHasCall && !stepHasTransform && !stepHasInvocationPlan && !step.deterministic && (!step.prompt || step.prompt.trim().length < 3)) {
       errors.push(`Step "${step.id ?? '?'}" has no substantive prompt.`);
+    }
+    if (stepHasTransform) {
+      const validation = validateWorkflowTransform(step.transform);
+      if (!validation.ok) {
+        errors.push(...validation.errors.map((error) => `Step "${step.id ?? '?'}" ${error}`));
+      }
+      const declaredEffect = step.sideEffect ?? step.side_effect;
+      if (declaredEffect !== 'read') {
+        errors.push(`Step "${step.id ?? '?'}" transform must explicitly declare sideEffect: read.`);
+      }
+      const incompatible: string[] = [];
+      if (step.deterministic !== undefined) incompatible.push('deterministic');
+      if (step.call !== undefined) incompatible.push('call');
+      if (stepHasInvocationPlan) incompatible.push('invocationPlan');
+      if (step.subgraph !== undefined) incompatible.push('subgraph');
+      if (step.forEach) incompatible.push('forEach');
+      if (step.usesSkill || step.uses_skill) incompatible.push('usesSkill');
+      if ((step.allowedTools?.length ?? 0) > 0) incompatible.push('allowedTools');
+      if (step.requiresApproval || step.requires_approval) incompatible.push('requiresApproval');
+      if (step.loopUntil || step.loop_until) incompatible.push('loopUntil');
+      if (incompatible.length > 0) {
+        errors.push(
+          `Step "${step.id ?? '?'}" transform cannot combine with ${incompatible.join(', ')}. `
+          + 'Pure computation has no model, tool, approval, loop, or effect authority.',
+        );
+      }
     }
     if (stepHasInvocationPlan) {
       const parsedPlan = parseWorkflowNodeInvocationPlan(rawInvocationPlan);
@@ -1210,12 +1260,13 @@ export function validateWorkflowDefinition(
       }
       if (
         step.deterministic !== undefined
+        || step.transform !== undefined
         || step.subgraph !== undefined
         || step.loopUntil !== undefined
         || step.loop_until !== undefined
       ) {
         errors.push(
-          `Step "${step.id ?? '?'}" invocationPlan is mutually exclusive with deterministic, subgraph, and loop executors.`,
+          `Step "${step.id ?? '?'}" invocationPlan is mutually exclusive with deterministic, transform, subgraph, and loop executors.`,
         );
       }
       const declaredEffect = step.sideEffect ?? step.side_effect;
@@ -1245,12 +1296,11 @@ export function validateWorkflowDefinition(
       if (!stepHasCall) {
         errors.push(`Step "${step.id ?? '?'}" declares call but no tool. Set call.tool to the tool slug, or remove call.`);
       }
-      // A bare call (no invocationPlan) has no typed compiler proof, but it is
-      // still a fully supported dispatch lane: it runs through the gated
-      // composio gateway at runtime (see executeWorkflowBareCallNode in
-      // workflow-runner.ts) — the same owner resolution, approvals, and
-      // mutation-receipt settlement as chat/Space. Requiring an invocationPlan
-      // here broke every pre-existing call-only workflow (60db67d8); restored.
+      // A bare call (no invocationPlan) is supported by compiling its exact
+      // current catalog binding at execution and then entering the same v3
+      // authority/dispatch/settlement kernel as a plan-carrying call. The
+      // validator therefore preserves the authoring shape without creating a
+      // legacy gateway or synthetic turn.
       if (step.deterministic) {
         errors.push(`Step "${step.id ?? '?'}" declares both call and deterministic — pick one non-LLM executor.`);
       }
@@ -1349,6 +1399,7 @@ export function validateWorkflowDefinition(
         const incompatible: string[] = [];
         if (step.forEach) incompatible.push('forEach');
         if (step.call) incompatible.push('call');
+        if (step.transform) incompatible.push('transform');
         if (step.deterministic) incompatible.push('deterministic');
         if (step.requiresApproval || step.requires_approval) incompatible.push('requiresApproval');
         if (step.loopUntil || step.loop_until) incompatible.push('loopUntil');
@@ -1416,6 +1467,74 @@ export function validateWorkflowDefinition(
     transitiveDepsCache.set(stepId, out);
     return out;
   };
+
+  // Fan-out source authority is structural, not prompt-derived. Validate every
+  // forEach declaration here so a promptless exact read call cannot bypass the
+  // same declared-input/dependency contract as a model-authored fan-out.
+  for (const step of steps) {
+    if (!step.id) continue;
+    const forEachNewOnly = step.forEachNewOnly === true || step.for_each_new_only === true;
+    if (forEachNewOnly && !(typeof step.forEach === 'string' && step.forEach.trim().length > 0)) {
+      errors.push(
+        `Step "${step.id}" sets forEachNewOnly but has no forEach source — add forEach so the runner can apply the cross-run watermark.`,
+      );
+    }
+    if (typeof step.forEach !== 'string' || step.forEach.trim().length === 0) continue;
+    const raw = step.forEach.trim();
+    const inputKey = forEachSourceInputKey(raw);
+    const src = forEachSourceStepId(raw);
+    if (inputKey) {
+      if (!workflowInputKeys.has(inputKey)) {
+        errors.push(
+          `Step "${step.id}" has forEach: "${raw}" but workflow input "${inputKey}" is not declared. `
+          + `Declare inputs.${inputKey}; a JSON array string or array-shaped event value can feed the fan-out.`,
+        );
+      }
+    } else if (!src) {
+      errors.push(
+        `Step "${step.id}" has unsupported forEach source "${raw}". Use input.<key>, an upstream step id, or {{steps.<stepId>.output[.<path>]}}.`,
+      );
+    } else if (!ids.has(src)) {
+      errors.push(
+        `Step "${step.id}" has forEach: "${raw}" but no such step "${src}" exists — the fan-out would iterate over nothing and the step is silently skipped at run time.`,
+      );
+    } else if (src === step.id) {
+      errors.push(`Step "${step.id}" has forEach pointing at itself.`);
+    } else if (!transitiveDeps(step.id).has(src)) {
+      errors.push(
+        `Step "${step.id}" fans out over "${src}" but does not depend on it — add "${src}" to this step's dependsOn so its list is produced first; otherwise the runner finds no items and skips the step.`,
+      );
+    }
+  }
+
+  // A transform can read only declared workflow inputs and outputs in its
+  // authenticated dependency closure. The evaluator also fails unresolved
+  // sources at runtime; this author-time pass prevents silent empty DAG edges.
+  for (const step of steps) {
+    if (step.transform === undefined || !step.id) continue;
+    const validation = validateWorkflowTransform(step.transform);
+    if (!validation.ok) continue;
+    for (const reference of validation.references) {
+      if (reference.kind === 'input' && reference.key && !workflowInputKeys.has(reference.key)) {
+        errors.push(
+          `Step "${step.id}" transform references undeclared workflow input "${reference.key}". `
+          + `Declare inputs.${reference.key} so callers and schedules can bind it.`,
+        );
+      }
+      if (reference.kind === 'step' && reference.stepId) {
+        if (!ids.has(reference.stepId)) {
+          errors.push(`Step "${step.id}" transform references unknown step "${reference.stepId}".`);
+        } else if (reference.stepId === step.id) {
+          errors.push(`Step "${step.id}" transform cannot read its own output.`);
+        } else if (!transitiveDeps(step.id).has(reference.stepId)) {
+          errors.push(
+            `Step "${step.id}" transform reads "${reference.source}" but does not depend on "${reference.stepId}". `
+            + `Add "${reference.stepId}" to dependsOn so its exact output exists first.`,
+          );
+        }
+      }
+    }
+  }
 
   if (data.trigger?.schedule && !validateCronExpression(data.trigger.schedule)) {
     errors.push(`Invalid cron expression: "${data.trigger.schedule}"`);
@@ -1497,37 +1616,6 @@ export function validateWorkflowDefinition(
       );
     }
 
-    const forEachNewOnly = step.forEachNewOnly === true || step.for_each_new_only === true;
-    if (forEachNewOnly && !(typeof step.forEach === 'string' && step.forEach.trim().length > 0)) {
-      errors.push(
-        `Step "${step.id}" sets forEachNewOnly but has no forEach source — add forEach so the runner can apply the cross-run watermark.`,
-      );
-    }
-
-    // forEach must fan out over an upstream DEPENDENCY's list. If it points at a
-    // missing step, itself, or a step it doesn't depend on, the runner reads no
-    // items and SILENTLY skips the step (reason: forEach-empty) — a fan-out that
-    // looks authored but does zero work. Catch it at author time.
-    if (typeof step.forEach === 'string' && step.forEach.trim().length > 0) {
-      const raw = step.forEach.trim();
-      const src = forEachSourceStepId(raw);
-      if (!src) {
-        errors.push(
-          `Step "${step.id}" has unsupported forEach source "${raw}". Use an upstream step id or {{steps.<stepId>.output[.<path>]}}.`,
-        );
-      } else if (!ids.has(src)) {
-        errors.push(
-          `Step "${step.id}" has forEach: "${raw}" but no such step "${src}" exists — the fan-out would iterate over nothing and the step is silently skipped at run time.`,
-        );
-      } else if (src === step.id) {
-        errors.push(`Step "${step.id}" has forEach pointing at itself.`);
-      } else if (!transitiveDeps(step.id).has(src)) {
-        errors.push(
-          `Step "${step.id}" fans out over "${src}" but does not depend on it — add "${src}" to this step's dependsOn so its list is produced first; otherwise the runner finds no items and skips the step.`,
-        );
-      }
-    }
-
     // Template-token sanity (typed-workflow-contract P1, report-only):
     // unrecognized tokens ({{url}} vs {{input.url}}, typos) and
     // {{input.X}} that no declared/common input binds → errors. Declared
@@ -1590,12 +1678,6 @@ export function validateWorkflowDefinition(
 
     const missingSkill = checkSkillReference(step, opts.installedSkillNames);
     if (missingSkill) warnings.push(missingSkill);
-
-    const deterministicIssue = checkDeterministicRunner(step);
-    if (deterministicIssue) {
-      if (step.deterministic?.runner?.trim()) errors.push(deterministicIssue);
-      else warnings.push(deterministicIssue);
-    }
 
     const parallelismIssue = checkParallelismHint(step);
     if (parallelismIssue) warnings.push(parallelismIssue);

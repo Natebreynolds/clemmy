@@ -80,6 +80,14 @@ test('resolve: a leftover cadence token is not a unique workflow name', () => {
   if (named.kind === 'fuzzy') assert.equal(named.name, 'nightly-digest');
 });
 
+test('resolve: "run my platform 49 workflow" uniquely matches the numbered slug', () => {
+  const platform49 = E('Platform 49 Slack Channel Review', 'platform-49-slack-channel-review');
+  const slack = E('Team Activity Slack Updates', 'team-activity-slack-updates');
+  const r = resolveWorkflowName('Can you run my platform 49 workflow', [platform49, slack, PROSPECT]);
+  assert.equal(r.kind, 'fuzzy');
+  if (r.kind === 'fuzzy') assert.equal(r.name, 'Platform 49 Slack Channel Review');
+});
+
 test('resolve: none for empty input', () => {
   assert.equal(resolveWorkflowName('   ', [PROSPECT, SEO]).kind, 'none');
 });

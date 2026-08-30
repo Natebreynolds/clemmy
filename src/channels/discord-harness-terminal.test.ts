@@ -768,7 +768,10 @@ test('missing approval owns one provider receipt, source, and needs-input termin
   assert.equal(bindDiscordHarnessSession({ channelId, sessionId: session.id }), true);
 
   const prompt = 'approve apr-none';
-  const provider = durableProviderRequest(channelId, prompt);
+  // This provider receipt has already selected the current conversation.
+  // Missing-card routing may settle only against that durable identity; the
+  // legacy channel-only continuity pointer is deliberately non-authorizing.
+  const provider = durableProviderRequest(channelId, prompt, session.id);
   const delivery = recordingTransport();
   const input = {
     channelId,
@@ -889,7 +892,9 @@ test('cross-channel approval commits in the current conversation and leaves the 
     subject: 'Foreign write',
   });
   const prompt = `approve ${approval.approvalId}`;
-  const provider = durableProviderRequest(currentChannelId, prompt);
+  // The foreign card is not evidence for the current conversation. Mirror
+  // real ingress by carrying the current session on the durable receipt.
+  const provider = durableProviderRequest(currentChannelId, prompt, current.id);
   const delivery = recordingTransport();
 
   assert.equal(await tryHandleHarnessApprovalReply({

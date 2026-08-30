@@ -43,7 +43,7 @@ import {
   operationEvidenceContract,
   type OperationEvidenceMode,
 } from '../graph/operation-evidence-contract.js';
-import { documentedAtomicInputContentCommit } from '../../integrations/composio/operation-semantics.js';
+import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import {
@@ -259,7 +259,10 @@ export function compileObligationManifest(input: {
       finiteBound: durableGraph.classification.multiItem?.collectThenConstruct === true
         || Number(durableGraph.classification.goalConstraints?.collection?.count) > 0,
     });
-    const contentCommitMode = documentedAtomicInputContentCommit(operation.resolvedTool)
+    const atomicInputContent = sealed
+      ? sealed.operationSemantics?.atomicInputContent
+      : currentManifestOperationSemantics(operation.resolvedTool)?.semantics.atomicInputContent;
+    const contentCommitMode = atomicInputContent
       ? 'documented_atomic_input' as const
       : undefined;
     const obligations = attachEvidenceObligations({

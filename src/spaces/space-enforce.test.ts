@@ -8,6 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,67 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-enf
 
 const enforce = await import('./space-enforce.js');
 const store = await import('./store.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+
+const CURRENT_READ_OPERATION = 'PROOF_SPACE_AUTHORING_READ_CURRENT';
+const CURRENT_WRITE_OPERATION = 'PROOF_SPACE_AUTHORING_WRITE_CURRENT';
+const STALE_READ_OPERATION = 'PROOF_SPACE_AUTHORING_READ_STALE';
+const UNREGISTERED_OPERATION = 'PROOF_SPACE_AUTHORING_READ_UNREGISTERED';
+
+function installEffectFixture(
+  operationId: string,
+  effect: 'read' | 'external_write',
+  lifecycle: 'current' | 'revoked' = 'current',
+): void {
+  const fingerprint = createHash('sha256')
+    .update(`space-enforce:${operationId}:${effect}`, 'utf8')
+    .digest('hex');
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `manifest.space.enforce.${operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'provider.space-enforce-fixture',
+    providerVersion: 'fixture.1',
+    operationVersion: '1',
+    definitionFingerprint: fingerprint,
+    effect,
+    accountId: 'account.space-enforce-fixture',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: effect === 'read' ? 'read_bounded_records' : 'bounded_write',
+    acceptedInputKinds: ['scope'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'space.enforce.test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: lifecycle },
+    advisoryRoles: [effect === 'read' ? 'source' : 'write'],
+  });
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory()
+    ?? capabilityCatalogs.createHostCapabilityCatalogFactory();
+  factory.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => { throw new Error('effect fixture must never own provider I/O'); },
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+}
+
+installEffectFixture(CURRENT_READ_OPERATION, 'read');
+installEffectFixture(CURRENT_WRITE_OPERATION, 'external_write');
+installEffectFixture(STALE_READ_OPERATION, 'read', 'revoked');
 
 function writeRunner(slug: string, file: string) {
   const dir = store.resolveInSpace(slug, 'data');
@@ -26,7 +88,7 @@ function writeRunner(slug: string, file: string) {
 test('clean thin space passes untouched (no repairs, no errors)', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'clean',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }],
+    dataSources: [{ id: 'pull', composioSlug: CURRENT_READ_OPERATION }],
     actions: [],
   });
   assert.equal(prep.ok, true);
@@ -38,21 +100,21 @@ test('prepare rejects ambiguous identities before a caller can smoke, refresh, o
   const prep = enforce.prepareSpaceForWrite({
     slug: 'identity-gate',
     dataSources: [
-      { id: '   ', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: ' pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: '_meta', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: 'x'.repeat(121), composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: 'control\u0001source', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: '   ', composioSlug: CURRENT_READ_OPERATION },
+      { id: ' pull', composioSlug: CURRENT_READ_OPERATION },
+      { id: 'pull', composioSlug: CURRENT_READ_OPERATION },
+      { id: 'pull', composioSlug: CURRENT_READ_OPERATION },
+      { id: '_meta', composioSlug: CURRENT_READ_OPERATION },
+      { id: 'x'.repeat(121), composioSlug: CURRENT_READ_OPERATION },
+      { id: 'control\u0001source', composioSlug: CURRENT_READ_OPERATION },
     ],
     actions: [
-      { id: '', composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'send ', composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'send', composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'y'.repeat(121), composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'control\u0001action', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: '', composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'send ', composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'send', composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'send', composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'y'.repeat(121), composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'control\u0001action', composioSlug: CURRENT_WRITE_OPERATION },
     ],
   });
   assert.equal(prep.ok, false);
@@ -74,14 +136,14 @@ test('prepare preserves valid prototype-shaped source and action identities', ()
   const prep = enforce.prepareSpaceForWrite({
     slug: 'identity-prototype',
     dataSources: [
-      { id: '__proto__', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: 'constructor', composioSlug: 'SALESFORCE_GET_CONTACTS' },
-      { id: 'prototype', composioSlug: 'SALESFORCE_GET_CONTACTS' },
+      { id: '__proto__', composioSlug: CURRENT_READ_OPERATION },
+      { id: 'constructor', composioSlug: CURRENT_READ_OPERATION },
+      { id: 'prototype', composioSlug: CURRENT_READ_OPERATION },
     ],
     actions: [
-      { id: '__proto__', composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'constructor', composioSlug: 'OUTLOOK_SEND_EMAIL' },
-      { id: 'prototype', composioSlug: 'OUTLOOK_SEND_EMAIL' },
+      { id: '__proto__', composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'constructor', composioSlug: CURRENT_WRITE_OPERATION },
+      { id: 'prototype', composioSlug: CURRENT_WRITE_OPERATION },
     ],
   });
   assert.equal(prep.ok, true, prep.errors.join('\n'));
@@ -99,7 +161,7 @@ test('auto-repair coerces confirm:true on a send-like action', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'sendy',
     dataSources: [],
-    actions: [{ id: 'send_email', label: 'Send email', composioSlug: 'OUTLOOK_OUTLOOK_SEND_EMAIL' }],
+    actions: [{ id: 'write_record', label: 'Write record', composioSlug: CURRENT_WRITE_OPERATION }],
   });
   assert.equal(prep.ok, true);
   assert.equal(prep.actions[0].confirm, true);
@@ -127,7 +189,7 @@ test('auto-repair marks every opaque runner action as approval-required', () => 
 test('auto-repair drops a bad timezone (keeps the source)', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'tz',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: '0 7 * * *', timezone: 'Mars/Phobos' }],
+    dataSources: [{ id: 'pull', composioSlug: CURRENT_READ_OPERATION, schedule: '0 7 * * *', timezone: 'Mars/Phobos' }],
     actions: [],
   });
   assert.equal(prep.ok, true);
@@ -140,37 +202,37 @@ test('auto-repair drops a redundant runner when both backends are declared', () 
   const prep = enforce.prepareSpaceForWrite({
     slug: 'both',
     dataSources: [],
-    actions: [{ id: 'act', composioSlug: 'SOME_TOOL', runner: 'r.mjs' }],
+    actions: [{ id: 'act', composioSlug: CURRENT_WRITE_OPERATION, runner: 'r.mjs' }],
   });
   assert.equal(prep.actions[0].runner, undefined);
-  assert.equal(prep.actions[0].composioSlug, 'SOME_TOOL');
+  assert.equal(prep.actions[0].composioSlug, CURRENT_WRITE_OPERATION);
 });
 
 test('auto-repair drops a redundant data-source runner when both backends are declared', () => {
   writeRunner('both-source', 'r.mjs');
   const prep = enforce.prepareSpaceForWrite({
     slug: 'both-source',
-    dataSources: [{ id: 'pull', composioSlug: 'SOME_READ_TOOL', runner: 'r.mjs' }],
+    dataSources: [{ id: 'pull', composioSlug: CURRENT_READ_OPERATION, runner: 'r.mjs' }],
     actions: [],
   });
   assert.equal(prep.ok, true);
   assert.equal(prep.dataSources[0].runner, undefined);
-  assert.equal(prep.dataSources[0].composioSlug, 'SOME_READ_TOOL');
+  assert.equal(prep.dataSources[0].composioSlug, CURRENT_READ_OPERATION);
   assert.match(prep.repairs.join(' '), /Data source "pull".*dropped the runner/);
 });
 
 test('Composio data sources must be provably read-only at authoring time', () => {
   const read = enforce.prepareSpaceForWrite({
     slug: 'read-source',
-    dataSources: [{ id: 'events', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS' }],
+    dataSources: [{ id: 'events', composioSlug: CURRENT_READ_OPERATION }],
     actions: [],
   });
   assert.equal(read.ok, true, read.errors.join('\n'));
 
   for (const composioSlug of [
-    'GOOGLESHEETS_UPDATE_SPREADSHEET',
-    'GMAIL_MARK_AS_READ',
-    'ACME_DO_THING',
+    CURRENT_WRITE_OPERATION,
+    STALE_READ_OPERATION,
+    UNREGISTERED_OPERATION,
   ]) {
     const unsafe = enforce.prepareSpaceForWrite({
       slug: 'unsafe-source',
@@ -282,7 +344,7 @@ test('ERROR: runner declarations must be filenames under data/, not paths', () =
 
 test('ERROR: invalid cron on a scheduled source blocks the save', () => {
   const prep = enforce.prepareSpaceForWrite({
-    slug: 'badcron', dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS', schedule: 'every morning' }], actions: [],
+    slug: 'badcron', dataSources: [{ id: 'pull', composioSlug: CURRENT_READ_OPERATION, schedule: 'every morning' }], actions: [],
   });
   assert.equal(prep.ok, false);
   assert.match(prep.errors.join(' '), /invalid schedule/);
@@ -336,7 +398,7 @@ test('cli_argv is admitted for review, never vouched as safe to run unattended',
 test('an ACTION still cannot be cli_argv-backed (no runtime can execute one)', () => {
   const prep = enforce.prepareSpaceForWrite({
     slug: 'cliact',
-    dataSources: [{ id: 'pull', composioSlug: 'SALESFORCE_GET_CONTACTS' }],
+    dataSources: [{ id: 'pull', composioSlug: CURRENT_READ_OPERATION }],
     actions: [{ id: 'send', cliArgv: ['sf', 'data', 'create'] } as never],
   });
   assert.equal(prep.ok, false, 'actions have no cli_argv runtime; admitting one would be unrunnable');

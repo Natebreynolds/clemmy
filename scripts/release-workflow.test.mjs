@@ -45,12 +45,27 @@ const desktopReleaseGuideText = readFileSync(
 const rootReadmeText = readFileSync(new URL('../README.md', import.meta.url), 'utf-8');
 const desktopReadmeText = readFileSync(new URL('../apps/desktop/README.md', import.meta.url), 'utf-8');
 const v3ReleaseNotesPath = new URL('../docs/releases/v3.0.0.md', import.meta.url);
+const v316ReleaseNotesPath = new URL('../docs/releases/v3.16.0.md', import.meta.url);
+const harnessSchemaVersionText = readFileSync(
+  new URL('../src/runtime/harness/schema-version.ts', import.meta.url),
+  'utf-8',
+);
 
 function runScripts(job) {
   return (job?.steps ?? [])
     .map((step) => step?.run)
     .filter((run) => typeof run === 'string')
     .join('\n');
+}
+
+function assertUnitBeforeJourneys(job, label) {
+  const steps = job?.steps ?? [];
+  const unitIndex = steps.findIndex((step) => String(step?.run ?? '').trim() === 'npm test');
+  const journeyIndex = steps.findIndex(
+    (step) => String(step?.run ?? '').trim() === 'npm run journeys',
+  );
+  assert.ok(unitIndex >= 0, `${label} must run the broad unit gate`);
+  assert.ok(journeyIndex > unitIndex, `${label} must run serialized journeys after broad units`);
 }
 
 function runBash(script, env) {
@@ -248,10 +263,17 @@ test('public release docs match fail-closed Windows production signing and the e
   }
 });
 
-test('v3.0.0 publishes curated major-release notes and other versions retain generated-note fallback', () => {
+test('version-matched curated release notes publish when present and other versions retain generated-note fallback', () => {
   assert.equal(existsSync(v3ReleaseNotesPath), true, 'the required v3.0.0 notes source must be checked in');
+  assert.equal(existsSync(v316ReleaseNotesPath), true, 'the current v3.16.0 notes source must be checked in');
   const notes = existsSync(v3ReleaseNotesPath) ? readFileSync(v3ReleaseNotesPath, 'utf-8') : '';
+  const currentNotes = existsSync(v316ReleaseNotesPath) ? readFileSync(v316ReleaseNotesPath, 'utf-8') : '';
   assert.match(notes, /^# Clementine 3\.0\.0/m);
+  assert.match(currentNotes, /^# v3\.16\.0/m);
+  assert.match(harnessSchemaVersionText, /HARNESS_SCHEMA_VERSION\s*=\s*70\s*;/);
+  assert.match(currentNotes, /schema v70/i);
+  assert.match(currentNotes, /logical_model_result_projection_receipts/);
+  assert.match(currentNotes, /metadata-only/i);
   assert.match(notes, /long-horizon/i);
   assert.match(notes, /workspace/i);
   assert.match(notes, /memory/i);
@@ -259,8 +281,8 @@ test('v3.0.0 publishes curated major-release notes and other versions retain gen
   assert.match(notes, /approval/i);
 
   const publisher = runScripts(workflow.jobs?.['publish-release']);
-  assert.match(publisher, /v3\.0\.0/);
-  assert.match(publisher, /docs\/releases\/v3\.0\.0\.md/);
+  assert.match(publisher, /curated_notes_file="docs\/releases\/\$\{RELEASE_TAG\}\.md"/);
+  assert.match(publisher, /if \[\[ -e "\$curated_notes_file" \]\]/);
   assert.match(publisher, /release_note_args=\(--generate-notes\)/);
   assert.match(publisher, /release_note_args=\(--notes-file "\$curated_notes_file"\)/);
   assert.match(publisher, /gh release create[\s\S]*"\$\{release_note_args\[@\]\}"/);
@@ -406,6 +428,85 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   assert.equal(workflow.jobs?.['release-mac']?.needs, 'preflight');
   assert.equal(workflow.jobs?.['release-windows']?.needs, 'preflight');
   assert.equal(workflow.concurrency?.['cancel-in-progress'], false);
+});
+
+test('main CI and desktop release preflight run broad units before serialized journeys', () => {
+  assertUnitBeforeJourneys(testWorkflow.jobs?.test, 'main CI');
+  assertUnitBeforeJourneys(workflow.jobs?.preflight, 'desktop release preflight');
+});
+
+test('fresh CI and release preflight run both package gates only after building the complete package candidate', () => {
+  for (const exclusion of [
+    '!dist/execution/reviewed-local-workflow-v3-process.fixture.js',
+    '!dist/journeys/*.fixture.js',
+    '!dist/journeys/*.fixture-support.js',
+    '!dist/runtime/harness/current-capability-manifest.fixture.js',
+  ]) {
+    assert.ok(rootPackage.files.includes(exclusion), `${exclusion} must remain outside the npm package API`);
+  }
+  for (const releaseAssetTest of [
+    'scripts/implementation-artifact-freshness.test.mjs',
+    'scripts/mobile-web-build-freshness.test.mjs',
+  ]) {
+    assert.ok(
+      String(rootPackage.scripts?.['test:release-assets'] ?? '').split(/\s+/).includes(releaseAssetTest),
+      `${releaseAssetTest} must remain owned by the release-assets gate`,
+    );
+  }
+  assert.ok(
+    String(rootPackage.scripts?.['test:release-closure'] ?? '')
+      .split(/\s+/)
+      .includes('packages/chat-engine/src/progress-phase.test.ts'),
+    'the chat progress-phase pin must remain owned by the release-closure gate',
+  );
+  assert.equal(
+    rootPackage.scripts?.['test:packaged-upgrade'],
+    'node scripts/run-tests-isolated.mjs scripts/rehearse-v314-packaged-daemon.test.mts',
+  );
+  assert.doesNotMatch(
+    String(rootPackage.scripts?.['test:release-closure'] ?? ''),
+    /rehearse-v314-packaged-daemon/,
+    'source/store-only release closure runs before dist exists',
+  );
+  const prepack = String(rootPackage.scripts?.prepack ?? '');
+  const prepackStages = [
+    'npm run build',
+    'npm run build:mobile-web',
+    'npm run build:console-web',
+    'npm run vendor:uv',
+  ];
+  let previousStage = -1;
+  for (const stage of prepackStages) {
+    const stageIndex = prepack.indexOf(stage);
+    assert.ok(stageIndex > previousStage, `prepack must run ${stage} in release order`);
+    previousStage = stageIndex;
+  }
+
+  for (const [label, job] of [
+    ['main CI', testWorkflow.jobs?.test],
+    ['desktop release preflight', workflow.jobs?.preflight],
+  ]) {
+    const steps = job?.steps ?? [];
+    const closureIndex = steps.findIndex((step) => String(step?.run ?? '').includes('npm run test:release-closure'));
+    const mobileInstallIndex = steps.findIndex(
+      (step) => step?.['working-directory'] === 'apps/mobile-web' && step?.run === 'npm ci',
+    );
+    const consoleInstallIndex = steps.findIndex(
+      (step) => step?.['working-directory'] === 'apps/console-web' && step?.run === 'npm ci',
+    );
+    const prepackIndex = steps.findIndex((step) => String(step?.run ?? '').includes('npm run prepack'));
+    const gateIndex = steps.findIndex((step) => {
+      const run = String(step?.run ?? '');
+      return run.includes('npm run test:packed-candidate') && run.includes('npm run test:packaged-upgrade');
+    });
+    assert.ok(closureIndex >= 0, `${label} retains source/store release closure`);
+    assert.ok(mobileInstallIndex >= 0, `${label} installs mobile-web before prepack`);
+    assert.ok(consoleInstallIndex >= 0, `${label} installs console-web before prepack`);
+    assert.ok(mobileInstallIndex < prepackIndex, `${label} installs mobile-web before prepack`);
+    assert.ok(consoleInstallIndex < prepackIndex, `${label} installs console-web before prepack`);
+    assert.ok(prepackIndex > closureIndex, `${label} builds the complete package only after source/store closure`);
+    assert.ok(gateIndex > prepackIndex, `${label} runs packed gates only after that prepack`);
+  }
 });
 
 test('main CI installs the isolated runner before hygiene self-tests and closes release-only coverage', () => {

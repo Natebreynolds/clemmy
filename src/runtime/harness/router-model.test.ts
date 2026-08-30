@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { RouterModelProvider, brainFalloverFirstByteMsForProvider } from './router-model.js';
 import { resetByoModelCache } from './byo-model.js';
 import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
+import { modelFirstByteStallMs } from './model-stall-policy.js';
 
 const ENV_KEYS = [
   'AUTH_MODE',
@@ -28,10 +29,32 @@ function withEnv(vars: Record<string, string>, fn: () => void): void {
   }
 }
 
-test('BYO completion-only streaming has no first-byte fallover deadline', () => {
-  assert.equal(brainFalloverFirstByteMsForProvider('byo'), undefined);
-  assert.equal(typeof brainFalloverFirstByteMsForProvider('codex'), 'number');
-  assert.equal(typeof brainFalloverFirstByteMsForProvider('claude'), 'number');
+test('BYO gets a LONGER fallover deadline, never an absent one', () => {
+  // This asserted `undefined` for BYO, to protect a real concern: the BYO
+  // adapter completes non-streaming and emits one synthetic chunk, so its
+  // "first byte" IS the whole completion and a streaming-length deadline would
+  // falsely fail healthy long work.
+  //
+  // The concern was right; the remedy was not. `undefined` removed the FALLOVER
+  // deadline while the loop's own first-byte watchdog still applied, so a hung
+  // BYO brain hit the watchdog, retried the same dead brain, and the turn DIED
+  // without the chain ever being consulted (live 2026-08-28: three
+  // model.transport_timeout retries, a dead turn, and a healthy Codex and
+  // Claude unused in the chain).
+  //
+  // The answer to "needs longer" is a longer budget, not none. Anything slower
+  // than the watchdog was already being killed, so a budget just below it only
+  // converts a death into a brain switch — which still returns an answer.
+  const byo = brainFalloverFirstByteMsForProvider('byo');
+  const codex = brainFalloverFirstByteMsForProvider('codex');
+  const claude = brainFalloverFirstByteMsForProvider('claude');
+  assert.equal(typeof byo, 'number', 'an absent budget disables fallover for a silent hang');
+  assert.equal(typeof codex, 'number');
+  assert.equal(typeof claude, 'number');
+  assert.ok((byo as number) > (codex as number),
+    'the original concern still holds: BYO needs more headroom than a streaming brain');
+  assert.ok((byo as number) < modelFirstByteStallMs(),
+    'and it must stay under the watchdog, or fallover is unreachable by construction');
 });
 
 test('brain route metrics wrapper carries the active session + workflow run ids', () => {

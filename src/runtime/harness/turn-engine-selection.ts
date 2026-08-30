@@ -1,12 +1,12 @@
 import { getRuntimeEnv } from '../../config.js';
 
 /**
- * Temporary cutover selector for the Clem-owned interactive turn engine.
+ * Cutover selector for the Clem-owned turn engine.
  *
- * Production host_v1 owns only fresh interactive chat. Workflow, execution,
- * and background owners retain their existing runners. `legacy_sdk` is a
- * persisted-state compatibility identity only: a fresh interactive turn must
- * never enter that owner, while persisted state always resumes through the
+ * Production host_v1 owns every fresh turn, regardless of whether the source
+ * is interactive, workflow, cron, background, execution, or agent-shaped.
+ * `legacy_sdk` is a persisted-state compatibility identity only: no fresh turn
+ * may enter that owner, while persisted state always resumes through the
  * engine that wrote it.
  */
 export const TURN_ENGINE_ENV_KEY = 'CLEMMY_TURN_ENGINE';
@@ -28,7 +28,7 @@ export class InvalidFreshTurnEngineError extends Error {
 
   constructor(raw: string) {
     const configuredValue = raw.trim();
-    super(`Unsupported fresh interactive turn engine: ${configuredValue || '(empty)'}`);
+    super(`Unsupported fresh turn engine: ${configuredValue || '(empty)'}`);
     this.name = 'InvalidFreshTurnEngineError';
     this.configuredValue = configuredValue;
   }
@@ -44,6 +44,12 @@ export function isHostTurnEngine(mode: TurnEngineMode): mode is HostTurnEngineMo
   return mode === 'host_v1' || mode === 'host_v1_read_only';
 }
 
+/** Fresh activations may never opt back into the rolling-upgrade resume owner. */
+export function requireFreshHostTurnEngine(mode: TurnEngineMode): HostTurnEngineMode {
+  if (!isHostTurnEngine(mode)) throw new InvalidFreshTurnEngineError(mode);
+  return mode;
+}
+
 export function selectTurnEngine(input: TurnEngineSelectionInput): TurnEngineMode {
   const persistedState = input.persistedState ?? 'none';
 
@@ -54,7 +60,6 @@ export function selectTurnEngine(input: TurnEngineSelectionInput): TurnEngineMod
   if (persistedState === 'host_v1' || persistedState === 'host_v1_read_only') return persistedState;
   if (persistedState === 'legacy_sdk') return 'legacy_sdk';
 
-  if (input.sessionKind !== 'chat') return 'legacy_sdk';
   return configuredTurnEngineMode(
     input.configuredValue
       ?? getRuntimeEnv(TURN_ENGINE_ENV_KEY, DEFAULT_TURN_ENGINE)

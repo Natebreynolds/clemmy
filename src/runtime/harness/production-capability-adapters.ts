@@ -19,6 +19,7 @@ import type { GraphNodeInvocationEnvelopeV1 } from './graph-node-envelope.js';
 import {
   attachSemanticContract,
   capabilityManifestDigest,
+  currentCapabilityManifest,
   type CapabilityManifestV1,
 } from './capability-manifest.js';
 import { isolatedTestContractActive } from './isolated-test-contract.js';
@@ -616,6 +617,20 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
       if (!compiled) throw new Error('native MCP invoke requires canonical object arguments');
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
+    // Reviewed Clementine-local mutations use the same immutable port and
+    // logical/physical workflow kernel as external calls. The attested local
+    // carrier revalidates the exact captured schema, registry execution
+    // contract, safe-mode arguments, and manifest identity before invoking the
+    // handler. No local tool name is interpreted here.
+    if (sealed.providerKind === 'local_registry' && sealed.effect === 'local_write') {
+      const compiled = authority?.canonicalArgs ?? (
+        payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? payload as Record<string, unknown>
+          : null
+      );
+      if (!compiled) throw new Error('reviewed local invoke requires canonical object arguments');
+      return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
+    }
     // A read-effect Composio operation this turn separately PROVED (proof-
     // provisioned via registerProofProvisionedCapabilities — not one of the
     // fixed demo operation ids above) carries a role-derived purpose this
@@ -639,8 +654,75 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
       const result = await executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
       return { result, complete: true };
     }
+    // A current Composio manifest is itself the operation definition. Once
+    // the host has sealed one exact external-write call (plan, consent,
+    // lease, canonical arguments, evidence contract, and physical dispatch),
+    // the adapter edge must not require a second operation-name registration.
+    // Reopen every identity-bearing field before forwarding only the
+    // authority-owned canonical object through the manifest's immutable port.
+    if (sealed.effect === 'external_write' && sealed.providerKind === 'composio') {
+      const current = currentCapabilityManifest(manifest);
+      const digest = current ? capabilityManifestDigest(current) : '';
+      if (!current || current.effect !== 'external_write' || current.providerKind !== 'composio') {
+        throw new Error('generic external write requires a current sealed manifest');
+      }
+      if (!authority) {
+        throw new Error('generic external write requires current call authority');
+      }
+      if (
+        authority.manifestId !== current.manifestId
+        || authority.manifestDigest !== digest
+        || authority.providerKind !== current.providerKind
+        || authority.providerIdentity !== current.providerIdentity
+        || authority.operationVersion !== current.operationVersion
+        || authority.liveProviderVersion !== current.providerVersion
+        || authority.liveFingerprint !== current.definitionFingerprint
+        || authority.resolvedEffect !== current.effect
+        || authority.argumentCompiler.id !== current.argumentCompiler.id
+        || authority.argumentCompiler.version !== current.argumentCompiler.version
+        || authority.invokePortId !== current.invokePortId
+      ) {
+        throw new Error('generic external write authority does not match the current sealed manifest port');
+      }
+      if (
+        binding.manifestDigest !== digest
+        || binding.toolName !== current.operationId
+        || binding.schemaVersion !== current.operationVersion
+        || binding.schemaDigest !== current.definitionFingerprint
+        || binding.account !== current.accountId
+        || binding.effect !== current.effect
+        || binding.providerKind !== current.providerKind
+      ) {
+        throw new Error('generic external write binding does not match the current sealed manifest');
+      }
+      const compiled = authority.canonicalArgs;
+      if (!compiled || typeof compiled !== 'object' || Array.isArray(compiled)) {
+        throw new Error('generic external write requires canonical object arguments');
+      }
+      return executeSealed(current.operationId, compiled, current.accountId, expectedTransport());
+    }
     throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
   };
+}
+
+function manifestHasCompatibleAttestedReconcile(manifest: CapabilityManifestV1): boolean {
+  if (
+    !manifest.reconciliation.supported
+    || manifest.reconciliation.policy !== 'exact_artifact'
+    || !manifest.reconcilePortId
+    || manifest.reconcilePortId === manifest.invokePortId
+  ) return false;
+  // Reviewed local mutations have a carrier-owned exact reconcile
+  // implementation. The only external legacy reconcile implemented by the
+  // attested transport is the beta Sheets adapter. An arbitrary external
+  // mutation — even one with a resource-verification recipe — must use its
+  // separately sealed verifier, never the transport's Sheets-shaped probe.
+  return manifest.providerKind === 'local_registry'
+    || (
+      manifest.providerKind === 'composio'
+      && manifest.operationId === BETA_PROVIDER_OPERATIONS.create
+      && manifest.purpose === 'persist_collection'
+    );
 }
 
 export function reconcileForSealedManifest(manifest: CapabilityManifestV1): GraphNodeCapabilityReconcile {
@@ -651,7 +733,11 @@ export function reconcileForSealedManifest(manifest: CapabilityManifestV1): Grap
     ? SHEET_RECONCILE
     : manifest.operationId;
   return async ({ artifactId }) => {
-    if (!supported || policy === 'uncertain_if_absent') {
+    if (
+      !supported
+      || policy === 'uncertain_if_absent'
+      || !manifestHasCompatibleAttestedReconcile(manifest)
+    ) {
       return { exists: false };
     }
     const id = artifactId?.trim() || '';

@@ -7,6 +7,7 @@
  * batch was NOT executed, and the response carries no terminal "refused/blocked".
  */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -37,6 +38,8 @@ const { pendingActionApprovalView } = await import('../runtime/harness/pending-a
 const { rememberAccountAlias } = await import('../memory/account-alias-store.js');
 const { rememberFact, forgetFact } = await import('../memory/facts.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const capabilityCatalog = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }> };
 type Handler = (input: Record<string, unknown>) => Promise<ToolResult>;
@@ -70,6 +73,51 @@ function approveExactPendingAction(
   const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'test');
   assert.equal(resolved.ok, true);
   return row.approvalId;
+}
+
+function installCurrentDraftCapability(): () => void {
+  const operationId = 'OUTLOOK_CREATE_DRAFT';
+  const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+  const definitionFingerprint = digest(`schema:${operationId}`);
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:test:${digest(operationId).slice(0, 20)}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'outlook',
+    providerVersion: 'test-v1',
+    operationVersion: '1',
+    definitionFingerprint,
+    effect: 'external_write',
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+    destination: { family: 'outlook-draft', posture: 'create_new' },
+    accountId: 'acct:test-outlook',
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: true, policy: 'exact_artifact' },
+    outputContract: { kind: 'created_resource' },
+    evidenceContract: { kinds: ['receipt', 'readback'], readbackRequired: true },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['create', 'destination'],
+  });
+  const prior = capabilityCatalog.peekHostCapabilityCatalogFactory();
+  capabilityCatalog.installHostCapabilityCatalogFactory(
+    capabilityCatalog.createHostCapabilityCatalogFactory([{
+      capabilityId: manifest.manifestId,
+      toolName: operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: definitionFingerprint,
+      effect: manifest.effect,
+      destination: manifest.destination,
+      account: manifest.accountId,
+      manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      liveFingerprint: definitionFingerprint,
+      manifest,
+      invoke: async () => ({}),
+    }]),
+  );
+  return () => capabilityCatalog.installHostCapabilityCatalogFactory(prior);
 }
 
 after(() => {
@@ -753,6 +801,7 @@ test('run_batch freezes legacy nested aliases and standing Outlook draft routing
   });
   const handler = batchHandler();
   let standingB: ReturnType<typeof rememberFact> | undefined;
+  const restoreCapabilityCatalog = installCurrentDraftCapability();
   try {
     const proposed = await withToolOutputContext(
       { sessionId, runScopeId: 'batch-frozen-binding-run' },
@@ -821,6 +870,7 @@ test('run_batch freezes legacy nested aliases and standing Outlook draft routing
     if (standingB) forgetFact(standingB.id);
     _setBatchPlanRunnerForTests(null);
     _setCertifyJudgeForTests(null);
+    restoreCapabilityCatalog();
     process.env.COMPOSIO_BACKEND = previousBackend ?? 'sdk';
   }
 });

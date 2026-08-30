@@ -1,10 +1,9 @@
 /**
- * Red-first release contract for decision-only autonomy on Claude OAuth.
+ * Release contract for decision-only autonomy on Claude OAuth.
  *
- * The Claude cron route bypasses buildOrchestratorAgent and dispatches straight
- * to the Claude Agent SDK brain. An empty per-call allowlist must therefore
- * close that SDK surface itself; proving only the normal harness builder is not
- * sufficient.
+ * Every brain now enters through the production host owner. An empty per-call
+ * allowlist must survive the bridge and reach that host-owned agent build
+ * unchanged; Claude OAuth must not reopen the retired standalone SDK owner.
  *
  * Run:
  *   npx tsx --test src/runtime/harness/claude-autonomy-authority.test.ts
@@ -19,12 +18,6 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-claude-autonomy-aut
 process.env.CLEMENTINE_HOME = TEST_HOME;
 
 const {
-  respondViaClaudeAgentSdkBrain,
-  setClaudeAgentSdkBrainJudgeForTest,
-  setClaudeAgentSdkBrainRunForTest,
-  setClaudeAgentSdkBrainUnifiedPrimerForTest,
-} = await import('./claude-agent-brain.js');
-const {
   _setBridgeImplsForTests,
   respondPreferHarness,
 } = await import('./respond-bridge.js');
@@ -34,17 +27,7 @@ beforeEach(() => {
   resetEventLog();
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: respondViaClaudeAgentSdkBrain,
   });
-  setClaudeAgentSdkBrainRunForTest(null);
-  setClaudeAgentSdkBrainJudgeForTest(null);
-  setClaudeAgentSdkBrainUnifiedPrimerForTest(async (query) => ({
-    objective: query,
-    hits: [],
-    perStore: {},
-    answerability: 'insufficient',
-    diagnostics: { candidates: 0, stores: [], elapsedMs: 0 },
-  }));
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_TOOL_SEARCH = 'on';
@@ -56,24 +39,51 @@ beforeEach(() => {
 
 after(() => {
   _setBridgeImplsForTests({});
-  setClaudeAgentSdkBrainRunForTest(null);
-  setClaudeAgentSdkBrainJudgeForTest(null);
-  setClaudeAgentSdkBrainUnifiedPrimerForTest(null);
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
 test('Claude OAuth cron honors explicit decision-only authority end to end', async () => {
-  let captured: Record<string, unknown> | undefined;
+  let builtWith: {
+    allowedToolNames?: string[];
+    excludeToolNames?: string[];
+    allowToolJit?: boolean;
+    acceptedRoute?: 'direct_reply' | 'retrieve' | 'act';
+  } | undefined;
   let legacyCalls = 0;
-  setClaudeAgentSdkBrainRunForTest(async (options) => {
-    captured = options as unknown as Record<string, unknown>;
-    return {
-      text: JSON.stringify({ summary: 'Decision only.', commitments: [], actions: [] }),
-      sessionId: options.sessionId,
-      model: 'claude-sonnet-4-6',
-      toolUses: [],
-      usage: { input_tokens: 1, output_tokens: 1 },
-    };
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async (options: typeof builtWith) => {
+      builtWith = options;
+      return {};
+    }) as never,
+    runConversation: (async (options: {
+      sessionId: string;
+      sourceUserSeq: number;
+      buildAgent?: (identity: {
+        sessionId: string;
+        sourceUserSeq: number;
+        route: 'direct_reply' | 'retrieve' | 'act';
+      }) => Promise<unknown>;
+    }) => {
+      await options.buildAgent?.({
+        sessionId: options.sessionId,
+        sourceUserSeq: options.sourceUserSeq,
+        route: 'direct_reply',
+      });
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: 'Decision only.',
+          reply: JSON.stringify({ summary: 'Decision only.', commitments: [], actions: [] }),
+          done: true,
+          nextAction: 'completed',
+          reason: null,
+        },
+      };
+    }) as never,
   });
 
   const response = await respondPreferHarness('cron', {
@@ -87,36 +97,17 @@ test('Claude OAuth cron honors explicit decision-only authority end to end', asy
 
   assert.equal(response.stoppedReason, 'success');
   assert.equal(legacyCalls, 0, 'an explicit authority boundary must never fall back to a wider legacy lane');
-  assert.ok(captured, 'precondition: Claude SDK brain served the cron turn');
-  assert.deepEqual(
-    captured.allowedLocalMcpTools,
-    [],
-    'the SDK permission surface must contain zero local tools',
+  assert.ok(builtWith, 'precondition: the production host owner built the cron turn');
+  assert.equal(builtWith.acceptedRoute, 'direct_reply', 'the host binds the compiled decision route');
+  assert.deepEqual(builtWith.allowedToolNames, [], 'the host tool surface remains explicitly empty');
+  assert.equal(
+    builtWith.allowToolJit,
+    true,
+    'execution-lane schema-on-demand admission is transport policy; the exact empty allowlist remains authority',
   );
-  assert.deepEqual(
-    captured.mcpToolAllowlist,
-    [],
-    'the local MCP server must advertise zero first-class schemas',
-  );
-  assert.deepEqual(
-    captured.localMcpToolUniverse,
-    [],
-    'tool_search/call_tool must have no deferred local authority universe',
-  );
-  assert.deepEqual(
-    captured.requiredLocalMcpTools,
-    [],
-    'decision-only turns must not require the normal memory/tool-acquisition sentinels',
-  );
-  const nativeScope = captured.nativeMcpToolScope as {
-    allowAll?: boolean;
-    allowedServerSlugs?: string[];
-    maxTools?: number;
-  } | undefined;
-  assert.ok(nativeScope, 'native MCP scope must be explicit for an authority-sensitive turn');
-  assert.equal(nativeScope.allowAll ?? false, false);
-  assert.deepEqual(nativeScope.allowedServerSlugs, []);
-  assert.equal(nativeScope.maxTools, 0, 'native external MCP attachment must be explicitly empty');
+  assert.equal(response.route?.routeKind, 'harness');
+  assert.equal(response.route?.provider, 'claude');
+  assert.equal(response.route?.transport, 'host_harness');
 });
 
 test('explicit decision-only authority blocks instead of using legacy fallback when cron harness is disabled', async () => {

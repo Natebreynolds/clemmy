@@ -1,10 +1,14 @@
 /** Canonical one-chain executor for workflow_v2_paginated_read. */
 import {
+  beginWorkflowPreparationPhysicalDispatch,
   beginPhysicalDispatch,
   settlePhysicalDispatch,
   type PhysicalCrossingIdentity,
 } from './dispatch-ledger.js';
-import { claimWorkflowPaginatedPhysicalIo } from './physical-io-claim.js';
+import {
+  claimWorkflowPaginatedPhysicalIo,
+  claimWorkflowPaginatedPreparationPhysicalIo,
+} from './physical-io-claim.js';
 import { commitLogicalCallSettlement } from './logical-call-settlement-store.js';
 import { classifyAttemptOutcome } from './attempt-outcome.js';
 import {
@@ -16,6 +20,7 @@ import {
   reserveWorkflowReadPage,
   settleWorkflowReadPage,
   withWorkflowReadPageAttestation,
+  workflowReadPagePreparationPhysicalDispatchId,
   type WorkflowPaginatedAggregateReceipt,
   type WorkflowPageContinuationState,
 } from './workflow-paginated-read-authority.js';
@@ -28,6 +33,7 @@ import {
   parseWorkflowNodeInvocationPlan,
   type WorkflowNodeInvocationPlanV1,
 } from '../../memory/workflow-node-invocation-plan.js';
+import { projectProviderResultEvidenceView } from './result-facts.js';
 
 export type ExecuteWorkflowPaginatedReadResult =
   | {
@@ -59,11 +65,27 @@ function refusalReason(value: object, fallback: string): string {
 
 function exactPortBinding(
   plan: WorkflowNodeInvocationPlanV1,
-): { capability: RegisteredHostCapability; invoke: RegisteredHostCapability['invoke'] } | null {
+): {
+  capability: RegisteredHostCapability;
+  invoke: RegisteredHostCapability['invoke'];
+  admitPreparation?: () => void;
+  prepareInvocation?: () => Promise<unknown>;
+  invokeWithPreparation?: <T>(proof: unknown, work: () => Promise<T>) => Promise<T>;
+} | null {
   const capability = peekHostCapabilityCatalogFactory()?.get(plan.binding.capabilityId);
   if (!capability?.manifest) return null;
   const port = resolveProductionPortsForManifest(capability.manifest);
-  return port ? { capability, invoke: port.invoke } : null;
+  if (!port || (
+    Boolean(port.prepareInvocation) !== Boolean(port.invokeWithPreparation)
+    || Boolean(port.prepareInvocation) !== Boolean(port.admitPreparation)
+  )) return null;
+  return {
+    capability,
+    invoke: port.invoke,
+    ...(port.admitPreparation ? { admitPreparation: port.admitPreparation } : {}),
+    ...(port.prepareInvocation ? { prepareInvocation: port.prepareInvocation } : {}),
+    ...(port.invokeWithPreparation ? { invokeWithPreparation: port.invokeWithPreparation } : {}),
+  };
 }
 
 function valueAtPath(value: unknown, path: string): unknown {
@@ -144,6 +166,17 @@ async function executePage(input: {
   }
   const exactPort = exactPortBinding(input.plan);
   if (!exactPort) return { status: 'blocked', reason: 'paginated exact immutable invoke port is unavailable', zeroBody: true };
+  if (exactPort.admitPreparation) {
+    try {
+      exactPort.admitPreparation();
+    } catch (error) {
+      return {
+        status: 'blocked',
+        reason: `paginated provider preparation refused locally: ${boundedError(error)}`,
+        zeroBody: true,
+      };
+    }
+  }
   const identity: PhysicalCrossingIdentity = {
     sessionId: minted.ref.sessionId,
     sourceUserSeq: minted.ref.sourceEventSeq,
@@ -161,6 +194,127 @@ async function executePage(input: {
     return { status: 'blocked', reason: 'paginated workflow read cancelled before physical reservation', zeroBody: true };
   }
   return withWorkflowReadPageAttestation(minted.proof, async (): Promise<PageExecutionResult> => {
+    let preparedProof: unknown;
+    let preparationReady = false;
+    if (exactPort.prepareInvocation) {
+      const preparationIdentity: PhysicalCrossingIdentity = {
+        ...identity,
+        physicalDispatchId: workflowReadPagePreparationPhysicalDispatchId({
+          activationDigest: minted.ref.activationDigest,
+          pageOrdinal: minted.ref.pageOrdinal,
+          logicalCallId: minted.ref.logicalCallId,
+          toolName: minted.toolName,
+          argumentDigest: minted.argumentDigest,
+        }),
+      };
+      const preparation = beginWorkflowPreparationPhysicalDispatch({
+        identity: preparationIdentity,
+        tool: minted.toolName,
+        args: input.args,
+        activationId: minted.ref.activationId,
+        activationDigest: minted.ref.activationDigest,
+        authorityDigest: minted.ref.authorityDigest,
+        authorityRevision: minted.ref.authorityRevision,
+        pageOrdinal: minted.ref.pageOrdinal,
+      });
+      if (preparation.status !== 'inserted') {
+        return {
+          status: 'blocked',
+          reason: preparation.status === 'replayed'
+            ? 'prior paginated preparation crossing is already owned'
+            : preparation.reason,
+          zeroBody: true,
+        };
+      }
+      const preparationClaim = claimWorkflowPaginatedPreparationPhysicalIo({
+        identity: {
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          physicalDispatchId: preparation.identity.physicalDispatchId,
+          authorityRootId: identity.acceptedTaskId,
+          logicalCallId: identity.logicalToolCallId,
+        },
+        activationId: minted.ref.activationId,
+        activationDigest: minted.ref.activationDigest,
+        authorityDigest: minted.ref.authorityDigest,
+        authorityRevision: minted.ref.authorityRevision,
+        pageOrdinal: minted.ref.pageOrdinal,
+        toolName: minted.toolName,
+      });
+      if (!preparationClaim.claimed) {
+        return {
+          status: 'blocked',
+          reason: preparationClaim.reason === 'already_claimed'
+            ? 'prior paginated preparation crossing is already in flight or terminal'
+            : `paginated preparation I/O claim refused: ${preparationClaim.reason}`,
+          zeroBody: true,
+        };
+      }
+      try {
+        preparedProof = await exactPort.prepareInvocation();
+      } catch (error) {
+        const physical = settlePhysicalDispatch({
+          identity: preparation.identity,
+          tool: minted.toolName,
+          outcome: 'threw',
+          turn: 0,
+        });
+        const logical = physical.status === 'inserted' || physical.status === 'replayed'
+          ? commitLogicalCallSettlement({
+              identity: {
+                sessionId: identity.sessionId,
+                sourceUserSeq: identity.sourceUserSeq,
+                acceptedTaskId: identity.acceptedTaskId,
+                logicalToolCallId: identity.logicalToolCallId,
+              },
+              contract: { toolName: minted.toolName, args: input.args },
+              execution: { kind: 'provider_execution' },
+              outcome: classifyAttemptOutcome({ executionFailed: true }),
+              recovery: { businessCall: false, mutating: false, requirementId: input.plan.requirementId },
+              observer: { lane: 'agents_runner', callId: identity.logicalToolCallId, turn: 0 },
+            })
+          : null;
+        markWorkflowReadPageFailed({
+          activationId: input.activationId,
+          pageOrdinal: input.pageOrdinal,
+          state: 'failed',
+        });
+        return {
+          status: 'failed',
+          reason: logical && (logical.status === 'committed' || logical.status === 'replayed')
+            ? boundedError(error)
+            : `paginated failed-preparation settlement refused: ${logical && 'reason' in logical ? logical.reason : 'physical settlement failed'}`,
+          zeroBody: true,
+        };
+      }
+      const settledPreparation = settlePhysicalDispatch({
+        identity: preparation.identity,
+        tool: minted.toolName,
+        outcome: 'returned',
+        turn: 0,
+      });
+      if (settledPreparation.status !== 'inserted' && settledPreparation.status !== 'replayed') {
+        markWorkflowReadPageFailed({
+          activationId: input.activationId,
+          pageOrdinal: input.pageOrdinal,
+          state: 'uncertain',
+        });
+        return { status: 'failed', reason: settledPreparation.reason, zeroBody: true };
+      }
+      preparationReady = true;
+      if (input.signal?.aborted) {
+        markWorkflowReadPageFailed({
+          activationId: input.activationId,
+          pageOrdinal: input.pageOrdinal,
+          state: 'cancelled',
+        });
+        return {
+          status: 'blocked',
+          reason: 'paginated workflow read cancelled after preparation and before business reservation',
+          zeroBody: true,
+        };
+      }
+    }
     const begun = beginPhysicalDispatch({ identity, tool: minted.toolName, args: input.args });
     if (begun.status !== 'inserted' && begun.status !== 'replayed') {
       return { status: 'blocked', reason: begun.reason, zeroBody: true };
@@ -191,7 +345,7 @@ async function executePage(input: {
     }
     let result: unknown;
     try {
-      result = await exactPort.invoke({
+      const invokeBusiness = () => exactPort.invoke({
         nodeId: minted.ref.nodeId,
         role: input.plan.requirementId,
         payload: structuredClone(input.args),
@@ -218,6 +372,12 @@ async function executePage(input: {
           invoke: exactPort.invoke,
         },
       });
+      if (exactPort.invokeWithPreparation) {
+        if (!preparationReady) throw new Error('paginated exact port preparation did not become ready');
+        result = await exactPort.invokeWithPreparation(preparedProof, invokeBusiness);
+      } else {
+        result = await invokeBusiness();
+      }
     } catch (error) {
       const physical = settlePhysicalDispatch({
         identity: begun.identity,
@@ -438,7 +598,11 @@ export async function executeWorkflowPaginatedRead(input: {
     if (ordinal + 1 >= continuation.maxPages) {
       return closePartial(input.activationId, 'maximum_page_budget_reached');
     }
-    cursor = valueAtPath(settled.result, continuation.nextCursorPath);
+    const evidenceView = projectProviderResultEvidenceView(settled.result);
+    if (evidenceView.kind !== 'provider_payload') {
+      return closePartial(input.activationId, 'malformed_evidence');
+    }
+    cursor = valueAtPath(evidenceView.payload, continuation.nextCursorPath);
   }
   return closePartial(input.activationId, 'maximum_page_budget_reached');
 }

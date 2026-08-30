@@ -8,6 +8,15 @@
  */
 import { createHash } from 'node:crypto';
 import type { RuntimeToolEffect } from './tool-effect.js';
+import {
+  parseOperationVerificationContract,
+  type OperationVerificationContractV1,
+} from './mutation-verification-contract.js';
+import {
+  atomicInputContentDeclarationFitsSchema,
+  parseAtomicInputContentCommitDeclaration,
+  type AtomicInputContentCommitDeclarationV1,
+} from './atomic-input-content-contract.js';
 
 export const CAPABILITY_MANIFEST_VERSION = 1 as const;
 
@@ -31,6 +40,24 @@ export interface CapabilityManifestDestinationV1 {
   posture: string;
 }
 
+export type CapabilityOperationReversibilityV1 =
+  | 'reversible'
+  | 'ordinary_non_destructive'
+  | 'irreversible';
+
+/**
+ * Adapter-authored operation semantics sealed into the manifest digest.
+ * Provider names and operation slugs are identity elsewhere in the manifest;
+ * shared planning, admission, and risk code consumes only this closed shape.
+ */
+export interface CapabilityManifestOperationSemanticsV1 {
+  version: 1;
+  /** Read-only is already sealed by manifest.effect. This optional field is
+   * only the positive non-read fact the effect contract cannot express. */
+  reversibility?: CapabilityOperationReversibilityV1;
+  atomicInputContent?: AtomicInputContentCommitDeclarationV1;
+}
+
 /**
  * Immutable provider-definition facts needed after discovery has ended.
  *
@@ -48,6 +75,12 @@ export interface CapabilityManifestExternalDefinitionV1 {
   providerOutputSchemaObserved?: true;
   providerOutputSchemaDigest?: string;
   semanticName: string;
+  /**
+   * Exact adapter-authored mutation/readback semantics for this provider
+   * definition. Absence means no verification authority. Legacy rows are
+   * never upgraded into this authority from current names or schema shapes.
+   */
+  verification?: OperationVerificationContractV1;
   behaviorHints: {
     readOnly: boolean | null;
     destructive: boolean | null;
@@ -72,6 +105,8 @@ export interface CapabilityManifestV1 {
    * manifests; new Composio/native-MCP materializers always persist it. */
   externalDefinition?: CapabilityManifestExternalDefinitionV1;
   effect: ManifestEffect;
+  /** Optional positive semantics. Absence stays unknown; names never fill it. */
+  operationSemantics?: CapabilityManifestOperationSemanticsV1;
   destination?: CapabilityManifestDestinationV1;
   accountId: string;
   idempotency: {
@@ -206,11 +241,17 @@ export function canonicalManifestBytes(manifest: CapabilityManifestV1): string {
               ? { providerOutputSchemaDigest: manifest.externalDefinition.providerOutputSchemaDigest }
               : {}),
             semanticName: manifest.externalDefinition.semanticName,
+            ...(manifest.externalDefinition.verification
+              ? { verification: manifest.externalDefinition.verification }
+              : {}),
             behaviorHints: { ...manifest.externalDefinition.behaviorHints },
           },
         }
       : {}),
     effect: manifest.effect,
+    ...(manifest.operationSemantics
+      ? { operationSemantics: manifest.operationSemantics }
+      : {}),
     destination: manifest.destination ?? null,
     accountId: manifest.accountId,
     idempotency: manifest.idempotency,
@@ -280,6 +321,32 @@ export function validateCapabilityManifestV1(
   if (!EFFECTS.has(manifest.effect) || manifest.effect === 'unknown') {
     return { ok: false, reason: 'unknown_effect' };
   }
+  const operationSemantics = manifest.operationSemantics === undefined
+    ? null
+    : parseCapabilityManifestOperationSemantics(manifest.operationSemantics);
+  if (manifest.operationSemantics !== undefined && !operationSemantics) {
+    return { ok: false, reason: 'incomplete' };
+  }
+  if (operationSemantics) {
+    const readEffect = manifest.effect === 'read';
+    const destructive = manifest.externalDefinition?.behaviorHints.destructive;
+    const atomic = operationSemantics.atomicInputContent;
+    if (
+      readEffect
+      || (operationSemantics.reversibility === 'ordinary_non_destructive'
+        && destructive === true)
+      || (atomic !== undefined && (
+        (manifest.effect !== 'external_write' && manifest.effect !== 'local_write')
+        || manifest.destination?.posture !== 'create_new'
+        || manifest.idempotency.required !== true
+        || manifest.reconciliation.supported !== true
+        || manifest.evidenceContract.readbackRequired !== false
+        || manifest.evidenceContract.kinds.length !== atomic.evidence.length
+        || manifest.evidenceContract.kinds.some((kind, index) => kind !== atomic.evidence[index])
+        || destructive === true
+      ))
+    ) return { ok: false, reason: 'incomplete' };
+  }
   if (manifest.externalDefinition) {
     const definition = manifest.externalDefinition;
     const hints = definition.behaviorHints;
@@ -297,11 +364,18 @@ export function validateCapabilityManifestV1(
       || (definition.providerOutputSchemaDigest !== undefined
         && !/^[a-f0-9]{64}$/.test(definition.providerOutputSchemaDigest))
       || !nonBlank(definition.semanticName)
+      || (definition.verification !== undefined
+        && !parseOperationVerificationContract(definition.verification))
       || !hints
       || !hint(hints.readOnly)
       || !hint(hints.destructive)
       || !hint(hints.idempotent)
       || !hint(hints.openWorld)
+      || (hints.readOnly !== null && hints.readOnly !== (manifest.effect === 'read'))
+      || (hints.destructive === true
+        && manifest.effect !== 'external_write'
+        && manifest.effect !== 'local_write'
+        && manifest.effect !== 'admin')
     ) return { ok: false, reason: 'incomplete' };
   }
   if (manifest.provenance?.trusted !== true || !nonBlank(manifest.provenance.issuer) || !nonBlank(manifest.provenance.issuedAt)) {
@@ -325,6 +399,63 @@ export function validateCapabilityManifestV1(
     return { ok: false, reason: 'incomplete' };
   }
   return { ok: true, manifest: boundManifestDescriptorFields(manifest) };
+}
+
+export function parseCapabilityManifestOperationSemantics(
+  value: unknown,
+): CapabilityManifestOperationSemanticsV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const hasReversibility = Object.hasOwn(row, 'reversibility');
+  const hasAtomic = Object.hasOwn(row, 'atomicInputContent');
+  const keys = Object.keys(row);
+  const allowed = new Set([
+    'version',
+    ...(hasReversibility ? ['reversibility'] : []),
+    ...(hasAtomic ? ['atomicInputContent'] : []),
+  ]);
+  const reversibilities = new Set<CapabilityOperationReversibilityV1>([
+    'reversible', 'ordinary_non_destructive', 'irreversible',
+  ]);
+  const atomicInputContent = hasAtomic
+    ? parseAtomicInputContentCommitDeclaration(row.atomicInputContent)
+    : undefined;
+  if (
+    row.version !== 1
+    || keys.length !== allowed.size
+    || keys.some((key) => !allowed.has(key))
+    || (!hasReversibility
+      && !hasAtomic)
+    || (hasReversibility
+      && !reversibilities.has(row.reversibility as CapabilityOperationReversibilityV1))
+    || (hasAtomic && !atomicInputContent)
+  ) return null;
+  return {
+    version: 1,
+    ...(hasReversibility
+      ? { reversibility: row.reversibility as CapabilityOperationReversibilityV1 }
+      : {}),
+    ...(atomicInputContent ? { atomicInputContent } : {}),
+  };
+}
+
+/** Reopen already-sealed generic semantics only when their closed compiler is
+ * still valid for the exact current input definition. This never discovers or
+ * upgrades semantics from an operation/provider name. */
+export function validateCapabilityManifestOperationSemanticsForInputSchema(input: {
+  semantics: CapabilityManifestOperationSemanticsV1;
+  inputSchema: unknown;
+}): CapabilityManifestOperationSemanticsV1 | null {
+  const semantics = parseCapabilityManifestOperationSemantics(input.semantics);
+  if (!semantics) return null;
+  if (
+    semantics.atomicInputContent
+    && !atomicInputContentDeclarationFitsSchema({
+      declaration: semantics.atomicInputContent,
+      inputSchema: input.inputSchema,
+    })
+  ) return null;
+  return semantics;
 }
 
 export function currentCapabilityManifest(

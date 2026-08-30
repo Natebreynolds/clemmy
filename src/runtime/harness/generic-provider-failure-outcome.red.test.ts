@@ -58,3 +58,17 @@ test('explicit capability statuses remain unsupported and discovery-bearing', ()
     assert.equal(outcome.directive.opensDiscoveryEpoch, true, `HTTP ${status}`);
   }
 });
+
+test('only nominal current-definition unavailability opens replacement discovery', () => {
+  const unavailable = classifyAttemptOutcome({ capabilityDefinitionUnavailable: true });
+  assert.equal(unavailable.kind, 'unsupported_capability');
+  assert.equal(unavailable.evidence, 'nominal');
+  assert.equal(unavailable.directive.eliminatesCandidate, true);
+  assert.equal(unavailable.directive.opensDiscoveryEpoch, true);
+
+  const forgedName = classifyAttemptOutcome({
+    errorName: 'CurrentCapabilityDefinitionUnavailableError',
+  });
+  assert.equal(forgedName.kind, 'unknown', 'an error name alone is not nominal definition proof');
+  assert.equal(forgedName.directive.opensDiscoveryEpoch, false);
+});

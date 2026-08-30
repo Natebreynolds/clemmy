@@ -42,7 +42,7 @@ import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect
 import { skillBindingHold } from '../memory/skill-binding-gate.js';
 import type { ComposioCliDefaultAccountAuthority } from '../integrations/composio/cli-default-account-authority.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
-import { findEmailDraftAuthoringPreference } from '../runtime/harness/constraint-guard.js';
+import { findComposioEmailDraftAuthoringPreference } from '../integrations/composio/standing-policy-adapter.js';
 
 const textResult = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 
@@ -74,7 +74,7 @@ function materializeComposioBatchBindings(plan: BatchPlan): MaterializedBatchBin
   }
   const slug = plan.composioSlug.trim();
   const toolkit = registeredToolkitOfSlug(slug);
-  const draftPreference = findEmailDraftAuthoringPreference(slug)?.preferredAccount;
+  const draftPreference = findComposioEmailDraftAuthoringPreference(slug)?.preferredAccount;
   const items = plan.items.map((item, index) => {
     const args = { ...item.args };
     const rawAlias = args.account_alias;

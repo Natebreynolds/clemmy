@@ -24,12 +24,14 @@ const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 
 const SURFACES = ['home', 'dashboard', 'webhook', 'cli', 'cron'] as const;
-const CHAT_SURFACES = ['home', 'dashboard', 'webhook', 'cli', 'discord', 'slack'] as const;
+const ALL_SURFACES = [
+  'webhook', 'cron', 'background', 'cli', 'dashboard', 'home', 'workflow', 'discord', 'slack',
+] as const;
 
 beforeEach(() => {
   resetEventLog();
   _setBridgeImplsForTests({});
-  for (const surface of SURFACES) delete process.env[`CLEMMY_HARNESS_${surface.toUpperCase()}`];
+  for (const surface of ALL_SURFACES) delete process.env[`CLEMMY_HARNESS_${surface.toUpperCase()}`];
   delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   delete process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN;
   delete process.env.CLEMMY_TURN_ENGINE;
@@ -65,9 +67,9 @@ test('blocked preflight is the same across home, web, webhook, gateway, and cron
   }
 });
 
-test('legacy break-glass cannot own a fresh effect-capable chat surface', async () => {
+test('the retired legacy flag cannot own a fresh turn on any surface', async () => {
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
-  for (const surface of CHAT_SURFACES) {
+  for (const surface of ALL_SURFACES) {
     const sessionId = `parity-no-fresh-legacy-${surface}`;
     process.env[`CLEMMY_HARNESS_${surface.toUpperCase()}`] = 'off';
     let legacyCalled = 0;

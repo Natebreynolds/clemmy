@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { documentedComposioManifestOperationSemantics } from '../../integrations/composio/operation-semantics.js';
+import {
+  compileAtomicInputContentContract,
+} from './atomic-input-content-contract.js';
 import {
   admitDocumentedCreateResultProjection,
   projectDocumentedCreateResult,
   type DocumentedCreateResultAuthorityV1,
 } from './documented-create-result-evidence.js';
 import { verifyAtomicContentCommit } from './atomic-content-commit-proof.js';
-import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
 import type { SealedNodeBinding } from './host-capability-catalog-factory.js';
 import type { ObligationManifest } from './obligation-manifest.js';
 
@@ -32,10 +35,15 @@ const ROWS = [
   { name: 'Two', rating: 4.7 },
 ];
 
-const contentContract = compileGoogleSheetsSheetFromJsonContract(PROVIDER_OPERATION, {
+const operationSemantics = documentedComposioManifestOperationSemantics(PROVIDER_OPERATION);
+assert.ok(operationSemantics?.atomicInputContent);
+const contentContract = compileAtomicInputContentContract({
+  declaration: operationSemantics.atomicInputContent,
+  providerArguments: {
   title: 'Two restaurants',
   sheet_name: 'Restaurants',
   sheet_json: JSON.stringify(ROWS),
+  },
 });
 assert.ok(contentContract);
 
@@ -49,6 +57,7 @@ const authority: DocumentedCreateResultAuthorityV1 = {
   providerInputSchemaDigest: SCHEMA_DIGEST,
   argumentDigest: ARGUMENT_DIGEST,
   submittedContentDigest: contentContract.submittedContentDigest,
+  resultIdentity: contentContract.resultIdentity,
   effect: 'external_write',
 };
 
@@ -117,6 +126,7 @@ function sealed(overrides: Partial<SealedNodeBinding> = {}): SealedNodeBinding {
     account: ACCOUNT,
     effect: 'external_write',
     destination: { family: 'workbook', posture: 'create_new' },
+    operationSemantics,
     bindingDigest: 'd'.repeat(64),
     ...overrides,
   };

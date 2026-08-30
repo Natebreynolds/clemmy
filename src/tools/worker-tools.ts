@@ -24,7 +24,7 @@ import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { fanoutBudgetStatus, formatTokens } from '../runtime/harness/run-token-budget.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
-import { recordModelRouteDecision, recordModelRouteOutcome, type ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
+import type { ModelRouteDecisionSource } from '../runtime/model-route-metrics.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { looksLikeUnknownModelError, markByoModelNotServed, repairByoRoutedModelId, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import { markWorkerModelCoolingDown, pickWorkerModelWithFallover, workerFailureLooksRateLimited } from '../agents/worker-model-fallover.js';
@@ -311,7 +311,7 @@ export function registerWorkerTools(server: McpServer): void {
         if (batch.status === 'parked') {
           return textResult([
             ...(heavyAdvisory ? [heavyAdvisory] : []),
-            `Batch parked safely before the unchanged run_worker deadline: ${batch.remainder.settled.length}/${callItems.length} settled; ${batch.remainder.failed.length} failed; ${batch.remainder.in_flight.length} in_flight; ${batch.remainder.pending.length} pending. No worker body remains active. Re-run the exact same items to reuse settled receipts and continue only the remainder.`,
+            `Batch parked safely before the unchanged run_worker deadline: ${batch.remainder.settled.length}/${callItems.length} settled; ${batch.remainder.failed.length} failed; ${batch.remainder.in_flight.length} in_flight; ${batch.remainder.pending.length} pending (not attempted). No worker body remains active. Re-run the exact same items to reuse settled receipts and continue only the remainder.`,
             renderWorkerBatchRemainder(batch.remainder),
             ...batch.items
               .filter((entry) => entry.output !== undefined)
@@ -651,27 +651,10 @@ export function registerWorkerTools(server: McpServer): void {
           payload: { item: input.item, model: workerModel, provider: workerProvider, lane: 'sdk_brain', transport },
         });
       } catch { /* telemetry is best-effort */ }
-      // Route-outcome capture (adaptive routing evidence): one decision+outcome
-      // pair per worker run so the policy job scores WORKER models, not just the
-      // brain. Fail-open — metrics must never fail a worker.
+      // Visibility timestamps describe the logical worker run. Provider-call
+      // accounting is owned by the Claude SDK adapter or RouterModelProvider;
+      // recording it again here would be a transport-mirror double count.
       const routeStartedAt = Date.now();
-      const routeDecisionId = recordModelRouteDecision({
-        sessionId,
-        role: 'worker',
-        intent: input.intent || undefined,
-        resolvedModel: workerModel,
-        provider: workerProvider,
-        // Bench fallover swapped the model after resolution ⇒ the run is a
-        // fallback; otherwise attribute the resolution honestly (policy picks
-        // must show up as policy — the learning loop's own evidence trail).
-        source: benchFalloverFrom ? 'fallback' : route.source ?? 'default',
-        reason: {
-          lane: 'sdk_brain',
-          item: input.item,
-          ...(route.policy ? { policy: route.policy } : {}),
-          ...(benchFalloverFrom ? { falloverFrom: benchFalloverFrom } : {}),
-        },
-      });
       try {
         // Match the orchestrator/workflow lanes' canonical route evidence. The
         // release proof separately requires a completed-call usage row, so this
@@ -746,12 +729,6 @@ export function registerWorkerTools(server: McpServer): void {
             appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_capped', data: { item: input.item } });
           } catch { /* telemetry is best-effort */ }
         }
-        recordModelRouteOutcome({
-          decisionId: routeDecisionId,
-          status: ok ? 'success' : 'failed',
-          latencyMs: Date.now() - routeStartedAt,
-          toolSuccess: ok,
-        });
         // Subagent-runs visibility spine: WHO ran (provider+model+role), WHAT they
         // did (task + persisted work-product), OUTCOME — attributed to the workflow
         // run when spawned in a step, else the session. This ONE choke-point covers
@@ -796,12 +773,6 @@ export function registerWorkerTools(server: McpServer): void {
       } catch (err) {
         if (err instanceof KillRequested || isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
         recordResult(false, firstLine(err), workerModel);
-        recordModelRouteOutcome({
-          decisionId: routeDecisionId,
-          status: 'failed',
-          latencyMs: Date.now() - routeStartedAt,
-          errorClass: err instanceof Error ? err.name : typeof err,
-        });
         // A THROWN worker (crashed before returning a result) was invisible in the
         // Agents panel — the success path above records, this one didn't. Record it
         // as a failed specialist so a crashed worker still shows up. Fail-open.

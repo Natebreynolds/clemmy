@@ -55,29 +55,116 @@ export const CACHE_BREAK_SENTINEL = '<<<CLEM_CACHE_BREAK>>>';
  *  on this precise string so the reconstruction is byte-identical to legacy. */
 export const INSTRUCTION_CACHE_DELIM = `\n\n${CACHE_BREAK_SENTINEL}\n\n`;
 
+/**
+ * Second, internal layer marker inside the dynamic side of the prompt-cache
+ * boundary.  It lets request recording distinguish per-turn policy/catalog
+ * bytes from memory bytes, and lets non-prefix adapters reconstruct their
+ * historical memory-first prompt exactly.  Like CACHE_BREAK_SENTINEL, this is
+ * transport metadata: every wire adapter strips it before provider I/O.
+ */
+export const CACHE_MEMORY_CONTEXT_SENTINEL = '<<<CLEM_MEMORY_CONTEXT>>>';
+export const CACHE_MEMORY_CONTEXT_DELIM = `\n\n${CACHE_MEMORY_CONTEXT_SENTINEL}\n\n`;
+
+/** Memory rendered by a caller (for example learned tool-choice recall) used
+ * to be appended after harnessInstructions(). Keep that exact placement
+ * distinguishable from the ordinary memory context for legacy reconstruction. */
+export const CACHE_MEMORY_APPEND_SENTINEL = '<<<CLEM_MEMORY_APPEND>>>';
+export const CACHE_MEMORY_APPEND_DELIM = `\n\n${CACHE_MEMORY_APPEND_SENTINEL}\n\n`;
+
+function splitLayerMarker(
+  text: string,
+  exactDelimiter: string,
+  sentinel: string,
+): { before: string; after: string; found: boolean } {
+  const exact = text.indexOf(exactDelimiter);
+  if (exact >= 0) {
+    return {
+      before: text.slice(0, exact),
+      after: text.slice(exact + exactDelimiter.length),
+      found: true,
+    };
+  }
+  const bare = text.indexOf(sentinel);
+  if (bare >= 0) {
+    return {
+      before: text.slice(0, bare).trimEnd(),
+      after: text.slice(bare + sentinel.length).trimStart(),
+      found: true,
+    };
+  }
+  return { before: text, after: '', found: false };
+}
+
+export function splitCacheDynamicLayers(text: string | undefined | null): {
+  turnContext: string;
+  memoryContext: string;
+  appendedMemory: string;
+} {
+  const raw = text ?? '';
+  const appended = splitLayerMarker(raw, CACHE_MEMORY_APPEND_DELIM, CACHE_MEMORY_APPEND_SENTINEL);
+  const base = splitLayerMarker(
+    appended.before,
+    CACHE_MEMORY_CONTEXT_DELIM,
+    CACHE_MEMORY_CONTEXT_SENTINEL,
+  );
+  return {
+    turnContext: base.before,
+    memoryContext: base.found ? base.after : '',
+    appendedMemory: appended.found ? appended.after : '',
+  };
+}
+
+export function splitCacheDynamicContext(text: string | undefined | null): {
+  turnContext: string;
+  memoryContext: string;
+} {
+  const split = splitCacheDynamicLayers(text);
+  return {
+    turnContext: split.turnContext,
+    memoryContext: [split.memoryContext, split.appendedMemory].filter(Boolean).join('\n\n'),
+  };
+}
+
+/** Strip all harness-only cache-layer markers while preserving layer order. */
+export function stripPromptCacheLayerSentinels(text: string | undefined | null): string {
+  const raw = text ?? '';
+  return raw
+    .split(INSTRUCTION_CACHE_DELIM).join('\n\n---\n\n')
+    .split(CACHE_BREAK_SENTINEL).join('---')
+    .split(CACHE_MEMORY_CONTEXT_DELIM).join('\n\n')
+    .split(CACHE_MEMORY_CONTEXT_SENTINEL).join('')
+    .split(CACHE_MEMORY_APPEND_DELIM).join('\n\n')
+    .split(CACHE_MEMORY_APPEND_SENTINEL).join('');
+}
+
 /** Bare strip: drop the sentinel, leaving a `---` separator. Defensive fallback
  *  for a sentinel that isn't wrapped in the exact delimiter. */
 export function stripCacheBreakSentinel(text: string | undefined | null): string {
-  const s = text ?? '';
-  return s.includes(CACHE_BREAK_SENTINEL) ? s.split(CACHE_BREAK_SENTINEL).join('---') : s;
+  return stripPromptCacheLayerSentinels(text);
 }
 
 /**
- * Restore the LEGACY (dynamic-first) instruction order for brains that don't use
- * the Anthropic cache breakpoint (Codex / BYO). The parity assembler emits
- * `${role}${DELIM}${ctx}` (stable-first, so Claude can cache the prefix); this
- * rebuilds the exact pre-parity `${ctx}\n\n---\n\n${role}`, making the Codex/BYO
- * wire BYTE-IDENTICAL to legacy whether parity is on or off — so a default-on
- * rollout cannot change the primary (Codex) path. No-op when no sentinel is
- * present (e.g. a sub-agent prompt that didn't pass through the assembler).
+ * Restore the LEGACY instruction order for brains that don't use the Anthropic
+ * cache breakpoint (Codex / BYO). Ordinary harness memory historically came
+ * first, followed by the role plus current-turn trailer; caller-rendered Tool
+ * Memory historically came last. The layer markers let us distinguish those
+ * cases from a turn-only suffix, which must remain `${role}\n\n${turn}`. This
+ * keeps the Codex/BYO wire byte-identical whether parity is on or off. No-op
+ * when no sentinel is present (for example a sub-agent prompt that did not pass
+ * through the assembler).
  */
 export function restoreLegacyInstructionOrder(text: string | undefined | null): string {
   const s = text ?? '';
   const idx = s.indexOf(INSTRUCTION_CACHE_DELIM);
   if (idx >= 0) {
     const role = s.slice(0, idx);
-    const ctx = s.slice(idx + INSTRUCTION_CACHE_DELIM.length);
-    return `${ctx}\n\n---\n\n${role}`;
+    const dynamic = s.slice(idx + INSTRUCTION_CACHE_DELIM.length);
+    const split = splitCacheDynamicLayers(dynamic);
+    const stableAndTurn = [role, split.turnContext].filter(Boolean).join('\n\n');
+    const historicalBase = split.memoryContext
+      ? `${split.memoryContext}\n\n---\n\n${stableAndTurn}`
+      : stableAndTurn;
+    return [historicalBase, split.appendedMemory].filter(Boolean).join('\n\n');
   }
   // Sentinel present but not in the exact delimiter shape → safe bare strip.
   return stripCacheBreakSentinel(s);

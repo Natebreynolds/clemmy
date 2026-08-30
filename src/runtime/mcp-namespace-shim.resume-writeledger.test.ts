@@ -30,6 +30,12 @@ const { appendEvent, createSession, listEvents, openEventLog } = await import('.
 const { grantSendTrust, openPlanScope, revokeSendTrust } = await import('../agents/plan-scope.js');
 const { saveProactivityPolicy } = await import('../agents/proactivity-policy.js');
 const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
+const currentCapabilityFixtures = await import('./harness/current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'airtable__list_records',
+  providerKind: 'native_mcp',
+  effect: 'read',
+}]);
 type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
 
 /** The settlement spine refuses dispatch without an accepted source AND a
@@ -50,7 +56,10 @@ function anchorAcceptedTask(sessionId: string, text: string): { seq: number; tur
   return { seq: source.seq, turn: source.turn };
 }
 
-after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
+after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
+  try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 // A server whose tool THROWS with a configurable error (ambiguous timeout vs a
 // demonstrably-never-sent failure).

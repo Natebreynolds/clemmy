@@ -31,8 +31,25 @@ const {
   _setOpennessJudgeForTests,
   _setOpennessJudgePortForTests,
 } = await import('./turn-openness.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'SCHEDULERCO_LIST_EVENTS',
+    providerKind: 'composio',
+    effect: 'read',
+  },
+  {
+    operationId: 'AIRTABLE_CREATE_MULTIPLE_RECORDS',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'records', posture: 'named_existing' },
+  },
+]);
 
-after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
+after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
+  rmSync(TMP_HOME, { recursive: true, force: true });
+});
 afterEach(() => {
   _setOpennessJudgeForTests(null);
   _setOpennessJudgePortForTests(null);

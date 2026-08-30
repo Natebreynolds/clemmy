@@ -5,10 +5,13 @@ import Database from 'better-sqlite3';
 import {
   chmodSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -32,6 +35,9 @@ RECLAMATION_DB.exec(`
     payload_id TEXT NOT NULL UNIQUE
   );
   CREATE TABLE staged_transfer_secret_payloads (
+    payload_id TEXT NOT NULL UNIQUE
+  );
+  CREATE TABLE model_request_provenance (
     payload_id TEXT NOT NULL UNIQUE
   );
 `);
@@ -184,6 +190,70 @@ function runRaceWriter(readyFile: string): Promise<store.AuthorityEncryptedPaylo
   });
 }
 
+function releaseHardLinkFromPeer(
+  hardLinkPath: string,
+): { ready: Promise<void>; done: Promise<void> } {
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', `
+    import { unlinkSync } from 'node:fs';
+    const hardLinkPath = process.env.CLEMMY_TEST_TRANSITIONAL_AUTHORITY_LINK;
+    if (!hardLinkPath) process.exit(2);
+    process.stdout.write('ready\\n');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+    unlinkSync(hardLinkPath);
+  `], {
+    env: {
+      ...process.env,
+      CLEMMY_TEST_TRANSITIONAL_AUTHORITY_LINK: hardLinkPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let readySettled = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+    if (!readySettled && stdout.includes('ready\n')) {
+      readySettled = true;
+      resolveReady();
+    }
+  });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const done = new Promise<void>((resolve, reject) => {
+    child.once('error', (error) => {
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(error);
+      }
+      reject(error);
+    });
+    child.once('exit', (code) => {
+      if (code !== 0) {
+        const error = new Error(`transitional link peer failed (${code}): ${stderr.slice(0, 240)}`);
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(error);
+        }
+        reject(error);
+        return;
+      }
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(new Error('transitional link peer exited before becoming ready'));
+      }
+      resolve();
+    });
+  });
+  return { ready, done };
+}
+
 test('two processes publishing the same payload adopt one no-replace ciphertext reference', async () => {
   const readyFile = path.join(TMP_HOME, 'race-ready');
   writeFileSync(readyFile, '', { mode: 0o600 });
@@ -205,6 +275,95 @@ test('two processes publishing the same payload adopt one no-replace ciphertext 
   }
 });
 
+test('a competing publisher waits out the winner hard-link transition without weakening readers', async () => {
+  const bindingDigest = '8'.repeat(64);
+  const bytes = Buffer.from('causal publication-link transition');
+  const seeded = store.persistAuthorityEncryptedPayload({
+    payloadKind: 'physical_return',
+    bindingDigest,
+    bytes,
+  });
+  const target = store.authorityEncryptedPayloadFilePath(seeded.payloadId);
+  const digest = seeded.payloadId.slice('authority-payload:'.length);
+  const transientLink = path.join(
+    path.dirname(target),
+    `.${digest}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  linkSync(target, transientLink);
+  assert.equal(lstatSync(target).nlink, 2, 'fixture pins the exact post-link/pre-unlink state');
+  assert.equal(store.readAuthorityEncryptedPayload({
+    reference: seeded,
+    payloadKind: 'physical_return',
+    bindingDigest,
+  }).status, 'corrupt', 'ordinary authority readers remain fail-closed during publication');
+
+  const peer = releaseHardLinkFromPeer(transientLink);
+  await peer.ready;
+  let replay: store.AuthorityEncryptedPayloadReference;
+  try {
+    replay = store.persistAuthorityEncryptedPayload({
+      payloadKind: 'physical_return',
+      bindingDigest,
+      bytes,
+    });
+  } finally {
+    await peer.done;
+    if (existsSync(transientLink)) unlinkSync(transientLink);
+  }
+  assert.deepEqual(replay!, seeded, 'the competing writer adopts only the exact winning ciphertext');
+  assert.equal(lstatSync(target).nlink, 1, 'ordinary authority readers still receive one-link files');
+  assert.equal(store.readAuthorityEncryptedPayload({
+    reference: replay!,
+    payloadKind: 'physical_return',
+    bindingDigest,
+  }).status, 'ok');
+});
+
+test('a publisher rereads when the winner settles between its corrupt read and transition check', () => {
+  const bindingDigest = '7'.repeat(64);
+  const bytes = Buffer.from('post-read publication transition');
+  const seeded = store.persistAuthorityEncryptedPayload({
+    payloadKind: 'physical_return',
+    bindingDigest,
+    bytes,
+  });
+  const target = store.authorityEncryptedPayloadFilePath(seeded.payloadId);
+  const digest = seeded.payloadId.slice('authority-payload:'.length);
+  const transientLink = path.join(
+    path.dirname(target),
+    `.${digest}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  linkSync(target, transientLink);
+  assert.equal(lstatSync(target).nlink, 2, 'fixture starts inside the publication window');
+
+  let releasedAfterCorruptRead = false;
+  store.setAuthorityEncryptedPayloadPublicationReadObserverForTests(({ read }) => {
+    if (releasedAfterCorruptRead || read.status !== 'corrupt') return;
+    releasedAfterCorruptRead = true;
+    unlinkSync(transientLink);
+  });
+  let replay: store.AuthorityEncryptedPayloadReference;
+  try {
+    replay = store.persistAuthorityEncryptedPayload({
+      payloadKind: 'physical_return',
+      bindingDigest,
+      bytes,
+    });
+  } finally {
+    store.setAuthorityEncryptedPayloadPublicationReadObserverForTests(null);
+    if (existsSync(transientLink)) unlinkSync(transientLink);
+  }
+
+  assert.equal(releasedAfterCorruptRead, true, 'fixture forced the exact post-read settlement race');
+  assert.deepEqual(replay!, seeded, 'the publisher rereads and adopts the exact winning ciphertext');
+  assert.equal(lstatSync(target).nlink, 1);
+  assert.equal(store.readAuthorityEncryptedPayload({
+    reference: replay!,
+    payloadKind: 'physical_return',
+    bindingDigest,
+  }).status, 'ok');
+});
+
 const RECLAIM_NOW_MS = Date.now();
 
 function makeOld(filePath: string): void {
@@ -223,7 +382,7 @@ function sweep(db: Database.Database = RECLAMATION_DB) {
   });
 }
 
-test('aged manifest, physical-return, and signed-URL payloads with exact DB references are retained', () => {
+test('aged authority payloads with exact DB references are retained', () => {
   const manifest = store.persistAuthorityEncryptedPayload({
     payloadKind: 'staged_transfer_manifest',
     bindingDigest: '2'.repeat(64),
@@ -239,25 +398,35 @@ test('aged manifest, physical-return, and signed-URL payloads with exact DB refe
     bindingDigest: '4'.repeat(64),
     bytes: Buffer.from('ciphertext owner fixture: signed URL'),
   });
+  const modelRequest = store.persistAuthorityEncryptedPayload({
+    payloadKind: 'model_request_snapshot',
+    bindingDigest: '9'.repeat(64),
+    bytes: Buffer.from('ciphertext owner fixture: exact model request'),
+  });
   const manifestPath = store.authorityEncryptedPayloadFilePath(manifest.payloadId);
   const checkpointPath = store.authorityEncryptedPayloadFilePath(checkpoint.payloadId);
   const signedUrlPath = store.authorityEncryptedPayloadFilePath(signedUrl.payloadId);
+  const modelRequestPath = store.authorityEncryptedPayloadFilePath(modelRequest.payloadId);
   makeOld(manifestPath);
   makeOld(checkpointPath);
   makeOld(signedUrlPath);
+  makeOld(modelRequestPath);
   RECLAMATION_DB.prepare(`INSERT INTO staged_transfer_plans (manifest_payload_id) VALUES (?)`)
     .run(manifest.payloadId);
   RECLAMATION_DB.prepare(`INSERT INTO physical_dispatch_return_checkpoints (payload_id) VALUES (?)`)
     .run(checkpoint.payloadId);
   RECLAMATION_DB.prepare(`INSERT INTO staged_transfer_secret_payloads (payload_id) VALUES (?)`)
     .run(signedUrl.payloadId);
+  RECLAMATION_DB.prepare(`INSERT INTO model_request_provenance (payload_id) VALUES (?)`)
+    .run(modelRequest.payloadId);
 
   const result = sweep();
   assert.equal(result.referenceSchemaAvailable, true);
-  assert.ok(result.retainedReferenced >= 3);
+  assert.ok(result.retainedReferenced >= 4);
   assert.equal(existsSync(manifestPath), true);
   assert.equal(existsSync(checkpointPath), true);
   assert.equal(existsSync(signedUrlPath), true);
+  assert.equal(existsSync(modelRequestPath), true);
 });
 
 test('a fresh unreferenced encrypted payload is retained until the full horizon passes', () => {

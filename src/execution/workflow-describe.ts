@@ -14,6 +14,7 @@ import type {
   WorkflowDefinition,
   WorkflowStepInput,
 } from '../memory/workflow-store.js';
+import { validateWorkflowTransform } from './workflow-transform.js';
 
 // ─── cron → human recurrence ─────────────────────────────────────────
 
@@ -139,6 +140,7 @@ function stepAnnotations(step: WorkflowStepInput): string[] {
   if (step.project) notes.push(`uses project "${step.project}"`);
   const skill = step.usesSkill ?? (step as { uses_skill?: string }).uses_skill;
   if (skill) notes.push(`uses the "${skill}" skill`);
+  if (step.transform) notes.push('runs a reviewed data transform (no AI)');
   if (step.deterministic?.runner) notes.push('runs a script (no AI)');
   const gated = step.requiresApproval === true || (step as { requires_approval?: boolean }).requires_approval === true;
   if (gated) {
@@ -205,6 +207,14 @@ export function deriveStepDataSources(step: WorkflowStepInput): string[] {
   for (const m of prompt.matchAll(/\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output[^}]*\}\}/g)) flow.add(`steps.${m[1]}`);
   for (const m of prompt.matchAll(/\{\{\s*input\.([a-zA-Z0-9_-]+)\s*\}\}/g)) flow.add(`input.${m[1]}`);
   for (const m of prompt.matchAll(/\{\{\s*project\.([a-zA-Z0-9_-]+)\s*\}\}/g)) flow.add(`project.${m[1]}`);
+  if (step.transform) {
+    const parsed = validateWorkflowTransform(step.transform);
+    if (parsed.ok) {
+      for (const reference of parsed.references) {
+        if (reference.kind !== 'item') flow.add(reference.source);
+      }
+    }
+  }
   if (step.forEach) flow.add(`forEach ${step.forEach}`);
   if (/\{\{\s*item[.\s}]/.test(prompt)) flow.add('item');
   if (flow.size > 0) out.push(`data flow: ${[...flow].join(', ')}`);

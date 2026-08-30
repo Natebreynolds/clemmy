@@ -18,11 +18,16 @@ import {
 import type { HostCapabilityCatalogFactory } from '../runtime/harness/host-capability-catalog-factory.js';
 import type { IndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
 import { canonicalArgumentDigestOf } from '../runtime/harness/resolved-call-authority.js';
+import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 import {
   armWorkflowV3CallAuthority,
   armWorkflowReadOnlyCallAuthority,
+  evaluateWorkflowV3AutoConsent,
   WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION,
+  type EvaluateWorkflowV3AutoConsentResult,
   type OneShotActivationAuthorization,
+  type WorkflowV3AutoConsentArmInput,
+  type WorkflowV3AutoConsentAuthorizationV1,
 } from '../runtime/harness/accepted-turn-call-authority.js';
 import {
   executeWorkflowReadOnlyCall,
@@ -429,6 +434,82 @@ export function workflowNodeCallAuthorityProofOwnsPrepared(
   );
 }
 
+function workflowV3ArmInputForPrepared(input: {
+  sessionId: string;
+  prepared: PreparedWorkflowNodeCallV1;
+  authority: Readonly<WorkflowNodeCallAuthorityBindingV1>;
+}): WorkflowV3AutoConsentArmInput {
+  const prepared = input.prepared;
+  return {
+    sessionId: input.sessionId,
+    workflowId: prepared.identity.workflowId,
+    workflowRevision: prepared.identity.workflowRevision,
+    workflowDigest: prepared.identity.workflowDigest,
+    runId: prepared.identity.runId,
+    runOccurrenceId: prepared.identity.runOccurrenceId,
+    nodeId: prepared.identity.nodeId,
+    nodeAttempt: prepared.identity.nodeAttempt,
+    invocationPlanDigest: prepared.invocationPlanDigest,
+    bindingSnapshotDigest: prepared.bindingSnapshotDigest,
+    controlDigest: prepared.controlDigest,
+    logicalCallId: prepared.logicalCallId,
+    authorityBindingDigest: input.authority.authorityBindingDigest,
+    requirementId: prepared.requirementId,
+    logicalCapabilityId: prepared.logicalCapabilityId,
+    canonicalArgumentDigest: prepared.canonicalArgumentDigest,
+    sourceArgumentDigest: prepared.sourceArgumentDigest,
+    obligationDigest: input.authority.obligation.obligationDigest,
+    binding: {
+      capabilityId: prepared.binding.capabilityId,
+      manifestId: prepared.binding.manifestId,
+      manifestDigest: prepared.binding.manifestDigest,
+      operationId: prepared.binding.operationId,
+      operationVersion: prepared.binding.operationVersion,
+      schemaDigest: prepared.binding.schemaDigest,
+      providerVersion: prepared.binding.providerVersion,
+      liveFingerprint: prepared.binding.liveFingerprint,
+      accountId: prepared.binding.accountId,
+      effect: prepared.binding.effect as WorkflowV3AutoConsentArmInput['binding']['effect'],
+      invokePortId: prepared.binding.invokePortId,
+      argumentCompiler: { ...prepared.binding.argumentCompiler },
+    },
+  };
+}
+
+/** Project one authentic prepared v3 call through canonical Auto. The risk
+ * evaluator reopens the current catalog/manifest/schema itself; callers get
+ * an opaque authorization only for exact ordinary/reversible work. */
+export function evaluatePreparedWorkflowNodeCallAutoConsent(input: {
+  sessionId: string;
+  prepared: PreparedWorkflowNodeCallV1;
+  proof: WorkflowNodeCallAuthorityProof;
+  inputSchema: unknown;
+}): EvaluateWorkflowV3AutoConsentResult {
+  if (!workflowNodeCallAuthorityProofOwnsPrepared(input.proof, input.prepared)) {
+    return { status: 'conflict', reason: 'prepared call is not authentic' };
+  }
+  const authority = preparedWorkflowNodeCallAuthorities.get(input.prepared as object);
+  if (
+    !authority
+    || authority.authorityBindingDigest !== input.proof.authorityBindingDigest
+    || authority.call.logicalCallId !== input.proof.logicalCallId
+  ) return { status: 'conflict', reason: 'prepared call lost its exact authority binding' };
+  if (
+    input.prepared.binding.effect === 'read'
+    || input.prepared.binding.effect === 'compute'
+    || input.prepared.binding.effect === 'host_only'
+  ) return { status: 'conflict', reason: 'canonical Auto v3 evaluation requires a mutating call' };
+  return evaluateWorkflowV3AutoConsent({
+    authority: workflowV3ArmInputForPrepared({
+      sessionId: input.sessionId,
+      prepared: input.prepared,
+      authority,
+    }),
+    inputSchema: input.inputSchema,
+    args: input.prepared.canonicalArgs as Record<string, unknown>,
+  });
+}
+
 export type ActivatePreparedWorkflowNodeCallResult =
   | {
       status: 'armed' | 'existing';
@@ -509,6 +590,7 @@ export function activatePreparedWorkflowNodeCall(input: {
   prepared: PreparedWorkflowNodeCallV1;
   proof: WorkflowNodeCallAuthorityProof;
   oneShotActivationAuthorization?: OneShotActivationAuthorization;
+  autoConsentAuthorization?: WorkflowV3AutoConsentAuthorizationV1;
 }): ActivatePreparedWorkflowNodeCallResult {
   if (!workflowNodeCallAuthorityProofOwnsPrepared(input.proof, input.prepared)) {
     return { status: 'blocked', reason: 'prepared_call_not_authentic', executable: false };
@@ -526,44 +608,24 @@ export function activatePreparedWorkflowNodeCall(input: {
   if (
     (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
     && !input.oneShotActivationAuthorization
+    && !input.autoConsentAuthorization
   ) {
     return { status: 'blocked', reason: 'exact_one_shot_authorization_required', executable: false };
   }
+  if (input.oneShotActivationAuthorization && input.autoConsentAuthorization) {
+    return { status: 'blocked', reason: 'conflicting_exact_authorizations', executable: false };
+  }
   const armed = armWorkflowV3CallAuthority({
-    sessionId: input.sessionId,
-    workflowId: input.prepared.identity.workflowId,
-    workflowRevision: input.prepared.identity.workflowRevision,
-    workflowDigest: input.prepared.identity.workflowDigest,
-    runId: input.prepared.identity.runId,
-    runOccurrenceId: input.prepared.identity.runOccurrenceId,
-    nodeId: input.prepared.identity.nodeId,
-    nodeAttempt: input.prepared.identity.nodeAttempt,
-    invocationPlanDigest: input.prepared.invocationPlanDigest,
-    bindingSnapshotDigest: input.prepared.bindingSnapshotDigest,
-    controlDigest: input.prepared.controlDigest,
-    logicalCallId: input.prepared.logicalCallId,
-    authorityBindingDigest: authority.authorityBindingDigest,
-    requirementId: input.prepared.requirementId,
-    logicalCapabilityId: input.prepared.logicalCapabilityId,
-    canonicalArgumentDigest: input.prepared.canonicalArgumentDigest,
-    sourceArgumentDigest: input.prepared.sourceArgumentDigest,
-    obligationDigest: authority.obligation.obligationDigest,
-    binding: {
-      capabilityId: input.prepared.binding.capabilityId,
-      manifestId: input.prepared.binding.manifestId,
-      manifestDigest: input.prepared.binding.manifestDigest,
-      operationId: input.prepared.binding.operationId,
-      operationVersion: input.prepared.binding.operationVersion,
-      schemaDigest: input.prepared.binding.schemaDigest,
-      providerVersion: input.prepared.binding.providerVersion,
-      liveFingerprint: input.prepared.binding.liveFingerprint,
-      accountId: input.prepared.binding.accountId,
-      effect,
-      invokePortId: input.prepared.binding.invokePortId,
-      argumentCompiler: { ...input.prepared.binding.argumentCompiler },
-    },
+    ...workflowV3ArmInputForPrepared({
+      sessionId: input.sessionId,
+      prepared: input.prepared,
+      authority,
+    }),
     ...(input.oneShotActivationAuthorization
       ? { oneShotActivationAuthorization: input.oneShotActivationAuthorization }
+      : {}),
+    ...(input.autoConsentAuthorization
+      ? { autoConsentAuthorization: input.autoConsentAuthorization }
       : {}),
   });
   if ('ref' in armed) {
@@ -1043,7 +1105,11 @@ async function executePreparedWorkflowNodeCall(
     };
   }
 
-  const evidence = verifyWorkflowNodeInvocationEvidence(kernel.result, prepared.resolved.plan);
+  const evidenceView = projectProviderResultEvidenceView(kernel.result);
+  const evidence = verifyWorkflowNodeInvocationEvidence(
+    evidenceView.kind === 'provider_payload' ? evidenceView.payload : undefined,
+    prepared.resolved.plan,
+  );
   if (!evidence.complete) {
     return {
       ok: false,

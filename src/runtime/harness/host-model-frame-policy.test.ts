@@ -140,11 +140,27 @@ test('fresh plan frame refuses every unsafe ordering, cardinality, carrier, effe
   }
 });
 
-test('proposal-free work_call refuses alone before activation and is ordinary after activation', () => {
+test('proposal-free read/compute is ordinary without a graph while mutation and unknown stay plan-bound', () => {
   assert.deepEqual(classifyHostModelFrame({ calls: [work()], planActivated: false, allowFreshPlanReadFusion: true }), {
-    kind: 'refused',
-    reason: 'host_planned_work_call_requires_plan_sibling',
+    kind: 'ordinary',
   });
+  assert.deepEqual(classifyHostModelFrame({
+    calls: [work({ effect: 'compute' })],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  }), {
+    kind: 'ordinary',
+  });
+  for (const effect of ['local_write', 'external_write', 'admin', 'unknown'] as const) {
+    assert.deepEqual(classifyHostModelFrame({
+      calls: [work({ effect })],
+      planActivated: false,
+      allowFreshPlanReadFusion: true,
+    }), {
+      kind: 'refused',
+      reason: 'host_planned_work_call_requires_plan_sibling',
+    }, effect);
+  }
   assert.deepEqual(classifyHostModelFrame({ calls: [work()], planActivated: true, allowFreshPlanReadFusion: true }), {
     kind: 'ordinary',
   });

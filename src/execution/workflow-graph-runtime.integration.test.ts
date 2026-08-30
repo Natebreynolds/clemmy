@@ -41,6 +41,7 @@ const { reshapeWorkflowGraph } = await import('./workflow-graph-reshape.js');
 const {
   applyWorkflowGraphPatch,
   compileWorkflowStepsToGraph,
+  validateWorkflowGraph,
   workflowSubgraphSpecialistNodeId,
   WORKFLOW_GRAPH_ALLOWED_TOOLS,
 } = await import('./workflow-graph.js');
@@ -111,6 +112,40 @@ test('persisted graph snapshots cannot bypass dynamic runtime node-id safety', (
   assert.equal(materialized.ok, false);
   assert.match(materialized.errors.join(' '), /reserved by the workflow runtime/i);
   assert.deepEqual(materialized.steps, authoredSteps, 'unsafe persisted nodes never become executable steps');
+});
+
+test('materialization admits only the byte-identical authored bare-call node', () => {
+  const authoredSteps = [{
+    id: 'pull_digest',
+    prompt: 'Pull the digest rows.',
+    sideEffect: 'read' as const,
+    call: { tool: 'ALPHA_LIST_RECORDS', args: { view: 'digest' } },
+  }];
+  const graph = compileWorkflowStepsToGraph(authoredSteps);
+
+  assert.equal(validateWorkflowGraph(graph).ok, false, 'default graph validation stays strict');
+  const exact = materializeWorkflowGraphSteps(authoredSteps, graph);
+  assert.equal(exact.ok, true, exact.errors.join('; '));
+  assert.deepEqual(exact.steps, authoredSteps);
+
+  const altered = structuredClone(graph);
+  altered.nodes[0]!.call = { tool: 'ALPHA_LIST_RECORDS', args: { view: 'ambient' } };
+  const alteredResult = materializeWorkflowGraphSteps(authoredSteps, altered);
+  assert.equal(alteredResult.ok, false);
+  assert.match(alteredResult.errors.join(' '), /altered authored node/i);
+
+  const graphAdded = structuredClone(graph);
+  graphAdded.nodes.push({
+    id: 'injected_call',
+    type: 'step',
+    stepId: 'injected_call',
+    prompt: 'Run an injected call.',
+    sideEffect: 'read',
+    call: { tool: 'ALPHA_LIST_RECORDS', args: { view: 'digest' } },
+  });
+  const graphAddedResult = materializeWorkflowGraphSteps(authoredSteps, graphAdded);
+  assert.equal(graphAddedResult.ok, false);
+  assert.match(graphAddedResult.errors.join(' '), /Graph-added node .* exact-call authority/i);
 });
 
 test('materializeWorkflowGraphSteps locks compiled specialists and reducer to result-only authority', () => {
@@ -1307,6 +1342,8 @@ test('an in-process graph node pages an offloaded upstream result without wideni
 });
 
 test('a graph patch admitted after the scheduler settles prevents stale terminal publication and executes on the next drain', async () => {
+  const priorHarnessFlag = process.env.WORKFLOW_USE_HARNESS;
+  process.env.WORKFLOW_USE_HARNESS = 'on';
   const workflowSlug = 'graph-terminal-race';
   const workflowName = 'Graph Terminal Race';
   const runId = 'graph-terminal-race-run';
@@ -1381,28 +1418,28 @@ test('a graph patch admitted after the scheduler settles prevents stale terminal
     assert.equal(reshaped.ok, true, reshaped.errors.join('; '));
   });
 
-  const legacyPrompts: string[] = [];
   const graphPrompts: string[] = [];
   _setWorkflowHarnessLoopImplsForTests({
     configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
     runConversation: (async (request: { input?: string; sessionId?: string }) => {
-      graphPrompts.push(String(request.input ?? ''));
+      const prompt = String(request.input ?? '');
+      graphPrompts.push(prompt);
+      const response = prompt.includes(marker) ? marker : 'seed completed';
       return {
         sessionId: request.sessionId ?? `workflow:${runId}:late_probe`,
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        lastDecision: { summary: marker },
+        lastDecision: { summary: response },
       };
     }) as never,
   });
+  let legacyCalls = 0;
   const assistant = {
-    respond: async (request: { message?: string; sessionId?: string }) => {
-      legacyPrompts.push(String(request.message ?? ''));
-      return {
-        text: 'seed completed',
-        sessionId: request.sessionId ?? `workflow:${runId}:seed`,
-      };
+    respond: async () => {
+      legacyCalls += 1;
+      throw new Error('graph runtime work must stay on the canonical harness owner');
     },
   } as never;
 
@@ -1423,6 +1460,8 @@ test('a graph patch admitted after the scheduler settles prevents stale terminal
   } finally {
     _setBeforeWorkflowGraphFinalizationForTests(null);
     _setWorkflowHarnessLoopImplsForTests();
+    if (priorHarnessFlag === undefined) delete process.env.WORKFLOW_USE_HARNESS;
+    else process.env.WORKFLOW_USE_HARNESS = priorHarnessFlag;
   }
 
   const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as {
@@ -1431,7 +1470,12 @@ test('a graph patch admitted after the scheduler settles prevents stale terminal
     stepOutputs?: Record<string, string>;
   };
   const events = readWorkflowEvents(workflowSlug, runId);
-  assert.equal(legacyPrompts.length, 1, 'the completed authored step is not repeated');
+  assert.equal(legacyCalls, 0, 'graph runtime work never falls through to the retired assistant lane');
+  assert.equal(
+    graphPrompts.filter((prompt) => prompt.includes('Return the seed value.')).length,
+    1,
+    'the completed authored step is not repeated by the canonical harness owner',
+  );
   assert.ok(graphPrompts.some((prompt) => prompt.includes(marker)));
   assert.equal(terminal.status, 'completed');
   assert.equal(terminal.stepOutputs?.late_probe, marker);

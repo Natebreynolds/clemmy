@@ -22,6 +22,7 @@ import {
 } from '../runtime/harness/independent-capability-observation.js';
 import { capabilityManifestDigest, currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
+import { workflowCapabilityDigest } from './workflow-capability-digest.js';
 
 export type WorkflowNodeInvocationBlockCode =
   | 'cancelled'
@@ -264,9 +265,9 @@ function identityBlock(
     return { code: 'operation_drift', message: 'Live operation identity/version differs from the plan.' };
   }
   if (
-    actual.schemaDigest !== expected.schemaDigest
+    workflowCapabilityDigest(actual.schemaDigest) !== expected.schemaDigest
     || actual.providerVersion !== expected.providerVersion
-    || actual.liveFingerprint !== expected.liveFingerprint
+    || workflowCapabilityDigest(actual.liveFingerprint) !== expected.liveFingerprint
   ) return { code: 'schema_drift', message: 'Live schema/provider fingerprint differs from the plan.' };
   if (actual.account !== expected.accountId) {
     return { code: 'account_drift', message: 'Live account identity differs from the plan.' };
@@ -409,7 +410,7 @@ export function resolveWorkflowNodeInvocation(
     observation.operationId !== expected.operationId
     || observation.operationVersion !== expected.operationVersion
     || observation.providerVersion !== expected.providerVersion
-    || observation.definitionFingerprint !== expected.liveFingerprint
+    || workflowCapabilityDigest(observation.definitionFingerprint) !== expected.liveFingerprint
     || observation.accountId !== expected.accountId
   ) return block('live_observation_drift', 'Independent capability observation differs from the exact plan.');
 

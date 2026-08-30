@@ -24,7 +24,10 @@ const { withToolOutputContext } = await import('../runtime/harness/tool-output-c
 
 test.after(() => rmSync(TMP, { recursive: true, force: true }));
 
-type ToolHandler = (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+type ToolHandler = (args: Record<string, unknown>) => Promise<{
+  content: Array<{ text: string }>;
+  isError?: boolean;
+}>;
 function capture(register: (s: never, b?: never) => void, backends?: unknown): ToolHandler {
   let handler: ToolHandler | undefined;
   const fake = { tool: (_n: string, _d: string, _s: unknown, h: ToolHandler) => { handler = h; } };
@@ -101,7 +104,9 @@ test('file_query tool reads a text file and returns ranked passages; corrective 
   const out = JSON.parse(textOf(await handler({ query: 'refund processing time', file })));
   assert.equal(out.hits[0].heading, 'Refunds');
   assert.match(out.hits[0].text, /14 days/);
-  const miss = JSON.parse(textOf(await handler({ query: 'zebra migration', file })));
+  const missResult = await handler({ query: 'zebra migration', file });
+  assert.notEqual(missResult.isError, true, 'an honest lexical miss remains a successful query result');
+  const miss = JSON.parse(textOf(missResult));
   assert.deepEqual(miss.hits, []);
   assert.match(miss.note, /lexical/);
 });
@@ -126,6 +131,99 @@ test('file_query finds a tail passage in a chunked parked source', async () => {
     handler({ query: marker, call_id: 'call_truncated_document' })));
   const parsed = JSON.parse(out) as { hits: Array<{ text: string }> };
   assert.ok(parsed.hits.some((hit) => hit.text.includes(marker)));
+});
+
+test('file_query treats a textual null in the unused strict-nullable source as absent', async () => {
+  const handler = capture(registerFileQueryTools as never);
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_null_calendar_view',
+    tool: 'provider_calendar_view',
+    output: '# Wednesday\n\nTeam sync starts at 10:00 AM.',
+    invocationNonce: 'nonce-calendar-view',
+  });
+
+  const out = textOf(await withToolOutputContext({ sessionId: sess.id }, () =>
+    handler({
+      query: 'subject start end',
+      file: 'null',
+      call_id: 'call_null_calendar_view',
+    })));
+
+  assert.doesNotMatch(out, /pass exactly ONE/i,
+    'a model textualization of the unused nullable field must not hide the parked result');
+  const parsed = JSON.parse(out) as { source: string; hits: Array<{ text: string }> };
+  assert.equal(parsed.source, 'tool output call_null_calendar_view');
+  assert.ok(parsed.hits.some((hit) => hit.text.includes('10:00 AM')));
+});
+
+test('file_query preserves a real path named null while ignoring an unused textual-null call id', async () => {
+  const handler = capture(registerFileQueryTools as never);
+  const literalNullPath = path.join(TMP, 'null');
+  const literalNullSource = `${TMP}/./null`;
+  writeFileSync(literalNullPath, '# Literal null path\n\nThe sentinel hard negative is intact.');
+
+  const out = textOf(await handler({
+    query: 'sentinel hard negative',
+    file: literalNullSource,
+    call_id: 'null',
+  }));
+
+  const parsed = JSON.parse(out) as { source: string; hits: Array<{ text: string }> };
+  assert.equal(parsed.source, 'null');
+  assert.ok(parsed.hits.some((hit) => hit.text.includes('hard negative')));
+});
+
+test('file_query refuses two concrete sources instead of choosing one', async () => {
+  const handler = capture(registerFileQueryTools as never);
+  const sess = createSession({ kind: 'chat' });
+  const file = path.join(TMP, 'two-concrete-sources.md');
+  writeFileSync(file, '# File source\n\nConcrete file payload.');
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_concrete_source',
+    tool: 'provider_document_read',
+    output: '# Parked source\n\nConcrete parked payload.',
+    invocationNonce: 'nonce-concrete-source',
+  });
+
+  const result = await withToolOutputContext({ sessionId: sess.id }, () =>
+    handler({ query: 'concrete payload', file, call_id: 'call_concrete_source' }));
+  const out = textOf(result);
+
+  assert.equal(result.isError, true, 'the direct MCP result must be failure-shaped');
+  assert.match(out, /pass exactly ONE of `file` \/ `call_id`/i);
+});
+
+test('file_query refuses when both sources are absent or bare-null sentinels', async () => {
+  const handler = capture(registerFileQueryTools as never);
+
+  for (const args of [
+    { query: 'missing sources' },
+    { query: 'missing sources', file: ' null ', call_id: 'NULL' },
+  ]) {
+    const result = await handler(args);
+    const out = textOf(result);
+    assert.equal(result.isError, true, 'the direct MCP result must be failure-shaped');
+    assert.match(out, /pass exactly ONE of `file` \/ `call_id`/i);
+  }
+});
+
+test('file_query source-resolution failures are MCP errors, not successful text', async () => {
+  const handler = capture(registerFileQueryTools as never);
+  const missingFile = await handler({
+    query: 'missing file',
+    file: path.join(TMP, 'does-not-exist.md'),
+  });
+  assert.equal(missingFile.isError, true);
+  assert.match(textOf(missingFile), /file_query failed/i);
+
+  const sess = createSession({ kind: 'chat' });
+  const missingCall = await withToolOutputContext({ sessionId: sess.id }, () =>
+    handler({ query: 'missing parked output', call_id: 'call_does_not_exist' }));
+  assert.equal(missingCall.isError, true);
+  assert.match(textOf(missingCall), /no stored output/i);
 });
 
 // ── time_slots ───────────────────────────────────────────────────────

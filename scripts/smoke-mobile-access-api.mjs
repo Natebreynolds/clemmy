@@ -5,11 +5,10 @@
 //
 //   1. GET status returns a coherent empty-state payload
 //   2. POST pin saves a PIN, status reports pinConfigured=true
-//   3. POST configure rejects garbage hostname
-//   4. GET qr refuses local-preview / unready public targets with a
-//      structured readiness error instead of emitting a dead localhost QR
-//   5. POST tunnel/start refuses with "no custom-domain tunnel configured" (since we
-//      never actually create one — that would require a real CF account)
+//   3. POST setup stays fail-closed while the pinned-TLS direct-app door is shut
+//   4. GET qr refuses the unready local target with a structured readiness
+//      error, and an untrusted hostname query cannot override that target
+//   5. Retired custom-domain/tunnel routes remain absent
 //
 // Run: npm run build && node scripts/smoke-mobile-access-api.mjs
 
@@ -127,8 +126,14 @@ ok('daemon booted');
   if (!res.ok) { fail(`status returned ${res.status}`); }
   else {
     const body = await res.json();
-    if (typeof body?.detect === 'object' && typeof body?.pin?.configured === 'boolean' && Array.isArray(body?.sessions)) {
-      ok('status payload has detect/pin/sessions shape');
+    if (
+      typeof body?.pin?.configured === 'boolean'
+      && Array.isArray(body?.sessions)
+      && typeof body?.target === 'object'
+      && typeof body?.target?.qrReady === 'boolean'
+      && typeof body?.setup?.phase === 'string'
+    ) {
+      ok('status payload has pin/sessions/target/setup shape');
     } else fail(`status payload shape wrong: ${JSON.stringify(body).slice(0, 240)}`);
   }
 }
@@ -174,15 +179,25 @@ ok('daemon booted');
   else fail(`expected 400 for bad PIN, got ${res.status}`);
 }
 
-// 6. POST configure with bad input
+// 6. One-tap setup stays fail-closed while the disposable daemon's direct-app
+// door is shut. A smoke must never turn a local-preview URL into pairing truth.
 {
-  const res = await fetch(`${baseUrl}/api/console/mobile-access/configure`, {
+  const res = await fetch(`${baseUrl}/api/console/mobile-access/setup`, {
     method: 'POST',
     headers: { ...authHeader, 'content-type': 'application/json' },
-    body: JSON.stringify({ tunnelName: 'bad name', hostname: 'no-dot' }),
+    body: JSON.stringify({}),
   });
-  if (res.status === 400) ok('configure rejects bad input (400)');
-  else fail(`expected 400 for bad configure, got ${res.status}`);
+  const body = await res.json().catch(() => ({}));
+  if (
+    res.status === 400
+    && body?.ok === false
+    && body?.view?.qrReady === false
+    && typeof body?.failure?.code === 'string'
+  ) {
+    ok('setup refuses while the direct-app target is not ready');
+  } else {
+    fail(`expected fail-closed setup response, got ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+  }
 }
 
 // 7. GET qr without hostname → readiness error (no dead localhost QR)
@@ -196,28 +211,43 @@ ok('daemon booted');
   }
 }
 
-// 8. GET qr with hostname override still refuses until Access + tunnel runtime are ready
+// 8. A legacy hostname query is inert. The server derives its direct-app target
+// from the live pinned-TLS runtime; a caller cannot manufacture another host.
 {
   const res = await fetch(`${baseUrl}/api/console/mobile-access/qr?hostname=clem.example.com`, { headers: authHeader });
   const body = await res.json().catch(() => ({}));
-  if (res.status === 409 && body?.code === 'MOBILE_QR_NOT_READY' && body?.target?.mode === 'custom-domain') {
-    ok('qr with hostname override is blocked until custom-domain target is ready');
+  if (
+    res.status === 409
+    && body?.code === 'MOBILE_QR_NOT_READY'
+    && body?.target?.mode === 'local-preview'
+    && /^http:\/\/127\.0\.0\.1:\d+\/m\/$/.test(body?.target?.url ?? '')
+  ) {
+    ok('hostname query cannot override the derived mobile target');
   } else {
-    fail(`expected 409 custom-domain readiness error, got ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+    fail(`expected 409 for the unchanged local target, got ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
   }
 }
 
-// 9. POST tunnel/start without configured tunnel → 400
+// 9. Custom-domain/tunnel administration retired with the direct-app pivot.
+// Keeping these routes absent prevents an old client from creating a second,
+// weaker exposure path.
 {
-  const res = await fetch(`${baseUrl}/api/console/mobile-access/tunnel/start`, {
-    method: 'POST',
-    headers: authHeader,
-  });
-  if (res.status === 400) {
-    const body = await res.json();
-    if (/no (custom-domain )?tunnel configured|cloudflared binary/.test(body.error || '')) ok('tunnel/start refuses without a tunnel');
-    else fail(`tunnel/start returned 400 but wrong error: ${JSON.stringify(body)}`);
-  } else fail(`expected 400 for unconfigured tunnel start, got ${res.status}`);
+  const [configure, tunnelStart] = await Promise.all([
+    fetch(`${baseUrl}/api/console/mobile-access/configure`, {
+      method: 'POST',
+      headers: { ...authHeader, 'content-type': 'application/json' },
+      body: JSON.stringify({ tunnelName: 'bad name', hostname: 'no-dot' }),
+    }),
+    fetch(`${baseUrl}/api/console/mobile-access/tunnel/start`, {
+      method: 'POST',
+      headers: authHeader,
+    }),
+  ]);
+  if (configure.status === 404 && tunnelStart.status === 404) {
+    ok('retired custom-domain and tunnel routes remain absent');
+  } else {
+    fail(`expected retired routes to return 404, got configure=${configure.status} tunnel/start=${tunnelStart.status}`);
+  }
 }
 
 console.log(exitCode === 0 ? '\nAll mobile-access dashboard checks passed.' : '\nSmoke FAILED.');

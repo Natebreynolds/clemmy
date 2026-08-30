@@ -195,6 +195,7 @@ export type LiveCapabilityMaterializationRefusal =
   | 'unattested_effect'
   | 'effect_not_read'
   | 'stale_observation'
+  | 'publication_expired'
   | 'port_registration_failed'
   | 'port_identity_mismatch'
   | 'independent_observation_missing'
@@ -1118,9 +1119,10 @@ function catalogEntry(input: {
 
 /**
  * Materialize exactly one currently observable read capability for an
- * objective. Every blocked outcome retires authority previously materialized
- * for the same carrier/objective scope; cached hints and lingering ports remain
- * non-authoritative by construction.
+ * objective. Every substantive blocked outcome retires authority previously
+ * materialized for the same carrier/objective scope. Cancellation/deadline
+ * expiry is different: abandoned work may neither publish nor revoke
+ * authority after its caller stopped awaiting it.
  */
 export async function materializeLiveReadCapability(input: {
   objective: string;
@@ -1135,6 +1137,10 @@ export async function materializeLiveReadCapability(input: {
   store?: CapabilityManifestStore;
   factory?: HostCapabilityCatalogFactory;
   refreshIndependentObservation?: RefreshIndependentObservation;
+  /** Owned by the bounded caller. Once false, this invocation may finish
+   * consuming already-started carrier I/O but may neither retire nor publish
+   * manifest/catalog authority. */
+  publicationGuard?: () => boolean;
   now?: () => number;
 }): Promise<MaterializeLiveReadCapabilityResult> {
   const store = input.store
@@ -1145,10 +1151,26 @@ export async function materializeLiveReadCapability(input: {
   if (!input.factory && !installedFactory) installHostCapabilityCatalogFactory(factory);
   const objective = normalizeObjective(input.objective);
   const prefix = scopePrefix({ objective, carrier: input.carrier.identity });
+  const publicationActive = (): boolean => {
+    try {
+      return input.publicationGuard?.() !== false;
+    } catch {
+      return false;
+    }
+  };
+  const publicationExpired = (): MaterializeLiveReadCapabilityResult => ({
+    status: 'blocked',
+    reason: 'publication_expired',
+    detail: 'the bounded acquisition caller stopped awaiting this materialization',
+    retired: [],
+  });
   const block = (
     reason: LiveCapabilityMaterializationRefusal,
     detail: string,
-  ): MaterializeLiveReadCapabilityResult => blocked({ reason, detail, store, factory, prefix });
+  ): MaterializeLiveReadCapabilityResult => publicationActive()
+    ? blocked({ reason, detail, store, factory, prefix })
+    : publicationExpired();
+  if (!publicationActive()) return publicationExpired();
   if (!objective) return block('empty_objective', 'an objective is required');
   if (Buffer.byteLength(objective, 'utf8') > MAX_OBJECTIVE_BYTES) {
     return block('empty_objective', 'the objective exceeds its canonical byte budget');
@@ -1182,6 +1204,7 @@ export async function materializeLiveReadCapability(input: {
       error instanceof Error ? error.message : String(error),
     );
   }
+  if (!publicationActive()) return publicationExpired();
   if (Array.isArray(enumerated) && enumerated.length > MAX_ENUMERATED_OPERATIONS) {
     return block(
       'enumeration_unbounded',
@@ -1247,6 +1270,7 @@ export async function materializeLiveReadCapability(input: {
   } catch (error) {
     return block('live_unavailable', error instanceof Error ? error.message : String(error));
   }
+  if (!publicationActive()) return publicationExpired();
   let firstLive: LiveCapabilityObservationResult;
   try {
     firstLive = input.carrier.observe(Object.freeze({ ...reference }));
@@ -1288,6 +1312,7 @@ export async function materializeLiveReadCapability(input: {
       error instanceof Error ? error.message : String(error),
     );
   }
+  if (!publicationActive()) return publicationExpired();
   if (!registered.ok) return block('port_registration_failed', registered.reason);
   const port = resolveProductionPortsForManifest(manifest);
   if (!port || typeof port.invoke !== 'function') {
@@ -1311,6 +1336,7 @@ export async function materializeLiveReadCapability(input: {
       error instanceof Error ? error.message : String(error),
     );
   }
+  if (!publicationActive()) return publicationExpired();
   if (!independentMatches(independent, first.attestation)) {
     return block(
       'independent_observation_missing',
@@ -1338,6 +1364,7 @@ export async function materializeLiveReadCapability(input: {
     return block('identity_mismatch', 'the live definition changed during materialization');
   }
 
+  if (!publicationActive()) return publicationExpired();
   let contractInstalled = false;
   try {
     const savedContract = saveToolContract({
@@ -1366,6 +1393,10 @@ export async function materializeLiveReadCapability(input: {
   let lifecycle:
     | ReturnType<CapabilityManifestStore['install']>
     | ReturnType<CapabilityManifestStore['supersede']>;
+  // Everything below is synchronous. Take the guard immediately before this
+  // critical section so an abort delivered on a later event-loop turn cannot
+  // leave a half-published manifest/catalog pair.
+  if (!publicationActive()) return publicationExpired();
   if (prior.length > 0) {
     lifecycle = store.supersede(prior[0]!.manifestId, manifest);
   } else {

@@ -138,16 +138,22 @@ test('D4: finishing a step earns the next search; rephrasing one does not', () =
 
   const first = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-A' });
   assert.equal(first.admitted, true);
-  governor.settle({
-    ...key, category: 'broad_discovery', callId: 'search-A', outcome: 'succeeded',
-  });
 
-  // Shopping the same requirement around buys neither a new claim nor another
-  // provider invocation. Only host-owned evidence can open the next epoch.
+  // Shopping the same requirement around while its physical call is still
+  // open buys neither a new claim nor another provider invocation.
   const shopping = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-A2' });
   assert.equal(shopping.admitted, false);
   assert.equal(shopping.reason, 'new_call_requires_retry_epoch');
   assert.equal(shopping.consumedBudget, false, 'no second claim is minted');
+
+  governor.settle({
+    ...key, category: 'broad_discovery', callId: 'search-A', outcome: 'succeeded',
+  });
+  const continuation = governor.admit({
+    ...key, category: 'broad_discovery', callId: 'search-A3',
+  });
+  assert.equal(continuation.admitted, true, 'a settled read may be refined or paginated');
+  assert.equal(continuation.reason, 'settled_continuation_admitted');
 
   // Actually USING what was found is different: "pull the rankings, then email
   // them" is one task and two systems, and the second system has genuinely not

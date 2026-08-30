@@ -23,6 +23,7 @@ const index = await import('../../memory/capability-index.js');
 const contracts = await import('../../tools/tool-contract-store.js');
 const eventlog = await import('./eventlog.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
+const manifests = await import('./capability-manifest.js');
 const manifestStores = await import('./capability-manifest-store.js');
 const ports = await import('./production-capability-ports.js');
 const observations = await import('./independent-capability-observation.js');
@@ -374,6 +375,10 @@ test('empty home accounts exact live preparation and business workflow crossings
      WHERE session_id = ? AND source_user_seq = ?
   `).get(armed.ref.sessionId, armed.ref.sourceEventSeq) as { n: number }).n, 2);
 
+  // A restart observation is necessarily newer than the manifest's original
+  // installation provenance. That observation time is not definition drift.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(
     manifestStores.createCapabilityManifestStore([], { durable: true }),
@@ -388,6 +393,11 @@ test('empty home accounts exact live preparation and business workflow crossings
   assert.equal(warm.status, 'installed', JSON.stringify(warm));
   if (warm.status === 'installed') {
     assert.equal(warm.manifest.manifestId, installed.manifest.manifestId);
+    assert.equal(
+      manifests.capabilityManifestDigest(warm.manifest),
+      manifests.capabilityManifestDigest(installed.manifest),
+    );
+    assert.equal(warm.manifest.provenance.issuedAt, installed.manifest.provenance.issuedAt);
     assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.snapshot().length, 1);
     assert.equal(ports.listProductionCapabilityPorts().length, 1);
   }

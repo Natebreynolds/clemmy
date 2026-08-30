@@ -573,7 +573,11 @@ test('a held catch-up exposes readiness blockers and remains skippable when Resu
     assert.equal(readiness?.ok, false);
     assert.equal(readiness?.blockers?.length, 1);
     assert.equal(readiness?.blockers?.[0]?.name, 'missing-merge.py');
-    assert.match(readiness?.blockers?.[0]?.reason ?? '', /script.*missing/i);
+    assert.match(
+      readiness?.blockers?.[0]?.reason ?? '',
+      /workflow_raw_subprocess_authority_unrepresented/,
+      'raw subprocess declarations remain fail-closed even when their named file is absent',
+    );
     assert.ok(card!.actions.includes('skip'), 'a readiness blocker never removes Skip');
 
     const blocked = await fetch(

@@ -99,13 +99,34 @@ test('renderSourceMapForContext returns empty when the flag is off', () => {
 
 test('renderSourceMapForContext renders a grouped, pointer-only block when on', () => {
   process.env.CLEMMY_SOURCE_MAP = 'on';
-  upsertResourcePointer({ app: 'Google Drive', kind: 'folder', name: 'Q3 Planning', whatsHere: 'board decks and OKRs' });
+  const drive = upsertResourcePointer({
+    app: 'Google Drive',
+    kind: 'folder',
+    name: 'Q3 Planning',
+    providerId: 'folder-123',
+    parentRef: 'google-drive:folder:planning-root',
+    whatsHere: 'board decks and OKRs',
+    trust: 0.9,
+    source: 'reactive',
+  });
+  upsertResourcePointer({
+    app: 'Google Drive',
+    kind: 'folder',
+    name: 'Q3 Planning',
+    ref: drive.ref,
+  });
   upsertResourcePointer({ app: 'Airtable', kind: 'base', name: 'Prospects', whatsHere: 'prospect records' });
   const block = renderSourceMapForContext();
   assert.match(block, /Data landscape/);
   assert.match(block, /Google Drive:/);
   assert.match(block, /Q3 Planning/);
   assert.match(block, /board decks and OKRs/);
+  assert.match(block, new RegExp(`ref=${drive.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(block, /parent=google-drive:folder:planning-root/);
+  assert.match(block, /trust=0\.90/);
+  assert.match(block, /source=reactive/);
+  assert.match(block, /seen=\d{4}-\d{2}-\d{2}/);
+  assert.match(block, /mentions=2/);
   assert.match(block, /Airtable:/);
 });
 

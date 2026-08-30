@@ -26,10 +26,13 @@ import {
   getEvent,
   getRunAttemptSourceUserEvent,
   listEvents,
+  openEventLog,
   resolveToolOutputForAuthority,
   type EventRow,
 } from './eventlog.js';
 import { extractJsonCandidate } from './json-repair.js';
+import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
+import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { hashToolCall } from './tool-guardrail.js';
 import { SETTLED_READ_REPLAY_KIND } from './settled-read-replay-semantics.js';
 
@@ -107,6 +110,8 @@ export interface ResolveSettledReadInfraRecoveryInput {
   runAttemptId: string;
   failedTurn: number;
 }
+
+type CanonicalInfraRecoveryResolution = SettledReadInfraRecovery | null | undefined;
 
 // Recovery text is sent directly back through the model boundary. Keep that
 // repair bounded; a larger durable result remains queryable through the normal
@@ -405,6 +410,117 @@ function interveningMutationOrSteer(
 }
 
 /**
+ * Recover one provider-neutral read from the canonical call kernel.
+ *
+ * `undefined` means this failed turn has no kernel settlement and permits the
+ * narrow legacy direct-Composio compatibility lookup below. `null` means the
+ * kernel did record candidate authority, but it was ambiguous or failed exact
+ * redemption; a weaker event-only path must not override that result.
+ */
+function resolveCanonicalInfraRecovery(
+  input: ResolveSettledReadInfraRecoveryInput,
+  events: readonly EventRow[],
+): CanonicalInfraRecoveryResolution {
+  const db = openEventLog();
+  const rows = db.prepare(`
+    SELECT s.logical_tool_call_id, s.result_handle_id, s.settlement_event_id,
+           s.observer_call_id, l.accepted_task_id, l.tool_name,
+           e.seq AS settlement_seq, e.turn AS settlement_turn
+      FROM logical_call_settlements s
+      JOIN logical_tool_calls l
+        ON l.session_id = s.session_id
+       AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+      JOIN events e ON e.id = s.settlement_event_id
+     WHERE s.session_id = ?
+       AND s.source_user_seq = ?
+       AND e.turn = ?
+       AND s.business_call = 1
+       AND s.mutating = 0
+       AND s.outcome_kind IN ('succeeded', 'empty_result')
+       AND s.result_handle_id IS NOT NULL
+       AND s.observer_call_id IS NOT NULL
+     ORDER BY e.seq DESC
+  `).all(
+    input.sessionId,
+    input.sourceUserSeq,
+    input.failedTurn,
+  ) as Array<{
+    logical_tool_call_id: string;
+    result_handle_id: string;
+    settlement_event_id: string;
+    observer_call_id: string;
+    accepted_task_id: string;
+    tool_name: string;
+    settlement_seq: number;
+    settlement_turn: number;
+  }>;
+  if (rows.length === 0) return undefined;
+  // One replacement prompt can faithfully carry one bounded result. Multiple
+  // successful calls may be jointly required; choosing the newest would erase
+  // the others and create a partial-answer authority. Decline instead.
+  if (rows.length !== 1) return null;
+  const row = rows[0]!;
+
+  const calledMatches = events.filter((event) =>
+    event.type === 'tool_called'
+    && event.turn === input.failedTurn
+    && eventString(event, 'callId') === row.observer_call_id
+    && eventNumber(event, 'sourceUserSeq') === input.sourceUserSeq
+    && eventString(event, 'attemptId') === input.runAttemptId
+    && eventString(event, 'accounting') === 'top_level'
+  );
+  if (calledMatches.length !== 1) return null;
+  const called = calledMatches[0]!;
+  const returned = matchingReturn(events, called);
+  if (!returned
+    || returned.turn !== input.failedTurn
+    || eventNumber(returned, 'sourceUserSeq') !== input.sourceUserSeq
+    || eventString(returned, 'attemptId') !== input.runAttemptId
+    || eventString(returned, 'accounting') !== 'top_level'
+    || nonEmptyString(returned.data.replayKind)
+    || interveningMutationOrSteer(events, returned.seq, Number.POSITIVE_INFINITY)) return null;
+
+  const settlement = redeemDurableLogicalCallSettlementForHost({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: row.accepted_task_id,
+    logicalToolCallId: row.logical_tool_call_id,
+  });
+  if (settlement.status !== 'ok'
+    || settlement.settlement.settlementEventId !== row.settlement_event_id
+    || settlement.settlement.resultHandleId !== row.result_handle_id
+    || settlement.settlement.outcome.kind !== 'succeeded'
+      && settlement.settlement.outcome.kind !== 'empty_result'
+    || !settlement.settlement.recovery.businessCall
+    || settlement.settlement.recovery.mutating) return null;
+
+  const redeemed = redeemSuccessfulSettlementResultForHost({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: row.accepted_task_id,
+    logicalToolCallId: row.logical_tool_call_id,
+  });
+  if (redeemed.status !== 'ok'
+    || redeemed.value.resultHandleId !== row.result_handle_id
+    || containsPendingAsyncState(redeemed.value.rawPayload)) return null;
+  const output = stripSettledReadHarnessAdvisory(
+    typeof redeemed.value.rawPayload === 'string'
+      ? redeemed.value.rawPayload
+      : redeemed.value.rawPayloadJson,
+  );
+  if (!output.trim()
+    || Buffer.byteLength(output, 'utf8') > INFRA_RECOVERY_MAX_OUTPUT_BYTES) return null;
+
+  return {
+    sourceCallId: row.observer_call_id,
+    sourceReturnedSeq: returned.seq,
+    output,
+    toolSlug: row.tool_name,
+  };
+}
+
+/**
  * Recover the durable bytes from a direct read that settled immediately before
  * a model/infrastructure failure.
  *
@@ -442,6 +558,13 @@ export function resolveSettledReadForInfraRecovery(
         'user_steer_note',
       ],
     });
+    const canonical = resolveCanonicalInfraRecovery(input, events);
+    if (canonical !== undefined) return canonical;
+
+    // Compatibility for a direct SDK Composio lifecycle which predates the
+    // canonical logical-settlement kernel. New carrier families must never be
+    // added here: their shared settlement/result-handle authority is consumed
+    // above without registration by shape or provider name.
     const canonicalCalls = events
       .filter((event) => event.type === 'tool_called'
         && event.turn === input.failedTurn

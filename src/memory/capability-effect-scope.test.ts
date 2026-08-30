@@ -59,8 +59,23 @@ test('request scope distinguishes reads, writes, compounds, and ambiguous asks',
   assert.equal(requestedCapabilityEffectScope('Find the Gmail email from Alice.'), 'read');
   assert.equal(requestedCapabilityEffectScope('Run the Gmail email lookup workflow.'), 'read',
     'email/message resource nouns alone are not writes');
+  assert.equal(
+    requestedCapabilityEffectScope('Read the latest email. This is read-only: do not send, delete, move, or modify anything.'),
+    'read',
+    'negated mutation names describe the boundary rather than requesting writes',
+  );
   assert.equal(requestedCapabilityEffectScope("What's on my Outlook calendar?"), 'read');
   assert.equal(requestedCapabilityEffectScope('whats on my Outlook calendar tomorrow'), 'read');
+  assert.equal(
+    requestedCapabilityEffectScope('How many deals does Tim have set to close this month in salesforce'),
+    'read',
+    'action-shaped words in the subject of a count question do not make it a write',
+  );
+  assert.equal(
+    requestedCapabilityEffectScope("What's on my calendar, then cancel the meeting"),
+    'mixed',
+    'a real follow-up effect preserves both the question read and requested write',
+  );
   assert.equal(requestedCapabilityEffectScope('Send the Gmail email now.'), 'write');
   assert.equal(requestedCapabilityEffectScope('Send me an email with the link to the sheet.'), 'write',
     'recipient-first payload grammar is one send role, not a fabricated read dependency');

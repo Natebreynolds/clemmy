@@ -17,6 +17,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,8 +41,73 @@ const {
   ToolCallsCounter,
   withHarnessRunContext,
 } = await import('../runtime/harness/brackets.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+const capabilityCatalog = await import('../runtime/harness/host-capability-catalog-factory.js');
+
+const READ_OPERATION = 'SLACK_LIST_ALL_CHANNELS';
+const WRITE_OPERATION = 'OPAQUE_PROVIDER_OPERATION_7';
+const priorCapabilityCatalog = capabilityCatalog.peekHostCapabilityCatalogFactory();
+
+function digest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function providerManifest(
+  operationId: string,
+  effect: 'read' | 'external_write',
+) {
+  const write = effect === 'external_write';
+  return capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:reconcile:${digest(operationId).slice(0, 20)}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'fixture:provider',
+    providerVersion: 'fixture-v1',
+    operationVersion: '1',
+    definitionFingerprint: digest(`schema:${operationId}`),
+    effect,
+    ...(write ? {
+      operationSemantics: { version: 1 as const, reversibility: 'reversible' as const },
+      destination: { family: 'generic-records', posture: 'create_new' as const },
+    } : {}),
+    accountId: 'account:reconcile-fixture',
+    idempotency: { required: write, policy: write ? 'key_before_dispatch' as const : 'none' as const },
+    reconciliation: { supported: write, policy: write ? 'exact_artifact' as const : 'none' as const },
+    outputContract: { kind: write ? 'created_resource' : 'records' },
+    evidenceContract: {
+      kinds: write ? ['receipt', 'readback'] : ['payload'],
+      readbackRequired: write,
+    },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: write ? ['destination'] : ['source'],
+  });
+}
+
+const providerManifests = [
+  providerManifest(READ_OPERATION, 'read'),
+  providerManifest(WRITE_OPERATION, 'external_write'),
+];
+capabilityCatalog.installHostCapabilityCatalogFactory(
+  capabilityCatalog.createHostCapabilityCatalogFactory(providerManifests.map((manifest) => ({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    ...(manifest.destination ? { destination: manifest.destination } : {}),
+    account: manifest.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({ successful: true }),
+  }))),
+);
 
 test.after(() => {
+  capabilityCatalog.installHostCapabilityCatalogFactory(priorCapabilityCatalog);
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -64,8 +130,16 @@ function appendExactToolLifecycle(input: {
   callId: string;
   arguments: unknown;
   output: string;
+  effect?: 'read' | 'external_write';
+  effectiveTool?: string;
 }): void {
   const tool = 'composio_execute_tool';
+  const args = input.arguments && typeof input.arguments === 'object' && !Array.isArray(input.arguments)
+    ? input.arguments as Record<string, unknown>
+    : null;
+  const effectiveTool = input.effectiveTool
+    ?? (typeof args?.tool_slug === 'string' ? args.tool_slug : undefined);
+  const effect = input.effect ?? 'read';
   const called = appendEvent({
     sessionId: input.sessionId,
     turn: 2,
@@ -75,7 +149,8 @@ function appendExactToolLifecycle(input: {
       tool,
       callId: input.callId,
       canonicalCallId: input.callId,
-      effect: 'read',
+      effect,
+      ...(effectiveTool ? { effectiveTool } : {}),
       arguments: input.arguments,
     },
   });
@@ -96,7 +171,8 @@ function appendExactToolLifecycle(input: {
       tool,
       callId: input.callId,
       canonicalCallId: input.callId,
-      effect: 'read',
+      effect,
+      ...(effectiveTool ? { effectiveTool } : {}),
       ok: true,
     },
   });
@@ -168,7 +244,7 @@ test('a large clean read-back naming the write target reconciles PRESENT — an 
   appendExactToolLifecycle({
     sessionId,
     callId: 'list-channels-readback',
-    arguments: { tool_slug: 'SLACK_LIST_ALL_CHANNELS', arguments: { limit: 220 } },
+    arguments: { tool_slug: READ_OPERATION, arguments: { limit: 220 } },
     output: wideCleanReadbackNamingTarget(),
   });
   const reconcile = registeredToolHandlers().get('execution_reconcile_write');
@@ -203,7 +279,7 @@ test('GUARD: a read-back with a genuine structured contradiction WITHIN bounds s
   appendExactToolLifecycle({
     sessionId,
     callId: 'contradicted-readback',
-    arguments: { tool_slug: 'SLACK_LIST_ALL_CHANNELS', arguments: { limit: 20 } },
+    arguments: { tool_slug: READ_OPERATION, arguments: { limit: 20 } },
     output: JSON.stringify({
       successful: true,
       error: null,
@@ -225,4 +301,76 @@ test('GUARD: a read-back with a genuine structured contradiction WITHIN bounds s
     'a contradicted read-back settles nothing',
   );
   assert.match(result.content[0]?.text ?? '', /contradicts success/i);
+});
+
+test('the canonical effective operation re-opens manifest authority when the bounded outer argument preview is unreadable', async () => {
+  const { sessionId, sourceUserSeq, execution, callId } = fixture('bounded-args');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  appendExactToolLifecycle({
+    sessionId,
+    callId: 'bounded-args-readback',
+    effectiveTool: READ_OPERATION,
+    // Production stores only a bounded preview of top-level SDK arguments. A
+    // large request can therefore end mid-JSON even though effectiveTool was
+    // derived from the complete input before clipping.
+    arguments: `{"tool_slug":"${READ_OPERATION}","arguments":{"query":"${'x'.repeat(8_000)}`,
+    output: JSON.stringify({
+      successful: true,
+      error: null,
+      data: { ok: true, channel: { id: 'C0999', name: 'growth-pod-449' } },
+    }),
+  });
+  const reconcile = registeredToolHandlers().get('execution_reconcile_write')!;
+  const ctx = { sessionId, sourceUserSeq, counter: new ToolCallsCounter(20) };
+  const result = await withHarnessRunContext(ctx, () => reconcile({
+    id: execution.id,
+    call_id: callId,
+    verdict: 'present',
+    evidence_call_id: 'bounded-args-readback',
+  }));
+  assert.equal(
+    listEvents(sessionId, { types: ['external_write_succeeded'] })
+      .filter((event) => event.data.callId === callId).length,
+    1,
+    result.content[0]?.text,
+  );
+});
+
+test('GUARD: a lifecycle read label cannot turn an unknown or manifest-declared write operation into read-back authority', async () => {
+  for (const [label, operation] of [
+    ['unknown-effect', 'UNREGISTERED_OPAQUE_PROVIDER_OPERATION_9'],
+    ['manifest-write', WRITE_OPERATION],
+  ] as const) {
+    const { sessionId, sourceUserSeq, execution, callId } = fixture(label);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const evidenceCallId = `${label}-readback`;
+    appendExactToolLifecycle({
+      sessionId,
+      callId: evidenceCallId,
+      // Deliberately pin the durable label to `read`: current manifest
+      // authority must still win, and an absent manifest must fail closed.
+      effect: 'read',
+      arguments: { tool_slug: operation, arguments: { exact: 'growth-pod-449' } },
+      output: JSON.stringify({
+        successful: true,
+        error: null,
+        data: { ok: true, channel: { id: 'C0999', name: 'growth-pod-449' } },
+      }),
+    });
+    const reconcile = registeredToolHandlers().get('execution_reconcile_write')!;
+    const ctx = { sessionId, sourceUserSeq, counter: new ToolCallsCounter(20) };
+    const result = await withHarnessRunContext(ctx, () => reconcile({
+      id: execution.id,
+      call_id: callId,
+      verdict: 'present',
+      evidence_call_id: evidenceCallId,
+    }));
+    assert.equal(
+      listEvents(sessionId, { types: ['external_write_succeeded'] })
+        .filter((event) => event.data.callId === callId).length,
+      0,
+      `${label} settles nothing`,
+    );
+    assert.match(result.content[0]?.text ?? '', /not a provably read-only tool call/i, label);
+  }
 });

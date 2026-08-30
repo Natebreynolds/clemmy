@@ -10,10 +10,12 @@ import {
   ClaudeAgentSdkToolSurfaceError,
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
+  runClaudeAgentSdkRouteAttempt,
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
 import { externalMcpScopeForAllowedToolLock } from '../../agents/external-mcp-scope-lock.js';
+import { registeredToolkitNamespaceOfOperation } from '../../integrations/composio/toolkit-slug.js';
 import {
   activateDispatchLease,
   revokeDispatchLeaseBeforeRecovery,
@@ -69,6 +71,23 @@ function workflowStepAutoContinueWallMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 900_000;
 }
 
+const OPERATION_TOKEN_RE = /\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b/g;
+
+/**
+ * Carrier exposure may follow an exact adapter-declared namespace, but never a
+ * kernel-maintained provider-name list. This is deliberately only a tool-
+ * surface requirement: the operation still needs its current manifest,
+ * account, schema, effect, and call authority before dispatch.
+ */
+function namesRegisteredComposioOperation(text: string): boolean {
+  for (const match of text.matchAll(OPERATION_TOKEN_RE)) {
+    const operation = match[0] ?? '';
+    const namespace = registeredToolkitNamespaceOfOperation(operation);
+    if (namespace && operation.trim().toLowerCase() !== namespace) return true;
+  }
+  return false;
+}
+
 export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fullLane: boolean): string[] {
   if (!fullLane) return [];
   const out = new Set<string>();
@@ -88,7 +107,7 @@ export function requiredLocalMcpToolsForWorkflowStep(step: WorkflowStepInput, fu
   if (
     text.includes('composio_execute_tool')
     || /\bcomposio\s+(?:tool|action)\b/.test(text)
-    || /\b(?:AIRTABLE|APIFY|DATAFORSEO|FIRECRAWL|GMAIL|GOOGLE(?:DOCS|DRIVE|SHEETS)?|HUBSPOT|NOTION|OUTLOOK|SALESFORCE|SLACK)_[A-Z0-9_]{3,}\b/.test(`${step.prompt ?? ''}\n${step.intent ?? ''}`)
+    || namesRegisteredComposioOperation(`${step.prompt ?? ''}\n${step.intent ?? ''}`)
   ) {
     out.add('composio_execute_tool');
   }
@@ -386,8 +405,24 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
   const runPhysicalSdkAttempt = async (
     options: ClaudeAgentSdkRunOptions,
   ): Promise<ClaudeAgentSdkRunResult> => {
+    const recordAttempt = (physicalOptions: ClaudeAgentSdkRunOptions): Promise<ClaudeAgentSdkRunResult> =>
+      runClaudeAgentSdkRouteAttempt(
+        runClaudeAgentSdkImpl,
+        physicalOptions,
+        {
+          sessionId: args.sessionId,
+          workflowRunId: args.runId,
+          workflowNodeId: args.step.id,
+          role: 'worker',
+          requestedModel: args.modelId,
+          resolvedModel: args.modelId,
+          provider: 'claude',
+          source: 'explicit',
+          reason: { lane: 'claude_agent_sdk_workflow_step' },
+        },
+      );
     if (!args.sessionId || !args.runAttemptId || !sdkDispatchScopeId) {
-      return runClaudeAgentSdkImpl(options);
+      return recordAttempt(options);
     }
     const dispatchLease = activateDispatchLease({
       sessionId: args.sessionId,
@@ -395,7 +430,7 @@ export async function runClaudeAgentSdkWorkflowStep(args: {
       runAttemptId: args.runAttemptId,
     });
     try {
-      return await runClaudeAgentSdkImpl({ ...options, dispatchLease });
+      return await recordAttempt({ ...options, dispatchLease });
     } finally {
       // Approval parking, cancellation, model failure, and healthy completion
       // all revoke before control returns to the workflow runner/recovery.

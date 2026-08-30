@@ -21,7 +21,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { summarizePromptComposition } = await import('./prompt-composition.js');
-const { CACHE_BREAK_SENTINEL } = await import('./model-wire-registry.js');
+const { CACHE_BREAK_SENTINEL, CACHE_MEMORY_CONTEXT_SENTINEL } = await import('./model-wire-registry.js');
 
 after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
 
@@ -155,7 +155,7 @@ test('instructions split at the cache sentinel: memory context is variable, not 
   const staticPart = 'You are Clem. Standing rules here.';
   const memoryPart = 'Current time: 03:14. Recent facts: …';
   const summary = summarizePromptComposition({
-    instructions: `${staticPart}${CACHE_BREAK_SENTINEL}${memoryPart}`,
+    instructions: `${staticPart}${CACHE_BREAK_SENTINEL}${CACHE_MEMORY_CONTEXT_SENTINEL}${memoryPart}`,
     currentMessage: 'hi',
   });
   const byName = new Map(summary.buckets.map((bucket) => [bucket.name, bucket]));

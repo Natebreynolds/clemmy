@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { parseWorkflowNodeInvocationPlan } from '../memory/workflow-node-invocation-plan.js';
 import {
   parseWorkflowCanonicalEntityResultProjection,
-  type WorkflowCanonicalEntityResultProjectionV1,
+  type WorkflowCanonicalEntityResultProjection,
 } from '../memory/workflow-result-projection-contract.js';
 import {
   parseCanonicalEntityWorkspaceBindingApproval,
@@ -44,7 +44,7 @@ export interface WorkflowReadPilotLineageV1 {
   workflowSessionId: string;
   /** Full reviewed bytes are deliberately present on the formal approval
    * card. A digest-only card would hide the extraction/entity contract. */
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBinding?: CanonicalEntityWorkspaceBindingApprovalV1;
 }
 
@@ -107,7 +107,7 @@ function canonicalLineage(input: WorkflowReadPilotLineageV1): WorkflowReadPilotL
     invocationPlanDigest: input.invocationPlanDigest,
     workflowSessionId: input.workflowSessionId,
     ...(input.resultProjection
-      ? { resultProjection: JSON.parse(canonicalJson(input.resultProjection)) as WorkflowCanonicalEntityResultProjectionV1 }
+      ? { resultProjection: JSON.parse(canonicalJson(input.resultProjection)) as WorkflowCanonicalEntityResultProjection }
       : {}),
     ...(input.workspaceBinding
       ? { workspaceBinding: JSON.parse(canonicalJson(input.workspaceBinding)) as CanonicalEntityWorkspaceBindingApprovalV1 }

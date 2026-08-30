@@ -183,12 +183,18 @@ function insertPhysical(db: Database.Database, input: ReturnType<typeof seedRefi
 }
 
 function durableSeedRows(db: Database.Database): unknown {
+  const leases = db.prepare(
+    `SELECT * FROM run_dispatch_leases WHERE session_id = 'v58-migration-session'`,
+  ).all() as Array<Record<string, unknown>>;
   return {
     sessions: db.prepare(`SELECT * FROM sessions WHERE id = 'v58-migration-session'`).all(),
     events: db.prepare(`SELECT * FROM events WHERE session_id = 'v58-migration-session' ORDER BY seq`).all(),
     roots: db.prepare(`SELECT * FROM accepted_turn_call_authorities WHERE session_id = 'v58-migration-session'`).all(),
     calls: db.prepare(`SELECT * FROM logical_tool_calls WHERE session_id = 'v58-migration-session'`).all(),
-    leases: db.prepare(`SELECT * FROM run_dispatch_leases WHERE session_id = 'v58-migration-session'`).all(),
+    // v68 adds one nullable revocation-reason column. Normalize the historical
+    // pre-v68 row to that current shape so this assertion continues to pin the
+    // durable values instead of failing merely because the schema gained NULL.
+    leases: leases.map((lease) => ({ revocation_reason: null, ...lease })),
   };
 }
 

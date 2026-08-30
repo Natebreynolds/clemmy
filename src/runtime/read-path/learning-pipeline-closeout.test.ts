@@ -490,7 +490,7 @@ test('the candidate card names every distinct account provenance for one identif
   assert.match(card, /deals@southco\.example/, 'the second account provenance is missing from the card');
   assert.match(card, /composio_execute_tool.*tool_slug.*MAILCO_SCAN_CONTRACTS/s,
     'the card must distinguish the executable carrier/slug from learned intent metadata');
-  assert.match(card, /intent label.*NEVER a tool name/s,
+  assert.match(card, /intent (?:is|label).*never a tool name/is,
     'the card must explicitly prevent semantic intent labels from being invoked');
 });
 
@@ -912,7 +912,10 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
       async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
     responses += 1;
     assert.notEqual(res.stoppedReason, 'error', `the warm host turn failed: ${JSON.stringify(res)}`);
-    assert.equal(res.text, 'Your calendar is ready.', JSON.stringify(eventlog.listEvents(sessionId)));
+    assert.match(res.text, /^Your calendar is ready\./, JSON.stringify(eventlog.listEvents(sessionId)));
+    assert.match(res.text, /Retained work \(durable checkpoint\):/);
+    assert.match(res.text, /Source\/tool schedulerco_list_events: 1 record \(unknown\) retained as rh_[a-f0-9]+\./);
+    assert.match(res.text, /External write state: no settled external-write attempt is recorded\./);
   } finally {
     _setBridgeImplsForTests({});
     productionPorts.clearProductionCapabilityPorts();
@@ -948,6 +951,10 @@ test('a warm paraphrase crosses the real host plan/work carrier, dispatches once
     'the one fresh plan preamble did not cross its awaited presentation port exactly once');
   assert.equal(events.filter((event) => event.type === 'conversation_completed').length, 1,
     'the host turn published more than one terminal');
+  const terminal = events.find((event) => event.type === 'conversation_completed');
+  assert.equal(terminal?.data.reason, 'verification_required');
+  assert.equal(terminal?.data.delivered, false);
+  assert.deepEqual(terminal?.data.verificationMissing, ['coverage_unproven']);
   assert.equal(events.filter((event) => event.type === 'turn_graph_shadow').length, 0,
     'the host fixture manufactured legacy graph authority');
   const db = eventlog.openEventLog();

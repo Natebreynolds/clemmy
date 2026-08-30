@@ -12,6 +12,7 @@
  * prefix cannot hide a concrete request from the full foreground action path.
  */
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { performance } from 'node:perf_hooks';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -245,8 +246,39 @@ interface RecordedModelRequest {
   caseId: string;
   toolNames: string[];
   advertisedToolSchemaBytes: number;
+  preWireWallMs: number;
+  preWireCpuMs: number;
   wireMs: number;
+  wireCpuMs: number;
 }
+
+interface CausalTimerAttribution {
+  active: boolean;
+  hostFiredDelayMs: number;
+  wireFiredDelayMs: number;
+}
+
+interface OrdinaryLatencySample {
+  wallMs: number;
+  hostCpuMs: number;
+  hostFiredDelayMs: number;
+}
+
+interface HostPhaseMark {
+  wallMs: number;
+  cpuMs: number;
+}
+
+interface ActiveHostTiming {
+  wallStartedAt: number;
+  cpuStarted: ReturnType<typeof process.cpuUsage>;
+  accepted?: HostPhaseMark;
+  buildStarted?: HostPhaseMark;
+  buildCompleted?: HostPhaseMark;
+}
+
+const causalTimerAttribution = new AsyncLocalStorage<CausalTimerAttribution>();
+const modelWireTimerPhase = new AsyncLocalStorage<boolean>();
 
 interface BuildRecord {
   caseId: string;
@@ -377,6 +409,136 @@ function fixed(value: number): number {
   return Number(value.toFixed(3));
 }
 
+function correctedHostCpuMs(totalCpuMs: number, wireCpuMs: number): number {
+  return Math.max(0, totalCpuMs - wireCpuMs);
+}
+
+function evaluateOrdinaryLatency(
+  samples: readonly OrdinaryLatencySample[],
+  limitMs = 50,
+): {
+  wallMedianMs: number;
+  wallP95Ms: number;
+  causalP95Ms: number;
+  violations: Array<{ gate: string; detail: unknown }>;
+} {
+  assert.ok(samples.length > 0);
+  const wall = samples.map((entry) => entry.wallMs).sort((left, right) => left - right);
+  const causal = samples
+    .map((entry) => entry.hostCpuMs + entry.hostFiredDelayMs)
+    .sort((left, right) => left - right);
+  const wallMedianMs = percentile(wall, 0.50);
+  const wallP95Ms = percentile(wall, 0.95);
+  const causalP95Ms = percentile(causal, 0.95);
+  const violations: Array<{ gate: string; detail: unknown }> = [];
+  if (wallP95Ms > limitMs) {
+    violations.push({
+      gate: 'positive_host_wall_p95_le_50ms',
+      detail: { wallMedianMs: fixed(wallMedianMs), wallP95Ms: fixed(wallP95Ms) },
+    });
+  }
+  if (causalP95Ms > limitMs) {
+    violations.push({
+      gate: 'positive_host_causal_cpu_plus_fired_delay_p95_le_50ms',
+      detail: { causalP95Ms: fixed(causalP95Ms) },
+    });
+  }
+  return { wallMedianMs, wallP95Ms, causalP95Ms, violations };
+}
+
+function installCausalTimerProbe(): () => void {
+  const originalSetTimeout = globalThis.setTimeout;
+  const instrumentedSetTimeout = ((
+    callback: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    const attribution = causalTimerAttribution.getStore();
+    const wirePhase = modelWireTimerPhase.getStore() === true;
+    const requestedDelayMs = Number.isFinite(delay) ? Math.max(0, Number(delay)) : 0;
+    const wrapped = function instrumentedTimerCallback(this: unknown, ...callbackArgs: unknown[]) {
+      if (attribution?.active && requestedDelayMs > 0) {
+        if (wirePhase) attribution.wireFiredDelayMs += requestedDelayMs;
+        else attribution.hostFiredDelayMs += requestedDelayMs;
+      }
+      callback.apply(this, callbackArgs);
+    };
+    return originalSetTimeout(wrapped, delay, ...args);
+  }) as typeof globalThis.setTimeout;
+  globalThis.setTimeout = instrumentedSetTimeout;
+  return () => {
+    if (globalThis.setTimeout === instrumentedSetTimeout) {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  };
+}
+
+test('ordinary latency evaluator governs wall p95, retains causal work as an additional guard, and subtracts wire CPU', () => {
+  const fast = (): OrdinaryLatencySample => ({ wallMs: 20, hostCpuMs: 10, hostFiredDelayMs: 0 });
+  const splitTail = [
+    ...Array.from({ length: 123 }, fast),
+    ...Array.from({ length: 7 }, (): OrdinaryLatencySample => ({
+      wallMs: 70,
+      hostCpuMs: 30,
+      hostFiredDelayMs: 30,
+    })),
+  ];
+  const splitEvaluation = evaluateOrdinaryLatency(splitTail);
+  assert.equal(splitEvaluation.wallP95Ms, 70);
+  assert.equal(splitEvaluation.causalP95Ms, 60);
+  assert.deepEqual(
+    splitEvaluation.violations.map((entry) => entry.gate),
+    [
+      'positive_host_wall_p95_le_50ms',
+      'positive_host_causal_cpu_plus_fired_delay_p95_le_50ms',
+    ],
+  );
+
+  const schedulerOnlyTail = [
+    ...Array.from({ length: 123 }, fast),
+    ...Array.from({ length: 7 }, (): OrdinaryLatencySample => ({
+      wallMs: 200,
+      hostCpuMs: 10,
+      hostFiredDelayMs: 0,
+    })),
+  ];
+  const schedulerEvaluation = evaluateOrdinaryLatency(schedulerOnlyTail);
+  assert.equal(schedulerEvaluation.wallP95Ms, 200);
+  assert.equal(schedulerEvaluation.causalP95Ms, 10);
+  assert.deepEqual(
+    schedulerEvaluation.violations.map((entry) => entry.gate),
+    ['positive_host_wall_p95_le_50ms'],
+  );
+
+  assert.equal(correctedHostCpuMs(35, 5), 30);
+  assert.equal(correctedHostCpuMs(4, 5), 0);
+});
+
+test('causal timer probe counts only fired positive delays and keeps model-wire delay separate', async (t) => {
+  const restoreCausalTimerProbe = installCausalTimerProbe();
+  t.after(restoreCausalTimerProbe);
+  const attribution: CausalTimerAttribution = {
+    active: true,
+    hostFiredDelayMs: 0,
+    wireFiredDelayMs: 0,
+  };
+  try {
+    await causalTimerAttribution.run(attribution, async () => {
+      const cancelled = setTimeout(() => {
+        assert.fail('cancelled timer must not fire');
+      }, 25);
+      clearTimeout(cancelled);
+      await new Promise<void>((resolve) => setTimeout(resolve, 2));
+      await modelWireTimerPhase.run(true, () =>
+        new Promise<void>((resolve) => setTimeout(resolve, 3)));
+    });
+  } finally {
+    attribution.active = false;
+  }
+  assert.equal(attribution.hostFiredDelayMs, 2);
+  assert.equal(attribution.wireFiredDelayMs, 3);
+});
+
 function responseFor(caseInfo: ConversationCase): string {
   return caseInfo.kind === 'conversation'
     ? `Conversation reply for ${caseInfo.id}.`
@@ -499,38 +661,60 @@ test('130 ordinary chats and direct generations use one foreground request with 
   });
 
   let activeCase: ConversationCase | null = null;
+  let activeHostTiming: ActiveHostTiming | null = null;
+  const markActiveHostPhase = (): HostPhaseMark | undefined => {
+    if (!activeHostTiming) return undefined;
+    const cpu = process.cpuUsage(activeHostTiming.cpuStarted);
+    return {
+      wallMs: Math.max(0, performance.now() - activeHostTiming.wallStartedAt),
+      cpuMs: (cpu.user + cpu.system) / 1_000,
+    };
+  };
   const modelRequests: RecordedModelRequest[] = [];
   const buildRecords: BuildRecord[] = [];
   const scriptedModel = {
     async getResponse(rawRequest: unknown) {
-      assert.ok(activeCase, 'a primary request is bound to the active accepted-channel case');
-      const startedAt = performance.now();
-      const request = (rawRequest ?? {}) as { tools?: Array<{ name?: string }> };
-      const tools = Array.isArray(request.tools) ? request.tools : [];
-      const toolNames = tools.map((entry) => entry?.name ?? '').filter(Boolean);
-      const advertisedToolSchemaBytes = tools.reduce(
-        (sum, entry) => sum + Buffer.byteLength(JSON.stringify(entry), 'utf8'),
-        0,
-      );
-      const reply = responseFor(activeCase);
-      const response = {
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
-        output: [textMessage(JSON.stringify({
-          summary: reply,
-          reply,
-          done: true,
-          nextAction: 'completed',
-          reason: null,
-        }))],
-        responseId: `primary-${activeCase.id}`,
-      };
-      modelRequests.push({
-        caseId: activeCase.id,
-        toolNames,
-        advertisedToolSchemaBytes,
-        wireMs: performance.now() - startedAt,
+      return modelWireTimerPhase.run(true, async () => {
+        assert.ok(activeCase, 'a primary request is bound to the active accepted-channel case');
+        const wireEnteredAt = performance.now();
+        const preWireCpu = activeHostTiming
+          ? process.cpuUsage(activeHostTiming.cpuStarted)
+          : { user: 0, system: 0 };
+        const startedAt = performance.now();
+        const cpuStarted = process.cpuUsage();
+        const request = (rawRequest ?? {}) as { tools?: Array<{ name?: string }> };
+        const tools = Array.isArray(request.tools) ? request.tools : [];
+        const toolNames = tools.map((entry) => entry?.name ?? '').filter(Boolean);
+        const advertisedToolSchemaBytes = tools.reduce(
+          (sum, entry) => sum + Buffer.byteLength(JSON.stringify(entry), 'utf8'),
+          0,
+        );
+        const reply = responseFor(activeCase);
+        const response = {
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          output: [textMessage(JSON.stringify({
+            summary: reply,
+            reply,
+            done: true,
+            nextAction: 'completed',
+            reason: null,
+          }))],
+          responseId: `primary-${activeCase.id}`,
+        };
+        const wireCpu = process.cpuUsage(cpuStarted);
+        modelRequests.push({
+          caseId: activeCase.id,
+          toolNames,
+          advertisedToolSchemaBytes,
+          preWireWallMs: activeHostTiming
+            ? Math.max(0, wireEnteredAt - activeHostTiming.wallStartedAt)
+            : 0,
+          preWireCpuMs: (preWireCpu.user + preWireCpu.system) / 1_000,
+          wireMs: performance.now() - startedAt,
+          wireCpuMs: (wireCpu.user + wireCpu.system) / 1_000,
+        });
+        return response;
       });
-      return response;
     },
     getStreamedResponse: streamResponse,
   };
@@ -538,26 +722,45 @@ test('130 ordinary chats and direct generations use one foreground request with 
   bridge._setBridgeImplsForTests({
     buildAgent: async (options) => {
       assert.ok(activeCase, 'agent construction is bound to the active accepted-channel case');
+      if (activeHostTiming) activeHostTiming.buildStarted = markActiveHostPhase();
       buildRecords.push({
         caseId: activeCase.id,
         hostPlainConversation: options.hostPlainConversation === true,
         hostFreshPlanning: options.hostFreshPlanning !== undefined,
       });
-      return buildOrchestratorAgent({
+      const agent = await buildOrchestratorAgent({
         ...options,
         model: scriptedModel as never,
       });
+      if (activeHostTiming) activeHostTiming.buildCompleted = markActiveHostPhase();
+      return agent;
     },
   });
 
   const hostOverheads: Array<{
     caseId: string;
     ms: number;
-    cpuMs: number;
+    hostCpuMs: number;
+    preWireWallMs: number;
+    preWireCpuMs: number;
+    channelAcceptWallMs: number;
+    channelAcceptCpuMs: number;
+    acceptedRouteWallMs: number;
+    acceptedRouteCpuMs: number;
+    agentBuildWallMs: number;
+    agentBuildCpuMs: number;
+    turnPreparationWallMs: number;
+    turnPreparationCpuMs: number;
+    postWireWallMs: number;
+    postWireCpuMs: number;
+    hostFiredDelayMs: number;
+    wireFiredDelayMs: number;
     wallMinusCpuMs: number;
     voluntaryContextSwitches: number;
     involuntaryContextSwitches: number;
   }> = [];
+  const restoreCausalTimerProbe = installCausalTimerProbe();
+  t.after(restoreCausalTimerProbe);
   for (const [index, caseInfo] of conversations.entries()) {
     activeCase = caseInfo;
     const sessionId = `${TRUE_SESSION_PREFIX}${index + 1}`;
@@ -572,21 +775,35 @@ test('130 ordinary chats and direct generations use one foreground request with 
     const cpuStarted = process.cpuUsage();
     const usageStarted = process.resourceUsage();
     const startedAt = performance.now();
-    await discord.runDiscordHarnessConversation({
-      prompt: caseInfo.prompt,
-      rawPrompt: caseInfo.prompt,
-      channelId: `ordinary-channel-${index + 1}`,
-      userId: `ordinary-user-${index + 1}`,
-      guildId: 'ordinary-competitive-guild',
-      transport: delivery.transport,
-      durableRequest: {
-        sessionId: session.id,
-        runId: `ordinary-request-${index + 1}`,
-        onSourceAccepted(source: { seq: number; turn: number }) {
-          acceptedSource = { seq: source.seq, turn: source.turn };
-        },
-      },
-    });
+    const timerAttribution: CausalTimerAttribution = {
+      active: true,
+      hostFiredDelayMs: 0,
+      wireFiredDelayMs: 0,
+    };
+    const caseHostTiming: ActiveHostTiming = { wallStartedAt: startedAt, cpuStarted };
+    activeHostTiming = caseHostTiming;
+    try {
+      await causalTimerAttribution.run(timerAttribution, () =>
+        discord.runDiscordHarnessConversation({
+          prompt: caseInfo.prompt,
+          rawPrompt: caseInfo.prompt,
+          channelId: `ordinary-channel-${index + 1}`,
+          userId: `ordinary-user-${index + 1}`,
+          guildId: 'ordinary-competitive-guild',
+          transport: delivery.transport,
+          durableRequest: {
+            sessionId: session.id,
+            runId: `ordinary-request-${index + 1}`,
+            onSourceAccepted(source: { seq: number; turn: number }) {
+              acceptedSource = { seq: source.seq, turn: source.turn };
+              if (activeHostTiming) activeHostTiming.accepted = markActiveHostPhase();
+            },
+          },
+        }));
+    } finally {
+      timerAttribution.active = false;
+      activeHostTiming = null;
+    }
     const elapsedMs = performance.now() - startedAt;
     const cpuElapsed = process.cpuUsage(cpuStarted);
     const usageElapsed = process.resourceUsage();
@@ -594,12 +811,35 @@ test('130 ordinary chats and direct generations use one foreground request with 
     assert.equal(requests.length, 1, `${caseInfo.id} has exactly one primary model request`);
     assert.equal(requests[0]!.caseId, caseInfo.id);
     const hostMs = Math.max(0, elapsedMs - requests[0]!.wireMs);
-    const cpuMs = (cpuElapsed.user + cpuElapsed.system) / 1_000;
+    const totalCpuMs = (cpuElapsed.user + cpuElapsed.system) / 1_000;
+    const hostCpuMs = correctedHostCpuMs(totalCpuMs, requests[0]!.wireCpuMs);
+    const preWireWallMs = Math.min(hostMs, requests[0]!.preWireWallMs);
+    const preWireCpuMs = Math.min(hostCpuMs, requests[0]!.preWireCpuMs);
+    const acceptedMark = caseHostTiming.accepted;
+    const buildStartedMark = caseHostTiming.buildStarted;
+    const buildCompletedMark = caseHostTiming.buildCompleted;
+    assert.ok(acceptedMark, `${caseInfo.id} records the accepted-channel phase boundary`);
+    assert.ok(buildStartedMark, `${caseInfo.id} records the accepted-source routing boundary`);
+    assert.ok(buildCompletedMark, `${caseInfo.id} records the agent-build phase boundary`);
     hostOverheads.push({
       caseId: caseInfo.id,
       ms: hostMs,
-      cpuMs,
-      wallMinusCpuMs: Math.max(0, hostMs - cpuMs),
+      hostCpuMs,
+      preWireWallMs,
+      preWireCpuMs,
+      channelAcceptWallMs: acceptedMark.wallMs,
+      channelAcceptCpuMs: acceptedMark.cpuMs,
+      acceptedRouteWallMs: Math.max(0, buildStartedMark.wallMs - acceptedMark.wallMs),
+      acceptedRouteCpuMs: Math.max(0, buildStartedMark.cpuMs - acceptedMark.cpuMs),
+      agentBuildWallMs: Math.max(0, buildCompletedMark.wallMs - buildStartedMark.wallMs),
+      agentBuildCpuMs: Math.max(0, buildCompletedMark.cpuMs - buildStartedMark.cpuMs),
+      turnPreparationWallMs: Math.max(0, preWireWallMs - buildCompletedMark.wallMs),
+      turnPreparationCpuMs: Math.max(0, preWireCpuMs - buildCompletedMark.cpuMs),
+      postWireWallMs: Math.max(0, hostMs - preWireWallMs),
+      postWireCpuMs: Math.max(0, hostCpuMs - preWireCpuMs),
+      hostFiredDelayMs: timerAttribution.hostFiredDelayMs,
+      wireFiredDelayMs: timerAttribution.wireFiredDelayMs,
+      wallMinusCpuMs: Math.max(0, hostMs - hostCpuMs),
       voluntaryContextSwitches:
         usageElapsed.voluntaryContextSwitches - usageStarted.voluntaryContextSwitches,
       involuntaryContextSwitches:
@@ -622,6 +862,20 @@ test('130 ordinary chats and direct generations use one foreground request with 
     assert.deepEqual(stops, [], `${caseInfo.id} has no user stop`);
     assert.equal(events.some((event) => event.type === 'turn_graph_compiled'), false,
       `${caseInfo.id} creates no graph`);
+    const contextPackets = events.filter((event) => event.type === 'agent_context_packet');
+    assert.equal(contextPackets.length, 1, `${caseInfo.id} builds one context packet`);
+    assert.equal(
+      contextPackets[0]!.data.semanticEnrichmentSkippedReason,
+      'plain_conversation_surface',
+      `${caseInfo.id} carries the accepted no-effect proof into context assembly`,
+    );
+    assert.deepEqual(contextPackets[0]!.data.skills, [], `${caseInfo.id} skips skill ranking`);
+    assert.deepEqual(contextPackets[0]!.data.workflows, [], `${caseInfo.id} skips workflow ranking`);
+    assert.equal(
+      (contextPackets[0]!.data.toolScope as { authority?: unknown } | undefined)?.authority,
+      'none',
+      `${caseInfo.id} records an exact zero-tool context boundary`,
+    );
     assert.equal(delivery.errors.length, 0, `${caseInfo.id} has no channel error`);
     assert.equal(delivery.followups.length, 0, `${caseInfo.id} fits one final Discord edit`);
     assert.equal(delivery.edits.at(-1), responseFor(caseInfo));
@@ -652,16 +906,24 @@ test('130 ordinary chats and direct generations use one foreground request with 
     [...new Set(hostOverheads.map((entry) => cohortPrefix(entry.caseId)))].map((cohort) => {
       const entries = hostOverheads.filter((entry) => cohortPrefix(entry.caseId) === cohort);
       const wall = entries.map((entry) => entry.ms).sort((left, right) => left - right);
-      const cpu = entries.map((entry) => entry.cpuMs).sort((left, right) => left - right);
+      const cpu = entries.map((entry) => entry.hostCpuMs).sort((left, right) => left - right);
+      const firedDelay = entries
+        .map((entry) => entry.hostFiredDelayMs)
+        .sort((left, right) => left - right);
+      const causal = entries
+        .map((entry) => entry.hostCpuMs + entry.hostFiredDelayMs)
+        .sort((left, right) => left - right);
       const wait = entries.map((entry) => entry.wallMinusCpuMs).sort((left, right) => left - right);
       return [cohort, {
         samples: entries.length,
         wallMedianMs: fixed(percentile(wall, 0.50)),
         wallP95Ms: fixed(percentile(wall, 0.95)),
-        cpuMedianMs: fixed(percentile(cpu, 0.50)),
-        cpuP95Ms: fixed(percentile(cpu, 0.95)),
-        wallMinusCpuMedianMs: fixed(percentile(wait, 0.50)),
-        wallMinusCpuP95Ms: fixed(percentile(wait, 0.95)),
+        hostCpuMedianMs: fixed(percentile(cpu, 0.50)),
+        hostCpuP95Ms: fixed(percentile(cpu, 0.95)),
+        hostFiredDelayP95Ms: fixed(percentile(firedDelay, 0.95)),
+        hostCausalP95Ms: fixed(percentile(causal, 0.95)),
+        observedWallMinusHostCpuMedianMs: fixed(percentile(wait, 0.50)),
+        observedWallMinusHostCpuP95Ms: fixed(percentile(wait, 0.95)),
       }];
     }),
   );
@@ -671,45 +933,118 @@ test('130 ordinary chats and direct generations use one foreground request with 
     .map((entry) => ({
       ...entry,
       ms: fixed(entry.ms),
-      cpuMs: fixed(entry.cpuMs),
+      hostCpuMs: fixed(entry.hostCpuMs),
+      hostFiredDelayMs: fixed(entry.hostFiredDelayMs),
+      wireFiredDelayMs: fixed(entry.wireFiredDelayMs),
       wallMinusCpuMs: fixed(entry.wallMinusCpuMs),
     }));
-  const cpuSorted = hostOverheads.map((entry) => entry.cpuMs).sort((left, right) => left - right);
+  const cpuSorted = hostOverheads
+    .map((entry) => entry.hostCpuMs)
+    .sort((left, right) => left - right);
+  const firedDelaySorted = hostOverheads
+    .map((entry) => entry.hostFiredDelayMs)
+    .sort((left, right) => left - right);
+  const causalSorted = hostOverheads
+    .map((entry) => entry.hostCpuMs + entry.hostFiredDelayMs)
+    .sort((left, right) => left - right);
+  const preWireWallSorted = hostOverheads
+    .map((entry) => entry.preWireWallMs)
+    .sort((left, right) => left - right);
+  const preWireCpuSorted = hostOverheads
+    .map((entry) => entry.preWireCpuMs)
+    .sort((left, right) => left - right);
+  const postWireWallSorted = hostOverheads
+    .map((entry) => entry.postWireWallMs)
+    .sort((left, right) => left - right);
+  const postWireCpuSorted = hostOverheads
+    .map((entry) => entry.postWireCpuMs)
+    .sort((left, right) => left - right);
+  const phaseDistribution = (field: keyof typeof hostOverheads[number]) => {
+    const values = hostOverheads
+      .map((entry) => entry[field])
+      .filter((value): value is number => typeof value === 'number')
+      .sort((left, right) => left - right);
+    return {
+      medianMs: fixed(percentile(values, 0.50)),
+      p95Ms: fixed(percentile(values, 0.95)),
+    };
+  };
   const wallMinusCpuSorted = hostOverheads
     .map((entry) => entry.wallMinusCpuMs)
     .sort((left, right) => left - right);
   const involuntarySorted = hostOverheads
     .map((entry) => entry.involuntaryContextSwitches)
     .sort((left, right) => left - right);
+  const latencyEvaluation = evaluateOrdinaryLatency(hostOverheads.map((entry) => ({
+    wallMs: entry.ms,
+    hostCpuMs: entry.hostCpuMs,
+    hostFiredDelayMs: entry.hostFiredDelayMs,
+  })));
   const temporalWindows = Array.from(
     { length: Math.ceil(hostOverheads.length / 10) },
     (_, windowIndex) => {
       const entries = hostOverheads.slice(windowIndex * 10, (windowIndex + 1) * 10);
       const wall = entries.map((entry) => entry.ms).sort((left, right) => left - right);
-      const cpu = entries.map((entry) => entry.cpuMs).sort((left, right) => left - right);
+      const cpu = entries.map((entry) => entry.hostCpuMs).sort((left, right) => left - right);
+      const firedDelay = entries
+        .map((entry) => entry.hostFiredDelayMs)
+        .sort((left, right) => left - right);
+      const causal = entries
+        .map((entry) => entry.hostCpuMs + entry.hostFiredDelayMs)
+        .sort((left, right) => left - right);
       const wait = entries.map((entry) => entry.wallMinusCpuMs).sort((left, right) => left - right);
       return {
         samples: `${windowIndex * 10 + 1}-${windowIndex * 10 + entries.length}`,
         wallP95Ms: fixed(percentile(wall, 0.95)),
-        cpuP95Ms: fixed(percentile(cpu, 0.95)),
-        wallMinusCpuP95Ms: fixed(percentile(wait, 0.95)),
+        hostCpuP95Ms: fixed(percentile(cpu, 0.95)),
+        hostFiredDelayP95Ms: fixed(percentile(firedDelay, 0.95)),
+        hostCausalP95Ms: fixed(percentile(causal, 0.95)),
+        observedWallMinusHostCpuP95Ms: fixed(percentile(wait, 0.95)),
       };
     },
   );
   t.diagnostic(`ordinary host timing cohorts: ${JSON.stringify(cohortTiming)}`);
-  t.diagnostic(`ordinary host paired wall/process-CPU control: ${JSON.stringify({
-    cpuMedianMs: fixed(percentile(cpuSorted, 0.50)),
-    cpuP95Ms: fixed(percentile(cpuSorted, 0.95)),
-    wallMinusCpuMedianMs: fixed(percentile(wallMinusCpuSorted, 0.50)),
-    wallMinusCpuP95Ms: fixed(percentile(wallMinusCpuSorted, 0.95)),
+  t.diagnostic(`ordinary host causal latency control: ${JSON.stringify({
+    hostCpuMedianMs: fixed(percentile(cpuSorted, 0.50)),
+    hostCpuP95Ms: fixed(percentile(cpuSorted, 0.95)),
+    hostFiredDelayMedianMs: fixed(percentile(firedDelaySorted, 0.50)),
+    hostFiredDelayP95Ms: fixed(percentile(firedDelaySorted, 0.95)),
+    hostCausalMedianMs: fixed(percentile(causalSorted, 0.50)),
+    hostCausalP95Ms: fixed(latencyEvaluation.causalP95Ms),
+    observedWallMinusHostCpuMedianMs: fixed(percentile(wallMinusCpuSorted, 0.50)),
+    observedWallMinusHostCpuP95Ms: fixed(percentile(wallMinusCpuSorted, 0.95)),
     involuntaryContextSwitchP95: percentile(involuntarySorted, 0.95),
     temporalWindows,
   })}`);
+  t.diagnostic(`ordinary host pre/post wire attribution: ${JSON.stringify({
+    preWireWallMedianMs: fixed(percentile(preWireWallSorted, 0.50)),
+    preWireWallP95Ms: fixed(percentile(preWireWallSorted, 0.95)),
+    preWireCpuMedianMs: fixed(percentile(preWireCpuSorted, 0.50)),
+    preWireCpuP95Ms: fixed(percentile(preWireCpuSorted, 0.95)),
+    postWireWallMedianMs: fixed(percentile(postWireWallSorted, 0.50)),
+    postWireWallP95Ms: fixed(percentile(postWireWallSorted, 0.95)),
+    postWireCpuMedianMs: fixed(percentile(postWireCpuSorted, 0.50)),
+    postWireCpuP95Ms: fixed(percentile(postWireCpuSorted, 0.95)),
+  })}`);
+  t.diagnostic(`ordinary host pre-wire phase attribution: ${JSON.stringify({
+    channelAcceptWall: phaseDistribution('channelAcceptWallMs'),
+    channelAcceptCpu: phaseDistribution('channelAcceptCpuMs'),
+    acceptedRouteWall: phaseDistribution('acceptedRouteWallMs'),
+    acceptedRouteCpu: phaseDistribution('acceptedRouteCpuMs'),
+    agentBuildWall: phaseDistribution('agentBuildWallMs'),
+    agentBuildCpu: phaseDistribution('agentBuildCpuMs'),
+    turnPreparationWall: phaseDistribution('turnPreparationWallMs'),
+    turnPreparationCpu: phaseDistribution('turnPreparationCpuMs'),
+  })}`);
   t.diagnostic(`ordinary host slowest samples: ${JSON.stringify(slowest)}`);
-  const violations: Array<{ gate: string; detail: unknown }> = [];
-  if (overhead.p95Ms > 50) {
-    violations.push({ gate: 'positive_host_overhead_p95_le_50ms', detail: overhead });
-  }
+  // The written competitive contract governs observed host wall p95 at 50 ms.
+  // Corrected process CPU plus the requested duration of positive-delay timers
+  // remains an additional causal guard and attribution metric; it cannot
+  // substitute for or excuse a wall-tail failure. The immediate model wire is
+  // excluded from both host wall and causal attribution.
+  const violations: Array<{ gate: string; detail: unknown }> = [
+    ...latencyEvaluation.violations,
+  ];
 
   const positiveSchemaLeaks = modelRequests.filter((request) =>
     request.toolNames.length > 0 || request.advertisedToolSchemaBytes !== 0);
@@ -761,6 +1096,7 @@ test('130 ordinary chats and direct generations use one foreground request with 
     'expected_work_source_lineage_identities',
     'expected_work_generated_artifact_contracts',
     'evidence_receipts',
+    'discovery_governor_tasks',
   ] as const;
   const rowCounts = Object.fromEntries(
     zeroSessionTables.map((table) => [table, sessionScopedCount(db, table)]),
@@ -808,6 +1144,15 @@ test('130 ordinary chats and direct generations use one foreground request with 
         runId: `near-action-request-${index + 1}`,
       },
     });
+    const negativeContextPacket = eventlog.listEvents(session.id, {
+      types: ['agent_context_packet'],
+    }).at(-1);
+    assert.ok(negativeContextPacket, `${caseInfo.id} builds an action context packet`);
+    assert.equal(
+      negativeContextPacket.data.semanticEnrichmentSkippedReason,
+      null,
+      `${caseInfo.id} cannot borrow the plain-conversation trim`,
+    );
     if (delivery.errors.length > 0) {
       violations.push({ gate: 'negative_accepted_channel_completion', detail: { caseId: caseInfo.id, errors: delivery.errors } });
     }
@@ -850,6 +1195,17 @@ test('130 ordinary chats and direct generations use one foreground request with 
     violations.push({ gate: 'negative_schema_bearing_surface', detail: negativeSchemaOffenders });
   }
   const negativeCost = counterDelta(counters, beforeNegatives);
+  const negativeDiscoveryTasks = (db.prepare(`
+    SELECT COUNT(*) AS n
+      FROM discovery_governor_tasks
+     WHERE session_id LIKE 'discord-near-action-%'
+  `).get() as { n: number }).n;
+  if (negativeDiscoveryTasks < negatives.length) {
+    violations.push({
+      gate: 'negative_discovery_initialization_retained',
+      detail: { expectedAtLeast: negatives.length, actual: negativeDiscoveryTasks },
+    });
+  }
   if (negativeCost.catalogSnapshot < negatives.length) {
     violations.push({ gate: 'negative_catalog_preparation_retained', detail: negativeCost });
   }

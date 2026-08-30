@@ -15,6 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -48,9 +49,60 @@ const {
   ToolCallsCounter,
   withHarnessRunContext,
 } = await import('../runtime/harness/brackets.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+const capabilityCatalog = await import('../runtime/harness/host-capability-catalog-factory.js');
 const EXECUTIONS_FILE = path.join(TMP_HOME, 'state', 'executions.json');
 
+const priorCapabilityCatalog = capabilityCatalog.peekHostCapabilityCatalogFactory();
+
+function digest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function reconciliationReadManifest(operationId: string) {
+  return capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:execution-tools:${digest(operationId).slice(0, 20)}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'fixture:provider',
+    providerVersion: 'fixture-v1',
+    operationVersion: '1',
+    definitionFingerprint: digest(`schema:${operationId}`),
+    effect: 'read',
+    accountId: 'account:execution-tools-fixture',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source'],
+  });
+}
+
+const reconciliationReadManifests = [
+  reconciliationReadManifest('GOOGLESHEETS_GET_RANGE'),
+  reconciliationReadManifest('OUTLOOK_LIST_DRAFTS'),
+];
+capabilityCatalog.installHostCapabilityCatalogFactory(
+  capabilityCatalog.createHostCapabilityCatalogFactory(reconciliationReadManifests.map((manifest) => ({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({ successful: true }),
+  }))),
+);
+
 test.after(() => {
+  capabilityCatalog.installHostCapabilityCatalogFactory(priorCapabilityCatalog);
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -170,6 +222,15 @@ function appendExactToolLifecycle(input: {
 }): void {
   const tool = input.tool ?? 'composio_execute_tool';
   const effect = input.effect ?? 'read';
+  const argumentsValue = input.arguments ?? {
+    tool_slug: 'GOOGLESHEETS_GET_RANGE',
+    arguments: { range: 'Sheet1!A:Z' },
+  };
+  const argumentsRecord = argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)
+    ? argumentsValue as Record<string, unknown>
+    : null;
+  const effectiveTool = input.effectiveTool
+    ?? (typeof argumentsRecord?.tool_slug === 'string' ? argumentsRecord.tool_slug : undefined);
   const called = appendEvent({
     sessionId: input.sessionId,
     turn: 2,
@@ -180,11 +241,8 @@ function appendExactToolLifecycle(input: {
       callId: input.callId,
       canonicalCallId: input.callId,
       effect,
-      arguments: input.arguments ?? {
-        tool_slug: 'GOOGLESHEETS_GET_RANGE',
-        arguments: { range: 'Sheet1!A:Z' },
-      },
-      ...(input.effectiveTool ? { effectiveTool: input.effectiveTool } : {}),
+      arguments: argumentsValue,
+      ...(effectiveTool ? { effectiveTool } : {}),
     },
   });
   writeToolOutput({
@@ -208,7 +266,7 @@ function appendExactToolLifecycle(input: {
       canonicalCallId: input.callId,
       effect,
       ok: true,
-      ...(input.effectiveTool ? { effectiveTool: input.effectiveTool } : {}),
+      ...(effectiveTool ? { effectiveTool } : {}),
       ...input.returnData,
     },
   });
@@ -1125,7 +1183,10 @@ test('execution_reconcile_write accepts only one exact parented provider-read li
     `DELETE FROM tool_output_invocation_chunks
       WHERE session_id = ? AND call_id = ? AND invocation_nonce = ? AND chunk_index = 0`,
   ).run(sessionId, 'truncated-read', 'nonce-truncated-read');
-  assert.match((await settleAbsent('truncated-read')).content[0].text, /no complete exact output/i);
+  assert.match(
+    (await settleAbsent('truncated-read')).content[0].text,
+    /not successful authority.*(?:incomplete|corrupt)/i,
+  );
 
   writeToolOutput({
     sessionId,

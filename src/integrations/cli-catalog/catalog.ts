@@ -84,6 +84,35 @@ export interface CliCatalogEntry {
    * vercel's method picker, stripe's press-Enter pairing) stay absent.
    */
   authHeadless?: boolean;
+  /**
+   * Closed reviewed-read contract. Presence means a human reviewed this
+   * exact argv prefix and structured arguments in source control. The
+   * harness provisioner may install it only for a currently connected
+   * catalog row; PATH discovery never becomes authority.
+   */
+  reviewedRead?: CatalogReviewedReadV1;
+}
+
+/** Host-reviewed CLI read. Bytes must match ReviewedCliArgumentV1 exactly. */
+export interface CatalogReviewedReadV1 {
+  descriptorId: string;
+  operationId: string;
+  displayName: string;
+  description: string;
+  argvPrefix: readonly string[];
+  arguments: readonly {
+    name: string;
+    kind: 'option' | 'positional' | 'switch';
+    token: string | null;
+    valueType: 'string' | 'number' | 'integer' | 'boolean';
+    required: boolean;
+  }[];
+  limits: {
+    timeoutMs: number;
+    maxStdoutBytes: number;
+    maxStderrBytes: number;
+    maxArgumentBytes: number;
+  };
 }
 
 /**
@@ -104,6 +133,31 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     authDocsUrl: 'https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_setup_auth_intro.htm',
     authCommand: 'sf org login web -a default',
     homepage: 'https://developer.salesforce.com/tools/salesforcecli',
+    // Default-org only. `sf org list` would classify a second inactive org
+    // as signed-out even when the default org is Connected.
+    authProbe: {
+      args: ['org', 'display', '--json'],
+      signedOutPattern: 'No default org found|NoAuthInfoFound|no default org|Not authenticated|No org found|unable to refresh session',
+      usernameCapture: '"username"\\s*:\\s*"([^"]+)"',
+      timeoutMs: 15_000,
+    },
+    reviewedRead: {
+      descriptorId: 'salesforce.data.query',
+      operationId: 'salesforce_sf_soql_query',
+      displayName: 'Salesforce CLI SOQL query',
+      description: 'Read-only SOQL via the local Salesforce sf CLI (sf data query --json). Query Salesforce opportunities, accounts, contacts, leads, and deals.',
+      argvPrefix: ['data', 'query', '--json'],
+      arguments: [
+        { name: 'query', kind: 'option', token: '--query', valueType: 'string', required: true },
+        { name: 'target_org', kind: 'option', token: '--target-org', valueType: 'string', required: false },
+      ],
+      limits: {
+        timeoutMs: 60_000,
+        maxStdoutBytes: 1_048_576,
+        maxStderrBytes: 65_536,
+        maxArgumentBytes: 32_768,
+      },
+    },
   },
   {
     id: 'higgsfield',

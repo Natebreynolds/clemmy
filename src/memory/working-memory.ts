@@ -7,25 +7,159 @@ import { loadSessionBrief } from './session-briefs.js';
 import type { SessionRecord } from '../types.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { isUserFacingSession } from '../execution/scope.js';
-import { getSession as getHarnessSession, listSessions, type SessionRow } from '../runtime/harness/eventlog.js';
+import {
+  getSession as getHarnessSession,
+  listEvents,
+  listSessions,
+  type SessionRow,
+} from '../runtime/harness/eventlog.js';
 import { pullRecentTurnsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 
 const SESSION_WORKING_MEMORY_DIR = path.join(path.dirname(WORKING_MEMORY_FILE), 'state', 'working-memory');
+const WORKING_MEMORY_PROJECTION_VERSION = 2 as const;
 
+type WorkingMemoryProjectionKind = 'derived_projection' | 'in_flight_checkpoint';
+
+interface WorkingMemorySourceWatermark {
+  terminalSeq: number | null;
+  terminalDigest: string;
+}
+
+interface WorkingMemoryProjectionMetadata extends WorkingMemorySourceWatermark {
+  version: typeof WORKING_MEMORY_PROJECTION_VERSION;
+  kind: WorkingMemoryProjectionKind;
+  sessionDigest: string;
+  contentDigest: string;
+}
 
 function workingMemoryDigest(sessionId: string): string {
   return createHash('sha1').update(sessionId).digest('hex');
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
 }
 
 export function workingMemoryPathForSession(sessionId: string): string {
   return path.join(SESSION_WORKING_MEMORY_DIR, `${workingMemoryDigest(sessionId)}.md`);
 }
 
+/** Non-model-visible freshness envelope beside the Markdown projection. */
+export function workingMemoryMetadataPathForSession(sessionId: string): string {
+  return path.join(SESSION_WORKING_MEMORY_DIR, `${workingMemoryDigest(sessionId)}.meta.json`);
+}
+
+function latestTerminalWatermark(sessionId: string): WorkingMemorySourceWatermark {
+  // One bounded durable point-read is the restart-safe stale marker. No
+  // in-memory pending map is needed: a newer conversation_completed sequence
+  // makes every older projection stale in this process or the next one.
+  const terminal = listEvents(sessionId, {
+    types: ['conversation_completed'],
+    desc: true,
+    limit: 1,
+  })[0];
+  if (!terminal) {
+    return {
+      terminalSeq: null,
+      terminalDigest: sha256(`no-terminal:${sha256(sessionId)}`),
+    };
+  }
+  return {
+    terminalSeq: terminal.seq,
+    terminalDigest: sha256(JSON.stringify({
+      seq: terminal.seq,
+      id: terminal.id,
+      turn: terminal.turn,
+      createdAt: terminal.createdAt,
+      data: terminal.data,
+    })),
+  };
+}
+
+function sameWatermark(
+  left: WorkingMemorySourceWatermark,
+  right: WorkingMemorySourceWatermark,
+): boolean {
+  return left.terminalSeq === right.terminalSeq
+    && left.terminalDigest === right.terminalDigest;
+}
+
+function readProjectionMetadata(sessionId: string): WorkingMemoryProjectionMetadata | null {
+  try {
+    const raw = JSON.parse(
+      readFileSync(workingMemoryMetadataPathForSession(sessionId), 'utf-8'),
+    ) as Partial<WorkingMemoryProjectionMetadata>;
+    if (
+      raw.version !== WORKING_MEMORY_PROJECTION_VERSION
+      || (raw.kind !== 'derived_projection' && raw.kind !== 'in_flight_checkpoint')
+      || raw.sessionDigest !== sha256(sessionId)
+      || (raw.terminalSeq !== null && !Number.isSafeInteger(raw.terminalSeq))
+      || typeof raw.terminalDigest !== 'string'
+      || typeof raw.contentDigest !== 'string'
+    ) {
+      return null;
+    }
+    return raw as WorkingMemoryProjectionMetadata;
+  } catch {
+    return null;
+  }
+}
+
+function writeProjectionMetadata(
+  sessionId: string,
+  content: string,
+  source: WorkingMemorySourceWatermark,
+  kind: WorkingMemoryProjectionKind,
+): void {
+  const metadata: WorkingMemoryProjectionMetadata = {
+    version: WORKING_MEMORY_PROJECTION_VERSION,
+    kind,
+    sessionDigest: sha256(sessionId),
+    terminalSeq: source.terminalSeq,
+    terminalDigest: source.terminalDigest,
+    contentDigest: sha256(content),
+  };
+  writeFileSync(workingMemoryMetadataPathForSession(sessionId), `${JSON.stringify(metadata)}\n`);
+}
+
 export function loadWorkingMemoryForSession(sessionId: string, maxChars = 3000): string | undefined {
   const filePath = workingMemoryPathForSession(sessionId);
-  if (!existsSync(filePath)) return undefined;
   try {
-    return readFileSync(filePath, 'utf-8').trim().slice(0, maxChars);
+    const durableSource = latestTerminalWatermark(sessionId);
+    const content = existsSync(filePath) ? readFileSync(filePath, 'utf-8') : null;
+    const metadata = content === null ? null : readProjectionMetadata(sessionId);
+    if (
+      content !== null
+      && metadata
+      && sameWatermark(metadata, durableSource)
+      && metadata.contentDigest === sha256(content)
+    ) {
+      if (
+        durableSource.terminalSeq !== null
+        || metadata.kind === 'in_flight_checkpoint'
+      ) {
+        return content.trim().slice(0, maxChars) || undefined;
+      }
+    }
+
+    // Before the first durable terminal, only an explicitly typed, digest-
+    // stamped in-flight checkpoint is readable. Missing, legacy, or tampered
+    // bytes stay a read miss and must not cause projection files to be made.
+    if (durableSource.terminalSeq === null) return undefined;
+
+    // Missing, legacy, corrupted, or stale bytes are never exposed. Rebuild
+    // synchronously at the central same-session read boundary; if it cannot be
+    // rebuilt, fail closed instead of returning the old unverified projection.
+    const session = getHarnessSession(sessionId);
+    if (!session) return undefined;
+    const rebuilt = rebuildWorkingMemoryProjection({
+      id: session.id,
+      channel: session.channel ?? undefined,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      turns: [],
+    }, false);
+    return rebuilt.trim().slice(0, maxChars) || undefined;
   } catch {
     return undefined;
   }
@@ -62,21 +196,26 @@ export function resolveWorkingMemoryForConsole(maxChars = 4000): ResolvedWorking
     // showing one as the current conversation is both confusing and a context
     // leak. Rank by the file's own mtime: a session row can be touched by
     // bookkeeping after its working-memory snapshot was written.
-    const candidates: Array<{ session: SessionRow; content: string; mtimeMs: number }> = [];
+    const candidates: Array<{ session: SessionRow; rankMs: number }> = [];
     for (const session of listSessions({ kind: 'chat', status: ['active', 'paused'], limit: 500 })) {
       if (!isUserFacingSession(session.id, session.channel ?? undefined)) continue;
-      const content = loadWorkingMemoryForSession(session.id, maxChars);
-      if (!content?.trim()) continue;
       let mtimeMs = 0;
       try { mtimeMs = statSync(workingMemoryPathForSession(session.id)).mtimeMs; } catch { /* keep deterministic fallback */ }
-      candidates.push({ session, content, mtimeMs });
+      const sessionUpdatedMs = Date.parse(session.updatedAt);
+      candidates.push({
+        session,
+        rankMs: Math.max(mtimeMs, Number.isFinite(sessionUpdatedMs) ? sessionUpdatedMs : 0),
+      });
     }
-    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || b.session.updatedAt.localeCompare(a.session.updatedAt));
-    const freshest = candidates[0];
-    if (freshest) {
+    candidates.sort((a, b) => b.rankMs - a.rankMs || b.session.updatedAt.localeCompare(a.session.updatedAt));
+    // Loading is demand-driven and may rebuild one stale projection. Do not
+    // eagerly rebuild every candidate merely to rank the console card.
+    for (const candidate of candidates) {
+      const content = loadWorkingMemoryForSession(candidate.session.id, maxChars);
+      if (!content?.trim()) continue;
       return {
-        content: freshest.content,
-        sessionLabel: sessionLabelFor(freshest.session),
+        content,
+        sessionLabel: sessionLabelFor(candidate.session),
         source: 'session',
       };
     }
@@ -164,11 +303,7 @@ function buildSessionHandoff(session: SessionRecord): string {
   return lines.join('\n');
 }
 
-export function refreshWorkingMemory(session: SessionRecord, opts: { writeGlobal?: boolean } = {}): void {
-  // writeGlobal defaults to true so the legacy respond()/execution callers keep
-  // their long-standing contract (they own the shared global working-memory.md).
-  // The harness path passes writeGlobal:false — see refreshWorkingMemoryForSession.
-  const { writeGlobal = true } = opts;
+function renderWorkingMemoryProjection(session: SessionRecord): string {
   const sections = [
     '# Working Memory',
     '',
@@ -185,16 +320,37 @@ export function refreshWorkingMemory(session: SessionRecord, opts: { writeGlobal
     buildActiveTaskFocus(session),
     '',
   ];
+  return sections.join('\n');
+}
 
-  const baseContent = sections.join('\n');
+/** Shared eager/lazy projection builder with a restart-safe source watermark. */
+function rebuildWorkingMemoryProjection(session: SessionRecord, writeGlobal: boolean): string {
+  // Read before and after rendering. If another process commits a terminal in
+  // between, never stamp the older render as current; one bounded retry closes
+  // that rare race without introducing a background worker.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sourceBefore = latestTerminalWatermark(session.id);
+    const content = renderWorkingMemoryProjection(session);
+    const sourceAfter = latestTerminalWatermark(session.id);
+    if (!sameWatermark(sourceBefore, sourceAfter)) continue;
 
-  const perSessionContent = baseContent;
-
-  mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
-  writeFileSync(workingMemoryPathForSession(session.id), perSessionContent);
-  if (writeGlobal && isUserFacingSession(session.id, session.channel)) {
-    writeFileSync(WORKING_MEMORY_FILE, baseContent);
+    mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
+    writeFileSync(workingMemoryPathForSession(session.id), content);
+    writeProjectionMetadata(session.id, content, sourceAfter, 'derived_projection');
+    if (writeGlobal && isUserFacingSession(session.id, session.channel)) {
+      writeFileSync(WORKING_MEMORY_FILE, content);
+    }
+    return content;
   }
+  throw new Error(`working-memory source changed while projecting session ${session.id}`);
+}
+
+export function refreshWorkingMemory(session: SessionRecord, opts: { writeGlobal?: boolean } = {}): void {
+  // writeGlobal defaults to true so the legacy respond()/execution callers keep
+  // their long-standing contract (they own the shared global working-memory.md).
+  // The harness path passes writeGlobal:false — see refreshWorkingMemoryForSession.
+  const { writeGlobal = true } = opts;
+  rebuildWorkingMemoryProjection(session, writeGlobal);
 }
 
 /**
@@ -214,8 +370,15 @@ export function refreshWorkingMemory(session: SessionRecord, opts: { writeGlobal
  * harness injection + console need.
  */
 export function refreshWorkingMemoryForSession(sessionId: string, channel?: string): void {
+  const session = getHarnessSession(sessionId);
   const now = new Date().toISOString();
-  refreshWorkingMemory({ id: sessionId, channel, createdAt: now, updatedAt: now, turns: [] }, { writeGlobal: false });
+  rebuildWorkingMemoryProjection({
+    id: sessionId,
+    channel: channel ?? session?.channel ?? undefined,
+    createdAt: session?.createdAt ?? now,
+    updatedAt: session?.updatedAt ?? now,
+    turns: [],
+  }, false);
 }
 
 export function workingMemoryExists(): boolean {
@@ -262,6 +425,9 @@ export function reapStaleWorkingMemory(maxAgeDays?: number): number {
       try {
         if (statSync(filePath).mtimeMs < cutoff) {
           unlinkSync(filePath);
+          try {
+            unlinkSync(path.join(SESSION_WORKING_MEMORY_DIR, entry.replace(/\.md$/, '.meta.json')));
+          } catch { /* absent sidecar */ }
           removed++;
         }
       } catch {
@@ -315,6 +481,15 @@ export function checkpointWorkingMemory(
 
     mkdirSync(SESSION_WORKING_MEMORY_DIR, { recursive: true });
     writeFileSync(filePath, next);
+    // A checkpoint is also a derived per-session projection. Stamp the current
+    // durable terminal source and exact bytes so a later load can verify it;
+    // the next terminal automatically invalidates this sidecar.
+    writeProjectionMetadata(
+      sessionId,
+      next,
+      latestTerminalWatermark(sessionId),
+      'in_flight_checkpoint',
+    );
   } catch {
     // best-effort; a checkpoint write must never break or fail a turn.
   }

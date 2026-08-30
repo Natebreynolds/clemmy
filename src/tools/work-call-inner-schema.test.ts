@@ -90,6 +90,99 @@ test('the count-only example in the work_call description is a VALID proposal (t
     'the description must teach that model-composed content is not a compute operation');
 });
 
+test('host-planned work_call JSON schema is the execution envelope, not the authoring proposal', async () => {
+  const { z } = await import('zod');
+  const {
+    HostPlannedWorkCallInputSchema,
+    WorkCallInputSchema,
+    normalizeWorkCallInputForFrozenCardinality,
+    workCallInputFromHostPlan,
+  } = await import('./work-call.js');
+  const planned = z.toJSONSchema(HostPlannedWorkCallInputSchema) as {
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  const authoring = z.toJSONSchema(WorkCallInputSchema) as {
+    properties?: Record<string, unknown>;
+  };
+  assert.equal('proposal' in (planned.properties ?? {}), false, 'plan_task already owns topology');
+  assert.equal((planned.required ?? []).includes('proposal'), false);
+  assert.equal('proposal' in (authoring.properties ?? {}), true, 'the authoring carrier still accepts a first-call proposal');
+  assert.equal((planned.required ?? []).includes('universe_item_id'), false,
+    'a host-frozen once requirement does not require an each-only null placeholder');
+  assert.ok(
+    JSON.stringify(planned).length * 2 < JSON.stringify(authoring).length,
+    'removing the topology union must shrink the advertised grammar, not just hide the field name',
+  );
+  const lifted = workCallInputFromHostPlan({
+    requirement_id: 'read_source',
+    universe_item_id: null,
+    name: 'salesforce_sf_soql_query',
+    args_json: '{"query":"SELECT Id FROM Opportunity"}',
+  });
+  assert.equal(lifted.proposal, null);
+  assert.equal(lifted.universe_selector, null);
+  assert.equal(lifted.seal_amendment, null);
+
+  // Live 2026-08-29, sess-mob-481c… source 100106: GLM emitted the
+  // nullable once-only slot as the JSON string "null" three times. Every
+  // provider payload was otherwise valid, but the cardinality wall correctly
+  // read that string as a universe member and refused before dispatch.
+  const providerPayload = JSON.stringify({
+    tool_slug: 'PROOF_CREATE_RECORD',
+    arguments: {
+      subject: 'null',
+      recipient: 'person@example.test',
+    },
+  });
+  const liveShaped = HostPlannedWorkCallInputSchema.safeParse({
+    requirement_id: 'create-record',
+    universe_item_id: 'null',
+    universe_selector: null,
+    seal_amendment: null,
+    name: 'composio_execute_tool',
+    args_json: providerPayload,
+  });
+  assert.equal(liveShaped.success, true);
+  if (!liveShaped.success) return;
+  const transported = workCallInputFromHostPlan(liveShaped.data);
+  assert.equal(transported.universe_item_id, 'null',
+    'transport parsing alone cannot reinterpret a possible each-member id');
+  const repaired = normalizeWorkCallInputForFrozenCardinality(transported, {
+    operations: [{ id: 'create-record', cardinality: { kind: 'once' } }],
+  });
+  assert.equal(repaired.universe_item_id, null,
+    'the exact transport sentinel becomes absence only under frozen once authority');
+  assert.equal(repaired.args_json, providerPayload,
+    'normalization must never inspect or rewrite the provider payload');
+
+  const omitted = HostPlannedWorkCallInputSchema.safeParse({
+    requirement_id: 'create-record',
+    name: 'composio_execute_tool',
+    args_json: providerPayload,
+  });
+  assert.equal(omitted.success, true, 'the preferred once-call envelope simply omits each-only controls');
+  if (omitted.success) {
+    assert.equal(workCallInputFromHostPlan(omitted.data).universe_item_id, null);
+  }
+
+  for (const realMember of ['null', 'NULL', 'null-1', 'record:null']) {
+    const preserved = normalizeWorkCallInputForFrozenCardinality({
+      proposal: null,
+      requirement_id: 'write-each',
+      universe_item_id: realMember,
+      universe_selector: null,
+      seal_amendment: null,
+      name: 'proof_write',
+      args_json: '{}',
+    }, {
+      operations: [{ id: 'write-each', cardinality: { kind: 'each' } }],
+    });
+    assert.equal(preserved.universe_item_id, realMember,
+      `each-member ${realMember} must remain cardinality evidence`);
+  }
+});
+
 test('the collect-then-construct example is a VALID once-write proposal and rides the description', async () => {
   const {
     WORK_CALL_COLLECT_THEN_CONSTRUCT_EXAMPLE,
@@ -129,51 +222,160 @@ test('work_call inherits the proven-resolution remap by construction (two-teeth 
   );
 });
 
-test('a bound collection refuses shell/curl before its callback while admitting the exact Composio carrier', async () => {
-  const { evaluateSourceStrategyWorkCarrier } = await import('./work-call.js');
-  const binding = {
-    version: 1,
-    primary: {
-      capabilityId: 'capability:composio:APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
-      accountIdentity: 'research@example.com',
-      schemaFingerprint: 'schema:apify:live',
-    },
-    equivalentFallbacks: [],
-    topology: 'single_aggregate_read_then_single_artifact_write',
-    topologyDigest: 'a'.repeat(64),
-    destination: { family: 'workbook', posture: 'create_new' },
-    effect: 'external_write',
-  } as const;
-  const requirement = { role: 'collection', effect: 'read' } as const;
-  let shellCallbacks = 0;
-  const shell = evaluateSourceStrategyWorkCarrier({
-    requirement,
-    binding,
-    bindingRequired: true,
-    targetName: 'run_shell_command',
-    targetArgs: { command: 'curl https://example.invalid/alternate-source' },
-  });
-  if (shell.status === 'admitted') shellCallbacks += 1;
-  assert.equal(shell.status, 'refused');
-  assert.equal(shellCallbacks, 0, 'a generic network process never starts for a bound collection');
+test('a bound collection admits generated current catalog sources independent of carrier name', async () => {
+  const {
+    evaluateSourceStrategyWorkCarrier,
+    sealedSourceStrategyWorkCarrierFromCatalog,
+  } = await import('./work-call.js');
+  const manifests = await import('../runtime/harness/capability-manifest.js');
+  const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 
-  let composioCallbacks = 0;
-  const composio = evaluateSourceStrategyWorkCarrier({
-    requirement,
-    binding,
+  const cases = [
+    { providerKind: 'reviewed_cli', selectorKind: 'cli', marker: 'b' },
+    { providerKind: 'native_mcp', selectorKind: 'mcp', marker: 'c' },
+    { providerKind: 'composio', selectorKind: 'composio', marker: 'd' },
+  ] as const;
+  const generated = cases.map(({ providerKind, selectorKind, marker }) => {
+    const operationId = `generated_${providerKind}_source_${marker.repeat(8)}`;
+    const accountId = `${providerKind}:account:${marker.repeat(8)}`;
+    const definitionFingerprint = marker.repeat(64);
+    const sourceSchemaFingerprint = marker.repeat(32);
+    const manifest = manifests.attachSemanticContract({
+      version: 1,
+      manifestId: `cap:generated:${providerKind}:${marker.repeat(16)}`,
+      providerKind,
+      operationId,
+      providerIdentity: `${providerKind}:fixture`,
+      providerVersion: `provider-${marker}`,
+      operationVersion: `operation-${marker}`,
+      definitionFingerprint,
+      effect: 'read',
+      accountId,
+      idempotency: { required: false, policy: 'none' },
+      reconciliation: { supported: false, policy: 'none' },
+      outputContract: { kind: 'records' },
+      purpose: 'collect_records',
+      acceptedInputKinds: ['arguments'],
+      producedOutputKinds: ['records'],
+      applicableDeliverableKinds: ['records'],
+      evidenceContract: { kinds: ['payload'], readbackRequired: false },
+      provenance: {
+        issuer: `host:generated-${providerKind}-fixture:v1`,
+        issuedAt: '2026-08-27T00:00:00.000Z',
+        trusted: true,
+      },
+      lifecycle: { state: 'current' },
+      advisoryRoles: ['source', 'collection'],
+      argumentCompiler: { id: `compile:${providerKind}:fixture:v1`, version: '1' },
+      invokePortId: `port:${providerKind}:fixture:${marker.repeat(8)}`,
+    });
+    const manifestDigest = manifests.capabilityManifestDigest(manifest);
+    const registered = {
+      capabilityId: manifest.manifestId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      effect: manifest.effect,
+      account: manifest.accountId,
+      providerKind: manifest.providerKind,
+      sourceSchemaFingerprint,
+      manifestDigest,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => ({ records: [] }),
+    };
+    const current = catalogs.createHostCapabilityCatalogFactory([registered])
+      .get(manifest.manifestId);
+    assert.ok(current);
+    const carrier = current
+      ? sealedSourceStrategyWorkCarrierFromCatalog({
+          entry: current,
+          attestation: {
+            bindingKind: 'catalog_manifest',
+            capabilityId: manifest.manifestId,
+            schemaFingerprint: manifest.definitionFingerprint,
+            accountId: manifest.accountId,
+            invokePortId: manifest.invokePortId,
+            operationId: manifest.operationId,
+            manifestId: manifest.manifestId,
+            manifestDigest,
+            effect: 'read',
+          },
+        })
+      : null;
+    assert.ok(carrier, `${providerKind} must project the same sealed source facts`);
+    const capabilityId = `capability:${selectorKind}:${operationId}`;
+    const binding = {
+      version: 1,
+      primary: { capabilityId, accountIdentity: accountId, schemaFingerprint: sourceSchemaFingerprint },
+      equivalentFallbacks: [],
+      topology: 'single_aggregate_read_then_single_artifact_write',
+      topologyDigest: marker.repeat(64),
+      destination: { family: 'workbook', posture: 'create_new' },
+      effect: 'external_write',
+    } as const;
+    const admitted = evaluateSourceStrategyWorkCarrier({
+      requirement: { role: 'collection', effect: 'read' },
+      binding,
+      bindingRequired: true,
+      carrier,
+    });
+    assert.deepEqual(admitted, { status: 'admitted', capabilityId, match: 'primary' });
+    return { carrier, binding, registered, manifest, manifestDigest };
+  });
+
+  const reviewed = generated[0]!;
+  assert.equal(reviewed.carrier?.capability.capabilityId.startsWith('capability:cli:'), true,
+    'the reviewed CLI source is supplied by manifest facts, not a shell or CLI target-name exception');
+
+  const missing = evaluateSourceStrategyWorkCarrier({
+    requirement: { role: 'collection', effect: 'read' },
+    binding: reviewed.binding,
     bindingRequired: true,
-    targetName: 'composio_execute_tool',
-    targetArgs: {
-      tool_slug: 'APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
-      arguments: JSON.stringify({ actorId: 'still-physically-verified-downstream' }),
-      connected_account_id: null,
+    carrier: null,
+  });
+  assert.equal(missing.status, 'refused', 'an unsealed shell/HTTP/process substitute stays outside the binding');
+
+  const staleSchema = evaluateSourceStrategyWorkCarrier({
+    requirement: { role: 'collection', effect: 'read' },
+    binding: {
+      ...reviewed.binding,
+      primary: { ...reviewed.binding.primary, schemaFingerprint: 'e'.repeat(32) },
     },
+    bindingRequired: true,
+    carrier: reviewed.carrier,
   });
-  if (composio.status === 'admitted') composioCallbacks += 1;
-  assert.deepEqual(composio, {
-    status: 'admitted',
-    capabilityId: 'capability:composio:APIFY_ACT_RUN_SYNC_GET_DATASET_ITEMS_GET',
-    match: 'primary',
+  assert.equal(staleSchema.status, 'refused', 'schema drift cannot inherit a prior source binding');
+
+  const unknownEffect = evaluateSourceStrategyWorkCarrier({
+    requirement: { role: 'collection', effect: 'unknown' },
+    binding: reviewed.binding,
+    bindingRequired: true,
+    carrier: reviewed.carrier,
   });
-  assert.equal(composioCallbacks, 1, 'the exact bound carrier continues to the physical account/schema gate');
+  assert.equal(unknownEffect.status, 'refused', 'unknown effects do not become reads through a catalog carrier');
+
+  const writeEffect = evaluateSourceStrategyWorkCarrier({
+    requirement: { role: 'collection', effect: 'external_write' },
+    binding: reviewed.binding,
+    bindingRequired: true,
+    carrier: reviewed.carrier,
+  });
+  assert.equal(writeEffect.status, 'refused', 'a known write cannot inherit source-read authority');
+
+  const copiedEntry = { ...reviewed.registered };
+  assert.equal(sealedSourceStrategyWorkCarrierFromCatalog({
+    entry: copiedEntry,
+    attestation: {
+      bindingKind: 'catalog_manifest',
+      capabilityId: reviewed.manifest.manifestId,
+      schemaFingerprint: reviewed.manifest.definitionFingerprint,
+      accountId: reviewed.manifest.accountId,
+      invokePortId: reviewed.manifest.invokePortId,
+      operationId: reviewed.manifest.operationId,
+      manifestId: reviewed.manifest.manifestId,
+      manifestDigest: reviewed.manifestDigest,
+      effect: 'read',
+    },
+  }), null, 'a catalog-shaped copy without the factory currentness attestation is inert');
 });

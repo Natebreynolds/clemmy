@@ -35,6 +35,7 @@ let serial = 0;
 function installPagedRead(
   responses: unknown[] | ((args: Record<string, unknown>, body: number) => Promise<unknown>),
   maxPages = 8,
+  options: { prepared?: boolean } = {},
 ) {
   const suffix = String(++serial);
   const exactManifest = manifests.attachSemanticContract({
@@ -61,6 +62,8 @@ function installPagedRead(
     advisoryRoles: ['source'],
   });
   let bodies = 0;
+  let preparations = 0;
+  let preparationWrappers = 0;
   assert.equal(ports.registerFixtureCapabilityPort(
     ports.productionPortIdentityFromManifest(exactManifest),
     {
@@ -69,6 +72,18 @@ function installPagedRead(
         const args = input.payload as Record<string, unknown>;
         return typeof responses === 'function' ? responses(args, index) : responses[index];
       },
+      ...(options.prepared ? {
+        admitPreparation() {},
+        async prepareInvocation() {
+          preparations += 1;
+          return Object.freeze({ pagePreparation: preparations });
+        },
+        async invokeWithPreparation<T>(proof: unknown, work: () => Promise<T>) {
+          assert.ok(proof && typeof proof === 'object');
+          preparationWrappers += 1;
+          return work();
+        },
+      } : {}),
     },
   ).ok, true);
   const entry: catalogs.RegisteredHostCapability = {
@@ -135,7 +150,13 @@ function installPagedRead(
       maxPages,
     },
   });
-  return { plan, bodies: () => bodies, exactManifest };
+  return {
+    plan,
+    bodies: () => bodies,
+    preparations: () => preparations,
+    preparationWrappers: () => preparationWrappers,
+    exactManifest,
+  };
 }
 
 function arm(plan: plans.WorkflowNodeInvocationPlanV1, label: string) {
@@ -153,6 +174,14 @@ function arm(plan: plans.WorkflowNodeInvocationPlanV1, label: string) {
     bindingSnapshotDigest: digest(`binding:${label}`),
     controlDigest: digest(`control:${label}`),
   });
+}
+
+function mcpEnvelope(payload: unknown): unknown {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    structuredContent: payload,
+    isError: false,
+  };
 }
 
 test('two pages exhaust under one activation and closed replay has zero new bodies', async () => {
@@ -221,6 +250,70 @@ test('two pages exhaust under one activation and closed replay has zero new bodi
   }
   assert.equal(installed.bodies(), 2);
   assert.equal(db.pragma('foreign_key_check').length, 0);
+});
+
+test('MCP envelopes project exact paginated evidence and continuation from provider payload', async () => {
+  const installed = installPagedRead([
+    mcpEnvelope({ records: [{ id: 'a' }], page: { exhausted: false, next: 'cursor-2' } }),
+    mcpEnvelope({ records: [{ id: 'b' }], page: { exhausted: true, next: null } }),
+  ]);
+  const armed = arm(installed.plan, 'mcp-envelope');
+  assert.equal(armed.status, 'armed', JSON.stringify(armed));
+  if (armed.status !== 'armed') return;
+
+  const completed = await kernel.executeWorkflowPaginatedRead({
+    activationId: armed.ref.activationId,
+    invocationPlan: installed.plan,
+    baseArgs: { scope: 'current' },
+  });
+  assert.equal(completed.status, 'completed', JSON.stringify(completed));
+  if (completed.status !== 'completed') return;
+  assert.equal(completed.aggregate.pageCount, 2);
+  assert.equal(completed.aggregate.totalItemCount, 2);
+  assert.equal(installed.bodies(), 2);
+});
+
+test('prepared immutable ports account for one settled probe before every paginated business page', async () => {
+  const installed = installPagedRead([
+    { records: [{ id: 'a' }], page: { exhausted: false, next: 'cursor-2' } },
+    { records: [{ id: 'b' }], page: { exhausted: true, next: null } },
+  ], 2, { prepared: true });
+  const armed = arm(installed.plan, 'prepared-pages');
+  assert.equal(armed.status, 'armed', JSON.stringify(armed));
+  if (armed.status !== 'armed') return;
+  const completed = await kernel.executeWorkflowPaginatedRead({
+    activationId: armed.ref.activationId,
+    invocationPlan: installed.plan,
+    baseArgs: { scope: 'current' },
+  });
+  assert.equal(completed.status, 'completed', JSON.stringify(completed));
+  assert.equal(installed.preparations(), 2);
+  assert.equal(installed.preparationWrappers(), 2);
+  assert.equal(installed.bodies(), 2);
+  const rows = eventlog.openEventLog().prepare(`
+    SELECT logical_tool_call_id, relation, state, io_claimed_at
+      FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+     ORDER BY logical_tool_call_id, ordinal
+  `).all(armed.ref.sessionId, armed.ref.sourceEventSeq) as Array<{
+    logical_tool_call_id: string;
+    relation: string;
+    state: string;
+    io_claimed_at: string | null;
+  }>;
+  assert.equal(rows.length, 4);
+  assert.equal(new Set(rows.map((row) => row.logical_tool_call_id)).size, 2);
+  assert.deepEqual(rows.map((row) => row.relation).sort(), ['child', 'child', 'probe', 'probe']);
+  assert.ok(rows.every((row) => row.state === 'returned' && row.io_claimed_at));
+  const replay = await kernel.executeWorkflowPaginatedRead({
+    activationId: armed.ref.activationId,
+    invocationPlan: installed.plan,
+    baseArgs: { scope: 'current' },
+  });
+  assert.equal(replay.status, 'replayed');
+  assert.equal(installed.preparations(), 2);
+  assert.equal(installed.preparationWrappers(), 2);
+  assert.equal(installed.bodies(), 2);
 });
 
 test('a repeated cursor stops before a third body and closes partial once', async () => {

@@ -49,7 +49,19 @@ let serial = 0;
 function acceptWorkflowStepSource(label: string) {
   serial += 1;
   const sessionId = `workflow:red-truth-run-${serial}:${label}`;
-  eventlog.createSession({ id: sessionId, kind: 'workflow', title: `step ${label}` });
+  eventlog.createSession({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: `step ${label}`,
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Workflow Settlement Truth Fixture',
+      workflowRunId: `red-truth-run-${serial}`,
+      stepId: label,
+      sessionIdSuffix: `red-truth-run-${serial}:${label}`,
+    },
+  });
   const source = eventlog.appendEvent({
     sessionId,
     turn: 1,

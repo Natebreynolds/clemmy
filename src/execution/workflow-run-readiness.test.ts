@@ -119,17 +119,10 @@ test('ready items are neither blockers nor warnings', () => {
   assert.equal(warnings.length, 0);
 });
 
-// Regression pin (2026-08-26): 60db67d8 layered an unconditional "retired"
-// blocker on top of the existing 'script' readiness check for
-// deterministic.runner / loopUntil.probe.runner AND filtered the real
-// script-existence item out of blockers to make room for it — refusing every
-// declaration whether or not its script existed. That starved 5 of the
-// owner's live workflows of a run record, 3 of them on live cron schedules
-// (this is THE READINESS GATE PIN: a scheduled trigger for an enabled
-// deterministic.runner workflow must produce a real run, not
-// blocked_readiness). Restored: the pre-existing 'script' check (present ⇒
-// ready, missing ⇒ blocked) is authoritative again, with no retirement layer.
-test('deterministic.runner readiness follows the real script — present is ready, missing still blocks', () => {
+// A script's presence certifies stored bytes, not the filesystem/network/CLI
+// authority of the body it would launch. Legacy declarations therefore remain
+// inspectable but are never queue-ready, whether or not the file exists.
+test('deterministic.runner readiness is a typed authority refusal even when its script exists', () => {
   const slug = 'owner-deterministic-readiness-shape';
   const scriptsDir = path.join(TMP_HOME, 'vault', '00-System', 'workflows', slug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
@@ -142,9 +135,15 @@ test('deterministic.runner readiness follows the real script — present is read
     trigger: { type: 'schedule', schedule: '0 7 * * *' },
     steps: [{ id: 'refresh', prompt: '', sideEffect: 'read', deterministic: { runner: 'refresh.mjs' } }],
   };
-  const ready = checkWorkflowRunReadiness(withScript, slug);
-  assert.equal(ready.ok, true, ready.message);
-  assert.equal(ready.blockers.length, 0);
+  const present = checkWorkflowRunReadiness(withScript, slug);
+  assert.equal(present.ok, false);
+  assert.equal(present.blockers.length, 1);
+  assert.equal(present.blockers[0]?.kind, 'script');
+  assert.equal(present.blockers[0]?.name, 'refresh.mjs');
+  assert.match(
+    present.blockers[0]?.reason ?? '',
+    /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i,
+  );
 
   const missingScript: WorkflowDefinition = {
     ...withScript,
@@ -154,7 +153,10 @@ test('deterministic.runner readiness follows the real script — present is read
   assert.equal(blocked.ok, false);
   assert.equal(blocked.blockers[0]?.kind, 'script');
   assert.equal(blocked.blockers[0]?.name, 'does-not-exist.mjs');
-  assert.doesNotMatch(blocked.blockers[0]?.reason ?? '', /shared exact authority/i);
+  assert.match(
+    blocked.blockers[0]?.reason ?? '',
+    /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i,
+  );
 });
 
 test('workflow readiness does not advertise the removed program executor', () => {
@@ -264,21 +266,22 @@ test('renderWorkflowVisualContract summarizes blocking and warning checks for au
   assert.doesNotMatch(msg, /\[PASS\] Graph structure/);
 });
 
-test('required Salesforce account fails closed without provider or CLI execution authority', () => {
+test('required Salesforce account warns and admits without provider or CLI execution authority', () => {
   const readiness = checkWorkflowRunReadiness(
     workflowWithResources({ salesforce_org: requiredSalesforceAccount() }),
     FRIDAY_SHAPE_SLUG,
   );
 
-  assert.equal(readiness.ok, false);
-  assert.equal(readiness.blockers.length, 1);
-  assert.equal(readiness.blockers[0]?.kind, 'cli');
-  assert.equal(readiness.blockers[0]?.name, 'sf:salesforce_org');
-  assert.equal(readiness.blockers[0]?.status, 'unknown');
-  assert.match(readiness.blockers[0]?.reason ?? '', /admitted exact-account read/i);
-  assert.match(readiness.blockers[0]?.reason ?? '', /no provider or CLI execution authority/i);
-  assert.match(readiness.blockers[0]?.evidence?.[0]?.detail ?? '', /zero provider or CLI process calls/i);
-  assert.match(readiness.message, /was not queued/);
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.blockers.length, 0);
+  assert.equal(readiness.warnings.length, 1);
+  assert.equal(readiness.warnings[0]?.kind, 'cli');
+  assert.equal(readiness.warnings[0]?.name, 'sf:salesforce_org');
+  assert.equal(readiness.warnings[0]?.status, 'unknown');
+  assert.match(readiness.warnings[0]?.reason ?? '', /admitted exact-account read/i);
+  assert.match(readiness.warnings[0]?.reason ?? '', /no provider or CLI execution authority/i);
+  assert.match(readiness.warnings[0]?.evidence?.[0]?.detail ?? '', /zero provider or CLI process calls/i);
+  assert.doesNotMatch(readiness.message, /was not queued/);
 });
 
 test('binary registration and generic auth-health cache do not attest an exact Salesforce org', () => {
@@ -316,10 +319,11 @@ test('binary registration and generic auth-health cache do not attest an exact S
     FRIDAY_SHAPE_SLUG,
   );
 
-  assert.equal(readiness.ok, false);
-  assert.equal(readiness.blockers[0]?.name, 'sf:salesforce_org');
-  assert.equal(readiness.blockers[0]?.status, 'unknown');
-  assert.match(readiness.blockers[0]?.reason ?? '', /cannot be verified/i);
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.blockers.length, 0);
+  assert.equal(readiness.warnings[0]?.name, 'sf:salesforce_org');
+  assert.equal(readiness.warnings[0]?.status, 'unknown');
+  assert.match(readiness.warnings[0]?.reason ?? '', /cannot be verified/i);
 });
 
 test('unsupported required account CLI is an informative warning, not a blocker', () => {
@@ -339,7 +343,7 @@ test('unsupported required account CLI is an informative warning, not a blocker'
   assert.equal(readiness.ok, true);
   assert.equal(readiness.blockers.length, 0);
   assert.equal(readiness.warnings.length, 1);
-  assert.match(readiness.warnings[0]?.reason ?? '', /no authoritative local account snapshot/i);
+  assert.match(readiness.warnings[0]?.reason ?? '', /admitted exact-account read/i);
 });
 
 test('non-required account resources do not participate in readiness', () => {
@@ -377,7 +381,7 @@ test('Salesforce readiness is local-only and does not mutate the binding', () =>
     FRIDAY_SHAPE_SLUG,
   );
 
-  assert.equal(readiness.ok, false);
-  assert.equal(readiness.blockers[0]?.name, 'sf:salesforce_org');
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.warnings[0]?.name, 'sf:salesforce_org');
   assert.equal(JSON.stringify(resource), before);
 });

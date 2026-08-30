@@ -49,6 +49,18 @@ import {
   hostCallCapabilityBindingMatchesAttestation,
   loadHostCallCapabilityBinding,
 } from './host-call-capability-binding.js';
+import {
+  deriveExternalCapabilityCallSignalsV1,
+  loadCatalogManifestExternalRiskAttestationV1,
+} from './external-capability-risk-loader.js';
+import {
+  evaluateInteractiveConsentV1,
+  INTERACTIVE_CONSENT_POLICY_VERSION,
+  type CapabilityRiskAttestationV1,
+  type ExactWorkCoverageV1,
+  type InteractiveConsentDecisionV1,
+} from './interactive-consent-policy.js';
+import { workflowCapabilityDigest } from '../../execution/workflow-capability-digest.js';
 
 export const HOST_READ_ONLY_CALL_AUTHORITY_ENGINE_VERSION = 'host_v1_read_only' as const;
 export const HOST_READ_ONLY_EFFECT_CEILING = 'read_compute_host_only' as const;
@@ -1535,12 +1547,15 @@ function verifyRow(
       ? readWorkflowV3ActivationBindingRow(db, activation.activation_id)
       : undefined;
     const exactInput = activation && binding
-      ? workflowV3InputFromRows(activation, binding)
+      ? workflowV3InputFromRows(db, activation, binding)
       : null;
     const activationDigest = exactInput ? workflowV3ActivationDigest(exactInput) : '';
     const authorization = exactInput?.oneShotActivationAuthorization;
     const authorizationRow = authorization
       ? exactOneShotAuthorizationRow(db, authorization)
+      : null;
+    const autoReceipt = exactInput && !authorization
+      ? exactWorkflowV3AutoReceiptInTransaction(db, workflowV3AutoConsentArmInput(exactInput))
       : null;
     const graphResolution = db.prepare(`
       SELECT 1 FROM accepted_task_resolutions
@@ -1551,7 +1566,9 @@ function verifyRow(
       || !binding
       || !exactInput
       || graphResolution
-      || (binding.effect !== 'host_only' && (!authorizationRow || authorizationRow.consumed_at === null))
+      || (binding.effect !== 'host_only'
+        && (!authorizationRow || authorizationRow.consumed_at === null)
+        && !autoReceipt)
       || activation.activation_digest !== activationDigest
       || activation.activation_id !== workflowNodeInvocationActivationId(activationDigest)
       || activation.authority_root_id !== workflowNodeCallAuthorityRootId(activationDigest)
@@ -1619,7 +1636,7 @@ function verifyRow(
     `).get(row.session_id, row.source_user_seq);
     const activationState = activation?.aggregate_state === 'open'
       ? 'open'
-      : activation?.aggregate_state === 'failed' || activation?.aggregate_state === 'conflict'
+      : activation?.aggregate_state === 'conflict'
         ? 'conflict'
         : 'closed';
     if (
@@ -2044,6 +2061,54 @@ export interface WorkflowV3DurableCapabilityBinding {
   argumentCompiler: { id: string; version: string };
 }
 
+/**
+ * Exact call bytes embedded in a pre-existing non-Workflow approval card.
+ *
+ * A Workspace action already asks the human one exact question containing the
+ * action snapshot and caller arguments. Requiring a second workflow_v3_call
+ * card for the same effect would create two consent paths. This contract lets
+ * that existing row carry the provider-ready v3 binding while keeping the
+ * shared activation transaction as the only consumer and dispatch authority.
+ * `runOccurrence: approval_id` makes every deliberate later click a new
+ * occurrence without inventing an authority id before the registry row exists.
+ */
+export interface WorkflowV3DelegatedApprovalContractV1 {
+  version: 1;
+  approvalTool: 'space_execute_action';
+  runOccurrence: 'approval_id';
+  activationSessionId: string;
+  workflowId: string;
+  workflowRevision: number;
+  workflowDigest: string;
+  nodeId: string;
+  nodeAttempt: number;
+  invocationPlanDigest: string;
+  bindingSnapshotDigest: string;
+  controlDigest: string;
+  requirementId: string;
+  logicalCapabilityId: string;
+  canonicalArgumentDigest: string;
+  sourceArgumentDigest: string;
+  obligationDigest: string;
+  binding: WorkflowV3DurableCapabilityBinding;
+}
+
+export function workflowV3DelegatedApprovalContract(input: Omit<
+  WorkflowV3DelegatedApprovalContractV1,
+  'version' | 'approvalTool' | 'runOccurrence'
+>): Readonly<WorkflowV3DelegatedApprovalContractV1> {
+  return Object.freeze({
+    version: 1 as const,
+    approvalTool: 'space_execute_action' as const,
+    runOccurrence: 'approval_id' as const,
+    ...input,
+    binding: Object.freeze({
+      ...input.binding,
+      argumentCompiler: Object.freeze({ ...input.binding.argumentCompiler }),
+    }),
+  });
+}
+
 export interface ArmWorkflowV3CallAuthorityInput extends ArmWorkflowReadOnlyCallAuthorityInput {
   authorityBindingDigest: string;
   requirementId: string;
@@ -2052,7 +2117,42 @@ export interface ArmWorkflowV3CallAuthorityInput extends ArmWorkflowReadOnlyCall
   sourceArgumentDigest: string;
   obligationDigest: string;
   binding: WorkflowV3DurableCapabilityBinding;
+  /** Opaque canonical-Auto decision minted from this exact current binding.
+   * It is deliberately not an approval row and carries no copyable authority
+   * fields. The durable decision receipt is appended atomically by arm(). */
+  autoConsentAuthorization?: WorkflowV3AutoConsentAuthorizationV1;
 }
+
+/** Process-opaque authority for one canonical Auto decision. A structural
+ * clone has no entry in the module-private WeakMap and grants nothing. */
+export interface WorkflowV3AutoConsentAuthorizationV1 {
+  readonly version: 1;
+}
+
+export type WorkflowV3AutoConsentArmInput = Omit<
+  ArmWorkflowV3CallAuthorityInput,
+  'oneShotActivationAuthorization' | 'autoConsentAuthorization'
+>;
+
+interface WorkflowV3AutoConsentDecisionReceiptV1 {
+  version: 1;
+  receiptId: string;
+  receiptDigest: string;
+  authorityInputDigest: string;
+  call: CapabilityRiskAttestationV1;
+  coverage: ExactWorkCoverageV1;
+  decision: Extract<InteractiveConsentDecisionV1, { kind: 'proceed' }>;
+}
+
+interface WorkflowV3AutoConsentAuthorizationState {
+  authorityInput: WorkflowV3AutoConsentArmInput;
+  receipt: WorkflowV3AutoConsentDecisionReceiptV1;
+}
+
+const workflowV3AutoConsentAuthorizations = new WeakMap<
+  object,
+  WorkflowV3AutoConsentAuthorizationState
+>();
 
 export interface OneShotActivationAuthorization {
   approvalId: string;
@@ -2214,7 +2314,7 @@ function workflowActivationDigestInput(
   };
 }
 
-function validWorkflowV3ArmInput(
+function validWorkflowV3BaseArmInput(
   input: ArmWorkflowV3CallAuthorityInput,
 ): input is ArmWorkflowV3CallAuthorityInput {
   const binding = input.binding;
@@ -2237,8 +2337,444 @@ function validWorkflowV3ArmInput(
     && ['host_only', 'local_write', 'external_write', 'admin'].includes(binding.effect)
     && exactWorkflowId(binding.invokePortId)
     && exactWorkflowId(binding.argumentCompiler.id)
-    && exactWorkflowId(binding.argumentCompiler.version)
-    && (binding.effect === 'host_only' || input.oneShotActivationAuthorization !== undefined);
+    && exactWorkflowId(binding.argumentCompiler.version);
+}
+
+function workflowV3AutoConsentArmInput(
+  input: ArmWorkflowV3CallAuthorityInput,
+): WorkflowV3AutoConsentArmInput {
+  return {
+    sessionId: input.sessionId,
+    workflowId: input.workflowId,
+    workflowRevision: input.workflowRevision,
+    workflowDigest: input.workflowDigest,
+    runId: input.runId,
+    runOccurrenceId: input.runOccurrenceId,
+    nodeId: input.nodeId,
+    nodeAttempt: input.nodeAttempt,
+    invocationPlanDigest: input.invocationPlanDigest,
+    bindingSnapshotDigest: input.bindingSnapshotDigest,
+    controlDigest: input.controlDigest,
+    logicalCallId: input.logicalCallId,
+    authorityBindingDigest: input.authorityBindingDigest,
+    requirementId: input.requirementId,
+    logicalCapabilityId: input.logicalCapabilityId,
+    canonicalArgumentDigest: input.canonicalArgumentDigest,
+    sourceArgumentDigest: input.sourceArgumentDigest,
+    obligationDigest: input.obligationDigest,
+    binding: {
+      ...input.binding,
+      argumentCompiler: { ...input.binding.argumentCompiler },
+    },
+  };
+}
+
+function exactWorkflowV3AutoConsentState(
+  input: ArmWorkflowV3CallAuthorityInput,
+): WorkflowV3AutoConsentAuthorizationState | null {
+  const authorization = input.autoConsentAuthorization;
+  if (!authorization || authorization.version !== 1) return null;
+  const state = workflowV3AutoConsentAuthorizations.get(authorization as object);
+  if (!state) return null;
+  try {
+    return closedCanonicalJson(state.authorityInput)
+      === closedCanonicalJson(workflowV3AutoConsentArmInput(input))
+      ? state
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function validWorkflowV3ArmInput(
+  input: ArmWorkflowV3CallAuthorityInput,
+): input is ArmWorkflowV3CallAuthorityInput {
+  if (!validWorkflowV3BaseArmInput(input)) return false;
+  const human = input.oneShotActivationAuthorization !== undefined;
+  const automatic = exactWorkflowV3AutoConsentState(input) !== null;
+  if (human && automatic) return false;
+  return input.binding.effect === 'host_only'
+    ? !human && !automatic
+    : human || automatic;
+}
+
+function workflowV3AutoDigest(domain: string, value: unknown): string {
+  return createHash('sha256').update(closedCanonicalJson({
+    domain,
+    version: 1,
+    value,
+  }), 'utf8').digest('hex');
+}
+
+function canonicalSnapshot<T>(value: T): T {
+  return JSON.parse(closedCanonicalJson(value)) as T;
+}
+
+function workflowV3AutoSource(input: WorkflowV3AutoConsentArmInput): CapabilityRiskAttestationV1['source'] {
+  return {
+    kind: 'workspace_action',
+    id: `workspace:${workflowV3AutoDigest('workspace-action-source-id', {
+      workflowId: input.workflowId,
+      nodeId: input.nodeId,
+    }).slice(0, 40)}`,
+    digest: workflowV3AutoDigest('workspace-action-source', {
+      workflowId: input.workflowId,
+      workflowRevision: input.workflowRevision,
+      workflowDigest: input.workflowDigest,
+      nodeId: input.nodeId,
+    }),
+  };
+}
+
+function workflowV3AutoAcceptedTaskId(input: WorkflowV3AutoConsentArmInput): string {
+  return `workspace-task:${workflowV3AutoDigest('workspace-action-task', {
+    workflowId: input.workflowId,
+    workflowRevision: input.workflowRevision,
+    workflowDigest: input.workflowDigest,
+    runId: input.runId,
+    runOccurrenceId: input.runOccurrenceId,
+    nodeId: input.nodeId,
+    nodeAttempt: input.nodeAttempt,
+  }).slice(0, 40)}`;
+}
+
+function workflowV3AutoBindingDigest(input: {
+  authority: WorkflowV3AutoConsentArmInput;
+  source: CapabilityRiskAttestationV1['source'];
+  destination: CapabilityRiskAttestationV1['destination'];
+  semanticBasis: CapabilityRiskAttestationV1['semanticBasis'];
+}): string {
+  return workflowV3AutoDigest('workspace-action-call-binding', {
+    authorityInputDigest: workflowV3AutoDigest('workspace-action-authority-input', input.authority),
+    source: input.source,
+    destination: input.destination,
+    semanticBasis: input.semanticBasis,
+  });
+}
+
+function workflowV3AutoReceipt(input: {
+  authority: WorkflowV3AutoConsentArmInput;
+  call: CapabilityRiskAttestationV1;
+  coverage: ExactWorkCoverageV1;
+  decision: Extract<InteractiveConsentDecisionV1, { kind: 'proceed' }>;
+}): WorkflowV3AutoConsentDecisionReceiptV1 {
+  const authorityInputDigest = workflowV3AutoDigest(
+    'workspace-action-authority-input',
+    input.authority,
+  );
+  const receiptDigest = workflowV3AutoDigest('workflow-v3-auto-consent-receipt', {
+    authorityInputDigest,
+    call: input.call,
+    coverage: input.coverage,
+    decision: input.decision,
+  });
+  return {
+    version: 1,
+    receiptId: `workflow-v3-auto:${receiptDigest}`,
+    receiptDigest,
+    authorityInputDigest,
+    call: canonicalSnapshot(input.call),
+    coverage: canonicalSnapshot(input.coverage),
+    decision: canonicalSnapshot(input.decision),
+  };
+}
+
+function workflowV3AutoReceiptMatchesAuthority(
+  receipt: WorkflowV3AutoConsentDecisionReceiptV1,
+  authority: WorkflowV3AutoConsentArmInput,
+): boolean {
+  try {
+    if (
+      receipt.version !== 1
+      || !isSha256(receipt.receiptDigest)
+      || receipt.receiptId !== `workflow-v3-auto:${receipt.receiptDigest}`
+      || receipt.authorityInputDigest !== workflowV3AutoDigest(
+        'workspace-action-authority-input',
+        authority,
+      )
+      || receipt.call.version !== INTERACTIVE_CONSENT_POLICY_VERSION
+      || receipt.call.source.kind !== 'workspace_action'
+      || receipt.call.source.id !== workflowV3AutoSource(authority).id
+      || receipt.call.source.digest !== workflowV3AutoSource(authority).digest
+      || receipt.call.acceptedTaskId !== workflowV3AutoAcceptedTaskId(authority)
+      || receipt.call.logicalToolCallId !== authority.logicalCallId
+      || receipt.call.operationId !== authority.binding.operationId
+      || receipt.call.argumentDigest !== authority.canonicalArgumentDigest
+      || receipt.call.schemaFingerprint !== authority.binding.liveFingerprint
+      || receipt.call.effect !== authority.binding.effect
+      || receipt.call.accountId !== authority.binding.accountId
+      || receipt.call.cardinality.kind !== 'once'
+      || receipt.coverage.acceptedTaskId !== receipt.call.acceptedTaskId
+      || receipt.coverage.requirementId !== authority.requirementId
+      || receipt.coverage.callBinding.logicalToolCallId !== authority.logicalCallId
+      || receipt.coverage.callBinding.argumentDigest !== authority.canonicalArgumentDigest
+      || receipt.coverage.callBinding.bindingDigest !== receipt.call.bindingDigest
+      || receipt.call.bindingDigest !== workflowV3AutoBindingDigest({
+        authority,
+        source: receipt.call.source,
+        destination: receipt.call.destination,
+        semanticBasis: receipt.call.semanticBasis,
+      })
+    ) return false;
+    const reproduced = evaluateInteractiveConsentV1({
+      call: receipt.call,
+      coverage: receipt.coverage,
+      userGrant: null,
+      readiness: { kind: 'ready' },
+      crossing: 'not_started',
+      reservationAlreadyClaimed: false,
+    });
+    if (
+      reproduced.kind !== 'proceed'
+      || (reproduced.basis !== 'exact_ordinary_work'
+        && reproduced.basis !== 'exact_reversible_work')
+      || closedCanonicalJson(reproduced) !== closedCanonicalJson(receipt.decision)
+    ) return false;
+    return closedCanonicalJson(workflowV3AutoReceipt({
+      authority,
+      call: receipt.call,
+      coverage: receipt.coverage,
+      decision: receipt.decision,
+    })) === closedCanonicalJson(receipt);
+  } catch {
+    return false;
+  }
+}
+
+function workflowV3AutoReceiptFromRow(value: unknown): WorkflowV3AutoConsentDecisionReceiptV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const receipt = (value as { receipt?: unknown }).receipt;
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return null;
+  return receipt as WorkflowV3AutoConsentDecisionReceiptV1;
+}
+
+function exactWorkflowV3AutoReceiptInTransaction(
+  db: HarnessDb,
+  authority: WorkflowV3AutoConsentArmInput,
+): WorkflowV3AutoConsentDecisionReceiptV1 | null {
+  const rows = db.prepare(`
+    SELECT data_json
+      FROM events
+     WHERE session_id = ? AND type = 'workflow_v3_auto_consent_decided'
+     ORDER BY seq ASC
+  `).all(authority.sessionId) as Array<{ data_json: string }>;
+  const matches: WorkflowV3AutoConsentDecisionReceiptV1[] = [];
+  for (const row of rows) {
+    try {
+      const receipt = workflowV3AutoReceiptFromRow(JSON.parse(row.data_json));
+      if (receipt && workflowV3AutoReceiptMatchesAuthority(receipt, authority)) matches.push(receipt);
+    } catch {
+      // A malformed private receipt grants nothing and cannot shadow an exact
+      // later row. More than one exact row below is still a hard conflict.
+    }
+  }
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+export type EvaluateWorkflowV3AutoConsentResult =
+  | {
+      status: 'decided';
+      decision: InteractiveConsentDecisionV1;
+      call?: CapabilityRiskAttestationV1;
+      coverage?: ExactWorkCoverageV1;
+      authorization?: WorkflowV3AutoConsentAuthorizationV1;
+    }
+  | { status: 'conflict'; reason: string };
+
+/** Project one exact current workflow-v3 provider binding through the shared
+ * consent reducer. Only ordinary/reversible decisions mint the opaque Auto
+ * token; all high-consequence outcomes remain normal human approval needs. */
+export function evaluateWorkflowV3AutoConsent(input: {
+  authority: WorkflowV3AutoConsentArmInput;
+  inputSchema: unknown;
+  args: Record<string, unknown>;
+}): EvaluateWorkflowV3AutoConsentResult {
+  const authority = canonicalSnapshot(input.authority);
+  const candidate = authority as ArmWorkflowV3CallAuthorityInput;
+  if (
+    !validWorkflowV3BaseArmInput(candidate)
+    || candidate.oneShotActivationAuthorization !== undefined
+    || candidate.autoConsentAuthorization !== undefined
+    || authority.binding.effect === 'host_only'
+    || canonicalArgumentDigestOf(input.args) !== authority.canonicalArgumentDigest
+  ) return { status: 'conflict', reason: 'workflow v3 Auto input is not one exact mutating call' };
+
+  // A committed receipt is already paired atomically with this exact
+  // activation. Reissue only the process-opaque address so restart/reentry can
+  // reach the kernel's settled replay without consulting a now-drifted live
+  // definition and, critically, without creating another provider crossing.
+  const existingReceipt = exactWorkflowV3AutoReceiptInTransaction(openEventLog(), authority);
+  if (existingReceipt) {
+    const authorization = Object.freeze({ version: 1 as const });
+    workflowV3AutoConsentAuthorizations.set(authorization, {
+      authorityInput: authority,
+      receipt: existingReceipt,
+    });
+    return {
+      status: 'decided',
+      decision: canonicalSnapshot(existingReceipt.decision),
+      call: canonicalSnapshot(existingReceipt.call),
+      coverage: canonicalSnapshot(existingReceipt.coverage),
+      authorization,
+    };
+  }
+
+  const factory = peekHostCapabilityCatalogFactory();
+  const entry = factory?.get(authority.binding.capabilityId);
+  const live = entry ? canonicalCatalogIdentityOf(entry) : null;
+  const manifest = entry?.manifest;
+  if (
+    !entry
+    || !live
+    || !manifest
+    || !currentCapabilityManifest(manifest)
+    || capabilityManifestDigest(manifest) !== authority.binding.manifestDigest
+    || live.capabilityId !== authority.binding.capabilityId
+    || live.manifestId !== authority.binding.manifestId
+    || live.manifestDigest !== authority.binding.manifestDigest
+    || live.operationId !== authority.binding.operationId
+    || live.schemaVersion !== authority.binding.operationVersion
+    || workflowCapabilityDigest(live.schemaDigest) !== authority.binding.schemaDigest
+    || live.providerVersion !== authority.binding.providerVersion
+    || workflowCapabilityDigest(live.liveFingerprint) !== authority.binding.liveFingerprint
+    || live.account !== authority.binding.accountId
+    || live.effect !== authority.binding.effect
+    || live.invokePortId !== authority.binding.invokePortId
+    || live.argumentCompiler.id !== authority.binding.argumentCompiler.id
+    || live.argumentCompiler.version !== authority.binding.argumentCompiler.version
+  ) return { status: 'conflict', reason: 'workflow v3 Auto binding is not the exact current capability' };
+
+  const posture = manifest.destination?.posture;
+  if (posture !== 'create_new' && posture !== 'named_existing') {
+    return { status: 'conflict', reason: 'workflow v3 Auto destination is not structurally bounded' };
+  }
+  const destination = {
+    posture,
+    digest: workflowV3AutoDigest('workspace-action-destination', {
+      workflowId: authority.workflowId,
+      runOccurrenceId: authority.runOccurrenceId,
+      nodeId: authority.nodeId,
+      operationId: authority.binding.operationId,
+      accountId: authority.binding.accountId,
+      manifestDigest: authority.binding.manifestDigest,
+      canonicalArgumentDigest: authority.canonicalArgumentDigest,
+    }),
+  } as const;
+  const signals = deriveExternalCapabilityCallSignalsV1({
+    version: 1,
+    inputSchema: input.inputSchema,
+    arguments: input.args,
+  });
+  if (signals.status !== 'projected') {
+    return { status: 'conflict', reason: 'workflow v3 Auto call signals are unresolved' };
+  }
+  const loaded = loadCatalogManifestExternalRiskAttestationV1({
+    version: 1,
+    binding: {
+      bindingKind: 'catalog_manifest',
+      capabilityId: authority.binding.capabilityId,
+      ...(live.providerInputSchemaDigest
+        ? { providerInputSchemaDigest: live.providerInputSchemaDigest }
+        : {}),
+      schemaFingerprint: live.liveFingerprint,
+      accountId: authority.binding.accountId,
+      invokePortId: authority.binding.invokePortId,
+      operationId: authority.binding.operationId,
+      manifestId: authority.binding.manifestId,
+      manifestDigest: authority.binding.manifestDigest,
+      effect: authority.binding.effect,
+    },
+    inputSchema: input.inputSchema,
+    destination,
+    callSignals: signals.callSignals,
+    safety: 'admissible',
+  });
+  if (!loaded.ok || loaded.attestation.projection.effect !== authority.binding.effect) {
+    return { status: 'conflict', reason: 'workflow v3 Auto risk attestation is unavailable or drifted' };
+  }
+
+  const source = workflowV3AutoSource(authority);
+  const acceptedTaskId = workflowV3AutoAcceptedTaskId(authority);
+  const call: CapabilityRiskAttestationV1 = {
+    version: INTERACTIVE_CONSENT_POLICY_VERSION,
+    source,
+    acceptedTaskId,
+    bindingDigest: workflowV3AutoBindingDigest({
+      authority,
+      source,
+      destination,
+      semanticBasis: loaded.attestation.projection.semanticBasis,
+    }),
+    logicalToolCallId: authority.logicalCallId,
+    operationId: authority.binding.operationId,
+    argumentDigest: authority.canonicalArgumentDigest,
+    schemaFingerprint: authority.binding.liveFingerprint,
+    effect: authority.binding.effect,
+    accountId: authority.binding.accountId,
+    destination,
+    cardinality: { kind: 'once' },
+    risk: loaded.attestation.projection.risk,
+    semanticBasis: loaded.attestation.projection.semanticBasis,
+    safety: loaded.attestation.projection.safety,
+  };
+  const coverage: ExactWorkCoverageV1 = {
+    version: INTERACTIVE_CONSENT_POLICY_VERSION,
+    source: { ...source },
+    acceptedTaskId,
+    contractId: `workspace-contract:${workflowV3AutoDigest('workspace-action-contract', {
+      workflowId: authority.workflowId,
+      workflowDigest: authority.workflowDigest,
+    }).slice(0, 40)}`,
+    requirementId: authority.requirementId,
+    requirementDigest: workflowV3AutoDigest('workspace-action-requirement', {
+      authorityBindingDigest: authority.authorityBindingDigest,
+      requirementId: authority.requirementId,
+      call,
+    }),
+    semanticScope: {
+      operationId: call.operationId,
+      schemaFingerprint: call.schemaFingerprint,
+      effect: call.effect,
+      accountId: call.accountId,
+      destination: { ...call.destination },
+      cardinality: { ...call.cardinality },
+      semanticBasis: { ...call.semanticBasis },
+    },
+    callBinding: {
+      logicalToolCallId: call.logicalToolCallId,
+      argumentDigest: call.argumentDigest,
+      bindingDigest: call.bindingDigest,
+    },
+    reservationKey: `workspace-reservation:${workflowV3AutoDigest('workspace-action-reservation', {
+      workflowId: authority.workflowId,
+      runId: authority.runId,
+      runOccurrenceId: authority.runOccurrenceId,
+      nodeId: authority.nodeId,
+      nodeAttempt: authority.nodeAttempt,
+      authorityBindingDigest: authority.authorityBindingDigest,
+    })}`,
+  };
+  const decision = evaluateInteractiveConsentV1({
+    call,
+    coverage,
+    userGrant: null,
+    readiness: { kind: 'ready' },
+    crossing: 'not_started',
+    reservationAlreadyClaimed: false,
+  });
+  if (
+    decision.kind !== 'proceed'
+    || (decision.basis !== 'exact_ordinary_work'
+      && decision.basis !== 'exact_reversible_work')
+  ) return { status: 'decided', decision, call, coverage };
+
+  const receipt = workflowV3AutoReceipt({ authority, call, coverage, decision });
+  const authorization = Object.freeze({ version: 1 as const });
+  workflowV3AutoConsentAuthorizations.set(authorization, {
+    authorityInput: authority,
+    receipt,
+  });
+  return { status: 'decided', decision, call, coverage, authorization };
 }
 
 function workflowV3ActivationDigest(input: ArmWorkflowV3CallAuthorityInput): string {
@@ -2283,20 +2819,55 @@ function workflowV3AuthorizationMatchesExactCall(
   row: OneShotAuthorizationApprovalRow,
   input: ArmWorkflowV3CallAuthorityInput,
 ): boolean {
-  if (
-    row.session_id !== input.sessionId
-    || row.tool !== WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION
-    || !row.args_json
-  ) return false;
+  if (!row.args_json) return false;
   try {
-    return closedCanonicalJson(JSON.parse(row.args_json))
-      === closedCanonicalJson(workflowV3ConsentArgs(input));
+    const parsed = JSON.parse(row.args_json) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    if (
+      row.session_id === input.sessionId
+      && row.tool === WORKFLOW_V3_CALL_AUTHORITY_ENGINE_VERSION
+    ) {
+      return closedCanonicalJson(parsed)
+        === closedCanonicalJson(workflowV3ConsentArgs(input));
+    }
+
+    // Workspace buttons already own one exact human approval. The host embeds
+    // this closed v3 binding in that row before presentation, then revalidates
+    // the live action/caller args before reaching this transaction. The row id
+    // itself becomes the unique run occurrence, so a later deliberate click
+    // receives a distinct activation while replay of this click is stable.
+    if (
+      row.tool !== 'space_execute_action'
+      || input.runId !== row.approval_id
+      || input.runOccurrenceId !== row.approval_id
+    ) return false;
+    const delegated = (parsed as Record<string, unknown>).workflowV3CallAuthorization;
+    if (!delegated || typeof delegated !== 'object' || Array.isArray(delegated)) return false;
+    const expected = workflowV3DelegatedApprovalContract({
+      activationSessionId: input.sessionId,
+      workflowId: input.workflowId,
+      workflowRevision: input.workflowRevision,
+      workflowDigest: input.workflowDigest,
+      nodeId: input.nodeId,
+      nodeAttempt: input.nodeAttempt,
+      invocationPlanDigest: input.invocationPlanDigest,
+      bindingSnapshotDigest: input.bindingSnapshotDigest,
+      controlDigest: input.controlDigest,
+      requirementId: input.requirementId,
+      logicalCapabilityId: input.logicalCapabilityId,
+      canonicalArgumentDigest: input.canonicalArgumentDigest,
+      sourceArgumentDigest: input.sourceArgumentDigest,
+      obligationDigest: input.obligationDigest,
+      binding: { ...input.binding, argumentCompiler: { ...input.binding.argumentCompiler } },
+    });
+    return closedCanonicalJson(delegated) === closedCanonicalJson(expected);
   } catch {
     return false;
   }
 }
 
 function workflowV3InputFromRows(
+  db: HarnessDb,
   activation: WorkflowActivationRow,
   binding: WorkflowV3ActivationBindingRow,
 ): ArmWorkflowV3CallAuthorityInput | null {
@@ -2347,7 +2918,15 @@ function workflowV3InputFromRows(
     },
     ...(authorization ? { oneShotActivationAuthorization: authorization } : {}),
   };
-  return validWorkflowV3ArmInput(input) ? input : null;
+  if (!validWorkflowV3BaseArmInput(input)) return null;
+  if (input.binding.effect === 'host_only') {
+    return authorization ? null : input;
+  }
+  if (authorization) return validWorkflowV3ArmInput(input) ? input : null;
+  return exactWorkflowV3AutoReceiptInTransaction(
+    db,
+    workflowV3AutoConsentArmInput(input),
+  ) ? input : null;
 }
 
 function workflowAuthorityRef(
@@ -2739,12 +3318,14 @@ export function armWorkflowV3CallAuthority(
   if (!validWorkflowV3ArmInput(input)) {
     return { status: 'conflict', reason: 'workflow v3 call-authority input is invalid or lacks exact consent' };
   }
+  const autoConsent = exactWorkflowV3AutoConsentState(input);
   const activationDigest = workflowV3ActivationDigest(input);
   const activationId = workflowNodeInvocationActivationId(activationDigest);
   const authorityRootId = workflowNodeCallAuthorityRootId(activationDigest);
   const db = openEventLog();
   installWorkflowV3BindingSqlAdmissionFunction(db);
   let activationEvent: EventRow | null = null;
+  let autoConsentEvent: EventRow | null = null;
   try {
     const transaction = db.transaction((): ArmWorkflowV3CallAuthorityResult => {
       const session = db.prepare('SELECT kind FROM sessions WHERE id = ?').get(input.sessionId) as {
@@ -2759,7 +3340,7 @@ export function armWorkflowV3CallAuthority(
       if (existingActivation) {
         const existingBinding = readWorkflowV3ActivationBindingRow(db, activationId);
         const reconstructed = existingBinding
-          ? workflowV3InputFromRows(existingActivation, existingBinding)
+          ? workflowV3InputFromRows(db, existingActivation, existingBinding)
           : null;
         if (
           !existingBinding
@@ -2807,6 +3388,25 @@ export function armWorkflowV3CallAuthority(
           input.oneShotActivationAuthorization,
         );
         if (!consumed.ok) return { status: 'conflict', reason: consumed.reason };
+      }
+
+      if (autoConsent) {
+        if (
+          !workflowV3AutoReceiptMatchesAuthority(autoConsent.receipt, autoConsent.authorityInput)
+          || exactWorkflowV3AutoReceiptInTransaction(db, autoConsent.authorityInput)
+        ) {
+          return { status: 'conflict', reason: 'workflow v3 Auto decision receipt is invalid or already bound' };
+        }
+        autoConsentEvent = insertInternalEventInTransaction(db, {
+          sessionId: input.sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'workflow_v3_auto_consent_decided',
+          data: {
+            protocolVersion: 1,
+            receipt: canonicalSnapshot(autoConsent.receipt),
+          },
+        });
       }
 
       activationEvent = insertInternalEventInTransaction(db, {
@@ -3010,7 +3610,10 @@ export function armWorkflowV3CallAuthority(
       return { status: 'armed', authority: loaded.authority, ref };
     });
     const result = transaction.immediate();
-    if (result.status === 'armed' && activationEvent) publishCommittedInternalEvent(activationEvent);
+    if (result.status === 'armed') {
+      if (autoConsentEvent) publishCommittedInternalEvent(autoConsentEvent);
+      if (activationEvent) publishCommittedInternalEvent(activationEvent);
+    }
     return result;
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
@@ -3125,9 +3728,9 @@ export function mintWorkflowV3CallAttestation(input: {
       || live.manifestDigest !== binding.manifestDigest
       || live.operationId !== binding.operationId
       || live.schemaVersion !== binding.operationVersion
-      || live.schemaDigest !== binding.schemaDigest
+      || workflowCapabilityDigest(live.schemaDigest) !== binding.schemaDigest
       || live.providerVersion !== binding.providerVersion
-      || live.liveFingerprint !== binding.liveFingerprint
+      || workflowCapabilityDigest(live.liveFingerprint) !== binding.liveFingerprint
       || live.account !== binding.accountId
       || live.effect !== binding.effect
       || live.invokePortId !== binding.invokePortId
@@ -3145,7 +3748,7 @@ export function mintWorkflowV3CallAttestation(input: {
       || observation.operationId !== binding.operationId
       || observation.operationVersion !== binding.operationVersion
       || observation.providerVersion !== binding.providerVersion
-      || observation.definitionFingerprint !== binding.liveFingerprint
+      || workflowCapabilityDigest(observation.definitionFingerprint) !== binding.liveFingerprint
       || observation.accountId !== binding.accountId
     ) return { status: 'conflict', reason: 'workflow v3 independent live observation differs from its plan' };
     const contract = durableLogicalCallContract(ref.authorityRootId, binding.operationId, input.args);
@@ -3260,9 +3863,9 @@ export function mintWorkflowReadOnlyCallAttestation(input: {
       || live.manifestDigest !== binding.manifestDigest
       || live.operationId !== binding.operationId
       || live.schemaVersion !== binding.operationVersion
-      || live.schemaDigest !== binding.schemaDigest
+      || workflowCapabilityDigest(live.schemaDigest) !== binding.schemaDigest
       || live.providerVersion !== binding.providerVersion
-      || live.liveFingerprint !== binding.liveFingerprint
+      || workflowCapabilityDigest(live.liveFingerprint) !== binding.liveFingerprint
       || live.account !== binding.accountId
       || live.effect !== 'read'
       || live.invokePortId !== binding.invokePortId
@@ -3280,7 +3883,7 @@ export function mintWorkflowReadOnlyCallAttestation(input: {
       || observation.operationId !== binding.operationId
       || observation.operationVersion !== binding.operationVersion
       || observation.providerVersion !== binding.providerVersion
-      || observation.definitionFingerprint !== binding.liveFingerprint
+      || workflowCapabilityDigest(observation.definitionFingerprint) !== binding.liveFingerprint
       || observation.accountId !== binding.accountId
     ) return { status: 'conflict', reason: 'workflow call independent live observation differs from its plan' };
     const contract = durableLogicalCallContract(ref.authorityRootId, binding.operationId, input.args);

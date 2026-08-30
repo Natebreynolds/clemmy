@@ -153,6 +153,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install mobile-web test dependencies
+        working-directory: apps/mobile-web
+        run: npm ci
+
       - name: Install console-web test dependencies
         working-directory: apps/console-web
         run: npm ci
@@ -167,6 +171,9 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: Canonical journeys
+        run: npm run journeys
 
       - name: Measurement-layer tests
         run: npm run test:measurement
@@ -188,6 +195,14 @@ jobs:
           command -v sqlite3
           sqlite3 --version
           npm run test:release-closure
+
+      - name: Build complete packaged candidate
+        run: npm run prepack
+
+      - name: Run post-build package and upgrade gates
+        run: |
+          npm run test:packed-candidate
+          npm run test:packaged-upgrade
 
       - name: Typecheck
         run: npm run typecheck
@@ -528,15 +543,16 @@ jobs:
             mark_latest=true
           fi
 
-          curated_notes_file=""
+          curated_notes_file="docs/releases/${RELEASE_TAG}.md"
           release_note_args=(--generate-notes)
-          if [[ "$RELEASE_TAG" == "v3.0.0" ]]; then
-            curated_notes_file="docs/releases/v3.0.0.md"
+          if [[ -e "$curated_notes_file" ]]; then
             if [[ ! -s "$curated_notes_file" ]]; then
               echo "::error::Missing required curated release notes: $curated_notes_file"
               exit 1
             fi
             release_note_args=(--notes-file "$curated_notes_file")
+          else
+            curated_notes_file=""
           fi
 
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

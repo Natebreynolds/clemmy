@@ -71,6 +71,35 @@ test('a read-only workflow reports no external writes or sends', () => {
   assert.match(renderWorkflowDryRunSimulation(sim), /only reads and reasons/);
 });
 
+test('a reviewed transform is shown as internal code with explicit upstream lineage', () => {
+  const sim = simulateWorkflowDryRun({
+    name: 'reviewed-transform-preview',
+    description: 'Read and reshape rows.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Read the source rows.', sideEffect: 'read' as const },
+      {
+        id: 'shape',
+        prompt: '',
+        dependsOn: ['pull'],
+        sideEffect: 'read' as const,
+        transform: {
+          version: 1 as const,
+          expression: { op: 'count' as const, value: { op: 'get' as const, from: 'steps.pull.output' } },
+        },
+      },
+    ],
+  });
+
+  const shape = sim.steps.find((step) => step.stepId === 'shape');
+  assert.equal(shape?.executor, 'transform');
+  assert.equal(shape?.effect, 'read_only');
+  assert.deepEqual(shape?.reads, ['pull']);
+  assert.deepEqual(shape?.touches.tools, []);
+  assert.deepEqual(shape?.touches.scripts, []);
+});
+
 test('step-level project binding overrides workflow project in the effects preview', () => {
   const sim = simulateWorkflowDryRun({
     name: 'project-write-wf',

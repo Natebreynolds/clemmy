@@ -5,6 +5,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   isMutatingExternalWrite,
   classifyCanonicalExternalEffect,
@@ -12,6 +13,78 @@ import {
   MissingExecutionWrapError,
   isIrreversibleSendSlug,
 } from './execution-gate.js';
+import {
+  createHostCapabilityCatalogFactory,
+  installHostCapabilityCatalogFactory,
+  type RegisteredHostCapability,
+} from './host-capability-catalog-factory.js';
+import {
+  attachSemanticContract,
+  capabilityManifestDigest,
+  type CapabilityManifestV1,
+} from './capability-manifest.js';
+
+function digest(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function effectManifest(
+  operationId: string,
+  effect: 'read' | 'external_write',
+): CapabilityManifestV1 {
+  const write = effect === 'external_write';
+  return attachSemanticContract({
+    version: 1,
+    manifestId: `cap:test:${digest(operationId).slice(0, 20)}`,
+    providerKind: operationId.includes('__') ? 'native_mcp' : 'composio',
+    operationId,
+    providerIdentity: 'test-provider',
+    providerVersion: 'test-v1',
+    operationVersion: '1',
+    definitionFingerprint: digest(`schema:${operationId}`),
+    effect,
+    ...(write ? {
+      operationSemantics: { version: 1, reversibility: 'reversible' as const },
+      destination: { family: 'generic-records', posture: 'create_new' },
+    } : {}),
+    accountId: 'acct:test',
+    idempotency: { required: write, policy: write ? 'key_before_dispatch' : 'none' },
+    reconciliation: { supported: write, policy: write ? 'exact_artifact' : 'none' },
+    outputContract: { kind: write ? 'created_resource' : 'records' },
+    evidenceContract: {
+      kinds: write ? ['receipt', 'readback'] : ['payload'],
+      readbackRequired: write,
+    },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: write ? ['create', 'destination'] : ['source'],
+  });
+}
+
+function registered(manifest: CapabilityManifestV1): RegisteredHostCapability {
+  return {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    destination: manifest.destination,
+    account: manifest.accountId,
+    manifestDigest: capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({}),
+  };
+}
+
+function withEffectManifests<T>(
+  manifests: readonly CapabilityManifestV1[],
+  run: () => T,
+): T {
+  installHostCapabilityCatalogFactory(createHostCapabilityCatalogFactory(manifests.map(registered)));
+  try { return run(); } finally { installHostCapabilityCatalogFactory(null); }
+}
 
 // ─── isIrreversibleSendSlug — the ONE canonical predicate ─────────
 // Permanent regression fixtures for the 2026-07-09 re-hunt Lane 5:
@@ -72,9 +145,16 @@ test('isMutatingExternalWrite: GOOGLESHEETS_VALUES_UPDATE is a write', () => {
 
 test('isMutatingExternalWrite: GOOGLESHEETS_VALUES_GET is a READ — not gated', () => {
   assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_VALUES_GET' }),
+    classifyCanonicalExternalEffect('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_VALUES_GET' }).classificationKnown,
     false,
+    'GET vocabulary alone is not effect authority',
   );
+  withEffectManifests([effectManifest('GOOGLESHEETS_VALUES_GET', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_VALUES_GET' }),
+      false,
+    );
+  });
 });
 
 test('isMutatingExternalWrite: OUTLOOK_CREATE_DRAFT is a write', () => {
@@ -85,14 +165,18 @@ test('isMutatingExternalWrite: OUTLOOK_CREATE_DRAFT is a write', () => {
 });
 
 test('isMutatingExternalWrite: OUTLOOK_LIST_MESSAGES is a read', () => {
-  assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES' }),
-    false,
-  );
+  withEffectManifests([effectManifest('OUTLOOK_LIST_MESSAGES', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'OUTLOOK_LIST_MESSAGES' }),
+      false,
+    );
+  });
 });
 
 test('isMutatingExternalWrite: CALL is a read object after GET/LIST/RETRIEVE', () => {
-  for (const slug of ['GONG_GET_CALL_TRANSCRIPT', 'VAPI_RETRIEVE_CALL', 'TWILIO_LIST_CALLS']) {
+  const reads = ['GONG_GET_CALL_TRANSCRIPT', 'VAPI_RETRIEVE_CALL', 'TWILIO_LIST_CALLS'];
+  withEffectManifests(reads.map((slug) => effectManifest(slug, 'read')), () => {
+  for (const slug of reads) {
     assert.equal(
       isMutatingExternalWrite('composio_execute_tool', { tool_slug: slug }),
       false,
@@ -109,6 +193,7 @@ test('isMutatingExternalWrite: CALL is a read object after GET/LIST/RETRIEVE', (
     true,
     'placing a call remains a mutation',
   );
+  });
 });
 
 test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_UPDATE is a write (BATCH verb)', () => {
@@ -119,17 +204,21 @@ test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_UPDATE is a write (BATCH verb)
 });
 
 test('isMutatingExternalWrite: GOOGLESHEETS_BATCH_GET is a read (canonical GET action wins over BATCH noun)', () => {
-  assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_GET' }),
-    false,
-  );
+  withEffectManifests([effectManifest('GOOGLESHEETS_BATCH_GET', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_GET' }),
+      false,
+    );
+  });
 });
 
 test('isMutatingExternalWrite: SALESFORCE_LIST_ACCOUNTS is a read', () => {
-  assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'SALESFORCE_LIST_ACCOUNTS' }),
-    false,
-  );
+  withEffectManifests([effectManifest('SALESFORCE_LIST_ACCOUNTS', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'SALESFORCE_LIST_ACCOUNTS' }),
+      false,
+    );
+  });
 });
 
 test('isMutatingExternalWrite: INSTAGRAM_POST_IG_USER_MEDIA_PUBLISH is a write (POST + PUBLISH)', () => {
@@ -170,6 +259,7 @@ test('isMutatingExternalWrite: every Composio carrier resolves to the same canon
 
 test('isMutatingExternalWrite: every Composio carrier resolves to the same canonical read action', () => {
   const wrapperArgs = { tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{}' };
+  withEffectManifests([effectManifest('OUTLOOK_LIST_MESSAGES', 'read')], () => {
   for (const [toolName, args] of [
     ['composio_execute_tool', wrapperArgs],
     ['mcp__clementine-local__composio_execute_tool', wrapperArgs],
@@ -179,14 +269,22 @@ test('isMutatingExternalWrite: every Composio carrier resolves to the same canon
   ] as const) {
     assert.equal(isMutatingExternalWrite(toolName, args), false, toolName);
   }
+  });
 });
 
 test('isMutatingExternalWrite: documented noun-shaped reads stay reads on wrapper, dynamic, and native MCP lanes', () => {
-  for (const slug of [
+  const slugs = [
     'SLACK_CONVERSATIONS_HISTORY',
     'TWITTER_USER_TIMELINE',
     'GOOGLEDRIVE_DOWNLOAD_FILE',
-  ]) {
+  ];
+  const native = [
+    'slack__conversations_history',
+    'twitter__user_timeline',
+    'googledrive__download_file',
+  ];
+  withEffectManifests([...slugs, ...native].map((operation) => effectManifest(operation, 'read')), () => {
+  for (const slug of slugs) {
     assert.equal(
       isMutatingExternalWrite('composio_execute_tool', { tool_slug: slug }),
       false,
@@ -213,6 +311,7 @@ test('isMutatingExternalWrite: documented noun-shaped reads stay reads on wrappe
     false,
     'native MCP Drive download is a catalog read',
   );
+  });
 });
 
 test('isMutatingExternalWrite: catalog read exemptions are exact and cannot be borrowed by an unknown provider action', () => {
@@ -236,13 +335,15 @@ test('isMutatingExternalWrite: deferred call_tool dispatch inherits the inner ac
     }),
     true,
   );
-  assert.equal(
-    isMutatingExternalWrite('mcp__clementine-local__call_tool', {
-      name: 'composio_execute_tool',
-      args_json: JSON.stringify({ tool_slug: 'SLACK_CONVERSATIONS_HISTORY', arguments: '{}' }),
-    }),
-    false,
-  );
+  withEffectManifests([effectManifest('SLACK_CONVERSATIONS_HISTORY', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('mcp__clementine-local__call_tool', {
+        name: 'composio_execute_tool',
+        args_json: JSON.stringify({ tool_slug: 'SLACK_CONVERSATIONS_HISTORY', arguments: '{}' }),
+      }),
+      false,
+    );
+  });
   assert.equal(
     isMutatingExternalWrite('call_tool', {
       name: 'googledocs__create_document',
@@ -251,14 +352,16 @@ test('isMutatingExternalWrite: deferred call_tool dispatch inherits the inner ac
     true,
     'the trusted catalog carrier proves a carrier-less provider create is external',
   );
-  assert.equal(
-    isMutatingExternalWrite('call_tool', {
-      name: 'googledocs__get_document',
-      args_json: '{}',
-    }),
-    false,
-    'the same catalog provenance preserves a known provider read',
-  );
+  withEffectManifests([effectManifest('googledocs__get_document', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('call_tool', {
+        name: 'googledocs__get_document',
+        args_json: '{}',
+      }),
+      false,
+      'the exact current manifest preserves a known provider read',
+    );
+  });
   assert.equal(
     isMutatingExternalWrite('call_tool', {
       name: 'server_a__transact',
@@ -337,13 +440,22 @@ test('isMutatingExternalWrite: unknown external actions fail closed on every ext
 // ─── isMutatingExternalWrite — exempt slug patterns ──────────────
 
 test('isMutatingExternalWrite: structural DataForSEO research jobs and polls are reads on every carrier', () => {
-  for (const toolSlug of [
+  const toolSlugs = [
     'DATAFORSEO_CREATE_SERP_GOOGLE_ORGANIC_TASK_POST',
     'DATAFORSEO_GET_SERP_GOOGLE_ORGANIC_TASK_ADVANCED_BY_ID',
     'DATAFORSEO_SERP_GOOGLE_ORGANIC_TASKS_READY',
     'DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
     'DATAFORSEO_BACKLINKS_SUMMARY_LIVE',
-  ]) {
+  ];
+  const nativeOperations = [
+    'DATAFORSEO_SERP_GOOGLE_ORGANIC_LIVE_ADVANCED',
+    'dataforseo__DATAFORSEO_LABS_GOOGLE_KEYWORDS_FOR_SITE',
+    'dataforseo__DATAFORSEO_BACKLINKS_SUMMARY_LIVE',
+  ];
+  withEffectManifests(
+    [...toolSlugs, ...nativeOperations].map((operation) => effectManifest(operation, 'read')),
+    () => {
+  for (const toolSlug of toolSlugs) {
     assert.equal(
       isMutatingExternalWrite('composio_execute_tool', { tool_slug: toolSlug }),
       false,
@@ -357,20 +469,26 @@ test('isMutatingExternalWrite: structural DataForSEO research jobs and polls are
   ]) {
     assert.equal(isMutatingExternalWrite(toolName, {}), false, toolName);
   }
+    },
+  );
 });
 
 test('isMutatingExternalWrite: FIRECRAWL_SCRAPE is exempt (external read, not mutation)', () => {
-  assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'FIRECRAWL_SCRAPE' }),
-    false,
-  );
+  withEffectManifests([effectManifest('FIRECRAWL_SCRAPE', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'FIRECRAWL_SCRAPE' }),
+      false,
+    );
+  });
 });
 
 test('isMutatingExternalWrite: FIRECRAWL_BATCH_SCRAPE is exempt (provider-side read job)', () => {
-  assert.equal(
-    isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' }),
-    false,
-  );
+  withEffectManifests([effectManifest('FIRECRAWL_BATCH_SCRAPE', 'read')], () => {
+    assert.equal(
+      isMutatingExternalWrite('composio_execute_tool', { tool_slug: 'FIRECRAWL_BATCH_SCRAPE' }),
+      false,
+    );
+  });
 });
 
 test('isMutatingExternalWrite: explicit mutations cannot borrow a provider read-job exemption', () => {
@@ -493,14 +611,33 @@ test('isGateEnabled: default ON when env unset', () => {
   }
 });
 
-test('isGateEnabled: explicit off disables', () => {
+test('isGateEnabled: production ignores the historical off flag', () => {
   const prev = process.env.CLEMMY_EXECUTION_GATE;
+  const isolated = process.env.CLEMMY_TEST_ISOLATED_HOME;
   process.env.CLEMMY_EXECUTION_GATE = 'off';
+  delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+  try {
+    assert.equal(isGateEnabled(), true);
+  } finally {
+    if (prev === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
+    else process.env.CLEMMY_EXECUTION_GATE = prev;
+    if (isolated === undefined) delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+    else process.env.CLEMMY_TEST_ISOLATED_HOME = isolated;
+  }
+});
+
+test('isGateEnabled: disposable isolated tests retain an explicit off seam', () => {
+  const prev = process.env.CLEMMY_EXECUTION_GATE;
+  const isolated = process.env.CLEMMY_TEST_ISOLATED_HOME;
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
   try {
     assert.equal(isGateEnabled(), false);
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_EXECUTION_GATE;
     else process.env.CLEMMY_EXECUTION_GATE = prev;
+    if (isolated === undefined) delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+    else process.env.CLEMMY_TEST_ISOLATED_HOME = isolated;
   }
 });
 
@@ -628,27 +765,39 @@ test('a native MCP server name is never effect evidence — a read verb in the S
       `${unknown} has no proven effect vocabulary`,
     );
   }
-  // A write verb in the OPERATION is still proven, which is stronger.
+  // A write verb in the operation is still only identity without a contract.
   assert.equal(
     classifyCanonicalExternalEffect('mcp__view-mailer__delete_list', {}).classificationKnown,
-    true,
-    'delete_list proves a write from its own verb',
+    false,
+    'delete_list vocabulary cannot manufacture an effect contract',
   );
 });
 
-test('effect evidence comes from the operation segment while IDENTITY keeps the server', () => {
-  // The send floor must still fire on the operation, and the identity the
-  // approval/telemetry layer sees must remain server-qualified.
-  const send = classifyCanonicalExternalEffect('mcp__mailer__send_campaign', {});
-  assert.equal(send.irreversible, true, 'a send verb in the OPERATION still proves an irreversible send');
-  assert.equal(send.action, 'mailer_send_campaign', 'identity stays server-qualified');
-  // Composio slugs have no server segment and are unchanged by this split.
-  const write = classifyCanonicalExternalEffect('composio_execute_tool', { tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}' });
-  assert.equal(write.mutating, true);
-  assert.equal(write.irreversible, true);
-  const read = classifyCanonicalExternalEffect('composio_execute_tool', { tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' });
-  assert.equal(read.mutating, false);
-  assert.equal(read.classificationKnown, true);
+test('sealed effects decide consequence while operation identity remains intact', () => {
+  const nativeSend = {
+    ...effectManifest('mailer__send_campaign', 'external_write'),
+    operationSemantics: { version: 1 as const, reversibility: 'irreversible' as const },
+  };
+  const composioSend = {
+    ...effectManifest('OUTLOOK_SEND_EMAIL', 'external_write'),
+    operationSemantics: { version: 1 as const, reversibility: 'irreversible' as const },
+  };
+  const readManifest = effectManifest('GOOGLESHEETS_BATCH_GET', 'read');
+  withEffectManifests([nativeSend, composioSend, readManifest], () => {
+    const send = classifyCanonicalExternalEffect('mcp__mailer__send_campaign', {});
+    assert.equal(send.irreversible, true);
+    assert.equal(send.action, 'mailer_send_campaign', 'identity stays server-qualified');
+    const write = classifyCanonicalExternalEffect('composio_execute_tool', {
+      tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}',
+    });
+    assert.equal(write.mutating, true);
+    assert.equal(write.irreversible, true);
+    const read = classifyCanonicalExternalEffect('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}',
+    });
+    assert.equal(read.mutating, false);
+    assert.equal(read.classificationKnown, true);
+  });
 });
 
 test('a server-declared readOnly tool becomes usable for reads; a declared destructive one never does', async () => {
@@ -678,17 +827,68 @@ test('a server-declared readOnly tool becomes usable for reads; a declared destr
     assert.equal(declaredDestructive.mutating, true);
     assert.equal(declaredDestructive.classificationKnown, true);
 
-    // A DECLARATION CANNOT OVERRIDE CONTRARY EVIDENCE: a write verb in the
-    // operation outranks the server's claim that the tool is read-only.
+    // Adapter-authored declaration wins; name vocabulary is not contrary
+    // evidence and cannot silently replace the declared effect.
     recordDeclaredMcpToolEffect('mcp__tidy__delete_everything', { readOnlyHint: true });
-    const lyingServer = classifyCanonicalExternalEffect('mcp__tidy__delete_everything', {});
-    assert.equal(lyingServer.mutating, true, 'a write verb outranks a readOnly declaration');
-    assert.notEqual(lyingServer.reversibility, 'read_only');
+    const declaredDespiteName = classifyCanonicalExternalEffect('mcp__tidy__delete_everything', {});
+    assert.equal(declaredDespiteName.mutating, false);
+    assert.equal(declaredDespiteName.reversibility, 'read_only');
 
     // Non-boolean or absent hints are not claims.
     recordDeclaredMcpToolEffect('mcp__vendor__thing', { readOnlyHint: 'yes' });
     assert.equal(classifyCanonicalExternalEffect('mcp__vendor__thing', {}).classificationKnown, false);
   } finally {
     _resetDeclaredMcpToolEffectsForTest();
+  }
+});
+
+test('sealed generic effects are provider-neutral and invariant under catalog permutation', () => {
+  const read = effectManifest('QUASAR_EPHEMERIS', 'read');
+  const write = effectManifest('NEBULA_MATERIALIZER', 'external_write');
+  for (const manifests of [[read, write], [write, read]]) {
+    withEffectManifests(manifests, () => {
+      assert.deepEqual(
+        classifyCanonicalExternalEffect('composio_execute_tool', {
+          tool_slug: read.operationId,
+          arguments: '{}',
+        }),
+        {
+          action: read.operationId,
+          external: true,
+          mutating: false,
+          irreversible: false,
+          reversibility: 'read_only',
+          classificationKnown: true,
+        },
+      );
+      assert.deepEqual(
+        classifyCanonicalExternalEffect('cx_nebula_materializer', {}),
+        {
+          action: write.operationId,
+          external: true,
+          mutating: true,
+          irreversible: false,
+          reversibility: 'reversible',
+          classificationKnown: true,
+        },
+      );
+    });
+  }
+});
+
+test('a stale callable row cannot supply manifest semantics or lower unknown risk', () => {
+  const manifest = effectManifest('QUASAR_EPHEMERIS', 'read');
+  const stale = { ...registered(manifest), schemaDigest: digest('drifted-schema') };
+  installHostCapabilityCatalogFactory(createHostCapabilityCatalogFactory([stale]));
+  try {
+    const effect = classifyCanonicalExternalEffect('composio_execute_tool', {
+      tool_slug: manifest.operationId,
+      arguments: '{}',
+    });
+    assert.equal(effect.mutating, true);
+    assert.equal(effect.classificationKnown, false);
+    assert.equal(effect.reversibility, 'unknown');
+  } finally {
+    installHostCapabilityCatalogFactory(null);
   }
 });

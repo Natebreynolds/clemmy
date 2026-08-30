@@ -29,6 +29,7 @@ import { consumeMobilePairingCode } from '../runtime/mobile-pairing.js';
 import { beginCodexDeviceLogin, pollCodexDeviceLogin } from '../runtime/auth-store.js';
 import {
   createSession,
+  createOrReuseSessionForExistingDevice,
   listSessions,
   revokeAllSessions,
   revokeSession,
@@ -62,7 +63,9 @@ import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
 import { relayClientIp } from '../runtime/mobile-ingress.js';
 import { markPushSubscribed } from '../runtime/mobile-sessions.js';
+import { atomicJsonMutate } from '../runtime/atomic-json.js';
 import {
+  getLatestRunAttempt as getLatestHarnessRunAttempt,
   claimHarnessChatRequest,
   claimRunAttemptLease,
   createSession as createHarnessChatSession,
@@ -127,7 +130,7 @@ import {
   processBackgroundTasks,
   queueBackgroundTaskApprovalResolution,
 } from '../execution/background-tasks.js';
-import type { AssistantRouteDiagnostics } from '../types.js';
+import type { AssistantRouteDiagnostics, RunStoppedReason } from '../types.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { exactPendingActionApprovalPreflight } from '../runtime/harness/pending-action-approval.js';
@@ -149,9 +152,11 @@ interface ChatSendResponse {
   sessionId: string;
   runId?: string;
   reply: string;
+  /** Exact durable terminal returned by the shared gateway. */
+  terminal?: PresentationEvent;
   pendingApprovalId?: string;
   queuedTaskId?: string;
-  stoppedReason?: string;
+  stoppedReason?: RunStoppedReason;
   turnsUsed?: number;
   route?: AssistantRouteDiagnostics;
 }
@@ -694,72 +699,453 @@ function consumeStreamTicket(ticket: string, deviceId: string, pathname: string)
  * at the relay hours later holding nothing redeemable and land on the scan
  * screen with no way forward. The token now lives seven days and survives
  * restarts (persisted HASHED — the file grants nothing readable). The
- * trust story is unchanged: single-use, one live token per device, spent
- * only by the shell that holds it, rate-limited on the pairing budget, and
- * revocable by revoking the device like any other session.
+ * trust story is unchanged: one bearer per generation, held only by the
+ * paired shell, rate-limited on the pairing budget, and revocable by
+ * revoking the device like any other session. Exact adoption retries are
+ * idempotent so a lost relay response cannot strand the phone.
  */
 const ORIGIN_HANDOFF_TTL_MS = 7 * 24 * 60 * 60_000;
 const ORIGIN_HANDOFF_FILE = 'mobile-origin-handoffs.json';
 
-interface PersistedOriginHandoffs {
+interface PersistedOriginHandoffEntryV2 {
+  protocolVersion: 2;
+  handoffId: string;
+  generation: number;
+  deviceId: string;
+  deviceLabel?: string;
+  expiresAt: number;
+  /** Native confirmed this exact generation is durable in Keychain. */
+  activatedAt?: number;
+  /** The matching session was durably created; exact retries are idempotent. */
+  adoptedAt?: number;
+  /** Adoption and its authenticated acknowledgement both completed. */
+  finalizedAt?: number;
+}
+
+interface PersistedOriginHandoffEntryV1 {
+  protocolVersion: 1;
+  deviceId: string;
+  deviceLabel?: string;
+  expiresAt: number;
+}
+
+type PersistedOriginHandoffEntry = PersistedOriginHandoffEntryV1 | PersistedOriginHandoffEntryV2;
+
+type PersistedOriginHandoffRowV1 = {
+  protocolVersion?: 1 | 2;
+  deviceId: string;
+  deviceLabel?: string;
+  expiresAt: number;
+  handoffId?: string;
+  generation?: number;
+  activatedAt?: number;
+  adoptedAt?: number;
+  finalizedAt?: number;
+};
+
+interface PersistedOriginHandoffsV1 {
   version: 1;
-  /** Keyed by sha256(token) — the raw token never touches disk. */
-  entries: Record<string, { deviceId: string; deviceLabel?: string; expiresAt: number }>;
+  nextGeneration?: number;
+  /** Additive v2 metadata; old daemons ignore it and remain rollback-safe. */
+  generations?: Record<string, number>;
+  /** Active bearers only. The rollback daemon reads this exact collection. */
+  entries: Record<string, PersistedOriginHandoffRowV1>;
+  /** Finalized receipts live outside `entries`, invisible to the old redeemer. */
+  finalizedEntries?: Record<string, PersistedOriginHandoffRowV1>;
 }
 
-function originHandoffFile(): string {
-  return path.join(BASE_DIR, 'state', ORIGIN_HANDOFF_FILE);
+interface PersistedOriginHandoffsV2 {
+  version: 2;
+  /** Durable monotonic generation per device, not per daemon process. */
+  generations: Record<string, number>;
+  /** Keyed by sha256(token) — the raw bearer never touches disk. */
+  entries: Record<string, PersistedOriginHandoffEntry>;
+  finalizedEntries?: Record<string, PersistedOriginHandoffEntryV2>;
 }
 
-function readOriginHandoffs(): PersistedOriginHandoffs {
-  try {
-    const parsed = JSON.parse(readFileSync(originHandoffFile(), 'utf-8')) as PersistedOriginHandoffs;
-    if (parsed && parsed.version === 1 && parsed.entries && typeof parsed.entries === 'object') return parsed;
-  } catch { /* absent or unreadable resets to empty — a handoff is re-mintable on the next LAN visit */ }
-  return { version: 1, entries: {} };
+type PersistedOriginHandoffs = PersistedOriginHandoffsV1 | PersistedOriginHandoffsV2;
+
+/**
+ * The canonical writer deliberately keeps top-level version 1. The previous
+ * daemon accepts that envelope and ignores additive row metadata, so a tag can
+ * be rolled back without erasing the phone's last usable credential.
+ */
+interface NormalizedOriginHandoffs {
+  version: 1;
+  generations: Record<string, number>;
+  entries: Record<string, PersistedOriginHandoffEntry>;
+  finalizedEntries: Record<string, PersistedOriginHandoffEntryV2>;
 }
 
-function writeOriginHandoffs(state: PersistedOriginHandoffs): void {
-  try {
-    mkdirSync(path.dirname(originHandoffFile()), { recursive: true, mode: 0o700 });
-    writeFileSync(originHandoffFile(), JSON.stringify(state, null, 2), { mode: 0o600 });
-  } catch { /* best effort — worst case is the pre-fix behavior (re-pair on LAN) */ }
+function originHandoffFile(opts?: { stateDir?: string }): string {
+  return path.join(opts?.stateDir ?? path.join(BASE_DIR, 'state'), ORIGIN_HANDOFF_FILE);
+}
+
+function ensureOriginHandoffDir(opts?: { stateDir?: string }): void {
+  mkdirSync(path.dirname(originHandoffFile(opts)), { recursive: true, mode: 0o700 });
+}
+
+function emptyOriginHandoffs(): NormalizedOriginHandoffs {
+  return { version: 1, generations: {}, entries: {}, finalizedEntries: {} };
+}
+
+/** Preserve legacy outstanding rows without upgrading their authority. */
+function normalizeOriginHandoffs(raw: PersistedOriginHandoffs): NormalizedOriginHandoffs {
+  const normalized = emptyOriginHandoffs();
+  if (!raw || !raw.entries || typeof raw.entries !== 'object') return normalized;
+  const sourceGenerations = raw.version === 2 ? raw.generations : raw.generations;
+  if (sourceGenerations && typeof sourceGenerations === 'object') {
+    for (const [deviceId, generation] of Object.entries(sourceGenerations)) {
+      if (Number.isSafeInteger(generation) && generation > 0) {
+        normalized.generations[deviceId] = generation;
+      }
+    }
+  }
+  for (const [digest, row] of Object.entries(raw.entries)) {
+    if (!row || typeof row.deviceId !== 'string' || !Number.isFinite(row.expiresAt)) continue;
+    if (
+      typeof row.handoffId === 'string'
+      && row.handoffId.length > 0
+      && Number.isSafeInteger(row.generation)
+      && Number(row.generation) > 0
+    ) {
+      const generation = Number(row.generation);
+      const normalizedEntry: PersistedOriginHandoffEntryV2 = {
+        protocolVersion: 2,
+        handoffId: row.handoffId,
+        generation,
+        deviceId: row.deviceId,
+        deviceLabel: row.deviceLabel,
+        expiresAt: row.expiresAt,
+        ...(Number.isFinite(row.activatedAt) ? { activatedAt: row.activatedAt } : {}),
+        ...(Number.isFinite(row.adoptedAt) ? { adoptedAt: row.adoptedAt } : {}),
+        ...(Number.isFinite(row.finalizedAt) ? { finalizedAt: row.finalizedAt } : {}),
+      };
+      if (normalizedEntry.finalizedAt !== undefined) {
+        normalized.finalizedEntries[digest] = normalizedEntry;
+      } else {
+        normalized.entries[digest] = normalizedEntry;
+      }
+      normalized.generations[row.deviceId] = Math.max(
+        normalized.generations[row.deviceId] ?? 0,
+        generation,
+      );
+      continue;
+    }
+    normalized.entries[digest] = {
+      protocolVersion: 1,
+      deviceId: row.deviceId,
+      deviceLabel: row.deviceLabel,
+      expiresAt: row.expiresAt,
+    };
+  }
+  for (const [digest, row] of Object.entries(raw.finalizedEntries ?? {})) {
+    if (
+      !row
+      || row.protocolVersion !== 2
+      || typeof row.deviceId !== 'string'
+      || typeof row.handoffId !== 'string'
+      || !Number.isSafeInteger(row.generation)
+      || Number(row.generation) <= 0
+      || !Number.isFinite(row.expiresAt)
+      || !Number.isFinite(row.finalizedAt)
+    ) continue;
+    normalized.finalizedEntries[digest] = {
+      protocolVersion: 2,
+      handoffId: row.handoffId,
+      generation: Number(row.generation),
+      deviceId: row.deviceId,
+      deviceLabel: row.deviceLabel,
+      expiresAt: row.expiresAt,
+      ...(Number.isFinite(row.activatedAt) ? { activatedAt: row.activatedAt } : {}),
+      ...(Number.isFinite(row.adoptedAt) ? { adoptedAt: row.adoptedAt } : {}),
+      finalizedAt: Number(row.finalizedAt),
+    };
+  }
+  return normalized;
+}
+
+function originHandoffStorageIsCanonical(raw: PersistedOriginHandoffs): boolean {
+  return raw?.version === 1
+    && Boolean(raw.generations && typeof raw.generations === 'object')
+    && Boolean(raw.finalizedEntries && typeof raw.finalizedEntries === 'object');
 }
 
 function handoffTokenDigest(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
-function mintOriginHandoff(deviceId: string, deviceLabel?: string): { token: string; expiresAt: number } {
-  const now = Date.now();
-  const state = readOriginHandoffs();
-  for (const [key, value] of Object.entries(state.entries)) {
-    // Expired tokens and this device's PRIOR token both retire: one live
-    // handoff per device, so a token left on an old LAN visit cannot be
-    // redeemed after a fresh one exists.
-    if (value.expiresAt <= now || value.deviceId === deviceId) delete state.entries[key];
-  }
-  const token = randomBytes(32).toString('base64url');
-  const expiresAt = now + ORIGIN_HANDOFF_TTL_MS;
-  state.entries[handoffTokenDigest(token)] = { deviceId, deviceLabel, expiresAt };
-  writeOriginHandoffs(state);
-  return { token, expiresAt };
+interface MintedOriginHandoff {
+  version: 2;
+  token: string;
+  expiresAt: number;
+  handoffId: string;
+  generation: number;
+  deviceId: string;
 }
 
-function consumeOriginHandoff(token: string): { deviceId: string; deviceLabel?: string } | null {
-  const state = readOriginHandoffs();
-  const entry = state.entries[handoffTokenDigest(token)];
-  if (!entry) return null;
-  // Single use, whatever the outcome.
-  delete state.entries[handoffTokenDigest(token)];
-  writeOriginHandoffs(state);
-  if (entry.expiresAt <= Date.now()) return null;
-  return { deviceId: entry.deviceId, deviceLabel: entry.deviceLabel };
+async function mintOriginHandoff(
+  deviceId: string,
+  deviceLabel: string | undefined,
+  opts?: { stateDir?: string },
+): Promise<MintedOriginHandoff> {
+  const now = Date.now();
+  const token = randomBytes(32).toString('base64url');
+  const handoffId = randomBytes(16).toString('base64url');
+  const expiresAt = now + ORIGIN_HANDOFF_TTL_MS;
+  let minted: MintedOriginHandoff | undefined;
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    (current) => {
+      const state = normalizeOriginHandoffs(current);
+      for (const [key, value] of Object.entries(state.entries)) {
+        // A replacement is NOT allowed to retire the last credential before
+        // iOS confirms the new tuple reached Keychain. Activation below is the
+        // commit point that removes older generations.
+        if (value.expiresAt <= now) delete state.entries[key];
+      }
+      for (const [key, value] of Object.entries(state.finalizedEntries)) {
+        if (value.expiresAt <= now) delete state.finalizedEntries[key];
+      }
+      const generation = (state.generations[deviceId] ?? 0) + 1;
+      state.generations[deviceId] = generation;
+      state.entries[handoffTokenDigest(token)] = {
+        protocolVersion: 2,
+        handoffId,
+        generation,
+        deviceId,
+        deviceLabel,
+        expiresAt,
+      };
+      minted = { version: 2, token, expiresAt, handoffId, generation, deviceId };
+      return state;
+    },
+    emptyOriginHandoffs(),
+  );
+  if (!minted) throw new Error('origin handoff mutation produced no lease');
+  return minted;
+}
+
+interface ConsumedOriginHandoff {
+  deviceId: string;
+  deviceLabel?: string;
+  originHandoff?: { handoffId: string; generation: number };
+  /** True after this bearer has durably created its one origin session. */
+  adopted: boolean;
+}
+
+async function resolveOriginHandoff(
+  token: string,
+  correlation: { handoffId?: string; generation?: number },
+  opts?: { stateDir?: string },
+): Promise<ConsumedOriginHandoff | null> {
+  const now = Date.now();
+  const digest = handoffTokenDigest(token);
+  let resolved: ConsumedOriginHandoff | null = null;
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    (current) => {
+      const state = normalizeOriginHandoffs(current);
+      const entry = state.entries[digest];
+      let changed = !originHandoffStorageIsCanonical(current);
+      for (const [key, value] of Object.entries(state.entries)) {
+        if (value.expiresAt <= now) {
+          delete state.entries[key];
+          changed = true;
+        }
+      }
+      if (!entry || entry.expiresAt <= now) return changed ? state : undefined;
+      if (entry.protocolVersion === 2 && entry.finalizedAt !== undefined) {
+        // Retain the tombstone until expiry so a lost finalize response can be
+        // acknowledged idempotently, but the bearer can never be adopted again.
+        return changed ? state : undefined;
+      }
+
+      if (entry.protocolVersion === 2 && (correlation.handoffId !== undefined || correlation.generation !== undefined)) {
+        // Correlation is not a second credential, but if supplied it must be
+        // exact. A wrong late response must not consume the valid newer lease.
+        if (
+          correlation.handoffId !== entry.handoffId
+          || correlation.generation !== entry.generation
+        ) return changed ? state : undefined;
+      }
+      resolved = {
+        deviceId: entry.deviceId,
+        deviceLabel: entry.deviceLabel,
+        adopted: entry.protocolVersion === 2 && entry.adoptedAt !== undefined,
+        ...(entry.protocolVersion === 2
+          ? { originHandoff: { handoffId: entry.handoffId, generation: entry.generation } }
+          : {}),
+      };
+      return changed ? state : undefined;
+    },
+    emptyOriginHandoffs(),
+  );
+  return resolved;
+}
+
+async function activateOriginHandoff(
+  deviceId: string,
+  correlation: { handoffId: string; generation: number },
+  opts?: { stateDir?: string },
+): Promise<boolean> {
+  const now = Date.now();
+  let activated = false;
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    (current) => {
+      const state = normalizeOriginHandoffs(current);
+      const selected = Object.entries(state.entries).find(([, value]) => (
+        value.protocolVersion === 2
+        && value.deviceId === deviceId
+        && value.handoffId === correlation.handoffId
+        && value.generation === correlation.generation
+        && value.expiresAt > now
+      ));
+      if (!selected) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      const [selectedDigest, selectedEntry] = selected;
+      if (selectedEntry.protocolVersion !== 2) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      state.entries[selectedDigest] = { ...selectedEntry, activatedAt: now };
+      for (const [digest, value] of Object.entries(state.entries)) {
+        if (
+          digest !== selectedDigest
+          && value.deviceId === deviceId
+          && (
+            value.protocolVersion === 1
+            || value.generation < selectedEntry.generation
+          )
+        ) {
+          // A delayed storage ACK for generation N must never retire a newer
+          // N+1 lease that has already been minted but whose response is still
+          // in flight to Keychain. Only the newest ACK may retire predecessors.
+          delete state.entries[digest];
+        }
+      }
+      activated = true;
+      return state;
+    },
+    emptyOriginHandoffs(),
+  );
+  return activated;
+}
+
+async function markOriginHandoffAdopted(
+  token: string,
+  correlation: { handoffId?: string; generation?: number },
+  opts?: { stateDir?: string },
+): Promise<boolean> {
+  const digest = handoffTokenDigest(token);
+  const now = Date.now();
+  let marked = false;
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    (current) => {
+      const state = normalizeOriginHandoffs(current);
+      const entry = state.entries[digest];
+      if (!entry || entry.expiresAt <= now) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      if (
+        entry.protocolVersion === 2
+        && (correlation.handoffId !== undefined || correlation.generation !== undefined)
+        && (
+          correlation.handoffId !== entry.handoffId
+          || correlation.generation !== entry.generation
+        )
+      ) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      if (entry.protocolVersion === 2) {
+        state.entries[digest] = { ...entry, adoptedAt: entry.adoptedAt ?? now };
+      } else {
+        // A legacy client has no correlated authenticated finalization. Keep
+        // its historical single-use contract and retire only after the exact
+        // session append above has committed.
+        delete state.entries[digest];
+      }
+      marked = true;
+      return state;
+    },
+    emptyOriginHandoffs(),
+  );
+  return marked;
+}
+
+async function retireOriginHandoff(
+  token: string,
+  opts?: { stateDir?: string },
+): Promise<void> {
+  const digest = handoffTokenDigest(token);
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    (current) => {
+      const state = normalizeOriginHandoffs(current);
+      if (!state.entries[digest]) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      delete state.entries[digest];
+      return state;
+    },
+    emptyOriginHandoffs(),
+  );
+}
+
+async function finalizeOriginHandoff(
+  deviceId: string,
+  correlation: { handoffId: string; generation: number },
+  session: MobileSessionRecord,
+  opts?: { stateDir?: string },
+): Promise<boolean> {
+  let finalized = false;
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    (current) => {
+      const state = normalizeOriginHandoffs(current);
+      const matchesSession = (digest: string, value: PersistedOriginHandoffEntryV2) => (
+        value.protocolVersion === 2
+        && value.deviceId === deviceId
+        && value.handoffId === correlation.handoffId
+        && value.generation === correlation.generation
+        && value.adoptedAt !== undefined
+        // The authenticated request must be the exact origin session minted
+        // from this bearer. A same-device LAN session cannot finalize it.
+        && (
+          digest === session.originHandoffDigest
+          || digest === session.tokenHash
+          || digest === session.previousTokenHash
+        )
+      );
+      const existingReceipt = Object.entries(state.finalizedEntries).find(([digest, value]) => (
+        matchesSession(digest, value)
+      ));
+      if (existingReceipt) {
+        finalized = true;
+        return originHandoffStorageIsCanonical(current) ? undefined : state;
+      }
+      const selected = Object.entries(state.entries).find(([digest, value]) => (
+        value.protocolVersion === 2 && matchesSession(digest, value)
+      ));
+      if (!selected) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      const [digest, entry] = selected;
+      if (entry.protocolVersion !== 2) return originHandoffStorageIsCanonical(current) ? undefined : state;
+      delete state.entries[digest];
+      state.finalizedEntries[digest] = { ...entry, finalizedAt: entry.finalizedAt ?? Date.now() };
+      finalized = true;
+      return state;
+    },
+    emptyOriginHandoffs(),
+  );
+  return finalized;
 }
 
 /** Test seam: a fresh test starts with no outstanding handoffs. */
-export function _clearOriginHandoffsForTests(): void {
-  writeOriginHandoffs({ version: 1, entries: {} });
+export async function _clearOriginHandoffsForTests(opts?: { stateDir?: string }): Promise<void> {
+  ensureOriginHandoffDir(opts);
+  await atomicJsonMutate<PersistedOriginHandoffs>(
+    originHandoffFile(opts),
+    () => emptyOriginHandoffs(),
+    emptyOriginHandoffs(),
+  );
 }
 
 /**
@@ -1311,14 +1697,80 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * authorization happened at home. Requires a live authenticated session
    * (and its device proof), so only a phone that already paired can ask.
    */
-  router.post('/auth/origin-handoff', requireMobileSession, (req, res) => {
+  router.post('/auth/origin-handoff', requireMobileSession, async (req, res) => {
     if (req.clemIngress === 'relay') {
       res.status(403).json({ error: 'LAN_ONLY' });
       return;
     }
     const ctx = req.mobileSession!;
-    const handoff = mintOriginHandoff(ctx.record.deviceId, ctx.record.deviceLabel);
-    res.json(handoff);
+    try {
+      const handoff = await mintOriginHandoff(ctx.record.deviceId, ctx.record.deviceLabel, stateOpts);
+      res.json(handoff);
+    } catch {
+      // Never hand the phone a bearer that was not durably published.
+      res.status(503).json({ error: 'HANDOFF_PERSIST_FAILED' });
+    }
+  });
+
+  /**
+   * Native Keychain storage is the commit point for replacing a handoff.
+   * Until this exact, device-authenticated acknowledgement arrives, older
+   * generations stay redeemable so a suspended page cannot strand the phone.
+   */
+  router.post('/auth/origin-handoff/activate', requireMobileSession, async (req, res) => {
+    const handoffId = typeof req.body?.handoffId === 'string' ? req.body.handoffId.trim() : '';
+    const generation = Number.isSafeInteger(req.body?.generation)
+      ? Number(req.body.generation)
+      : 0;
+    if (!handoffId || generation <= 0) {
+      res.status(400).json({ error: 'HANDOFF_CORRELATION_REQUIRED' });
+      return;
+    }
+    try {
+      const activated = await activateOriginHandoff(
+        req.mobileSession!.record.deviceId,
+        { handoffId, generation },
+        stateOpts,
+      );
+      if (!activated) {
+        res.status(409).json({ error: 'HANDOFF_NOT_CURRENT' });
+        return;
+      }
+      res.json({ ok: true, handoffId, generation });
+    } catch {
+      res.status(503).json({ error: 'HANDOFF_PERSIST_FAILED' });
+    }
+  });
+
+  /**
+   * Retire an adopted handoff only after the relay origin proves it received
+   * the matching session cookie. Until this authenticated acknowledgement,
+   * the exact bearer remains retryable across a lost adoption response.
+   */
+  router.post('/auth/origin-handoff/finalize', requireMobileSession, async (req, res) => {
+    const handoffId = typeof req.body?.handoffId === 'string' ? req.body.handoffId.trim() : '';
+    const generation = Number.isSafeInteger(req.body?.generation)
+      ? Number(req.body.generation)
+      : 0;
+    if (!handoffId || generation <= 0) {
+      res.status(400).json({ error: 'HANDOFF_CORRELATION_REQUIRED' });
+      return;
+    }
+    try {
+      const finalized = await finalizeOriginHandoff(
+        req.mobileSession!.record.deviceId,
+        { handoffId, generation },
+        req.mobileSession!.record,
+        stateOpts,
+      );
+      if (!finalized) {
+        res.status(409).json({ error: 'HANDOFF_NOT_ADOPTED_BY_SESSION' });
+        return;
+      }
+      res.json({ ok: true, handoffId, generation });
+    } catch {
+      res.status(503).json({ error: 'HANDOFF_PERSIST_FAILED' });
+    }
   });
 
   /**
@@ -1334,6 +1786,24 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(400).json({ error: 'HANDOFF_TOKEN_REQUIRED' });
       return;
     }
+    const suppliedHandoffId = typeof req.body?.handoffId === 'string'
+      ? req.body.handoffId.trim()
+      : undefined;
+    const suppliedGeneration = Number.isSafeInteger(req.body?.generation)
+      && Number(req.body.generation) > 0
+      ? Number(req.body.generation)
+      : undefined;
+    if (
+      req.body?.version === 2
+      && (!suppliedHandoffId || suppliedGeneration === undefined)
+    ) {
+      res.status(400).json({ error: 'HANDOFF_CORRELATION_REQUIRED' });
+      return;
+    }
+    if ((suppliedHandoffId === undefined) !== (suppliedGeneration === undefined)) {
+      res.status(400).json({ error: 'HANDOFF_CORRELATION_INCOMPLETE' });
+      return;
+    }
     const adoptOpts = { ...stateOpts, scope: 'pair' as const };
     const gate = checkAttempt(ip, adoptOpts);
     if (!gate.allowed) {
@@ -1342,7 +1812,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         .json({ error: 'LOCKED_OUT', retryAfterMs: gate.retryAfterMs });
       return;
     }
-    const handoff = consumeOriginHandoff(token);
+    let handoff: ConsumedOriginHandoff | null;
+    try {
+      handoff = await resolveOriginHandoff(
+        token,
+        { handoffId: suppliedHandoffId, generation: suppliedGeneration },
+        stateOpts,
+      );
+    } catch {
+      res.status(503).json({ error: 'HANDOFF_PERSIST_FAILED' });
+      return;
+    }
     if (!handoff) {
       const decision = await recordFailure(ip, adoptOpts);
       await notifyGlobalLockdown('pair', decision);
@@ -1358,18 +1838,58 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(401).json({ error: 'INVALID_HANDOFF' });
       return;
     }
+    let adopted: Awaited<ReturnType<typeof createOrReuseSessionForExistingDevice>>;
+    try {
+      // The handoff bearer becomes the exact session bearer. If the response
+      // is lost, retrying the same handoff reopens this same record and cookie
+      // instead of creating another session or reporting a false invalidity.
+      adopted = await createOrReuseSessionForExistingDevice(
+        {
+          deviceLabel: handoff.deviceLabel,
+          devicePublicKeyJwk: readDeviceKeyFromBody(req),
+          ip,
+          // Same device identity as the LAN session: one phone, one row in the
+          // device list, revocable as one thing.
+          deviceId: handoff.deviceId,
+          originHandoffDigest: handoffTokenDigest(token),
+          // A settled handoff may reopen only its exact still-current session.
+          // It may never mint a fresh row after rotation or revocation.
+          reuseOnly: handoff.adopted,
+        },
+        token,
+        stateOpts,
+      );
+    } catch {
+      res.status(503).json({ error: 'SESSION_PERSIST_FAILED' });
+      return;
+    }
+    if (!adopted) {
+      // The device was revoked before this atomic session append. The already
+      // claimed handoff stays spent and cannot resurrect it on another try.
+      await retireOriginHandoff(token, stateOpts).catch(() => undefined);
+      const decision = await recordFailure(ip, adoptOpts);
+      await notifyGlobalLockdown('pair', decision);
+      res.status(401).json({ error: 'INVALID_HANDOFF' });
+      return;
+    }
+    try {
+      const marked = await markOriginHandoffAdopted(
+        token,
+        { handoffId: suppliedHandoffId, generation: suppliedGeneration },
+        stateOpts,
+      );
+      if (!marked) {
+        // Session creation is already durable and deterministic. A retry will
+        // reuse it, so retain the native lease and report a retryable failure.
+        res.status(503).json({ error: 'HANDOFF_SETTLEMENT_FAILED' });
+        return;
+      }
+    } catch {
+      res.status(503).json({ error: 'HANDOFF_SETTLEMENT_FAILED' });
+      return;
+    }
     await recordSuccess(ip, adoptOpts);
-    const { token: sessionToken, record } = await createSession(
-      {
-        deviceLabel: handoff.deviceLabel,
-        devicePublicKeyJwk: readDeviceKeyFromBody(req),
-        ip,
-        // Same device identity as the LAN session: one phone, one row in the
-        // device list, revocable as one thing.
-        deviceId: handoff.deviceId,
-      },
-      stateOpts,
-    );
+    const { token: sessionToken, record } = adopted;
     setSessionCookie(req, res, sessionToken);
     res.json({
       deviceId: record.deviceId,
@@ -1377,6 +1897,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       expiresAt: record.expiresAt,
       binding: record.binding,
       sessionFingerprint: sessionFingerprint(sessionToken),
+      ...(handoff.originHandoff ? { originHandoff: handoff.originHandoff } : {}),
     });
   });
 
@@ -2363,8 +2884,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
+    // The phone stream is tiny SSE frames. Nagle + the relay mux will hold
+    // them until a buffer fills, which looks like a dead turn (live 2026-08-29:
+    // the Mac had already searched and planned; the phone sat on a spinner).
+    res.socket?.setNoDelay(true);
 
     let closed = false;
+    const flushStream = (): void => {
+      const flushable = res as { flush?: () => void };
+      if (typeof flushable.flush === 'function') flushable.flush();
+    };
     // Emit `id: <seq>` on each frame so the browser sends
     // Last-Event-ID on reconnect; `seq` is monotonic per session.
     const writeEvent = (name: string, payload: unknown, eventSeq?: number): void => {
@@ -2374,6 +2903,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
       res.write(`event: ${name}\n`);
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      flushStream();
     };
 
     try {
@@ -2429,6 +2959,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const heartbeat = setInterval(() => {
       if (closed || res.destroyed) return;
       res.write(`: ping\n\n`);
+      flushStream();
     }, 15_000);
     const cleanup = (): void => {
       if (closed) return;
@@ -2591,6 +3122,54 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         workspaceSlug: spaceSlug,
       } : undefined);
       const conversationId = priorLineage?.conversationId ?? proposedSessionId;
+      // MID-RUN STEERING — parity with the desktop dock (console-routes).
+      //
+      // A message sent while this session's attempt is STILL RUNNING becomes a
+      // durable steer note delivered at the model's next tool-result boundary.
+      // It must NOT claim a new attempt: claiming retires the running row and
+      // kills the work in flight, which is exactly the "nudging Clem mid-run
+      // killed the run" failure the desktop path already learned. Without this
+      // the phone could only watch a long run, never redirect it — reported
+      // live 2026-08-26.
+      //
+      // Typed controls, replays, and approvals keep their existing priority
+      // above; a dead lease is NOT running and falls through to the normal turn.
+      if (!typedControl && !priorReceipt && requestedSessionId) {
+        try {
+          const latestAttempt = getLatestHarnessRunAttempt(proposedSessionId);
+          const leaseLive = Boolean(
+            latestAttempt
+            && !latestAttempt.finishedAt
+            && latestAttempt.leaseExpiresAt
+            && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
+          );
+          if (leaseLive) {
+            const { appendSteerNote } = await import('../runtime/harness/steer-notes.js');
+            const note = appendSteerNote(proposedSessionId, message);
+            res.json({
+              ok: true,
+              steered: true,
+              sessionId: proposedSessionId,
+              noteSeq: note.seq,
+            });
+            return;
+          }
+          // steerOnly is the client's promise that this text must never become
+          // a competing turn. If the run just ended, refuse so the phone can
+          // re-send it deliberately as a normal message.
+          if (req.body?.steerOnly === true) {
+            res.status(409).json({ error: 'RUN_NOT_ACTIVE' });
+            return;
+          }
+        } catch (steerErr) {
+          if (req.body?.steerOnly === true) {
+            res.status(409).json({ error: 'RUN_NOT_ACTIVE' });
+            return;
+          }
+          void steerErr; /* any failure falls through to the normal turn path */
+        }
+      }
+
       if (!typedControl && !priorReceipt && !harnessGetSession(proposedSessionId)) {
         createHarnessChatSession({
           id: proposedSessionId,
@@ -2749,13 +3328,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
       const gatewayResponse = await execution;
       if (gatewayResponse.stoppedReason === 'error') {
-        res.status(500).json({ error: 'CHAT_SEND_FAILED', message: PUBLIC_RUN_FAILURE_TEXT });
+        res.status(500).json({
+          error: 'CHAT_SEND_FAILED',
+          message: PUBLIC_RUN_FAILURE_TEXT,
+          sessionId: gatewayResponse.sessionId,
+          runId: gatewayResponse.runId,
+          stoppedReason: gatewayResponse.stoppedReason,
+          terminal: gatewayResponse.terminal,
+        });
         return;
       }
       const payload: ChatSendResponse = {
         sessionId: gatewayResponse.sessionId,
         runId: gatewayResponse.runId,
         reply: gatewayResponse.text,
+        terminal: gatewayResponse.terminal,
         pendingApprovalId: gatewayResponse.pendingApprovalId,
         queuedTaskId: gatewayResponse.queuedTaskId,
         stoppedReason: gatewayResponse.stoppedReason,
@@ -3642,13 +4229,120 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * exactly as on desktop).
    */
   router.post('/api/chat/sessions/:sessionId/cancel', requireMobileSession, async (req, res) => {
+    const ctx = req.mobileSession!;
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
       ? req.body as Record<string, unknown>
       : {};
     const requestedAttemptId = typeof body.attemptId === 'string' ? body.attemptId.trim() : '';
+    const clientRequestId = typeof body.clientRequestId === 'string' ? body.clientRequestId.trim() : '';
+
+    // Stop by REQUEST identity, the way the desktop route already can.
+    //
+    // The attempt-scoped branch below can only stop a run that has already been
+    // registered, so between the tap on send and that registration the phone
+    // had nothing to press — and the Activity sheet withholds a foreground
+    // chat turn for its first WORKING_NOW_FOREGROUND_MS besides. Live
+    // 2026-08-28: a turn looped `plan_task` for ~6 minutes with the composer
+    // locked and no reachable stop on any mobile screen. The phone already
+    // mints an Idempotency-Key for every send, and the host already keys
+    // cancellation on exactly that value, so the missing piece was only ever
+    // this branch. Desktop/mobile divergence on a control this basic is the
+    // defect, not a platform difference.
+    if (clientRequestId) {
+      if (clientRequestId.length < 8 || clientRequestId.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(clientRequestId)) {
+        res.status(400).json({ error: 'client request id must be 8-160 URL-safe characters', code: 'INVALID_CHAT_REQUEST_ID' });
+        return;
+      }
+      try {
+        // getHarnessChatRequestReceipt and getLatestRunAttemptByRunId are
+        // already static imports here; only the cancellation latch is not.
+        const { requestHarnessChatCancellation } = await import('../runtime/harness/eventlog.js');
+        const { stopExactHarnessAttempt } = await import('../runtime/harness/stop-exact-attempt.js');
+        // The phone's raw key is NOT the host's request id. /api/chat/send
+        // stores `mobile:${mobileChatDigest(deviceId, key)}` (see the send
+        // handler), so cancelling under the raw UUID finds no receipt, stops
+        // nothing, and still answers 200 — a Stop button that reports success
+        // while the turn keeps running, which is strictly worse than the 400
+        // it replaced. Deriving it here also binds the tombstone to THIS
+        // device: the id can no longer be an arbitrary caller-supplied string,
+        // so a mobile caller cannot write a latch outside its own namespace.
+        const requestId = `mobile:${mobileChatDigest(ctx.record.deviceId, clientRequestId)}`;
+        const receipt = getHarnessChatRequestReceipt(requestId);
+        // A receipt for another session would let one phone stop another
+        // session's turn by guessing a key, so the attempt stop stays
+        // session-bound even though the id is already device-derived.
+        const attempt = receipt && receipt.sessionId === sessionId
+          ? getLatestRunAttemptByRunId(receipt.sessionId, receipt.runId)
+          : null;
+        // Armed AFTER the receipt read on purpose. The latch is a tombstone on
+        // the key: arming it first burns the idempotency key even when the tap
+        // stops nothing, and every later retry of that same message then 409s.
+        const cancellation = requestHarnessChatCancellation(requestId, 'cancelled from the phone');
+        let cancelledApprovals = 0;
+        if (attempt && !attempt.finishedAt && attempt.status === 'active') {
+          cancelledApprovals = stopExactHarnessAttempt(
+            sessionId,
+            attempt,
+            'cancelled from the phone',
+            'mobile',
+          ).cancelledApprovals;
+        }
+        res.json({
+          ok: true,
+          sessionId,
+          // Echo the caller's own value, not the host-derived id: the phone
+          // cannot recompute the digest and would not recognize it.
+          clientRequestId,
+          cancelled: Boolean(cancellation),
+          // False means the turn had not been registered yet: the latch is
+          // armed and the run is refused when it tries to start.
+          pendingAcceptance: !receipt || !attempt,
+          attemptId: attempt?.attemptId ?? null,
+          cancelledApprovals,
+        });
+      } catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
     if (!requestedAttemptId) {
-      res.status(400).json({ error: 'attemptId is required; refresh the run before stopping it', code: 'RUN_ATTEMPT_REQUIRED' });
+      // Live 2026-08-28: the Tim-deal Grok turn searched for ~5 minutes with
+      // no kill_requested. The phone's Stop is gated on cancelKey, which is
+      // only set when THIS client minted the send. A refresh, another surface,
+      // or a lost in-flight key left the composer locked and nothing to press.
+      // Stopping the session's currently-active attempt is not a historical
+      // session-wide kill — it is the one live run the user is staring at.
+      try {
+        const { getActiveRunAttempt } = await import('../runtime/harness/eventlog.js');
+        const { stopExactHarnessAttempt } = await import('../runtime/harness/stop-exact-attempt.js');
+        const activeAttempt = getActiveRunAttempt(sessionId);
+        if (!activeAttempt) {
+          res.status(409).json({
+            error: 'there is no live run to stop on this conversation',
+            code: 'NO_ACTIVE_RUN',
+            sessionId,
+          });
+          return;
+        }
+        const stopped = stopExactHarnessAttempt(
+          sessionId,
+          activeAttempt,
+          'cancelled from the phone',
+          'mobile',
+        );
+        res.json({
+          ok: true,
+          sessionId,
+          attemptId: activeAttempt.attemptId,
+          cancelledApprovals: stopped.cancelledApprovals,
+          cancelledTasks: stopped.cancelledTasks,
+          stoppedActive: true,
+        });
+      } catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
     try {
@@ -3775,21 +4469,133 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // NAMED AGENTS — a person's own standing helpers. Reads and edits only; a
+  // message to an agent is an ordinary chat turn (see /api/chat), so nothing
+  // here grants authority a plain turn would not have.
+  router.get('/api/agents', requireMobileSession, async (_req, res) => {
+    try {
+      const { listAgents } = await import('../memory/agent-store.js');
+      const { listSkills } = await import('../memory/skill-store.js');
+      const { listWorkflows } = await import('../memory/workflow-store.js');
+      res.json({
+        agents: listAgents(),
+        // The pinnable inventory travels with the list so the phone can build
+        // an agent without a second round trip on a slow connection.
+        available: {
+          skills: listSkills().map((skill) => skill.name).slice(0, 200),
+          workflows: listWorkflows().map((entry) => entry.name).slice(0, 200),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({ error: String((error as Error)?.message ?? error) });
+    }
+  });
+
+  router.post('/api/agents', requireMobileSession, async (req, res) => {
+    try {
+      const { createAgent } = await import('../memory/agent-store.js');
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const created = createAgent({
+        name: String(body.name ?? ''),
+        description: typeof body.description === 'string' ? body.description : '',
+        skills: Array.isArray(body.skills) ? body.skills as string[] : [],
+        workflows: Array.isArray(body.workflows) ? body.workflows as string[] : [],
+        model: typeof body.model === 'string' ? body.model : null,
+      });
+      if (!created.ok) {
+        res.status(created.reason === 'name_taken' ? 409 : 400).json({ error: created.reason });
+        return;
+      }
+      res.json({ agent: created.agent });
+    } catch (error) {
+      res.status(500).json({ error: String((error as Error)?.message ?? error) });
+    }
+  });
+
+  router.post('/api/agents/:id', requireMobileSession, async (req, res) => {
+    try {
+      const { updateAgent } = await import('../memory/agent-store.js');
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const updated = updateAgent(String(req.params.id ?? ''), {
+        ...(typeof body.name === 'string' ? { name: body.name } : {}),
+        ...(typeof body.description === 'string' ? { description: body.description } : {}),
+        ...(Array.isArray(body.skills) ? { skills: body.skills as string[] } : {}),
+        ...(Array.isArray(body.workflows) ? { workflows: body.workflows as string[] } : {}),
+        ...(body.model === null || typeof body.model === 'string' ? { model: body.model as string | null } : {}),
+      });
+      if (!updated) {
+        res.status(404).json({ error: 'AGENT_NOT_FOUND' });
+        return;
+      }
+      res.json({ agent: updated });
+    } catch (error) {
+      res.status(500).json({ error: String((error as Error)?.message ?? error) });
+    }
+  });
+
+  router.post('/api/agents/:id/delete', requireMobileSession, async (req, res) => {
+    try {
+      const { deleteAgent } = await import('../memory/agent-store.js');
+      res.json({ deleted: deleteAgent(String(req.params.id ?? '')) });
+    } catch (error) {
+      res.status(500).json({ error: String((error as Error)?.message ?? error) });
+    }
+  });
+
   router.get('/api/settings/models', requireMobileSession, async (_req, res) => {
     try {
       const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
-      const { brainOptions, effectiveBrainValue } = await import('../runtime/harness/model-role-options.js');
+      const { effectiveBrainValue, modelRoleOptionCatalogSnapshot } = await import('../runtime/harness/model-role-options.js');
+      const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
       const { getActiveAuthMode } = await import('../config.js');
+      const catalog = modelRoleOptionCatalogSnapshot();
       res.json({
         // WHO actually answers the next message — including the honest
         // inactiveBinding when a saved choice is unavailable.
         brain: resolveRoleModel('brain'),
-        options: brainOptions(),
+        options: catalog.brainOptions,
         effectiveValue: effectiveBrainValue(),
         activeBrain: getActiveAuthMode(),
+        // Exact connected Codex ids only. The phone never derives provider
+        // identity or accepts credentials; console and mobile share one
+        // validation + persistence owner for OPENAI_MODEL_RESCUE.
+        codexRescue: codexRescueSettingsSnapshot(catalog),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/settings/models/codex-rescue', requireMobileSession, async (req, res) => {
+    try {
+      const {
+        CodexRescueSettingsError,
+        persistCodexRescueModel,
+      } = await import('../runtime/harness/codex-rescue-settings.js');
+      const rawModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
+      const clear = req.body?.clear === true;
+      if (!clear && !rawModelId) {
+        res.status(400).json({
+          error: 'INVALID_CODEX_RESCUE_MODEL',
+          message: 'Choose an exact Codex model id, or clear the rescue override.',
+        });
+        return;
+      }
+      const codexRescue = persistCodexRescueModel(clear ? null : rawModelId);
+
+      // Apply on the next turn without restarting, matching the console door.
+      const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
+      const { clearAutonomyAgentCache } = await import('../agents/autonomy-v2.js');
+      resetHarnessRuntimeConfig();
+      clearAutonomyAgentCache();
+      res.json({ ok: true, codexRescue });
+    } catch (err) {
+      const { CodexRescueSettingsError } = await import('../runtime/harness/codex-rescue-settings.js');
+      const status = err instanceof CodexRescueSettingsError ? 400 : 500;
+      res.status(status).json({
+        error: err instanceof CodexRescueSettingsError ? err.code : 'CODEX_RESCUE_SAVE_FAILED',
+        message: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 

@@ -308,7 +308,7 @@ function exactCallLease(
   };
 }
 
-test('exact typed plan_task refusals settle normally and replay without activation or redispatch', async (t) => {
+test('exact typed plan_task recoveries settle normally and replay without activation or redispatch', async (t) => {
   const cases = [
     {
       label: 'plan not admitted',
@@ -327,6 +327,53 @@ test('exact typed plan_task refusals settle normally and replay without activati
         ok: false,
         code: 'plan_not_required',
         detail: 'This accepted source does not require an action graph.',
+      }),
+    },
+    {
+      label: 'unique named workflow',
+      callId: 'model:plan-refusal-unique-workflow',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_not_required',
+        detail: 'this accepted request uniquely names an existing workflow; call workflow_run with that exact name',
+        workflowName: 'platform-49-slack-channel-review',
+        repair: 'Call workflow_run with name "platform-49-slack-channel-review". Do not plan_task. Do not workflow_get unless the user asked to inspect the definition.',
+      }),
+    },
+    {
+      label: 'account selection required',
+      callId: 'model:plan-account-selection',
+      expectedOutcome: 'input_required',
+      value: JSON.stringify({
+        ok: false,
+        code: 'account_selection_required',
+        detail: 'Outlook Send Email is the matching write for this ask; ask which connected account to use.',
+        question: 'Which connected account should I use?',
+        accountChoices: ['work@corp.example', 'personal@example.net'],
+        repair: 'Ask the user which exact connected account to use. Do not pick a substitute write.',
+      }),
+    },
+    {
+      label: 'missing required write',
+      callId: 'model:plan-incomplete-missing-write',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_incomplete_missing_write',
+        detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
+        requestedEffectScope: 'mixed',
+        repair: 'Use tool_search for the exact missing write capability, then call plan_task again.',
+      }),
+    },
+    {
+      label: 'missing artifact data lineage',
+      callId: 'model:plan-incomplete-data-lineage',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_incomplete_data_lineage',
+        detail: 'The artifact write names only ordering dependencies and has no exact dataFrom source.',
+        writeOperationIds: ['write_sheet'],
+        sourceOperationIds: ['read_accounts'],
+        repair: 'Keep dependsOn for ordering and set dataFrom to the exact operation whose bytes construct the artifact.',
       }),
     },
   ] as const;
@@ -354,8 +401,33 @@ test('exact typed plan_task refusals settle normally and replay without activati
       // typed failure, never 'succeeded'. (Before 2026-08-26 these settled
       // succeeded with success=1 handles — every evidence consumer overcounted.)
       assert.notEqual(first.settlement.outcome.kind, 'succeeded');
+      if ('expectedOutcome' in candidate) {
+        assert.equal(first.settlement.outcome.kind, candidate.expectedOutcome);
+      }
       assert.equal(first.settlement.duplicate, false);
       assert.equal(bodies, 1);
+
+      const durable = eventlog.openEventLog().prepare(`
+        SELECT outcome_kind, recovery_action, physical_crossing_count, host_crossing_count
+          FROM logical_call_settlements
+         WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+      `).get(task.sessionId, task.sourceUserSeq, candidate.callId) as {
+        outcome_kind: string;
+        recovery_action: string;
+        physical_crossing_count: number;
+        host_crossing_count: number;
+      };
+      assert.equal(durable.physical_crossing_count, 0);
+      assert.equal(durable.host_crossing_count, 1);
+      if ('expectedOutcome' in candidate) {
+        assert.deepEqual({
+          outcome_kind: durable.outcome_kind,
+          recovery_action: durable.recovery_action,
+        }, {
+          outcome_kind: 'input_required',
+          recovery_action: 'ask_user',
+        });
+      }
 
       const replay = await execute();
       assert.equal(replay.settlement.duplicate, true);
@@ -547,6 +619,63 @@ test('beforePhysicalAdmission runs in the current child lease after logical admi
     ['returned'],
   );
   leases.revokeDispatchLease(task.parentLease);
+});
+
+test('due parallel read bodies return before the first durable settlement continuation', async () => {
+  const task = fixture('Read four independent local sources.');
+  let enteredBodies = 0;
+  let returnedBodies = 0;
+  let releaseBodies!: () => void;
+  const allBodiesEntered = new Promise<void>((resolve) => { releaseBodies = resolve; });
+  let recordCheckpoint!: (value: { returnedBodies: number; settlements: number }) => void;
+  const checkpoint = new Promise<{ returnedBodies: number; settlements: number }>(
+    (resolve) => { recordCheckpoint = resolve; },
+  );
+  let checkpointScheduled = false;
+
+  const executions = Array.from({ length: 4 }, (_, index) => runCall(task, {
+    callId: `model:parallel-read-${index}`,
+    args: { source: `independent-${index}` },
+    deadlineMs: 1_000,
+    invoke: async () => {
+      enteredBodies += 1;
+      if (enteredBodies === 4) releaseBodies();
+      await allBodiesEntered;
+      // These are four independent timers due in the same timers phase. The
+      // first body schedules a check-phase observer before its host completion
+      // continuation can schedule durable settlement.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      returnedBodies += 1;
+      if (!checkpointScheduled) {
+        checkpointScheduled = true;
+        setImmediate(() => {
+          const settlements = (eventlog.openEventLog().prepare(`
+            SELECT COUNT(*) AS count
+              FROM logical_call_settlements
+             WHERE session_id = ? AND source_user_seq = ?
+          `).get(task.sessionId, task.sourceUserSeq) as { count: number }).count;
+          recordCheckpoint({ returnedBodies, settlements });
+        });
+      }
+      return `result-${index}`;
+    },
+  }));
+
+  try {
+    const [observed, results] = await Promise.all([
+      checkpoint,
+      Promise.all(executions),
+    ]);
+    assert.deepEqual(observed, { returnedBodies: 4, settlements: 0 });
+    assert.deepEqual(results.map((result) => result.value), [
+      'result-0',
+      'result-1',
+      'result-2',
+      'result-3',
+    ]);
+  } finally {
+    leases.revokeDispatchLease(task.parentLease);
+  }
 });
 
 test('beforePhysicalAdmission refusal settles a truthful zero-crossing call and never enters the body', async () => {

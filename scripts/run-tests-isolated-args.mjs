@@ -1,5 +1,29 @@
 export const DEFAULT_TEST_TARGETS = Object.freeze([
-  'src/**/*.test.ts',
+  // Performance-sensitive end-to-end journeys have their own serialized
+  // `npm run journeys` gate. Running them again in the broad concurrent unit
+  // suite makes their latency contract measure sibling-test contention rather
+  // than Clementine. Keep this list explicit so adding a new source area also
+  // requires deciding which gate owns it.
+  'src/*.test.ts',
+  'src/agents/**/*.test.ts',
+  'src/assistant/**/*.test.ts',
+  'src/autoresearch/**/*.test.ts',
+  'src/channels/**/*.test.ts',
+  'src/cli/**/*.test.ts',
+  'src/daemon/**/*.test.ts',
+  'src/dashboard/**/*.test.ts',
+  'src/execution/**/*.test.ts',
+  'src/gateway/**/*.test.ts',
+  'src/integrations/**/*.test.ts',
+  'src/memory/**/*.test.ts',
+  'src/planning/**/*.test.ts',
+  'src/plugins/**/*.test.ts',
+  'src/runtime/**/*.test.ts',
+  'src/setup/**/*.test.ts',
+  'src/shared/**/*.test.ts',
+  'src/spaces/**/*.test.ts',
+  'src/tasks/**/*.test.ts',
+  'src/tools/**/*.test.ts',
   'apps/**/*.test.ts',
 ]);
 

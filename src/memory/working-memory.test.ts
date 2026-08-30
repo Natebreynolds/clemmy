@@ -24,12 +24,19 @@ const {
   resolveWorkingMemoryForConsole,
   reapStaleWorkingMemory,
   loadWorkingMemoryForSession,
+  workingMemoryMetadataPathForSession,
   workingMemoryPathForSession,
 } = await import('./working-memory.js');
 const { WORKING_MEMORY_FILE } = await import('./vault.js');
 const { existsSync, unlinkSync, utimesSync } = await import('node:fs');
 const { SessionStore } = await import('./session-store.js');
-const { appendEvent, createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const {
+  appendEvent,
+  closeEventLog,
+  createSession,
+  openEventLog,
+  resetEventLog,
+} = await import('../runtime/harness/eventlog.js');
 
 function seedChatTurn(sessionId: string, userText: string, replyText: string): void {
   appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: userText } });
@@ -117,6 +124,153 @@ test('refreshWorkingMemoryForSession writes the per-session file from the transc
   // The global file is the working_memory tool's scratchpad — the harness path
   // must NOT clobber it (writeGlobal:false).
   assert.equal(existsSync(WORKING_MEMORY_FILE), false, 'harness refresh never writes the global working-memory.md');
+});
+
+test('lazy load detects a newer durable terminal after restart and rebuilds before returning bytes', () => {
+  resetEventLog();
+  const sessionId = 'sess-wm-restart-staleness';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Restart freshness' });
+  seedChatTurn(sessionId, 'Initial WM-RESTART-OLD source.', 'WM-RESTART-OLD recorded.');
+  refreshWorkingMemoryForSession(sessionId, 'desktop');
+  assert.match(loadWorkingMemoryForSession(sessionId) ?? '', /WM-RESTART-OLD/);
+
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Replace it with durable WM-RESTART-NEW.' },
+  });
+  appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reply: 'WM-RESTART-NEW is now current.' },
+  });
+  // Close the cached DB handle to model the important half of a process
+  // restart: there is no in-memory stale marker to help the next reader.
+  closeEventLog();
+
+  const loaded = loadWorkingMemoryForSession(sessionId);
+  assert.match(loaded ?? '', /WM-RESTART-NEW/);
+  const metadata = JSON.parse(
+    readFileSync(workingMemoryMetadataPathForSession(sessionId), 'utf-8'),
+  ) as { terminalSeq?: number };
+  assert.ok(Number.isSafeInteger(metadata.terminalSeq), 'rebuilt projection carries a durable source sequence');
+});
+
+test('lazy load reads a valid digest-stamped in-flight checkpoint before the first terminal', () => {
+  resetEventLog();
+  const sessionId = 'sess-wm-in-flight-readable';
+  checkpointWorkingMemory(sessionId, {
+    turn: 3,
+    toolCallsTotal: 7,
+    lastText: 'WM-IN-FLIGHT-VERIFIED remains resumable.',
+  });
+
+  const loaded = loadWorkingMemoryForSession(sessionId);
+  assert.match(loaded ?? '', /In-flight Checkpoint/);
+  assert.match(loaded ?? '', /WM-IN-FLIGHT-VERIFIED/);
+  const metadata = JSON.parse(
+    readFileSync(workingMemoryMetadataPathForSession(sessionId), 'utf-8'),
+  ) as { terminalSeq?: number | null; kind?: string };
+  assert.equal(metadata.terminalSeq, null);
+  assert.equal(metadata.kind, 'in_flight_checkpoint');
+});
+
+test('lazy load rejects tampered checkpoint Markdown and sidecar bytes without rewriting either', () => {
+  resetEventLog();
+  const rawTamperSessionId = 'sess-wm-checkpoint-raw-tamper';
+  checkpointWorkingMemory(rawTamperSessionId, { lastText: 'WM-RAW-ORIGINAL' });
+  const rawPath = workingMemoryPathForSession(rawTamperSessionId);
+  const rawMetadataPath = workingMemoryMetadataPathForSession(rawTamperSessionId);
+  const rawMetadataBefore = readFileSync(rawMetadataPath, 'utf-8');
+  const tamperedRaw = `${readFileSync(rawPath, 'utf-8')}\nWM-RAW-TAMPER-MUST-NOT-LOAD\n`;
+  writeFileSync(rawPath, tamperedRaw);
+
+  assert.equal(loadWorkingMemoryForSession(rawTamperSessionId), undefined);
+  assert.equal(readFileSync(rawPath, 'utf-8'), tamperedRaw, 'reader does not rewrite raw drift');
+  assert.equal(readFileSync(rawMetadataPath, 'utf-8'), rawMetadataBefore, 'reader does not bless raw drift');
+
+  const sidecarTamperSessionId = 'sess-wm-checkpoint-sidecar-tamper';
+  checkpointWorkingMemory(sidecarTamperSessionId, { lastText: 'WM-SIDECAR-ORIGINAL' });
+  const sidecarPath = workingMemoryPathForSession(sidecarTamperSessionId);
+  const sidecarMetadataPath = workingMemoryMetadataPathForSession(sidecarTamperSessionId);
+  const sidecarContentBefore = readFileSync(sidecarPath, 'utf-8');
+  const sidecar = JSON.parse(readFileSync(sidecarMetadataPath, 'utf-8')) as Record<string, unknown>;
+  const tamperedSidecar = `${JSON.stringify({ ...sidecar, contentDigest: 'tampered' })}\n`;
+  writeFileSync(sidecarMetadataPath, tamperedSidecar);
+
+  assert.equal(loadWorkingMemoryForSession(sidecarTamperSessionId), undefined);
+  assert.equal(readFileSync(sidecarPath, 'utf-8'), sidecarContentBefore, 'reader does not rewrite verified content');
+  assert.equal(readFileSync(sidecarMetadataPath, 'utf-8'), tamperedSidecar, 'reader does not repair unverified sidecar drift');
+});
+
+test('lazy load with no terminal and no checkpoint is a zero-write miss', () => {
+  resetEventLog();
+  const sessionId = 'sess-wm-fresh-zero-write';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Fresh session' });
+  const projectionPath = workingMemoryPathForSession(sessionId);
+  const metadataPath = workingMemoryMetadataPathForSession(sessionId);
+
+  assert.equal(existsSync(projectionPath), false, 'precondition: no projection exists');
+  assert.equal(existsSync(metadataPath), false, 'precondition: no sidecar exists');
+  assert.equal(loadWorkingMemoryForSession(sessionId), undefined);
+  assert.equal(existsSync(projectionPath), false, 'read miss does not create Markdown');
+  assert.equal(existsSync(metadataPath), false, 'read miss does not create a sidecar');
+});
+
+test('a same-session lazy rebuild performs no filesystem work for another session', () => {
+  resetEventLog();
+  const first = 'sess-wm-demand-first';
+  const second = 'sess-wm-demand-second';
+  createSession({ id: first, kind: 'chat', channel: 'desktop', title: 'First' });
+  createSession({ id: second, kind: 'chat', channel: 'desktop', title: 'Second' });
+  seedChatTurn(first, 'WM-FIRST-OLD.', 'old first');
+  seedChatTurn(second, 'WM-SECOND-STABLE.', 'stable second');
+  refreshWorkingMemoryForSession(first, 'desktop');
+  refreshWorkingMemoryForSession(second, 'desktop');
+  const secondContentBefore = readFileSync(workingMemoryPathForSession(second), 'utf-8');
+  const secondMetadataBefore = readFileSync(workingMemoryMetadataPathForSession(second), 'utf-8');
+
+  appendEvent({
+    sessionId: first,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'WM-FIRST-NEW.' },
+  });
+  appendEvent({
+    sessionId: first,
+    turn: 2,
+    role: 'system',
+    type: 'conversation_completed',
+    data: { reply: 'new first' },
+  });
+  assert.match(loadWorkingMemoryForSession(first) ?? '', /WM-FIRST-NEW/);
+  assert.equal(readFileSync(workingMemoryPathForSession(second), 'utf-8'), secondContentBefore);
+  assert.equal(readFileSync(workingMemoryMetadataPathForSession(second), 'utf-8'), secondMetadataBefore);
+});
+
+test('a stale projection fails closed when its durable session cannot be rebuilt', () => {
+  resetEventLog();
+  const sessionId = 'sess-wm-fail-closed';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Fail closed' });
+  seedChatTurn(sessionId, 'WM-STALE-MUST-NOT-LEAK.', 'old');
+  refreshWorkingMemoryForSession(sessionId, 'desktop');
+  const staleBytes = readFileSync(workingMemoryPathForSession(sessionId), 'utf-8');
+  assert.match(staleBytes, /WM-STALE-MUST-NOT-LEAK/);
+
+  // Removing the durable source makes the sidecar unverifiable and leaves no
+  // canonical record from which the central reader could rebuild.
+  openEventLog().prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
+  assert.equal(loadWorkingMemoryForSession(sessionId), undefined);
+  assert.equal(
+    readFileSync(workingMemoryPathForSession(sessionId), 'utf-8'),
+    staleBytes,
+    'the stale file may remain for forensics but is never returned',
+  );
 });
 
 test('resolveWorkingMemoryForConsole surfaces the freshest user-facing session; internal sessions are skipped', () => {

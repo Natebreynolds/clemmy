@@ -127,6 +127,73 @@ function requirement(objective: string, requirementId = generated('requirement')
   return { requirementId, objective: `retrieve ${objective}`, effect: 'read' as const };
 }
 
+function genericCliNominationAdapter(input: {
+  rows: ReadonlyArray<{ identifier: string; accountIdentity: string; description: string }>;
+  adapterId?: string;
+  carrierKind?: 'cli' | 'mcp';
+  carrierName?: string;
+  onMaterialize?: () => void;
+}) {
+  const observedAt = Date.now();
+  const carrierKind = input.carrierKind ?? 'cli';
+  const carrierName = input.carrierName ?? 'reviewed-cli-test';
+  const carrier = {
+    identity: { kind: carrierKind, name: carrierName },
+    async enumerate() {
+      return input.rows.map((row) => ({
+        identifier: row.identifier,
+        carrierKind,
+        carrier: carrierName,
+        displayName: row.identifier,
+        description: row.description,
+        effectClass: 'read' as const,
+        effectProvenance: carrierKind === 'cli' ? 'curated' as const : 'declared' as const,
+        accountIdentity: row.accountIdentity,
+      }));
+    },
+    async refresh() {},
+    observe(reference: { identifier: string; accountId: string }) {
+      const row = input.rows.find((candidate) => (
+        candidate.identifier === reference.identifier
+        && candidate.accountIdentity === reference.accountId
+      ));
+      if (!row) return 'missing' as const;
+      return {
+        operationId: row.identifier,
+        providerKind: carrierKind === 'cli' ? 'reviewed_cli' as const : 'native_mcp' as const,
+        providerIdentity: carrierKind === 'cli' ? '/reviewed/cli/test' : `mcp:${carrierName}`,
+        providerVersion: 'provider-v1',
+        operationVersion: `operation-v1:${row.identifier}:${row.accountIdentity}`,
+        accountId: row.accountIdentity,
+        effect: 'read' as const,
+        effectAttestation: carrierKind === 'cli' ? 'host_reviewed' as const : 'carrier_declared' as const,
+        inputSchema: { type: 'object', additionalProperties: false },
+        observedAt,
+        invoke: {
+          portId: `port:${row.identifier}:${row.accountIdentity}`,
+          argumentCompiler: {
+            id: 'host:reviewed-cli-test',
+            version: '1',
+          },
+        },
+      };
+    },
+  };
+  return registry.createAttestedLiveReadCarrierAdapter({
+    adapterId: input.adapterId ?? 'reviewed_cli:reviewed-cli-test',
+    carrier,
+    async materialize() {
+      input.onMaterialize?.();
+      return {
+        status: 'blocked',
+        reason: 'missing',
+        detail: 'selection probe stops before publication',
+        retired: [],
+      };
+    },
+  });
+}
+
 test.afterEach(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
   manifestStores.installCapabilityManifestStore(null);
@@ -156,9 +223,145 @@ test('zero configured carriers stays missing even when advisory memory claims an
   });
   const result = await acquisition.acquire(requirement(objective));
   assert.equal(result.status, 'blocked');
-  if (result.status === 'blocked') assert.equal(result.reason, 'missing');
+  if (result.status === 'blocked') {
+    assert.equal(result.reason, 'missing');
+    assert.equal(result.detail, 'no live-read carrier adapters are configured');
+  }
   assert.equal(catalogs.peekHostCapabilityCatalogFactory()?.snapshot().length, 0);
   assert.equal(ports.listProductionCapabilityPorts().length, 0);
+});
+
+test('an observable carrier with no matching nomination stays semantically missing', async () => {
+  resetAuthoritySurfaces();
+  const acquisition = registry.createProductionLiveReadAcquisitionRegistry({
+    configuredAdapters: () => [genericCliNominationAdapter({ rows: [] })],
+  });
+  const result = await acquisition.acquire(requirement(generated('objective')));
+  assert.equal(result.status, 'blocked');
+  if (result.status === 'blocked') {
+    assert.equal(result.reason, 'missing');
+    assert.equal(result.detail, 'no current attested read capability matched the objective');
+  }
+});
+
+test('exact normalized identifier wins over fuzzy sibling nominations', async () => {
+  const exactIdentifier = 'Reviewed_CLI_Constellation_Read';
+  const candidate = genericCliNominationAdapter({
+    rows: [
+      {
+        identifier: exactIdentifier,
+        accountIdentity: 'reviewed_cli:host',
+        description: 'Read constellation facts.',
+      },
+      {
+        identifier: 'reviewed_cli_ambiguous_alpha',
+        accountIdentity: 'reviewed_cli:host',
+        description: 'Inspect ambiguous nebula.',
+      },
+      {
+        identifier: 'reviewed_cli_ambiguous_beta',
+        accountIdentity: 'reviewed_cli:host',
+        description: 'Inspect ambiguous nebula.',
+      },
+    ],
+  });
+  const nominated = await candidate.nominate({
+    requirementId: generated('requirement'),
+    objective: 'reviewed_cli_constellation_read',
+    effect: 'read',
+  });
+  assert.equal(nominated.status, 'nominated', JSON.stringify(nominated));
+  if (nominated.status !== 'nominated') return;
+  assert.deepEqual(nominated.nominations.map((row) => ({
+    identifier: row.identity.reference.identifier,
+    accountId: row.identity.reference.accountId,
+  })), [{
+    identifier: exactIdentifier,
+    accountId: 'reviewed_cli:host',
+  }]);
+});
+
+test('exact identifier keeps every account nomination ambiguous', async () => {
+  const identifier = 'reviewed_cli_constellation_read';
+  const candidate = genericCliNominationAdapter({
+    rows: [
+      { identifier, accountIdentity: 'reviewed_cli:first', description: 'Read constellation facts.' },
+      { identifier, accountIdentity: 'reviewed_cli:second', description: 'Read constellation facts.' },
+      {
+        identifier: 'reviewed_cli_constellation_sibling',
+        accountIdentity: 'reviewed_cli:host',
+        description: 'Read constellation facts.',
+      },
+    ],
+  });
+  const nominated = await candidate.nominate({
+    requirementId: generated('requirement'),
+    objective: identifier,
+    effect: 'read',
+  });
+  assert.equal(nominated.status, 'nominated', JSON.stringify(nominated));
+  if (nominated.status !== 'nominated') return;
+  assert.deepEqual(nominated.nominations.map((row) => row.identity.reference.accountId), [
+    'reviewed_cli:first',
+    'reviewed_cli:second',
+  ]);
+});
+
+test('registry-wide exact identifier suppresses a fuzzy sibling from another carrier', async () => {
+  const identifier = 'generated_mcp__read_constellation';
+  const materialized = { exact: 0, fuzzy: 0 };
+  const exact = genericCliNominationAdapter({
+    adapterId: 'native_mcp:generated-mcp',
+    carrierKind: 'mcp',
+    carrierName: 'generated-mcp',
+    rows: [{ identifier, accountIdentity: 'mcp:generated', description: 'Read constellation facts.' }],
+    onMaterialize: () => { materialized.exact += 1; },
+  });
+  const fuzzy = genericCliNominationAdapter({
+    adapterId: 'reviewed_cli:sibling-cli',
+    carrierName: 'sibling-cli',
+    rows: [{
+      identifier: 'generated_mcp__read_constellation_sibling',
+      accountIdentity: 'reviewed_cli:host',
+      description: 'Read constellation facts.',
+    }],
+    onMaterialize: () => { materialized.fuzzy += 1; },
+  });
+  resetAuthoritySurfaces();
+  const result = await registry.createProductionLiveReadAcquisitionRegistry({
+    configuredAdapters: () => [fuzzy, exact],
+  }).acquire({ requirementId: generated('requirement'), objective: identifier, effect: 'read' });
+  assert.equal(result.status, 'blocked');
+  if (result.status === 'blocked') assert.equal(result.reason, 'missing');
+  assert.deepEqual(materialized, { exact: 1, fuzzy: 0 });
+});
+
+test('registry-wide exact identifier preserves two exact account nominations', async () => {
+  const identifier = 'reviewed_cli_constellation_read';
+  const materialized = { first: 0, second: 0 };
+  const first = genericCliNominationAdapter({
+    adapterId: 'reviewed_cli:first-carrier',
+    carrierName: 'first-carrier',
+    rows: [{ identifier, accountIdentity: 'reviewed_cli:first', description: 'Read facts.' }],
+    onMaterialize: () => { materialized.first += 1; },
+  });
+  const second = genericCliNominationAdapter({
+    adapterId: 'reviewed_cli:second-carrier',
+    carrierName: 'second-carrier',
+    rows: [{ identifier, accountIdentity: 'reviewed_cli:second', description: 'Read facts.' }],
+    onMaterialize: () => { materialized.second += 1; },
+  });
+  resetAuthoritySurfaces();
+  const result = await registry.createProductionLiveReadAcquisitionRegistry({
+    configuredAdapters: () => [second, first],
+  }).acquire({ requirementId: generated('requirement'), objective: identifier, effect: 'read' });
+  assert.equal(result.status, 'blocked');
+  if (result.status === 'blocked') {
+    assert.equal(result.reason, 'ambiguous');
+    assert.match(result.detail, /reviewed_cli:first-carrier/);
+    assert.match(result.detail, /reviewed_cli:second-carrier/);
+  }
+  assert.deepEqual(materialized, { first: 0, second: 0 });
 });
 
 test('blank-state configured MCP is acquired without serverName in the request or seeded authority', async () => {

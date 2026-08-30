@@ -4,6 +4,9 @@ import {
   appendEvent,
   createSession,
   getSession,
+  insertInternalEventInTransaction,
+  openEventLog,
+  publishCommittedInternalEvent,
   updateSession,
   type CreateSessionInput,
   type EventRow,
@@ -48,6 +51,11 @@ const META_INTERRUPT = '__interrupt_state';
 // resumes rebuild an Agent, so without this sibling record a scoped/local-only
 // turn silently reopened the legacy allow-all MCP surface after approval.
 const META_INTERRUPT_MCP_SCOPE = '__interrupt_mcp_scope';
+// Local checkpoint recovery is not an approval interruption. Keeping a
+// separate key prevents UI/card owners from treating host bookkeeping as a
+// user decision while still surviving daemon restart.
+const META_RECOVERY = '__host_recovery_state';
+const META_RECOVERY_MCP_SCOPE = '__host_recovery_mcp_scope';
 // Restart-recovery marker: set while a runConversation is in flight, cleared in
 // a finally when it returns/throws — so ONLY a hard process death (daemon crash
 // /restart mid-run) leaves it set. The boot scan uses it to surface an
@@ -64,6 +72,11 @@ export interface RecordTurnResultInput {
   history: AgentInputItem[];
   lastResponseId: string | undefined;
   turn: number;
+}
+
+export interface RecordCompletedTurnResultInput extends RecordTurnResultInput {
+  finalOutputPreview: string;
+  toolCalls: number;
 }
 
 export class HarnessSession {
@@ -253,6 +266,72 @@ export class HarnessSession {
   }
 
   /**
+   * Canonical successful-turn durability owner. The replay snapshot, audit
+   * boundary, internal run terminal, and logical turn watermark describe one
+   * completed result, so publishing any proper subset would expose a state no
+   * reader should observe. Insert all four under one SQLite transaction, then
+   * publish the two events in their original order only after commit.
+   *
+   * Blocked/error/approval paths deliberately keep using recordTurnResult and
+   * their existing terminal owners because they do not have this exact event
+   * sequence.
+   */
+  recordCompletedTurnResult(input: RecordCompletedTurnResultInput): void {
+    const db = openEventLog();
+    const snapshot: PersistedConversation = {
+      items: input.history,
+      lastResponseId: input.lastResponseId,
+      updatedAt: new Date().toISOString(),
+    };
+    let turnEnded!: EventRow;
+    let runCompleted!: EventRow;
+
+    const commit = db.transaction(() => {
+      // json_set preserves unrelated metadata written by concurrent owners;
+      // writing a stale in-memory metadata object here would erase it.
+      db.prepare(
+        `UPDATE sessions
+            SET metadata_json = json_set(metadata_json, '$.__conversation', json(?)),
+                updated_at = ?
+          WHERE id = ?`,
+      ).run(JSON.stringify(snapshot), snapshot.updatedAt, this.row.id);
+
+      turnEnded = insertInternalEventInTransaction(db, {
+        sessionId: this.row.id,
+        turn: input.turn,
+        role: 'system',
+        type: 'turn_ended',
+        data: {
+          items: input.history.length,
+          lastResponseId: input.lastResponseId ?? null,
+        },
+      });
+      runCompleted = insertInternalEventInTransaction(db, {
+        sessionId: this.row.id,
+        turn: input.turn,
+        role: 'system',
+        type: 'run_completed',
+        data: {
+          finalOutputPreview: input.finalOutputPreview,
+          toolCalls: input.toolCalls,
+        },
+      });
+
+      db.prepare(
+        `UPDATE sessions
+            SET metadata_json = json_set(metadata_json, '$.__turn', ?),
+                updated_at = ?
+          WHERE id = ?`,
+      ).run(input.turn, new Date().toISOString(), this.row.id);
+    });
+
+    commit.immediate();
+    this.refresh();
+    publishCommittedInternalEvent(turnEnded);
+    publishCommittedInternalEvent(runCompleted);
+  }
+
+  /**
    * Save a `RunState.toString()` blob produced when the SDK pauses for
    * an approval interrupt. Resumed via:
    *   const state = RunState.fromString(harnessSession.loadInterruptState()!);
@@ -319,6 +398,82 @@ export class HarnessSession {
       type: 'run_resumed',
       data: {},
     });
+  }
+
+  saveRecoveryState(
+    serialized: string,
+    options: { mcpToolScope?: McpToolScope | null } = {},
+  ): void {
+    const meta = { ...this.row.metadata };
+    meta[META_RECOVERY] = serialized;
+    if (options.mcpToolScope && typeof options.mcpToolScope.reason === 'string') {
+      meta[META_RECOVERY_MCP_SCOPE] = JSON.parse(JSON.stringify(options.mcpToolScope)) as McpToolScope;
+    } else {
+      delete meta[META_RECOVERY_MCP_SCOPE];
+    }
+    this.row = updateSession(this.row.id, { metadata: meta });
+  }
+
+  loadRecoveryState(): string | null {
+    const raw = this.row.metadata[META_RECOVERY];
+    return typeof raw === 'string' ? raw : null;
+  }
+
+  loadRecoveryMcpToolScope(): McpToolScope | null {
+    const raw = this.row.metadata[META_RECOVERY_MCP_SCOPE];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const scope = raw as Partial<McpToolScope>;
+    if (typeof scope.reason !== 'string' || !scope.reason.trim()) return null;
+    try {
+      return JSON.parse(JSON.stringify(scope)) as McpToolScope;
+    } catch {
+      return null;
+    }
+  }
+
+  clearRecoveryState(): void {
+    if (!(META_RECOVERY in this.row.metadata) && !(META_RECOVERY_MCP_SCOPE in this.row.metadata)) return;
+    const meta = { ...this.row.metadata };
+    delete meta[META_RECOVERY];
+    delete meta[META_RECOVERY_MCP_SCOPE];
+    this.row = updateSession(this.row.id, { metadata: meta });
+  }
+
+  /**
+   * Adopt one already-verified ready model-batch checkpoint and release its
+   * private recovery owner in the same local transaction. The exact serialized
+   * state is the compare-and-swap token: a concurrent replacement cannot be
+   * erased or paired with the wrong conversation snapshot.
+   */
+  adoptRecoveredConversation(input: {
+    serializedState: string;
+    history: AgentInputItem[];
+    lastResponseId: string | undefined;
+  }): boolean {
+    const db = openEventLog();
+    const snapshot: PersistedConversation = {
+      items: input.history,
+      lastResponseId: input.lastResponseId,
+      updatedAt: new Date().toISOString(),
+    };
+    const adopted = db.prepare(`
+      UPDATE sessions
+         SET metadata_json = json_remove(
+               json_set(metadata_json, '$.__conversation', json(?)),
+               '$.__host_recovery_state',
+               '$.__host_recovery_mcp_scope'
+             ),
+             updated_at = ?
+       WHERE id = ?
+         AND json_extract(metadata_json, '$.__host_recovery_state') = ?
+    `).run(
+      JSON.stringify(snapshot),
+      snapshot.updatedAt,
+      this.row.id,
+      input.serializedState,
+    );
+    this.refresh();
+    return adopted.changes === 1;
   }
 
   /**

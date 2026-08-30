@@ -39,6 +39,7 @@ const full = args.has('--full');
 const live = args.has('--live') || process.env.CLEMMY_READINESS_LIVE === '1';
 
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.HARNESS_TOOL_BRACKETS = 'off';
 process.env.CLEMMY_TURN_MEMORY_PRIMER = 'on';
 process.env.CLEMMY_TURN_MEMORY_PRIMER_HYBRID = 'off';
@@ -289,6 +290,8 @@ async function main(): Promise<void> {
 
   if (live) {
     const liveEnv: NodeJS.ProcessEnv = { ...process.env };
+    delete liveEnv.CLEMMY_TEST_ISOLATED_HOME;
+    delete liveEnv.HARNESS_TOOL_BRACKETS;
     if (REAL_CLEMENTINE_HOME === undefined) delete liveEnv.CLEMENTINE_HOME;
     else liveEnv.CLEMENTINE_HOME = REAL_CLEMENTINE_HOME;
     if (REAL_LOCAL_EMBEDDINGS === undefined) delete liveEnv.CLEMMY_LOCAL_EMBEDDINGS;

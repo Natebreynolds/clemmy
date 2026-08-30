@@ -22,8 +22,24 @@ const dispatch = await import('./dispatch-ledger.js');
 const attempts = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const resolution = await import('./resolution-ledger.js');
+const currentCapabilities = await import('./current-capability-manifest.fixture.js');
+
+const priorCapabilityCatalog = currentCapabilities.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'alpha__list_opportunities',
+    providerKind: 'native_mcp',
+    effect: 'read',
+  },
+  {
+    operationId: 'alpha__send_report',
+    providerKind: 'native_mcp',
+    effect: 'external_write',
+    operationSemantics: { version: 1, reversibility: 'irreversible' },
+  },
+]);
 
 test.after(() => {
+  currentCapabilities.restoreCurrentCapabilityManifestFixtures(priorCapabilityCatalog);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

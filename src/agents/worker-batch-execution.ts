@@ -232,7 +232,8 @@ export function claimWorkerBatchDurableOwnership(
       parent_scope_id = excluded.parent_scope_id,
       parent_lease_id = excluded.parent_lease_id,
       activated_at = excluded.activated_at,
-      revoked_at = NULL
+      revoked_at = NULL,
+      revocation_reason = NULL
     WHERE run_dispatch_leases.revoked_at IS NOT NULL
   `).run(
     lease.scopeId,
@@ -251,35 +252,6 @@ export function claimWorkerBatchDurableOwnership(
     throw error;
   }
   return lease;
-}
-
-/**
- * DAEMON-BOOT recovery only. The daemon's boot fence first terminalizes every
- * attempt owned by the dead predecessor process. This second exact join then
- * revokes only worker-batch claims owned by those terminal attempts. Merely
- * finishing an attempt never invokes this function, so a live or
- * abort-ignoring body cannot become stealable through elapsed time/status
- * alone. A CLI or live daemon path must never call this recovery sweep.
- */
-export function reconcileWorkerBatchDurableOwnershipAtBoot(
-  nowMs = Date.now(),
-): number {
-  return openEventLog().prepare(`
-    UPDATE run_dispatch_leases
-       SET revoked_at = COALESCE(revoked_at, ?)
-     WHERE scope_id LIKE 'worker-batch:v1:%'
-       AND revoked_at IS NULL
-       AND run_attempt_id IS NOT NULL
-       AND EXISTS (
-         SELECT 1
-           FROM run_attempts AS attempt
-          WHERE attempt.attempt_id = run_dispatch_leases.run_attempt_id
-            AND attempt.session_id = run_dispatch_leases.session_id
-            AND attempt.finished_at IS NOT NULL
-       )
-  `).run(
-    new Date(nowMs).toISOString(),
-  ).changes;
 }
 
 export function releaseWorkerBatchDurableOwnership(lease: DispatchLeaseRef | undefined): void {

@@ -139,9 +139,17 @@ test('scenario 3/4: a failed candidate reopens discovery instead of closing the 
   assert.equal(first.admitted, true);
   governor.settle({ ...key, category: 'broad_discovery', callId: 'search-1', outcome: 'succeeded' });
 
+  // A successful discovery may need one follow-up/refinement under the same
+  // subject. Once that continuation actually fails, a third physical call
+  // cannot borrow its authority.
+  const continuation = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-2' });
+  assert.equal(continuation.admitted, true);
+  assert.equal(continuation.reason, 'settled_continuation_admitted');
+  governor.settle({ ...key, category: 'broad_discovery', callId: 'search-2', outcome: 'failed' });
+
   // Same task, no new evidence: the repeat neither mints a claim nor receives
   // provider authority under a different physical id.
-  const repeat = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-2' });
+  const repeat = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-3' });
   assert.equal(repeat.admitted, false);
   assert.equal(repeat.reason, 'new_call_requires_retry_epoch');
   assert.equal(repeat.consumedBudget, false);
@@ -157,7 +165,7 @@ test('scenario 3/4: a failed candidate reopens discovery instead of closing the 
 
   // Now looking for a sibling is allowed — the capability class was never the
   // thing that failed.
-  const sibling = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-3' });
+  const sibling = governor.admit({ ...key, category: 'broad_discovery', callId: 'search-4' });
   assert.equal(sibling.admitted, true);
   assert.equal(sibling.reason, 'new_evidence_admitted');
 });

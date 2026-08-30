@@ -31,7 +31,10 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-effect-truth\n', 'utf8');
 
 const { appendEvent, createSession, listEvents, closeEventLog } = await import('./eventlog.js');
-const { commitTurnOutcome } = await import('./delivery-committer.js');
+const {
+  commitTurnOutcome,
+  HOST_LOCAL_FAILURE_BLOCKED_TEXT,
+} = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { publicCompletionText, projectHarnessEventsForPublic } = await import('./public-presentation.js');
 const { HOST_TOOL_UNCERTAIN_BLOCKED_TEXT } = await import('./host-turn-runner.js');
@@ -116,8 +119,14 @@ test('a zero-external-dispatch turn can never render the may-have-begun copy', (
     'zero external dispatches in the ledger: possible external execution may not be claimed');
   assert.doesNotMatch(text, /must be reconciled/i,
     'with nothing external in flight there is nothing to reconcile — the door this copy locks does not exist');
-  assert.match(text, /[Nn]othing external/,
-    'the honest terminal states the ledger fact the user needs: nothing external ran');
+  assert.match(text, /completed work and retained results remain preserved/i,
+    'the honest terminal preserves prior work instead of denying that an earlier read ran');
+  assert.match(text, /no uncertain external change is pending/i,
+    'the terminal states only the ledger fact it can prove about the failed step');
+  assert.equal(text, HOST_LOCAL_FAILURE_BLOCKED_TEXT,
+    'the residual terminal is one bounded factual host error, not a recovery instruction');
+  assert.doesNotMatch(text, /ask me|continue|retry|checkpoint|resume/i,
+    'a terminal with no retained recovery owner must not solicit user lifting or promise a retry');
 });
 
 test('a turn with a genuinely unresolved external write keeps the reconciliation copy', () => {

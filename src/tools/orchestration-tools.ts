@@ -70,7 +70,6 @@ import {
 import type { WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
 import { listFinalFailedItems } from '../execution/workflow-events.js';
 import {
-  queueWorkflowRun,
   queueWorkflowCreationTest,
   requeueWorkflowFailedItemsFromRun,
 } from './workflow-run-queue.js';
@@ -79,25 +78,22 @@ import {
   TURN_SCOPED_HOLD_LABEL,
   describeTurnScopedHold,
 } from './workflow-turn-scoped-hold.js';
-import { surfaceWorkflowPendingInputs } from '../agents/plan-proposals.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   listEvents,
   getSession,
 } from '../runtime/harness/eventlog.js';
-import { workflowOriginReplyTargetForSource } from '../runtime/workflow-origin-authority.js';
-import { prepareWorkflowChatDispatch } from '../runtime/harness/workflow-chat-dispatch-prepare.js';
 export { _setWorkflowDispatchEventAppenderForTests } from '../runtime/harness/workflow-chat-dispatch-prepare.js';
 import {
   resolveWorkflowName,
   workflowNamesEqual,
   type ResolverEntry,
 } from './workflow-resolve.js';
+import { uniqueEnabledWorkflowMatch } from './named-workflow-match.js';
+import { admitNamedWorkflowRunFromAcceptedSource } from './admit-named-workflow-run.js';
 import { addNotification } from '../runtime/notifications.js';
 import { matchToolChoicesForStep, slugifyIntent, type StepToolChoiceMatch, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
-import { linkFocusActionForSession } from '../memory/focus.js';
-import { analyzeWorkflowIntent, type WorkflowBuilderIntent } from '../execution/workflow-builder-analysis.js';
-import { synthesizeWorkflowDefinition, renderAnalysisForApproval } from '../execution/workflow-builder-synthesis.js';
+import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { readDurableBindings, type RoleBinding } from '../runtime/harness/model-roles.js';
 import {
   applyWorkflowVisualContractFixes,
@@ -118,7 +114,21 @@ import {
   workflowTerminalOutcomeNeedsAttention,
   type WorkflowTerminalOutcome,
 } from '../execution/workflow-terminal-outcome.js';
-import { withTerminalAuthoringEvidenceReceipt } from './tool-registry.js';
+import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
+
+function originatingAcceptedUserText(): string {
+  const ctx = getToolOutputContext();
+  if (
+    !ctx?.sessionId
+    || !Number.isSafeInteger(ctx.sourceUserSeq)
+    || (ctx.sourceUserSeq ?? 0) <= 0
+  ) return '';
+  const source = listEvents(ctx.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === ctx.sourceUserSeq);
+  const display = typeof source?.data.displayText === 'string' ? source.data.displayText : '';
+  const text = typeof source?.data.text === 'string' ? source.data.text : '';
+  return (display || text).trim();
+}
 
 /**
  * Parse the workflow_run `inputs` field, which the model passes as a JSON
@@ -146,6 +156,22 @@ export interface AuthoredWorkflowResult {
   boundNotes: string[];
   advisories: string[];
   gaps: ReturnType<typeof analyzeWorkflowGaps>;
+}
+
+/** Stamp the exact workflow artifact only after the canonical reader reopens
+ * the directory layout. Create, whole-definition update, and targeted-step
+ * edit all use this one receipt grammar, so the harness proves the final bytes
+ * instead of trusting authoring prose. */
+function withWorkflowCommit(dirName: string, result: string): string {
+  const entry = readWorkflow(dirName);
+  if (!entry || entry.name !== dirName || entry.layout !== 'directory') {
+    throw new Error(`Workflow ${dirName} was committed but its exact local artifact could not be reopened.`);
+  }
+  return withHostLocalWriteCommitFromFile({
+    createdId: dirName,
+    committedPath: entry.filePath,
+    result,
+  });
 }
 
 /**
@@ -447,10 +473,22 @@ export function bindStepsToToolChoices(
   for (const step of steps) {
     if (step.usesSkill) continue; // a skill owns its own tool surface
     if (step.prompt.includes(BIND_DIRECTIVE_MARKER)) continue; // already engine-bound
+    const requestedEffectScope = requestedCapabilityEffectScope(step.prompt);
     let matches: StepToolChoiceMatch[];
     try { matches = matchToolChoicesForStep(step.prompt, { choices: opts.choices }); } catch { continue; }
     const top = matches.find((m) => !m.alreadyBound);
     if (!top) continue;
+    // A compound read+write step needs more than one effect role. Procedural
+    // memory is useful ranking evidence for the operation it proved, but one
+    // recalled CLI/MCP must never lock the whole step's surface and strand the
+    // other role. Keep the step unchanged and make the missing discovery work
+    // explicit; a later authoring pass may split/bind the roles independently.
+    if (requestedEffectScope === 'mixed') {
+      advisories.push(
+        `Step \`${step.id ?? '?'}\` contains mixed read/write work. Remembered ${top.kind} \`${neutralizeTemplatePlaceholders(top.command)}\` may cover one operation, but it was not auto-bound or used to lock the step. Split the effects into separate steps or keep discovery available for every unresolved capability.`,
+      );
+      continue;
+    }
     // AUTO-BIND only when it's a proven cli/mcp choice AND locking it in won't
     // silently widen the auto-approval scope the author chose; otherwise advise.
     const safeToLock = canLockWithoutEscalation(step.allowedTools, top.family);
@@ -801,10 +839,8 @@ const STEP_OUTPUT_CONTRACT_DESC =
 
 const WorkflowLoopUntilSchema = z.object({
   maxAttempts: z.number().min(1).max(10).optional(),
-  probe: z.object({ runner: z.string().min(1) }).optional()
-    .describe('Deterministic exit probe: a scripts/ helper (like deterministic.runner) run AFTER each attempt.'),
   until: WorkflowStepOutputContractSchema.optional()
-    .describe('Contract the probe output must satisfy for the loop to EXIT — e.g. {"required_keys":["done"],"non_empty":["done"]} for poll-until-complete, or a min_items check for page-until-drained.'),
+    .describe('Contract the step output must satisfy for the loop to EXIT — e.g. {"required_keys":["done"],"non_empty":["done"]} for poll-until-complete, or a min_items check for page-until-drained.'),
 });
 
 const WorkflowTriggerEventSchema = z.object({
@@ -829,7 +865,7 @@ const WORKFLOW_VISUAL_CONTRACT_FIX_KINDS = [
 const WorkflowVisualContractFixKindSchema = z.enum(WORKFLOW_VISUAL_CONTRACT_FIX_KINDS);
 
 const LOOP_UNTIL_DESC =
-  'Step-level loop. Exit condition = the step\'s own output contract (retry-until-contract-passes, ≤5 attempts), OR probe+until (loop until EXTERNAL STATE satisfies the until contract — poll-until-done / paginate-until-drained, ≤10 attempts). Plain LLM read steps; write needs loopSafe; send never loops.';
+  'Step-level loop whose exit condition is the step\'s own output contract (retry until the contract passes, bounded by maxAttempts). Use an exact read call when each attempt must observe external state. Plain LLM read steps may loop; write needs loopSafe; send never loops.';
 
 // The cron TOOL surfaces (add_cron_job / cron_list / cron_run_history /
 // trigger_cron_job / cron_progress_write) were retired; only cron_progress_read
@@ -1033,13 +1069,12 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_create',
-    "Create a workflow. Clementine intelligently handles it however you describe it: give a simple goal (\"audit sites daily and email the report\") and I'll break it into steps, suggest tools, and ask for approval. Or give full step-by-step details for more control. Either way, I analyze for gaps, validate dependencies, and ensure it's production-ready. "
-      + "SIMPLE MODE: Just describe what you want automated (e.g., \"Research a domain's SEO metrics and summarize them as JSON\"). I'll intelligently break it into steps, suggest tools, detect parallelization, and show you the plan before creating. "
-      + "ADVANCED MODE: Provide step-by-step definitions with full prompts, dependencies, and tool choices for complete control. I still validate and suggest improvements. "
+    "Create a workflow from the exact semantic step graph you author for the user's request. Keep the graph small: each step does one business job, and use dependencies only where data or ordering genuinely requires them. The host validates and compiles your graph; it never invents missing topology from keyword rules. "
       + "AUTHORING MODEL: Workflows are AUTONOMOUS BY DEFAULT — they run end-to-end on your one-time consent (enabling), WITHOUT pausing for per-step approval, unless you set `requiresApproval: true` on irreversible actions (sends, publishes). "
       + "Each step does ONE job; outputs flow to dependent steps automatically via `dependsOn`. Steps with the same dependsOn run in parallel. Use forEach for per-item fan-out. "
       + "For a heavy read-only analysis over upstream results/artifacts, use `subgraph: {mode:'read_parallel_v1', specialists:[...]}` on the reducer step; its 2–6 result-only specialists run concurrently and the authored step joins them. Keep external fetches and all writes/sends as separate nodes. "
       + "DECLARE STEP INPUTS on mechanical tool steps: `inputs` maps argument names to sources like input.domain or steps.fetch.output.rows. If the exact tool + args are known, prefer `call`; otherwise a single direct allowedTools slug + inputs + output lets the compiler codify it safely. "
+      + "For pure data shaping, use `transform`: a closed v1 JSON expression over literal/input/upstream values with get, jsonParse, jsonStringify, object, array, count, map, select, and aggregate. It runs in-process with fixed bounds and no model/tool/process access. Do not author raw script runners: deterministic.runner and loopUntil.probe.runner are legacy migration fields and fail closed before execution. Express external work as exact `call` steps and pure computation as `transform`. "
       + "DECLARE OUTPUT CONTRACTS on any step whose output a later step depends on (type, required_keys, verify.path_exists). The engine verifies before continuing, preventing hollow results from feeding downstream. "
       + "DECLARE sideEffect on every step ('read' | 'write' | 'send') — it drives the safety law: send steps never auto-retry, crash-resume halts on interrupted writes/sends. "
       + "PINNED GOAL: declare `goal` to make the workflow run-to-completion — every completed run is validated EXTERNALLY against the goal's success criteria; an unmet goal automatically re-runs the workflow with the validation feedback (bounded by max_attempts, never after an irreversible step executed), and an exhausted goal parks loudly for the user. "
@@ -1049,7 +1084,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       description: z.string().min(1),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}, the local project with {{project.path}} / {{project.name}}, and iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
+        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}, the local project with {{project.path}} / {{project.name}}, and iterate with {{item}} under forEach. Optional when `call` is the executor.'),
         project: z.string().optional().describe('Local workspace/project name or path this step requires. Omit to inherit the workflow-level project. Readiness preflight blocks the run if the project is not available locally.'),
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         model: z.string().optional(),
@@ -1057,17 +1092,14 @@ export function registerOrchestrationTools(server: McpServer): void {
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
-        forEach: z.string().optional().describe('Fan out once per item from an upstream step output. The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
+        forEach: z.string().optional().describe('Fan out once per item from an upstream step output or declared input.<key> (a JSON array string is accepted). The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         subgraph: WorkflowReadParallelSubgraphSchema.optional(),
+        transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. Closed expr ops: literal(value), get(from input.<key> | steps.<id>.output[.<path>] | item[.<path>] inside map), jsonParse(value), jsonStringify(value), object(fields:[{key,value}]), array(items), count(value), map(value,each), select(value,where?,columns?,limit?), aggregate(value,groupBy,metrics?). No code, shell, network, files, tools, or ambient clock. Declare sideEffect:"read" and dependsOn for every referenced upstream step.'),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
-        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. Composio output keeps its `{successful, data, ...}` envelope: bind provider fields with paths such as `steps.fetch.output.data.records`, and validate them with contract paths such as `data.records`. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
-        deterministic: z.object({
-          runner: z.string().min(1).describe('Relative script path inside the workflow\'s scripts/ dir, e.g. "fetch-keywords.js". Extensions: .js/.mjs/.cjs/.ts/.py/.sh or a shebang executable.'),
-          source: z.string().optional().describe('The script\'s SOURCE CODE. When provided, I write it to scripts/<runner> at save time so the step runs immediately — this is how you WRITE CODE for a mechanical step. The script must print ONE JSON document to stdout. Reference inputs/upstream via argv or env you set in the step. Omit only to reuse a script already in scripts/.'),
-        }).optional().describe('DETERMINISTIC SCRIPT step — the agent writes CODE that runs in a sandbox with NO LLM turn (token-free, fast, repeatable every run). Use for mechanical work with a known procedure: shell/CLI, HTTP/API, or data transforms that do not need reasoning. Mutually exclusive with call and prompt.'),
+        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. Composio output keeps its `{successful, data, ...}` envelope: bind provider fields with paths such as `steps.fetch.output.data.records`, and validate them with contract paths such as `data.records`. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
         allowedTools: z.array(z.string()).optional(),
         usesSkill: z.string().optional().describe('Installed skill directory name (under skills/). For repeatable transforms, prefer one usesSkill step over many hand-wired prompt steps.'),
         requiresApproval: z.boolean().optional(),
@@ -1077,7 +1109,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         sideEffect: z.enum(['read', 'write', 'send']).optional().describe("External side-effect class. 'read' = gathers data only; 'write' = mutates local/remote state reversibly; 'send' = irreversible outbound (email/publish/post). Drives the safety law: send never auto-retries, crash-resume halts on interrupted writes/sends. Declare it — undeclared steps fall back to prose heuristics."),
         loopUntil: WorkflowLoopUntilSchema.optional().describe(LOOP_UNTIL_DESC),
         loopSafe: z.boolean().optional().describe('Author assertion that re-running this WRITE step is idempotent (e.g. an upsert keyed on a stable id). Required for loopUntil on write steps; also allows goal re-pursuit past this step.'),
-      })).optional().describe('(Optional) If omitted, I intelligently break down your description into steps. If provided, I still validate and suggest improvements.'),
+      })).min(1).describe('REQUIRED model-authored semantic graph. Include every business step in execution order/dependency form; the host validates and compiles this graph but does not invent missing steps.'),
       project: z.string().optional().describe('Default local workspace/project name or path for this workflow. Use when steps operate in a specific repo or local project; step-level project overrides it.'),
       trigger_schedule: z.string().optional(),
       trigger_timezone: z.string().optional().describe('IANA timezone for trigger_schedule, e.g. "America/Los_Angeles". Use this whenever the user says a local time so 8 AM means their 8 AM, not the server host time.'),
@@ -1096,34 +1128,11 @@ export function registerOrchestrationTools(server: McpServer): void {
       }).optional().describe('PINNED RUN GOAL (run-to-completion): the run is validated externally against these criteria at completion; unmet → automatic re-run with the validation feedback folded into every step prompt (never after an irreversible step executed); exhausted → parks loudly with per-criterion evidence.'),
     },
     async ({ name, description, steps, project, trigger_schedule, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal }) => {
-      // INTELLIGENT WORKFLOW CREATION:
-      // If steps not provided, analyze the description and generate steps intelligently
-      let finalSteps = steps;
-      let analysisReport = '';
-
+      // The already-running primary model owns semantic topology. Refuse a
+      // missing graph even for direct/internal callers that bypass the tool
+      // schema; keyword synthesis here would be a second, less-informed author.
       if (!steps || steps.length === 0) {
-        // Simple mode: description only, analyze and generate steps
-        const analysis = analyzeWorkflowIntent({
-          description,
-          frequency: trigger_schedule,
-        });
-
-        // Show analysis to user
-        analysisReport = `\n\n📋 **Workflow Analysis**\n${renderAnalysisForApproval(analysis)}\n`;
-
-        // Generate steps from analysis
-        const workflowDef = synthesizeWorkflowDefinition(analysis);
-        finalSteps = workflowDef.steps;
-
-        // Use suggested inputs if not provided
-        if (!inputs && workflowDef.inputs) {
-          inputs = JSON.stringify(workflowDef.inputs);
-        }
-      }
-
-      // Validate that we have steps
-      if (!finalSteps || finalSteps.length === 0) {
-        return textResult('Workflow must have at least one step. Either provide steps directly or describe what you want to automate.');
+        return textResult('Workflow was NOT created: provide at least one explicit model-authored semantic step. The host validates and compiles steps but does not infer a graph from description keywords.');
       }
 
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
@@ -1144,7 +1153,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
-      const stepGraphError = validateWorkflowStepGraph(finalSteps);
+      const stepGraphError = validateWorkflowStepGraph(steps);
       if (stepGraphError) return textResult(stepGraphError);
       const triggerResult = buildWorkflowTrigger({
         schedule: trigger_schedule,
@@ -1166,7 +1175,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         ...(typeof project === 'string' && project.trim() ? { project: project.trim() } : {}),
         enabled: true,
         trigger: triggerResult.trigger,
-        steps: normalizeWorkflowSteps(finalSteps),
+        steps: normalizeWorkflowSteps(steps),
         ...(allowSends !== undefined ? { allowSends } : {}),
         ...(goal ? { goal: { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts } } : {}),
         resources: Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined,
@@ -1219,10 +1228,9 @@ export function registerOrchestrationTools(server: McpServer): void {
           created.savedDef.enabled = false;
           writeWorkflowAndSyncTriggers(dirName, created.savedDef);
         }
-        return textResult(withTerminalAuthoringEvidenceReceipt(
-          'workflow_create',
-          `${analysisReport}`
-          + `Created workflow "${name}" (saved DISABLED pending readiness answers). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+        return textResult(withWorkflowCommit(
+          dirName,
+          `Created workflow "${name}" (saved DISABLED pending readiness answers). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `${appendDataSources(created.savedDef)}`
           + `${appendVisualContract(created.executionPlan)}`
           + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
@@ -1233,10 +1241,9 @@ export function registerOrchestrationTools(server: McpServer): void {
         const testInputs = workflowSmokeInputs(created.savedDef, providedSmokeInputs);
         const missingSmokeInputs = missingWorkflowRunInputs(created.savedDef, testInputs);
         if (missingSmokeInputs.length > 0) {
-          return textResult(withTerminalAuthoringEvidenceReceipt(
-            'workflow_create',
-            `${analysisReport}`
-            + `Created workflow "${name}" (saved DISABLED pending verification). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+          return textResult(withWorkflowCommit(
+            dirName,
+            `Created workflow "${name}" (saved DISABLED pending verification). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
             + `${appendDataSources(created.savedDef)}`
             + `${appendVisualContract(created.executionPlan)}`
             + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
@@ -1244,20 +1251,18 @@ export function registerOrchestrationTools(server: McpServer): void {
           ));
         }
         const queued = queueWorkflowCreationTest(name, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
-        return textResult(withTerminalAuthoringEvidenceReceipt(
-          'workflow_create',
-          `${analysisReport}`
-          + `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+        return textResult(withWorkflowCommit(
+          dirName,
+          `Created workflow "${name}" (saved DISABLED while I test it). Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
           + `${appendDataSources(created.savedDef)}`
           + `${appendVisualContract(created.executionPlan)}`
           + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
           + `${queued.message}${advisoryTail}`,
         ));
       }
-      return textResult(withTerminalAuthoringEvidenceReceipt(
-        'workflow_create',
-        `${analysisReport}`
-        + `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
+      return textResult(withWorkflowCommit(
+        dirName,
+        `Created workflow "${name}". Here's what it will do:\n\n${describeWorkflowPlainEnglish(created.savedDef)}\n\n`
         + `${appendDataSources(created.savedDef)}`
         + `${appendVisualContract(created.executionPlan)}`
         + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}`
@@ -1410,18 +1415,19 @@ export function registerOrchestrationTools(server: McpServer): void {
         );
       }
       if (resolution.kind === 'fuzzy') {
-        return textResult(
-          `No workflow is named exactly "${name}". The closest match is "${resolution.name}". `
-            + `Confirm with the user before running it — e.g. "Just to confirm, did you want me to kick off your ${resolution.name} workflow? I'll report back once it's done." — `
-            + `then call workflow_run with name "${resolution.name}".`,
-        );
+        const turnMatch = uniqueEnabledWorkflowMatch(originatingAcceptedUserText());
+        if (!turnMatch || !workflowNamesEqual(turnMatch.name, resolution.name)) {
+          return textResult(
+            `No workflow is named exactly "${name}". The closest match is "${resolution.name}". `
+              + `Confirm with the user before running it — e.g. "Just to confirm, did you want me to kick off your ${resolution.name} workflow? I'll report back once it's done." — `
+              + `then call workflow_run with name "${resolution.name}".`,
+          );
+        }
+        // The accepted turn already uniquely named this workflow. Re-asking
+        // for the same identity is a second confirmation of work the owner
+        // already identified (live 2026-08-29: "run my platform 49 workflow").
       }
-      // Exact match → run it.
-      const workflow = all.find((e) => workflowNamesEqual(e.data.name, resolution.name));
-      if (!workflow) return textResult(`Workflow "${name}" not found.`);
-      const canonicalName = workflow.data.name;
-      if (!workflow.data.enabled) return textResult(`Workflow "${canonicalName}" is disabled.`);
-
+      // Exact (or accepted-source unique fuzzy) match → the shared admit path.
       // The old name-literal "unrequested workflow" guard was DELETED here
       // (live 2026-07-23): it refused a user-confirmed run because the slug
       // only appeared in the assistant's own question, and it manufactured a
@@ -1430,107 +1436,35 @@ export function registerOrchestrationTools(server: McpServer): void {
       // external write, 2026-05-31) is carried by the EFFECT layer now: every
       // irreversible send inside a run hits the approval gates and parks a
       // card in the origin chat. Constrain effects, not methods.
-      // Session context still matters for ask-then-resume pending inputs and
-      // the origin-session report-back below; absent for internal callers.
-      const toolCtx = getToolOutputContext();
-
       let parsedInputs: Record<string, string>;
       try {
         parsedInputs = parseWorkflowRunInputsJson(inputs);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
-      const normalizedInputs = normalizeWorkflowRunInputs(parsedInputs);
-      const runCertification = certifyWorkflow(workflow.data, {
-        workflowSlug: workflow.name,
-        runInputs: normalizedInputs,
+      const toolCtx = getToolOutputContext();
+      const admitted = admitNamedWorkflowRunFromAcceptedSource({
+        workflowName: resolution.name,
+        sessionId: toolCtx?.sessionId,
+        sourceUserSeq: toolCtx?.sourceUserSeq,
+        inputs: parsedInputs,
       });
-      if (runCertification.resourceGaps.length > 0) {
+      if (admitted.status === 'certification_failed') {
+        const workflow = all.find((entry) => workflowNamesEqual(entry.data.name, admitted.workflowName));
+        const cert = workflow
+          ? certifyWorkflow(workflow.data, {
+              workflowSlug: workflow.name,
+              runInputs: normalizeWorkflowRunInputs(parsedInputs),
+            })
+          : null;
         return textResult(
-          `${renderWorkflowCertification(runCertification)}\n\n${renderWorkflowCertificationCommandHint(runCertification)}`,
+          cert
+            ? `${admitted.message}\n\n${renderWorkflowCertificationCommandHint(cert)}`
+            : admitted.message,
           { maxChars: 40_000 },
         );
       }
-      const missing = missingWorkflowRunInputs(workflow.data, normalizedInputs);
-      if (missing.length > 0) {
-        // Ask-then-resume: in a chat context, surface a pending-inputs proposal
-        // keyed to the session so the user's NEXT reply supplies the values and
-        // we resume the run (see plan-continuity). This replaces the old
-        // model-directed retry message that the strict-mode schema could not
-        // satisfy — the call that drove the 84× / 3-min hang. No session context
-        // (tests / internal callers) → keep the deterministic rejection.
-        if (toolCtx?.sessionId) {
-          surfaceWorkflowPendingInputs({
-            workflowName: canonicalName,
-            requiredInputs: missing,
-            providedInputs: normalizedInputs,
-            sessionId: toolCtx.sessionId,
-            originatingRequest: `Run the "${canonicalName}" workflow`,
-          });
-          const inputList = missing.map((key) => `\`${key}\``).join(', ');
-          return textResult(
-            `I need ${inputList} to run the "${canonicalName}" workflow. Reply with ${missing.length === 1 ? 'it' : 'them'} and I'll run it.`,
-          );
-        }
-        return textResult(
-          [
-            `Workflow "${canonicalName}" was not queued because required input${missing.length === 1 ? '' : 's'} ${missing.map((key) => `"${key}"`).join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing.`,
-            `Call workflow_run again with inputs including ${missing.map((key) => `"${key}": "<value>"`).join(', ')}.`,
-          ].join('\n'),
-        );
-      }
-
-      // Gap E: carry the triggering chat session so the run re-enters it on a
-      // terminal state (in-context report-back, in ADDITION to the global
-      // notification). toolCtx is the agent's tool-output context resolved
-      // above; absent for non-chat callers → notification-only.
-      const exactOrigin = toolCtx?.sessionId
-        && Number.isSafeInteger(toolCtx.sourceUserSeq)
-        && (toolCtx.sourceUserSeq ?? 0) > 0
-        ? { sessionId: toolCtx.sessionId, sourceUserSeq: toolCtx.sourceUserSeq as number }
-        : undefined;
-      const exactSource = exactOrigin
-        ? listEvents(exactOrigin.sessionId, { types: ['user_input_received'] })
-            .find((event) => event.seq === exactOrigin.sourceUserSeq)
-        : undefined;
-      const replyTarget = exactOrigin
-        ? workflowOriginReplyTargetForSource(exactOrigin)
-        : null;
-      if (exactOrigin && (!exactSource || !replyTarget)) {
-        return textResult(
-          `Workflow "${canonicalName}" was not queued because this chat's exact report-back target could not be bound safely.`,
-        );
-      }
-      const originObserver = exactOrigin && replyTarget
-        ? { ...exactOrigin, replyTarget }
-        : undefined;
-      const queued = queueWorkflowRun(canonicalName, normalizedInputs, {
-        ...(originObserver
-          ? {
-              originObserver,
-              prepareChatDispatch: prepareWorkflowChatDispatch,
-            }
-          : { originSessionId: toolCtx?.sessionId }),
-      });
-      const acceptedDispatch = Boolean(queued.chatDispatchPreparation)
-        || queued.status === 'queued'
-        || queued.status === 'duplicate';
-      if (acceptedDispatch && !queued.id) {
-        throw new Error('workflow queue accepted a run without returning its durable run id');
-      }
-      if (queued.id && acceptedDispatch && !queued.chatDispatchPreparation) {
-        linkFocusActionForSession(toolCtx?.sessionId, {
-          id: queued.id,
-          label: canonicalName,
-          status: 'running',
-          kind: 'workflow',
-          ref: queued.id,
-          note: queued.status === 'duplicate'
-            ? 'Rejoined the already-running workflow; no duplicate was queued.'
-            : undefined,
-        });
-      }
-      return textResult(queued.message);
+      return textResult(admitted.message);
     },
   );
 
@@ -1831,13 +1765,13 @@ export function registerOrchestrationTools(server: McpServer): void {
       + 'IMPORTANT: when `steps` is present it REPLACES THE ENTIRE STEP GRAPH; never send one step as a patch. Read and resend every step for a graph change, or use workflow_edit_step for a targeted prompt edit. '
       + 'Design THIN agentic steps: a few capable steps (each doing a whole meaningful chunk), not many micro-steps. `dependsOn` both orders steps and carries upstream outputs into the downstream STEP CONTEXT. '
       + 'For a heavy read-only analysis, `subgraph: {mode:"read_parallel_v1", specialists:[...]}` compiles 2–6 concurrent result-only branches and uses the authored step as their reducer; keep fetch/effect nodes separate. '
-      + 'For mechanical tool steps, declare `inputs` argument bindings plus `output`, or use `call` directly when the exact tool and args are known.',
+      + 'For mechanical tool steps, declare `inputs` argument bindings plus `output`, or use `call` directly when the exact tool and args are known. Raw deterministic/probe runners are legacy migration fields and are refused before execution.',
     {
       name: z.string().min(1),
       description: z.string().optional(),
       steps: z.array(z.object({
         id: z.string().min(1),
-        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}, the local project with {{project.path}} / {{project.name}}, and iterate with {{item}} under forEach. Optional when `call` or `deterministic` is the executor.'),
+        prompt: z.string().optional().describe('The step task. Outputs from dependsOn steps arrive automatically in STEP CONTEXT.upstream; reference {{steps.<id>.output}} only when a precise inline value is useful. Reference a workflow input with {{input.<key>}}, the local project with {{project.path}} / {{project.name}}, and iterate with {{item}} under forEach. Optional when `call` is the executor.'),
         project: z.string().optional().describe('Local workspace/project name or path this step requires. Omit to inherit the workflow-level project.'),
         dependsOn: z.array(z.string()).optional().describe('Step IDs this step waits for. Their outputs are automatically available to this step in STEP CONTEXT.upstream.'),
         model: z.string().optional(),
@@ -1845,17 +1779,14 @@ export function registerOrchestrationTools(server: McpServer): void {
         tier: z.number().optional(),
         maxTurns: z.number().optional(),
         useHarness: z.boolean().optional(),
-        forEach: z.string().optional().describe('Fan out once per item from an upstream step output. The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
+        forEach: z.string().optional().describe('Fan out once per item from an upstream step output or declared input.<key> (a JSON array string is accepted). The runner aggregates results as [{itemKey, output}]. Use an object/scalar output contract for EACH item, or an array output contract for the aggregate.'),
         forEachNewOnly: z.boolean().optional().describe('Cross-run watermark: fan out over only items NOT completed by any prior run of this workflow (stable key = item.id/key/slug). Use for recurring "process new arrivals" feeds — new leads, new emails, new rows. Failed items retry next run; requires forEach.'),
         subgraph: WorkflowReadParallelSubgraphSchema.optional(),
+        transform: z.string().optional().describe('PURE REVIEWED TRANSFORM as exact JSON text: {"version":1,"expression":<expr>}. Closed expr ops: literal, get, jsonParse, jsonStringify, object, array, count, map, select, aggregate. No code or effect access. Declare sideEffect:"read" and dependsOn for referenced upstream steps.'),
         call: z.object({
           tool: z.string().min(1).describe('Tool slug to invoke directly (v1: a composio slug).'),
           args: z.record(z.string(), z.unknown()).optional().describe('Arguments. String values template: {{input.x}}, {{steps.<id>.output[.path]}}, {{item[.path]}}, {{project.path}}, {{date}} — a value that is EXACTLY one token resolves to the raw upstream value (object/array preserved).'),
-        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. Composio output keeps its `{successful, data, ...}` envelope: bind provider fields with paths such as `steps.fetch.output.data.records`, and validate them with contract paths such as `data.records`. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. Mutually exclusive with deterministic. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
-        deterministic: z.object({
-          runner: z.string().min(1).describe('Relative script path inside the workflow\'s scripts/ dir, e.g. "fetch-keywords.js". Extensions: .js/.mjs/.cjs/.ts/.py/.sh or a shebang executable.'),
-          source: z.string().optional().describe('The script\'s SOURCE CODE. When provided, I write it to scripts/<runner> at save time so the step runs immediately — this is how you WRITE CODE for a mechanical step. The script must print ONE JSON document to stdout. Reference inputs/upstream via argv or env you set in the step. Omit only to reuse a script already in scripts/.'),
-        }).optional().describe('DETERMINISTIC SCRIPT step — the agent writes CODE that runs in a sandbox with NO LLM turn (token-free, fast, repeatable every run). Use for mechanical work with a known procedure: shell/CLI, HTTP/API, or data transforms that do not need reasoning. Mutually exclusive with call and prompt.'),
+        }).optional().describe('STRUCTURED TOOL CALL — the runner executes this tool DIRECTLY with no LLM turn (deterministic, free, un-phantomable). Use when the tool + arg shape are known. Composio output keeps its `{successful, data, ...}` envelope: bind provider fields with paths such as `steps.fetch.output.data.records`, and validate them with contract paths such as `data.records`. A reasoned tool USE (deciding which tool / shaping ambiguous input) stays a normal prompt step. No prompt needed. May combine with forEach for READ-class calls; send/write call fan-out is blocked until per-call idempotency tracking lands.'),
         allowedTools: z.array(z.string()).optional(),
         requiresApproval: z.boolean().optional().describe('Set true to pause this step for user approval before execution (for irreversible sends / publishes).'),
         approvalPreview: z.string().optional().describe('One-line preview shown on the approval card when requiresApproval is set.'),
@@ -2061,14 +1992,15 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateGaps = renderWorkflowGapQuestions(updatePrep.status === 'readiness_gaps' ? updatePrep.gaps : analyzeWorkflowGaps(savedNext));
       const updateExecutionPlan = buildWorkflowExecutionPlanWithReadiness(savedNext, entry.name);
       const updateContractReport = appendVisualContract(updateExecutionPlan);
-      return textResult(
+      return textResult(withWorkflowCommit(
+        entry.name,
         `Workflow "${name}" updated. Here's what it does now:\n\n${describeWorkflowPlainEnglish(savedNext)}\n\n`
           + `${appendDataSources(savedNext)}`
           + `${updateContractReport}${updateContractReport ? '\n\n' : ''}`
           + `${updatePrep.status === 'readiness_gaps' ? `${renderReadinessHold(name)}\n\n` : ''}`
           + `${reSmoke ? `${reSmoke.message}\n\n` : ''}`
           + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
-      );
+      ));
     },
   );
 
@@ -2154,7 +2086,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         silent: true,
         metadata: { source: 'workflow_edit_step', workflowName: workflowSlug, stepId: step_id },
       });
-      return textResult(`${resultMessage}${reSmokeMsg}`);
+      return textResult(withWorkflowCommit(
+        workflowSlug,
+        `${resultMessage}${reSmokeMsg}`,
+      ));
     },
   );
 

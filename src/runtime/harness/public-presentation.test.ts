@@ -494,6 +494,8 @@ test('a malformed typed presentation cannot launder its duplicate legacy reply i
   }));
   assert.ok(projected);
   assert.match(String(projected.data.reply), /final reply was not safe to display/i);
+  assert.doesNotMatch(String(projected.data.reply), /ask me|continue|retry|resume/i,
+    'an invalid terminal has no recovery owner and must not solicit a continuation');
   assert.notEqual(projected.data.reply, 'Safe committed fallback.');
   assert.equal((projected.data.presentation as { status?: string }).status, 'failed');
 });
@@ -516,6 +518,7 @@ test('a typed presentation with contradictory status and kind fails closed', () 
   }));
   assert.ok(projected);
   assert.match(String(projected.data.reply), /final reply was not safe to display/i);
+  assert.doesNotMatch(String(projected.data.reply), /ask me|continue|retry|resume/i);
   assert.notEqual(projected.data.reply, 'Safe committed fallback.');
   assert.equal((projected.data.presentation as { kind?: string }).kind, 'error');
 });

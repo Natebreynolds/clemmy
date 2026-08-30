@@ -12,10 +12,22 @@ import { z } from 'zod';
 import { resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { convertToMarkdown, isConvertibleExtension } from '../runtime/markitdown.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { chunkText, scoreChunks } from './file-query-core.js';
 
 const MAX_TEXT_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Strict tool schemas represent an optional string as string | null. Some
+ * compatible models textualize that unused null as the literal string
+ * `"null"`. Reserve only that bare token as absence; real paths such as
+ * `./null` and call ids containing the word remain ordinary sources.
+ */
+function optionalSource(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return !trimmed || trimmed.toLowerCase() === 'null' ? null : trimmed;
+}
 
 export function registerFileQueryTools(server: McpServer): void {
   server.tool(
@@ -33,17 +45,20 @@ export function registerFileQueryTools(server: McpServer): void {
     },
     async ({ query, file, call_id, top_k }) => {
       try {
-        const sources = [file, call_id].filter((v) => v && v.trim());
-        if (sources.length !== 1) return textResult('ERROR: pass exactly ONE of `file` / `call_id`.');
+        const fileSource = optionalSource(file);
+        const callIdSource = optionalSource(call_id);
+        if ((fileSource === null) === (callIdSource === null)) {
+          return invalidArgumentsTextResult('ERROR: pass exactly ONE of `file` / `call_id`.');
+        }
         let text: string;
         let label: string;
-        if (file?.trim()) {
-          const filePath = path.resolve(file.trim());
+        if (fileSource !== null) {
+          const filePath = path.resolve(fileSource);
           const stat = statSync(filePath);
-          if (stat.size > MAX_TEXT_BYTES) return textResult(`ERROR: file is ${Math.round(stat.size / 1024 / 1024)}MB (cap 50MB).`);
+          if (stat.size > MAX_TEXT_BYTES) return invalidArgumentsTextResult(`ERROR: file is ${Math.round(stat.size / 1024 / 1024)}MB (cap 50MB).`);
           if (isConvertibleExtension(filePath)) {
             const converted = await convertToMarkdown(filePath);
-            if (!converted.ok) return textResult(`ERROR: could not extract text from ${path.basename(filePath)}: ${converted.error}`);
+            if (!converted.ok) return invalidArgumentsTextResult(`ERROR: could not extract text from ${path.basename(filePath)}: ${converted.error}`);
             text = converted.markdown;
           } else {
             text = readFileSync(filePath, 'utf-8');
@@ -51,19 +66,19 @@ export function registerFileQueryTools(server: McpServer): void {
           label = path.basename(filePath);
         } else {
           const sessionId = getToolOutputContext()?.sessionId;
-          if (!sessionId) return textResult('ERROR: call_id needs a live session context — pass `file` instead.');
-          const resolution = resolveToolOutputForAuthority(sessionId, call_id!.trim());
-          if (resolution.status === 'ambiguous') return textResult(`ERROR: call id "${call_id}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
-          if (resolution.status === 'missing') return textResult(`ERROR: no stored output for call id "${call_id}" in this session.`);
-          if (resolution.status === 'failed') return textResult(`ERROR: stored output for call id "${call_id}" cannot be used because ${resolution.reason}. Re-run the source read.`);
+          if (!sessionId) return invalidArgumentsTextResult('ERROR: call_id needs a live session context — pass `file` instead.');
+          const resolution = resolveToolOutputForAuthority(sessionId, callIdSource!);
+          if (resolution.status === 'ambiguous') return invalidArgumentsTextResult(`ERROR: call id "${callIdSource}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
+          if (resolution.status === 'missing') return invalidArgumentsTextResult(`ERROR: no stored output for call id "${callIdSource}" in this session.`);
+          if (resolution.status === 'failed') return invalidArgumentsTextResult(`ERROR: stored output for call id "${callIdSource}" cannot be used because ${resolution.reason}. Re-run the source read.`);
           if (resolution.record.truncatedAtWrite) {
-            return textResult(
-              `ERROR: stored output for call id "${call_id}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so file_query will not report matches or misses from a prefix. `
+            return invalidArgumentsTextResult(
+              `ERROR: stored output for call id "${callIdSource}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so file_query will not report matches or misses from a prefix. `
               + 'Re-read/page the provider source until every page is present, or stage the full result as a file and query that file.',
             );
           }
           text = resolution.record.output;
-          label = `tool output ${call_id}`;
+          label = `tool output ${callIdSource}`;
         }
 
         const chunks = chunkText(text);
@@ -86,7 +101,7 @@ export function registerFileQueryTools(server: McpServer): void {
           })),
         }, null, 1));
       } catch (err) {
-        return textResult(`ERROR: file_query failed: ${err instanceof Error ? err.message : String(err)}`);
+        return invalidArgumentsTextResult(`ERROR: file_query failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
   );

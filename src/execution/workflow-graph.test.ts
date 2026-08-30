@@ -7,6 +7,7 @@ import {
   compileWorkflowStepsToGraph,
   getReadyWorkflowGraphNodes,
   validateWorkflowGraph,
+  validateWorkflowGraphAgainstAuthoredSteps,
   workflowGraphEdgeId,
   workflowSubgraphSpecialistNodeId,
   WORKFLOW_GRAPH_ALLOWED_TOOLS,
@@ -36,6 +37,88 @@ test('compileWorkflowStepsToGraph preserves step metadata and dependency edges',
   assert.deepEqual(graph.edges, [
     { id: 'dependency:pull->send', source: 'pull', target: 'send', type: 'dependency' },
   ]);
+});
+
+test('compiled graph digest-covers an authored transform and refuses graph-added transform authority', () => {
+  const authoredSteps = [{
+    id: 'shape',
+    prompt: '',
+    sideEffect: 'read' as const,
+    transform: {
+      version: 1 as const,
+      expression: { op: 'literal' as const, value: [{ id: 'a' }] },
+    },
+  }];
+  const graph = compileWorkflowStepsToGraph(authoredSteps);
+  assert.deepEqual(graph.nodes[0]?.transform, authoredSteps[0].transform);
+  assert.equal(validateWorkflowGraphAgainstAuthoredSteps(graph, authoredSteps).ok, true);
+
+  const tampered = structuredClone(graph);
+  tampered.nodes[0]!.transform = {
+    version: 1,
+    expression: { op: 'literal', value: [{ id: 'ambient' }] },
+  };
+  const tamperedValidation = validateWorkflowGraphAgainstAuthoredSteps(tampered, authoredSteps);
+  assert.equal(tamperedValidation.ok, false);
+  assert.match(tamperedValidation.errors.join(' '), /not byte-identical authored transform semantics/i);
+
+  const added = compileWorkflowStepsToGraph([{ id: 'source', prompt: 'Return source.', sideEffect: 'read' }]);
+  added.nodes.push({
+    id: 'injected_transform',
+    type: 'step',
+    stepId: 'injected_transform',
+    prompt: '',
+    sideEffect: 'read',
+    transform: { version: 1, expression: { op: 'literal', value: true } },
+  });
+  const addedValidation = validateWorkflowGraphAgainstAuthoredSteps(
+    added,
+    [{ id: 'source', prompt: 'Return source.', sideEffect: 'read' }],
+  );
+  assert.equal(addedValidation.ok, false, 'dynamic graph patches cannot mint transform semantics');
+});
+
+test('authored bare-call validation context is exact-node-only and does not widen graph authority', () => {
+  const authoredSteps = [{
+    id: 'pull',
+    prompt: 'Pull the digest.',
+    sideEffect: 'read' as const,
+    call: { tool: 'ALPHA_LIST_RECORDS', args: { view: 'digest' } },
+  }];
+  const graph = compileWorkflowStepsToGraph(authoredSteps);
+
+  const strict = validateWorkflowGraph(graph);
+  assert.equal(strict.ok, false, 'the default graph validator remains exact-plan-only');
+  assert.match(strict.errors.join(' '), /missing its exact invocation plan/i);
+  assert.equal(
+    validateWorkflowGraphAgainstAuthoredSteps(graph, authoredSteps).ok,
+    true,
+    'the unchanged authored node may proceed to the shared live-catalog compiler',
+  );
+
+  const altered = structuredClone(graph);
+  altered.nodes[0]!.call = { tool: 'ALPHA_LIST_RECORDS', args: { view: 'ambient' } };
+  const alteredValidation = validateWorkflowGraphAgainstAuthoredSteps(altered, authoredSteps);
+  assert.equal(alteredValidation.ok, false);
+  assert.match(alteredValidation.errors.join(' '), /missing its exact invocation plan/i);
+
+  const graphAdded = compileWorkflowStepsToGraph([
+    { id: 'seed', prompt: 'Return the seed.', sideEffect: 'read' as const },
+  ]);
+  graphAdded.nodes.push({
+    id: 'injected_call',
+    type: 'step',
+    stepId: 'injected_call',
+    prompt: 'Run an injected call.',
+    sideEffect: 'read',
+    call: { tool: 'ALPHA_LIST_RECORDS', args: { view: 'digest' } },
+  });
+  const graphAddedValidation = validateWorkflowGraphAgainstAuthoredSteps(
+    graphAdded,
+    [{ id: 'seed', prompt: 'Return the seed.', sideEffect: 'read' }],
+  );
+  assert.equal(graphAddedValidation.ok, false);
+  assert.match(graphAddedValidation.errors.join(' '), /missing its exact invocation plan/i);
 });
 
 test('read_parallel_v1 compiles stable specialist siblings and the authored step as their join', () => {

@@ -69,13 +69,20 @@ export interface CuratedToolkit {
   slug: string;
   displayName: string;
   authMode: ToolkitAuthMode;
+  /** Adapter-declared presentation aliases used only for explicit namespace alignment. */
+  namespaceAliases?: readonly string[];
 }
 
 export const CURATED_TOOLKITS: CuratedToolkit[] = [
   { slug: 'gmail', displayName: 'Gmail', authMode: 'managed' },
   { slug: 'googlecalendar', displayName: 'Google Calendar', authMode: 'managed' },
   { slug: 'googledrive', displayName: 'Google Drive', authMode: 'managed' },
-  { slug: 'googlesheets', displayName: 'Google Sheets', authMode: 'managed' },
+  {
+    slug: 'googlesheets',
+    displayName: 'Google Sheets',
+    authMode: 'managed',
+    namespaceAliases: ['Google Sheet'],
+  },
   { slug: 'googledocs', displayName: 'Google Docs', authMode: 'managed' },
   { slug: 'slack', displayName: 'Slack', authMode: 'managed' },
   { slug: 'github', displayName: 'GitHub', authMode: 'managed' },
@@ -2128,16 +2135,94 @@ export async function getExactComposioToolBySlug(slug: string): Promise<Composio
   if (list.length > 1) throw new ComposioExactToolProviderContractError();
   const item = list[0];
   if (!item || String(item.slug ?? '').toUpperCase() !== wanted) return null;
+  const toolkit = obj(item.toolkit);
+  const toolkitSlug = str(toolkit.slug) ?? str(item.toolkitSlug) ?? str(item.toolkit_slug);
+  const hasCamelOutput = Object.prototype.hasOwnProperty.call(item, 'outputParameters');
+  const hasSnakeOutput = Object.prototype.hasOwnProperty.call(item, 'output_parameters');
+  const tool = {
+    slug: item.slug,
+    name: item.name ?? item.slug,
+    description: item.description ?? '',
+    ...(toolkitSlug ? { toolkitSlug } : {}),
+    inputParameters: item.inputParameters ?? item.input_parameters,
+    ...(hasCamelOutput
+      ? { outputParameters: item.outputParameters }
+      : hasSnakeOutput
+        ? { outputParameters: item.output_parameters }
+        : {}),
+    ...(str(item.version) ? { version: str(item.version) } : {}),
+  } as ComposioToolkitTool;
+  toolSchemaObservedAt.set(tool, observedAt);
+  return tool;
+}
+
+/**
+ * Revalidate MANY exact slugs in ONE provider call.
+ *
+ * Same authority contract as the single-slug lookup — a row counts only if the
+ * provider returns that exact slug — but the cost is one request for the whole
+ * batch instead of one per slug. Discovery revalidates several advisory
+ * nominations at once, and per-slug calls would put that cost on every turn.
+ *
+ * The provider is not trusted to answer only what was asked: a row whose slug
+ * was not requested is dropped rather than returned, so a loose server-side
+ * filter can never widen the caller's universe.
+ */
+export async function getExactComposioToolsBySlugs(
+  slugs: readonly string[],
+): Promise<Map<string, ComposioToolkitTool>> {
+  const wanted = new Set<string>();
+  for (const raw of slugs) {
+    const slug = String(raw ?? '').trim().toUpperCase();
+    if (!slug || normalizedComposioActionSlug(slug) !== slug) continue;
+    wanted.add(slug);
+  }
+  const found = new Map<string, ComposioToolkitTool>();
+  if (wanted.size === 0) return found;
+
+  const composio = getComposio() as any;
+  if (!composio) {
+    // Keyless/CLI installs have no batch endpoint; fall back per slug.
+    for (const slug of wanted) {
+      const tool = await getComposioToolBySlugViaCli(slug);
+      if (tool && String(tool.slug ?? '').toUpperCase() === slug) found.set(slug, tool);
+    }
+    return found;
+  }
+
+  const requested = [...wanted];
+  const observedAt = Date.now();
+  const raw = await composio.tools.getRawComposioTools({
+    tools: requested,
+    limit: requested.length,
+  });
+  const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.items) ? raw.items : []);
+  for (const item of list) {
+    const slug = String(item?.slug ?? '').toUpperCase();
+    // Never accept a row nobody asked for, and never let a duplicate row
+    // silently replace the first observation of the same slug.
+    if (!slug || !wanted.has(slug) || found.has(slug)) continue;
+    const toolkit = obj(item.toolkit);
+    const toolkitSlug = str(toolkit.slug) ?? str(item.toolkitSlug) ?? str(item.toolkit_slug);
+    const hasCamelOutput = Object.prototype.hasOwnProperty.call(item, 'outputParameters');
+    const hasSnakeOutput = Object.prototype.hasOwnProperty.call(item, 'output_parameters');
     const tool = {
       slug: item.slug,
       name: item.name ?? item.slug,
       description: item.description ?? '',
+      ...(toolkitSlug ? { toolkitSlug } : {}),
       inputParameters: item.inputParameters ?? item.input_parameters,
-      outputParameters: item.outputParameters ?? item.output_parameters,
-      version: str(item.version),
+      ...(hasCamelOutput
+        ? { outputParameters: item.outputParameters }
+        : hasSnakeOutput
+          ? { outputParameters: item.output_parameters }
+          : {}),
+      ...(str(item.version) ? { version: str(item.version) } : {}),
     } as ComposioToolkitTool;
-  toolSchemaObservedAt.set(tool, observedAt);
-  return tool;
+    toolSchemaObservedAt.set(tool, observedAt);
+    found.set(slug, tool);
+  }
+  return found;
 }
 
 /**

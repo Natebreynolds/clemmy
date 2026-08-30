@@ -28,6 +28,12 @@
  */
 import { getRuntimeEnv } from '../../config.js';
 import type { AgentContextPacket } from './context-packet.js';
+import {
+  READ_RE,
+  SEQUENCE_RE,
+  WRITE_RE,
+  positiveActionSignalText,
+} from './multi-item-intent.js';
 
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high';
 
@@ -56,6 +62,40 @@ export interface EffortSignals {
    * may use 'high' — latency is invisible there and depth aids hard work.
    */
   interactive?: boolean;
+  /**
+   * True only for one bounded foreground action: no per-item work, no explicit
+   * sequence, and no combined read/write plan. A moderate classifier result can
+   * otherwise come from scalar request details (times, durations, versions),
+   * which should not make an interactive single-action turn enter extended
+   * deliberation before it can act.
+   */
+  boundedForegroundAction?: boolean;
+}
+
+export interface TurnEffortSignalInput {
+  interactive: boolean;
+  turnIntent: AgentContextPacket['turnIntent'];
+  multiItem: boolean;
+  text: string;
+}
+
+/**
+ * Derive the foreground posture from the same provider-neutral request facts
+ * already used by context assembly. This is latency policy only; it grants no
+ * tool or effect authority.
+ */
+export function reasoningEffortSignalsForTurn(input: TurnEffortSignalInput): EffortSignals {
+  const actionText = positiveActionSignalText(input.text);
+  const hasRead = READ_RE.test(actionText);
+  const hasWrite = WRITE_RE.test(actionText);
+  return {
+    interactive: input.interactive,
+    boundedForegroundAction: input.interactive
+      && input.turnIntent === 'action'
+      && !input.multiItem
+      && !SEQUENCE_RE.test(actionText)
+      && !(hasRead && hasWrite),
+  };
 }
 
 /** Base ladder: complexity → effort, before the interactive ceiling. */
@@ -80,6 +120,15 @@ export function selectReasoningEffort(
   signals: EffortSignals = {},
 ): { effort: ReasoningEffort; reason: string } {
   const base = baseEffort(complexity);
+  if (
+    signals.interactive
+    && signals.boundedForegroundAction
+    && complexity === 'moderate'
+  ) {
+    // One foreground action should reach its tool path promptly. The moderate
+    // tier is often carried by scalar details rather than multi-step work.
+    return { effort: 'none', reason: 'moderate/interactive-single-action' };
+  }
   if (signals.interactive && base === 'high') {
     // A person is waiting — cap the slowest tier.
     return { effort: 'medium', reason: 'complex/interactive-cap' };

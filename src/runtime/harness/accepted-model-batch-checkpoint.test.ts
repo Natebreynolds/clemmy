@@ -5,6 +5,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { AgentInputItem } from '@openai/agents';
+import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-accepted-model-batch-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -22,6 +23,9 @@ const leases = await import('./dispatch-lease.js');
 const brackets = await import('./brackets.js');
 const invocation = await import('./host-tool-invocation.js');
 const protocol = await import('./conversation-protocol.js');
+const protocolSession = await import('./conversation-protocol-session.js');
+const hostResults = await import('./host-model-result-receipt.js');
+const logicalResults = await import('./logical-model-result-projection-receipt.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -147,6 +151,7 @@ function runCall<T>(input: {
   toolName: string;
   args: unknown;
   effect: 'read' | 'external_write';
+  boundary?: 'host_owned_local' | 'host_owned_external';
   deadlineMs?: number;
   invoke: () => Promise<T>;
 }) {
@@ -163,7 +168,7 @@ function runCall<T>(input: {
       },
       parentLease: input.task.parentLease,
       effect: input.effect,
-      boundary: 'host_owned_external',
+      boundary: input.boundary ?? 'host_owned_external',
       deadlineMs: input.deadlineMs ?? 200,
       invoke: input.invoke,
     }))) as Promise<invocation.HostToolInvocationResult<T>>;
@@ -192,6 +197,56 @@ function resultText(history: readonly AgentInputItem[], callId: string): string 
     if (output?.type === 'text' && typeof output.text === 'string') return output.text;
   }
   return undefined;
+}
+
+function exactSettledResult(input: {
+  task: Fixture;
+  callId: string;
+  history: readonly AgentInputItem[];
+}): AgentInputItem {
+  const evidence = protocolSession.durableConversationProtocolEvidenceForCall({
+    sessionId: input.task.sessionId,
+    history: input.history,
+    callId: input.callId,
+  });
+  assert.equal(evidence?.kind, 'settled_result');
+  if (!evidence || evidence.kind !== 'settled_result') {
+    throw new Error('fixture has no exact settled model result');
+  }
+  return evidence.result;
+}
+
+function recordLogicalResult(
+  admission: AcceptedModelBatchRef,
+  resultItem: AgentInputItem,
+): void {
+  const recorded = logicalResults.recordLogicalModelResultProjectionReceipt({
+    admission,
+    resultItem,
+  });
+  assert.ok(
+    recorded.status === 'recorded' || recorded.status === 'existing',
+    `logical projection receipt was ${recorded.status}`,
+  );
+}
+
+function projectedTextResult(input: {
+  callId: string;
+  toolName: string;
+  value: unknown;
+}): AgentInputItem {
+  return {
+    type: 'function_call_result',
+    callId: input.callId,
+    name: input.toolName,
+    output: {
+      type: 'text',
+      text: typeof input.value === 'string'
+        ? input.value
+        : JSON.stringify(input.value),
+    },
+    status: 'completed',
+  } as AgentInputItem;
 }
 
 test('an admitted batch with no logical start is balanced durably and chains only from its exact checkpoint', () => {
@@ -232,6 +287,23 @@ test('an admitted batch with no logical start is balanced durably and chains onl
     providerResponseId: 'response:different',
   });
   assert.equal(competing.status, 'conflict');
+
+  const noStartResult = hostResults.buildHostToolDispositionResult({
+    callId: 'call:read:1',
+    toolName: 'records_read',
+    disposition: 'not_started',
+    frameDigest: digest('frame:call:read:1'),
+    frameIndex: 0,
+    frameSize: 1,
+  });
+  hostResults.recordHostModelResultReceipts({
+    admission: admitted.admission,
+    resultItems: [noStartResult],
+  });
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
+    committedResultItems: [noStartResult],
+  });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
 
   const recovered = checkpoints.recoverAcceptedModelBatchForRestart({
     sessionId: task.sessionId,
@@ -296,6 +368,17 @@ for (const candidate of [
     const crossing = physicalRows(task, candidate.callId);
     assert.equal(crossing.length, 1);
 
+    const resultItem = exactSettledResult({
+      task,
+      callId: candidate.callId,
+      history: [...preHistory(task), ...openFrame({ ...candidate, args })],
+    });
+    recordLogicalResult(admitted.admission, resultItem);
+    const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
+      committedResultItems: [resultItem],
+    });
+    assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
+
     const recovered = checkpoints.recoverAcceptedModelBatchForRestart({
       sessionId: task.sessionId,
       sourceUserSeq: task.sourceUserSeq,
@@ -332,6 +415,161 @@ for (const candidate of [
   });
 }
 
+for (const candidate of [
+  { label: 'local', boundary: 'host_owned_local' as const },
+  { label: 'external read', boundary: 'host_owned_external' as const },
+]) {
+  test(`an exact ${candidate.label} non-success projection remains ordinary restart-safe model data`, async () => {
+    const task = fixture(`Inspect one ${candidate.label} source and report its typed corrective.`);
+    const callId = `call:typed-failure:${candidate.label.replace(/\s+/g, '-')}`;
+    const toolName = 'read_file';
+    const args = { path: `/fixture/${candidate.label.replace(/\s+/g, '-')}.txt` };
+    const admitted = checkpoints.admitAcceptedModelBatch({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      preHistory: preHistory(task),
+      frameHistory: openFrame({ callId, toolName, args }),
+      providerResponseId: `response:${callId}`,
+    });
+    assert.equal(admitted.status, 'admitted');
+    if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+
+    let bodies = 0;
+    const payload = {
+      ok: false,
+      code: 'fixture_typed_corrective',
+      detail: 'Use the returned corrective in the next model step.',
+    };
+    const invoked = await runCall({
+      task,
+      callId,
+      toolName,
+      args,
+      effect: 'read',
+      boundary: candidate.boundary,
+      invoke: async () => {
+        bodies += 1;
+        return payload;
+      },
+    });
+    assert.equal(invoked.settlement.outcome.kind, 'unknown');
+    assert.equal(bodies, 1);
+
+    const resultItem = projectedTextResult({ callId, toolName, value: payload });
+    recordLogicalResult(admitted.admission, resultItem);
+    const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
+      committedResultItems: [resultItem],
+    });
+    assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
+
+    const recovered = checkpoints.recoverAcceptedModelBatchForRestart({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+    });
+    assert.equal(recovered.status, 'ready');
+    if (recovered.status !== 'ready') throw new Error(recovered.reason);
+    assert.equal(resultText(recovered.checkpoint.history, callId), JSON.stringify(payload));
+    assert.equal(physicalRows(task, callId).length, 1);
+    assert.equal(bodies, 1, 'checkpoint recovery cannot repeat the body');
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+test('a returned unknown mutation cannot use a projection receipt to bypass reconciliation', async () => {
+  const task = fixture('Attempt one external mutation whose acknowledgement is negative.');
+  const callId = 'call:returned-unknown-write';
+  const toolName = 'space_publish';
+  const args = { title: 'Unknown acknowledgement' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task),
+    frameHistory: openFrame({ callId, toolName, args }),
+    providerResponseId: 'response:returned-unknown-write',
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+
+  const payload = { ok: false, code: 'unknown_write_acknowledgement' };
+  const invoked = await runCall({
+    task,
+    callId,
+    toolName,
+    args,
+    effect: 'external_write',
+    invoke: async () => payload,
+  });
+  assert.equal(invoked.settlement.outcome.kind, 'uncertain_write');
+  const resultItem = projectedTextResult({ callId, toolName, value: payload });
+  recordLogicalResult(admitted.admission, resultItem);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
+    committedResultItems: [resultItem],
+  });
+  assert.equal(finalized.status, 'evidence_unavailable');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('an uncertain host-owned mutation with zero provider crossings checkpoints reconciliation', async () => {
+  const task = fixture('Attempt one host-owned mutation whose effect is not acknowledged.');
+  const callId = 'call:host-owned-unknown-write';
+  const toolName = 'space_publish';
+  const args = { title: 'Host-owned unknown acknowledgement' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task),
+    frameHistory: openFrame({ callId, toolName, args }),
+    providerResponseId: 'response:host-owned-unknown-write',
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+
+  await assert.rejects(runCall({
+    task,
+    callId,
+    toolName,
+    args,
+    effect: 'external_write',
+    boundary: 'host_owned_local',
+    invoke: async () => { throw new Error('acknowledgement unavailable'); },
+  }));
+  const settlement = eventlog.openEventLog().prepare(`
+    SELECT outcome_kind, physical_crossing_count, host_crossing_count,
+           requires_reconciliation
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, callId);
+  assert.deepEqual(settlement, {
+    outcome_kind: 'uncertain_write',
+    physical_crossing_count: 0,
+    host_crossing_count: 1,
+    requires_reconciliation: 1,
+  });
+
+  const effectUnknown = hostResults.buildHostToolDispositionResult({
+    callId,
+    toolName,
+    disposition: 'effect_unknown',
+    frameDigest: digest(`frame:${callId}`),
+    frameIndex: 0,
+    frameSize: 1,
+  });
+  recordLogicalResult(admitted.admission, effectUnknown);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
+    committedResultItems: [effectUnknown],
+  });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
+  assert.equal(finalized.checkpoint.disposition, 'reconciliation_required');
+
+  const recovered = checkpoints.recoverAcceptedModelBatchForRestart({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(recovered.status, 'reconciliation_required');
+  assert.equal(physicalRows(task, callId).length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('a timed-out external write remains reconciliation-only and is never blindly retried', async () => {
   const task = fixture('Create the exact external table once.');
   const callId = 'call:unknown-write';
@@ -361,6 +599,21 @@ test('a timed-out external write remains reconciliation-only and is never blindl
   }));
   assert.equal(bodies, 1);
   assert.equal(physicalRows(task, callId).length, 1);
+
+  const effectUnknown = hostResults.buildHostToolDispositionResult({
+    callId,
+    toolName,
+    disposition: 'effect_unknown',
+    frameDigest: digest(`frame:${callId}`),
+    frameIndex: 0,
+    frameSize: 1,
+  });
+  if (admitted.status !== 'admitted') throw new Error('fixture admission failed');
+  recordLogicalResult(admitted.admission, effectUnknown);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, {
+    committedResultItems: [effectUnknown],
+  });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
 
   const recovered = checkpoints.recoverAcceptedModelBatchForRestart({
     sessionId: task.sessionId,

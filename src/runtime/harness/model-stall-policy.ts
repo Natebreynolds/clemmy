@@ -21,13 +21,29 @@ export function modelFirstByteStallMs(): number {
   return ceiling > 0 ? Math.min(raw, ceiling) : raw;
 }
 
-/** Legacy SDK-runner retry budget. The host stepper deliberately never uses it. */
-export function modelStreamStallRetries(): number {
+/** Absolute wall for an interactive foreground attempt to produce its first
+ * actionable assistant text/tool item. Provider-private reasoning proves the
+ * connection is alive, but cannot keep a person on a silent UI indefinitely.
+ * Background/workflow/worker lanes do not opt into this policy. */
+export function modelInteractivePreActionableMs(): number {
   const raw = Number.parseInt(
-    getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_RETRIES', '3') ?? '3',
+    getRuntimeEnv('CLEMMY_MODEL_INTERACTIVE_PRE_ACTIONABLE_MS', '60000') ?? '60000',
     10,
   );
-  if (!Number.isFinite(raw) || raw < 0) return 3;
+  if (!Number.isFinite(raw)) return 60_000;
+  return raw <= 0 ? 0 : raw;
+}
+
+/** Shared pre-content retry budget. One clean retry is enough to move to the
+ * already-selected rescue model without multiplying a silent provider wall
+ * into a multi-minute foreground hang. Callers may override this for an
+ * explicit diagnostic/rehearsal, but ordinary turns default to one. */
+export function modelStreamStallRetries(): number {
+  const raw = Number.parseInt(
+    getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_RETRIES', '1') ?? '1',
+    10,
+  );
+  if (!Number.isFinite(raw) || raw < 0) return 1;
   return raw;
 }
 

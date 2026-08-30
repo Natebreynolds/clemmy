@@ -8,6 +8,7 @@
  * The model is stubbed — no Codex quota, no OPENAI_API_KEY.
  */
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -28,6 +29,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-host-turn\n',
 const {
   hostRunRunner: productionHostRunRunner,
   HostInterruptState,
+  HostRecoveryState,
   hostToolCallsLimitCheckpointFor,
 } = await import('./host-turn-runner.js');
 const hostRunRunner: typeof productionHostRunRunner = (
@@ -44,6 +46,11 @@ const hostRunRunner: typeof productionHostRunRunner = (
 const { runConversation, runTurn } = await import('./loop.js');
 const { HarnessSession } = await import('./session.js');
 const eventlog = await import('./eventlog.js');
+const noProgressProjection = await import('./host-no-progress-projection.js');
+const requestProvenance = await import('./model-request-provenance.js');
+const logicalProjectionReceipts = await import('./logical-model-result-projection-receipt.js');
+const memoryRecallUsage = await import('../../memory/recall-usage.js');
+const memoryDatabase = await import('../../memory/db.js');
 const { actionBus } = await import('../action-bus.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
@@ -84,6 +91,7 @@ const { turnOutcomeId } = await import('./turn-outcome.js');
 
 test.after(() => {
   eventlog.closeEventLog();
+  memoryDatabase.closeMemoryDb();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -135,6 +143,29 @@ function stubModel(responses: unknown[][]) {
     },
     getStreamedResponse: testModelStream,
   };
+}
+
+function capturingTextModel(text: string) {
+  let call = 0;
+  const requests: unknown[] = [];
+  return {
+    calls: () => call,
+    requests,
+    async getResponse(request: unknown) {
+      requests.push(request);
+      call += 1;
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output: [textMsg(text)],
+        responseId: `captured-response-${call}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
 const textMsg = (text: string) => ({
@@ -237,7 +268,7 @@ type MaterialSourceBinding = NonNullable<ReturnType<
 async function acceptMaterialSourceContinuation(input: {
   label: string;
   binding: MaterialSourceBinding;
-  consumingDecision?: 'exact' | 'missing' | 'duplicate' | 'reforged' | 'mutated' | 'wrong_role' | 'mixed_role';
+  consumingDecision?: 'exact' | 'missing' | 'duplicate' | 'reforged' | 'mutated' | 'wrong_role' | 'mixed_role' | 'variant';
   reforgedBinding?: MaterialSourceBinding;
   omitParentDecision?: boolean;
   parentDecision?: 'exact' | 'wrong_turn' | 'mixed_turn';
@@ -315,18 +346,24 @@ async function acceptMaterialSourceContinuation(input: {
     turn: 2,
     role: 'user',
     type: 'user_input_received',
-    data: { text: 'Yes' },
+    data: { text: input.consumingDecision === 'variant' ? 'Use a different source instead.' : 'Yes' },
   });
   await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({
     sessionId: session.id,
     sourceUserSeq: source.seq,
-    message: 'Yes',
-  }, source.seq, { typedClassification: { disposition: 'affirmed' } });
+    message: input.consumingDecision === 'variant' ? 'Use a different source instead.' : 'Yes',
+  }, source.seq, {
+    typedClassification: {
+      disposition: input.consumingDecision === 'variant' ? 'provided' : 'affirmed',
+    },
+  });
   const inspection = continuityRuntime.inspectDurableMaterialSourceContinuation({
     sessionId: session.id,
     sourceUserSeq: source.seq,
   });
-  if (input.omitParentDecision || input.parentDecision === 'wrong_turn' || input.parentDecision === 'mixed_turn') {
+  if (input.consumingDecision === 'variant') {
+    assert.equal(inspection.status, 'variant', JSON.stringify(inspection));
+  } else if (input.omitParentDecision || input.parentDecision === 'wrong_turn' || input.parentDecision === 'mixed_turn') {
     assert.equal(inspection.status, 'refused');
   } else {
     assert.equal(inspection.status, 'verified', JSON.stringify(inspection));
@@ -449,7 +486,11 @@ function runHostCanary(
 function runProductionHost(
   fixture: ReturnType<typeof acceptHostCanarySource>,
   agent: Record<string, unknown>,
-  itemsOrState: unknown = [{ type: 'message', role: 'user', content: 'exercise the boundary' }],
+  itemsOrState: unknown = [{
+    type: 'message',
+    role: 'user',
+    content: fixture.source.data.text,
+  }],
 ) {
   return brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     throwingRunner() as never,
@@ -462,6 +503,138 @@ function runProductionHost(
     } as never,
   ));
 }
+
+test('production model provenance refuses input from outside the exact accepted source', async () => {
+  const fixture = acceptHostCanarySource('foreign-model-input');
+  const model = stubModel([[textMsg('must not dispatch')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+
+  await assert.rejects(
+    () => runProductionHost(fixture, agent, [{
+      type: 'message',
+      role: 'user',
+      content: 'This text was never accepted for this source.',
+    }]),
+    (error: unknown) => error instanceof requestProvenance.ModelRequestProvenanceError
+      && error.code === 'accepted_input_not_visible',
+  );
+  assert.equal(model.calls(), 0, 'foreign source text crossed the provider boundary');
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM model_request_provenance
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0);
+});
+
+test('production model dispatch keeps sourceUserSeq-proven memory across event turn drift', async () => {
+  const fixture = acceptHostCanarySource('proven-memory-dispatch');
+  const primer = '[MEMORY PRIMER]\nThe durable preference for this request is teal.';
+  const recallId = `host-proven-memory-${fixture.source.seq}`;
+  memoryRecallUsage.recordRecallRun({
+    id: recallId,
+    objective: String(fixture.source.data.text),
+    surface: 'turn_memory_primer',
+    answerability: 'supported',
+    candidateRefs: [],
+    sessionId: fixture.session.id,
+  });
+  eventlog.appendEvent({
+    sessionId: fixture.session.id,
+    // The source sequence is the identity. A turn-number join would lose this
+    // genuine primer before the provider boundary.
+    turn: fixture.source.turn + 7,
+    role: 'system',
+    type: 'turn_memory_primer',
+    data: {
+      sourceUserSeq: fixture.source.seq,
+      injected: true,
+      injectedBytes: Buffer.byteLength(primer, 'utf8'),
+      visibleTextSha256: sha256(primer),
+      recallId,
+    },
+  });
+  const model = capturingTextModel('I kept the verified memory and answered the request.');
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+
+  await runProductionHost(fixture, agent, [
+    { type: 'message', role: 'user', content: fixture.source.data.text },
+    { role: 'system', content: primer },
+  ]);
+
+  assert.equal(model.calls(), 1);
+  assert.equal(JSON.stringify(model.requests[0]).includes('The durable preference'), true,
+    'the exact proven primer did not reach the model');
+  const row = eventlog.openEventLog().prepare(`
+    SELECT record_id FROM model_request_provenance
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(fixture.session.id, fixture.source.seq) as { record_id: string };
+  const projected = requestProvenance.projectModelRequestProvenance(row.record_id);
+  assert.equal(projected.status, 'ok', JSON.stringify(projected));
+  if (projected.status === 'ok') {
+    assert.equal(projected.manifest.verifiedMemory[0]?.recallId, recallId);
+  }
+});
+
+test('production model dispatch removes one unproven whole primer and records sanitized bytes', async () => {
+  const fixture = acceptHostCanarySource('unproven-memory-dispatch');
+  const primer = '[MEMORY PRIMER]\nThese bytes have no durable recall source.';
+  const model = capturingTextModel('I answered without the unproven optional context.');
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+
+  await runProductionHost(fixture, agent, [
+    { type: 'message', role: 'user', content: fixture.source.data.text },
+    { role: 'system', content: primer },
+  ]);
+
+  assert.equal(model.calls(), 1);
+  assert.equal(JSON.stringify(model.requests[0]).includes('[MEMORY PRIMER]'), false,
+    'the unproven optional item crossed the provider boundary');
+  const row = eventlog.openEventLog().prepare(`
+    SELECT record_id, normalized_request_digest
+      FROM model_request_provenance
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(fixture.session.id, fixture.source.seq) as {
+    record_id: string;
+    normalized_request_digest: string;
+  };
+  const projected = requestProvenance.projectModelRequestProvenance(row.record_id);
+  assert.equal(projected.status, 'ok', JSON.stringify(projected));
+  if (projected.status === 'ok') {
+    assert.deepEqual(projected.manifest.verifiedMemory, []);
+    assert.equal(projected.record.normalizedRequestDigest, row.normalized_request_digest);
+  }
+});
+
+test('production model dispatch refuses an unsettled tool result before provider I/O', async () => {
+  const fixture = acceptHostCanarySource('unsettled-result-dispatch');
+  const model = capturingTextModel('must not dispatch');
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const callId = `ambient-unsettled-${fixture.source.seq}`;
+
+  await assert.rejects(
+    () => runProductionHost(fixture, agent, [
+      { type: 'message', role: 'user', content: fixture.source.data.text },
+      { type: 'function_call', callId, name: 'unsettled_tool', arguments: '{}' },
+      {
+        type: 'function_call_result',
+        callId,
+        name: 'unsettled_tool',
+        status: 'completed',
+        output: { type: 'text', text: 'unsettled result bytes' },
+      },
+    ]),
+    (error: unknown) => error instanceof requestProvenance.ModelRequestProvenanceError
+      && error.code === 'ambient_unsettled_tool_result',
+  );
+  assert.equal(model.calls(), 0, 'an unsettled result reached the provider');
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM model_request_provenance
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0);
+});
 
 function bindHostCanarySurface(
   fixture: ReturnType<typeof acceptHostCanarySource>,
@@ -647,6 +820,705 @@ test('production host pairs a no-effect refusal when its durable ALS owner is ab
     retry: 'replan',
     requiresReconciliation: false,
   }]);
+});
+
+test('production host keeps the no-progress recovery directive out of the exact checkpoint chain', async () => {
+  const fixture = acceptHostCanarySource('checkpoint-recovery-overlay');
+  let bodies = 0;
+  const recovery = {
+    type: 'function' as const,
+    name: 'plan_task',
+    description: 'Exercise the permitted recovery control frame.',
+    parameters: { type: 'object', properties: {} },
+    needsApproval: async () => false,
+    invoke: async () => { bodies += 1; return 'must not run'; },
+  };
+  const model = stubModel([
+    [toolCall('checkpoint-before-recovery', recovery.name, {})],
+    [toolCall('checkpoint-during-recovery', recovery.name, {})],
+    [textMsg('must not outrun the no-progress governor')],
+  ]);
+  const agent = { model, tools: [recovery] };
+  bindHostCanarySurface(fixture, agent, [recovery]);
+
+  const outcome = await runProductionHost(fixture, agent);
+
+  assert.deepEqual(outcome.terminal, {
+    status: 'blocked',
+    reason: 'control_no_progress_exhausted',
+    resumable: false,
+  });
+  assert.doesNotMatch(String(outcome.finalOutput), /checkpoint|reconcil/i,
+    'ordinary host bookkeeping is never rendered as a user-facing effect failure');
+  assert.equal(model.calls(), 2, 'the exact one-shot recovery runs before the governor stops');
+  assert.equal(bodies, 0, 'neither unowned fixture crosses its body boundary');
+  const rows = eventlog.openEventLog().prepare(`
+    SELECT admission.batch_ordinal, admission.call_ids_json,
+           checkpoint.disposition, checkpoint.history_item_count
+      FROM accepted_model_batch_admissions admission
+      LEFT JOIN accepted_model_batch_checkpoints checkpoint
+        ON checkpoint.session_id = admission.session_id
+       AND checkpoint.source_user_seq = admission.source_user_seq
+       AND checkpoint.batch_ordinal = admission.batch_ordinal
+     WHERE admission.session_id = ? AND admission.source_user_seq = ?
+     ORDER BY admission.batch_ordinal
+  `).all(fixture.session.id, fixture.source.seq) as Array<{
+    batch_ordinal: number;
+    call_ids_json: string;
+    disposition: string | null;
+    history_item_count: number | null;
+  }>;
+  assert.deepEqual(rows.map((row) => ({
+    ordinal: row.batch_ordinal,
+    callIds: JSON.parse(row.call_ids_json),
+    disposition: row.disposition,
+  })), [
+    { ordinal: 1, callIds: ['checkpoint-before-recovery'], disposition: 'ready' },
+    { ordinal: 2, callIds: ['checkpoint-during-recovery'], disposition: 'ready' },
+  ]);
+  assert.ok(rows.every((row, index) => (
+    index === 0 || row.history_item_count! > rows[index - 1]!.history_item_count!
+  )), 'each checkpoint extends the exact prior balanced history');
+});
+
+test('production host turns an exact plan account choice into one question with no provider body', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('plan-account-choice-recovery');
+    let planBodies = 0;
+    let providerBodies = 0;
+    const accountChoices = ['work@corp.example', 'personal@example.net'];
+    const planTool = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'plan_task',
+      description: 'Admit the model-authored plan.',
+      parameters: { type: 'object', additionalProperties: true },
+      needsApproval: async () => false,
+      invoke: async () => {
+        planBodies += 1;
+        return JSON.stringify({
+          ok: false,
+          code: 'account_selection_required',
+          detail: 'Outlook Send Email is the matching write; ask which connected account to use.',
+          question: 'Which connected account should I use?',
+          accountChoices,
+          repair: 'Ask the user which exact connected account to use. Do not pick a substitute write.',
+        });
+      },
+    });
+    const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
+    const providerTool = {
+      type: 'function' as const,
+      name: 'provider_body_fixture',
+      description: 'A business provider body that must stay behind the account choice.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      needsApproval: async () => false,
+      invoke: async () => {
+        providerBodies += 1;
+        return 'must not run';
+      },
+    };
+    const surfaces: string[][] = [];
+    let modelCalls = 0;
+    const model = {
+      calls: () => modelCalls,
+      async getResponse(request: { tools?: Array<{ name?: string }> }) {
+        surfaces.push((request.tools ?? []).flatMap((entry) => (
+          typeof entry.name === 'string' ? [entry.name] : []
+        )));
+        modelCalls += 1;
+        return {
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          output: modelCalls === 1
+            ? [toolCall('account-plan', 'plan_task', fusedPlanArgs('external_write'))]
+            : [toolCall('account-question', 'ask_user_question', {
+                question: 'Which connected account should I use?',
+                options: accountChoices,
+                purpose: 'clarification',
+              })],
+          responseId: `account-choice-response-${modelCalls}`,
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const tools = [planTool, questionTool, providerTool];
+    const agent = { model, tools, toolUseBehavior: userChoiceToolUseBehavior };
+    bindHostCanarySurface(fixture, agent, tools);
+
+    const outcome = await runProductionHost(fixture, agent);
+
+    assert.match(
+      String(outcome.finalOutput),
+      /^\[clementine:awaiting-user-input:final\]\nWhich connected account should I use\?/,
+    );
+    assert.equal(model.calls(), 2, 'one causal recovery step emits the question');
+    assert.equal(planBodies, 1);
+    assert.equal(providerBodies, 0, 'the unresolved account choice never enters a provider body');
+    assert.ok(surfaces[0]?.includes('provider_body_fixture'));
+    assert.deepEqual(surfaces[1], ['ask_user_question'],
+      'the recovery surface contains only the exact user-input control');
+    const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    assert.equal(questions.length, 1);
+    assert.deepEqual({
+      question: questions[0]?.data.question,
+      options: questions[0]?.data.options,
+      purpose: questions[0]?.data.purpose,
+    }, {
+      question: 'Which connected account should I use?',
+      options: accountChoices,
+      purpose: 'clarification',
+    });
+    assert.deepEqual(eventlog.openEventLog().prepare(`
+      SELECT outcome_kind, recovery_action, physical_crossing_count, host_crossing_count
+        FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(fixture.session.id, fixture.source.seq, 'account-plan'), {
+      outcome_kind: 'input_required',
+      recovery_action: 'ask_user',
+      physical_crossing_count: 0,
+      host_crossing_count: 1,
+    });
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('consequence-free dependency lookup keeps result readers for one step while repeated authority acquisition stays control-only', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const inertTool = (name: string) => ({
+    type: 'function' as const,
+    name,
+    description: `${name} surface fixture`,
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    needsApproval: async () => false,
+    invoke: async () => `${name} must not run`,
+  });
+  try {
+    const lookupFixture = acceptHostCanarySource('dependency-lookup-reader-surface');
+    let lookupBodies = 0;
+    const lookup = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'file_query',
+      description: 'Read one already-landed dependency result.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      needsApproval: async () => false,
+      invoke: async () => {
+        lookupBodies += 1;
+        return { records: [{ id: 'landed-record', value: 42 }] };
+      },
+    });
+    const lookupTools = [
+      lookup,
+      inertTool('tool_output_query'),
+      inertTool('recall_tool_result'),
+      inertTool('plan_task'),
+    ];
+    const lookupSurfaces: string[][] = [];
+    let lookupModelCalls = 0;
+    const lookupModel = {
+      calls: () => lookupModelCalls,
+      async getResponse(request: { tools?: Array<{ name?: string }> }) {
+        lookupSurfaces.push((request.tools ?? []).flatMap((entry) => (
+          typeof entry.name === 'string' ? [entry.name] : []
+        )));
+        lookupModelCalls += 1;
+        return {
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          output: lookupModelCalls === 1
+            ? [toolCall('landed-dependency-lookup', 'file_query', {})]
+            : [textMsg('answered from the landed lookup')],
+          responseId: `dependency-lookup-response-${lookupModelCalls}`,
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const lookupAgent = { model: lookupModel, tools: lookupTools };
+    bindHostCanarySurface(lookupFixture, lookupAgent, lookupTools);
+
+    const lookupOutcome = await runProductionHost(lookupFixture, lookupAgent);
+
+    assert.equal(lookupOutcome.finalOutput, 'answered from the landed lookup');
+    assert.equal(lookupBodies, 1);
+    assert.equal(lookupModel.calls(), 2, 'the landed lookup receives exactly one bounded synthesis step');
+    assert.ok(lookupSurfaces[1]?.includes('tool_output_query'),
+      'the bounded synthesis step lost tool_output_query');
+    assert.ok(lookupSurfaces[1]?.includes('recall_tool_result'),
+      'the bounded synthesis step lost recall_tool_result');
+    const lookupDelta = lookupOutcome.history.filter((item) => (
+      (item as { callId?: unknown }).callId === 'landed-dependency-lookup'
+    ));
+    assert.deepEqual(noProgressProjection.projectHostNoProgressAttempt({
+      sessionId: lookupFixture.session.id,
+      sourceUserSeq: lookupFixture.source.seq,
+      historyDelta: lookupDelta,
+    }), { status: 'ok', attemptClass: 'dependency_lookup' });
+
+    const authorityFixture = acceptHostCanarySource('authority-acquisition-control-surface');
+    let authorityBodies = 0;
+    const authorityLookup = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'tool_search',
+      description: 'Acquire one bounded capability candidate.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string' } },
+        required: ['query'],
+        additionalProperties: false,
+      },
+      needsApproval: async () => false,
+      invoke: async () => {
+        authorityBodies += 1;
+        // The production runner classifies attempts from this exact durable
+        // admission fact, never from the model-authored discovery tool name.
+        eventlog.appendEvent({
+          sessionId: authorityFixture.session.id,
+          turn: 1,
+          role: 'system',
+          type: 'discovery_governor_decision',
+          data: {
+            sourceUserSeq: authorityFixture.source.seq,
+            callId: `authority-acquisition-${authorityBodies}`,
+            decision: 'admitted',
+          },
+        });
+        return { capabilities: [{ name: 'calendar_get', description: 'Read calendar data.' }] };
+      },
+    });
+    const authorityTools = [
+      authorityLookup,
+      inertTool('tool_output_query'),
+      inertTool('recall_tool_result'),
+      inertTool('plan_task'),
+    ];
+    const authoritySurfaces: string[][] = [];
+    let authorityModelCalls = 0;
+    const authorityModel = {
+      calls: () => authorityModelCalls,
+      async getResponse(request: { tools?: Array<{ name?: string }> }) {
+        authoritySurfaces.push((request.tools ?? []).flatMap((entry) => (
+          typeof entry.name === 'string' ? [entry.name] : []
+        )));
+        authorityModelCalls += 1;
+        return {
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          output: [toolCall(
+            `authority-acquisition-${authorityModelCalls}`,
+            'tool_search',
+            { query: 'calendar operation' },
+          )],
+          responseId: `authority-acquisition-response-${authorityModelCalls}`,
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const authorityAgent = { model: authorityModel, tools: authorityTools };
+    bindHostCanarySurface(authorityFixture, authorityAgent, authorityTools);
+
+    const authorityOutcome = await runProductionHost(authorityFixture, authorityAgent);
+
+    const authorityDelta = authorityOutcome.history.filter((item) => (
+      (item as { callId?: unknown }).callId === 'authority-acquisition-1'
+    ));
+    assert.deepEqual(noProgressProjection.projectHostNoProgressAttempt({
+      sessionId: authorityFixture.session.id,
+      sourceUserSeq: authorityFixture.source.seq,
+      historyDelta: authorityDelta,
+    }), { status: 'ok', attemptClass: 'authority_acquisition' });
+    assert.deepEqual(authorityOutcome.terminal, {
+      status: 'blocked',
+      reason: 'control_no_progress_exhausted',
+      resumable: false,
+    });
+    assert.equal(authorityModel.calls(), 2);
+    assert.deepEqual(authoritySurfaces[1], ['plan_task'],
+      'authority acquisition incorrectly inherited the ordinary result-reader surface');
+    assert.equal(authorityBodies, 1,
+      'the repeated authority acquisition crossed despite the control-only surface');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('a local checkpoint-store failure holds privately and exact recovery never reexecutes the frame', async () => {
+  const fixture = acceptHostCanarySource('result-checkpoint-containment');
+  let bodies = 0;
+  const model = stubModel([
+    [toolCall('uncheckpointable-result', 'missing_owner_fixture', {})],
+    [textMsg('must not reach a later model request')],
+  ]);
+  const configured = {
+    type: 'function',
+    name: 'missing_owner_fixture',
+    description: 'ownership boundary fixture',
+    parameters: { type: 'object', properties: {} },
+    needsApproval: async () => false,
+    invoke: async () => { bodies += 1; return 'must not run'; },
+  };
+  const agent = { model, tools: [configured] };
+  bindHostCanarySurface(fixture, agent, [configured]);
+
+  const db = eventlog.openEventLog();
+  const trigger = `reject_host_result_checkpoint_${acceptedSerial}`;
+  const sessionId = fixture.session.id.replaceAll("'", "''");
+  db.exec(`
+    CREATE TEMP TRIGGER ${trigger}
+    BEFORE INSERT ON accepted_model_batch_checkpoints
+    WHEN NEW.session_id = '${sessionId}'
+    BEGIN
+      SELECT RAISE(ABORT, 'fixture checkpoint unavailable');
+    END
+  `);
+  let outcome: Awaited<ReturnType<typeof runProductionHost>>;
+  try {
+    outcome = await runProductionHost(fixture, agent);
+  } finally {
+    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+
+  assert.equal(outcome.terminal, undefined);
+  assert.deepEqual(outcome.hold, {
+    owner: 'host',
+    wake: 'recovery',
+    reason: 'recovery_pending',
+  });
+  assert.equal(outcome.finalOutput, undefined, 'local bookkeeping authors no public retry text');
+  assert.ok(outcome.serializedRecoveryState);
+  assert.equal(model.calls(), 1, 'unsettled result bytes cannot reach another model request');
+  assert.equal(bodies, 0, 'the no-effect refusal never enters its tool body');
+  assert.equal(outcome.lastResponseId, undefined, 'the uncheckpointed response id is not adopted');
+  assert.equal(
+    outcome.history.filter((item) => (
+      (item as { type?: string }).type === 'function_call_result'
+    )).length,
+    0,
+    'result bytes without a balanced checkpoint never enter model-visible history',
+  );
+  assert.deepEqual(db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM accepted_model_batch_admissions
+        WHERE session_id = ? AND source_user_seq = ?) AS admissions,
+      (SELECT COUNT(*) FROM host_model_result_receipts
+        WHERE session_id = ? AND source_user_seq = ?) AS receipts,
+      (SELECT COUNT(*) FROM accepted_model_batch_checkpoints
+        WHERE session_id = ? AND source_user_seq = ?) AS checkpoints
+  `).get(
+    fixture.session.id,
+    fixture.source.seq,
+    fixture.session.id,
+    fixture.source.seq,
+    fixture.session.id,
+    fixture.source.seq,
+  ), {
+    admissions: 1,
+    receipts: 1,
+    checkpoints: 0,
+  }, 'accepted call/result accounting remains durable for host recovery');
+  assert.equal(eventlog.listEvents(fixture.session.id, {
+    types: ['conversation_completed', 'awaiting_user_input', 'approval_requested'],
+  }).length, 0, 'the private hold emits no public terminal, question, or card');
+
+  const recovery = HostRecoveryState.fromString(outcome.serializedRecoveryState!);
+  const resumed = await runProductionHost(fixture, agent, recovery);
+  assert.equal(resumed.finalOutput, undefined,
+    'checkpoint recovery cannot smuggle a next model request past ordinary context assembly');
+  assert.deepEqual(resumed.hold, {
+    owner: 'host',
+    wake: 'recovery',
+    reason: 'recovery_pending',
+  });
+  assert.equal(resumed.terminal, undefined);
+  assert.equal(bodies, 0, 'checkpoint recovery never re-enters the refused tool body');
+  assert.equal(model.calls(), 1, 'recovery finalizes bytes without dispatching another model');
+  const continuation = HostRecoveryState.fromString(resumed.serializedRecoveryState!);
+  assert.equal(continuation.phase, 'continue');
+  assert.deepEqual(continuation.frameHistory, []);
+  assert.deepEqual(continuation.resultItems, []);
+  assert.equal(continuation.acceptedModelBatchRef?.batchId, recovery.acceptedModelBatchRef?.batchId,
+    'the private continuation keeps the exact accepted-batch identity');
+  assert.deepEqual(db.prepare(`
+    SELECT batch_ordinal, disposition FROM accepted_model_batch_checkpoints
+     WHERE session_id = ? AND source_user_seq = ?
+  `).all(fixture.session.id, fixture.source.seq), [{
+    batch_ordinal: 1,
+    disposition: 'ready',
+  }]);
+});
+
+test('a successful logical result receipt failure recovers exact bytes without rerunning its body', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('logical-result-receipt-containment');
+    let bodies = 0;
+    const readTool = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'task_list',
+      description: 'Return one exact local task-list result.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      needsApproval: async () => false,
+      invoke: async () => {
+        bodies += 1;
+        return { records: [{ id: 'task-1', title: 'Keep the exact settled bytes' }] };
+      },
+    });
+    const model = stubModel([
+      [toolCall('logical-result-receipt-call', 'task_list', {})],
+      [textMsg('continued after exact receipt recovery')],
+    ]);
+    const agent = { model, tools: [readTool] };
+    bindHostCanarySurface(fixture, agent, [readTool]);
+
+    const db = eventlog.openEventLog();
+    const trigger = `reject_logical_projection_receipt_${acceptedSerial}`;
+    const sessionId = fixture.session.id.replaceAll("'", "''");
+    db.exec(`
+      CREATE TEMP TRIGGER ${trigger}
+      BEFORE INSERT ON logical_model_result_projection_receipts
+      WHEN NEW.session_id = '${sessionId}'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture projection receipt unavailable');
+      END
+    `);
+    let held: Awaited<ReturnType<typeof runProductionHost>>;
+    try {
+      held = await runProductionHost(fixture, agent);
+    } finally {
+      db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+
+    assert.deepEqual(held.hold, {
+      owner: 'host',
+      wake: 'recovery',
+      reason: 'recovery_pending',
+    });
+    assert.equal(held.terminal, undefined);
+    assert.equal(held.finalOutput, undefined);
+    assert.equal(bodies, 1, 'the successful local body crossed exactly once');
+    assert.equal(model.calls(), 1, 'uncheckpointed result bytes never reach another model');
+    const recovery = HostRecoveryState.fromString(held.serializedRecoveryState!);
+    assert.equal(recovery.phase, 'finalize');
+    assert.deepEqual(db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM logical_call_settlements
+          WHERE session_id = ? AND source_user_seq = ?
+            AND outcome_kind = 'succeeded') AS settlements,
+        (SELECT COUNT(*) FROM logical_model_result_projection_receipts
+          WHERE session_id = ? AND source_user_seq = ?) AS receipts,
+        (SELECT COUNT(*) FROM accepted_model_batch_checkpoints
+          WHERE session_id = ? AND source_user_seq = ?) AS checkpoints
+    `).get(
+      fixture.session.id,
+      fixture.source.seq,
+      fixture.session.id,
+      fixture.source.seq,
+      fixture.session.id,
+      fixture.source.seq,
+    ), { settlements: 1, receipts: 0, checkpoints: 0 });
+
+    const recovered = await runProductionHost(fixture, agent, recovery);
+    assert.deepEqual(recovered.hold, {
+      owner: 'host',
+      wake: 'recovery',
+      reason: 'recovery_pending',
+    });
+    assert.equal(HostRecoveryState.fromString(recovered.serializedRecoveryState!).phase, 'continue');
+    assert.equal(bodies, 1, 'receipt/checkpoint recovery never re-enters the settled body');
+    assert.equal(model.calls(), 1, 'recovery performs no model replay');
+    assert.deepEqual(db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM logical_model_result_projection_receipts
+          WHERE session_id = ? AND source_user_seq = ?) AS receipts,
+        (SELECT COUNT(*) FROM accepted_model_batch_checkpoints
+          WHERE session_id = ? AND source_user_seq = ?
+            AND disposition = 'ready') AS checkpoints
+    `).get(
+      fixture.session.id,
+      fixture.source.seq,
+      fixture.session.id,
+      fixture.source.seq,
+    ), { receipts: 1, checkpoints: 1 });
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('runTurn persists, wakes, adopts, and continues one exact post-body recovery', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('persisted-logical-result-recovery');
+    let bodies = 0;
+    const readTool = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'task_list',
+      description: 'Return one local task list.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      needsApproval: async () => false,
+      invoke: async () => {
+        bodies += 1;
+        return { records: [{ id: 'task-1', title: 'Persist exact recovery' }] };
+      },
+    });
+    const model = stubModel([
+      [toolCall('persisted-recovery-call', 'task_list', {})],
+      [textMsg('continued after durable checkpoint adoption')],
+    ]);
+    const agent = { model, tools: [readTool] };
+    bindHostCanarySurface(fixture, agent, [readTool]);
+    const turnOptions = {
+      sessionId: fixture.session.id,
+      input: String(fixture.source.data.text),
+      sourceUserSeq: fixture.source.seq,
+      reuseRecordedUserInput: true as const,
+      suppressMemoryCapture: true,
+      turnEngine: 'host_v1' as const,
+      agent: agent as never,
+      makeRunner: () => throwingRunner() as never,
+      maxTurns: 4,
+    };
+
+    const db = eventlog.openEventLog();
+    const trigger = `reject_persisted_projection_receipt_${acceptedSerial}`;
+    const sessionId = fixture.session.id.replaceAll("'", "''");
+    db.exec(`
+      CREATE TEMP TRIGGER ${trigger}
+      BEFORE INSERT ON logical_model_result_projection_receipts
+      WHEN NEW.session_id = '${sessionId}'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture persisted projection unavailable');
+      END
+    `);
+    let first: Awaited<ReturnType<typeof runTurn>>;
+    try {
+      first = await runTurn(turnOptions);
+    } finally {
+      db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    assert.equal(first.status, 'held', JSON.stringify(first));
+    assert.deepEqual(first.hold, { owner: 'host', wake: 'recovery', reason: 'recovery_pending' });
+    assert.equal(HostRecoveryState.fromString(
+      HarnessSession.load(fixture.session.id)!.loadRecoveryState()!,
+    ).phase, 'finalize');
+    assert.equal(bodies, 1);
+    assert.equal(model.calls(), 1);
+    assert.equal(eventlog.listEvents(fixture.session.id, {
+      types: ['conversation_completed', 'awaiting_user_input', 'approval_requested'],
+    }).length, 0, 'the durable bookkeeping owner produces no public terminal or card');
+
+    const second = await runTurn(turnOptions);
+    assert.equal(second.status, 'held', JSON.stringify(second));
+    assert.equal(HostRecoveryState.fromString(
+      HarnessSession.load(fixture.session.id)!.loadRecoveryState()!,
+    ).phase, 'continue');
+    assert.equal(bodies, 1, 'finalization wake never re-enters the body');
+    assert.equal(model.calls(), 1, 'finalization wake never replays the model');
+
+    const completed = await runTurn(turnOptions);
+    assert.equal(completed.status, 'completed', JSON.stringify(completed));
+    assert.equal(bodies, 1);
+    assert.equal(model.calls(), 2,
+      'only the ordinary model continuation runs after atomic checkpoint adoption');
+    assert.equal(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), null);
+    const providerHistory = HarnessSession.load(fixture.session.id)?.prepareProviderHistory();
+    assert.equal(providerHistory?.status, 'ready');
+    if (providerHistory?.status === 'ready') {
+      assert.equal(providerHistory.providerHistory.filter((item) => {
+        const row = item as unknown as { role?: unknown; content?: unknown };
+        return row.role === 'user' && row.content === fixture.source.data.text;
+      }).length, 1, 'same-source continuation does not duplicate the accepted user message');
+    }
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('a tool-output guardrail projection is sealed before checkpoint and next-model provenance', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('guardrail-result-projection');
+    let bodies = 0;
+    const guardedRead = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'task_list',
+      description: 'Return a local result whose public projection is guarded.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      needsApproval: async () => false,
+      outputGuardrails: [{
+        name: 'redact-private-tool-output',
+        run: async () => ({
+          behavior: { type: 'rejectContent' as const, message: 'The private fields were redacted.' },
+        }),
+      }],
+      invoke: async () => {
+        bodies += 1;
+        return { privateToken: 'never-project-this-value', records: [{ id: 'task-1' }] };
+      },
+    });
+    const seenInputs: unknown[][] = [];
+    let modelCall = 0;
+    const model = {
+      calls: () => modelCall,
+      async getResponse(request: { input?: unknown }) {
+        seenInputs.push(structuredClone(Array.isArray(request.input) ? request.input : []));
+        modelCall += 1;
+        return {
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          output: modelCall === 1
+            ? [toolCall('guarded-result-call', 'task_list', {})]
+            : [textMsg('continued from the redacted result')],
+          responseId: `guarded-result-response-${modelCall}`,
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const agent = { model, tools: [guardedRead] };
+    bindHostCanarySurface(fixture, agent, [guardedRead]);
+
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(outcome.finalOutput, 'continued from the redacted result');
+    assert.equal(bodies, 1);
+    const visibleResult = (seenInputs[1] ?? []).find((item) => (
+      (item as { type?: unknown }).type === 'function_call_result'
+    ));
+    assert.match(JSON.stringify(visibleResult), /private fields were redacted/);
+    assert.doesNotMatch(JSON.stringify(visibleResult), /never-project-this-value/);
+
+    const db = eventlog.openEventLog();
+    const receipt = db.prepare(`
+      SELECT receipt_id, result_class, result_item_sha256
+        FROM logical_model_result_projection_receipts
+       WHERE session_id = ? AND source_user_seq = ? AND call_id = ?
+    `).get(
+      fixture.session.id,
+      fixture.source.seq,
+      'guarded-result-call',
+    ) as { receipt_id: string; result_class: string; result_item_sha256: string };
+    assert.equal(receipt.result_class, 'text');
+    assert.equal(receipt.result_item_sha256,
+      logicalProjectionReceipts.logicalModelResultItemDigest(visibleResult as never),
+      'the receipt seals the exact transformed whole result item');
+    const provenanceRow = db.prepare(`
+      SELECT record_id, provenance_json FROM model_request_provenance
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY request_ordinal DESC LIMIT 1
+    `).get(fixture.session.id, fixture.source.seq) as {
+      record_id: string;
+      provenance_json: string;
+    };
+    assert.equal(JSON.parse(provenanceRow.provenance_json).settledResults[0]?.projectionReceiptId,
+      receipt.receipt_id, 'the next request cites the same immutable result projection receipt');
+    assert.equal(requestProvenance.projectModelRequestProvenance(provenanceRow.record_id).status, 'ok');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });
 
 test('runTurn selects the production host_v1_read_only engine without an injected runRunner', async () => {
@@ -964,6 +1836,63 @@ test('fresh host chat enters the host loop before semantic graphs and commits on
   }
 });
 
+test('fresh chat, workflow, execution, and agent sessions all enter one graphless host owner by default', async () => {
+  const previous = process.env.CLEMMY_TURN_ENGINE;
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  try {
+    for (const kind of ['chat', 'workflow', 'execution', 'agent'] as const) {
+      const session = eventlog.createSession({
+        id: `host-v1-fresh-kind-${kind}-${++acceptedSerial}`,
+        kind,
+      });
+      const model = stubModel([[textMsg(JSON.stringify({
+        summary: `${kind} host selected`,
+        reply: `${kind} host selected`,
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      }))]]);
+      let legacyRunnerCalls = 0;
+      const result = await runConversation({
+        sessionId: session.id,
+        input: `Return the ${kind} completion receipt.`,
+        maxSteps: 1,
+        maxTurns: 3,
+        judgeCompletion: false,
+        buildAgent: async (identity) => {
+          assert.equal(identity.route, undefined, `${kind}: host construction receives no legacy semantic route`);
+          return { model, instructions: 'base system', tools: [] } as never;
+        },
+        makeRunner: () => {
+          const runner = new EventEmitter();
+          (runner as unknown as { run: () => never }).run = () => {
+            legacyRunnerCalls += 1;
+            throw new Error('legacy Runner.run must be unreachable');
+          };
+          return runner as never;
+        },
+      });
+
+      assert.equal(result.status, 'completed', `${kind}: ${result.error ?? ''}`);
+      assert.equal(result.publicPresentation?.text, `${kind} host selected`);
+      assert.equal(legacyRunnerCalls, 0, `${kind}: no legacy model owner`);
+      assert.equal(model.calls(), 1, `${kind}: one host model activation`);
+      const events = eventlog.listEvents(session.id);
+      const selected = events.filter((event) => event.type === 'turn_engine_selected');
+      assert.equal(selected.length, 1, `${kind}: one exact owner`);
+      assert.equal(selected[0]?.data.engine, 'host_v1');
+      assert.equal(selected[0]?.data.resumed, false);
+      assert.equal(events.filter((event) => event.type === 'turn_graph_shadow').length, 0,
+        `${kind}: fresh host ownership cannot enter the legacy semantic graph`);
+      assert.equal(events.filter((event) => event.type === 'conversation_completed').length, 1,
+        `${kind}: one terminal`);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = previous;
+  }
+});
+
 test('fresh-plan model frames refuse unsafe siblings before any plan or sibling crossing', async (t) => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -1097,15 +2026,14 @@ test('a refused or failed plan barrier never starts its fused read and leaves pa
     bindHostCanarySurface(fixture, agent, [planTool, workTool]);
 
     const outcome = await runProductionHost(fixture, agent);
-    // Fail-RETURN, not fail-closed (2026-08-26): a plan-barrier refusal is a
-    // settled typed failure returned to the model for bounded repair. The
-    // conversation survives — a repeated identical frame retires through the
-    // capability-unavailable checkpoint instead of terminating reason=blocked.
-    // (Before this, 12 lvl50 authority-failed-closed lines were 12 dead
-    // non-resumable conversations in one gauntlet.)
-    assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
-    assert.match(String(outcome.finalOutput ?? ''), /unavailable for this request/,
-      'the retired frame ends in the honest capability-unavailable checkpoint, conversation intact');
+    // The first settled plan failure still gets one model-led repair. This
+    // fixture model repeats the already-closed ids, so the protocol boundary
+    // stops it before another preparation or transcript commit.
+    assert.deepEqual(outcome.terminal, {
+      status: 'blocked',
+      reason: 'model_reused_committed_call_id',
+    }, JSON.stringify(outcome));
+    assert.match(String(outcome.finalOutput ?? ''), /already-committed tool call identifier/i);
     assert.equal(planBodies, 1, 'the direct plan barrier is the only admitted body');
     assert.equal(siblingBodies, 0, 'the sibling body stays behind activation');
     const calls = outcome.history.filter((item) =>
@@ -2706,29 +3634,28 @@ test('host tool resolution includes enabled MCP tools through agent.getAllTools'
   assert.equal(outcome.finalOutput, 'MCP complete');
 });
 
-test('MCP text, image, and file outputs remain structured in the next model projection', async () => {
-  const projectedInputs: unknown[] = [];
-  let call = 0;
-  const model = {
-    async getResponse(request: { input?: unknown }) {
-      projectedInputs.push(structuredClone(request.input));
-      call += 1;
-      return {
-        usage: {},
-        output: call === 1
-          ? [toolCall('mcp-media-call', 'records__media', {})]
-          : [textMsg('media inspected')],
-      };
-    },
-    getStreamedResponse: testModelStream,
-  };
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [],
-      getAllTools: async () => [{
-        type: 'function', name: 'records__media', description: 'MCP media result',
+test('production text, image, and file outputs remain structured in the next model projection', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('mcp-structured-media-result');
+    const projectedInputs: unknown[] = [];
+    let call = 0;
+    const model = {
+      async getResponse(request: { input?: unknown }) {
+        projectedInputs.push(structuredClone(request.input));
+        call += 1;
+        return {
+          usage: {},
+          output: call === 1
+            ? [toolCall('mcp-media-call', 'task_list', {})]
+            : [textMsg('media inspected')],
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const mediaTool = brackets.wrapToolForHarness({
+        type: 'function', name: 'task_list', description: 'Host media result',
         parameters: { type: 'object', properties: {} },
         needsApproval: async () => false,
         invoke: async () => [
@@ -2741,33 +3668,48 @@ test('MCP text, image, and file outputs remain structured in the next model proj
             filename: 'report.txt',
           },
         ],
-      }],
-    } as never,
-    [] as never,
-    { maxTurns: 4 },
-  );
+      });
+    const agent = { model, tools: [mediaTool], getAllTools: async () => [mediaTool] };
+    bindHostCanarySurface(fixture, agent, [mediaTool]);
+    const outcome = await runProductionHost(fixture, agent);
 
-  const result = outcome.history.find((item) =>
-    (item as { type?: string }).type === 'function_call_result') as {
-      output?: unknown;
-    } | undefined;
-  const expectedOutput = [
-    { type: 'input_text', text: 'caption' },
-    { type: 'input_image', image: 'data:image/png;base64,aW1hZ2U=' },
-    {
-      type: 'input_file',
-      file: 'data:text/plain;base64,cmVwb3J0',
-      filename: 'report.txt',
-    },
-  ];
-  assert.deepEqual(result?.output, expectedOutput, 'history preserves the SDK protocol media shapes');
-  assert.deepEqual(
-    (projectedInputs[1] as unknown[]).find((item) =>
-      (item as { type?: string }).type === 'function_call_result'),
-    { type: 'function_call_result', callId: 'mcp-media-call', name: 'records__media', status: 'completed', output: expectedOutput },
-    'the next model sees structured inputs rather than a JSON-stringified media array',
-  );
-  assert.equal(outcome.finalOutput, 'media inspected');
+    const result = outcome.history.find((item) =>
+      (item as { type?: string }).type === 'function_call_result') as {
+        output?: unknown;
+      } | undefined;
+    const expectedOutput = [
+      { type: 'input_text', text: 'caption' },
+      { type: 'input_image', image: 'data:image/png;base64,aW1hZ2U=' },
+      {
+        type: 'input_file',
+        file: 'data:text/plain;base64,cmVwb3J0',
+        filename: 'report.txt',
+      },
+    ];
+    assert.deepEqual(result?.output, expectedOutput, 'history preserves the SDK protocol media shapes');
+    assert.deepEqual(
+      (projectedInputs[1] as unknown[]).find((item) =>
+        (item as { type?: string }).type === 'function_call_result'),
+      { type: 'function_call_result', callId: 'mcp-media-call', name: 'task_list', status: 'completed', output: expectedOutput },
+      'the next model sees structured inputs rather than a JSON-stringified media array',
+    );
+    assert.equal(outcome.finalOutput, 'media inspected');
+    assert.deepEqual(eventlog.openEventLog().prepare(`
+      SELECT projection.result_class, checkpoint.disposition
+        FROM logical_model_result_projection_receipts projection
+        JOIN accepted_model_batch_checkpoints checkpoint
+          ON checkpoint.session_id = projection.session_id
+         AND checkpoint.source_user_seq = projection.source_user_seq
+         AND checkpoint.batch_ordinal = projection.batch_ordinal
+       WHERE projection.session_id = ? AND projection.source_user_seq = ?
+    `).all(fixture.session.id, fixture.source.seq), [{
+      result_class: 'media',
+      disposition: 'ready',
+    }], 'structured media bytes are sealed before their ready checkpoint');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });
 
 test('unsupported tool, handoff, namespace, and output surfaces fail closed before a model call', async (t) => {
@@ -2844,6 +3786,114 @@ test('toolUseBehavior remains the terminal control boundary without another mode
   );
   assert.equal(model.calls(), 1);
   assert.equal(outcome.finalOutput, 'Question posted: Which account?');
+});
+
+test('mixed zero-crossing reads can terminally clarify without model continuation or a business write', async () => {
+  const session = eventlog.createSession({
+    id: `host-mixed-refusal-clarification-${++acceptedSerial}`,
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send James Marshall a calendar invite.' },
+  });
+  let businessWrites = 0;
+  const successfulBatches: string[][] = [];
+  const model = stubModel([
+    [
+      toolCall('recipient-memory', 'memory_recall_all', { objective: 'James Marshall contact details' }),
+      toolCall('calendar-capability', 'tool_search', { query: 'create calendar event' }),
+      toolCall('refused-salesforce-escape', 'salesforce_contact_lookup', { name: 'James Marshall' }),
+    ],
+    [toolCall('business-write', 'memory_remember', { content: 'must not execute' })],
+    [textMsg('must not reach another model step')],
+  ]);
+  const outcome = await hostRunRunner(
+    throwingRunner() as never,
+    {
+      model,
+      tools: [
+        {
+          type: 'function', name: 'memory_recall_all', description: 'grounded recipient lookup',
+          parameters: { type: 'object', properties: { objective: { type: 'string' } } },
+          invoke: async () => 'No grounded email address found for James Marshall.',
+          needsApproval: async () => false,
+        },
+        {
+          type: 'function', name: 'tool_search', description: 'calendar capability lookup',
+          parameters: { type: 'object', properties: { query: { type: 'string' } } },
+          invoke: async () => JSON.stringify({
+            capabilityRef: 'cap:resolved:calendar_create_event',
+            connectedAccountId: 'connected-account-1',
+          }),
+          needsApproval: async () => false,
+        },
+        {
+          type: 'function', name: 'memory_remember', description: 'business write sentinel',
+          parameters: { type: 'object', properties: { content: { type: 'string' } } },
+          invoke: async () => {
+            businessWrites += 1;
+            return 'must not execute';
+          },
+          needsApproval: async () => false,
+        },
+      ],
+      toolUseBehavior: async (
+        _context: unknown,
+        results: Array<{ tool: { name: string }; output: unknown }>,
+      ) => {
+        const names = results.map((result) => result.tool.name);
+        successfulBatches.push(names);
+        if (names.join(',') !== 'memory_recall_all,tool_search') {
+          return { isFinalOutput: false };
+        }
+        const question = 'What email address should I use for James Marshall?';
+        eventlog.appendEvent({
+          sessionId: session.id,
+          turn: 1,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: {
+            question,
+            purpose: 'recipient_identity',
+            sourceUserSeq: source.seq,
+          },
+        });
+        return { isFinalOutput: true, finalOutput: question };
+      },
+    } as never,
+    [{ type: 'message', role: 'user', content: 'Send James Marshall a calendar invite.' }] as never,
+    {
+      maxTurns: 5,
+      context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    },
+  );
+
+  assert.equal(outcome.finalOutput, 'What email address should I use for James Marshall?');
+  assert.equal(model.calls(), 1, 'the terminal clarification owns the turn');
+  assert.equal(businessWrites, 0, 'a later model-authored business write never runs');
+  assert.deepEqual(successfulBatches, [['memory_recall_all', 'tool_search']]);
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length,
+    1,
+    'the host emits exactly one durable question',
+  );
+  assert.deepEqual(
+    outcome.history
+      .filter((item) => (item as { type?: string }).type === 'function_call_result')
+      .map((item) => (item as { callId?: string }).callId),
+    ['recipient-memory', 'calendar-capability', 'refused-salesforce-escape'],
+    'successful and refused siblings remain paired in provider order',
+  );
+  assert.deepEqual(dispositionMarkers(outcome.history), [{
+    disposition: 'refused_pre_dispatch',
+    effect: 'none',
+    retry: 'replan',
+    requiresReconciliation: false,
+  }]);
 });
 
 test('agent output guardrails still stop a secret-bearing final answer', async () => {
@@ -3088,17 +4138,19 @@ test('runTurn consumes a host terminal before run_completed or success hooks', a
   );
 });
 
-test('a stalled host model step aborts once and becomes a typed blocked checkpoint', async () => {
+test('a pre-content host model stall retries within its exact budget before becoming blocked', async () => {
   const prior = process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+  const priorRetries = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
   process.env.CLEMMY_MODEL_STREAM_STALL_MS = '25';
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '3';
   let calls = 0;
-  let observedAbort = false;
+  let observedAborts = 0;
   const model = {
     async getResponse(request: { signal?: AbortSignal }) {
       calls += 1;
       return await new Promise<never>((_resolve, reject) => {
         request.signal?.addEventListener('abort', () => {
-          observedAbort = true;
+          observedAborts += 1;
           reject(request.signal?.reason ?? new Error('aborted'));
         }, { once: true });
       });
@@ -3112,14 +4164,16 @@ test('a stalled host model step aborts once and becomes a typed blocked checkpoi
       [] as never,
       { maxTurns: 8 },
     );
-    assert.equal(calls, 1);
-    assert.equal(observedAbort, true);
+    assert.equal(calls, 4, 'one initial attempt plus the exact three-attempt pre-content retry budget');
+    assert.equal(observedAborts, 4, 'every retired stalled attempt is aborted before the next begins');
     assert.equal(outcome.terminal?.status, 'blocked');
     assert.equal(outcome.terminal?.reason, 'model_stalled');
     assert.doesNotMatch(String(outcome.finalOutput), /say continue|retry/i);
   } finally {
     if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_MS;
     else process.env.CLEMMY_MODEL_STREAM_STALL_MS = prior;
+    if (priorRetries === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = priorRetries;
   }
 });
 
@@ -3750,7 +4804,10 @@ test('a rejected approval becomes a visible tool result, never an execution', as
 });
 
 test('maxTurns becomes one typed blocked checkpoint — never an ask or fake continue', async () => {
-  const model = stubModel([[toolCall('loop', 'ping', {})]]);
+  const model = stubModel([
+    [toolCall('loop-1', 'ping', {})],
+    [toolCall('loop-2', 'ping', {})],
+  ]);
   const agent = {
     model,
     tools: [{
@@ -4220,7 +5277,10 @@ test('production host carries generic user-question and worker envelopes through
       bindHostCanarySurface(fixture, agent, [questionTool]);
       const outcome = await runProductionHost(fixture, agent);
       assert.equal(model.calls(), 1, 'a typed question is a host control receipt, not another model loop');
-      assert.match(String(outcome.finalOutput), /Question posted:/);
+      assert.match(
+        String(outcome.finalOutput),
+        /^\[clementine:awaiting-user-input:final\]\nWhich practice area should I start with\?/,
+      );
       const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
       assert.equal(questions.length, 1);
       assert.deepEqual({
@@ -4491,6 +5551,7 @@ test('production host external reads require one exact frozen manifest/account/s
     } else {
       assert.match(JSON.stringify(outcome.history),
         /exact capability, effect, account, schema, or invoke binding is absent or changed/);
+      assert.match(JSON.stringify(outcome.history), /Failed check:/);
       assert.equal((db.prepare(`
         SELECT COUNT(*) AS n FROM physical_dispatches
          WHERE session_id = ? AND source_user_seq = ?
@@ -4735,7 +5796,7 @@ test('production host consumes exact material-source A/Q/B authority before any 
     bindingMatches?: boolean;
     bindingAccount?: 'exact' | 'missing' | 'wrong';
     bindingSchema?: 'exact' | 'missing';
-    consumingDecision?: 'exact' | 'missing' | 'duplicate' | 'reforged' | 'mutated' | 'wrong_role' | 'mixed_role';
+    consumingDecision?: 'exact' | 'missing' | 'duplicate' | 'reforged' | 'mutated' | 'wrong_role' | 'mixed_role' | 'variant';
     omitParentDecision?: boolean;
     parentDecision?: 'exact' | 'wrong_turn' | 'mixed_turn';
     noContinuation?: boolean;
@@ -4817,7 +5878,12 @@ test('production host consumes exact material-source A/Q/B authority before any 
     }
     const manifest = capabilityManifests.attachSemanticContract({
       version: 1,
-      manifestId: `manifest:${input.label}`,
+      // The production catalog treats a callable capability id and its
+      // immutable manifest id as one exact identity.  This fixture used to
+      // register two different ids and accidentally relied on the operation
+      // name alone to bridge them; the current callable-manifest predicate
+      // correctly refuses that stale shape.
+      manifestId: capabilityId,
       providerKind,
       operationId,
       providerIdentity: `configured-records:${input.label}`,
@@ -4974,6 +6040,10 @@ test('production host consumes exact material-source A/Q/B authority before any 
     await t.test('missing consuming decision refuses before logical admission', () => runVariant({
       label: 'missing-decision', purpose: 'invoke_live_read', consumingDecision: 'missing', shouldExecute: false,
     }));
+    await t.test('materially different B stays closed before Q2 confirmation', () => runVariant({
+      label: 'variant-unconfirmed', purpose: 'invoke_live_read', consumingDecision: 'variant',
+      shouldExecute: false,
+    }));
     await t.test('duplicate consuming decision refuses before logical admission', () => runVariant({
       label: 'duplicate-decision', purpose: 'invoke_live_read', consumingDecision: 'duplicate', shouldExecute: false,
     }));
@@ -5028,6 +6098,10 @@ test('production host consumes exact material-source A/Q/B authority before any 
     }));
     await t.test('unbound generic live read during verified B fails closed', () => runVariant({
       label: 'unbound-live-read', purpose: 'invoke_live_read', bindingMatches: false, shouldExecute: false,
+    }));
+    await t.test('unknown provider purpose cannot bypass an actual material-source continuation', () => runVariant({
+      label: 'unknown-purpose-bound-read', purpose: 'provider_future_read', bindingMatches: false,
+      shouldExecute: false,
     }));
   } finally {
     productionPorts.clearProductionCapabilityPorts();
@@ -5157,7 +6231,13 @@ test('production host refuses unpropagated source carriers before approval, chil
         kind, name: 'dispatch_background_task', args: { task: 'collect from another source' },
       }));
       await t.test(`${kind} source cannot auto-test a newly authored workflow`, () => runVariant({
-        kind, name: 'workflow_create', args: { name: 'future-source-workflow', steps: [] },
+        kind,
+        name: 'workflow_create',
+        args: {
+          name: 'future-source-workflow',
+          description: 'Inspect the future source.',
+          steps: [{ id: 'inspect', prompt: 'Inspect the future source and return a summary.', sideEffect: 'read' }],
+        },
       }));
       await t.test(`${kind} source cannot schedule future unpropagated execution`, () => runVariant({
         kind, name: 'workflow_schedule', args: { name: 'future-source-workflow', cron: '0 * * * *' },
@@ -6010,36 +7090,32 @@ test('host approval resume re-enters with an exact durable call lease before the
   ]);
   const agent = { model, tools: [boundedRead] };
   bindHostCanarySurface(fixture, agent, [boundedRead]);
-  const options = {
-    maxTurns: 4,
-    hostReadOnlyCanary: true,
-    context: fixture.context,
-  };
-  const paused = await brackets.withHarnessRunContext(fixture.parent, () => (
-    productionHostRunRunner(
-      throwingRunner() as never,
-      agent as never,
-      [{ type: 'message', role: 'user', content: 'list roots' }] as never,
-      options,
-    )
-  ));
+  const paused = await runProductionHost(fixture, agent);
   assert.equal(paused.hasInterruptions, true);
   assert.equal(bodies, 0);
   const state = HostInterruptState.fromString(paused.serializedState!);
+  assert.ok(state.acceptedModelBatchRef, 'V5 approval state owns the exact pre-admitted batch');
+  const pausedRef = state.acceptedModelBatchRef!;
+  const db = eventlog.openEventLog();
+  assert.deepEqual(db.prepare(`
+    SELECT admission.batch_id,
+           (SELECT COUNT(*) FROM accepted_model_batch_checkpoints checkpoint
+             WHERE checkpoint.session_id = admission.session_id
+               AND checkpoint.source_user_seq = admission.source_user_seq
+               AND checkpoint.batch_ordinal = admission.batch_ordinal) AS checkpoints
+      FROM accepted_model_batch_admissions admission
+     WHERE admission.session_id = ? AND admission.source_user_seq = ?
+       AND admission.batch_ordinal = ?
+  `).get(fixture.session.id, fixture.source.seq, pausedRef.batchOrdinal), {
+    batch_id: pausedRef.batchId,
+    checkpoints: 0,
+  }, 'approval pause keeps one open admission and no result checkpoint');
   state.approve(state.getInterruptions()[0]);
-  const resumed = await brackets.withHarnessRunContext(fixture.parent, () => (
-    productionHostRunRunner(
-      throwingRunner() as never,
-      agent as never,
-      state as never,
-      options,
-    )
-  ));
+  const resumed = await runProductionHost(fixture, agent, state);
   assert.equal(resumed.finalOutput, 'resume completed');
   assert.equal(bodies, 1);
   assert.equal(model.calls(), 2);
 
-  const db = eventlog.openEventLog();
   assert.deepEqual(db.prepare(`
     SELECT logical_tool_call_id, state FROM logical_tool_calls
      WHERE session_id = ? AND source_user_seq = ?
@@ -6064,6 +7140,75 @@ test('host approval resume re-enters with an exact durable call lease before the
   assert.equal(callLease.source_user_seq, fixture.source.seq);
   assert.equal(callLease.logical_tool_call_id, 'resume-owned-call');
   assert.ok(callLease.revoked_at, 'the exact resumed generation is fenced before return');
+  assert.deepEqual(db.prepare(`
+    SELECT checkpoint.batch_id, checkpoint.disposition,
+           projection.call_id, projection.result_class
+      FROM accepted_model_batch_checkpoints checkpoint
+      JOIN logical_model_result_projection_receipts projection
+        ON projection.session_id = checkpoint.session_id
+       AND projection.source_user_seq = checkpoint.source_user_seq
+       AND projection.batch_ordinal = checkpoint.batch_ordinal
+     WHERE checkpoint.session_id = ? AND checkpoint.source_user_seq = ?
+       AND checkpoint.batch_ordinal = ?
+  `).get(fixture.session.id, fixture.source.seq, pausedRef.batchOrdinal), {
+    batch_id: pausedRef.batchId,
+    disposition: 'ready',
+    call_id: 'resume-owned-call',
+    result_class: 'text',
+  }, 'approval resume finalizes the same V5 batch exactly once');
+});
+
+test('host approval rejection checkpoints the exact V5 batch without executing the body', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('approval-rejection-checkpoint');
+    let bodies = 0;
+    const boundedRead = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'workspace_roots',
+      description: 'List directories Clementine is allowed to inspect or operate in.',
+      parameters: { type: 'object', properties: {} },
+      needsApproval: async () => true,
+      invoke: async () => { bodies += 1; return 'must not run'; },
+    });
+    const model = stubModel([
+      [toolCall('rejected-owned-call', 'workspace_roots', {})],
+      [textMsg('understood, I left it unchanged')],
+    ]);
+    const agent = { model, tools: [boundedRead] };
+    bindHostCanarySurface(fixture, agent, [boundedRead]);
+
+    const paused = await runProductionHost(fixture, agent);
+    assert.equal(paused.hasInterruptions, true);
+    const state = HostInterruptState.fromString(paused.serializedState!);
+    const ref = state.acceptedModelBatchRef;
+    assert.ok(ref);
+    state.reject(state.getInterruptions()[0]);
+    const resumed = await runProductionHost(fixture, agent, state);
+    assert.equal(resumed.finalOutput, 'understood, I left it unchanged');
+    assert.equal(bodies, 0);
+    assert.equal(model.calls(), 2);
+    assert.deepEqual(eventlog.openEventLog().prepare(`
+      SELECT checkpoint.batch_id, checkpoint.disposition,
+             receipt.call_id, receipt.disposition AS result_class
+        FROM accepted_model_batch_checkpoints checkpoint
+        JOIN host_model_result_receipts receipt
+          ON receipt.session_id = checkpoint.session_id
+         AND receipt.source_user_seq = checkpoint.source_user_seq
+         AND receipt.batch_ordinal = checkpoint.batch_ordinal
+       WHERE checkpoint.session_id = ? AND checkpoint.source_user_seq = ?
+         AND checkpoint.batch_ordinal = ?
+    `).get(fixture.session.id, fixture.source.seq, ref!.batchOrdinal), {
+      batch_id: ref!.batchId,
+      disposition: 'ready',
+      call_id: 'rejected-owned-call',
+      result_class: 'user_rejected',
+    });
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });
 
 test('read-only canary requires exact harness-wrapper attestation', async (t) => {

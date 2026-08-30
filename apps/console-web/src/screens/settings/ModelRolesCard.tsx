@@ -11,6 +11,7 @@ import { relativeTime } from '@/lib/inbox';
 import {
   getSettings,
   setActiveBrain,
+  patchCodexRescueModel,
   patchModelRole,
   patchFusion,
   type ActiveBrain,
@@ -143,6 +144,11 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
   // accepts role:'judge' with any connected model); "Automatic" stays the default.
   const judgeOptions = mr.roleOptions?.judge ?? mr.available;
   const judgeFlat = judgeOptions.flatMap((p) => p.models.map((m) => ({ ...m, provider: p.provider })));
+  const codexRescue = settings.data?.models?.codexRescue;
+  const codexRescueOptions = [...(mr.available.find((p) => p.provider === 'codex')?.models ?? [])];
+  if (codexRescue?.configured && !codexRescueOptions.some((model) => model.id === codexRescue.modelId)) {
+    codexRescueOptions.push({ id: codexRescue.modelId, label: `${codexRescue.modelId} (saved)` });
+  }
   const connected = (prov: string) => mr.available.some((p) => p.provider === prov);
   const discovery = mr.discovery;
   const discoveryProviders = discovery ? Object.values(discovery.providers) : [];
@@ -196,6 +202,10 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
           : setActiveBrain(value as ActiveBrain, undefined, sessionId));
   const onRole = (role: 'worker' | 'judge', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
+  const onCodexRescue = (value: string) =>
+    run('codex-rescue', () => patchCodexRescueModel(
+      value === '__primary__' ? { clear: true } : { modelId: value },
+    ));
 
   // Task-specific (intent-scoped) worker routing — e.g. "design" → Claude. Reads
   // the same bindings the chat tool writes; routes only workers tagged with that
@@ -254,6 +264,35 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
             </Select>
           )}
         </RoleRow>
+
+        {codexRescue && (
+          <div className="grid items-center gap-2 sm:grid-cols-[1fr_1.2fr] sm:gap-4">
+            <Field
+              label="Codex rescue"
+              hint="Last-resort Codex model when an all-in BYO brain fails before producing content. Choose a cheaper model independently of the primary."
+            >
+              {(id) => (
+                <Select
+                  id={id}
+                  disabled={busy === 'codex-rescue'}
+                  value={codexRescue.configured ? codexRescue.modelId : '__primary__'}
+                  onChange={(event) => onCodexRescue(event.target.value)}
+                >
+                  <option value="__primary__">Follow Codex primary ({codexRescue.inheritedModelId})</option>
+                  {codexRescueOptions.map((model) => (
+                    <option key={`rescue-${model.id}`} value={model.id}>{model.label}</option>
+                  ))}
+                </Select>
+              )}
+            </Field>
+            <div className="flex min-w-0 items-center gap-2 pb-1 text-small text-muted">
+              <BrainCircuit className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+              <span className="truncate text-fg" title={codexRescue.modelId}>{codexRescue.modelId}</span>
+              <span className="shrink-0 rounded bg-canvas px-1.5 py-0.5 text-caption text-muted">codex</span>
+              <span className="shrink-0 text-caption text-muted">· {codexRescue.configured ? 'set here' : 'follows primary'}</span>
+            </div>
+          </div>
+        )}
 
         <RoleRow icon={Users} label="Workers" hint="Delegated run_worker / grunt labor." resolved={mr.roles.worker}>
           {(id) => (

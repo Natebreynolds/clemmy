@@ -296,7 +296,14 @@ test('standard action keeps control discovery before freeze, fuses proposal with
       JSON.stringify({ query: 'read the user profile', limit: 1, role_key: null }),
       { toolCall: { callId: 'control-search' } },
     );
-    assert.match(String(searchResult), /work_call/);
+    const searchBody = JSON.parse(String(searchResult)) as {
+      results?: Array<{ name?: string; carrier?: string }>;
+    };
+    assert.equal(
+      searchBody.results?.find((candidate) => candidate.name === 'user_profile_read')?.carrier,
+      'call_tool',
+      'control discovery reports its truthful call_tool carrier before business work is frozen',
+    );
     assert.equal(expectedWork.loadExpectedWorkContract(session.id, sourceUserSeq).status, 'missing');
 
     const first = await workCall.invoke(
@@ -376,10 +383,15 @@ test('standard action keeps control discovery before freeze, fuses proposal with
 
   assert.equal(result.publicPresentation?.status, 'blocked');
   assert.equal(result.publicPresentation?.kind, 'blocked', 'unfinished write obligation cannot publish done');
-  assert.equal(
-    result.publicPresentation?.text,
-    'I finished the two reads, but I haven\'t written or verified the report yet. I can resume from that step.',
+  const blockedText = result.publicPresentation?.text ?? '';
+  assert.match(
+    blockedText,
+    /^I finished the two reads, but I haven't written or verified the report yet\. I can resume from that step\./,
   );
+  assert.match(blockedText, /Retained work \(durable checkpoint\):/);
+  assert.match(blockedText, /Source\/tool user_profile_read: completed result retained as rh_[a-f0-9]+\./);
+  assert.match(blockedText, /Source\/tool workspace_roots: 1 record \(unknown\) retained as rh_[a-f0-9]+\./);
+  assert.match(blockedText, /External write state: no settled external-write attempt is recorded\./);
   assert.equal(repairCalls, 1, 'one exact staged verification gap earns one sealed repair call');
   assert.equal(repairPacket?.acceptedRequest, 'Read my profile and workspace roots, then write a local report.');
   assert.ok(repairPacket?.gaps.some((gap) => gap.kind === 'work_contract_incomplete'));

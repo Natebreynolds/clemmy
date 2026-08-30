@@ -38,7 +38,8 @@ import {
 import { isAutoApprovedByScope } from '../../agents/plan-scope.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { getRuntimeEnv } from '../../config.js';
-import { classifyRuntimeToolEffect, type RuntimeToolEffect } from './tool-effect.js';
+import { classifyRuntimeToolEffect, unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
+import { catalogOperationIdentityKey } from './runtime-tool-identity.js';
 import { isMandatable, resolveCallable } from './callable-surface.js';
 
 const logger = pino({ name: 'clementine.harness.tool-guardrail' });
@@ -516,7 +517,7 @@ export interface GuardrailDecision {
   /** Human-readable reason — surfaced in events + error messages. */
   reason: string;
   /** Bucket the decision came from (exact-args / same-mut-tool / etc). */
-  rule: 'exact_args_repeat' | 'same_mut_tool_repeat' | 'fanout_refusal_deadlock' | 'allowed';
+  rule: 'exact_args_repeat' | 'semantic_result_repeat' | 'same_mut_tool_repeat' | 'fanout_refusal_deadlock' | 'allowed';
   /** Current count for the matched signature/tool. */
   count: number;
   /** What to CALL the repeated call in the memo — the gateway slug when there
@@ -679,9 +680,15 @@ function getOrCreateTracker(sessionId: string): SessionTrackerState {
  * intentionally hash differently.
  */
 export function hashToolCall(toolName: string, args: unknown): string {
-  const canonical = canonicalize(args);
+  // OPEN-THE-GATES 5.3: loop detection keyed on wrapper spelling, so
+  // google_sheets__batch_get vs GOOGLESHEETS_BATCH_GET vs composio_execute_tool
+  // wrapping the same slug evaded the identical-call count (13 refusals, one
+  // refusal text). Key the effective operation identity after unwrap.
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args);
+  const identity = catalogOperationIdentityKey(effective.toolName ?? toolName) || toolName;
+  const canonical = canonicalize(effective.args ?? args);
   const json = JSON.stringify(canonical);
-  return createHash('sha256').update(`${toolName}::${json}`).digest('hex');
+  return createHash('sha256').update(`${identity}::${json}`).digest('hex');
 }
 
 function canonicalize(value: unknown): unknown {
@@ -715,6 +722,54 @@ function canonicalize(value: unknown): unknown {
 // loses one comparison); bounded.
 const recentOutputFps = new Map<string, string[]>();
 const MAX_OUTPUT_FP_ENTRIES = 2_000;
+
+/**
+ * A control tool can be stuck even while the model keeps changing prose in
+ * its arguments. The exact-args ladder cannot see that class: the host returns
+ * the same closed refusal, the model rewrites a criterion, and the signature
+ * changes forever. Track the RESULT consequence for plan_task independently
+ * of argument spelling. Three byte-equivalent semantic refusals are already
+ * three concrete repair opportunities; the third ends the turn instead of
+ * allowing an unbounded refusal/history loop.
+ *
+ * Process-local is intentional. This guards one live model loop; the durable
+ * logical settlements remain the restart truth, and a daemon restart may
+ * safely grant a fresh (bounded) repair window.
+ */
+interface SemanticRefusalLoopState {
+  identity: string;
+  code: 'plan_not_admitted' | 'plan_invalid_input';
+  count: number;
+}
+const semanticRefusalLoops = new Map<string, SemanticRefusalLoopState>();
+const MAX_SEMANTIC_REFUSAL_SCOPES = 200;
+const PLAN_SEMANTIC_REFUSAL_HARD_STOP_AT = 3;
+
+function semanticPlanRefusal(result: unknown): Pick<SemanticRefusalLoopState, 'identity' | 'code'> | null {
+  let value = result;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) as unknown; } catch { return null; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.ok !== false) return null;
+  if (record.code !== 'plan_not_admitted' && record.code !== 'plan_invalid_input') return null;
+  if (typeof record.detail !== 'string' || record.detail.trim().length === 0) return null;
+  const withheld = Array.isArray(record.withheld)
+    ? record.withheld.flatMap((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+        const item = entry as Record<string, unknown>;
+        if (typeof item.id !== 'string') return [];
+        return [`${item.id}:${typeof item.reason === 'string' ? item.reason : ''}`];
+      }).sort()
+    : [];
+  const identity = createHash('sha256').update(JSON.stringify({
+    code: record.code,
+    detail: record.detail.trim(),
+    withheld,
+  })).digest('hex');
+  return { identity, code: record.code };
+}
 
 function outputFpKey(scopeId: string, signature: string): string {
   return `${scopeId}::${signature}`;
@@ -832,6 +887,7 @@ export function noteGuardrailObservedCost(
 /** Test seam: scope signals are process-local and must not leak between tests. */
 export function _resetGuardrailScopeSignals(): void {
   scopeSignals.clear();
+  semanticRefusalLoops.clear();
 }
 
 export function noteGuardrailToolResult(
@@ -839,8 +895,8 @@ export function noteGuardrailToolResult(
   toolName: string,
   args: unknown,
   result: unknown,
-): void {
-  if (!scopeId) return;
+): GuardrailDecision | undefined {
+  if (!scopeId) return undefined;
   try {
     const key = outputFpKey(scopeId, hashToolCall(toolName, args));
     const fps = recentOutputFps.get(key) ?? [];
@@ -854,6 +910,37 @@ export function noteGuardrailToolResult(
       recentOutputFps.delete(oldest);
     }
   } catch { /* discrimination is advisory-only */ }
+
+  if (toolName !== 'plan_task') return undefined;
+  const refusal = semanticPlanRefusal(result);
+  if (!refusal) {
+    semanticRefusalLoops.delete(scopeId);
+    return undefined;
+  }
+  const prior = semanticRefusalLoops.get(scopeId);
+  const state: SemanticRefusalLoopState = prior?.identity === refusal.identity
+    ? { ...prior, count: prior.count + 1 }
+    : { ...refusal, count: 1 };
+  semanticRefusalLoops.delete(scopeId);
+  semanticRefusalLoops.set(scopeId, state);
+  while (semanticRefusalLoops.size > MAX_SEMANTIC_REFUSAL_SCOPES) {
+    const oldest = semanticRefusalLoops.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    semanticRefusalLoops.delete(oldest);
+  }
+  if (state.count < PLAN_SEMANTIC_REFUSAL_HARD_STOP_AT) return undefined;
+  const classified = classifyGuardrailEffect(toolName, args);
+  return {
+    action: 'escalate',
+    signature: `semantic-result:${state.identity}`,
+    toolName,
+    reason: `${toolName} returned the same typed ${state.code} refusal ${state.count} times despite its repair instructions — ending this turn instead of repeating the same blocked consequence.`,
+    rule: 'semantic_result_repeat',
+    count: state.count,
+    mutating: classified.mutating,
+    effect: classified.effect,
+    dangerousWrite: classified.dangerousWrite,
+  };
 }
 
 function pollExemptSlugEvidence(toolName: string, args: unknown): boolean {
@@ -1515,6 +1602,7 @@ function sameMutHaltEnforcedInWarn(): boolean {
  *  hook we'd wire when sessions transition to terminal states. */
 export function resetTracker(sessionId: string): void {
   trackers.delete(sessionId);
+  semanticRefusalLoops.delete(sessionId);
 }
 
 /** Test-only: simulate a daemon restart by dropping the in-memory
@@ -1542,6 +1630,7 @@ export function _peekTracker(sessionId: string): Readonly<{
 /** Test-only: clear all trackers + classification cache. */
 export function _resetAllTrackersForTests(): void {
   trackers.clear();
+  semanticRefusalLoops.clear();
 }
 
 /**

@@ -499,7 +499,10 @@ function stopError(reason: HostToolInvocationStopReason, deadlineMs: number): Er
     : new HostToolInvocationCancelledError(reason);
 }
 
-type SettledPlanTaskResultDisposition = 'activation_required' | 'settled_refusal';
+type SettledPlanTaskResultDisposition =
+  | 'activation_required'
+  | 'input_required'
+  | 'settled_refusal';
 
 const PLAN_TASK_RESULT_MAX_BYTES = 64 * 1024;
 const PLAN_TASK_RESULT_MAX_REQUIREMENTS = 32;
@@ -552,6 +555,24 @@ function exactPlanTaskResultId(value: unknown): value is string {
   return typeof value === 'string' && PLAN_TASK_RESULT_ID.test(value);
 }
 
+function exactPlanTaskResultTextList(input: {
+  value: unknown;
+  maxItems: number;
+  maxItemBytes: number;
+  idOnly?: boolean;
+  allowEmpty?: boolean;
+}): input is typeof input & { value: string[] } {
+  return Array.isArray(input.value)
+    && (input.allowEmpty === true || input.value.length > 0)
+    && input.value.length <= input.maxItems
+    && input.value.every((entry) => (
+      input.idOnly === true
+        ? exactPlanTaskResultId(entry)
+        : boundedPlanTaskResultText(entry, input.maxItemBytes)
+    ))
+    && new Set(input.value).size === input.value.length;
+}
+
 function exactPlanTaskResultCardinality(value: unknown): boolean {
   if (!exactPlanTaskResultRecord(value) || typeof value.kind !== 'string') return false;
   if (value.kind === 'once') return exactPlanTaskResultKeys(value, ['kind']);
@@ -582,11 +603,33 @@ function exactPlanTaskResultRequirement(value: unknown): value is Record<string,
   return value.effect === 'read' ? value.coverage !== null : value.coverage === null;
 }
 
+function exactPlanTaskUnverifiedMutations(
+  value: unknown,
+  requirementsValue: unknown,
+): boolean {
+  if (value === undefined) return true;
+  if (
+    !Array.isArray(value)
+    || !Array.isArray(requirementsValue)
+    || value.length < 1
+    || value.length > requirementsValue.length
+    || value.some((operationId) => !exactPlanTaskResultId(operationId))
+    || new Set(value).size !== value.length
+  ) return false;
+  return value.every((operationId) => requirementsValue.some((requirement) => {
+    if (!exactPlanTaskResultRecord(requirement)) return false;
+    return requirement.id === operationId
+      && (requirement.effect === 'local_write'
+        || requirement.effect === 'external_write'
+        || requirement.effect === 'admin');
+  }));
+}
+
 /**
  * `plan_task` has one closed result union. A successful member may cross into
- * expected-work activation; the two typed refusal members are ordinary,
- * durably settled repair outcomes. Nothing else is authority to choose either
- * branch, including a truthy/falsy or missing `ok` field.
+ * expected-work activation; exact repair/input members are ordinary, durably
+ * settled control outcomes. Nothing else is authority to choose either branch,
+ * including a truthy/falsy or missing `ok` field.
  */
 function settledPlanTaskResultDisposition(input: {
   value: unknown;
@@ -612,16 +655,69 @@ function settledPlanTaskResultDisposition(input: {
     ) return 'settled_refusal';
     if (
       payload.code === 'plan_not_required'
-      && exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail'])
+      && (
+        exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail'])
+        || exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair'])
+        || exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair', 'workflowName'])
+      )
       && boundedPlanTaskResultText(payload.detail)
+      && (payload.repair === undefined || boundedPlanTaskResultText(payload.repair))
+      && (payload.workflowName === undefined || boundedPlanTaskResultText(payload.workflowName, 256))
+    ) return 'settled_refusal';
+    if (
+      payload.code === 'account_selection_required'
+      && exactPlanTaskResultKeys(payload, [
+        'ok', 'code', 'detail', 'question', 'accountChoices', 'repair',
+      ])
+      && boundedPlanTaskResultText(payload.detail)
+      && boundedPlanTaskResultText(payload.question, 500)
+      && exactPlanTaskResultTextList({
+        value: payload.accountChoices,
+        maxItems: 5,
+        maxItemBytes: 256,
+      })
+      && boundedPlanTaskResultText(payload.repair)
+    ) return 'input_required';
+    if (
+      payload.code === 'plan_incomplete_missing_write'
+      && exactPlanTaskResultKeys(payload, [
+        'ok', 'code', 'detail', 'requestedEffectScope', 'repair',
+      ])
+      && boundedPlanTaskResultText(payload.detail)
+      && (payload.requestedEffectScope === 'write' || payload.requestedEffectScope === 'mixed')
+      && boundedPlanTaskResultText(payload.repair)
+    ) return 'settled_refusal';
+    if (
+      payload.code === 'plan_incomplete_data_lineage'
+      && exactPlanTaskResultKeys(payload, [
+        'ok', 'code', 'detail', 'writeOperationIds', 'sourceOperationIds', 'repair',
+      ])
+      && boundedPlanTaskResultText(payload.detail)
+      && exactPlanTaskResultTextList({
+        value: payload.writeOperationIds,
+        maxItems: PLAN_TASK_RESULT_MAX_REQUIREMENTS,
+        maxItemBytes: 128,
+        idOnly: true,
+      })
+      && exactPlanTaskResultTextList({
+        value: payload.sourceOperationIds,
+        maxItems: PLAN_TASK_RESULT_MAX_REQUIREMENTS,
+        maxItemBytes: 128,
+        idOnly: true,
+      })
+      && boundedPlanTaskResultText(payload.repair)
     ) return 'settled_refusal';
     return null;
   }
+  const successKeys = [
+    'ok', 'acceptedTaskId', 'graphId', 'graphHash', 'contractId',
+    'requirements', 'next',
+  ];
   if (
-    !exactPlanTaskResultKeys(payload, [
-      'ok', 'acceptedTaskId', 'graphId', 'graphHash', 'contractId',
-      'requirements', 'next',
-    ])
+    !(
+      exactPlanTaskResultKeys(payload, successKeys)
+      || exactPlanTaskResultKeys(payload, [...successKeys, 'unverifiedMutations'])
+    )
     || payload.acceptedTaskId !== input.acceptedTaskId
     || payload.graphId !== `turn-graph:v1:${input.sourceUserSeq}`
     || typeof payload.graphHash !== 'string'
@@ -635,6 +731,7 @@ function settledPlanTaskResultDisposition(input: {
     || new Set(payload.requirements.map((requirement) => (
       (requirement as Record<string, unknown>).id
     ))).size !== payload.requirements.length
+    || !exactPlanTaskUnverifiedMutations(payload.unverifiedMutations, payload.requirements)
     || !boundedPlanTaskResultText(payload.next, 2_048)
   ) return null;
   return 'activation_required';
@@ -667,7 +764,7 @@ function enforceSettledPlanTaskResult(input: {
       'settled plan_task result is not an exact typed success or refusal',
     );
   }
-  if (disposition === 'settled_refusal') return;
+  if (disposition !== 'activation_required') return;
   const activation = activateSettledPlanTaskAfterLogicalSettlement({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -979,6 +1076,7 @@ export async function invokeHostToolCall<T>(
       ...parentContext,
       dispatchLease: childLease,
       hostOwnsToolDeadlineAndSettlement: true,
+      hostOwnedToolEffect: input.effect,
     };
 
     return runWithDispatchLease(childLease, () => withHarnessRunContext(
@@ -1158,6 +1256,16 @@ export async function invokeHostToolCall<T>(
             if (killTimer) clearInterval(killTimer);
             input.callerSignal?.removeEventListener('abort', callerAbort);
           };
+          const yieldBeforeParallelSettlement = async (): Promise<void> => {
+            if (input.effect !== 'read' && input.effect !== 'compute') return;
+            // Read/compute siblings are admitted as one parallel wave. Once a
+            // body has returned, claim its terminal state synchronously above,
+            // then let other already-due body callbacks return before this
+            // call begins synchronous durable settlement. Without this turn
+            // boundary, the first result's SQLite/event work runs inside its
+            // promise continuation and serializes otherwise-independent I/O.
+            await new Promise<void>((resume) => setImmediate(resume));
+          };
           const assertFrozenObservation = (): void => {
             const observed = currentHostToolInvocationObservation();
             if (
@@ -1187,6 +1295,15 @@ export async function invokeHostToolCall<T>(
           }): SettledToolAttempt => {
             assertFrozenObservation();
             const observed = currentHostToolInvocationObservation();
+            const resultPresent = observed?.resultPresent || args.resultPresent === true;
+            const result = observed?.resultPresent ? observed.result : args.result;
+            const planTaskDisposition = contract.toolName === 'plan_task' && resultPresent
+              ? settledPlanTaskResultDisposition({
+                  value: result,
+                  acceptedTaskId,
+                  sourceUserSeq: input.identity.sourceUserSeq,
+                })
+              : null;
             return settleToolAttempt({
               sessionId: input.identity.sessionId,
               sourceUserSeq: input.identity.sourceUserSeq,
@@ -1198,13 +1315,15 @@ export async function invokeHostToolCall<T>(
               args: input.identity.args,
               mutating: isMutating,
               businessCall: frozenBusinessCall,
-              ...(observed?.resultPresent
-                ? { result: observed.result }
-                : args.resultPresent === true ? { result: args.result } : {}),
+              ...(resultPresent ? { result } : {}),
               ...(observed?.thrownPresent
                 ? { thrown: observed.thrown }
                 : args.thrownPresent === true ? { thrown: args.thrown } : {}),
-              signals: { ...observed?.signals, ...args.signals },
+              signals: {
+                ...observed?.signals,
+                ...args.signals,
+                ...(planTaskDisposition === 'input_required' ? { needsUserInput: true } : {}),
+              },
             });
           };
           const adoptedNestedSettlement = (): SettledToolAttempt => {
@@ -1416,6 +1535,7 @@ export async function invokeHostToolCall<T>(
               cleanup();
               void (async () => {
                 try {
+                  await yieldBeforeParallelSettlement();
                   assertDispatchLeaseCurrent(childLease);
                   closeTop('returned');
                   const settlement = input.boundary === 'nested_owned'
@@ -1448,6 +1568,7 @@ export async function invokeHostToolCall<T>(
               cleanup();
               void (async () => {
                 try {
+                  await yieldBeforeParallelSettlement();
                   assertDispatchLeaseCurrent(childLease);
                   closeTop('threw');
                   if (input.boundary === 'nested_owned') adoptedNestedSettlement();

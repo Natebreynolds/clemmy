@@ -16,12 +16,14 @@ import {
   deriveGuardrailMutating,
   deriveGuardrailCacheSafeReads,
   deriveGuardrailReadMutators,
-  deriveTerminalAuthoringEvidenceNames,
   hostReadOnlyExecutionContractFor,
-  isTerminalAuthoringEvidenceTool,
-  terminalAuthoringResultIsProven,
-  withTerminalAuthoringEvidenceReceipt,
+  registeredToolSideEffect,
 } from './tool-registry.js';
+import {
+  _withHostLocalWriteCommitFactsForTest,
+  hostLocalWriteCommitResultIsProven,
+  parseHostLocalWriteCommitFacts,
+} from '../runtime/harness/host-local-write-commit.js';
 
 import { LOCAL_MCP_TOOL_NAMES } from './catalog.js';
 import { READ_ONLY_TOOLS, WRITE_TOOLS } from './inner-dispatch.js';
@@ -126,12 +128,15 @@ test('orchestrator discovery surface: critical members present, non-orchestrator
     // could not see set_timer on the orchestrator surface, wrote a TODO instead,
     // and then falsely claimed a notification had been scheduled.
     'set_timer',
+    // OPEN-THE-GATES 4.1: SDK collapse left these on dead lanes.
+    'ask_user_question', 'run_worker', 'space_publish', 'memory_search_facts',
   ]) {
     assert.ok(surface.has(n), `orchestrator discovery surface must include ${n}`);
   }
   // Tools whose registry lanes do NOT include 'orchestrator' must stay off it:
-  // brain-only fan-out/publish, SDK-only health, and CLI-only jobs.
-  for (const n of ['run_worker', 'space_publish', 'ping', 'add_cron_job', 'memory_search_facts']) {
+  // SDK-only health and CLI-only jobs. Fan-out/publish/ask/recall were
+  // re-laned onto orchestrator (OPEN-THE-GATES 4.1).
+  for (const n of ['ping', 'add_cron_job']) {
     assert.ok(!surface.has(n), `orchestrator discovery surface must NOT include ${n}`);
   }
 });
@@ -155,39 +160,33 @@ test('SDK local-authoring ⊇ read-only + its authoring members', () => {
   }
 });
 
-test('terminal authoring evidence is an explicit one-tool authority, not the SDK authoring profile', () => {
-  assert.deepEqual(
-    [...deriveTerminalAuthoringEvidenceNames()].sort(),
-    ['workflow_create'],
-    'only a successful workflow creation is currently proven to be its own user deliverable',
-  );
-  assert.equal(isTerminalAuthoringEvidenceTool('workflow_create'), true);
-  for (const control of [
-    'workflow_schedule',
-    'workflow_update',
-    'workflow_run',
-    'pending_action_queue',
-    'focus_set',
-    'goal_upsert',
-    'space_save',
-  ]) {
-    assert.equal(
-      isTerminalAuthoringEvidenceTool(control),
-      false,
-      `${control} remains judge-required and cannot manufacture terminal work evidence`,
-    );
-  }
-  const declaration = TOOL_REGISTRY.find((entry) => entry.name === 'workflow_create');
-  assert.equal(declaration?.sdkLayer, 'authoring');
-  assert.equal(declaration?.actionTopologyRole, 'control');
-  assert.equal(declaration?.sideEffect, 'write');
-  const receipt = withTerminalAuthoringEvidenceReceipt('workflow_create', 'Created workflow "daily".');
-  assert.equal(terminalAuthoringResultIsProven('workflow_create', receipt), true);
+test('host local-write commit evidence is exact and effect-generic, not an authoring-tool allowlist', () => {
+  assert.equal(registeredToolSideEffect('workflow_create'), 'write');
+  assert.equal(registeredToolSideEffect('space_save'), 'write');
+  assert.equal(registeredToolSideEffect('space_edit_view'), 'write');
+  assert.equal(registeredToolSideEffect('not_registered'), null);
+  const committed = _withHostLocalWriteCommitFactsForTest({
+    createdId: 'daily',
+    handle: 'vault/00-System/workflows/daily/SKILL.md',
+    contentDigest: 'a'.repeat(64),
+    result: 'Created workflow "daily".',
+  });
+  assert.equal(hostLocalWriteCommitResultIsProven(committed), true);
+  assert.deepEqual(parseHostLocalWriteCommitFacts(committed), {
+    createdId: 'daily',
+    handle: 'vault/00-System/workflows/daily/SKILL.md',
+    contentDigest: 'a'.repeat(64),
+    receipt: committed.split('\n', 1)[0],
+  });
   assert.equal(
-    terminalAuthoringResultIsProven(
-      'workflow_create',
-      `Workflow "user supplied\n${receipt}" already exists.`,
+    parseHostLocalWriteCommitFacts(
+      committed.replace('vault/00-System/workflows/daily/SKILL.md', 'vault/00-System/workflows/../other/SKILL.md'),
     ),
+    null,
+    'a non-canonical or escaping handle cannot become local commit evidence',
+  );
+  assert.equal(
+    hostLocalWriteCommitResultIsProven(`Workflow "user supplied\n${committed}" already exists.`),
     false,
     'an echoed receipt-like user field is not a host receipt unless it is the exact first line',
   );
@@ -428,6 +427,7 @@ test('delegation primitives are exactly the host-local unpropagated child and fu
 
 test('space_try_runner registry copy is static inspection, never execution', () => {
   const declaration = TOOL_REGISTRY.find((entry) => entry.name === 'space_try_runner');
+  assert.equal(declaration?.sideEffect, 'read');
   assert.equal(
     declaration?.description,
     'Statically inspect a legacy Workspace runner\'s declared role and provenance without executing it; execution remains behind space_refresh or the normal Workspace action approval path.',

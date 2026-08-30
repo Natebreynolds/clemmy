@@ -37,6 +37,7 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import type { ModelCapability } from './model-wire-registry.js';
 import { BoundaryError, type BoundaryErrorKind } from '../boundary-error.js';
 import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
+import { isProviderInternalGenerationFailure } from '../../shared/provider-internal-generation.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.resilient-model' });
@@ -116,8 +117,12 @@ export function classifyModelError(err: unknown): ErrorClass {
   if (e?.isRetryable === true) {
     return { retryable: true, kind: 'model.transport_timeout', status, isAuth: false, retryAfterMs };
   }
-  // No HTTP status — a transport / network error thrown before/within the stream.
+  // No HTTP status — a transport / network error thrown before/within the stream,
+  // or a native SSE provider that finished HTTP 200 then died while sampling.
   if (status === undefined) {
+    if (isProviderInternalGenerationFailure(err)) {
+      return { retryable: true, kind: 'model.http_5xx', isAuth: false, retryAfterMs };
+    }
     const msg = typeof e?.message === 'string' ? e.message : '';
     const name = typeof e?.name === 'string' ? e.name : '';
     if (TRANSPORT_RE.test(msg) || TRANSPORT_RE.test(name)) {

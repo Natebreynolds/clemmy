@@ -39,7 +39,7 @@ function installRetiredProviderBodyCanary(): void {
   });
 }
 
-test('manual Composio refresh without shared durable authority is a zero-body refusal', async () => {
+test('manual unproven Composio refresh is refused before durable authority with zero bodies', async () => {
   const slug = 'manual-composio-contained';
   store.spaceStore.save({
     id: slug,
@@ -51,7 +51,7 @@ test('manual Composio refresh without shared durable authority is a zero-body re
     const result = await runner.refreshSpaceData(slug, 'contacts', { cause: 'manual' });
     assert.equal(result.length, 1);
     assert.equal(result[0]?.ok, false);
-    assert.match(result[0]?.error ?? '', /no shared durable call authority/i);
+    assert.match(result[0]?.error ?? '', /not provably read-only/i);
     assert.equal(retiredProviderBodies, 0, 'manual console refresh entered zero provider bodies');
   } finally {
     runner._setSpaceComposioDispatchForTests(null);

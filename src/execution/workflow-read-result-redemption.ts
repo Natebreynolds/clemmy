@@ -5,6 +5,7 @@ import {
 import { redeemDurableLogicalCallSettlementForHost } from '../runtime/harness/logical-call-settlement-store.js';
 import {
   redeemClosedWorkflowPaginatedRead,
+  redeemFailedWorkflowPaginatedRead,
 } from '../runtime/harness/workflow-paginated-read-authority.js';
 import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
 
@@ -52,8 +53,25 @@ export interface VerifiedClosedWorkflowReadResultV1 {
   complete: true;
 }
 
+export interface VerifiedFailedWorkflowReadResultV1 extends Omit<
+  VerifiedClosedWorkflowReadResultV1,
+  'executionKind' | 'complete'
+> {
+  executionKind: 'paginated_read';
+  complete: false;
+  failure: {
+    kind: 'page_execution_failed';
+    aggregateReceiptId: string;
+    aggregateReceiptDigest: string;
+  };
+}
+
 export type RedeemVerifiedClosedWorkflowReadResultV1 =
   | { ok: true; value: VerifiedClosedWorkflowReadResultV1 }
+  | { ok: false; code: 'missing' | 'conflict' | 'storage_error'; reason: string };
+
+export type RedeemVerifiedFailedWorkflowReadResultV1 =
+  | { ok: true; value: VerifiedFailedWorkflowReadResultV1 }
   | { ok: false; code: 'missing' | 'conflict' | 'storage_error'; reason: string };
 
 function exactLineage(
@@ -197,6 +215,60 @@ export function redeemVerifiedClosedWorkflowReadResult(input: {
         rawByteCount: result.value.rawByteCount,
       }],
       complete: true,
+    },
+  };
+}
+
+/** Redeem a digest-bound settled prefix plus its exact failed successor. */
+export function redeemVerifiedFailedWorkflowReadResult(input: {
+  executionKind: 'single_read' | 'paginated_read';
+  activationId: string;
+  lineage: WorkflowReadResultLineageV1;
+}): RedeemVerifiedFailedWorkflowReadResultV1 {
+  if (input.executionKind !== 'paginated_read') {
+    return { ok: false, code: 'conflict', reason: 'failed partition projection requires paginated workflow-read authority' };
+  }
+  const redeemed = redeemFailedWorkflowPaginatedRead({
+    activationId: input.activationId,
+    ...input.lineage,
+  });
+  if (redeemed.status !== 'ok') {
+    return { ok: false, code: redeemed.status, reason: redeemed.reason };
+  }
+  return {
+    ok: true,
+    value: {
+      version: 1,
+      executionKind: 'paginated_read',
+      activationId: redeemed.value.authority.activationId,
+      activationDigest: redeemed.value.authority.activationDigest,
+      authorityRootId: redeemed.value.authority.authorityRootId,
+      aggregateReceiptId: redeemed.value.aggregate.aggregateReceiptId,
+      aggregateReceiptDigest: redeemed.value.aggregate.aggregateReceiptDigest,
+      pages: redeemed.value.pages.map((page) => ({
+        pageOrdinal: page.pageOrdinal,
+        receiptKind: 'paginated_page',
+        pageReceiptId: page.pageReceiptId,
+        pageReceiptDigest: page.pageReceiptDigest,
+        resultHandleId: page.resultHandleId,
+        settledResultDigest: page.settledResultDigest,
+        logicalCallId: page.logicalCallId,
+        physicalDispatchId: page.physicalDispatchId,
+        inputCursorDigest: page.inputCursorDigest,
+        nextCursorDigest: page.nextCursorDigest,
+        exhausted: false,
+        itemCount: page.itemCount,
+        settledAt: page.settledAt,
+        rawPayload: page.rawPayload,
+        rawPayloadJson: page.rawPayloadJson,
+        rawByteCount: page.rawByteCount,
+      })),
+      complete: false,
+      failure: {
+        kind: 'page_execution_failed',
+        aggregateReceiptId: redeemed.value.aggregate.aggregateReceiptId,
+        aggregateReceiptDigest: redeemed.value.aggregate.aggregateReceiptDigest,
+      },
     },
   };
 }

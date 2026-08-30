@@ -617,6 +617,34 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
     const preparationCrossings = durable.status === 'ok'
       ? durable.settlement.crossings.filter((crossing) => crossing.relation === 'probe')
       : [];
+    const exactUncertainWrite = port.mutating
+      && durable.settlement.toolName === recoveryMaterial.toolName
+      && durable.settlement.argumentDigest === recoveryMaterial.argumentDigest
+      && durable.settlement.executionKind === 'provider_execution'
+      && durable.settlement.recovery.businessCall === true
+      && durable.settlement.recovery.mutating === true
+      && durable.settlement.recovery.requirementId === parsed.plan.requirementId
+      && durable.settlement.outcome.kind === 'uncertain_write'
+      && durable.settlement.outcome.directive.requiresReconciliation === true
+      && durable.settlement.physicalCrossingCount === durable.settlement.crossings.length
+      && durable.settlement.hostCrossingCount === 0
+      && businessCrossings.length === 1
+      && ['threw', 'timed_out', 'unknown'].includes(businessCrossings[0]?.terminalState ?? '')
+      && preparationCrossings.every((crossing) =>
+        crossing.terminalState === 'returned' || crossing.terminalState === 'threw');
+    if (exactUncertainWrite) {
+      // The provider boundary was crossed for a mutation but no acknowledgement
+      // came back. The settled v3 occurrence is the recovery authority: retain
+      // its open root/lease and park every reentry without redispatch. Treating
+      // this as corruption (or as a normal failed call) loses the one durable
+      // fact that prevents the same effect from being performed twice.
+      return {
+        status: 'blocked',
+        reason: 'prior_crossing_unknown_no_redispatch',
+        zeroBody: false,
+        activationId: input.activationId,
+      };
+    }
     if (
       durable.settlement.toolName !== recoveryMaterial.toolName
       || durable.settlement.argumentDigest !== recoveryMaterial.argumentDigest
@@ -891,7 +919,12 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
               },
               contract: { toolName: minted.toolName, args: input.args },
               execution: { kind: 'provider_execution' },
-              outcome: classifyAttemptOutcome({ executionFailed: true }),
+              outcome: classifyAttemptOutcome({
+                executionFailed: true,
+                ...(businessCall && port.mutating
+                  ? { mutating: true, acknowledged: false }
+                  : {}),
+              }),
               recovery: {
                 businessCall,
                 mutating: port.mutating,
@@ -905,7 +938,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
             ? logical.reason
             : 'reason' in physical ? physical.reason : 'settlement did not commit';
           poison(port, input.activationId, `workflow failed-call settlement refused: ${settlementReason}`);
-        } else {
+        } else if (logical.settlement.outcome.kind !== 'uncertain_write') {
           const closed = closeWorkflowAndRevokeLease({
             activationId: input.activationId,
             outcome: 'failed',
@@ -919,12 +952,21 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
             poison(port, input.activationId, `workflow failed-call terminal closure refused: ${closeReason}`);
           }
         }
-        return {
-          status: 'failed',
-          reason,
-          zeroBody: !businessCall,
-          activationId: input.activationId,
-        };
+        return logical
+          && (logical.status === 'committed' || logical.status === 'replayed')
+          && logical.settlement.outcome.kind === 'uncertain_write'
+          ? {
+              status: 'blocked',
+              reason: 'prior_crossing_unknown_no_redispatch',
+              zeroBody: false,
+              activationId: input.activationId,
+            }
+          : {
+              status: 'failed',
+              reason,
+              zeroBody: !businessCall,
+              activationId: input.activationId,
+            };
       };
 
       let preparedProof: unknown;

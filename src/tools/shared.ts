@@ -1,7 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BASE_DIR as CONFIG_BASE_DIR } from '../config.js';
+import {
+  BASE_DIR as CONFIG_BASE_DIR,
+  invalidateRuntimeConfigSnapshot,
+} from '../config.js';
 import { PlanStore } from '../planning/plan-store.js';
 import { SessionStore } from '../memory/session-store.js';
 import matter from 'gray-matter';
@@ -73,10 +76,26 @@ export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_R
 
 export { DEFAULT_TOOL_RESULT_MAX_CHARS };
 
+export interface TextToolResult {
+  [key: string]: unknown;
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+}
+
+export interface InvalidArgumentsTextResult extends TextToolResult {
+  isError: true;
+}
+
+// Nominal in-process identity for a local tool's repairable argument refusal.
+// The WeakSet is deliberately module-private: provider/model JSON can copy the
+// public MCP shape, but it cannot manufacture the identity consumed by the
+// local runtime bridge.
+const INVALID_ARGUMENTS_TEXT_RESULTS = new WeakSet<object>();
+
 export function textResult(
   text: string,
   options?: { maxChars?: number; isError?: boolean },
-): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {
+): TextToolResult {
   const capped = formatRecallableToolText(text, {
     maxChars: options?.maxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS,
   });
@@ -84,6 +103,28 @@ export function textResult(
     content: [{ type: 'text', text: capped }],
     ...(options?.isError ? { isError: true } : {}),
   };
+}
+
+/**
+ * Return ordinary MCP error content while retaining non-serializable nominal
+ * proof that this exact in-process value is a repairable argument refusal.
+ */
+export function invalidArgumentsTextResult(
+  text: string,
+  options?: { maxChars?: number },
+): InvalidArgumentsTextResult {
+  const result = textResult(text, {
+    ...(options?.maxChars === undefined ? {} : { maxChars: options.maxChars }),
+    isError: true,
+  }) as InvalidArgumentsTextResult;
+  INVALID_ARGUMENTS_TEXT_RESULTS.add(result);
+  return result;
+}
+
+export function isInvalidArgumentsTextResult(
+  value: unknown,
+): value is InvalidArgumentsTextResult {
+  return Boolean(value && typeof value === 'object' && INVALID_ARGUMENTS_TEXT_RESULTS.has(value));
 }
 
 /**
@@ -391,6 +432,7 @@ export function updateEnvKey(key: string, value: string): void {
   // handful of call sites worked around this by manually setting process.env[key]
   // after the call; doing it here fixes the whole class once, for every caller.
   process.env[key] = value;
+  invalidateRuntimeConfigSnapshot('environment');
   if (key === 'WORKSPACE_DIRS') clearWorkspaceProjectCache();
 }
 
@@ -411,6 +453,7 @@ export function removeEnvKey(key: string): void {
     }
   }
   delete process.env[key];
+  invalidateRuntimeConfigSnapshot('environment');
 }
 
 export function getWorkspaceDirs(): string[] {

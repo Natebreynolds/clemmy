@@ -8,6 +8,7 @@ import type { Runner } from '@openai/agents';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-authority-production-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.COMPOSIO_BACKEND = 'sdk';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.HARNESS_TOOL_BRACKETS = 'off';

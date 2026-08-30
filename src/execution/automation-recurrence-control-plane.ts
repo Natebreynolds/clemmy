@@ -6,7 +6,7 @@ import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { parseWorkflowNodeInvocationPlan } from '../memory/workflow-node-invocation-plan.js';
 import {
   parseWorkflowCanonicalEntityResultProjection,
-  type WorkflowCanonicalEntityResultProjectionV1,
+  type WorkflowCanonicalEntityResultProjection,
 } from '../memory/workflow-result-projection-contract.js';
 import {
   approvalResolutionWithinLifetime,
@@ -141,7 +141,7 @@ export interface AutomationRecurrencePreviewV1 {
   workflowInputs: Record<string, string>;
   workflowInputsDigest: string;
   authoritySnapshot: AutomationRecurrenceAuthoritySnapshotV1;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBinding?: CanonicalEntityWorkspaceBindingApprovalV1;
   previewedAt: string;
 }
@@ -171,7 +171,7 @@ export interface AutomationRecurrenceConsentArgsV1 {
   workflowInputs: Record<string, string>;
   workflowInputsDigest: string;
   authoritySnapshot: AutomationRecurrenceAuthoritySnapshotV1;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBinding?: CanonicalEntityWorkspaceBindingApprovalV1;
 }
 
@@ -245,7 +245,7 @@ export interface AutomationRecurrenceActivationReceiptV1 {
   workflowInputs: Record<string, string>;
   workflowInputsDigest: string;
   authoritySnapshot: AutomationRecurrenceAuthoritySnapshotV1;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBinding?: CanonicalEntityWorkspaceBindingApprovalV1;
   consent: {
     version: 1;

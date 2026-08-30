@@ -322,10 +322,11 @@ test('retention-aged non-chat orphan is failed only after its durable attempt ow
     false,
     'a crash-left marker bound to the finished attempt is cleared with the orphan',
   );
-  assert.ok(
+  assert.equal(
     (db.prepare('SELECT revoked_at FROM run_dispatch_leases WHERE scope_id = ?')
       .get(`${orphan.id}::runner`) as { revoked_at: string | null }).revoked_at,
-    'the provably invalid lease is closed before the orphan is failed',
+    null,
+    'generic retention does not own dispatch-lease quarantine',
   );
   assert.equal(getSession(owned.id)?.status, 'active', 'an unfinished attempt keeps resumable work active');
   assert.equal(

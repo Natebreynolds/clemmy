@@ -1,0 +1,1931 @@
+#!/usr/bin/env node
+
+/**
+ * Release gate: boot the actual npm-packed daemon twice on one exact-v3.14
+ * disposable home.  The store-only rehearsal owns legacy fixture provenance;
+ * this layer proves the packaged entry performs recovery once and reopens
+ * without replaying model, provider, business, or reviewed-local work.
+ */
+import { spawn, spawnSync, execFileSync, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  inspectV314RehearsalHome,
+  REQUIRED_FIXTURE_IDENTITIES,
+  runV314UpgradeRehearsal,
+  type HomeInspection,
+} from './rehearse-v314-upgrade.mts';
+import { fingerprintRuntimeSourceFromGit } from '../src/runtime/source-fingerprint.ts';
+
+type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
+export interface PackagedV314DaemonRehearsalOptions {
+  rehearsalRoot?: string;
+  keep?: boolean;
+}
+
+export interface PackagedDaemonBuild {
+  version: string;
+  entry: string;
+  packaged: boolean;
+  gitSha?: string;
+  gitDirty?: boolean;
+  sourceFingerprint?: string;
+  expectedSchemaVersion: number;
+  schemaVersion: number;
+}
+
+export interface PackagedDaemonBoot {
+  ordinal: 1 | 2;
+  pid: number;
+  ready: boolean;
+  recoverySettled: boolean;
+  settledPhaseSequence: number;
+  notificationDeliverySettled: boolean;
+  notificationDeliveryQueueLength: number;
+  cleanExit: boolean;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  build: PackagedDaemonBuild;
+  stdoutSha256: string;
+  stderrSha256: string;
+}
+
+export interface WorkDelta {
+  total: number;
+  components: Record<string, number>;
+}
+
+export interface PackagedV314ExerciseReport {
+  version: 1;
+  installedRoot: string;
+  oldSessionId: string;
+  oldWorkflowName: string;
+  oldSpaceId: string;
+  coldSessionId: string;
+  coldSourceUserSeq: number;
+  coldTerminalSeq: number;
+  workflowRunId: string;
+  workflowRunStatus: string;
+  proposalId: string;
+  proposalRevision: number;
+  proposalDigest: string;
+  reviewProjectionId: string;
+  reviewApprovalId: string;
+  advancementId: string;
+  advancementStage: 'blocked';
+  advancementStateRevision: number;
+  advancementStateDigest: string;
+  advancementBlockedCode: 'capability_acquisition_missing';
+  advancementBlockedDetail: string;
+  firstConvergence: {
+    failures: number;
+    [key: string]: Json;
+  };
+  secondConvergence: {
+    failures: number;
+    [key: string]: Json;
+  };
+  notificationDeliveryDigest: string;
+  notificationDeliveryQueueLength: number;
+  modelRequests: Array<{ model: string | null; stream: boolean; bodySha256: string }>;
+}
+
+export interface PackagedV314DaemonRehearsalReport {
+  ok: boolean;
+  paths: {
+    rehearsalRoot: string;
+    immutableSnapshot: string;
+    daemonHome: string;
+    tarball: string;
+    packageEntry: string;
+    exerciseFixture: string;
+    report: string;
+  };
+  candidate: {
+    gitSha: string;
+    sourceFingerprint: string;
+    tarballSha256: string;
+  };
+  boots: PackagedDaemonBoot[];
+  exercise: PackagedV314ExerciseReport;
+  firstBootWorkDelta: WorkDelta;
+  exerciseWorkDelta: WorkDelta;
+  secondBootWorkDelta: WorkDelta;
+  firstBootStateDigest: string;
+  postExerciseStateDigest: string;
+  secondBootStateDigest: string;
+  postExerciseRawStateDigest: string;
+  secondBootRawStateDigest: string;
+  secondBootRawStateDiff: StateDifference;
+  secondBootLogicalStateDiff: StateDifference;
+  checks: Array<{ name: string; ok: boolean; detail?: Json }>;
+  limitations: string[];
+}
+
+const PACKAGED_CAPABILITY_ACQUISITION_MISSING_DETAILS = new Set([
+  'no live-read carrier adapters are configured',
+  'no current attested read capability matched the objective',
+]);
+
+export function isPackagedCapabilityAcquisitionMissingDetail(value: unknown): value is string {
+  return typeof value === 'string'
+    && PACKAGED_CAPABILITY_ACQUISITION_MISSING_DETAILS.has(value);
+}
+
+interface WorkSnapshot {
+  counters: Record<string, number>;
+}
+
+interface StateDifference {
+  sqliteSchemasChanged: string[];
+  sqliteTablesAdded: string[];
+  sqliteTablesRemoved: string[];
+  sqliteTablesChanged: string[];
+  filesAdded: string[];
+  filesRemoved: string[];
+  filesChanged: string[];
+}
+
+const scriptFile = fileURLToPath(import.meta.url);
+const repoRoot = path.resolve(path.dirname(scriptFile), '..');
+const tempRoot = realpathSync(os.tmpdir());
+const CREDENTIAL_KEY = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTHORIZATION|COMPOSIO|OPENAI|ANTHROPIC|XAI|SLACK|DISCORD|WEBHOOK|API_KEY)/i;
+const WORK_EVENT_TYPES = new Set([
+  'tool_called',
+  'tool_returned',
+  'external_write',
+  'external_write_succeeded',
+  'external_write_failed',
+  'external_write_orphaned',
+  'provider_dispatch_started',
+  'provider_dispatch_settled',
+  'deliverable_saved',
+  'sdk_tool_use_recorded',
+  'worker_model_routed',
+  'worker_result',
+  'model_started',
+]);
+export const WORK_TABLES = [
+  'accepted_model_batch_admissions',
+  'artifact_content_verifications',
+  'artifact_run_scopes',
+  'artifact_source_roots',
+  'durable_result_handles',
+  'evidence_receipts',
+  'expected_work_call_bindings',
+  'graph_journal_entries',
+  'graph_node_leases',
+  'host_call_capability_bindings',
+  'logical_call_progress_claims',
+  'logical_call_settlement_crossings',
+  'logical_call_settlements',
+  'logical_model_result_projection_receipts',
+  'logical_tool_calls',
+  'obligation_transitions',
+  'physical_dispatch_authority',
+  'physical_dispatch_return_checkpoints',
+  'physical_dispatches',
+  'run_attempts',
+  'settlement_claims',
+  'staged_transfer_stage_receipts',
+  'tool_output_invocations',
+  'tool_outputs',
+  'workflow_node_invocation_activations',
+  'workflow_paginated_read_pages',
+  'workflow_v3_call_activation_bindings',
+  'write_evidence_dispatch_outcomes',
+  'write_evidence_proofs',
+] as const;
+
+function asJson(value: unknown): Json {
+  return JSON.parse(JSON.stringify(value)) as Json;
+}
+
+function stable(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${stable(entry)}`)
+    .join(',')}}`;
+}
+
+function sha256(value: Buffer | string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function assertDisposable(candidate: string, label: string): string {
+  const absolute = path.resolve(candidate);
+  const resolved = existsSync(absolute)
+    ? realpathSync(absolute)
+    : path.join(realpathSync(path.dirname(absolute)), path.basename(absolute));
+  if (resolved === tempRoot || !resolved.startsWith(`${tempRoot}${path.sep}`)) {
+    throw new Error(`${label} must resolve below the OS temp directory; refused ${resolved}`);
+  }
+  const liveHome = path.resolve(os.homedir(), '.clementine-next');
+  if (resolved === liveHome || resolved.startsWith(`${liveHome}${path.sep}`)) {
+    throw new Error(`${label} must never address the live Clementine home; refused ${resolved}`);
+  }
+  return resolved;
+}
+
+function pathWithoutCheckout(rawPath = ''): string {
+  return rawPath.split(path.delimiter).filter((entry) => {
+    if (!entry) return false;
+    const relative = path.relative(repoRoot, path.resolve(entry));
+    return relative !== '' && (relative.startsWith('..') || path.isAbsolute(relative));
+  }).join(path.delimiter);
+}
+
+/** Pure environment boundary shared by npm staging and packaged daemon boots. */
+export function sanitizePackagedGateEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined || CREDENTIAL_KEY.test(key)) continue;
+    const lower = key.toLowerCase();
+    if (
+      key === 'NODE_OPTIONS'
+      || key === 'NODE_PATH'
+      || key === 'NODE_TEST_CONTEXT'
+      || key === 'INIT_CWD'
+      || key === 'PWD'
+      || key === 'OLDPWD'
+      || key.startsWith('CLEMENTINE_')
+      || key.startsWith('CLEM_')
+      || key.startsWith('CLEMMY_')
+      || key.startsWith('MCP_')
+      || lower.startsWith('npm_package_')
+      || lower.startsWith('npm_lifecycle_')
+      || lower === 'npm_execpath'
+      || lower === 'npm_node_execpath'
+      || lower === 'npm_config_local_prefix'
+      || lower === 'npm_config_prefix'
+    ) continue;
+    env[key] = value;
+  }
+  env.PATH = pathWithoutCheckout(source.PATH);
+  return env;
+}
+
+function isWithin(candidate: string, parent: string): boolean {
+  const relative = path.relative(realpathSync(parent), realpathSync(candidate));
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function run(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): string {
+  const cwd = path.resolve(options.cwd ?? repoRoot);
+  const env: NodeJS.ProcessEnv = { ...(options.env ?? sanitizePackagedGateEnvironment(process.env)), PWD: cwd };
+  delete env.OLDPWD;
+  const result = spawnSync(command, args, {
+    cwd,
+    env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 128 * 1024 * 1024,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${command} ${args.join(' ')} exited ${result.status}\n${result.stderr || result.stdout}`.trim());
+  }
+  return result.stdout ?? '';
+}
+
+function currentCandidateIdentity(): { gitSha: string; sourceFingerprint: string } {
+  const gitSha = execFileSync('git', ['-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  }).trim();
+  const dirty = execFileSync('git', [
+    '-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '--untracked-files=all',
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    maxBuffer: 128 * 1024 * 1024,
+  }).trim();
+  if (dirty) {
+    throw new Error('packaged upgrade gate requires one clean reviewed candidate commit; the worktree is dirty');
+  }
+  const sourceFingerprint = fingerprintRuntimeSourceFromGit({ repoRoot, gitHead: gitSha });
+  const stampPath = path.join(repoRoot, 'dist/runtime/build-stamp.json');
+  if (!existsSync(stampPath)) throw new Error('candidate dist/runtime/build-stamp.json is missing; run npm run build');
+  const stamp = JSON.parse(readFileSync(stampPath, 'utf8')) as {
+    gitSha?: unknown;
+    sourceFingerprint?: unknown;
+    gitDirty?: unknown;
+    expectedSchemaVersion?: unknown;
+    implementationManifestDigest?: unknown;
+  };
+  if (stamp.gitSha !== gitSha || stamp.sourceFingerprint !== sourceFingerprint || stamp.gitDirty !== false) {
+    throw new Error(
+      `candidate build is stale: stamp=${String(stamp.sourceFingerprint)} current=${sourceFingerprint}; run npm run build`,
+    );
+  }
+  if (!Number.isInteger(stamp.expectedSchemaVersion) || !/^[a-f0-9]{64}$/.test(String(stamp.implementationManifestDigest ?? ''))) {
+    throw new Error('candidate build stamp lacks exact schema or shipped-implementation identity');
+  }
+  return { gitSha, sourceFingerprint };
+}
+
+function packAndInstall(rehearsalRoot: string): { tarball: string; packageEntry: string } {
+  const packRoot = path.join(rehearsalRoot, 'candidate-pack');
+  const installRoot = path.join(rehearsalRoot, 'release-v314-packaged-daemon');
+  const npmCache = path.join(rehearsalRoot, 'npm-cache');
+  const npmHome = path.join(rehearsalRoot, 'npm-home');
+  mkdirSync(packRoot, { recursive: true });
+  mkdirSync(installRoot, { recursive: true });
+  mkdirSync(npmCache, { recursive: true });
+  mkdirSync(npmHome, { recursive: true });
+  const npmEnv = {
+    ...sanitizePackagedGateEnvironment(process.env),
+    HOME: npmHome,
+    USERPROFILE: npmHome,
+    npm_config_cache: npmCache,
+    NPM_CONFIG_CACHE: npmCache,
+    npm_config_audit: 'false',
+    npm_config_fund: 'false',
+    npm_config_update_notifier: 'false',
+  };
+  const packedJson = run('npm', [
+    'pack',
+    '--ignore-scripts',
+    '--json',
+    '--pack-destination',
+    packRoot,
+  ], { env: npmEnv });
+  const packed = JSON.parse(packedJson) as Array<{ filename?: unknown }>;
+  const filename = packed[0]?.filename;
+  if (typeof filename !== 'string' || !filename.endsWith('.tgz')) {
+    throw new Error(`npm pack did not return one tarball: ${packedJson}`);
+  }
+  const tarball = path.join(packRoot, filename);
+  writeFileSync(path.join(installRoot, 'package.json'), `${JSON.stringify({
+    name: 'clementine-v314-packaged-daemon-gate',
+    private: true,
+    version: '0.0.0',
+  })}\n`, { flag: 'wx' });
+  run('npm', [
+    'install',
+    '--omit=optional',
+    '--no-audit',
+    '--no-fund',
+    '--no-package-lock',
+    tarball,
+  ], { cwd: installRoot, env: npmEnv });
+  const installedPackage = path.join(installRoot, 'node_modules', 'clemmy');
+  const packageEntry = path.join(installedPackage, 'dist', 'index.js');
+  if (!existsSync(packageEntry) || lstatSync(installedPackage).isSymbolicLink()) {
+    throw new Error('npm did not install a real packed Clementine directory');
+  }
+  if (existsSync(path.join(installedPackage, 'src'))) {
+    throw new Error('packed Clementine unexpectedly contains the source tree');
+  }
+  const installedRequire = createRequire(path.join(installRoot, 'package.json'));
+  const sqliteEntry = installedRequire.resolve('better-sqlite3');
+  if (!isWithin(sqliteEntry, installRoot) || isWithin(sqliteEntry, path.join(repoRoot, 'node_modules'))) {
+    throw new Error(`packed daemon resolved better-sqlite3 outside its fresh install: ${sqliteEntry}`);
+  }
+  run(process.execPath, ['-e', [
+    "const { createRequire } = require('node:module');",
+    'const req = createRequire(process.argv[1]);',
+    "const Database = req('better-sqlite3');",
+    "const db = new Database(':memory:');",
+    "if (db.prepare('SELECT 1 AS ok').get().ok !== 1) process.exit(7);",
+    'db.close();',
+  ].join(' '), path.join(installRoot, 'package.json')], { cwd: installRoot, env: npmEnv });
+  return { tarball, packageEntry };
+}
+
+function daemonEnv(home: string): NodeJS.ProcessEnv {
+  const env = sanitizePackagedGateEnvironment(process.env);
+  return {
+    ...env,
+    HOME: home,
+    USERPROFILE: home,
+    TMPDIR: os.tmpdir(),
+    CLEMENTINE_HOME: home,
+    CLEMMY_TEST_ISOLATED_HOME: '1',
+    CLEMMY_TEST_DISABLE_LIVE_MODELS: '1',
+    CLEMMY_LOCAL_EMBEDDINGS: 'off',
+    CLEMMY_REFLECTION: 'off',
+    CLEMMY_MEMORY_DECAY: 'off',
+    CLEMMY_MEMORY_DEDUP: 'off',
+    CLEMMY_AUTHORITY_SEAL_KEY: 'ab'.repeat(32),
+    CLEMMY_HARNESS_CRON: 'off',
+    CLEMMY_MCP_PREWARM: 'off',
+    CLEMMY_BOOT_WARMUP: 'off',
+    CLEMMY_CLI_DISCOVERY_WARMUP: 'off',
+    MCP_AUTO_IMPORT_ENABLED: 'false',
+    OPENAI_AGENTS_DISABLE_TRACING: '1',
+    AUTH_MODE: 'api_key',
+    WEBHOOK_ENABLED: 'false',
+    DISCORD_ENABLED: 'false',
+    SLACK_ENABLED: 'false',
+    WEBHOOK_ALLOW_LAN: 'false',
+    CLEMENTINE_MOBILE_APP_LISTENER: 'off',
+  };
+}
+
+function parseBuild(stdout: string): PackagedDaemonBuild | null {
+  for (const line of stdout.split(/\r?\n/)) {
+    try {
+      const value = JSON.parse(line) as { build?: unknown };
+      if (value.build && typeof value.build === 'object') return value.build as PackagedDaemonBuild;
+    } catch {
+      // Human shutdown lines and partial log chunks are intentionally ignored.
+    }
+  }
+  return null;
+}
+
+async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode) return { code: child.exitCode, signal: child.signalCode };
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`daemon ${child.pid ?? 'unknown'} did not exit within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      child.removeListener('error', onError);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      cleanup();
+      resolve({ code, signal });
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    child.once('exit', onExit);
+    child.once('error', onError);
+  });
+}
+
+export function notificationDeliverySettlement(home: string): {
+  settled: boolean;
+  queueLength: number;
+  recoveryNotificationIds: string[];
+  desktopReceiptIds: string[];
+  missingDesktopReceiptIds: string[];
+  legacyFixturePreserved: boolean;
+  setupPromptPresent: boolean;
+} {
+  const readArray = (relativePath: string): Array<Record<string, unknown>> => {
+    const file = path.join(home, relativePath);
+    if (!existsSync(file)) return [];
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.filter((entry): entry is Record<string, unknown> =>
+            entry !== null && typeof entry === 'object' && !Array.isArray(entry))
+        : [];
+    } catch {
+      return [];
+    }
+  };
+  const notifications = readArray('state/notifications.json');
+  const notificationById = new Map(notifications.flatMap((entry) =>
+    typeof entry.id === 'string' ? [[entry.id, entry] as const] : []));
+  const queue = readArray('state/notification-delivery-queue.json');
+  const metadata = (notification: Record<string, unknown>): Record<string, unknown> => {
+    const value = notification.metadata;
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  };
+  const recoveryNotifications = notifications.filter((notification) => {
+    const details = metadata(notification);
+    const interruptedChat = notification.kind === 'system'
+      && notification.title === 'A chat task was interrupted by a restart'
+      && details.sessionId === REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId
+      && details.reason === 'interrupted_by_restart';
+    const disabledWorkflow = notification.kind === 'workflow'
+      && notification.title === `Workflow not run: ${REQUIRED_FIXTURE_IDENTITIES.workflowName}`
+      && details.workflow === REQUIRED_FIXTURE_IDENTITIES.workflowName;
+    const cancelledApproval = notification.kind === 'system'
+      && notification.title === 'Approval closed with its ended session'
+      && details.sessionId === REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId
+      && details.approvalResolution === 'cancelled_by_system';
+    return interruptedChat || disabledWorkflow || cancelledApproval;
+  });
+  const hasTimestamp = (value: unknown): boolean =>
+    typeof value === 'string' && Number.isFinite(Date.parse(value));
+  const hasDesktopReceipt = (notification: Record<string, unknown>): boolean => {
+    const plan = notification.deliveryPlan;
+    const destinationIds = plan !== null && typeof plan === 'object' && !Array.isArray(plan)
+      ? (plan as Record<string, unknown>).destinationIds
+      : undefined;
+    return Array.isArray(destinationIds)
+      && destinationIds.length === 1
+      && destinationIds[0] === 'derived-desktop'
+      && Array.isArray(notification.deliveredDestinations)
+      && notification.deliveredDestinations.length === 1
+      && notification.deliveredDestinations[0] === 'derived-desktop'
+      && hasTimestamp(notification.deliveredAt)
+      && hasTimestamp(notification.deliveryPlanCompletedAt)
+      && typeof notification.deliveryError !== 'string';
+  };
+  const recoveryNotificationIds = recoveryNotifications.flatMap((notification) =>
+    typeof notification.id === 'string' ? [notification.id] : []).sort();
+  const desktopReceiptIds = recoveryNotifications.flatMap((notification) =>
+    typeof notification.id === 'string' && hasDesktopReceipt(notification) ? [notification.id] : []).sort();
+  const missingDesktopReceiptIds = recoveryNotificationIds
+    .filter((id) => !desktopReceiptIds.includes(id));
+  const legacyFixture = notificationById.get(REQUIRED_FIXTURE_IDENTITIES.notificationId);
+  const legacyFixturePreserved = legacyFixture?.silent === true
+    && legacyFixture.deliveryPlan === undefined
+    && legacyFixture.deliveredAt === undefined
+    && legacyFixture.deliveredDestinations === undefined;
+  const setupPromptPresent = notifications.some((notification) => {
+    const details = notification.metadata;
+    return notification.silent === true
+      && details !== null
+      && typeof details === 'object'
+      && !Array.isArray(details)
+      && (details as Record<string, unknown>).errorCategory === 'no_destinations';
+  });
+  return {
+    // Since U5 the local desktop is a guaranteed delivery surface. A healthy
+    // headless packaged boot therefore drains its queue after durably recording
+    // one desktop receipt for each recovery notification. Merely observing an
+    // empty queue is insufficient: the exact receipts below are the proof that
+    // recovery notifications were delivered rather than lost.
+    settled: queue.length === 0
+      && recoveryNotifications.length === 4
+      && desktopReceiptIds.length === recoveryNotifications.length
+      && legacyFixturePreserved
+      && !setupPromptPresent,
+    queueLength: queue.length,
+    recoveryNotificationIds,
+    desktopReceiptIds,
+    missingDesktopReceiptIds,
+    legacyFixturePreserved,
+    setupPromptPresent,
+  };
+}
+
+async function bootPackagedDaemon(
+  ordinal: 1 | 2,
+  packageEntry: string,
+  home: string,
+): Promise<PackagedDaemonBoot> {
+  const child = spawn(process.execPath, [packageEntry, 'daemon', '--foreground'], {
+    cwd: path.dirname(path.dirname(packageEntry)),
+    env: daemonEnv(home),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let stdout = '';
+  let stderr = '';
+  let recoverySettled = false;
+  let settledPhaseSequence = 0;
+  child.stdout?.on('data', (chunk: Buffer | string) => {
+    stdout = `${stdout}${String(chunk)}`.slice(-2_000_000);
+  });
+  child.stderr?.on('data', (chunk: Buffer | string) => {
+    stderr = `${stderr}${String(chunk)}`.slice(-2_000_000);
+  });
+  child.on('message', (message: unknown) => {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return;
+    const heartbeat = message as {
+      type?: unknown;
+      phase?: { name?: unknown; sequence?: unknown };
+    };
+    if (
+      heartbeat.type === 'clementine.daemon.heartbeat'
+      && heartbeat.phase?.name === 'daemon.loop.sleep'
+      && Number.isSafeInteger(heartbeat.phase.sequence)
+    ) {
+      recoverySettled = true;
+      settledPhaseSequence = heartbeat.phase.sequence as number;
+    }
+  });
+  const deadline = Date.now() + 120_000;
+  let ready = false;
+  while (Date.now() < deadline) {
+    if (stdout.includes('Daemon loop started')) ready = true;
+    if (ready && recoverySettled) break;
+    if (child.exitCode !== null || child.signalCode) break;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  if (!ready || !recoverySettled) {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    const exited = await waitForExit(child, 5_000).catch(() => ({ code: child.exitCode, signal: child.signalCode }));
+    throw new Error(
+      `packaged daemon boot ${ordinal} failed ${ready ? 'first-tick recovery completion' : 'readiness'} `
+      + `(${exited.code}/${exited.signal})\n${stderr || stdout}`,
+    );
+  }
+  const deliveryDeadline = Date.now() + 30_000;
+  let deliverySettlement = notificationDeliverySettlement(home);
+  while (!deliverySettlement.settled && Date.now() < deliveryDeadline) {
+    if (child.exitCode !== null || child.signalCode) break;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    deliverySettlement = notificationDeliverySettlement(home);
+  }
+  if (!deliverySettlement.settled) {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    const exited = await waitForExit(child, 5_000).catch(() => ({ code: child.exitCode, signal: child.signalCode }));
+    throw new Error(
+      `packaged daemon boot ${ordinal} did not settle its durable notification-delivery queue `
+      + `(${exited.code}/${exited.signal}): ${stable(deliverySettlement)}`,
+    );
+  }
+  // daemon.loop.sleep is emitted only after the entire first tick (scheduler,
+  // trigger recovery, workflow drain, automation convergence, maintenance,
+  // and heartbeat persistence) has completed. It is the deterministic boot
+  // recovery barrier; stdout quietness is not authority.
+  const pid = child.pid ?? 0;
+  child.kill('SIGTERM');
+  let exited: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    exited = await waitForExit(child, 10_000);
+  } catch (error) {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    await waitForExit(child, 5_000).catch(() => undefined);
+    throw error;
+  }
+  const build = parseBuild(stdout);
+  if (!build) throw new Error(`packaged daemon boot ${ordinal} did not self-report build identity\n${stdout}`);
+  return {
+    ordinal,
+    pid,
+    ready,
+    recoverySettled,
+    settledPhaseSequence,
+    notificationDeliverySettled: deliverySettlement.settled,
+    notificationDeliveryQueueLength: deliverySettlement.queueLength,
+    cleanExit: exited.code === 0 && exited.signal === null,
+    exitCode: exited.code,
+    signal: exited.signal,
+    build,
+    stdoutSha256: sha256(stdout),
+    stderrSha256: sha256(stderr),
+  };
+}
+
+const PACKAGED_EXERCISE_MARKER = 'CLEMENTINE_V314_PACKAGED_EXERCISE=';
+
+function runPackagedUpgradeExercise(
+  exerciseFixture: string,
+  packageEntry: string,
+  home: string,
+): PackagedV314ExerciseReport {
+  const installedRoot = path.dirname(path.dirname(packageEntry));
+  const stdout = run(process.execPath, [exerciseFixture, installedRoot, home], {
+    cwd: installedRoot,
+    env: daemonEnv(home),
+  });
+  const markerLine = stdout.split(/\r?\n/)
+    .findLast((line) => line.startsWith(PACKAGED_EXERCISE_MARKER));
+  if (!markerLine) throw new Error(`packaged exercise returned no exact marker\n${stdout}`);
+  const parsed = JSON.parse(markerLine.slice(PACKAGED_EXERCISE_MARKER.length)) as PackagedV314ExerciseReport;
+  if (
+    parsed.version !== 1
+    || parsed.installedRoot !== installedRoot
+    || !parsed.coldSessionId
+    || !Number.isSafeInteger(parsed.coldSourceUserSeq)
+    || !Number.isSafeInteger(parsed.coldTerminalSeq)
+    || parsed.workflowRunStatus !== 'completed'
+    || parsed.proposalRevision !== 3
+    || !/^[a-f0-9]{64}$/.test(parsed.proposalDigest)
+    || !parsed.reviewProjectionId
+    || !parsed.reviewApprovalId
+    || !parsed.advancementId
+    || parsed.advancementStage !== 'blocked'
+    || !Number.isSafeInteger(parsed.advancementStateRevision)
+    || !/^[a-f0-9]{64}$/.test(parsed.advancementStateDigest)
+    || parsed.advancementBlockedCode !== 'capability_acquisition_missing'
+    || !isPackagedCapabilityAcquisitionMissingDetail(parsed.advancementBlockedDetail)
+    || parsed.firstConvergence?.failures !== 0
+    || parsed.secondConvergence?.failures !== 0
+    || !/^[a-f0-9]{64}$/.test(parsed.notificationDeliveryDigest)
+    || !Number.isSafeInteger(parsed.notificationDeliveryQueueLength)
+    // U5 makes the durable local store a real desktop delivery surface, so the
+    // explicit production delivery passes above must drain the ordinary loud
+    // workflow notification instead of retaining a no-destination retry row.
+    || parsed.notificationDeliveryQueueLength !== 0
+    || !Array.isArray(parsed.modelRequests)
+    || parsed.modelRequests.length < 2
+    || parsed.modelRequests.some((request) =>
+      request.model !== 'upgrade-fixture-model'
+      || !/^[a-f0-9]{64}$/.test(request.bodySha256))
+  ) {
+    throw new Error(`packaged exercise returned an invalid proof: ${stable(parsed)}`);
+  }
+  return parsed;
+}
+
+function usageEntries(home: string): number {
+  const directory = path.join(home, 'state', 'token-usage');
+  if (!existsSync(directory)) return 0;
+  return readdirSync(directory)
+    .filter((name) => name.endsWith('.ndjson'))
+    .reduce((total, name) => total + readFileSync(path.join(directory, name), 'utf8').split(/\r?\n/).filter(Boolean).length, 0);
+}
+
+function executionActivityEntries(home: string): number {
+  const file = path.join(home, 'state', 'executions.json');
+  if (!existsSync(file)) return 0;
+  const rows = JSON.parse(readFileSync(file, 'utf8')) as Array<{ activity?: unknown }>;
+  return rows.reduce((total, row) => total + (Array.isArray(row.activity) ? row.activity.length : 0), 0);
+}
+
+function workSnapshot(home: string, inspection: HomeInspection): WorkSnapshot {
+  const counters: Record<string, number> = {};
+  const harness = inspection.sqlite['state/harness.db'];
+  for (const table of WORK_TABLES) counters[`table:${table}`] = harness?.tableCounts[table] ?? 0;
+  for (const type of [...WORK_EVENT_TYPES].sort()) counters[`event:${type}`] = inspection.carriers.eventTypes[type] ?? 0;
+  counters.model_usage_entries = usageEntries(home);
+  // A terminal audit log under runs/<id>/events.jsonl is recovery projection,
+  // not a fresh admitted body. Count canonical run records, then assert their
+  // exact status/receipt bytes separately.
+  counters.workflow_runs = inspection.carriers.workflowRuns.length;
+  counters.workflow_trigger_events = inspection.carriers.triggerEvents.length;
+  counters.execution_activity_entries = executionActivityEntries(home);
+  return { counters };
+}
+
+function workDelta(before: WorkSnapshot, after: WorkSnapshot): WorkDelta {
+  const keys = new Set([...Object.keys(before.counters), ...Object.keys(after.counters)]);
+  const components: Record<string, number> = {};
+  let total = 0;
+  for (const key of [...keys].sort()) {
+    const delta = (after.counters[key] ?? 0) - (before.counters[key] ?? 0);
+    if (delta !== 0) components[key] = delta;
+    total += Math.abs(delta);
+  }
+  return { total, components };
+}
+
+function nonSqliteState(
+  home: string,
+  inspection: HomeInspection,
+  normalizeObservations: boolean,
+): Record<string, string> {
+  const files = { ...inspection.allNonSqliteFiles };
+  if (!normalizeObservations) return files;
+  for (const relativePath of Object.keys(files)) {
+    if (relativePath.endsWith('/workflow-schedule-state.json') || relativePath === 'workflow-schedule-state.json') {
+      files[relativePath] = sha256(stable(inspection.carriers.workflowScheduleState));
+    }
+  }
+  const daemonStatePath = 'cron/daemon-state.json';
+  if (files[daemonStatePath]) {
+    const record = (() => {
+      try {
+        const parsed = JSON.parse(readFileSync(path.join(home, daemonStatePath), 'utf8')) as unknown;
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : null;
+      } catch {
+        return null;
+      }
+    })();
+    if (record) {
+      // These two fields are observation cursors, not admitted occurrence or
+      // effect authority. Every pending occurrence and dedupe map remains in
+      // the projection and any other daemon-state mutation still fails.
+      const {
+        lastHealthyTickAt: _heartbeatObservation,
+        lastCronEvaluatedAtMs: _cronScanObservation,
+        ...authority
+      } = record;
+      files[daemonStatePath] = sha256(stable(authority));
+    }
+  }
+  return files;
+}
+
+function stateProjection(
+  home: string,
+  inspection: HomeInspection,
+  normalizeObservations: boolean,
+): {
+  sqlite: Record<string, {
+    userVersion: number;
+    schemaVersions: number[] | null;
+    schemaDigest: string;
+    tableCounts: Record<string, number>;
+    tableDigests: Record<string, string>;
+  }>;
+  files: Record<string, string>;
+} {
+  return {
+    sqlite: Object.fromEntries(Object.entries(inspection.sqlite).map(([name, value]) => [name, {
+      userVersion: value.userVersion,
+      schemaVersions: value.schemaVersions,
+      schemaDigest: value.schemaDigest,
+      tableCounts: value.tableCounts,
+      tableDigests: value.tableDigests,
+    }])),
+    files: nonSqliteState(home, inspection, normalizeObservations),
+  };
+}
+
+function stateProjectionDigest(projection: ReturnType<typeof stateProjection>): string {
+  return sha256(stable(projection));
+}
+
+function stateDifference(
+  left: ReturnType<typeof stateProjection>,
+  right: ReturnType<typeof stateProjection>,
+): StateDifference {
+  const difference: StateDifference = {
+    sqliteSchemasChanged: [],
+    sqliteTablesAdded: [],
+    sqliteTablesRemoved: [],
+    sqliteTablesChanged: [],
+    filesAdded: [],
+    filesRemoved: [],
+    filesChanged: [],
+  };
+  for (const dbName of [...new Set([...Object.keys(left.sqlite), ...Object.keys(right.sqlite)])].sort()) {
+    const before = left.sqlite[dbName];
+    const after = right.sqlite[dbName];
+    if (!before || !after) {
+      difference.sqliteSchemasChanged.push(dbName);
+      continue;
+    }
+    if (
+      before.schemaDigest !== after.schemaDigest
+      || before.userVersion !== after.userVersion
+      || stable(before.schemaVersions) !== stable(after.schemaVersions)
+    ) difference.sqliteSchemasChanged.push(dbName);
+    for (const table of [...new Set([
+      ...Object.keys(before.tableDigests),
+      ...Object.keys(after.tableDigests),
+    ])].sort()) {
+      const identity = `${dbName}:${table}`;
+      if (!(table in before.tableDigests)) difference.sqliteTablesAdded.push(identity);
+      else if (!(table in after.tableDigests)) difference.sqliteTablesRemoved.push(identity);
+      else if (
+        before.tableDigests[table] !== after.tableDigests[table]
+        || before.tableCounts[table] !== after.tableCounts[table]
+      ) difference.sqliteTablesChanged.push(identity);
+    }
+  }
+  for (const file of [...new Set([...Object.keys(left.files), ...Object.keys(right.files)])].sort()) {
+    if (!(file in left.files)) difference.filesAdded.push(file);
+    else if (!(file in right.files)) difference.filesRemoved.push(file);
+    else if (left.files[file] !== right.files[file]) difference.filesChanged.push(file);
+  }
+  return difference;
+}
+
+function noStateDifference(difference: StateDifference): boolean {
+  return Object.values(difference).every((entries) => entries.length === 0);
+}
+
+function sqliteHealthy(inspection: HomeInspection): boolean {
+  return Object.values(inspection.sqlite).every((value) =>
+    value.integrity.length === 1
+    && value.integrity[0] === 'ok'
+    && value.foreignKeyViolations.length === 0
+    && /^[a-f0-9]{64}$/.test(value.schemaDigest)
+    && Object.values(value.tableDigests).every((digest) => /^[a-f0-9]{64}$/.test(digest)));
+}
+
+function schemaShape(inspection: HomeInspection): Json {
+  return asJson({
+    harness: inspection.sqlite['state/harness.db']?.schemaVersions?.at(-1) ?? null,
+    memory: inspection.sqlite['state/memory.db']?.schemaVersions?.at(-1) ?? null,
+    workspace: inspection.sqlite['state/workspaces.db']?.userVersion ?? null,
+    workflowTrigger: inspection.sqlite['state/workflow-triggers.db']?.tableColumns ?? {},
+  });
+}
+
+function identityRowsPreserved(
+  reference: Json[] | undefined,
+  actual: Json[] | undefined,
+  key: string,
+  immutableFields: readonly string[],
+): boolean {
+  const observed = new Map<string, Record<string, Json>>();
+  for (const entry of actual ?? []) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const row = entry as Record<string, Json>;
+    if (typeof row[key] === 'string' || typeof row[key] === 'number') {
+      observed.set(String(row[key]), row);
+    }
+  }
+  for (const entry of reference ?? []) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const expected = entry as Record<string, Json>;
+    const current = observed.get(String(expected[key]));
+    if (!current) return false;
+    for (const field of immutableFields) {
+      if (stable(expected[field] ?? null) !== stable(current[field] ?? null)) return false;
+    }
+  }
+  return true;
+}
+
+function rowByIdentity(rows: Json[] | undefined, key: string, value: Json): Record<string, Json> | null {
+  for (const entry of rows ?? []) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const record = entry as Record<string, Json>;
+    if (record[key] === value) return record;
+  }
+  return null;
+}
+
+function eventRows(
+  inspection: HomeInspection,
+  sessionId: string,
+  type: string,
+): Record<string, Json>[] {
+  const rows = inspection.sqlite['state/harness.db']?.identities.events ?? [];
+  return rows.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const row = entry as Record<string, Json>;
+    return row.session_id === sessionId && row.type === type ? [row] : [];
+  });
+}
+
+function eventData(row: Record<string, Json> | null | undefined): Record<string, Json> | null {
+  if (!row || typeof row.data_json !== 'string') return null;
+  try {
+    const parsed = JSON.parse(row.data_json) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, Json>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function jsonRecord(value: Json): Record<string, Json> | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, Json>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonStateRecord(home: string, relativePath: string): Record<string, Json> | null {
+  const file = path.join(home, relativePath);
+  if (!existsSync(file)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? asJson(parsed) as Record<string, Json>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function runForReceipt(inspection: HomeInspection, receiptId: Json): Record<string, Json> | null {
+  return inspection.carriers.workflowRuns.find((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    return (entry as Record<string, Json>).triggerReceiptId === receiptId;
+  }) as Record<string, Json> | undefined ?? null;
+}
+
+function acceptanceForReceipt(inspection: HomeInspection, receiptId: Json): Record<string, Json> | null {
+  return inspection.carriers.triggerReceiptAcceptances.find((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    return (entry as Record<string, Json>).receiptId === receiptId;
+  }) as Record<string, Json> | undefined ?? null;
+}
+
+function notificationRows(
+  inspection: HomeInspection,
+  predicate: (notification: Record<string, Json>) => boolean,
+): Record<string, Json>[] {
+  return inspection.carriers.notifications.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const notification = entry as Record<string, Json>;
+    return predicate(notification) ? [notification] : [];
+  });
+}
+
+function preservedPreexistingFiles(
+  reference: HomeInspection,
+  actual: HomeInspection,
+  mutablePaths: ReadonlySet<string>,
+): { ok: boolean; changed: string[]; missing: string[] } {
+  const changed: string[] = [];
+  const missing: string[] = [];
+  for (const [file, digest] of Object.entries(reference.allNonSqliteFiles)) {
+    if (mutablePaths.has(file)) continue;
+    if (!(file in actual.allNonSqliteFiles)) missing.push(file);
+    else if (actual.allNonSqliteFiles[file] !== digest) changed.push(file);
+  }
+  return { ok: changed.length === 0 && missing.length === 0, changed, missing };
+}
+
+function unexpectedAddedFiles(
+  reference: HomeInspection,
+  actual: HomeInspection,
+  allowedPaths: ReadonlySet<string>,
+): string[] {
+  return Object.keys(actual.allNonSqliteFiles)
+    .filter((file) => !(file in reference.allNonSqliteFiles) && !allowedPaths.has(file))
+    .sort();
+}
+
+function legacyIdentitiesPreserved(reference: HomeInspection, actual: HomeInspection): boolean {
+  const beforeHarness = reference.sqlite['state/harness.db']?.identities ?? {};
+  const afterHarness = actual.sqlite['state/harness.db']?.identities ?? {};
+  const beforeMemory = reference.sqlite['state/memory.db']?.identities ?? {};
+  const afterMemory = actual.sqlite['state/memory.db']?.identities ?? {};
+  const beforeWorkspace = reference.sqlite['state/workspaces.db']?.identities ?? {};
+  const afterWorkspace = actual.sqlite['state/workspaces.db']?.identities ?? {};
+  const beforeTrigger = reference.sqlite['state/workflow-triggers.db']?.identities ?? {};
+  const afterTrigger = actual.sqlite['state/workflow-triggers.db']?.identities ?? {};
+  return [
+    identityRowsPreserved(beforeHarness.sessions, afterHarness.sessions, 'id', ['id', 'kind']),
+    identityRowsPreserved(beforeHarness.events, afterHarness.events, 'id', [
+      'id', 'session_id', 'seq', 'turn', 'role', 'type', 'data_json',
+    ]),
+    identityRowsPreserved(beforeHarness.pendingApprovals, afterHarness.pendingApprovals, 'approval_id', [
+      'approval_id', 'session_id', 'channel', 'channel_id', 'requested_at', 'expires_at',
+      'subject', 'tool', 'args_json', 'resume_key', 'presentation_json',
+    ]),
+    identityRowsPreserved(beforeHarness.runArtifacts, afterHarness.runArtifacts, 'id', [
+      'id', 'session_id', 'run_scope_id', 'slot_key', 'kind', 'provider',
+      'status', 'resource_id', 'uri',
+    ]),
+    identityRowsPreserved(beforeHarness.runAttempts, afterHarness.runAttempts, 'attempt_id', [
+      'attempt_id', 'session_id', 'source_user_seq', 'run_id', 'started_at',
+    ]),
+    identityRowsPreserved(beforeHarness.dispatchLeases, afterHarness.dispatchLeases, 'scope_id', [
+      'scope_id', 'session_id', 'lease_id', 'run_attempt_id', 'parent_scope_id',
+      'parent_lease_id', 'activated_at',
+    ]),
+    identityRowsPreserved(beforeMemory.memoryEpisodes, afterMemory.memoryEpisodes, 'id', [
+      'id', 'kind', 'session_id', 'call_id', 'status', 'content_hash',
+    ]),
+    identityRowsPreserved(beforeMemory.entities, afterMemory.entities, 'id', [
+      'id', 'entity_type', 'canonical_name', 'canonical_name_lc',
+    ]),
+    identityRowsPreserved(beforeMemory.focus, afterMemory.focus, 'id', [
+      'id', 'resource_ref', 'title', 'status', 'related_session_id',
+    ]),
+    identityRowsPreserved(beforeWorkspace.workspaces, afterWorkspace.workspaces, 'id', [
+      'id', 'slug', 'title', 'status', 'origin_session_id',
+    ]),
+    identityRowsPreserved(beforeWorkspace.workspaceObservations, afterWorkspace.workspaceObservations, 'id', [
+      'id', 'workspace_id', 'source_key', 'refresh_id', 'batch_id', 'status', 'is_current',
+    ]),
+    identityRowsPreserved(beforeTrigger.workflowTriggers, afterTrigger.workflowTriggers, 'id', [
+      'id', 'workflow_name', 'kind', 'schedule', 'timezone', 'webhook_path', 'event_type',
+    ]),
+    identityRowsPreserved(beforeTrigger.workflowTriggerEvents, afterTrigger.workflowTriggerEvents, 'id', [
+      'id', 'trigger_id', 'dedupe_key',
+    ]),
+  ].every(Boolean);
+}
+
+export async function runPackagedV314DaemonRehearsal(
+  options: PackagedV314DaemonRehearsalOptions = {},
+): Promise<PackagedV314DaemonRehearsalReport> {
+  const candidate = currentCandidateIdentity();
+  const rehearsalRoot = options.rehearsalRoot
+    ? assertDisposable(options.rehearsalRoot, 'packaged daemon rehearsal root')
+    : mkdtempSync(path.join(tempRoot, 'clem-v314-packaged-daemon-'));
+  const base = await runV314UpgradeRehearsal({ rehearsalRoot, keep: true });
+  const daemonHome = path.join(rehearsalRoot, 'packaged-daemon-home');
+  cpSync(base.paths.immutableSnapshot, daemonHome, {
+    recursive: true,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+  const { tarball, packageEntry } = packAndInstall(rehearsalRoot);
+  const exerciseFixture = path.join(repoRoot, 'scripts', 'rehearse-v314-packaged-exercise.mjs');
+  if (!existsSync(exerciseFixture)) throw new Error(`packaged exercise fixture is missing: ${exerciseFixture}`);
+  const before = inspectV314RehearsalHome(daemonHome);
+  const beforeWork = workSnapshot(daemonHome, before);
+  const firstProcess = await bootPackagedDaemon(1, packageEntry, daemonHome);
+  const first = inspectV314RehearsalHome(daemonHome);
+  const firstScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
+  const firstDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
+  const firstLogicalState = stateProjection(daemonHome, first, true);
+  const firstWork = workSnapshot(daemonHome, first);
+  const exercise = runPackagedUpgradeExercise(exerciseFixture, packageEntry, daemonHome);
+  const postExercise = inspectV314RehearsalHome(daemonHome);
+  const postExerciseScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
+  const postExerciseDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
+  const postExerciseRawState = stateProjection(daemonHome, postExercise, false);
+  const postExerciseLogicalState = stateProjection(daemonHome, postExercise, true);
+  const postExerciseWork = workSnapshot(daemonHome, postExercise);
+  const secondProcess = await bootPackagedDaemon(2, packageEntry, daemonHome);
+  const second = inspectV314RehearsalHome(daemonHome);
+  const secondScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
+  const secondDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
+  const secondRawState = stateProjection(daemonHome, second, false);
+  const secondLogicalState = stateProjection(daemonHome, second, true);
+  const secondWork = workSnapshot(daemonHome, second);
+  const firstBootWorkDelta = workDelta(beforeWork, firstWork);
+  const exerciseWorkDelta = workDelta(firstWork, postExerciseWork);
+  const secondBootWorkDelta = workDelta(postExerciseWork, secondWork);
+  const firstBootStateDigest = stateProjectionDigest(firstLogicalState);
+  const postExerciseStateDigest = stateProjectionDigest(postExerciseLogicalState);
+  const secondBootStateDigest = stateProjectionDigest(secondLogicalState);
+  const postExerciseRawStateDigest = stateProjectionDigest(postExerciseRawState);
+  const secondBootRawStateDigest = stateProjectionDigest(secondRawState);
+  const secondBootRawStateDiff = stateDifference(postExerciseRawState, secondRawState);
+  const secondBootLogicalStateDiff = stateDifference(postExerciseLogicalState, secondLogicalState);
+  const checks: PackagedV314DaemonRehearsalReport['checks'] = [];
+  const add = (name: string, ok: boolean, detail?: unknown): void => {
+    checks.push({ name, ok, ...(detail === undefined ? {} : { detail: asJson(detail) }) });
+  };
+  add('exact_v314_fixture_rehearsal_is_green', base.ok, base.checks.filter((check) => !check.ok));
+  add('actual_npm_tarball_entry_is_installed_without_source_or_symlink',
+    existsSync(packageEntry)
+      && !lstatSync(path.dirname(path.dirname(packageEntry))).isSymbolicLink()
+      && !existsSync(path.join(path.dirname(path.dirname(packageEntry)), 'src')),
+    { packageEntry });
+  add('first_packaged_daemon_boot_reaches_ready_and_closes_cleanly', firstProcess.ready && firstProcess.cleanExit, firstProcess);
+  add('second_packaged_daemon_boot_reaches_ready_and_closes_cleanly', secondProcess.ready && secondProcess.cleanExit, secondProcess);
+  add('both_packaged_daemons_complete_one_full_recovery_tick_before_shutdown',
+    firstProcess.recoverySettled
+      && secondProcess.recoverySettled
+      && firstProcess.notificationDeliverySettled
+      && secondProcess.notificationDeliverySettled
+      && firstProcess.settledPhaseSequence > 0
+      && secondProcess.settledPhaseSequence > 0,
+    { first: firstProcess, second: secondProcess });
+  add('both_processes_self_report_one_exact_packaged_candidate',
+    firstProcess.build.packaged
+      && secondProcess.build.packaged
+      && stable(firstProcess.build) === stable(secondProcess.build)
+      && firstProcess.build.entry === packageEntry
+      && firstProcess.build.gitSha === candidate.gitSha
+      && firstProcess.build.sourceFingerprint === candidate.sourceFingerprint,
+    { first: firstProcess.build, second: secondProcess.build, candidate });
+  add('packaged_daemon_reaches_the_store_rehearsal_schema_targets',
+    stable(schemaShape(first)) === stable(schemaShape(base.firstBoot))
+      && stable(schemaShape(second)) === stable(schemaShape(base.firstBoot))
+      && firstProcess.build.schemaVersion === firstProcess.build.expectedSchemaVersion
+      && secondProcess.build.schemaVersion === secondProcess.build.expectedSchemaVersion,
+    { expected: schemaShape(base.firstBoot), first: schemaShape(first), second: schemaShape(second) });
+  add('both_packaged_boots_and_the_installed_exercise_leave_every_sqlite_store_healthy',
+    sqliteHealthy(first) && sqliteHealthy(postExercise) && sqliteHealthy(second));
+  add('legacy_conversation_memory_artifact_space_and_trigger_identities_survive',
+    legacyIdentitiesPreserved(base.firstBoot, first)
+      && legacyIdentitiesPreserved(base.firstBoot, postExercise)
+      && legacyIdentitiesPreserved(base.firstBoot, second));
+  const pendingApproval = (inspection: HomeInspection): Record<string, Json> | null => {
+    const rows = inspection.sqlite['state/harness.db']?.identities.pendingApprovals ?? [];
+    for (const entry of rows) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const row = entry as Record<string, Json>;
+      if (row.subject === 'Pending read-only fixture approval') return row;
+    }
+    return null;
+  };
+  const pendingBefore = pendingApproval(before);
+  const pendingFirst = pendingApproval(first);
+  const pendingSecond = pendingApproval(second);
+  add('first_packaged_boot_quarantines_the_aged_ownerless_approval_once',
+    pendingBefore?.status === 'pending'
+      && pendingBefore.resolution === null
+      && pendingBefore.consumed_at === null
+      && pendingFirst?.status === 'cancelled'
+      && pendingFirst.resolution === 'cancelled_by_system'
+      && pendingFirst.resolver === 'reaper-dead-session'
+      && typeof pendingFirst.resolved_at === 'string'
+      && pendingFirst.consumed_at === null
+      && stable(pendingFirst) === stable(pendingSecond),
+    { before: pendingBefore, first: pendingFirst, second: pendingSecond });
+  const beforeAttempt = rowByIdentity(
+    before.sqlite['state/harness.db']?.identities.runAttempts,
+    'attempt_id',
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptId,
+  );
+  const firstAttempt = rowByIdentity(
+    first.sqlite['state/harness.db']?.identities.runAttempts,
+    'attempt_id',
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptId,
+  );
+  const secondAttempt = rowByIdentity(
+    second.sqlite['state/harness.db']?.identities.runAttempts,
+    'attempt_id',
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptId,
+  );
+  add('first_packaged_boot_interrupts_the_exact_orphan_attempt_once',
+    beforeAttempt?.status === 'active'
+      && beforeAttempt.finished_at === null
+      && beforeAttempt.session_id === REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId
+      && beforeAttempt.source_user_seq === REQUIRED_FIXTURE_IDENTITIES.activeSourceUserSeq
+      && beforeAttempt.run_id === REQUIRED_FIXTURE_IDENTITIES.activeRunId
+      && firstAttempt?.status === 'interrupted'
+      && typeof firstAttempt.finished_at === 'string'
+      && stable(firstAttempt) === stable(secondAttempt),
+    { before: beforeAttempt, first: firstAttempt, second: secondAttempt });
+  const beforeLease = rowByIdentity(
+    before.sqlite['state/harness.db']?.identities.dispatchLeases,
+    'scope_id',
+    REQUIRED_FIXTURE_IDENTITIES.ambiguousWriteLeaseScopeId,
+  );
+  const firstLease = rowByIdentity(
+    first.sqlite['state/harness.db']?.identities.dispatchLeases,
+    'scope_id',
+    REQUIRED_FIXTURE_IDENTITIES.ambiguousWriteLeaseScopeId,
+  );
+  const secondLease = rowByIdentity(
+    second.sqlite['state/harness.db']?.identities.dispatchLeases,
+    'scope_id',
+    REQUIRED_FIXTURE_IDENTITIES.ambiguousWriteLeaseScopeId,
+  );
+  add('first_packaged_boot_explicitly_quarantines_the_exact_old_dispatch_lease_once',
+    beforeLease?.session_id === REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId
+      && beforeLease.run_attempt_id === REQUIRED_FIXTURE_IDENTITIES.activeAttemptId
+      && beforeLease.revoked_at === null
+      && (beforeLease.revocation_reason === null || beforeLease.revocation_reason === undefined)
+      && firstLease?.session_id === beforeLease.session_id
+      && firstLease.run_attempt_id === beforeLease.run_attempt_id
+      && firstLease.lease_id === beforeLease.lease_id
+      && typeof firstLease.revoked_at === 'string'
+      && firstLease.revocation_reason === 'terminal_run_attempt_at_daemon_boot'
+      && stable(firstLease) === stable(secondLease),
+    { before: beforeLease, first: firstLease, second: secondLease });
+  const beforeWrites = eventRows(
+    before,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'external_write',
+  );
+  const firstWrites = eventRows(
+    first,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'external_write',
+  );
+  const secondWrites = eventRows(
+    second,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'external_write',
+  );
+  const firstWriteOutcomes = [
+    ...eventRows(first, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'external_write_succeeded'),
+    ...eventRows(first, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'external_write_failed'),
+    ...eventRows(first, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'external_write_orphaned'),
+  ];
+  const secondWriteOutcomes = [
+    ...eventRows(second, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'external_write_succeeded'),
+    ...eventRows(second, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'external_write_failed'),
+    ...eventRows(second, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'external_write_orphaned'),
+  ];
+  const firstDecisions = eventRows(
+    first,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'restart_recovery_decision',
+  );
+  const secondDecisions = eventRows(
+    second,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'restart_recovery_decision',
+  );
+  const recoveryDecision = eventData(firstDecisions[0]);
+  const firstTerminals = eventRows(
+    first,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'conversation_completed',
+  );
+  const secondTerminals = eventRows(
+    second,
+    REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId,
+    'conversation_completed',
+  );
+  const recoveryTerminal = eventData(firstTerminals[0]);
+  add('ambiguous_old_write_is_never_inferred_safe_or_redispatched',
+    beforeWrites.length === 1
+      && stable(beforeWrites) === stable(firstWrites)
+      && stable(firstWrites) === stable(secondWrites)
+      && firstWriteOutcomes.length === 0
+      && secondWriteOutcomes.length === 0
+      && (first.sqlite['state/harness.db']?.tableCounts.physical_dispatches ?? 0) === 0
+      && (second.sqlite['state/harness.db']?.tableCounts.physical_dispatches ?? 0) === 0,
+    {
+      beforeWrites,
+      firstWrites,
+      secondWrites,
+      firstWriteOutcomes,
+      secondWriteOutcomes,
+      firstPhysicalDispatches: first.sqlite['state/harness.db']?.tableCounts.physical_dispatches ?? null,
+      secondPhysicalDispatches: second.sqlite['state/harness.db']?.tableCounts.physical_dispatches ?? null,
+    });
+  add('ambiguous_old_write_gets_one_exact_manual_restart_decision_and_terminal',
+    firstDecisions.length === 1
+      && secondDecisions.length === 1
+      && stable(firstDecisions) === stable(secondDecisions)
+      && recoveryDecision?.autoResume === false
+      && recoveryDecision.autoResumeSkipped === 'external_write'
+      && recoveryDecision.externalWritesSinceInterrupt === 1
+      && recoveryDecision.interruptedAttemptId === REQUIRED_FIXTURE_IDENTITIES.activeAttemptId
+      && recoveryDecision.interruptedRunId === REQUIRED_FIXTURE_IDENTITIES.activeRunId
+      && firstTerminals.length === 1
+      && secondTerminals.length === 1
+      && stable(firstTerminals) === stable(secondTerminals)
+      && recoveryTerminal?.sourceUserSeq === REQUIRED_FIXTURE_IDENTITIES.activeSourceUserSeq
+      && eventRows(first, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'run_resumed').length === 0
+      && eventRows(second, REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId, 'run_resumed').length === 0,
+    {
+      decisions: firstDecisions,
+      terminals: firstTerminals,
+      recoveryDecision,
+      recoveryTerminal,
+    });
+  const beforeTriggerEvent = before.carriers.triggerEvents.find((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const row = entry as Record<string, Json>;
+    return row.state === 'pending' && row.run_id === null;
+  }) as Record<string, Json> | undefined;
+  const beforeEventTrigger = (
+    before.sqlite['state/workflow-triggers.db']?.identities.workflowTriggers ?? []
+  ).find((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const row = entry as Record<string, Json>;
+    return row.workflow_name === REQUIRED_FIXTURE_IDENTITIES.workflowName
+      && row.kind === 'system_event'
+      && row.event_type === 'upgrade.rehearsal.never-fired';
+  }) as Record<string, Json> | undefined;
+  const expectedTriggerPayload = {
+    fixture: true,
+    id: REQUIRED_FIXTURE_IDENTITIES.triggerOccurrenceId,
+    fixtureId: 'fixture-item-v314',
+  };
+  const beforeTriggerPayload = jsonRecord(beforeTriggerEvent?.payload_json ?? null);
+  const firstTriggerEvent = rowByIdentity(
+    first.carriers.triggerEvents,
+    'id',
+    beforeTriggerEvent?.id ?? null,
+  );
+  const secondTriggerEvent = rowByIdentity(
+    second.carriers.triggerEvents,
+    'id',
+    beforeTriggerEvent?.id ?? null,
+  );
+  const beforeScheduleRun = runForReceipt(before, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
+  const beforeEventRun = runForReceipt(before, beforeTriggerEvent?.id ?? null);
+  const firstScheduleRun = runForReceipt(first, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
+  const firstEventRun = runForReceipt(first, beforeTriggerEvent?.id ?? null);
+  const secondScheduleRun = runForReceipt(second, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
+  const secondEventRun = runForReceipt(second, beforeTriggerEvent?.id ?? null);
+  const beforeScheduleAcceptance = acceptanceForReceipt(before, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
+  const beforeEventAcceptance = acceptanceForReceipt(before, beforeTriggerEvent?.id ?? null);
+  const firstScheduleAcceptance = acceptanceForReceipt(first, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
+  const firstEventAcceptance = acceptanceForReceipt(first, beforeTriggerEvent?.id ?? null);
+  const secondScheduleAcceptance = acceptanceForReceipt(second, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
+  const secondEventAcceptance = acceptanceForReceipt(second, beforeTriggerEvent?.id ?? null);
+  const firstBootMutableLegacyFiles = new Set<string>([
+    'cron/daemon-state.json',
+    'cron/workflow-schedule-state.json',
+    'state/executions.json',
+    'state/notification-delivery-queue.json',
+    'state/notifications.json',
+    ...before.carriers.workflowRuns.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const file = (entry as Record<string, Json>).file;
+      return typeof file === 'string' ? [file] : [];
+    }),
+  ]);
+  const preservedLegacyFiles = preservedPreexistingFiles(before, first, firstBootMutableLegacyFiles);
+  add('first_packaged_boot_preserves_every_preexisting_non_sqlite_file_outside_named_recovery_owners',
+    preservedLegacyFiles.ok,
+    { ...preservedLegacyFiles, allowedMutable: [...firstBootMutableLegacyFiles].sort() });
+  const allowedFirstBootAddedFiles = new Set<string>([
+    'cron/daemon-state.json',
+    'state/notification-delivery-queue.json',
+    ...[beforeScheduleRun, beforeEventRun].flatMap((run) => {
+      const runId = typeof run?.id === 'string' ? run.id : '';
+      return runId
+        ? [`vault/00-System/workflows/${REQUIRED_FIXTURE_IDENTITIES.workflowName}/runs/${runId}/events.jsonl`]
+        : [];
+    }),
+  ]);
+  const unexpectedFirstBootAddedFiles = unexpectedAddedFiles(before, first, allowedFirstBootAddedFiles);
+  add('first_packaged_boot_adds_only_named_recovery_projection_files',
+    unexpectedFirstBootAddedFiles.length === 0,
+    {
+      unexpected: unexpectedFirstBootAddedFiles,
+      allowed: [...allowedFirstBootAddedFiles].sort(),
+      added: Object.keys(first.allNonSqliteFiles)
+        .filter((file) => !(file in before.allNonSqliteFiles))
+        .sort(),
+    });
+  add('first_packaged_boot_recovers_the_exact_trigger_queue_crash_without_rebinding',
+    before.carriers.triggerEvents.length === 1
+      && beforeTriggerEvent?.state === 'pending'
+      && beforeTriggerEvent.run_id === null
+      && beforeTriggerEvent.deduped === 0
+      && beforeTriggerEvent.attempt_count === 0
+      && beforeTriggerEvent.last_attempt_at === null
+      && beforeTriggerEvent.next_attempt_at === null
+      && beforeTriggerEvent.last_error === null
+      && beforeTriggerEvent.claim_token === null
+      && beforeTriggerEvent.claim_expires_at === null
+      && beforeTriggerEvent.enqueued_at === null
+      && beforeTriggerEvent.trigger_id === beforeEventTrigger?.id
+      && beforeTriggerEvent.dedupe_key === `fixture-${REQUIRED_FIXTURE_IDENTITIES.triggerOccurrenceId}`
+      && beforeTriggerEvent.trigger_generation === beforeEventTrigger?.generation
+      && stable(beforeTriggerPayload) === stable(expectedTriggerPayload)
+      && beforeTriggerEvent.payload_hash === sha256(stable(expectedTriggerPayload))
+      && first.carriers.triggerEvents.length === 1
+      && firstTriggerEvent?.state === 'enqueued'
+      && firstTriggerEvent.deduped === 0
+      && firstTriggerEvent.attempt_count === 0
+      && firstTriggerEvent.last_attempt_at === null
+      && firstTriggerEvent.next_attempt_at === null
+      && firstTriggerEvent.last_error === null
+      && firstTriggerEvent.claim_token === null
+      && firstTriggerEvent.claim_expires_at === null
+      && typeof firstTriggerEvent.enqueued_at === 'string'
+      && typeof firstTriggerEvent.updated_at === 'string'
+      && firstTriggerEvent.run_id === beforeEventRun?.id
+      && stable(firstTriggerEvent) === stable(secondTriggerEvent)
+      && beforeScheduleAcceptance?.runId === beforeScheduleRun?.id
+      && beforeEventAcceptance?.runId === beforeEventRun?.id
+      && stable(beforeScheduleAcceptance) === stable(firstScheduleAcceptance)
+      && stable(firstScheduleAcceptance) === stable(secondScheduleAcceptance)
+      && stable(beforeEventAcceptance) === stable(firstEventAcceptance)
+      && stable(firstEventAcceptance) === stable(secondEventAcceptance),
+    {
+      triggerEvent: { before: beforeTriggerEvent ?? null, first: firstTriggerEvent, second: secondTriggerEvent },
+      scheduleAcceptance: { before: beforeScheduleAcceptance, first: firstScheduleAcceptance, second: secondScheduleAcceptance },
+      eventAcceptance: { before: beforeEventAcceptance, first: firstEventAcceptance, second: secondEventAcceptance },
+    });
+  const disabledRun = (run: Record<string, Json> | null, beforeRun: Record<string, Json> | null): boolean =>
+    run?.id === beforeRun?.id
+      && run?.workflow === beforeRun?.workflow
+      && run?.workflowSlug === beforeRun?.workflowSlug
+      && stable(run?.inputs ?? null) === stable(beforeRun?.inputs ?? null)
+      && run?.source === beforeRun?.source
+      && run?.createdAt === beforeRun?.createdAt
+      && run?.workflowDefinitionSnapshotDigest === beforeRun?.workflowDefinitionSnapshotDigest
+      && run?.triggerReceiptId === beforeRun?.triggerReceiptId
+      && run?.status === 'error'
+      && typeof run?.finishedAt === 'string'
+      && typeof run?.error === 'string'
+      && /workflow .* is disabled/i.test(run.error);
+  const runEventProjection = (inspection: HomeInspection, runId: Json): Record<string, Json> | null => {
+    if (typeof runId !== 'string') return null;
+    const expectedFile = `vault/00-System/workflows/${REQUIRED_FIXTURE_IDENTITIES.workflowName}/runs/${runId}/events.jsonl`;
+    return (inspection.carriers.workflowRunEvents ?? []).flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const row = entry as Record<string, Json>;
+      return row.file === expectedFile ? [row] : [];
+    }).at(0) ?? null;
+  };
+  const exactDisabledRunEvent = (
+    projection: Record<string, Json> | null,
+    run: Record<string, Json> | null,
+  ): boolean => {
+    if (!projection || !Array.isArray(projection.events) || projection.events.length !== 1) return false;
+    const event = projection.events[0];
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return false;
+    const row = event as Record<string, Json>;
+    return row.kind === 'run_failed'
+      && row.error === run?.error
+      && typeof row.t === 'string'
+      && Number.isFinite(Date.parse(row.t));
+  };
+  const firstScheduleEvents = runEventProjection(first, beforeScheduleRun?.id ?? null);
+  const firstEventEvents = runEventProjection(first, beforeEventRun?.id ?? null);
+  const secondScheduleEvents = runEventProjection(second, beforeScheduleRun?.id ?? null);
+  const secondEventEvents = runEventProjection(second, beforeEventRun?.id ?? null);
+  add('first_packaged_boot_quarantines_both_old_queued_runs_once_without_body_execution',
+    beforeScheduleRun?.status === 'queued'
+      && beforeEventRun?.status === 'queued'
+      && beforeScheduleRun.id !== beforeEventRun.id
+      && disabledRun(firstScheduleRun, beforeScheduleRun)
+      && disabledRun(firstEventRun, beforeEventRun)
+      && exactDisabledRunEvent(firstScheduleEvents, firstScheduleRun)
+      && exactDisabledRunEvent(firstEventEvents, firstEventRun)
+      && stable(firstScheduleEvents) === stable(secondScheduleEvents)
+      && stable(firstEventEvents) === stable(secondEventEvents)
+      && stable(firstScheduleRun) === stable(secondScheduleRun)
+      && stable(firstEventRun) === stable(secondEventRun),
+    {
+      schedule: { before: beforeScheduleRun, first: firstScheduleRun, second: secondScheduleRun },
+      event: { before: beforeEventRun, first: firstEventRun, second: secondEventRun },
+      eventLogs: {
+        schedule: { first: firstScheduleEvents, second: secondScheduleEvents },
+        event: { first: firstEventEvents, second: secondEventEvents },
+      },
+    });
+  const interruptionNotifications = (inspection: HomeInspection): Record<string, Json>[] =>
+    notificationRows(inspection, (notification) => {
+      const metadata = notification.metadata;
+      return notification.kind === 'system'
+        && notification.title === 'A chat task was interrupted by a restart'
+        && metadata !== null
+        && typeof metadata === 'object'
+        && !Array.isArray(metadata)
+        && (metadata as Record<string, Json>).sessionId === REQUIRED_FIXTURE_IDENTITIES.activeAttemptSessionId
+        && (metadata as Record<string, Json>).reason === 'interrupted_by_restart';
+    });
+  const workflowFailureNotifications = (inspection: HomeInspection): Record<string, Json>[] => {
+    const expectedRunIds = new Set([beforeScheduleRun?.id, beforeEventRun?.id]);
+    return notificationRows(inspection, (notification) => {
+      const metadata = notification.metadata;
+      if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+      const runId = (metadata as Record<string, Json>).runId;
+      return typeof runId === 'string'
+        && notification.id === `workflow-${runId}-disabled`
+        && notification.kind === 'workflow'
+        && notification.title === `Workflow not run: ${REQUIRED_FIXTURE_IDENTITIES.workflowName}`
+        && typeof metadata === 'object'
+        && expectedRunIds.has(runId)
+        && stable(metadata) === stable({
+          workflow: REQUIRED_FIXTURE_IDENTITIES.workflowName,
+          runId,
+        });
+    });
+  };
+  const firstApproval = rowByIdentity(
+    first.sqlite['state/harness.db']?.identities.pendingApprovals,
+    'session_id',
+    REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+  );
+  const secondApproval = rowByIdentity(
+    second.sqlite['state/harness.db']?.identities.pendingApprovals,
+    'session_id',
+    REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+  );
+  const beforeApprovalOwnerSession = rowByIdentity(
+    before.sqlite['state/harness.db']?.identities.sessions,
+    'id',
+    REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+  );
+  const firstApprovalOwnerSession = rowByIdentity(
+    first.sqlite['state/harness.db']?.identities.sessions,
+    'id',
+    REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+  );
+  const secondApprovalOwnerSession = rowByIdentity(
+    second.sqlite['state/harness.db']?.identities.sessions,
+    'id',
+    REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+  );
+  const firstRepresentativeSession = rowByIdentity(
+    first.sqlite['state/harness.db']?.identities.sessions,
+    'id',
+    REQUIRED_FIXTURE_IDENTITIES.sessionId,
+  );
+  const secondRepresentativeSession = rowByIdentity(
+    second.sqlite['state/harness.db']?.identities.sessions,
+    'id',
+    REQUIRED_FIXTURE_IDENTITIES.sessionId,
+  );
+  const approvalQuarantineNotifications = (
+    inspection: HomeInspection,
+    approvalId: Json,
+  ): Record<string, Json>[] => notificationRows(inspection, (notification) => {
+    const metadata = notification.metadata;
+    return typeof approvalId === 'string'
+      && notification.id === `approval-system-cancelled-${approvalId}`
+      && notification.kind === 'system'
+      && notification.title === 'Approval closed with its ended session'
+      && metadata !== null
+      && typeof metadata === 'object'
+      && !Array.isArray(metadata)
+      && stable(metadata) === stable({
+        approvalId,
+        sessionId: REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+        subject: 'Pending read-only fixture approval',
+        tool: 'fixture_read',
+        approvalStatus: 'cancelled',
+        approvalResolution: 'cancelled_by_system',
+        recommendedAction: 'start_new_request',
+      });
+  });
+  const firstInterruptionNotifications = interruptionNotifications(first);
+  const secondInterruptionNotifications = interruptionNotifications(second);
+  const firstWorkflowFailureNotifications = workflowFailureNotifications(first);
+  const secondWorkflowFailureNotifications = workflowFailureNotifications(second);
+  const firstApprovalNotifications = approvalQuarantineNotifications(first, firstApproval?.approval_id ?? null);
+  const secondApprovalNotifications = approvalQuarantineNotifications(second, secondApproval?.approval_id ?? null);
+  const interruptCleanupFailureNotifications = (inspection: HomeInspection): Record<string, Json>[] =>
+    notificationRows(inspection, (notification) =>
+      typeof notification.id === 'string'
+      && notification.id.startsWith('interrupt-clear-failed-'));
+  add('first_packaged_boot_emits_each_expected_quarantine_notification_once',
+    firstInterruptionNotifications.length === 1
+      && stable(firstInterruptionNotifications) === stable(secondInterruptionNotifications)
+      && firstWorkflowFailureNotifications.length === 2
+      && stable(firstWorkflowFailureNotifications) === stable(secondWorkflowFailureNotifications)
+      && firstApproval?.status === 'cancelled'
+      && firstApproval.resolution === 'cancelled_by_system'
+      && stable(firstApproval) === stable(secondApproval)
+      && beforeApprovalOwnerSession?.status === 'completed'
+      && firstApprovalOwnerSession?.status === 'cancelled'
+      && stable(firstApprovalOwnerSession) === stable(secondApprovalOwnerSession)
+      && firstRepresentativeSession?.status === 'completed'
+      && stable(firstRepresentativeSession) === stable(secondRepresentativeSession)
+      && interruptCleanupFailureNotifications(first).length === 0
+      && interruptCleanupFailureNotifications(second).length === 0
+      && firstApprovalNotifications.length === 1
+      && stable(firstApprovalNotifications) === stable(secondApprovalNotifications),
+    {
+      interruption: { first: firstInterruptionNotifications, second: secondInterruptionNotifications },
+      workflow: { first: firstWorkflowFailureNotifications, second: secondWorkflowFailureNotifications },
+      approval: {
+        row: { first: firstApproval, second: secondApproval },
+        ownerSession: {
+          before: beforeApprovalOwnerSession,
+          first: firstApprovalOwnerSession,
+          second: secondApprovalOwnerSession,
+        },
+        representativeSession: { first: firstRepresentativeSession, second: secondRepresentativeSession },
+        interruptCleanupFailures: {
+          first: interruptCleanupFailureNotifications(first),
+          second: interruptCleanupFailureNotifications(second),
+        },
+        notifications: { first: firstApprovalNotifications, second: secondApprovalNotifications },
+      },
+    });
+  const workflowTriggerRows = (inspection: HomeInspection): Record<string, Json>[] =>
+    (inspection.sqlite['state/workflow-triggers.db']?.identities.workflowTriggers ?? []).flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const row = entry as Record<string, Json>;
+      return row.workflow_name === REQUIRED_FIXTURE_IDENTITIES.workflowName ? [row] : [];
+    });
+  const beforeTriggers = workflowTriggerRows(before);
+  const firstTriggers = workflowTriggerRows(first);
+  const secondTriggers = workflowTriggerRows(second);
+  const exactTriggerTopology = beforeTriggers.length === 2
+    && beforeTriggers.filter((row) => row.kind === 'schedule').length === 1
+    && beforeTriggers.filter((row) => row.kind === 'system_event').length === 1
+    && beforeTriggers.some((row) =>
+      row.kind === 'schedule'
+      && row.schedule === '0 0 1 1 *'
+      && row.timezone === 'UTC')
+    && beforeTriggers.some((row) =>
+      row.kind === 'system_event'
+      && row.event_type === 'upgrade.rehearsal.never-fired');
+  const triggerReconciled = exactTriggerTopology
+    && beforeTriggers.length === firstTriggers.length
+    && firstTriggers.length === secondTriggers.length
+    && beforeTriggers.every((beforeTrigger) => {
+      const firstTrigger = rowByIdentity(firstTriggers, 'id', beforeTrigger.id);
+      const secondTrigger = rowByIdentity(secondTriggers, 'id', beforeTrigger.id);
+      return beforeTrigger.enabled === 1
+        && Number.isSafeInteger(beforeTrigger.generation)
+        && firstTrigger?.workflow_name === beforeTrigger.workflow_name
+        && firstTrigger.kind === beforeTrigger.kind
+        && firstTrigger.schedule === beforeTrigger.schedule
+        && firstTrigger.timezone === beforeTrigger.timezone
+        && firstTrigger.webhook_path === beforeTrigger.webhook_path
+        && firstTrigger.event_type === beforeTrigger.event_type
+        && firstTrigger.enabled === 0
+        && firstTrigger.generation === Number(beforeTrigger.generation) + 1
+        && stable(firstTrigger) === stable(secondTrigger);
+    });
+  add('first_packaged_boot_reconciles_the_disabled_trigger_once',
+    triggerReconciled,
+    { before: beforeTriggers, first: firstTriggers, second: secondTriggers });
+  add('first_daemon_boot_does_not_replay_model_provider_business_or_local_body_work',
+    firstBootWorkDelta.total === 0, firstBootWorkDelta);
+  add('installed_candidate_reads_old_conversation_space_and_workflow_then_creates_new_cold_turn_run_and_approved_project',
+    exercise.oldSessionId === REQUIRED_FIXTURE_IDENTITIES.sessionId
+      && exercise.oldWorkflowName === REQUIRED_FIXTURE_IDENTITIES.workflowName
+      && exercise.oldSpaceId === REQUIRED_FIXTURE_IDENTITIES.workspaceId
+      && exercise.workflowRunStatus === 'completed'
+      && exercise.proposalRevision === 3
+      && exercise.modelRequests.length >= 2
+      && exerciseWorkDelta.total > 0,
+    { exercise, exerciseWorkDelta });
+  const postExerciseHarness = postExercise.sqlite['state/harness.db']?.identities ?? {};
+  const secondHarness = second.sqlite['state/harness.db']?.identities ?? {};
+  const exercisedProposal = rowByIdentity(
+    postExerciseHarness.automationOpportunityProposals,
+    'proposal_id',
+    exercise.proposalId,
+  );
+  const secondProposal = rowByIdentity(
+    secondHarness.automationOpportunityProposals,
+    'proposal_id',
+    exercise.proposalId,
+  );
+  const exercisedReview = rowByIdentity(
+    postExerciseHarness.automationOpportunityReviews,
+    'projection_id',
+    exercise.reviewProjectionId,
+  );
+  const secondReview = rowByIdentity(
+    secondHarness.automationOpportunityReviews,
+    'projection_id',
+    exercise.reviewProjectionId,
+  );
+  const exercisedAdvancement = rowByIdentity(
+    postExerciseHarness.automationPilotAdvancements,
+    'advancement_id',
+    exercise.advancementId,
+  );
+  const secondAdvancement = rowByIdentity(
+    secondHarness.automationPilotAdvancements,
+    'advancement_id',
+    exercise.advancementId,
+  );
+  const exercisedAdvancementState = jsonRecord(exercisedAdvancement?.state_json ?? null);
+  const secondAdvancementState = jsonRecord(secondAdvancement?.state_json ?? null);
+  const exercisedAdvancementBlocked = exercisedAdvancementState?.blocked;
+  const blockedRecord = exercisedAdvancementBlocked
+    && typeof exercisedAdvancementBlocked === 'object'
+    && !Array.isArray(exercisedAdvancementBlocked)
+    ? exercisedAdvancementBlocked as Record<string, Json>
+    : null;
+  add('approved_project_review_and_blocked_acquisition_are_an_exact_second_boot_fixed_point',
+    exercisedProposal?.status === 'approved'
+      && exercisedProposal.revision === exercise.proposalRevision
+      && exercisedProposal.digest === exercise.proposalDigest
+      && exercisedReview?.proposal_id === exercise.proposalId
+      && exercisedReview.status === 'approved'
+      && exercisedReview.approval_id === exercise.reviewApprovalId
+      && exercisedReview.proposal_digest === exercise.proposalDigest
+      && exercisedAdvancement?.proposal_id === exercise.proposalId
+      && exercisedAdvancement.review_projection_id === exercise.reviewProjectionId
+      && exercisedAdvancement.stage === exercise.advancementStage
+      && exercisedAdvancement.state_revision === exercise.advancementStateRevision
+      && exercisedAdvancement.state_digest === exercise.advancementStateDigest
+      && exercisedAdvancement.owner_session_id === exercise.coldSessionId
+      && exercisedAdvancement.source_user_seq === exercise.coldSourceUserSeq
+      && exercisedAdvancementState?.reviewApprovalId === exercise.reviewApprovalId
+      && exercisedAdvancementState.reviewProjectionId === exercise.reviewProjectionId
+      && exercisedAdvancementState.proposalRevision === exercise.proposalRevision
+      && exercisedAdvancementState.proposalDigest === exercise.proposalDigest
+      && blockedRecord?.code === exercise.advancementBlockedCode
+      && blockedRecord.detail === exercise.advancementBlockedDetail
+      && stable(exercisedAdvancementState) === stable(secondAdvancementState)
+      && stable(exercisedProposal) === stable(secondProposal)
+      && stable(exercisedReview) === stable(secondReview)
+      && stable(exercisedAdvancement) === stable(secondAdvancement),
+    {
+      postExercise: {
+        proposal: exercisedProposal,
+        review: exercisedReview,
+        advancement: exercisedAdvancement,
+      },
+      second: {
+        proposal: secondProposal,
+        review: secondReview,
+        advancement: secondAdvancement,
+      },
+    });
+  add('second_daemon_boot_performs_zero_repeated_model_provider_business_or_local_body_work',
+    secondBootWorkDelta.total === 0, secondBootWorkDelta);
+  const firstScheduleWatermark = firstScheduleObservation?.lastEvaluatedAtMs;
+  const postScheduleWatermark = postExerciseScheduleObservation?.lastEvaluatedAtMs;
+  const secondScheduleWatermark = secondScheduleObservation?.lastEvaluatedAtMs;
+  const firstHealthyAt = firstDaemonObservation?.lastHealthyTickAt;
+  const postHealthyAt = postExerciseDaemonObservation?.lastHealthyTickAt;
+  const secondHealthyAt = secondDaemonObservation?.lastHealthyTickAt;
+  const firstCronWatermark = firstDaemonObservation?.lastCronEvaluatedAtMs;
+  const postCronWatermark = postExerciseDaemonObservation?.lastCronEvaluatedAtMs;
+  const secondCronWatermark = secondDaemonObservation?.lastCronEvaluatedAtMs;
+  const finiteNonnegative = (value: Json | undefined): value is number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  const validIso = (value: Json | undefined): value is string =>
+    typeof value === 'string' && Number.isFinite(Date.parse(value));
+  add('normalized_daemon_and_schedule_observation_watermarks_are_present_well_formed_and_monotonic',
+    finiteNonnegative(firstScheduleWatermark)
+      && finiteNonnegative(postScheduleWatermark)
+      && finiteNonnegative(secondScheduleWatermark)
+      && firstScheduleWatermark === postScheduleWatermark
+      && secondScheduleWatermark >= postScheduleWatermark
+      && validIso(firstHealthyAt)
+      && validIso(postHealthyAt)
+      && validIso(secondHealthyAt)
+      && firstHealthyAt === postHealthyAt
+      && Date.parse(secondHealthyAt) >= Date.parse(postHealthyAt)
+      && finiteNonnegative(firstCronWatermark)
+      && finiteNonnegative(postCronWatermark)
+      && finiteNonnegative(secondCronWatermark)
+      && firstCronWatermark === postCronWatermark
+      && secondCronWatermark >= postCronWatermark,
+    {
+      schedule: {
+        first: firstScheduleWatermark ?? null,
+        postExercise: postScheduleWatermark ?? null,
+        second: secondScheduleWatermark ?? null,
+      },
+      daemon: {
+        healthy: { first: firstHealthyAt ?? null, postExercise: postHealthyAt ?? null, second: secondHealthyAt ?? null },
+        cron: { first: firstCronWatermark ?? null, postExercise: postCronWatermark ?? null, second: secondCronWatermark ?? null },
+      },
+    });
+  add('second_daemon_boot_is_durably_state_idempotent_after_the_installed_exercise',
+    postExerciseStateDigest === secondBootStateDigest
+      && noStateDifference(secondBootLogicalStateDiff), {
+    firstBootStateDigest,
+    postExerciseStateDigest,
+    secondBootStateDigest,
+    rawStateDigests: { postExerciseRawStateDigest, secondBootRawStateDigest },
+    rawDifference: secondBootRawStateDiff,
+    logicalDifference: secondBootLogicalStateDiff,
+    observationNormalizations: [
+      'cron/workflow-schedule-state.json:lastEvaluatedAtMs',
+      'cron/daemon-state.json:lastHealthyTickAt',
+      'cron/daemon-state.json:lastCronEvaluatedAtMs',
+    ],
+  });
+  add('second_daemon_boot_does_not_duplicate_notifications_or_trigger_runs',
+    postExercise.carriers.notifications.length === second.carriers.notifications.length
+      && postExercise.carriers.notificationQueue.length === second.carriers.notificationQueue.length
+      && postExercise.carriers.triggerEvents.length === second.carriers.triggerEvents.length
+      && postExercise.carriers.workflowRunFiles.length === second.carriers.workflowRunFiles.length,
+    {
+      postExercise: {
+        notifications: postExercise.carriers.notifications.length,
+        queue: postExercise.carriers.notificationQueue.length,
+        triggerEvents: postExercise.carriers.triggerEvents.length,
+        workflowRuns: postExercise.carriers.workflowRunFiles.length,
+      },
+      second: {
+        notifications: second.carriers.notifications.length,
+        queue: second.carriers.notificationQueue.length,
+        triggerEvents: second.carriers.triggerEvents.length,
+        workflowRuns: second.carriers.workflowRunFiles.length,
+      },
+    });
+  const finalCandidate = currentCandidateIdentity();
+  add('candidate_commit_and_runtime_fingerprint_remain_exact_after_the_rehearsal',
+    stable(finalCandidate) === stable(candidate), { initial: candidate, final: finalCandidate });
+  const reportPath = path.join(rehearsalRoot, 'packaged-daemon-upgrade-report.json');
+  const report: PackagedV314DaemonRehearsalReport = {
+    ok: checks.every((check) => check.ok),
+    paths: {
+      rehearsalRoot,
+      immutableSnapshot: base.paths.immutableSnapshot,
+      daemonHome,
+      tarball,
+      packageEntry,
+      exerciseFixture,
+      report: reportPath,
+    },
+    candidate: {
+      ...candidate,
+      tarballSha256: sha256(readFileSync(tarball)),
+    },
+    boots: [firstProcess, secondProcess],
+    exercise,
+    firstBootWorkDelta,
+    exerciseWorkDelta,
+    secondBootWorkDelta,
+    firstBootStateDigest,
+    postExerciseStateDigest,
+    secondBootStateDigest,
+    postExerciseRawStateDigest,
+    secondBootRawStateDigest,
+    secondBootRawStateDiff,
+    secondBootLogicalStateDiff,
+    checks,
+    limitations: [
+      'The legacy home is the exact-tag, public-API, sanitized representative fixture; it is not a clone of a production home with historical corruption, partial writes, or machine-specific credentials.',
+      'External channels, connected-provider credentials, model warmup, MCP warmup, and CLI warmup are absent. The fixture does admit and reconcile one exact cron occurrence, but the installed exercise uses only a loopback OpenAI-compatible fixture model, so separate live-provider and live-scheduler canaries remain required.',
+    ],
+  };
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
+  if (options.keep === false) {
+    assertDisposable(rehearsalRoot, 'packaged daemon cleanup root');
+    rmSync(rehearsalRoot, { recursive: true, force: true });
+  }
+  return report;
+}
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const rootIndex = args.indexOf('--rehearsal-root');
+  const requestedRoot = rootIndex >= 0 ? args[rootIndex + 1] : undefined;
+  if (rootIndex >= 0 && !requestedRoot) throw new Error('--rehearsal-root requires a path below the OS temp directory');
+  const report = await runPackagedV314DaemonRehearsal({ rehearsalRoot: requestedRoot, keep: true });
+  if (args.includes('--json')) console.log(JSON.stringify(report));
+  else {
+    const passed = report.checks.filter((check) => check.ok).length;
+    console.log(`${report.ok ? 'PASS' : 'FAIL'} packaged v3.14 daemon recovery (${passed}/${report.checks.length} checks)`);
+    for (const check of report.checks) console.log(`${check.ok ? 'PASS' : 'FAIL'} ${check.name}`);
+    console.log(`Report: ${report.paths.report}`);
+  }
+  if (!report.ok) process.exitCode = 1;
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === pathToFileURL(scriptFile).href) {
+  void main().catch((error) => {
+    console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

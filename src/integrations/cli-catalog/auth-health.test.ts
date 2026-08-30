@@ -77,15 +77,79 @@ test('every catalog install command still passes the install allowlist', () => {
 const railway = CLI_CATALOG.find((e) => e.id === 'railway')!.authProbe!;
 const gcloud = CLI_CATALOG.find((e) => e.id === 'gcloud')!.authProbe!;
 const netlify = CLI_CATALOG.find((e) => e.id === 'netlify')!.authProbe!;
+const salesforce = CLI_CATALOG.find((e) => e.id === 'salesforce')!;
+const salesforceProbe = salesforce.authProbe!;
+
+test('Salesforce CLI has a default-org auth probe and a closed reviewed SOQL read', () => {
+  assert.ok(salesforceProbe, 'Salesforce must attest auth, not stay unknown');
+  assert.deepEqual(salesforceProbe.args, ['org', 'display', '--json']);
+  assert.equal(salesforce.reviewedRead?.operationId, 'salesforce_sf_soql_query');
+  assert.deepEqual(salesforce.reviewedRead?.argvPrefix, ['data', 'query', '--json']);
+  assert.equal(
+    salesforce.reviewedRead?.arguments.some((argument) => argument.kind === 'option' && argument.token === '--query'),
+    true,
+  );
+});
+
+test('Salesforce default-org display JSON classifies ok even when another org would be inactive in org list', () => {
+  const verdict = classifyProbeOutput(salesforceProbe, {
+    exitCode: 0,
+    output: JSON.stringify({
+      status: 0,
+      result: {
+        username: 'sales.user@example.com',
+        connectedStatus: 'Connected',
+        alias: 'default',
+        id: '00D000000000001',
+      },
+    }, null, 2),
+    timedOut: false,
+  });
+  assert.equal(verdict.authStatus, 'ok');
+  assert.equal(verdict.username, 'sales.user@example.com');
+});
+
+test('Salesforce org-list JSON with one inactive sibling is not the auth probe — display-only signed-out stays honest', () => {
+  const listPoison = JSON.stringify({
+    result: {
+      nonScratchOrgs: [
+        { username: 'ok@example.com', connectedStatus: 'Connected', isDefaultUsername: true },
+        { username: 'dead@example.com', connectedStatus: 'Unable to refresh session due to: inactive user', isDefaultUsername: false },
+      ],
+    },
+  });
+  const listVerdict = classifyProbeOutput(salesforceProbe, {
+    exitCode: 0,
+    output: listPoison,
+    timedOut: false,
+  });
+  assert.equal(listVerdict.authStatus, 'signed_out',
+    'org list is the wrong probe: an inactive sibling would poison Connected default. The catalog must use org display.');
+  const displayVerdict = classifyProbeOutput(salesforceProbe, {
+    exitCode: 0,
+    output: '{"status":0,"result":{"username":"ok@example.com","connectedStatus":"Connected"}}',
+    timedOut: false,
+  });
+  assert.equal(displayVerdict.authStatus, 'ok');
+});
+
+test('Salesforce no-default-org output classifies signed_out', () => {
+  const verdict = classifyProbeOutput(salesforceProbe, {
+    exitCode: 1,
+    output: 'Error (NoDefaultOrgFoundError): No default org found. Use "sf org login web" or set a default.',
+    timedOut: false,
+  });
+  assert.equal(verdict.authStatus, 'signed_out');
+});
 
 test('exit 0 with output classifies ok and captures the username', () => {
   const verdict = classifyProbeOutput(railway, {
     exitCode: 0,
-    output: 'Logged in as nathan@example.com 👋',
+    output: 'Logged in as cli.user@example.com 👋',
     timedOut: false,
   });
   assert.equal(verdict.authStatus, 'ok');
-  assert.equal(verdict.username, 'nathan@example.com');
+  assert.equal(verdict.username, 'cli.user@example.com');
 });
 
 test('the signed-out pattern outranks the exit code — gcloud reports signed-out with exit 0', () => {
@@ -107,11 +171,11 @@ test('gcloud with an active account is ok and captures the account', () => {
 });
 
 test('ANSI-colored output is stripped before matching — netlify colors its status block', () => {
-  const colored = `[32mName: [39m Nathan Reynolds\n[32mEmail: [39mnathan@example.com`;
+  const colored = `[32mName: [39m Test User\n[32mEmail: [39mcli.user@example.com`;
   assert.equal(stripAnsi(colored).includes(''), false);
   const verdict = classifyProbeOutput(netlify, { exitCode: 0, output: colored, timedOut: false });
   assert.equal(verdict.authStatus, 'ok');
-  assert.equal(verdict.username, 'nathan@example.com');
+  assert.equal(verdict.username, 'cli.user@example.com');
 });
 
 test('signed-out text classifies signed_out even on non-zero exit', () => {
@@ -146,7 +210,7 @@ test('signed_out→ok fires the recovered event exactly once; ok→ok never fire
     await getCliHealth('railway', { force: true });
     assert.equal(recovered.length, 0, 'entering signed_out is not a recovery');
 
-    output = 'Logged in as nathan@example.com 👋';
+    output = 'Logged in as cli.user@example.com 👋';
     invalidateCliHealth('railway');
     await getCliHealth('railway', { force: true });
     assert.deepEqual(recovered, ['railway'], 'the signed_out→ok edge fires exactly once');

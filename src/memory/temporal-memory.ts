@@ -9,7 +9,8 @@ import {
   type MemoryPolicyRow,
 } from './db.js';
 import { resolveToolOutputForAuthority, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
-import { classifyConstraintEnforcement } from './policy-enforcement.js';
+import { compileComposioStandingPolicy } from '../integrations/composio/standing-policy-compiler.js';
+import { compilePromptStandingPolicyDescriptor } from './policy-enforcement.js';
 
 const MAX_EVIDENCE_CHARS = 2_000;
 
@@ -363,19 +364,16 @@ export function syncMemoryPolicyForFact(factId: number): MemoryPolicyRow | null 
   }
 
   const descriptor = fact.kind === 'constraint'
-    ? classifyConstraintEnforcement(fact.content)
+    ? compileComposioStandingPolicy(fact.content)
     : null;
   const policyType = fact.kind === 'constraint'
     ? descriptor!.deterministic ? 'hard_constraint' : 'standing_preference'
     : fact.kind === 'user' ? 'core_profile' : 'standing_preference';
   const enforcement = descriptor?.deterministic ? 'dispatch' : 'prompt';
-  const appliesTo = descriptor ?? {
-    schemaVersion: 1,
-    family: fact.kind === 'user' ? 'core_profile' : 'standing_preference',
-    deterministic: false,
-    tools: [],
-    reason: 'Prompt-context policy; not a tool-dispatch constraint.',
-  };
+  const appliesTo = descriptor ?? compilePromptStandingPolicyDescriptor(
+    fact.content,
+    fact.kind === 'user' ? 'core_profile' : 'standing_preference',
+  );
   db.prepare(`
     INSERT INTO memory_policies
       (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)

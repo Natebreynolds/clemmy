@@ -162,6 +162,27 @@ function terminalStatus(event: import('./eventlog.js').EventRow): string | undef
   return (event.data.presentation as { status?: string } | undefined)?.status;
 }
 
+/** The workflow runner owns these sources outside the interactive expected-work
+ * binder. Reproduce its exact durable session stamp instead of letting the
+ * bridge manufacture a generic, binderless `bridge:workflow` fixture. */
+function createWorkflowOwnedSession(sessionIdSuffix: string): string {
+  const sessionId = `workflow:${sessionIdSuffix}`;
+  eventlog.createSession({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: `Recovery fixture::${sessionIdSuffix}`,
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Respond Bridge Recovery Fixture',
+      workflowRunId: `run:${sessionIdSuffix}`,
+      stepId: sessionIdSuffix,
+      sessionIdSuffix,
+    },
+  });
+  return sessionId;
+}
+
 beforeEach(() => {
   eventlog.resetEventLog();
   bridge._setBridgeImplsForTests({});
@@ -206,9 +227,10 @@ test('completed-work recovery candidate proposes done with a delivery concern; a
     }) as never,
   });
 
+  const completedSessionId = createWorkflowOwnedSession('respond-one-gate-completed-candidate');
   const completed = await bridge.respondViaHarness('workflow', {
     message: 'Update the fixture record.',
-    sessionId: 'respond-one-gate-completed-candidate',
+    sessionId: completedSessionId,
   });
   const completedTerminal = onlyTerminal(completed.sessionId);
   assert.equal(completed.stoppedReason, 'success', JSON.stringify({ completed, terminal: completedTerminal.data }));
@@ -222,14 +244,23 @@ test('completed-work recovery candidate proposes done with a delivery concern; a
   });
   assert.equal(terminalStatus(completedTerminal), 'done');
 
+  const noWorkSessionId = createWorkflowOwnedSession('respond-one-gate-no-work-candidate');
   const noWork = await bridge.respondViaHarness('workflow', {
     message: 'Try the fixture without any completed work.',
-    sessionId: 'respond-one-gate-no-work-candidate',
+    sessionId: noWorkSessionId,
   });
   assert.equal(noWork.stoppedReason, 'blocked');
+  assert.doesNotMatch(noWork.text, /ask me|continue|retry|resume/i,
+    'an ownerless stalled terminal must not make the user restart host recovery');
   assert.equal(proposals[1]?.status, 'blocked');
   assert.equal(proposals[1]?.deliveryConcern, undefined);
-  assert.equal(terminalStatus(onlyTerminal(noWork.sessionId)), 'blocked');
+  const noWorkTerminal = onlyTerminal(noWork.sessionId);
+  assert.equal(terminalStatus(noWorkTerminal), 'blocked');
+  assert.equal(
+    (noWorkTerminal.data.presentation as { resumable?: unknown }).resumable,
+    false,
+    'the bridge did not retain a resumable recovery owner for this terminal',
+  );
 });
 
 test('a recovery candidate with no successful work still proposes done, and the shared rule holds it', async () => {
@@ -255,9 +286,10 @@ test('a recovery candidate with no successful work still proposes done, and the 
     }) as never,
   });
 
+  const sessionId = createWorkflowOwnedSession('respond-one-gate-no-success');
   const response = await bridge.respondViaHarness('workflow', {
     message: 'Send the fixture message.',
-    sessionId: 'respond-one-gate-no-success',
+    sessionId,
   });
 
   assert.equal(response.stoppedReason, 'blocked');
@@ -294,9 +326,10 @@ test('parse recovery after a confirmed external write never reruns and lets the 
     }) as never,
   });
 
+  const sessionId = createWorkflowOwnedSession('respond-one-gate-parse-write');
   const response = await bridge.respondViaHarness('workflow', {
     message: 'Update the fixture record once.',
-    sessionId: 'respond-one-gate-parse-write',
+    sessionId,
   });
 
   assert.equal(calls, 1, 'the external-write safety fence still forbids a whole-turn rerun');
@@ -438,4 +471,47 @@ test('legacy standalone Claude reducer: narration give-up asks the shared rule i
     presentationAlreadyDiscloses: true,
   });
   assert.equal(terminalStatus(onlyTerminal(sessionId)), 'done');
+});
+
+test('ownerless narration give-up closes factually without asking for a continuation', async () => {
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'on';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'off';
+  const sessionId = 'respond-one-gate-narration-no-work';
+  bridge._setBridgeImplsForTests({
+    allowStandaloneClaudeInteractiveBrainForTests: true,
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    claudeAgentBrain: (async (_surface, request) => {
+      eventlog.createSession({ id: request.sessionId, kind: 'chat' });
+      const attempt = eventlog.beginRunAttempt(request.sessionId, { runId: request.runId });
+      const source = eventlog.recordRunAttemptUserInput(attempt, {
+        turn: 1,
+        role: 'user',
+        data: { text: request.message },
+      }, { armRunInFlight: true });
+      assert.ok(shadow.recordTurnGraphShadow({
+        identity: { sessionId: request.sessionId, sourceUserSeq: source.seq, turn: source.turn },
+        surface: 'home',
+      }));
+      const error = new Error('Say the word and I will run it properly.') as Error & {
+        narrationGiveUp: true;
+      };
+      error.narrationGiveUp = true;
+      throw error;
+    }) as never,
+  });
+
+  const response = await bridge.respondPreferHarness(
+    'home',
+    { message: 'Run the fixture task.', sessionId },
+    async (request) => ({ text: 'legacy must not run', sessionId: request.sessionId }),
+  );
+
+  assert.equal(response.stoppedReason, 'blocked');
+  assert.doesNotMatch(response.text, /say the word|ask me|continue|retry|resume/i,
+    'provider/model retry language never becomes an ownerless user instruction');
+  const terminal = onlyTerminal(sessionId);
+  assert.equal(terminalStatus(terminal), 'blocked');
+  assert.equal((terminal.data.presentation as { resumable?: unknown }).resumable, false);
 });

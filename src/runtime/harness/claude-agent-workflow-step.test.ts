@@ -449,6 +449,27 @@ test('requiredLocalMcpToolsForWorkflowStep still requires explicit Composio exec
   assert.deepEqual(requiredLocalMcpToolsForWorkflowStep(discoverStep, true), ['composio_search_tools']);
 });
 
+test('requiredLocalMcpToolsForWorkflowStep recognizes adapter-registered operation namespaces without a provider allowlist', () => {
+  const novelCuratedStep = {
+    id: 'archive_generated_issue',
+    sideEffect: 'write' as const,
+    prompt: 'Invoke LINEAR_ARCHIVE_GENERATED_ISSUE with the exact current arguments.',
+  };
+  assert.deepEqual(
+    requiredLocalMcpToolsForWorkflowStep(novelCuratedStep, true),
+    ['composio_execute_tool'],
+    'a registered toolkit omitted from the historical regex still receives the shared carrier',
+  );
+  assert.deepEqual(
+    requiredLocalMcpToolsForWorkflowStep({
+      ...novelCuratedStep,
+      prompt: 'Invoke UNREGISTERED_ARCHIVE_GENERATED_ISSUE with the exact current arguments.',
+    }, true),
+    [],
+    'an arbitrary underscore token cannot manufacture a carrier requirement',
+  );
+});
+
 test('requiredLocalMcpToolsForWorkflowStep does not equate every send step with notify_user', () => {
   const emailStep = {
     id: 'send_daily_email',

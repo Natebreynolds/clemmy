@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR } from '../../config.js';
+import { BASE_DIR, invalidateRuntimeConfigSnapshot } from '../../config.js';
 import type { SecretBackend, SecretName } from './types.js';
 
 /**
@@ -58,6 +58,7 @@ function writeVault(vault: VaultShape): void {
   writeFileSync(tmp, JSON.stringify(vault, null, 2), { encoding: 'utf-8', mode: 0o600 });
   renameSync(tmp, VAULT_FILE);
   try { chmodSync(VAULT_FILE, 0o600); } catch { /* best-effort on platforms that ignore mode */ }
+  invalidateRuntimeConfigSnapshot('secret_vault');
 }
 
 export class FileSecretBackend implements SecretBackend {
@@ -86,7 +87,10 @@ export class FileSecretBackend implements SecretBackend {
     if (Object.keys(vault.entries).length === 0) {
       // No entries left — remove the file entirely so "Reset Credentials"
       // leaves the user with a fully clean slate.
-      try { unlinkSync(VAULT_FILE); } catch { /* ignore */ }
+      try {
+        unlinkSync(VAULT_FILE);
+        invalidateRuntimeConfigSnapshot('secret_vault');
+      } catch { /* ignore */ }
       return;
     }
     writeVault(vault);
@@ -96,7 +100,10 @@ export class FileSecretBackend implements SecretBackend {
    *  "Reset Credentials" flow. NEVER touches .env or keychain. */
   static reset(): void {
     if (existsSync(VAULT_FILE)) {
-      try { unlinkSync(VAULT_FILE); } catch { /* ignore */ }
+      try {
+        unlinkSync(VAULT_FILE);
+        invalidateRuntimeConfigSnapshot('secret_vault');
+      } catch { /* ignore */ }
     }
   }
 

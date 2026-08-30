@@ -11,7 +11,7 @@ import { listWorkflows } from '../../memory/workflow-store.js';
 import { listWorkspaceProjects } from '../../tools/shared.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
-import { pinnedCalendarRuleLabels } from './constraint-guard.js';
+import { composioStandingPolicyCapabilityHints } from '../../integrations/composio/standing-policy-adapter.js';
 import { pitfallsForSkills } from './known-pitfalls.js';
 import { listHarnessCapabilityHealth } from './capability-health.js';
 import { renderAgentSystemGuidance, type AgentSystemGuidance } from '../agent-system-guidance.js';
@@ -75,7 +75,7 @@ export interface AgentContextPacket {
   inputPreview: string;
   /** Explicit proof that relevance/discovery work was intentionally bypassed,
    * rather than merely returning an empty result. */
-  semanticEnrichmentSkippedReason: 'declined_continuation' | null;
+  semanticEnrichmentSkippedReason: 'declined_continuation' | 'plain_conversation_surface' | null;
   complexity: 'simple' | 'moderate' | 'complex';
   /** Shared "is this turn consequential" signal (turn-intent.ts). 'qa' turns
    *  skip the safe-to-skip preflight I/O (health probes, fan-out detection);
@@ -548,7 +548,10 @@ function renderCandidates(title: string, candidates: RankedContextCandidate[], i
 
 function summarizeToolScope(input: string): AgentContextPacket['toolScope'] {
   try {
-    return resolveMcpToolScope({ userInput: input, pinnedCalendarLabels: pinnedCalendarRuleLabels() });
+    return resolveMcpToolScope({
+      userInput: input,
+      standingCapabilityHints: composioStandingPolicyCapabilityHints(),
+    });
   } catch {
     return { reason: 'tool scope unavailable' };
   }
@@ -609,6 +612,10 @@ export function buildAgentContextPacket(
     /** Skip relevance work for a typed decline while retaining the bounded
      *  deterministic conversation/safety packet. */
     suppressSemanticEnrichment?: boolean;
+    /** The accepted-source boundary proved this is closed-world conversation
+     *  and the host mounted a zero-tool surface. Omit action-only ranking and
+     *  health context; conversational focus/prospective context still applies. */
+    plainConversationSurface?: boolean;
     /** Literal current-turn authority when `input` is private retrieval text. */
     authorityInput?: string;
     /** The user explicitly declined the prior task and supplied a separate
@@ -623,6 +630,14 @@ export function buildAgentContextPacket(
 ): AgentContextPacket {
   const authorityInput = opts?.authorityInput ?? input;
   const suppressSemanticEnrichment = opts?.suppressSemanticEnrichment === true;
+  const plainConversationSurface = opts?.plainConversationSurface === true;
+  const suppressActionSemanticEnrichment = suppressSemanticEnrichment || plainConversationSurface;
+  const semanticEnrichmentSkippedReason: AgentContextPacket['semanticEnrichmentSkippedReason'] =
+    suppressSemanticEnrichment
+      ? 'declined_continuation'
+      : plainConversationSurface
+        ? 'plain_conversation_surface'
+        : null;
   const complexity = classifyComplexity(suppressSemanticEnrichment ? authorityInput : input);
   // Pure-Q&A turns skip ONLY the health probes (disk + MCP I/O) — pure telemetry
   // that never changes what the model CAN do, so it's safe to drop on a question.
@@ -641,12 +656,14 @@ export function buildAgentContextPacket(
   // merely because their prompt contained generic words such as "manager" and
   // "report". Route only node-owned context here.
   const constrainedWorkflowNode = opts?.sessionKind === 'workflow';
-  const skills = constrainedWorkflowNode || suppressSemanticEnrichment ? [] : rankSkills(input);
-  const workflows = constrainedWorkflowNode || suppressSemanticEnrichment ? [] : rankWorkflows(input);
-  const projectCommands = constrainedWorkflowNode || suppressSemanticEnrichment ? [] : rankProjectCommands(input);
-  const toolScope = summarizeToolScope(authorityInput);
-  const mcp = lightenQa || constrainedWorkflowNode || suppressSemanticEnrichment ? [] : mcpHealth();
-  const healthWarnings = suppressSemanticEnrichment
+  const skills = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankSkills(input);
+  const workflows = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankWorkflows(input);
+  const projectCommands = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankProjectCommands(input);
+  const toolScope: McpToolScope = plainConversationSurface
+    ? { authority: 'none', reason: 'accepted source proved a plain conversation surface' }
+    : summarizeToolScope(authorityInput);
+  const mcp = lightenQa || constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : mcpHealth();
+  const healthWarnings = suppressActionSemanticEnrichment
     ? []
     : [
         ...harnessCapabilityHealthWarnings(),
@@ -693,8 +710,18 @@ export function buildAgentContextPacket(
   // Fan-out detection always runs — a multi-item request ("research these 8
   // companies") has no action verb but is NOT light; dropping it would lose the
   // parallelism directive. Only the health probes (below) are safe to skip on qa.
-  const multiItem = detectMultiItemIntent(authorityInput);
-  const agentSystem = renderAgentSystemGuidance(authorityInput, opts?.sessionKind);
+  const multiItem: MultiItemIntent = plainConversationSurface
+    ? {
+        isMultiItem: false,
+        itemCount: 0,
+        itemKind: null,
+        sameShapeWork: false,
+        explicitParallelRequest: false,
+      }
+    : detectMultiItemIntent(authorityInput);
+  const agentSystem = plainConversationSurface
+    ? { injected: false, recommendationCount: 0, recommendations: [], policy: null, summary: '', text: '' }
+    : renderAgentSystemGuidance(authorityInput, opts?.sessionKind);
   const fanoutPosture = agentSystem.policy?.fanoutPosture ?? 'unknown';
   const recommendedWorkerWaveSize = agentSystem.policy?.recommendedWorkerWaveSize ?? 8;
   // The count-aware fan-out directive belongs to EVERY non-workflow lane.
@@ -726,7 +753,7 @@ export function buildAgentContextPacket(
   // suppressConfirmBeat: the loop substitutes a goal OBJECTIVE for synthetic
   // continuation/retry inputs — the beat must only ever evaluate a REAL user
   // message, never a substituted one mid-run.
-  const preflightDecision = opts?.suppressConfirmBeat
+  const preflightDecision = plainConversationSurface || opts?.suppressConfirmBeat
     ? { phase: 'execute', consequential: false, reason: 'ordinary_execution' } as const
     : classifyTurnPreflight({
         message: authorityInput,
@@ -747,6 +774,7 @@ export function buildAgentContextPacket(
   // orphan event rows. runTurn always supplies this exact source identity.
   if (
     !opts?.suppressConfirmBeat
+    && !plainConversationSurface
     && opts?.sessionKind === 'chat'
     && Number.isSafeInteger(opts?.sourceUserSeq)
     && (opts?.sourceUserSeq ?? 0) > 0
@@ -769,7 +797,7 @@ export function buildAgentContextPacket(
   // Same chat-only persistence condition as the preflight decision.
   let capabilityResolution: CapabilityResolution = { entries: [], registryAvailable: false };
   let capabilityBlock = '';
-  if (!constrainedWorkflowNode && !suppressSemanticEnrichment && !opts?.skipCapabilityHunt) {
+  if (!constrainedWorkflowNode && !suppressActionSemanticEnrichment && !opts?.skipCapabilityHunt) {
     try {
       capabilityResolution = resolveTurnCapabilities(input, { sessionId: opts?.sessionId });
       capabilityBlock = renderCapabilityResolutionForContext(capabilityResolution, { focusInput: input });
@@ -786,7 +814,7 @@ export function buildAgentContextPacket(
     }
   }
 
-  const mcpScopeLine = toolScope.allowAll
+  const mcpScopeLine = suppressActionSemanticEnrichment || toolScope.allowAll
     ? ''
     : `External MCP scope: ${(toolScope.allowedServerSlugs ?? []).join(', ') || 'none'}${toolScope.maxTools ? `, max ${toolScope.maxTools} tools` : ''} (${toolScope.reason}).`;
   const memoryStatusLine = memory.skippedReason || !memory.enabled
@@ -807,8 +835,8 @@ export function buildAgentContextPacket(
     prospectiveCapture,
     ruleCapture,
     mcpScopeLine,
-    suppressSemanticEnrichment ? '' : providerAccessLine(),
-    ...(suppressSemanticEnrichment
+    suppressActionSemanticEnrichment ? '' : providerAccessLine(),
+    ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates(
           'Likely skills',
@@ -818,27 +846,25 @@ export function buildAgentContextPacket(
     // Pre-flight error library: the freshest distilled lessons for the skills
     // this turn will likely use — surfaced BEFORE acting so a known mistake
     // isn't repeated (they used to be reachable only via skill_read).
-    suppressSemanticEnrichment ? '' : pitfallsForSkills(skills.map((s) => s.name)),
-    ...(suppressSemanticEnrichment
+    suppressActionSemanticEnrichment ? '' : pitfallsForSkills(skills.map((s) => s.name)),
+    ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Project commands (the real deliverable route)', projectCommands, PROJECT_COMMANDS_INSTRUCTION)),
-    ...(suppressSemanticEnrichment
+    ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. If the user asks to RUN/start/kick off something by name — even a loose one ("run my email flow", "kick off the prospect routine") — call workflow_run with their exact phrasing: the resolver matches it to the right saved workflow (or asks which) and confirms before anything runs, then it executes in the background and reports back here. Do NOT auto-run a workflow the user did not ask to run; for a task that merely resembles a saved workflow, do it directly and offer to save it as a workflow afterward.')),
     healthWarnings.length > 0
       ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
       : '',
     agentSystem.text,
-    suppressSemanticEnrichment ? '' : parallelismLine,
+    suppressActionSemanticEnrichment ? '' : parallelismLine,
     confirmBeat,
     capabilityBlock,
   ].filter((line): line is string => Boolean(line));
 
   return {
     inputPreview: clip(suppressSemanticEnrichment ? authorityInput : input, 200),
-    semanticEnrichmentSkippedReason: suppressSemanticEnrichment
-      ? 'declined_continuation'
-      : null,
+    semanticEnrichmentSkippedReason,
     complexity,
     turnIntent,
     memory,

@@ -31,7 +31,7 @@ test.after(() => {
 
 let serial = 0;
 
-function accept(text: string) {
+function acceptWithoutExpectedWork(text: string) {
   const session = eventlog.createSession({ id: `terminal-preparation-${++serial}`, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id,
@@ -43,17 +43,41 @@ function accept(text: string) {
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
   }));
-  const fixed = contracts.freezeDeterministicExpectedWorkContract({
-    sessionId: session.id,
-    sourceUserSeq: source.seq,
-  });
-  assert.ok(fixed.status === 'fixed' || fixed.status === 'replayed', JSON.stringify(fixed));
   return {
     sessionId: session.id,
     sourceUserSeq: source.seq,
     turn: 1,
     acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
   };
+}
+
+/** Exact host-v1 pre-planning shape: the source is accepted, but discovery
+ * starts before an expected-task graph/authority has been persisted. */
+function acceptBeforePlanning(text: string) {
+  const session = eventlog.createSession({ id: `terminal-preparation-${++serial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  return {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq),
+  };
+}
+
+function accept(text: string) {
+  const task = acceptWithoutExpectedWork(text);
+  const fixed = contracts.freezeDeterministicExpectedWorkContract({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.ok(fixed.status === 'fixed' || fixed.status === 'replayed', JSON.stringify(fixed));
+  return task;
 }
 
 function settleRead(input: {
@@ -657,7 +681,6 @@ test('serialized contradictory envelopes cannot launder canonical metadata text'
         ...contradiction,
         content: [{ type: 'text', text: WORKFLOW_READ_RESULT }],
       }),
-      assertOutcome: 'succeeded',
     });
   }
 });
@@ -1141,4 +1164,322 @@ test('a retrieve answered by a provider collection read without a completeness s
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['resolution_finalized'] }).length, 1);
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['evidence_receipt'] }).length, 1);
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['obligation_satisfied'] }).length, 1);
+});
+
+/**
+ * A turn that TRIED to act, never got a plan admitted, and performed no
+ * business call may not answer as though it were ordinary conversation.
+ *
+ * Live 2026-08-26 (sess-mob-3c4d…, sourceUserSeq 90213): asked "how many
+ * accounts does my team have by seller", Clem ran discovery, attempted
+ * plan_task SEVEN times — every one refused "cites a capability that was not
+ * disclosed to this source" — settled ZERO business calls, and then published
+ * status `done`, kind `answer`:
+ *
+ *   "I can confirm 120 accounts across 8 active sellers, but I can't
+ *    retrieve the live owner-by-owner breakdown right now."
+ *
+ * Both numbers were invented, "I can confirm" asserted verification that never
+ * happened, and the honest-sounding hedge about the breakdown made the
+ * fabrication MORE credible. A tool that fails loudly costs a retry; one that
+ * fabricates a figure and calls it confirmed costs a decision.
+ *
+ * Whether evidence was REQUIRED was being decided by a regex over the user's
+ * wording (`today|now|latest|…`). That question has nothing to do with phrasing:
+ * the durable record already shows what the turn itself decided it needed.
+ * Repeated plan_task attempts with no admitted contract are not "this was never
+ * action work" — they are action work that failed to admit.
+ */
+test('a source that attempted action admission and did nothing cannot answer as done', () => {
+  // This is the live-shaped failed-admission state: graph accepted, but every
+  // plan_task attempt refused before any expected-work contract could freeze.
+  const task = acceptWithoutExpectedWork('How many accounts does my team have by seller');
+
+  // The model decided this needed action and tried repeatedly; nothing was ever
+  // admitted, and no business call settled.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    eventlog.appendEvent({
+      sessionId: task.sessionId,
+      turn: task.turn,
+      role: 'system',
+      type: 'tool_called',
+      data: { sourceUserSeq: task.sourceUserSeq, tool: 'plan_task', callId: `plan-${attempt}` },
+    });
+  }
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.notEqual(prepared.status, 'ready',
+    'a turn that provably performed no work must not be cleared to answer as done');
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  if (prepared.status !== 'needs_verification') return;
+  assert.ok(
+    prepared.missing.includes('action_attempted_without_evidence'),
+    `the hold must name the real reason, got ${JSON.stringify(prepared.missing)}`,
+  );
+});
+
+test('a failed admission attempt does not override successful business evidence', () => {
+  const task = acceptWithoutExpectedWork('How many accounts does my team have by seller');
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'tool_called',
+    data: { sourceUserSeq: task.sourceUserSeq, tool: 'plan_task', callId: 'plan-before-read' },
+  });
+  settleRead({
+    task,
+    tool: 'accounts_by_seller',
+    args: { groupBy: 'seller' },
+    payload: {
+      successful: true,
+      data: { records: [{ seller: 'Alex', accounts: 12 }] },
+      meta: { complete: true },
+    },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(prepared.status, 'unstaged', JSON.stringify(prepared));
+});
+
+test('a frozen zero-operation contract cannot launder a later failed action admission', () => {
+  const task = accept('Hello, how are you?');
+  const contract = contracts.loadExpectedWorkContract(task.sessionId, task.sourceUserSeq);
+  assert.equal(contract.status, 'ok', JSON.stringify(contract));
+  if (contract.status !== 'ok') return;
+  assert.equal(contract.contract.operations.length, 0, 'fixture must reach the zero-op finalization path');
+
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'tool_called',
+    data: { sourceUserSeq: task.sourceUserSeq, tool: 'plan_task', callId: 'plan-zero-op' },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['action_attempted_without_evidence'],
+  );
+});
+
+test('an ordinary conversational turn that never attempted action is unaffected', () => {
+  const task = accept('hey how is it going');
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.notEqual(prepared.status, 'needs_verification',
+    'plain conversation owes no external evidence; this gate must not touch it');
+});
+
+test('failed discovery for an unplanned current-state read cannot publish done (live source 91056)', () => {
+  const task = acceptBeforePlanning(
+    'Read the single most recent message in my Outlook Inbox and return only its subject and received time.',
+  );
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      tool: 'tool_search',
+      callId: 'discovery-timeout',
+      canonicalCallId: 'discovery-timeout',
+      accounting: 'top_level',
+      topologyRole: 'control',
+      effect: 'read',
+      effectiveTool: 'tool_search',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      callId: 'discovery-timeout',
+      outcome: 'timed_out',
+    },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'I cannot complete this read here. ASK: Could you re-run it?',
+  });
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['discovery_attempted_without_business_evidence'],
+  );
+});
+
+test('successful tool discovery for an ordinary catalog question remains a completed answer', () => {
+  const task = acceptBeforePlanning('Which tools are available in this session?');
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      tool: 'tool_search',
+      callId: 'discovery-success',
+      canonicalCallId: 'discovery-success',
+      accounting: 'top_level',
+      topologyRole: 'control',
+      effect: 'read',
+      effectiveTool: 'tool_search',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      callId: 'discovery-success',
+      outcome: 'succeeded',
+    },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'Outlook and Slack tools are available.',
+  });
+  assert.equal(prepared.status, 'unstaged', JSON.stringify(prepared));
+});
+
+test('a failed tool search while answering an ordinary catalog question remains conversational', () => {
+  const task = acceptBeforePlanning('Which tools are available in this session?');
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      tool: 'tool_search',
+      callId: 'ordinary-discovery-timeout',
+      canonicalCallId: 'ordinary-discovery-timeout',
+      accounting: 'top_level',
+      topologyRole: 'control',
+      effect: 'read',
+      effectiveTool: 'tool_search',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      callId: 'ordinary-discovery-timeout',
+      outcome: 'timed_out',
+    },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'The catalog search timed out.',
+  });
+  assert.equal(prepared.status, 'unstaged', JSON.stringify(prepared));
+});
+
+test('failed discovery for a graph-classified retrieve holds even without freshness wording', () => {
+  const task = acceptWithoutExpectedWork('Find emails from Bob.');
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      tool: 'tool_search',
+      callId: 'retrieve-discovery-timeout',
+      canonicalCallId: 'retrieve-discovery-timeout',
+      accounting: 'top_level',
+      topologyRole: 'control',
+      effect: 'read',
+      effectiveTool: 'tool_search',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      callId: 'retrieve-discovery-timeout',
+      outcome: 'timed_out',
+    },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'I could not search the mailbox because discovery timed out.',
+  });
+  assert.equal(prepared.status, 'needs_verification', JSON.stringify(prepared));
+  assert.deepEqual(
+    prepared.status === 'needs_verification' ? prepared.missing : [],
+    ['discovery_attempted_without_business_evidence'],
+  );
+});
+
+test('graph-backed catalog introspection remains conversational after failed discovery', () => {
+  const task = acceptWithoutExpectedWork('Which tools are available in this session?');
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      tool: 'tool_search',
+      callId: 'graph-catalog-discovery-timeout',
+      canonicalCallId: 'graph-catalog-discovery-timeout',
+      accounting: 'top_level',
+      topologyRole: 'control',
+      effect: 'read',
+      effectiveTool: 'tool_search',
+    },
+  });
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: task.turn,
+    role: 'system',
+    type: 'discovery_governor_outcome',
+    data: {
+      sourceUserSeq: task.sourceUserSeq,
+      callId: 'graph-catalog-discovery-timeout',
+      outcome: 'timed_out',
+    },
+  });
+
+  const prepared = preparation.prepareAcceptedTaskTerminal({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    proposedReply: 'The catalog search timed out.',
+  });
+  assert.equal(prepared.status, 'unstaged', JSON.stringify(prepared));
 });

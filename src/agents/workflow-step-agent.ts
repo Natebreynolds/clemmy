@@ -600,8 +600,7 @@ export async function buildWorkflowStepAgent(
   const learnedRecall = (!surfaceLocked && options.userInput)
     ? renderToolChoicesForContext(8, undefined, options.userInput)
     : '';
-  const staticInstructions = [
-    STEP_INSTRUCTIONS,
+  const volatileInstructions = [
     ...(options.resultOnlyTools
       ? [
           'This is a graph-added read-only prompt node. You have no work tools, external MCP servers, general file access, notification authority, or wildcard authority. For an offloaded upstream value, workspace_artifact_query can page exact JSON rows from this run workspace only. Reason over the supplied prompt and step context, then return the result through workflow_step_result.',
@@ -609,14 +608,13 @@ export async function buildWorkflowStepAgent(
       : []),
     catalogBlock,
   ].filter(Boolean).join('\n\n');
-  const baseInstructions = harnessInstructions(staticInstructions, {
+  const instructions = harnessInstructions(STEP_INSTRUCTIONS, {
     sessionId: options.sessionId ?? undefined,
     focusInput: options.userInput ?? undefined,
     includeRememberedToolChoices: false,
+    volatileInstructions,
+    volatileMemoryInstructions: learnedRecall,
   });
-  const instructions = learnedRecall
-    ? () => `${baseInstructions()}\n\n${learnedRecall}`
-    : baseInstructions;
   const agent = new Agent<RuntimeContextValue, any>({
     name: 'WorkflowStep',
     instructions,

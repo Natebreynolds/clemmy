@@ -206,14 +206,12 @@ test('mergedSpawnEnv honors explicit npm cache overrides', () => {
 // This is a sweep, not a single-case regression: the class recurs whenever a
 // NEW seam is added, so the rule is enforced against the tree.
 test('every credential-bearing CLI seam spawns through mergedSpawnEnv', () => {
-  const CREDENTIAL_SEAMS = [
+  const CREDENTIAL_SPAWN_SEAMS = [
     'src/tools/computer-tools.ts',
-    'src/tools/dynamic-tools.ts',
-    'src/execution/workflow-run-readiness.ts',
     'src/runtime/cli-discovery.ts',
   ];
   const offenders: string[] = [];
-  for (const file of CREDENTIAL_SEAMS) {
+  for (const file of CREDENTIAL_SPAWN_SEAMS) {
     const absolute = path.join(HERE, '..', '..', file);
     if (!existsSync(absolute)) {
       offenders.push(`${file}: missing — update this pin if the seam moved`);
@@ -231,6 +229,34 @@ test('every credential-bearing CLI seam spawns through mergedSpawnEnv', () => {
     }
   }
   assert.deepEqual(offenders, [], `CLI seams must share one spawn environment:\n${offenders.join('\n')}`);
+});
+
+test('inventory and workflow readiness seams remain process-free', () => {
+  // These used to launch installed scripts and account-readiness probes. Both
+  // execution paths were retired because neither owned exact logical/physical
+  // call authority. Do not force an unused mergedSpawnEnv import merely to
+  // satisfy the credential-spawn sweep; pin the stronger property instead.
+  const PROCESS_FREE_SEAMS = [
+    'src/tools/dynamic-tools.ts',
+    'src/execution/workflow-run-readiness.ts',
+  ];
+  const offenders: string[] = [];
+  for (const file of PROCESS_FREE_SEAMS) {
+    const absolute = path.join(HERE, '..', '..', file);
+    if (!existsSync(absolute)) {
+      offenders.push(`${file}: missing — update this pin if the seam moved`);
+      continue;
+    }
+    const source = readFileSync(absolute, 'utf-8');
+    if (
+      /from\s+['"]node:child_process['"]/.test(source)
+      || /require\(\s*['"]node:child_process['"]\s*\)/.test(source)
+      || /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\s*\(/.test(source)
+    ) {
+      offenders.push(`${file}: inventory/readiness seam regained child-process execution`);
+    }
+  }
+  assert.deepEqual(offenders, [], `process-free seams must not launch children:\n${offenders.join('\n')}`);
 });
 
 test('the sandboxed code-certification probe scrubs its env but still resolves via augmentPath', () => {

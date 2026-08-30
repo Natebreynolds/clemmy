@@ -104,6 +104,22 @@ const DIRECT_PROJECT_REQUEST_RE =
 const EXPLICIT_COMPOUND_RE =
   /\b(?:after\s+that|and\s+then|end\s+to\s+end|followed\s+by|from\s+start\s+to\s+finish|then)\b|\s\+\s/i;
 
+/**
+ * Pure pre-intent veto for the reply-local construction shortcut. A durable
+ * artifact or explicit standing operation cannot be completed inside one
+ * assistant message, even before the main intent classifier has assigned
+ * action semantics. This is descriptive shape only; it grants no authority.
+ */
+export function hasDurableOrStandingProjectShape(text: string): boolean {
+  const value = (text ?? '').trim().replace(/[’]/g, "'");
+  if (!value || !DIRECT_PROJECT_REQUEST_RE.test(value)) return false;
+  const durable = DURABLE_ARTIFACT_OBJECT_RE.test(value)
+    || MAKE_DURABLE_ARTIFACT_OBJECT_RE.test(value)
+    || COMPOUND_DURABLE_ARTIFACT_RE.test(value);
+  const standing = STANDING_OPERATION_RE.test(value) || /\bautomate\b/i.test(value);
+  return durable || standing;
+}
+
 export function classifyProjectShape(
   text: string,
   intent: Pick<IntentClassification, 'intent'>,

@@ -7,6 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdtempSync,
@@ -27,6 +28,67 @@ const runner = await import('./runner.js');
 const registry = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+
+const CURRENT_READ_OPERATION = 'PROOF_SPACE_ACTION_READ_CURRENT';
+const CURRENT_WRITE_OPERATION = 'PROOF_SPACE_ACTION_WRITE_CURRENT';
+const STALE_READ_OPERATION = 'PROOF_SPACE_ACTION_READ_STALE';
+const UNREGISTERED_OPERATION = 'PROOF_SPACE_ACTION_READ_UNREGISTERED';
+
+function installEffectFixture(
+  operationId: string,
+  effect: 'read' | 'external_write',
+  lifecycle: 'current' | 'revoked' = 'current',
+): void {
+  const fingerprint = createHash('sha256')
+    .update(`space-action-gate:${operationId}:${effect}`, 'utf8')
+    .digest('hex');
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `manifest.space.action-gate.${operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'provider.space-action-gate-fixture',
+    providerVersion: 'fixture.1',
+    operationVersion: '1',
+    definitionFingerprint: fingerprint,
+    effect,
+    accountId: 'account.space-action-gate-fixture',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: effect === 'read' ? 'read_bounded_records' : 'bounded_write',
+    acceptedInputKinds: ['scope'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'space.action-gate.test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: lifecycle },
+    advisoryRoles: [effect === 'read' ? 'source' : 'write'],
+  });
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory()
+    ?? capabilityCatalogs.createHostCapabilityCatalogFactory();
+  factory.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => { throw new Error('effect fixture must never own provider I/O'); },
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+}
+
+installEffectFixture(CURRENT_READ_OPERATION, 'read');
+installEffectFixture(CURRENT_WRITE_OPERATION, 'external_write');
+installEffectFixture(STALE_READ_OPERATION, 'read', 'revoked');
 
 function approvalRow(approvalId: string): registry.PendingApprovalRow {
   const row = registry.listPending({ status: 'pending' }).find((r) => r.approvalId === approvalId);
@@ -88,14 +150,11 @@ function mutationPhaseCounts(approvalId: string): { receipts: number; commits: n
   };
 }
 
-test('spaceActionNeedsApproval: composio writes/sends gate, reads do not', () => {
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'a', composioSlug: 'OUTLOOK_SEND_EMAIL' }), true);
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'b', composioSlug: 'SALESFORCE_CREATE_RECORD' }), true);
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'upload', composioSlug: 'ONE_DRIVE_UPLOAD_FILE' }), true);
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'mark', composioSlug: 'GMAIL_MARK_AS_READ' }), true);
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'unknown', composioSlug: 'ACME_DO_THING' }), true);
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'c', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS' }), false);
-  assert.equal(gate.spaceActionNeedsApproval({ id: 'd', composioSlug: 'SALESFORCE_GET_CONTACTS' }), false);
+test('spaceActionNeedsApproval: current manifest effects govern while stale and unknown identities gate', () => {
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'write', composioSlug: CURRENT_WRITE_OPERATION }), true);
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'stale', composioSlug: STALE_READ_OPERATION }), true);
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'unknown', composioSlug: UNREGISTERED_OPERATION }), true);
+  assert.equal(gate.spaceActionNeedsApproval({ id: 'read', composioSlug: CURRENT_READ_OPERATION }), false);
 });
 
 test('spaceActionNeedsApproval: every opaque runner action gates regardless of its label', () => {

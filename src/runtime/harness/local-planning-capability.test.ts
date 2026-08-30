@@ -21,7 +21,10 @@ writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-local-planning\n'
 
 const local = await import('./local-planning-capability.js');
 const registry = await import('../../tools/tool-registry.js');
-const { buildScopedLocalToolSearch } = await import('../../tools/local-runtime-tools.js');
+const {
+  buildScopedLocalToolSearch,
+  getLocalToolSchemas,
+} = await import('../../tools/local-runtime-tools.js');
 const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
 const eventlog = await import('./eventlog.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
@@ -32,6 +35,7 @@ const dispatch = await import('./dispatch-ledger.js');
 const identities = await import('./attempt-identity.js');
 const topology = await import('../graph/work-topology.js');
 const toolSearch = await import('../../tools/tool-search-tool.js');
+const workCallConfiguredNames = new Set(getLocalToolSchemas().keys());
 
 after(() => {
   local._setConfiguredLocalPlanningToolObserverForTests(null);
@@ -44,8 +48,10 @@ after(() => {
 const POSITIVE_NAMES = [
   'workflow_create',
   'workflow_update',
+  'workflow_edit_step',
   'space_save',
   'space_edit_view',
+  'space_edit_runner',
   'write_file',
 ] as const;
 
@@ -111,6 +117,58 @@ function proposalFor(input: {
   };
 }
 
+function readProposalFor(input: {
+  objective: string;
+  capabilityRef: string;
+  requestedEffect?: 'read' | 'local_write';
+}) {
+  const requestedEffect = input.requestedEffect ?? 'read';
+  const canonicalTopology = {
+    version: 1 as const,
+    operations: [{
+      id: 'read_local',
+      effect: requestedEffect,
+      coverage: requestedEffect === 'read' ? 'single' as const : null,
+      dependsOn: [],
+      dataFrom: [],
+      cardinality: { kind: 'once' as const },
+    }],
+    universes: [],
+  };
+  return {
+    version: 1 as const,
+    relation: 'new_goal' as const,
+    targetGoal: null,
+    goal: {
+      objective: input.objective,
+      criteria: [{ id: 'criterion_1', statement: 'The exact local read result is returned.' }],
+      openSlots: [],
+      candidates: [{ kind: 'capability' as const, id: input.capabilityRef }],
+    },
+    work: {
+      construct: 'single_act' as const,
+      cardinality: null,
+      destinations: null,
+      destination: null,
+      requestedEffect,
+      topology: canonicalTopology,
+      topologyHash: topology.workTopologyDigest(canonicalTopology),
+      operations: [{
+        id: 'read_local',
+        role: 'source',
+        requestedEffect,
+        capabilityRef: input.capabilityRef,
+        dependsOn: [],
+        evidence: ['tool_result'],
+      }],
+      deliverables: [{ id: 'read_evidence', kind: 'evidence' }],
+      evidenceRequirements: ['tool_result'],
+    },
+    slotAnswers: [],
+    rationale: 'Use the exact local read capability disclosed by the host.',
+  };
+}
+
 async function createPlanningSource(label: string, objective: string) {
   const session = eventlog.createSession({ id: `local-planning-${label}`, kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -157,6 +215,13 @@ async function searchExact(
       name: string;
       carrier?: string;
       capabilityRef?: string;
+      capabilityVariants?: Array<{
+        variantId: string;
+        capabilityRef: string;
+        reversibility: string;
+        destructive: boolean;
+        destinationPosture: string | null;
+      }>;
       planningProvenance?: string;
       planningRefStatus?: string;
     }>;
@@ -189,11 +254,17 @@ test('registry semantics admit reversible local writes generically and refuse un
     path: 'new.txt', content: 'new', mode: 'create', append: null,
   }), true);
   assert.equal(local.localPlanningArgumentsMatch(write.definition, {
+    path: 'strict-nullable-new.txt', content: 'new', mode: null, append: null,
+  }), true, 'the planning safe mode must match write_file runtime null -> create semantics');
+  assert.equal(local.localPlanningArgumentsMatch(write.definition, {
     path: 'existing.txt', content: 'replace', mode: 'overwrite', append: null,
   }), false);
   assert.equal(local.localPlanningArgumentsMatch(write.definition, {
     path: 'existing.txt', content: 'append', mode: 'create', append: true,
   }), false);
+  assert.equal(local.localPlanningArgumentsMatch(write.definition, {
+    path: 'existing.txt', content: 'replace', mode: null, append: false,
+  }), false, 'append:false remains runtime overwrite even when mode is null');
 
   const futureDeclaration: import('../../tools/tool-registry.js').ToolDecl = {
     name: 'future_reversible_write',
@@ -225,6 +296,31 @@ test('registry semantics admit reversible local writes generically and refuse un
   assert.equal(future.ok, true, future.ok ? '' : future.reason);
   if (future.ok) assert.equal(future.definition.capabilityRef, 'cap:local:future_reversible_write:reversible');
 
+  const undeclaredRuntimeDefault = local.deriveLocalPlanningDefinition({
+    declaration: {
+      ...futureDeclaration,
+      name: 'future_create_only_write',
+      localPlanning: {
+        ...futureDeclaration.localPlanning!,
+        reversibility: 'create_only',
+        safeMode: {
+          id: 'create',
+          requiredEquals: { mode: 'create' },
+          nullEquivalentToRequired: ['mode'],
+        },
+      },
+    },
+    carrier: 'work_call',
+    schema: {
+      type: 'object',
+      properties: { mode: { type: 'string', enum: ['create', 'overwrite'] } },
+      required: ['mode'],
+      additionalProperties: false,
+    },
+  });
+  assert.deepEqual(undeclaredRuntimeDefault, { ok: false, reason: 'safe_mode_not_structural' },
+    'a registry row cannot claim null equivalence unless the exact current schema admits null');
+
   for (const [name, reason] of [
     ['workflow_delete', 'destructive'],
     ['mcp_add', 'not_local_write'],
@@ -236,6 +332,158 @@ test('registry semantics admit reversible local writes generically and refuse un
     assert.equal(refused.ok, false, name);
     if (!refused.ok) assert.equal(refused.reason, reason, name);
   }
+});
+
+test('reviewed project reads enter local planning generically without widening arbitrary reads or shell', async () => {
+  for (const name of ['user_profile_read', 'time_slots'] as const) {
+    assert.equal(local.isRegistryDeclaredLocalPlanningCapability(name), true, name);
+    assert.equal(
+      local.isWorkCallConfiguredLocalPlanningCapability(name, workCallConfiguredNames),
+      true,
+      name,
+    );
+    assert.equal(local.isRegistryDeclaredLocalPlanningMutation(name), false, name);
+    const observed = await local.observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
+    assert.equal(observed.ok, true, observed.ok ? '' : `${name}:${observed.reason}`);
+    if (!observed.ok) continue;
+    assert.equal(observed.definition.capabilityRef, `cap:local:${name}:read`);
+    assert.equal(observed.definition.descriptor.effect, 'read');
+    assert.equal(observed.definition.consequence, 'read');
+    assert.equal(observed.definition.reversibility, 'read_only');
+    assert.equal(observed.definition.descriptor.destinationPosture, null);
+    assert.equal(observed.definition.descriptor.handleRequired, false);
+    assert.deepEqual(observed.definition.descriptor.evidenceKinds, ['tool_result']);
+    assert.deepEqual(observed.definition.descriptor.producedOutputKinds, ['evidence']);
+    assert.equal(observed.definition.safeMode, null);
+    const wrongCarrier = await local.observeCurrentLocalPlanningDefinition({ name, carrier: 'call_tool' });
+    assert.deepEqual(wrongCarrier, { ok: false, reason: 'carrier_mismatch' });
+  }
+
+  for (const name of ['run_shell_command', 'read_file'] as const) {
+    assert.equal(local.isRegistryDeclaredLocalPlanningCapability(name), false, name);
+    const refused = await local.observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
+    assert.equal(refused.ok, false, name);
+  }
+
+  assert.equal(local.isRegistryDeclaredLocalPlanningCapability('git_status'), true,
+    'the generic registry predicate remains a routing hint, not schema authority');
+  assert.equal(
+    local.isWorkCallConfiguredLocalPlanningCapability('git_status', workCallConfiguredNames),
+    false,
+  );
+  assert.deepEqual(
+    await local.observeCurrentLocalPlanningDefinition({ name: 'git_status', carrier: 'work_call' }),
+    { ok: false, reason: 'not_configured' },
+    'a reviewed project read without a current generic work_call dispatch schema cannot enter planning',
+  );
+});
+
+test('a disclosed read ref freezes only a read operation and cannot cross effect ceilings', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const objective = 'Read my current local user profile.';
+  const run = await createPlanningSource('read-effect-bounds', objective);
+  const readSearch = await searchExact(
+    run.planning,
+    new Set(['user_profile_read', 'workflow_create']),
+    'user_profile_read',
+  );
+  const readRef = readSearch.results[0]?.capabilityRef;
+  assert.equal(readRef, 'cap:local:user_profile_read:read');
+  const writeSearch = await searchExact(
+    run.planning,
+    new Set(['user_profile_read', 'workflow_create']),
+    'workflow_create',
+  );
+  const writeRef = writeSearch.results[0]?.capabilityRef;
+  assert.equal(writeRef, 'cap:local:workflow_create:reversible');
+
+  const admitted = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: run.identity,
+    surface: 'direct',
+    proposal: readProposalFor({ objective, capabilityRef: readRef! }),
+    planningCatalogAuthority: run.planning.authority,
+  });
+  assert.equal(admitted.ok, true, admitted.ok ? '' : admitted.reason);
+  if (!admitted.ok) return;
+  assert.equal(admitted.compiled.graph.effectCeiling, 'read');
+  const readNode = admitted.compiled.graph.nodes.find((node) => node.operationId === 'read_local');
+  assert.deepEqual(readNode?.capabilities, [{ kind: 'tool', resolution: 'explicit', names: [readRef] }]);
+  assert.deepEqual(
+    [...local.durableSelectedLocalPlanningCapabilityNames({
+      ...run.identity,
+      workCallConfiguredNames,
+    })],
+    ['user_profile_read'],
+  );
+  assert.deepEqual([...local.durableSelectedLocalPlanningMutationNames(run.identity)], []);
+
+  const replayed = await semantic.primePrimaryModelPlanningCatalog(run.identity);
+  assert.equal(replayed.ok, true, replayed.ok ? '' : replayed.reason);
+  if (replayed.ok) {
+    assert.equal(
+      replayed.planning.capabilities.find((entry) => entry.id === readRef)?.effect,
+      'read',
+    );
+  }
+
+  const writeRun = await createPlanningSource('read-ref-write-ceiling', objective);
+  const writeRunRead = await searchExact(
+    writeRun.planning,
+    new Set(['user_profile_read']),
+    'user_profile_read',
+  );
+  const writeCeiling = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: writeRun.identity,
+    surface: 'direct',
+    proposal: readProposalFor({
+      objective,
+      capabilityRef: writeRunRead.results[0]!.capabilityRef!,
+      requestedEffect: 'local_write',
+    }),
+    planningCatalogAuthority: writeRun.planning.authority,
+  });
+  assert.equal(writeCeiling.ok, false);
+  if (!writeCeiling.ok) assert.match(writeCeiling.reason, /effect/i);
+
+  const readRun = await createPlanningSource('write-ref-read-ceiling', objective);
+  const readRunWrite = await searchExact(
+    readRun.planning,
+    new Set(['workflow_create']),
+    'workflow_create',
+  );
+  const readCeiling = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: readRun.identity,
+    surface: 'direct',
+    proposal: readProposalFor({
+      objective,
+      capabilityRef: readRunWrite.results[0]!.capabilityRef!,
+    }),
+    planningCatalogAuthority: readRun.planning.authority,
+  });
+  assert.equal(readCeiling.ok, false);
+  if (!readCeiling.ok) assert.match(readCeiling.reason, /effect/i);
+});
+
+test('work_call planning authority publishes the canonical deferred JSON schema', async () => {
+  const observed = await local.observeCurrentLocalPlanningDefinition({
+    name: 'workflow_create',
+    carrier: 'work_call',
+  });
+  assert.equal(observed.ok, true, observed.ok ? '' : observed.reason);
+  if (!observed.ok) return;
+  const root = observed.schema as any;
+  const step = root.properties.steps.items;
+  const callArgs = step.properties.call.anyOf[0].properties.args.anyOf[0];
+
+  assert.ok(root.properties.description, 'a required property named description remains in the contract');
+  assert.notEqual(callArgs.additionalProperties, false);
+  assert.equal(
+    typeof callArgs.additionalProperties,
+    'object',
+    'provider-native values inside a structured call remain arbitrary JSON on the args_json carrier',
+  );
 });
 
 test('schema, registry, and invented-ref drift cannot replay a local definition', async () => {
@@ -307,22 +555,68 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
     assert.ok(row, name);
     assert.equal(row?.carrier, 'work_call');
     assert.equal(row?.planningProvenance, local.AUTHORIZED_LOCAL_REGISTRY_PROVENANCE);
-    assert.match(row?.capabilityRef ?? '', new RegExp(`^cap:local:${name}:`));
-    refs.set(name, row!.capabilityRef!);
+    const primaryRef = row?.capabilityRef ?? row?.capabilityVariants?.[0]?.capabilityRef;
+    assert.match(primaryRef ?? '', new RegExp(`^cap:local:${name}:`));
+    refs.set(name, primaryRef!);
+    if (name === 'write_file') {
+      assert.equal(row?.capabilityRef, undefined,
+        'a multi-mode tool must not advertise its create ref as authority for every mode');
+      assert.deepEqual(row?.capabilityVariants, [
+        {
+          variantId: 'create',
+          capabilityRef: 'cap:local:write_file:create',
+          reversibility: 'create_only',
+          destructive: false,
+          destinationPosture: 'create_new',
+        },
+        {
+          variantId: 'append',
+          capabilityRef: 'cap:local:write_file:append',
+          reversibility: 'irreversible',
+          destructive: false,
+          destinationPosture: 'named_existing',
+        },
+        {
+          variantId: 'overwrite',
+          capabilityRef: 'cap:local:write_file:overwrite',
+          reversibility: 'irreversible',
+          destructive: true,
+          destinationPosture: 'named_existing',
+        },
+      ], 'tool_search must disclose all frozen choices before work_call arguments');
+    }
   }
-  for (const name of ['workflow_delete', 'mcp_add']) {
+  // These two must stay uncitable, and they still are — what changed is that
+  // the row now NAMES why instead of stamping one flat label on every ref-less
+  // result. The distinction matters per name:
+  //   workflow_delete is destructive, so it is marked as such and is
+  //     deliberately never offered as directly callable.
+  //   mcp_add is sideEffect 'admin', so it refuses as not_local_write, carries
+  //     a work_call carrier, and therefore has no door on this turn — it keeps
+  //     the original status. Were it ever to resolve to call_tool this
+  //     assertion would fail, which is the point.
+  const EXPECTED_REFUSAL = {
+    workflow_delete: 'not_plannable_destructive',
+    mcp_add: 'unsupported_unmaterialized',
+  } as const;
+  for (const [name, expected] of Object.entries(EXPECTED_REFUSAL)) {
     const body = await searchExact(run.planning, allowed, name);
     const row = body.results.find((entry) => entry.name === name);
     assert.ok(row, name);
-    assert.equal(row?.capabilityRef, undefined);
-    assert.equal(row?.planningRefStatus, 'unsupported_unmaterialized');
+    assert.equal(row?.capabilityRef, undefined, `${name} must mint no ref`);
+    assert.equal(row?.planningRefStatus, expected, name);
+    assert.notEqual(row?.planningRefStatus, 'dispatch_now', `${name} must never be offered as callable`);
   }
 
   const durable = eventlog.listEvents(run.identity.sessionId, { types: ['capability_discovered'] })
     .flatMap((event) => Array.isArray(event.data.capabilities)
       ? event.data.capabilities as Array<Record<string, unknown>>
       : []);
-  assert.equal(durable.length, POSITIVE_NAMES.length);
+  assert.equal(
+    durable.length,
+    POSITIVE_NAMES.length + 2,
+    'write_file contributes create, append, and overwrite rows under one configured name',
+  );
   for (const [name, ref] of refs) {
     const row = durable.find((entry) => entry.capabilityRef === ref);
     assert.ok(row, `${name} durable disclosure missing`);
@@ -359,6 +653,143 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
   assert.equal(externalCoverage, 'authorized_external_v1');
 });
 
+test('ordinary Workspace creation compiles to exactly one semantic space_save mutation', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const objective = 'Create one inline Workspace view for the current project.';
+  const run = await createPlanningSource('space-save-single-commit', objective);
+  const body = await searchExact(run.planning, new Set(['space_save']), 'space_save');
+  const ref = body.results[0]?.capabilityRef;
+  assert.equal(ref, 'cap:local:space_save:reversible');
+
+  const admitted = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: run.identity,
+    surface: 'direct',
+    proposal: proposalFor({
+      objective,
+      capabilityRef: ref!,
+      operationId: 'author_workspace',
+      deliverableKind: 'workspace',
+    }),
+    planningCatalogAuthority: run.planning.authority,
+  });
+  assert.equal(admitted.ok, true, admitted.ok ? '' : admitted.reason);
+  if (!admitted.ok) throw new Error(admitted.reason);
+  assert.deepEqual(
+    [...new Set(admitted.compiled.graph.nodes
+      .map((node) => node.operationId)
+      .filter((operationId): operationId is string => typeof operationId === 'string'))],
+    ['author_workspace'],
+    'compiler phase nodes must all remain projections of one semantic requirement',
+  );
+  const capabilityOwner = admitted.compiled.graph.nodes.find((node) => (
+    node.operationId === 'author_workspace'
+    && node.capabilities.some((capability) => capability.names?.includes(ref!))
+  ));
+  assert.deepEqual(capabilityOwner?.capabilities, [{
+    kind: 'tool',
+    resolution: 'explicit',
+    names: ['cap:local:space_save:reversible'],
+  }]);
+
+  const frozen = contracts.freezePrimaryModelExpectedWorkContract(run.identity);
+  assert.ok(frozen.status === 'fixed' || frozen.status === 'replayed', JSON.stringify(frozen));
+  if (frozen.status !== 'fixed' && frozen.status !== 'replayed') throw new Error(frozen.reason);
+  assert.deepEqual(frozen.contract.operations, [{
+    id: 'author_workspace',
+    effect: 'local_write',
+    dependsOn: [],
+    dataFrom: [],
+    cardinality: { kind: 'once' },
+  }]);
+});
+
+test('write_file freezes append authority before work_call arguments exist', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const objective = 'Append one exact section to the existing local report.';
+  const run = await createPlanningSource('write-file-append-freeze', objective);
+  const body = await searchExact(run.planning, new Set(['write_file']), 'write_file');
+  const row = body.results.find((entry) => entry.name === 'write_file');
+  const appendRef = row?.capabilityVariants?.find((variant) => (
+    variant.capabilityRef.endsWith(':append')
+  ))?.capabilityRef;
+  assert.equal(appendRef, 'cap:local:write_file:append');
+
+  const admitted = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: run.identity,
+    surface: 'direct',
+    proposal: proposalFor({
+      objective,
+      capabilityRef: appendRef!,
+      operationId: 'append_report',
+      destinationPosture: 'named_existing',
+      deliverableKind: 'file',
+    }),
+    planningCatalogAuthority: run.planning.authority,
+  });
+  assert.equal(admitted.ok, true, admitted.ok ? '' : admitted.reason);
+  if (!admitted.ok) return;
+  const operation = admitted.compiled.graph.nodes.find((node) => node.operationId === 'append_report');
+  assert.deepEqual(operation?.capabilities, [{
+    kind: 'tool',
+    resolution: 'explicit',
+    names: ['cap:local:write_file:append'],
+  }]);
+
+  const append = await local.loadDurableAuthorizedLocalPlanningDefinition({
+    ...run.identity,
+    capabilityRef: appendRef!,
+  });
+  assert.equal(append.ok, true, append.ok ? '' : append.reason);
+  if (!append.ok) return;
+  const args = { path: 'report.txt', content: 'new section', mode: 'create', append: true };
+  assert.equal(local.localPlanningArgumentsMatch(append.definition, args), true);
+  const create = await local.loadDurableAuthorizedLocalPlanningDefinition({
+    ...run.identity,
+    capabilityRef: 'cap:local:write_file:create',
+  });
+  assert.equal(create.ok, true, create.ok ? '' : create.reason);
+  if (create.ok) assert.equal(local.localPlanningArgumentsMatch(create.definition, args), false);
+});
+
+test('an exact runner edit needs no invented provider destination', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const objective = 'Update this Workspace runner to bind its reviewed local data source.';
+  const run = await createPlanningSource('space-runner-destinationless', objective);
+  const body = await searchExact(
+    run.planning,
+    new Set(['space_edit_runner']),
+    'space_edit_runner',
+  );
+  const ref = body.results[0]?.capabilityRef;
+  assert.equal(ref, 'cap:local:space_edit_runner:reversible');
+
+  const admitted = await semantic.admitAndCompilePrimaryModelProposal({
+    identity: run.identity,
+    surface: 'direct',
+    proposal: proposalFor({
+      objective,
+      capabilityRef: ref!,
+      operationId: 'edit_workspace_runner',
+      destinationPosture: null,
+      deliverableKind: 'workspace',
+    }),
+    planningCatalogAuthority: run.planning.authority,
+  });
+  assert.equal(admitted.ok, true, admitted.ok ? '' : admitted.reason);
+  if (!admitted.ok) throw new Error(admitted.reason);
+  assert.equal(admitted.compiled.graph.effectCeiling, 'local_write');
+  assert.ok(admitted.compiled.graph.nodes.some((node) => (
+    node.operationId === 'edit_workspace_runner'
+    && node.capabilities.some((capability) => capability.names?.includes(ref!))
+  )));
+});
+
 test('plan freeze accepts only a current disclosed local ref and work admission binds it once before a body', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
@@ -368,6 +799,8 @@ test('plan freeze accepts only a current disclosed local ref and work admission 
   const body = await searchExact(run.planning, new Set(['workflow_create']), 'workflow_create');
   const ref = body.results[0]?.capabilityRef;
   assert.equal(ref, 'cap:local:workflow_create:reversible');
+  const createSchema = body.schemas.workflow_create as { required?: unknown };
+  assert.ok(Array.isArray(createSchema.required) && createSchema.required.includes('steps'));
 
   const invented = await semantic.admitAndCompilePrimaryModelProposal({
     identity: run.identity,
@@ -461,7 +894,7 @@ test('plan freeze accepts only a current disclosed local ref and work admission 
   'the binding proof stops before the local authoring body');
 });
 
-test('schema drift after disclosure is refused at plan freeze', async () => {
+test('selected schema drift is advisory at plan admission but exact local authority refuses before dispatch', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
@@ -489,13 +922,7 @@ test('schema drift after disclosure is refused at plan freeze', async () => {
     },
   }));
   try {
-    const reopened = await local.loadDurableAuthorizedLocalPlanningDefinition({
-      ...run.identity,
-      capabilityRef: ref!,
-    });
-    assert.equal(reopened.ok, false);
-    if (!reopened.ok) assert.equal(reopened.reason, 'surface_changed');
-    const refused = await semantic.admitAndCompilePrimaryModelProposal({
+    const admitted = await semantic.admitAndCompilePrimaryModelProposal({
       identity: run.identity,
       surface: 'direct',
       proposal: proposalFor({
@@ -505,9 +932,36 @@ test('schema drift after disclosure is refused at plan freeze', async () => {
       }),
       planningCatalogAuthority: run.planning.authority,
     });
-    assert.equal(refused.ok, false);
-    if (!refused.ok) assert.match(refused.reason, /local capability changed/i);
-    assert.equal(eventlog.getTurnGraphEventForSource(run.identity.sessionId, run.identity.sourceUserSeq), null);
+    assert.equal(admitted.ok, true, admitted.ok ? '' : admitted.reason);
+    assert.notEqual(
+      eventlog.getTurnGraphEventForSource(run.identity.sessionId, run.identity.sourceUserSeq),
+      null,
+      'G14 keeps the selected disclosed definition as advisory planning input',
+    );
+
+    const disclosure = eventlog.listEvents(run.identity.sessionId, {
+      types: ['planning_catalog_disclosed'],
+    }).find((event) => event.data.sourceUserSeq === run.identity.sourceUserSeq);
+    const advisories = Array.isArray(disclosure?.data.frozenCatalogAdvisories)
+      ? disclosure.data.frozenCatalogAdvisories as Array<Record<string, unknown>>
+      : [];
+    assert.ok(advisories.some((entry) => (
+      entry.id === ref
+      && entry.reason === 'changed_shape_between_disclosure_and_admission'
+    )), JSON.stringify(advisories));
+
+    // Planning supply is not physical authority. The downstream local
+    // consent/binding/dispatch seam reopens this exact source-bound definition
+    // and must still reject the now-drifted schema identity.
+    const reopened = await local.loadDurableAuthorizedLocalPlanningDefinition({
+      ...run.identity,
+      capabilityRef: ref!,
+    });
+    assert.equal(reopened.ok, false);
+    if (!reopened.ok) {
+      assert.equal(reopened.reason, 'surface_changed');
+      assert.equal(reopened.detail, 'local_planning_surface_changed');
+    }
   } finally {
     local._setConfiguredLocalPlanningToolObserverForTests(null);
   }

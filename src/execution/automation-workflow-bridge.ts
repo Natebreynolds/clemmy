@@ -33,7 +33,7 @@ import {
 } from '../memory/workflow-node-invocation-plan.js';
 import {
   parseWorkflowCanonicalEntityResultProjection,
-  type WorkflowCanonicalEntityResultProjectionV1,
+  type WorkflowCanonicalEntityResultProjection,
 } from '../memory/workflow-result-projection-contract.js';
 import {
   createCanonicalEntityWorkspaceBindingApproval,
@@ -56,6 +56,7 @@ import {
   type AutomationOpportunityV1,
 } from './automation-opportunity.js';
 import type { AutomationOpportunityProposalRecordV1 } from './automation-opportunity-store.js';
+import { selectAutomaticReadPilotTarget } from './automation-pilot-target.js';
 import type { ProjectEffectClass } from './project-plan-ir.js';
 import { workflowDefinitionHash } from './workflow-run-definition.js';
 import {
@@ -198,7 +199,7 @@ export interface AutomationSingleReadPilotContractV1 {
   evidence: WorkflowNodeEvidenceContractV1;
   completeness: WorkflowNodeCompletenessContractV1;
   continuation?: WorkflowNodeContinuationContractV1;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBindingSelection?: CanonicalEntityWorkspaceBindingSelectionV1;
 }
 
@@ -638,6 +639,7 @@ function resolveBindings(input: {
   opportunity: AutomationOpportunityV1;
   snapshot: AutomationLiveCapabilitySnapshotV1;
   selections: readonly AutomationApprovedCapabilitySelectionV1[];
+  requirementIds?: ReadonlySet<string>;
 }): { bindings: AutomationWorkflowCapabilityBindingV1[]; issues: AutomationWorkflowBridgeIssueV1[] } {
   const issues: AutomationWorkflowBridgeIssueV1[] = [];
   const selections = new Map<string, AutomationApprovedCapabilitySelectionV1>();
@@ -660,18 +662,24 @@ function resolveBindings(input: {
 
   const knownRequirements = new Set(input.opportunity.capabilityRequirements.map((item) => item.id));
   for (const selection of selections.values()) {
-    if (!knownRequirements.has(selection.requirementId)) {
+    if (
+      !knownRequirements.has(selection.requirementId)
+      || (input.requirementIds && !input.requirementIds.has(selection.requirementId))
+    ) {
       issues.push({
         code: 'selection_invalid',
         requirementId: selection.requirementId,
-        message: `Capability selection references unknown requirement "${selection.requirementId}".`,
+        message: `Capability selection references a requirement outside this exact compilation target: "${selection.requirementId}".`,
       });
     }
   }
   if (issues.length > 0) return { bindings: [], issues };
 
   const bindings: AutomationWorkflowCapabilityBindingV1[] = [];
-  for (const requirement of input.opportunity.capabilityRequirements) {
+  const required = input.requirementIds
+    ? input.opportunity.capabilityRequirements.filter((requirement) => input.requirementIds!.has(requirement.id))
+    : input.opportunity.capabilityRequirements;
+  for (const requirement of required) {
     const requirementDigest = automationCapabilityRequirementDigest(requirement);
     const current = input.snapshot.capabilities.filter((contract) => (
       contract.lifecycle === 'current'
@@ -802,13 +810,9 @@ function exactSingleReadPlan(input: {
 }) {
   const contract = input.contract;
   if (!contract) return undefined;
-  if (
-    input.opportunity.phases.length !== 1
-    || input.opportunity.capabilityRequirements.length !== 1
-    || input.opportunity.partition.mode !== 'single'
-  ) throw new Error('the read pilot compiler supports exactly one unpartitioned phase and one capability');
-  const phase = input.opportunity.phases[0];
-  const requirement = input.opportunity.capabilityRequirements[0];
+  const target = selectAutomaticReadPilotTarget(input.opportunity);
+  if (!target.ok) throw new Error(target.reason);
+  const { phase, requirement } = target;
   const binding = input.bindings.find((candidate) => candidate.requirementId === contract.requirementId);
   if (
     contract.phaseId !== phase.id
@@ -873,6 +877,7 @@ function exactSingleReadPlan(input: {
         ruleId: rule.id,
         fields: [...rule.fields].sort(),
         normalizers: [...rule.normalizers].sort(),
+        match: rule.match,
       }))
       .sort((left, right) => left.ruleId.localeCompare(right.ruleId));
     const projectedRules = exactProjection.identityRules
@@ -880,8 +885,17 @@ function exactSingleReadPlan(input: {
         ruleId: rule.ruleId,
         fields: [...rule.fields].sort(),
         normalizers: [...rule.normalizers].sort(),
+        match: !('kind' in rule)
+          ? 'exact' as const
+          : rule.kind === 'exact_identifier' ? 'exact' as const : 'compound' as const,
       }))
       .sort((left, right) => left.ruleId.localeCompare(right.ruleId));
+    const expectedOutcomeAuthority = input.opportunity.partition.mode === 'single'
+      ? input.opportunity.partition.outcomeAuthority
+      : undefined;
+    const projectedOutcomeAuthority = exactProjection.version === 2
+      ? exactProjection.partition.outcomeAuthority
+      : undefined;
     const supportedMerge = dataset.schema.additionalFields === 'reject'
       && dataset.merge.mode === 'review_required'
       && dataset.merge.defaultConflict === 'review_required'
@@ -892,6 +906,7 @@ function exactSingleReadPlan(input: {
     if (
       stableJson(expectedFields) !== stableJson(projectedFields)
       || stableJson(expectedRules) !== stableJson(projectedRules)
+      || stableJson(expectedOutcomeAuthority ?? null) !== stableJson(projectedOutcomeAuthority ?? null)
       || !supportedMerge
       || !contract.evidence.requiredPaths.includes(exactProjection.recordsPath)
       || !contract.completeness.evidencePaths.includes(exactProjection.recordsPath)
@@ -953,6 +968,15 @@ function buildPreview(input: {
       message,
     };
   }
+  const pilotTarget = invocationPlan
+    ? selectAutomaticReadPilotTarget(input.opportunity)
+    : undefined;
+  if (pilotTarget && !pilotTarget.ok) {
+    return { code: 'workflow_tool_kernel_binding_unrepresented', message: pilotTarget.reason };
+  }
+  const workflowPhases = invocationPlan && pilotTarget?.ok
+    ? [pilotTarget.phase]
+    : topologicalPhases(input.opportunity);
   const workflow: WorkflowDefinition = {
     name: workflowName,
     description: input.opportunity.objective,
@@ -965,7 +989,7 @@ function buildPreview(input: {
     trigger: workflowTriggerFor(input.opportunity, input.target),
     ...(!invocationPlan ? { allowedTools: [...WORKFLOW_GRAPH_ALLOWED_TOOLS] } : {}),
     ...(invocationPlan ? { inputs: structuredClone(input.readPilotContract!.workflowInputs) } : {}),
-    steps: topologicalPhases(input.opportunity).map((phase) => ({
+    steps: workflowPhases.map((phase) => ({
       id: phase.id,
       prompt: invocationPlan ? '' : phase.objective,
       ...(phase.dependsOn.length > 0 ? { dependsOn: [...phase.dependsOn] } : {}),
@@ -1092,7 +1116,15 @@ function representationIssues(
       message: 'This preview has no exact typed invocation plan for the shared workflow call kernel.',
     });
   }
-  if (opportunity.partition.mode !== 'single' || opportunity.phases.some((phase) => phase.partitioned)) {
+  const pilotTarget = selectAutomaticReadPilotTarget(opportunity);
+  const exactFiniteSource = opportunity.partition.mode === 'finite'
+    && pilotTarget.ok
+    && exactReadPlan
+    && preview.workflow.steps[0]?.id === pilotTarget.phase.id;
+  if (
+    (opportunity.partition.mode !== 'single' || opportunity.phases.some((phase) => phase.partitioned))
+    && !exactFiniteSource
+  ) {
     issues.push({
       code: 'workflow_partition_contract_unrepresented',
       message: 'The approved partition denominator/checkpoint contract has no exact WorkflowDefinition field.',
@@ -1232,6 +1264,9 @@ export function designApprovedAutomationWorkflowBridge(
     opportunity: approved.opportunity,
     snapshot: input.liveSnapshot,
     selections: input.selections ?? [],
+    ...(input.readPilotContract
+      ? { requirementIds: new Set([input.readPilotContract.requirementId]) }
+      : {}),
   });
   if (resolved.issues.length > 0) return { ok: false, issues: resolved.issues };
 

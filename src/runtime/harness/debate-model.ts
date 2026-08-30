@@ -34,7 +34,11 @@ import { classifyTurnIntent } from './turn-intent.js';
 import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 import { resolveProvider } from './model-wire-registry.js';
-import { recordModelRouteDecision, recordModelRouteOutcome } from '../model-route-metrics.js';
+import {
+  withModelRouteMetrics,
+  type ModelRouteDecisionSource,
+  type ModelRouteRole,
+} from '../model-route-metrics.js';
 import {
   claudeAvailable,
   codexAvailable,
@@ -858,18 +862,58 @@ function logDebateAvailabilityTransition(active: boolean): void {
  * MiniMax judge hits MiniMax, not whatever single backend is configured.
  */
 function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, haveCodex: boolean): Model | null {
+  let model: Model | null;
   if (checker.provider === 'codex') {
-    return haveCodex ? new CodexModelProvider().getModel(checker.modelId) : null;
-  }
-  if (checker.provider === 'byo') {
+    model = haveCodex ? new CodexModelProvider().getModel(checker.modelId) : null;
+  } else if (checker.provider === 'byo') {
     const byo = resolveByoProviderForModel(checker.modelId) ?? getByoBackendConfig();
-    return byo.configured ? getByoModel(checker.modelId, byo) : null;
+    model = byo.configured ? getByoModel(checker.modelId, byo) : null;
+  } else {
+    // claude
+    if (!haveClaude) return null;
+    model = checker.modelId && checker.modelId !== getClaudeBrainModel()
+      ? new ClaudeModelProvider().getModel(checker.modelId)
+      : new ClaudeModelProvider().getModel();
   }
-  // claude
-  if (!haveClaude) return null;
-  return checker.modelId && checker.modelId !== getClaudeBrainModel()
-    ? new ClaudeModelProvider().getModel(checker.modelId)
-    : new ClaudeModelProvider().getModel();
+  if (!model) return null;
+  return withDirectModelRouteMetrics(
+    model,
+    'judge',
+    checker.provider,
+    checker.modelId,
+    routeSourceForResolvedRole(checker),
+    'judge',
+  );
+}
+
+function routeSourceForResolvedRole(checker: ResolvedRoleModel): ModelRouteDecisionSource {
+  if (checker.source === 'policy') return 'policy';
+  if (checker.source === 'default') return 'default';
+  return checker.matchedIntent ? 'intent_binding' : 'binding';
+}
+
+/** Direct fusion/boundary models bypass RouterModelProvider. Instrument them at
+ * the same adapter-call boundary without carrying any prompt or response text. */
+function withDirectModelRouteMetrics(
+  model: Model,
+  role: ModelRouteRole,
+  provider: ModelProviderClass,
+  modelId: string,
+  source: ModelRouteDecisionSource,
+  seam: 'draft' | 'judge',
+): Model {
+  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+  const workflowRunId = sessionId?.startsWith('workflow:') ? sessionId.split(':')[1] : undefined;
+  return withModelRouteMetrics(model, {
+    sessionId,
+    workflowRunId,
+    role,
+    requestedModel: modelId,
+    resolvedModel: modelId,
+    provider,
+    source,
+    reason: { seam: `fusion_${seam}` },
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1137,8 +1181,25 @@ export function resolveDebateBrains(passthrough: ModelProvider, modelName?: stri
   // BOTH Claude and Codex (the two drafters). Build the Claude brain through the
   // PROVIDER so it carries the overload fallback chain Opus -> Sonnet -> Codex.
   if (!haveClaude || !haveCodex) return null;
-  const claude: Model = new ClaudeModelProvider().getModel();
-  const codex: Model = new CodexModelProvider().getModel();
+  const claudeModelId = getClaudeBrainModel();
+  const rawCodex = new CodexModelProvider().getModel();
+  const codexModelId = (rawCodex as { modelId?: string }).modelId ?? MODELS.primary;
+  const claude: Model = withDirectModelRouteMetrics(
+    new ClaudeModelProvider().getModel(),
+    'brain',
+    'claude',
+    claudeModelId,
+    'default',
+    'draft',
+  );
+  const codex: Model = withDirectModelRouteMetrics(
+    rawCodex,
+    'brain',
+    'codex',
+    codexModelId,
+    'default',
+    'draft',
+  );
   // The judge comes from the role→model registry (a UI/chat binding wins; else the
   // provider-derived default), dispatched by its provider so the role snapshot and
   // the actual judge cannot diverge. A byo judge with no configured backend → null.
@@ -2032,28 +2093,6 @@ function recordDebateTrace(rec: Record<string, unknown>): void {
     });
   } catch {
     /* operational mirror is best-effort */
-  }
-  // Route-outcome capture (adaptive routing evidence): one decision+outcome per
-  // judge pass so the policy job scores JUDGE models too. Latency is not cleanly
-  // attributable at this seam and is omitted (the scorer tolerates missing
-  // fields). Fail-open.
-  try {
-    const judgeModel = typeof safeRec.judge === 'string' && safeRec.judge ? safeRec.judge : resolveRoleModel('judge').modelId;
-    const outcome = typeof safeRec.outcome === 'string' ? safeRec.outcome : 'reconciled';
-    const decisionId = recordModelRouteDecision({
-      sessionId,
-      role: 'judge',
-      resolvedModel: judgeModel,
-      provider: resolveEffectiveProviderForModel(judgeModel),
-      source: 'default',
-      reason: { seam: safeRec.path === 'verify' ? 'verify_checker' : 'debate', outcome },
-    });
-    recordModelRouteOutcome({
-      decisionId,
-      status: /failed|timeout/i.test(outcome) ? 'failed' : 'success',
-    });
-  } catch {
-    /* metrics must never affect a judge pass */
   }
   try {
     const p = debateTracePath();

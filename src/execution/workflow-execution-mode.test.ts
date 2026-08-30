@@ -9,15 +9,26 @@ const wf = (steps: any[]) => ({ name: 'wf', description: 'd', enabled: true, tri
 
 test('stepExecutor classifies by how a step actually runs', () => {
   assert.equal(stepExecutor({ id: 'a', prompt: 'x', call: { tool: 'gmail_send' } }), 'call');
-  assert.equal(stepExecutor({ id: 'b', prompt: 'x', deterministic: { runner: 'x.py' } }), 'deterministic');
-  assert.equal(stepExecutor({ id: 'c', prompt: 'x', usesSkill: 'brief' }), 'skill');
-  assert.equal(stepExecutor({ id: 'd', prompt: 'x' }), 'model');
+  assert.equal(stepExecutor({
+    id: 'b',
+    prompt: '',
+    sideEffect: 'read',
+    transform: { version: 1, expression: { op: 'literal', value: true } },
+  }), 'transform');
+  assert.equal(stepExecutor({ id: 'c', prompt: 'x', deterministic: { runner: 'x.py' } }), 'deterministic');
+  assert.equal(stepExecutor({ id: 'd', prompt: 'x', usesSkill: 'brief' }), 'skill');
+  assert.equal(stepExecutor({ id: 'e', prompt: 'x' }), 'model');
 });
 
 test('AGENTLESS: every step runs as code — no agent, no tokens per run', () => {
   const r = classifyWorkflowExecutionMode(wf([
     { id: 'pull', prompt: 'pull', call: { tool: 'dataforseo_rank' } },
-    { id: 'enrich', prompt: 'enrich', deterministic: { runner: 'enrich.py' } },
+    {
+      id: 'reshape',
+      prompt: '',
+      sideEffect: 'read',
+      transform: { version: 1, expression: { op: 'literal', value: { ready: true } } },
+    },
     { id: 'file', prompt: 'save', call: { tool: 'write_file' } },
   ]));
   assert.equal(r.mode, 'agentless');

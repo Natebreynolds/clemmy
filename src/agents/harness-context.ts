@@ -39,7 +39,12 @@ import { loadWorkingMemoryForSession } from '../memory/working-memory.js';
 import { listHeldTasks } from './plan-proposals.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { modelParityEnabled, CACHE_BREAK_SENTINEL } from '../runtime/harness/model-wire-registry.js';
+import {
+  modelParityEnabled,
+  CACHE_BREAK_SENTINEL,
+  CACHE_MEMORY_CONTEXT_SENTINEL,
+  CACHE_MEMORY_APPEND_SENTINEL,
+} from '../runtime/harness/model-wire-registry.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
@@ -422,7 +427,7 @@ export function renderHarnessMemoryContext(opts?: {
   }
   return [
     '# Persistent Context',
-    'This block is loaded fresh each turn from the user\'s vault and memory stores. Treat it as ground truth about who the user is and what they\'re working on — it is the same persistent memory the chat dock and voice surfaces use, so what you learn here carries across every Clementine channel.',
+    'This block is loaded fresh each turn from the user\'s vault and memory stores and carries across every Clementine channel. It blends explicit user memory, curated identity, derived observations, pointers, and current state; it is persistent context, not uniform ground truth. Honor explicit user-authored preferences and constraints, but use the displayed provenance and freshness of derived material, verify stale or conflicting claims against the live source, and never present an inference as a confirmed fact.',
     '',
     ...blocks,
   ].join('\n\n');
@@ -439,6 +444,13 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   focusInput?: string;
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
+  /** Per-accepted-turn rules, frozen authority and catalog disclosures. These
+   *  remain model-visible but MUST sit after the stable rubric boundary. */
+  volatileInstructions?: string;
+  /** Memory-derived text assembled outside renderHarnessMemoryContext (for
+   *  example workflow tool-choice recall). It shares the memory suffix rather
+   *  than masquerading as current-turn policy. */
+  volatileMemoryInstructions?: string;
 }): () => string {
   // One constructed Agent represents one accepted turn/step activation but
   // may make several model calls. Snapshot memory at construction so tool
@@ -452,15 +464,26 @@ export function harnessInstructions(roleInstructions: string, opts?: {
     includeRememberedToolChoices: opts?.includeRememberedToolChoices,
     includeSessionActions: opts?.includeSessionActions,
   });
-  const rendered = !ctx
-    ? roleInstructions
-    // Parity (default): STABLE role instructions FIRST so the whole prefix
-    // (identity + role + tools) can be prompt-cached; the per-turn DYNAMIC
-    // memory context goes AFTER the cache-break sentinel. Brains that don't
-    // cache (Codex/BYO) strip the sentinel back to a `---` separator at their
-    // wire. Legacy order (dynamic-first) restored when parity is off.
-    : modelParityEnabled()
-      ? `${roleInstructions}\n\n${CACHE_BREAK_SENTINEL}\n\n${ctx}`
-      : `${ctx}\n\n---\n\n${roleInstructions}`;
+  const volatileInstructions = opts?.volatileInstructions?.trim() ?? '';
+  const volatileMemoryInstructions = opts?.volatileMemoryInstructions?.trim() ?? '';
+  const historicalRole = [roleInstructions, volatileInstructions].filter(Boolean).join('\n\n');
+  const dynamic = [
+    volatileInstructions,
+    ...(ctx ? [CACHE_MEMORY_CONTEXT_SENTINEL, ctx] : []),
+    ...(volatileMemoryInstructions
+      ? [CACHE_MEMORY_APPEND_SENTINEL, volatileMemoryInstructions]
+      : []),
+  ].filter(Boolean).join('\n\n');
+  const rendered = modelParityEnabled() && dynamic
+    // Only the identity/rubric policy precedes the boundary. Every current-turn
+    // authority/catalog byte and every memory byte follows it, so changing
+    // either can invalidate only its own suffix rather than re-billing policy.
+    ? `${roleInstructions}\n\n${CACHE_BREAK_SENTINEL}\n\n${dynamic}`
+    // Kill-switch/legacy path retains the exact historical order: memory first,
+    // separator, then role + the per-turn instruction trailer.
+    : [
+        ctx ? `${ctx}\n\n---\n\n${historicalRole}` : historicalRole,
+        volatileMemoryInstructions,
+      ].filter(Boolean).join('\n\n');
   return () => rendered;
 }

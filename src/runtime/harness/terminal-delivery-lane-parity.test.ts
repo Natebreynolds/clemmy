@@ -14,6 +14,7 @@ import type { Agent, Runner } from '@openai/agents';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-terminal-lane-parity-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.AUTH_MODE = 'claude_oauth';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';

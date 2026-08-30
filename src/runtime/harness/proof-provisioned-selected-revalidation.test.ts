@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
 
+import type { OperationVerificationContractV1 } from './mutation-verification-contract.js';
+
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-selected-definition-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
@@ -21,6 +23,7 @@ const schemas = await import('../../tools/composio-schema-cache.js');
 const { digestSchema } = await import('../../tools/tool-contract-store.js');
 const composio = await import('../../integrations/composio/client.js');
 const providerIdentity = await import('../../integrations/composio/provider-definition-identity.js');
+const selectedDefinitions = await import('../../integrations/composio/selected-definition-revalidation.js');
 
 const CONNECTION_ID = 'connection-mega-selected';
 const SELECTED_A = 'MEGA_SELECTED_SOURCE';
@@ -51,10 +54,43 @@ const OUTPUT_B = {
   properties: { records: { type: 'array' } },
 };
 
+/**
+ * Local copies of the retired Sheets declarations. They describe the raw
+ * Google API shape, not the Composio wrapper observed in production. Keeping
+ * them test-local lets this suite prove that neither selected-definition
+ * revalidation nor durable replay can turn a stale caller-supplied contract
+ * into current adapter authority.
+ */
+const RETIRED_CREATE_VERIFICATION = {
+  mutation: {
+    version: 1,
+    resourceFamily: 'googlesheets',
+    producedHandleKind: 'created_resource',
+    proof: 'resource_identity_v1',
+    target: {
+      source: 'authoritative_result',
+      pointers: ['/spreadsheetId'],
+    },
+  },
+} as const satisfies OperationVerificationContractV1;
+
+const RETIRED_READBACK_VERIFICATION = {
+  readback: {
+    version: 1,
+    resourceFamily: 'googlesheets',
+    acceptedHandleKind: 'created_resource',
+    requestTargetPointers: ['/spreadsheetId'],
+    responseTargetPointers: ['/spreadsheetId'],
+  },
+} as const satisfies OperationVerificationContractV1;
+
 function proofTurn(
   id: string,
   identifiers: readonly string[],
   accountIdentity = CONNECTION_ID,
+  effectClassFor: (identifier: string) => 'read' | 'write' = (identifier) => (
+    identifier === SELECTED_B ? 'write' : 'read'
+  ),
 ) {
   const session = eventlog.createSession({ id, kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -79,12 +115,355 @@ function proofTurn(
         status: 'proven',
         connection: 'connected',
         accountIdentity,
-        effectClass: identifier === SELECTED_B ? 'write' : 'read',
+        effectClass: effectClassFor(identifier),
       })),
     },
   });
   return { sessionId: session.id, sourceUserSeq: source.seq };
 }
+
+test('retired adapter contracts cannot publish a mutation or host-derived verifier', async () => {
+  const create = 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1';
+  const readback = 'GOOGLESHEETS_BATCH_GET';
+  const createInput = {
+    type: 'object',
+    required: ['title'],
+    properties: { title: { type: 'string' } },
+  };
+  const createOutput = {
+    type: 'object',
+    required: ['spreadsheetId'],
+    properties: { spreadsheetId: { type: 'string' } },
+  };
+  const readbackInput = {
+    type: 'object',
+    required: ['spreadsheetId'],
+    properties: {
+      spreadsheetId: { type: 'string' },
+      ranges: { type: 'array', items: { type: 'string' } },
+    },
+  };
+  const readbackOutput = {
+    type: 'object',
+    required: ['spreadsheetId', 'valueRanges'],
+    properties: {
+      spreadsheetId: { type: 'string' },
+      valueRanges: { type: 'array' },
+    },
+  };
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: CONNECTION_ID,
+    status: 'ACTIVE',
+    user_id: 'selected-user',
+    toolkit: { slug: 'googlesheets' },
+  }]);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  let businessCalls = 0;
+  production.installProductionTransport(async () => {
+    businessCalls += 1;
+    return {};
+  });
+  schemas.resetToolSchemaCache();
+  schemas._setToolSchemaLoaderForTests(async (identifier) => {
+    if (identifier === create) {
+      return {
+        inputParameters: createInput,
+        outputParameters: createOutput,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: '20260827_create',
+      };
+    }
+    if (identifier === readback) {
+      return {
+        inputParameters: readbackInput,
+        outputParameters: readbackOutput,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: '20260827_readback',
+      };
+    }
+    return null;
+  });
+
+  const result = await provisioning.registerProofProvisionedCapabilities(
+    proofTurn(
+      'exact-host-derived-verifier-publication',
+      [create],
+      CONNECTION_ID,
+      () => 'write',
+    ),
+    {
+      allowedIdentifiers: [create, readback],
+      hostDerivedVerificationIdentifiers: [readback],
+      selectedDefinitions: [
+        {
+          identifier: create,
+          schemaDigest: digestSchema(createInput),
+          outputSchemaDigest: digestSchema(createOutput),
+          accountIdentity: CONNECTION_ID,
+          verificationContract: RETIRED_CREATE_VERIFICATION,
+        },
+        {
+          identifier: readback,
+          schemaDigest: digestSchema(readbackInput),
+          outputSchemaDigest: digestSchema(readbackOutput),
+          accountIdentity: CONNECTION_ID,
+          verificationContract: RETIRED_READBACK_VERIFICATION,
+        },
+      ],
+    },
+  );
+
+  assert.deepEqual(result.refusal, {
+    code: 'selected_definition_semantic_contract_drift',
+    identifier: create,
+  });
+  assert.deepEqual(result.registered, []);
+  assert.equal(factory.get(`cap:resolved:${create.toLowerCase()}`), undefined);
+  assert.equal(factory.get(`cap:resolved:${readback.toLowerCase()}`), undefined);
+  assert.equal(businessCalls, 0, 'publication revalidates metadata but never dispatches provider work');
+});
+
+test('a fully bound opaque operation preserves generic reversible semantics across exact refresh', async () => {
+  const identifier = 'MEGA_OPAQUE_FORGE';
+  const operationVersion = '20260827_opaque';
+  const invokePortId = `port:cap:resolved:${identifier.toLowerCase()}:${identifier}`;
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: CONNECTION_ID,
+    status: 'ACTIVE',
+    user_id: 'selected-user',
+    toolkit: { slug: 'mega' },
+  }]);
+  schemas.resetToolSchemaCache();
+  schemas._setToolSchemaLoaderForTests(async (operationId) => operationId === identifier
+    ? {
+        inputParameters: SCHEMA_B,
+        outputParameters: OUTPUT_B,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: operationVersion,
+      }
+    : null);
+  const definitionFingerprint = providerIdentity.fingerprintComposioProviderDefinition({
+    operationId: identifier,
+    operationVersion,
+    accountId: CONNECTION_ID,
+    invokePortId,
+    inputSchema: SCHEMA_B,
+    outputSchema: OUTPUT_B,
+  });
+  assert.ok(definitionFingerprint);
+  const operationSemantics = { version: 1, reversibility: 'reversible' } as const;
+  const result = await selectedDefinitions.revalidateSelectedComposioDefinitions([{
+    identifier,
+    schemaDigest: digestSchema(SCHEMA_B),
+    accountIdentity: CONNECTION_ID,
+    definitionFingerprint: definitionFingerprint!,
+    outputSchemaDigest: digestSchema(OUTPUT_B),
+    providerOperationVersion: operationVersion,
+    invokePortId,
+    operationSemantics,
+  }]);
+  assert.equal(result.ok, true, result.ok ? '' : JSON.stringify(result.refusal));
+  if (result.ok) {
+    assert.deepEqual(result.definitions.get(identifier.toLowerCase())?.operationSemantics, operationSemantics);
+  }
+});
+
+test('historical disclosure cannot inject retired mutation or verifier semantics', async () => {
+  const create = 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1';
+  const readback = 'GOOGLESHEETS_BATCH_GET';
+  const generic = 'GOOGLESHEETS_ZZZ_LEGACY_NON_VERIFICATION_READ';
+  const fillers = Array.from({ length: 8 }, (_, index) =>
+    `GOOGLESHEETS_AAA_LEGACY_CARD_FILLER_${String(index + 1).padStart(2, '0')}`);
+  const createInput = {
+    type: 'object',
+    required: ['title'],
+    properties: { title: { type: 'string' } },
+  };
+  const createOutput = {
+    type: 'object',
+    required: ['spreadsheetId'],
+    properties: { spreadsheetId: { type: 'string' } },
+  };
+  const readbackInput = {
+    type: 'object',
+    required: ['spreadsheetId'],
+    properties: {
+      spreadsheetId: { type: 'string' },
+      ranges: { type: 'array', items: { type: 'string' } },
+    },
+  };
+  const readbackOutput = {
+    type: 'object',
+    required: ['spreadsheetId', 'valueRanges'],
+    properties: {
+      spreadsheetId: { type: 'string' },
+      valueRanges: { type: 'array' },
+    },
+  };
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: CONNECTION_ID,
+    status: 'ACTIVE',
+    user_id: 'selected-user',
+    toolkit: { slug: 'googlesheets' },
+  }]);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  let businessCalls = 0;
+  production.installProductionTransport(async () => {
+    businessCalls += 1;
+    return {};
+  });
+  schemas.resetToolSchemaCache();
+  schemas._setToolSchemaLoaderForTests(async (identifier) => {
+    if (identifier === create) {
+      return {
+        inputParameters: createInput,
+        outputParameters: createOutput,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: '20260827_create',
+      };
+    }
+    if (identifier === readback) {
+      return {
+        inputParameters: readbackInput,
+        outputParameters: readbackOutput,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: '20260827_readback',
+      };
+    }
+    if (identifier === generic || fillers.includes(identifier)) {
+      return {
+        inputParameters: SCHEMA_A,
+        outputParameters: OUTPUT_A,
+        providerObservedAt: Date.now(),
+        providerOperationVersion: '20260827_legacy_generic',
+      };
+    }
+    return null;
+  });
+
+  const genericIdentifiers = [...fillers, generic];
+  const genericSeed = await provisioning.registerProofProvisionedCapabilities(
+    proofTurn('legacy-semantic-generic-seed', genericIdentifiers, CONNECTION_ID, () => 'read'),
+    {
+      allowedIdentifiers: genericIdentifiers,
+      expectedSchemaDigests: genericIdentifiers.map((identifier) => ({
+        identifier,
+        schemaDigest: digestSchema(SCHEMA_A),
+      })),
+    },
+  );
+  assert.equal(genericSeed.refusal, undefined, JSON.stringify(genericSeed.refusal));
+
+  const retiredOperationSeed = await provisioning.registerProofProvisionedCapabilities(
+    proofTurn(
+      'legacy-semantic-retired-operation-seed',
+      [create, readback],
+      CONNECTION_ID,
+      (identifier) => identifier === create ? 'write' : 'read',
+    ),
+    {
+      allowedIdentifiers: [create, readback],
+      expectedSchemaDigests: [
+        {
+          identifier: create,
+          schemaDigest: digestSchema(createInput),
+        },
+        {
+          identifier: readback,
+          schemaDigest: digestSchema(readbackInput),
+        },
+      ],
+    },
+  );
+  assert.equal(
+    retiredOperationSeed.refusal,
+    undefined,
+    JSON.stringify(retiredOperationSeed.refusal),
+  );
+
+  const replaySession = eventlog.createSession({
+    id: 'legacy-semantic-contract-replay',
+    kind: 'chat',
+  });
+  const source = eventlog.appendEvent({
+    sessionId: replaySession.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'quux wibble frobnicator' },
+  });
+  const currentByIdentifier = new Map([create, readback, generic].map((identifier) => {
+    const entry = factory.snapshot().find((candidate) =>
+      candidate.manifest?.operationId === identifier);
+    assert.ok(entry, `seeded current definition is live for ${identifier}`);
+    const descriptor = semantic.hostDescriptorFromRegistered(entry!);
+    assert.ok(descriptor, `seeded current definition has a descriptor for ${identifier}`);
+    return [identifier, { entry: entry!, descriptor: descriptor! }] as const;
+  }));
+  const legacyRows = [create, readback, generic].map((identifier) => {
+    const current = currentByIdentifier.get(identifier)!;
+    const manifest = current.entry.manifest;
+    assert.ok(manifest?.externalDefinition, `seeded definition is external for ${identifier}`);
+    return {
+      kind: 'composio',
+      providerKind: 'composio',
+      identifier,
+      effectClass: identifier === create ? 'write' : 'read',
+      capabilityRef: current.descriptor.id,
+      manifestDigest: current.descriptor.manifestDigest,
+      accountIdentity: CONNECTION_ID,
+      descriptor: current.descriptor,
+      ...(identifier === generic
+        ? {
+            // A genuine legacy row binds only the provider input digest. It is
+            // compatible solely because the current definition also carries
+            // no verification semantics.
+            schemaFingerprint: current.entry.providerInputSchemaDigest,
+          }
+        : {
+            // Historical state may contain a structurally valid contract, but
+            // it cannot inject that contract into the current adapter row.
+            providerDefinition: {
+              version: 1,
+              providerInputSchemaDigest:
+                manifest!.externalDefinition!.providerInputSchemaDigest,
+              definitionFingerprint: manifest!.definitionFingerprint,
+              providerOperationVersion: manifest!.operationVersion,
+              providerOutputSchemaDigest:
+                manifest!.externalDefinition!.providerOutputSchemaDigest ?? null,
+              invokePortId: manifest!.invokePortId,
+              verificationContract: identifier === create
+                ? RETIRED_CREATE_VERIFICATION
+                : RETIRED_READBACK_VERIFICATION,
+            },
+          }),
+    };
+  });
+  eventlog.appendEvent({
+    sessionId: replaySession.id,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: { sourceUserSeq: source.seq, capabilities: legacyRows },
+  });
+
+  const primed = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: replaySession.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) throw new Error(primed.reason);
+  const citable = new Set(primed.planning.capabilities.map((descriptor) => descriptor.id));
+  assert.equal(citable.has(currentByIdentifier.get(create)!.descriptor.id), false,
+    'a historical row cannot inject a retired mutation verification declaration');
+  assert.equal(citable.has(currentByIdentifier.get(readback)!.descriptor.id), false,
+    'a historical row cannot inject a retired readback verification declaration');
+  assert.equal(citable.has(currentByIdentifier.get(generic)!.descriptor.id), true,
+    'a legacy row for a still-current non-verification operation retains compatibility');
+  assert.equal(businessCalls, 0, 'replay and catalog priming perform no business provider I/O');
+});
 
 after(() => {
   schemas._setToolSchemaLoaderForTests(null);

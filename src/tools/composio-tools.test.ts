@@ -227,6 +227,111 @@ test('ambiguous Composio mutation errors never replay the provider dispatch', as
   assert.doesNotMatch(output, /Retry this EXACT call/i);
 });
 
+test('Composio terminal settlements preserve the accepted observer call id, never the output nonce', async () => {
+  const {
+    __gatewayTest__,
+    runComposioExecuteForTestInSession,
+    runComposioExecuteWithGatewayForTest,
+  } = await import('./composio-tools.js');
+  const { withLogicalToolCall } = await import('../runtime/harness/attempt-identity.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { openEventLog } = await import('../runtime/harness/eventlog.js');
+
+  const invoke = async (
+    anchor: ReturnType<typeof anchorAcceptedTask>,
+    callId: string,
+    toolSlug: string,
+    args: Record<string, unknown>,
+    body: () => Promise<unknown>,
+  ): Promise<unknown> => withAnchoredRunContext(anchor, () => withLogicalToolCall({
+    sessionId: anchor.sessionId,
+    sourceUserSeq: anchor.sourceUserSeq,
+    logicalToolCallId: callId,
+    tool: toolSlug,
+    args,
+  }, () => withToolOutputContext({
+    sessionId: anchor.sessionId,
+    sourceUserSeq: anchor.sourceUserSeq,
+    callId,
+    toolName: 'composio_execute_tool',
+    settlementNonce: `nonce:${callId}`,
+  }, body)));
+
+  const rows: Array<{ sessionId: string; callId: string }> = [];
+
+  const returned = anchorAcceptedTask('run one returned provider read');
+  let returnedBodies = 0;
+  const returnedCallId = 'accepted-composio-returned';
+  await invoke(returned, returnedCallId, 'PROOF_RETURNED_READ', { query: 'one' }, async () => (
+    runComposioExecuteForTestInSession(
+      'PROOF_RETURNED_READ',
+      { query: 'one' },
+      (async () => {
+        returnedBodies += 1;
+        return { successful: true, data: { records: [] } };
+      }) as never,
+      returned.sessionId,
+    )
+  ));
+  assert.equal(returnedBodies, 1, 'returned settlement does not replay the provider body');
+  rows.push({ sessionId: returned.sessionId, callId: returnedCallId });
+
+  const thrown = anchorAcceptedTask('run one terminal provider failure');
+  let thrownBodies = 0;
+  const thrownCallId = 'accepted-composio-thrown';
+  await invoke(thrown, thrownCallId, 'PROOF_THROWN_READ', { query: 'two' }, async () => (
+    runComposioExecuteForTestInSession(
+      'PROOF_THROWN_READ',
+      { query: 'two' },
+      (async () => {
+        thrownBodies += 1;
+        throw Object.assign(new Error('Bad request'), { status: 400 });
+      }) as never,
+      thrown.sessionId,
+    )
+  ));
+  assert.equal(thrownBodies, 1, 'terminal thrown settlement does not replay the provider body');
+  rows.push({ sessionId: thrown.sessionId, callId: thrownCallId });
+
+  const refused = anchorAcceptedTask('refuse one provider call before dispatch');
+  const refusedCallId = 'accepted-composio-refused';
+  const refusedSlug = 'AIRTABLE_CREATE_RECORD';
+  const refusedArgs = { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Ada' } };
+  __gatewayTest__.recordReconnectBreaker(refused.sessionId, refusedSlug);
+  let refusedBodies = 0;
+  await invoke(refused, refusedCallId, refusedSlug, refusedArgs, async () => (
+    runComposioExecuteWithGatewayForTest(
+      refusedSlug,
+      refusedArgs,
+      (async () => {
+        refusedBodies += 1;
+        return { successful: true, data: { id: 'rec1' } };
+      }) as never,
+      refused.sessionId,
+    )
+  ));
+  assert.equal(refusedBodies, 0, 'pre-dispatch refusal never enters the provider body');
+  rows.push({ sessionId: refused.sessionId, callId: refusedCallId });
+
+  const db = openEventLog();
+  for (const expected of rows) {
+    const settlement = db.prepare(`
+      SELECT logical_tool_call_id, observer_call_id
+        FROM logical_call_settlements
+       WHERE session_id = ?
+       ORDER BY settled_at DESC LIMIT 1
+    `).get(expected.sessionId) as {
+      logical_tool_call_id: string;
+      observer_call_id: string | null;
+    } | undefined;
+    assert.deepEqual(settlement, {
+      logical_tool_call_id: expected.callId,
+      observer_call_id: expected.callId,
+    });
+    assert.notEqual(settlement?.observer_call_id, `nonce:${expected.callId}`);
+  }
+});
+
 test('a nominal local pre-dispatch error RESOLVES as the typed refusal once for both mutations and reads', async () => {
   // CONTRACT CHANGE (2026-08-06): typed pre-dispatch errors are now RETURNED
   // as ExternalWritePreDispatchResult so they survive the SDK's

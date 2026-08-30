@@ -79,6 +79,8 @@ export interface MobileSessionRecord {
   /** Audit only — never used for authorization decisions. */
   createdIp?: string;
   lastSeenIp?: string;
+  /** Stable hash of the origin-handoff bearer that created this session. */
+  originHandoffDigest?: string;
 }
 
 interface MobileSessionsFileV1 {
@@ -179,56 +181,179 @@ export interface CreatedSession {
   record: MobileSessionRecord;
 }
 
+export interface CreateMobileSessionInput {
+  deviceLabel?: string;
+  devicePublicKeyJwk?: JsonWebKey;
+  scope?: MobileSessionScope;
+  ip?: string;
+  /** Reuse an existing device identity (e.g. re-pairing the same phone). */
+  deviceId?: string;
+  /** Internal, server-derived binding for idempotent cross-origin adoption. */
+  originHandoffDigest?: string;
+}
+
 function mintToken(): string {
   return randomBytes(32).toString('base64url');
 }
 
-export async function createSession(
-  input: {
-    deviceLabel?: string;
-    devicePublicKeyJwk?: JsonWebKey;
-    scope?: MobileSessionScope;
-    ip?: string;
-    /** Reuse an existing device identity (e.g. re-pairing the same phone). */
-    deviceId?: string;
-  } = {},
+function prepareSession(
+  input: CreateMobileSessionInput,
   opts?: MobileSessionStoreOptions,
-): Promise<CreatedSession> {
+  fixedToken?: string,
+): CreatedSession {
   const now = opts?.now?.() ?? Date.now();
   const ttl = opts?.ttlMs ?? DEFAULT_TTL_MS;
   const absoluteTtl = opts?.absoluteTtlMs ?? ABSOLUTE_TTL_MS;
-  const token = mintToken();
+  const token = fixedToken ?? mintToken();
   const hasKey = isSupportedDeviceKey(input.devicePublicKeyJwk);
-  const record: MobileSessionRecord = {
-    tokenHash: hashToken(token),
-    deviceId: input.deviceId || `dev-${randomBytes(6).toString('base64url')}`,
-    deviceLabel: input.deviceLabel?.slice(0, 80),
-    createdAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + ttl).toISOString(),
-    lastSeenAt: new Date(now).toISOString(),
-    devicePublicKeyJwk: hasKey ? input.devicePublicKeyJwk : undefined,
-    binding: hasKey ? 'key' : 'cookie',
-    scope: input.scope ?? 'full',
-    tokenGeneration: 0,
-    absoluteExpiresAt: new Date(now + absoluteTtl).toISOString(),
-    lastRotatedAt: new Date(now).toISOString(),
-    // A client that paired without a key gets the same grace as a migrated one,
-    // so an older cached PWA bundle keeps working while it updates itself.
-    upgradeGraceUntil: hasKey ? undefined : new Date(now + UPGRADE_GRACE_MS).toISOString(),
-    createdIp: input.ip,
-    lastSeenIp: input.ip,
+  return {
+    token,
+    record: {
+      tokenHash: hashToken(token),
+      deviceId: input.deviceId || `dev-${randomBytes(6).toString('base64url')}`,
+      deviceLabel: input.deviceLabel?.slice(0, 80),
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + ttl).toISOString(),
+      lastSeenAt: new Date(now).toISOString(),
+      devicePublicKeyJwk: hasKey ? input.devicePublicKeyJwk : undefined,
+      binding: hasKey ? 'key' : 'cookie',
+      scope: input.scope ?? 'full',
+      tokenGeneration: 0,
+      absoluteExpiresAt: new Date(now + absoluteTtl).toISOString(),
+      lastRotatedAt: new Date(now).toISOString(),
+      // A client that paired without a key gets the same grace as a migrated one,
+      // so an older cached PWA bundle keeps working while it updates itself.
+      upgradeGraceUntil: hasKey ? undefined : new Date(now + UPGRADE_GRACE_MS).toISOString(),
+      createdIp: input.ip,
+      lastSeenIp: input.ip,
+      originHandoffDigest: /^[a-f0-9]{64}$/.test(input.originHandoffDigest ?? '')
+        ? input.originHandoffDigest
+        : undefined,
+    },
   };
+}
+
+export async function createSession(
+  input: CreateMobileSessionInput = {},
+  opts?: MobileSessionStoreOptions,
+): Promise<CreatedSession> {
+  const now = opts?.now?.() ?? Date.now();
+  const created = prepareSession(input, opts);
   const file = sessionsFile(opts);
   ensureParentDir(file);
   await atomicJsonMutate<MobileSessionsFileV2>(
     file,
     (current) => {
       const live = pruneExpired(current.sessions ?? [], now);
-      return { version: 2, sessions: [...live, record] };
+      return { version: 2, sessions: [...live, created.record] };
     },
     emptyFile(),
   );
-  return { token, record };
+  return created;
+}
+
+/**
+ * Creates another origin-scoped session only while this exact device still
+ * has a live session.
+ *
+ * The precondition and append share the same cross-process file lock as every
+ * revocation operation. Consequently a seven-day origin-handoff cannot revive
+ * a deliberately revoked phone: if revocation wins first this returns
+ * undefined; if creation wins first the following revocation removes both
+ * origin sessions.
+ */
+export async function createSessionForExistingDevice(
+  input: CreateMobileSessionInput & { deviceId: string },
+  opts?: MobileSessionStoreOptions,
+): Promise<CreatedSession | undefined> {
+  if (!input.deviceId) return undefined;
+  const now = opts?.now?.() ?? Date.now();
+  const created = prepareSession(input, opts);
+  let admitted = false;
+  const file = sessionsFile(opts);
+  ensureParentDir(file);
+  await atomicJsonMutate<MobileSessionsFileV2>(
+    file,
+    (current) => {
+      const live = pruneExpired(current.sessions ?? [], now);
+      if (!live.some((row) => row.deviceId === input.deviceId)) {
+        return { version: 2, sessions: live };
+      }
+      admitted = true;
+      return { version: 2, sessions: [...live, created.record] };
+    },
+    emptyFile(),
+  );
+  return admitted ? created : undefined;
+}
+
+/**
+ * Idempotently adopts one exact bearer as the session token for an existing
+ * device. The handoff route supplies a server-minted 256-bit token; binding
+ * the resulting session to that same token means a lost HTTP response can be
+ * retried without storing a second raw secret or creating another session.
+ *
+ * The lookup/reuse, live-device precondition, and append share the normal
+ * sessions-file lock with device revocation.
+ */
+export async function createOrReuseSessionForExistingDevice(
+  input: CreateMobileSessionInput & { deviceId: string; reuseOnly?: boolean },
+  sessionToken: string,
+  opts?: MobileSessionStoreOptions,
+): Promise<CreatedSession | undefined> {
+  if (!input.deviceId || sessionToken.length < 32) return undefined;
+  const now = opts?.now?.() ?? Date.now();
+  const tokenHash = hashToken(sessionToken);
+  const prepared = prepareSession(input, opts, sessionToken);
+  let record: MobileSessionRecord | undefined;
+  const file = sessionsFile(opts);
+  ensureParentDir(file);
+  await atomicJsonMutate<MobileSessionsFileV2>(
+    file,
+    (current) => {
+      const live = pruneExpired(current.sessions ?? [], now);
+      const existing = live.find((row) => row.tokenHash === tokenHash);
+      if (existing) {
+        if (
+          existing.deviceId === input.deviceId
+          && (
+            input.originHandoffDigest === undefined
+            || existing.originHandoffDigest === input.originHandoffDigest
+          )
+        ) record = existing;
+        return live.length === (current.sessions ?? []).length
+          ? undefined
+          : { version: 2, sessions: live };
+      }
+      if (
+        input.originHandoffDigest
+        && live.some((row) => row.originHandoffDigest === input.originHandoffDigest)
+      ) {
+        // The session append may have committed immediately before the
+        // handoff receipt write crashed. Its stable digest is enough to prove
+        // this bearer has already exercised its one create transition; after
+        // rotation it may not manufacture another row.
+        return live.length === (current.sessions ?? []).length
+          ? undefined
+          : { version: 2, sessions: live };
+      }
+      // Once a handoff has created its origin session, a retry may reopen only
+      // that exact still-current bearer. It must never mint fresh authority if
+      // the bearer was later rotated or retired.
+      if (input.reuseOnly) {
+        return live.length === (current.sessions ?? []).length
+          ? undefined
+          : { version: 2, sessions: live };
+      }
+      if (!live.some((row) => row.deviceId === input.deviceId)) {
+        return { version: 2, sessions: live };
+      }
+      record = prepared.record;
+      return { version: 2, sessions: [...live, prepared.record] };
+    },
+    emptyFile(),
+  );
+  return record ? { token: sessionToken, record } : undefined;
 }
 
 /**

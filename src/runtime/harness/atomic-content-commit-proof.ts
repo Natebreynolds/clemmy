@@ -8,14 +8,13 @@
  * interpretation below has exactly one owner.
  */
 import type Database from 'better-sqlite3';
-import { documentedAtomicInputContentCommit } from '../../integrations/composio/operation-semantics.js';
 import type { SealedNodeBinding } from './host-capability-catalog-factory.js';
 import type { ObligationManifest } from './obligation-manifest.js';
 import { verifyCanonicalDocumentedCreateResult } from './documented-create-result-evidence.js';
 import {
-  googleSheetsSheetFromJsonMatchesSourceRecords,
-  parseGoogleSheetsSheetFromJsonContract,
-} from './sheet-from-json-content-contract.js';
+  atomicTabularContentMatchesSourceRecords,
+  parseAtomicTabularRecordSetContentContract,
+} from './atomic-input-content-contract.js';
 import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import type {
   TypedPhysicalAuthorityProof,
@@ -118,11 +117,7 @@ function recordsPayload(value: unknown): unknown[] | null {
 }
 
 function sameExactAtomicOperation(left: string, right: string): boolean {
-  return Boolean(
-    documentedAtomicInputContentCommit(left)
-    && documentedAtomicInputContentCommit(right)
-    && left.trim().toUpperCase() === right.trim().toUpperCase(),
-  );
+  return Boolean(left.trim() && left.trim().toLowerCase() === right.trim().toLowerCase());
 }
 
 /**
@@ -146,7 +141,6 @@ export function verifyAtomicContentCommit(input: {
 }): AtomicContentCommitProofResult {
   if (
     input.node.contentCommitMode !== 'documented_atomic_input'
-    || !documentedAtomicInputContentCommit(input.node.resolvedTool)
     || input.node.effectKind !== 'external_write'
     || !input.manifest.nodes.some((node) => node.nodeId === input.node.nodeId
       && node.operationId === input.node.operationId
@@ -297,6 +291,7 @@ export function verifyAtomicContentCommit(input: {
         !== projected.binding.providerInputSchemaDigest
       || sealed.binding.argumentDigest !== projected.binding.argumentDigest
       || sealed.binding.effect !== 'external_write'
+      || !sealed.binding.operationSemantics?.atomicInputContent
     ) return {
       ok: false,
       status: 'conflict',
@@ -310,9 +305,9 @@ export function verifyAtomicContentCommit(input: {
   `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as {
     contract_json: string;
   } | undefined;
-  let contentContract: ReturnType<typeof parseGoogleSheetsSheetFromJsonContract> = null;
+  let contentContract: ReturnType<typeof parseAtomicTabularRecordSetContentContract> = null;
   try {
-    contentContract = parseGoogleSheetsSheetFromJsonContract(
+    contentContract = parseAtomicTabularRecordSetContentContract(
       generated ? JSON.parse(generated.contract_json) : null,
     );
   } catch { /* refusal below */ }
@@ -380,7 +375,7 @@ export function verifyAtomicContentCommit(input: {
   const sourceLogicalToolCallId = sourceRows[0]!.logical_tool_call_id;
   const source = input.resolveSuccessfulResult(sourceLogicalToolCallId);
   const sourceRecords = source.ok ? recordsPayload(source.rawPayload) : null;
-  if (!sourceRecords || !googleSheetsSheetFromJsonMatchesSourceRecords(contentContract, sourceRecords)) {
+  if (!sourceRecords || !atomicTabularContentMatchesSourceRecords(contentContract, sourceRecords)) {
     return { ok: false, status: 'conflict', reason: source.ok
       ? 'atomic submitted rows are not all and only the settled source rows'
       : `atomic source settlement is not redeemable: ${source.reason}` };

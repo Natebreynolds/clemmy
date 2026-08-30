@@ -13,6 +13,7 @@ const { WORKFLOWS_DIR } = await import('../../memory/vault.js');
 const {
   objectiveExplicitlyNamesWorkflow,
   uniqueEnabledWorkflowMatch,
+  uniqueWorkflowRunRequest,
 } = await import('../../tools/named-workflow-match.js');
 const { tryHostDispatchNamedWorkflow } = await import('./named-workflow-host-dispatch.js');
 const { createSession, appendEvent, resetEventLog } = await import('./eventlog.js');
@@ -47,6 +48,58 @@ test.beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(path.join(path.dirname(CRON_RUNS_DIR), 'workflow-schedule-state.json'), { force: true });
+});
+
+test('uniqueWorkflowRunRequest: an anaphoric run inherits the unique prior accepted identity', () => {
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  seedSlackAndFacebook();
+  const liveFollowUp = 'Can you just run that workflow and get the sheet updated please';
+  assert.equal(uniqueWorkflowRunRequest(liveFollowUp), null, 'the follow-up does not name a catalog entry');
+  const inherited = uniqueWorkflowRunRequest(liveFollowUp, [
+    "What's on my calendar Monday",
+    "What's the latest on the platform 49 updates. Anything stand out in terms of request",
+  ]);
+  assert.ok(inherited);
+  assert.equal(inherited?.slug, 'platform-49-slack-channel-review');
+  assert.equal(
+    uniqueWorkflowRunRequest(liveFollowUp, [
+      "What's the latest on the platform 49 updates",
+      'Did the team activity slack updates go out?',
+    ]),
+    null,
+    'two prior unique identities stay unclaimed',
+  );
+  assert.equal(
+    uniqueWorkflowRunRequest("What's the latest on the platform 49 updates"),
+    null,
+    'a retrieve is not a run request',
+  );
+  const explicit = uniqueWorkflowRunRequest('Run my platform 49 workflow please', [
+    'run my team activity slack updates',
+  ]);
+  assert.ok(explicit);
+  assert.equal(explicit?.slug, 'platform-49-slack-channel-review', 'an explicit current name wins over priors');
+});
+
+test('uniqueEnabledWorkflowMatch: spoken "platform 49 workflow" uniquely matches the numbered slug', () => {
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  seedSlackAndFacebook();
+  const match = uniqueEnabledWorkflowMatch('Can you run my platform 49 workflow');
+  assert.ok(match);
+  assert.equal(match?.slug, 'platform-49-slack-channel-review');
+  assert.equal(match?.resolutionKind, 'fuzzy');
 });
 
 test('uniqueEnabledWorkflowMatch: live early-run phrasing resolves the slack workflow', () => {
@@ -190,7 +243,6 @@ test('tryHostDispatchNamedWorkflow: an exact name is still not execution authori
 test('tryHostDispatchNamedWorkflow: fuzzy and management phrasing never authorizes RUN', () => {
   seedSlackAndFacebook();
   for (const text of [
-    'run my team activity slack updates workflow',
     'delete my team activity slack updates workflow',
     'disable team activity slack updates',
     'reschedule team activity slack updates to 10am',
@@ -222,6 +274,77 @@ test('tryHostDispatchNamedWorkflow: fuzzy and management phrasing never authoriz
       : 0,
     0,
   );
+});
+
+test('tryHostDispatchNamedWorkflow: a unique run request on a disabled workflow does not queue', () => {
+  seedSlackAndFacebook();
+  const session = createSession({ kind: 'chat', channel: 'desktop' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'run my team activity slack updates workflow',
+      originReplyTarget: REPLY_TARGET,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(REPLY_TARGET),
+    },
+  });
+  const result = tryHostDispatchNamedWorkflow({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    userText: String(source.data.text),
+    route: 'act',
+  });
+  assert.equal(result.status, 'blocked');
+  if (result.status === 'blocked') {
+    assert.equal(result.reason, 'disabled');
+  }
+  assert.equal(
+    existsSync(WORKFLOW_RUNS_DIR)
+      ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json')).length
+      : 0,
+    0,
+    'disabled unique-run identity is not a queue',
+  );
+});
+
+test('tryHostDispatchNamedWorkflow: a unique enabled run request queues through workflow_run', () => {
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  seedSlackAndFacebook();
+  const session = createSession({ kind: 'chat', channel: 'desktop' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Can you run my platform 49 flow please now so it catches up',
+      originReplyTarget: REPLY_TARGET,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(REPLY_TARGET),
+    },
+  });
+  const result = tryHostDispatchNamedWorkflow({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    userText: String(source.data.text),
+    route: 'act',
+  });
+  assert.equal(result.status, 'dispatched', JSON.stringify(result));
+  if (result.status === 'dispatched') {
+    assert.equal(result.workflowName, 'Platform 49 Slack Channel Review');
+    assert.ok(result.runId);
+  }
+  const runs = existsSync(WORKFLOW_RUNS_DIR)
+    ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json'))
+    : [];
+  assert.equal(runs.length, 1, 'the unique run must land in the shared queue');
 });
 
 test('tryHostDispatchNamedWorkflow: a counted set into one sheet is not a named workflow', () => {
@@ -332,11 +455,14 @@ test('satisfyNextScheduledWorkflowOccurrence: 07:27 marks today 09:00 handled an
     trigger: { schedule: '0 9 * * 1-5' },
     steps: [{ id: 'post', prompt: 'Post the team update.' }],
   });
-  const at727 = new Date(2026, 7, 14, 7, 27, 0);
+  // Keep the synthetic occurrence ahead of wall-clock retention. A historical
+  // date eventually ages out of the seven-day scheduler state between the
+  // first and second assertion, which tests pruning rather than idempotency.
+  const at727 = new Date(2099, 7, 14, 7, 27, 0);
   const result = satisfyNextScheduledWorkflowOccurrence('team-activity-slack-updates', at727);
   assert.equal(result.satisfied, true);
   assert.ok(result.atMs);
-  const nineAm = new Date(2026, 7, 14, 9, 0, 0).getTime();
+  const nineAm = new Date(2099, 7, 14, 9, 0, 0).getTime();
   assert.equal(result.atMs, nineAm);
 
   const again = satisfyNextScheduledWorkflowOccurrence('team-activity-slack-updates', at727);
@@ -344,7 +470,7 @@ test('satisfyNextScheduledWorkflowOccurrence: 07:27 marks today 09:00 handled an
 
   const afterNine = satisfyNextScheduledWorkflowOccurrence(
     'team-activity-slack-updates',
-    new Date(2026, 7, 14, 10, 0, 0),
+    new Date(2099, 7, 14, 10, 0, 0),
   );
   assert.equal(afterNine.satisfied, false, 'tomorrow must stay pending');
 });

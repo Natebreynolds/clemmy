@@ -15,6 +15,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const eventlog = await import('./eventlog.js');
+const shadow = await import('../graph/turn-graph-shadow.js');
+const dispatch = await import('./dispatch-ledger.js');
+const identities = await import('./attempt-identity.js');
+const outcomes = await import('./attempt-outcome.js');
+const settlements = await import('./logical-call-settlement-store.js');
 const {
   SETTLED_READ_REPEAT_REPLAY_KIND,
   acceptedSourceRequestsPolling,
@@ -229,6 +234,170 @@ test('infra recovery returns the latest settled read only for its exact bound at
     runAttemptId: attempt.attemptId,
     failedTurn: turn,
   }), null, 'an unfinished later canonical call remains the real recovery target');
+});
+
+test('infra recovery redeems one canonical non-mutating settlement without provider-name policy', () => {
+  eventlog.resetEventLog();
+  const sessionId = 'settled-repeat-canonical-provider-neutral';
+  eventlog.createSession({ id: sessionId, kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(sessionId, { runId: 'canonical-provider-neutral' });
+  const source = eventlog.recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Inspect the current generated inventory once.' },
+  });
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+  }));
+
+  const turn = 2;
+  const callId = 'generated-carrier-call';
+  const tool = 'qxv_inventory_probe';
+  const args = { partition: 'current' };
+  const output = {
+    successful: true,
+    data: { marker: 'GENERATED_PROVIDER_NEUTRAL_RESULT', records: [{ id: 'qxv-1' }] },
+  };
+  const called = startCall({
+    sessionId,
+    sourceUserSeq: source.seq,
+    callId,
+    runScopeId: `${sessionId}::source:${source.seq}`,
+    attemptId: attempt.attemptId,
+    turn,
+    tool,
+    toolSlug: tool,
+    args,
+    effect: 'read',
+  });
+  const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
+  const logicalToolCallId = 'logical:generated-provider-neutral';
+  const begun = dispatch.beginPhysicalDispatch({
+    identity: {
+      sessionId,
+      sourceUserSeq: source.seq,
+      turn,
+      acceptedTaskId,
+      logicalToolCallId,
+      physicalDispatchId: 'dispatch:generated-provider-neutral',
+      ordinal: 0,
+    },
+    tool,
+    args,
+  });
+  assert.equal(begun.status, 'inserted', JSON.stringify(begun));
+  if (begun.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: begun.identity,
+    tool,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const committed = settlements.commitLogicalCallSettlement({
+    identity: { sessionId, sourceUserSeq: source.seq, acceptedTaskId, logicalToolCallId },
+    contract: { toolName: tool, args },
+    execution: { kind: 'provider_execution' },
+    result: { payload: output },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'native_mcp', callId, turn },
+  });
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  completeCall({
+    sessionId,
+    sourceUserSeq: source.seq,
+    callId,
+    runScopeId: `${sessionId}::source:${source.seq}`,
+    called,
+    output: JSON.stringify(output),
+    attemptId: attempt.attemptId,
+    turn,
+    tool,
+    toolSlug: tool,
+    effect: 'read',
+  });
+
+  const resolved = resolveSettledReadForInfraRecovery({
+    sessionId,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    failedTurn: turn,
+  });
+  assert.ok(resolved);
+  assert.equal(resolved.sourceCallId, callId);
+  assert.equal(resolved.toolSlug, tool);
+  assert.match(resolved.output, /GENERATED_PROVIDER_NEUTRAL_RESULT/);
+
+  const writeTurn = 3;
+  const writeCallId = 'generated-mutating-call';
+  const writeTool = 'qxv_inventory_mutator';
+  const writeArgs = { value: 'changed' };
+  const writeCalled = startCall({
+    sessionId,
+    sourceUserSeq: source.seq,
+    callId: writeCallId,
+    runScopeId: `${sessionId}::source:${source.seq}`,
+    attemptId: attempt.attemptId,
+    turn: writeTurn,
+    tool: writeTool,
+    toolSlug: writeTool,
+    args: writeArgs,
+    effect: 'external_write',
+  });
+  const writeLogicalToolCallId = 'logical:generated-mutating';
+  const writeBegun = dispatch.beginPhysicalDispatch({
+    identity: {
+      sessionId,
+      sourceUserSeq: source.seq,
+      turn: writeTurn,
+      acceptedTaskId,
+      logicalToolCallId: writeLogicalToolCallId,
+      physicalDispatchId: 'dispatch:generated-mutating',
+      ordinal: 0,
+    },
+    tool: writeTool,
+    args: writeArgs,
+  });
+  assert.equal(writeBegun.status, 'inserted', JSON.stringify(writeBegun));
+  if (writeBegun.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: writeBegun.identity,
+    tool: writeTool,
+    outcome: 'returned',
+  }).status, 'inserted');
+  const writeOutput = { successful: true, data: { id: 'changed-qxv-1' } };
+  assert.equal(settlements.commitLogicalCallSettlement({
+    identity: {
+      sessionId,
+      sourceUserSeq: source.seq,
+      acceptedTaskId,
+      logicalToolCallId: writeLogicalToolCallId,
+    },
+    contract: { toolName: writeTool, args: writeArgs },
+    execution: { kind: 'provider_execution' },
+    result: { payload: writeOutput },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true, acknowledged: true }),
+    recovery: { businessCall: true, mutating: true },
+    observer: { lane: 'native_mcp', callId: writeCallId, turn: writeTurn },
+  }).status, 'committed');
+  completeCall({
+    sessionId,
+    sourceUserSeq: source.seq,
+    callId: writeCallId,
+    runScopeId: `${sessionId}::source:${source.seq}`,
+    called: writeCalled,
+    output: JSON.stringify(writeOutput),
+    attemptId: attempt.attemptId,
+    turn: writeTurn,
+    tool: writeTool,
+    toolSlug: writeTool,
+    effect: 'external_write',
+  });
+  assert.equal(resolveSettledReadForInfraRecovery({
+    sessionId,
+    sourceUserSeq: source.seq,
+    runAttemptId: attempt.attemptId,
+    failedTurn: writeTurn,
+  }), null, 'a successful write is never injected into automatic read recovery');
 });
 
 function resolveCurrent(input: {

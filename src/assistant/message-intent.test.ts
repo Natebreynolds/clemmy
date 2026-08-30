@@ -136,6 +136,26 @@ test('casual: greeting-shaped but very long is NOT casual', () => {
   assert.notEqual(classifyMessageIntent(long).intent, 'casual');
 });
 
+test('casual: a greeting prefix does not hide a hosted-world calendar/email ask', () => {
+  // Live 2026-08-28: "Hey what's on my calendar today" is 30 chars, matches
+  // /^(hey)\b/, compiled casual, tools stripped, published as done with zero
+  // crossings. A social opener is not a closed social turn.
+  for (const msg of [
+    "Hey what's on my calendar today",
+    'Hey what’s on my calendar today',
+    'Hi, what is on my calendar?',
+    'Hello can you check my email',
+    "hey show my calendar",
+  ]) {
+    const result = classifyMessageIntent(msg);
+    assert.notEqual(result.intent, 'casual', `"${msg}" must not compile as a greeting`);
+    assert.notEqual(result.intent, 'conversation', `"${msg}" names the user's world`);
+  }
+  for (const msg of ['hey', 'hi', 'hey!', "hey how's it going", 'hey, how are you']) {
+    assert.equal(classifyMessageIntent(msg).intent, 'casual', `"${msg}" stays a greeting`);
+  }
+});
+
 // ─── meta_clarify ──────────────────────────────────────────────
 
 test('meta_clarify: questions about the agent itself', () => {

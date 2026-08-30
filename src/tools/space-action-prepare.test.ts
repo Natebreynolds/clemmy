@@ -2,9 +2,9 @@
  * Run: npx tsx --test src/tools/space-action-prepare.test.ts
  *
  * A chat/model turn may prepare one action already declared by a Workspace,
- * but it must not gain a second execution path. The tool below reuses the
- * Workspace button's exact approval authority: it stages when authority is
- * absent and may run only an exact invocation covered by standing approval.
+ * but it must not gain a second execution path. The tool below uses canonical
+ * Auto for ordinary current Composio writes and retains one exact approval for
+ * genuinely user-owned effects.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,9 +17,6 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-act
 const { registerSpaceTools } = await import('./space-tools.js');
 const { spaceStore } = await import('../spaces/store.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-const {
-  SPACE_ACTION_TOOL,
-} = await import('../spaces/space-action-gate.js');
 const spaceRunner = await import('../spaces/runner.js');
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
@@ -43,12 +40,12 @@ function resultText(result: unknown): string {
 
 const tools = captureTools();
 
-test('space_action_prepare model contract truthfully distinguishes staging from exact standing-authority execution', () => {
+test('space_action_prepare model contract truthfully distinguishes ordinary Auto from user-owned approval', () => {
   const description = descriptions.space_action_prepare ?? '';
-  assert.match(description, /standing approval/i);
-  assert.match(description, /does not dispatch/i);
-  assert.match(description, /executes only the exact declared action/i);
-  assert.doesNotMatch(description, /never dispatches/i);
+  assert.match(description, /ordinary current Composio create\/update executes/i);
+  assert.match(description, /sends\/deletes\/admin work still create one exact approval/i);
+  assert.match(description, /ambiguous accounts ask one account choice/i);
+  assert.match(description, /executed only when the durable kernel says it ran/i);
 });
 
 test('Workspace runner catalog copy truthfully describes space_try_runner as static-only', () => {
@@ -94,7 +91,7 @@ test('space_action_prepare refuses an unknown declared action without minting au
   );
 });
 
-test('space_action_prepare binds one approval to the exact Workspace action and args with zero pre-approval dispatch', async () => {
+test('space_action_prepare refuses a Composio action without one-shot request identity and mints no blind approval', async () => {
   const slug = 'prepare-exact-action';
   spaceStore.save({
     id: slug,
@@ -135,26 +132,10 @@ test('space_action_prepare binds one approval to the exact Workspace action and 
       sessionId: `space-${slug}`,
       status: 'pending',
     });
-    assert.equal(pending.length, 1, 'an exact retry converges on one approval');
-    const [row] = pending;
-    assert.ok(row);
-    assert.equal(row.tool, SPACE_ACTION_TOOL);
-    assert.equal(row.sessionId, `space-${slug}`);
-    assert.equal(row.args?.spaceSlug, slug);
-    assert.equal(row.args?.actionId, 'pause-campaign');
-    assert.deepEqual(row.args?.callerArgs, {
-      campaign_id: 'cmp-9',
-      status: 'PAUSED',
-    });
-    assert.deepEqual(
-      (row.args?.actionSnapshot as { composioSlug?: unknown } | undefined)?.composioSlug,
-      'GOOGLEADS_PAUSE_CAMPAIGN',
-      'authority comes from the declared action, not a caller-provided tool slug',
-    );
-    assert.match(first, new RegExp(row.approvalId));
-    assert.match(duplicate, new RegExp(row.approvalId));
-    assert.match(first, /not (?:run|dispatched)/i);
-    assert.equal(providerDispatches, 0, 'preparing approval never reaches the provider');
+    assert.equal(pending.length, 0, 'missing request identity cannot mint a blind approval');
+    assert.match(first, /one-shot request identity is unavailable/i);
+    assert.match(duplicate, /one-shot request identity is unavailable/i);
+    assert.equal(providerDispatches, 0, 'identity refusal never reaches the provider');
   } finally {
     spaceRunner._setSpaceComposioDispatchForTests(null);
   }

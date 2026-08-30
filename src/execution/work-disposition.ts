@@ -21,6 +21,10 @@ export interface WorkManifestPhase {
   id: string;
   dependsOn: string[];
   runnerClass: string;
+  /** The model's judgment about what a successful phase produces. Data phases
+   * must close over an exact retained logical-call result; action phases may
+   * close over an ordinary receipt. Omitted preserves the legacy action lane. */
+  resultKind?: 'data' | 'action';
 }
 
 export interface WorkManifest {
@@ -157,6 +161,9 @@ export function admitWorkDisposition(
       // could not tell whether both ran or one ran twice.
       if (phaseIds.has(id)) errors.push(`phase "${id}" appears twice`);
       phaseIds.add(id);
+      if (phase.resultKind !== undefined && !['data', 'action'].includes(phase.resultKind)) {
+        errors.push(`phase "${id}" has unknown resultKind "${String(phase.resultKind)}"`);
+      }
     }
     for (const phase of manifest.phases) {
       for (const dependency of phase.dependsOn) {

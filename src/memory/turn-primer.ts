@@ -174,7 +174,7 @@ export async function buildUnifiedTurnPrimer(input: {
   // shipped whether recall held a complete roster or a single truncated
   // stub — and nothing anywhere consumed the answerability verdict.
   const USE_RULES = {
-    supported: 'Use relevant hits: answer directly from a complete evidence-backed FACT for local-memory questions. Treat partial snippets as leads; load a cited source before external writes or when exact requested values are missing.',
+    supported: 'Use relevant hits as priors. Answer local-memory questions from a complete evidence-backed FACT. Person/system identity (who Tim is, which CRM) is a hypothesis to VERIFY with a live read — never this week\'s numbers. Dated snapshots are priors, not current truth. Treat partial snippets as leads; load a cited source before external writes or when exact requested values are missing.',
     partial: 'Recall is PARTIAL for this ask: the hits below are leads, not complete answers. If the answer should live in memory, call memory_recall_all (one call) before answering from assumption.',
     insufficient: 'Recall found little for this ask. If this depends on remembered context, call memory_recall_all (one call) rather than guessing; otherwise proceed.',
   } as const;

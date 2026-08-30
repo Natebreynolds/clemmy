@@ -59,10 +59,17 @@ export interface Policy {
 }
 
 export interface ModelTriple { fast: string; primary: string; deep: string }
+export interface CodexRescueModelSnapshot {
+  modelId: string;
+  inheritedModelId: string;
+  envKey: 'OPENAI_MODEL_RESCUE';
+  configured: boolean;
+}
 export interface ModelsSnapshot {
   models: ModelTriple;
   defaults: ModelTriple;
   presets: { id: string; label: string }[];
+  codexRescue: CodexRescueModelSnapshot;
 }
 
 export type ModelRoutingMode = 'off' | 'worker' | 'all_in';
@@ -205,6 +212,8 @@ export const patchBudget = (p: Partial<BudgetSettings>) =>
   patch<{ runtimeBudget: BudgetSettings }>('/api/console/settings/runtime-budget', p);
 export const patchModels = (p: Partial<ModelTriple>) =>
   patch<{ models: ModelsSnapshot }>('/api/console/settings/models', p);
+export const patchCodexRescueModel = (p: { modelId?: string; clear?: boolean }) =>
+  patch<{ models: ModelsSnapshot }>('/api/console/settings/models/codex-rescue', p);
 export const patchModelBackend = (p: ModelBackendPatch) =>
   patch<{ modelBackend: ModelBackend; models: ModelsSnapshot }>('/api/console/settings/model-backend', p);
 

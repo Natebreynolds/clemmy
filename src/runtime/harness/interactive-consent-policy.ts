@@ -299,6 +299,19 @@ export function evaluateInteractiveConsentV1(
     };
   }
 
+  // Host bookkeeping and recovery are controls, not user-owned
+  // dependencies. A projector that attaches a credential, target/account
+  // choice, missing business input, or explicit human checkpoint to a
+  // host-only call has produced contradictory authority facts. Keep that
+  // repair inside the host instead of manufacturing a card the user cannot
+  // meaningfully resolve.
+  if (
+    call.effect === 'host_only'
+    && (input.readiness.kind !== 'ready' || input.explicitHumanCheckpoint)
+  ) {
+    return { kind: 'repair', reason: 'authority_conflict' };
+  }
+
   switch (input.readiness.kind) {
     case 'credential_missing':
       return {
@@ -402,13 +415,17 @@ export function evaluateInteractiveConsentV1(
     || call.risk.reversibility === 'irreversible'
     || call.risk.consequence === 'send'
     || call.risk.consequence === 'delete'
-    || call.risk.consequence === 'admin';
+    || call.risk.consequence === 'admin'
+    // A sealed set is one true bulk crossing and therefore one exact approval
+    // subject. `each` is intentionally absent: each member has its own host-
+    // derived occurrence and bulk orchestration owns any aggregate card.
+    || call.cardinality.kind === 'set';
   if (highConsequence) {
     return {
       kind: 'needs_user',
       need: 'approval',
       subjectDigest: call.bindingDigest,
-      reason: 'This exact accepted call is destructive, irreversible, or administrative.',
+      reason: 'This exact accepted call is destructive, irreversible, administrative, or a sealed bulk mutation.',
     };
   }
 

@@ -216,11 +216,43 @@ export async function pairDevice(pairToken: string, deviceLabel?: string): Promi
 
 /**
  * Ask this (LAN) origin for a handoff token that the app can spend at the
- * relay origin. Cheap, single-use, short-lived — minted on every LAN visit so
- * a fresh one is always waiting when the phone leaves the house.
+ * relay origin. It is generation-fenced and durably leased until the adopted
+ * origin proves its cookie arrived, so a dropped response cannot strand the
+ * phone. Minted on LAN visits so a fresh one is waiting when the phone leaves.
  */
-export async function mintOriginHandoff(): Promise<{ token: string; expiresAt: number }> {
+export interface OriginHandoffResponse {
+  version: 2;
+  token: string;
+  expiresAt: number;
+  handoffId: string;
+  generation: number;
+  deviceId: string;
+}
+
+export async function mintOriginHandoff(): Promise<OriginHandoffResponse> {
   return api('/m/auth/origin-handoff', { method: 'POST' });
+}
+
+/** Retire older generations only after native confirms this exact lease is in Keychain. */
+export async function activateOriginHandoff(
+  handoffId: string,
+  generation: number,
+): Promise<{ ok: true; handoffId: string; generation: number }> {
+  return api('/m/auth/origin-handoff/activate', {
+    method: 'POST',
+    body: JSON.stringify({ handoffId, generation }),
+  });
+}
+
+/** Retire an adopted lease only after this origin holds its exact session. */
+export async function finalizeOriginHandoff(
+  handoffId: string,
+  generation: number,
+): Promise<{ ok: true; handoffId: string; generation: number }> {
+  return api('/m/auth/origin-handoff/finalize', {
+    method: 'POST',
+    body: JSON.stringify({ handoffId, generation }),
+  });
 }
 
 /**
@@ -228,12 +260,43 @@ export async function mintOriginHandoff(): Promise<{ token: string; expiresAt: n
  * session the browser cannot carry across origins. Same device identity, so
  * the phone stays one row in the desktop's device list.
  */
-export async function adoptOriginSession(token: string): Promise<LoginResponse> {
+export interface OriginHandoffAdoption {
+  token: string;
+  handoffId?: string;
+  generation?: number;
+}
+
+export async function adoptOriginSession(handoff: OriginHandoffAdoption): Promise<LoginResponse> {
   const devicePublicKeyJwk = await devicePublicKeyOrUndefined();
-  return adoptSession(await api<LoginResponse>('/m/auth/origin-adopt', {
+  const correlated = Boolean(handoff.handoffId && handoff.generation);
+  const response = await api<LoginResponse & {
+    originHandoff?: { handoffId: string; generation: number };
+  }>('/m/auth/origin-adopt', {
     method: 'POST',
-    body: JSON.stringify({ token, devicePublicKeyJwk }),
-  }));
+    body: JSON.stringify({
+      ...(correlated ? { version: 2 } : {}),
+      token: handoff.token,
+      ...(handoff.handoffId ? { handoffId: handoff.handoffId } : {}),
+      ...(handoff.generation ? { generation: handoff.generation } : {}),
+      devicePublicKeyJwk,
+    }),
+  });
+  if (
+    correlated
+    && (
+      response.originHandoff?.handoffId !== handoff.handoffId
+      || response.originHandoff?.generation !== handoff.generation
+    )
+  ) {
+    throw makeError(502, { error: 'HANDOFF_ACK_MISMATCH' }, 'Origin handoff acknowledgement did not match');
+  }
+  return adoptSession(response);
+}
+
+export function isInvalidOriginHandoffError(error: unknown): boolean {
+  const candidate = error as ApiError | undefined;
+  const body = candidate?.body as { error?: unknown } | undefined;
+  return candidate?.status === 401 && body?.error === 'INVALID_HANDOFF';
 }
 
 /** Binds a device key to an existing cookie-only session and rotates its token. */
@@ -582,8 +645,8 @@ export async function sendChatMessage(
  * the accepted run keeps going.
  */
 export async function sendChatMessageAsync(
-  input: { message: string; sessionId?: string | null; idempotencyKey: string },
-): Promise<{ accepted: boolean; sessionId: string; runId: string; sinceSeq: number }> {
+  input: { message: string; sessionId?: string | null; idempotencyKey: string; steerOnly?: boolean },
+): Promise<{ accepted: boolean; sessionId: string; runId?: string; sinceSeq?: number; steered?: boolean }> {
   return api('/m/api/chat/send', {
     method: 'POST',
     headers: { 'idempotency-key': input.idempotencyKey },
@@ -591,6 +654,7 @@ export async function sendChatMessageAsync(
       message: input.message,
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       async: true,
+      ...(input.steerOnly ? { steerOnly: true } : {}),
     }),
   });
 }
@@ -797,6 +861,58 @@ export interface MobileWorkflow {
   lastRunAt: string | null;
 }
 
+export interface MobileAgent {
+  id: string;
+  name: string;
+  description: string;
+  skills: string[];
+  workflows: string[];
+  model: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MobileAgentsResponse {
+  agents: MobileAgent[];
+  available: { skills: string[]; workflows: string[] };
+}
+
+export async function listAgents(): Promise<MobileAgentsResponse> {
+  return api<MobileAgentsResponse>('/m/api/agents');
+}
+
+export async function createAgent(draft: {
+  name: string;
+  description?: string;
+  skills?: string[];
+  workflows?: string[];
+  model?: string | null;
+}): Promise<{ agent: MobileAgent }> {
+  return api<{ agent: MobileAgent }>('/m/api/agents', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(draft),
+  });
+}
+
+export async function updateAgent(id: string, patch: {
+  name?: string;
+  description?: string;
+  skills?: string[];
+  workflows?: string[];
+  model?: string | null;
+}): Promise<{ agent: MobileAgent }> {
+  return api<{ agent: MobileAgent }>(`/m/api/agents/${encodeURIComponent(id)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+}
+
+export async function deleteAgent(id: string): Promise<{ deleted: boolean }> {
+  return api<{ deleted: boolean }>(`/m/api/agents/${encodeURIComponent(id)}/delete`, { method: 'POST' });
+}
+
 export async function listWorkflows(): Promise<{ workflows: MobileWorkflow[] }> {
   return api<{ workflows: MobileWorkflow[] }>('/m/api/workflows');
 }
@@ -961,6 +1077,37 @@ export async function cancelChatTurn(sessionId: string, attemptId: string): Prom
   });
 }
 
+/** Stop the live chat turn by the REQUEST identity the phone already minted
+ *  for it. Unlike the attempt-scoped primitive above this works before a run
+ *  attempt is registered, so Stop is reachable from the moment of send rather
+ *  than only once the run surfaces on Activity. */
+export async function cancelChatRequest(
+  sessionId: string,
+  clientRequestId: string,
+): Promise<{ ok: boolean; pendingAcceptance: boolean }> {
+  return api<{ ok: boolean; pendingAcceptance: boolean }>(
+    `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientRequestId }),
+    },
+  );
+}
+
+/** Stop the live attempt on this conversation when this client never minted
+ *  a cancel key (refresh, another surface, lost in-flight key). */
+export async function cancelActiveChat(sessionId: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(
+    `/m/api/chat/sessions/${encodeURIComponent(sessionId)}/cancel`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+  );
+}
+
 export async function controlTask(taskId: string, action: 'cancel' | 'resume'): Promise<{ ok: true; status: string }> {
   return api<{ ok: true; status: string }>(`/m/api/tasks/${encodeURIComponent(taskId)}/${action}`, { method: 'POST' });
 }
@@ -1075,11 +1222,27 @@ export interface BrainOptionRow {
   providerId?: string;
 }
 
+export interface CodexRescueModelOption {
+  id: string;
+  label: string;
+  available: boolean;
+}
+
+export interface CodexRescueSettings {
+  modelId: string;
+  inheritedModelId: string;
+  envKey: 'OPENAI_MODEL_RESCUE';
+  configured: boolean;
+  options: CodexRescueModelOption[];
+}
+
 export interface ModelSettings {
   brain: ResolvedBrain;
   options: BrainOptionRow[];
   effectiveValue: string;
   activeBrain: string;
+  /** Optional for cached PWAs talking briefly to an older daemon. */
+  codexRescue?: CodexRescueSettings;
 }
 
 export async function getModelSettings(): Promise<ModelSettings> {
@@ -1095,6 +1258,15 @@ export async function setBrain(value: string, sessionId?: string): Promise<{ ok:
   return api('/m/api/settings/models/brain', {
     method: 'POST',
     body: JSON.stringify(sessionId ? { value, sessionId } : { value }),
+  });
+}
+
+/** Pick an exact server-catalogued Codex rescue id, or null to follow the
+ * primary again. No credential material crosses this mobile API. */
+export async function setCodexRescueModel(modelId: string | null): Promise<{ ok: boolean; codexRescue: CodexRescueSettings }> {
+  return api('/m/api/settings/models/codex-rescue', {
+    method: 'POST',
+    body: JSON.stringify(modelId === null ? { clear: true } : { modelId }),
   });
 }
 

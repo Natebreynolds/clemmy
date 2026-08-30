@@ -23,6 +23,12 @@ process.env.CLEMMY_GUARDRAIL_PERSIST = 'on'; // this test NEEDS the persist path
 
 const { evaluateToolCall, applyMode, _simulateRestartForTests } = await import('./tool-guardrail.js');
 const { createSession, readGuardrailState, writeGuardrailState } = await import('./eventlog.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'dataforseo__serp_organic_live_advanced',
+  providerKind: 'native_mcp',
+  effect: 'read',
+}]);
 
 test('nested-dispatch scopes persist and the historical code-mode suffix remains readable', () => {
   const sid = 'sess-scoped-persistence';
@@ -110,5 +116,6 @@ test('review #9: a persisted composio WRITE runaway survives restart; persisted 
 });
 
 after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
 });

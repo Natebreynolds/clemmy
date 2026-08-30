@@ -117,7 +117,7 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
     pattern: '/m/auth/origin-adopt',
     realm: 'mobile-anon',
     reason:
-      'Spending a LAN-minted, single-use origin-handoff token IS the authentication '
+      'Presenting a LAN-minted origin-handoff bearer IS the authentication '
       + 'that establishes the same device session at the relay origin.',
   },
   {
@@ -163,6 +163,22 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
     reason:
       'Enforced by requireMobileSession, including the device proof; the route also '
       + 'refuses relay ingress so the handoff can only be minted from a LAN visit.',
+  },
+  {
+    method: 'POST',
+    pattern: '/m/auth/origin-handoff/activate',
+    realm: 'mobile-session',
+    reason:
+      'Native confirms exact Keychain persistence through the already-bound mobile session; '
+      + 'this acknowledgement may retire only older handoff generations.',
+  },
+  {
+    method: 'POST',
+    pattern: '/m/auth/origin-handoff/finalize',
+    realm: 'mobile-session',
+    reason:
+      'The newly adopted, proof-bound origin session acknowledges its exact handoff before '
+      + 'the native shell deletes the durable Keychain lease.',
   },
 
   // ---- Mobile: admin-only within the mobile router -------------------------

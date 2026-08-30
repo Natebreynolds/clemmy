@@ -51,6 +51,7 @@ import { registerModelRoleTools } from './model-role-tools.js';
 import { registerRecallTools } from './recall-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
+import { registerArtifactBundleTools } from './artifact-bundle-tools.js';
 import { registerToolSearchTool } from './tool-search-tool.js';
 import { buildAuthorizedToolSearchCandidateSources } from './tool-search-provider-sources.js';
 import {
@@ -59,7 +60,8 @@ import {
 } from './call-tool.js';
 import { registerClaudeActionWorkCall } from './work-call-mcp.js';
 import { loadBoundExpectedWorkContract } from '../runtime/harness/frozen-work-surface.js';
-import { durableSelectedLocalPlanningMutationNames } from '../runtime/harness/local-planning-capability.js';
+import { durableSelectedLocalPlanningCapabilityNames } from '../runtime/harness/local-planning-capability.js';
+import { getLocalToolSchemas } from './local-runtime-tools.js';
 import { confirmedSourceStrategyBindingForSource } from '../runtime/harness/source-strategy-admission.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
 import { ensureToolDirectories, textResult } from './shared.js';
@@ -486,13 +488,15 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   const registeredNames = new Set<string>();
   const deferredNames = new Set(resolvedDeferredTools(opts));
   const consideredDescriptors = new Map<string, SealableToolLike>();
+  const workCallLocalSchemaNames = new Set(getLocalToolSchemas().keys());
   const selectedLocalPlanningNames = opts.sessionId
     && Number.isSafeInteger(opts.sourceUserSeq)
     && (opts.sourceUserSeq ?? 0) > 0
-    ? durableSelectedLocalPlanningMutationNames({
-        sessionId: opts.sessionId,
-        sourceUserSeq: opts.sourceUserSeq as number,
-      })
+      ? durableSelectedLocalPlanningCapabilityNames({
+          sessionId: opts.sessionId,
+          sourceUserSeq: opts.sourceUserSeq as number,
+          workCallConfiguredNames: workCallLocalSchemaNames,
+        })
     : new Set<string>();
 
   installAmbientToolContext(server, opts);
@@ -568,6 +572,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   registerArtifactClaimTools(server);
   // Exact JSON slices from run-workspace artifacts/offloaded step context.
   registerWorkspaceArtifactTools(server);
+  registerArtifactBundleTools(server);
   registerDynamicTools(server);
   // Agent SDK lane only: expose the mutating tools (shell/composio/write) through
   // the full harness gate chain so the Claude Agent SDK can execute them safely.

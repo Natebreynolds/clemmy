@@ -11,6 +11,17 @@ import {
 import { durableConversationProtocolEvidenceForCall } from './conversation-protocol-session.js';
 import { openEventLog } from './eventlog.js';
 import { proveHostPlannedResolutionCoexistenceInTransaction } from './host-planned-resolution-coexistence.js';
+import {
+  canonicalHostModelResultClass,
+  hostModelResultReceiptForAdmissionCall,
+  hostModelResultReceiptMatchesItem,
+  resultItemFromHostModelResultReceipt,
+  type CanonicalHostModelResultClass,
+} from './host-model-result-receipt.js';
+import {
+  logicalModelResultProjectionReceiptForAdmissionCall,
+  logicalModelResultProjectionReceiptMatchesItem,
+} from './logical-model-result-projection-receipt.js';
 
 /**
  * Append-only mid-turn durability for one accepted host model/tool batch.
@@ -153,6 +164,11 @@ export type FinalizeAcceptedModelBatchResult =
   | { status: 'committed' | 'existing'; checkpoint: AcceptedModelBatchCheckpoint }
   | { status: 'evidence_unavailable' | 'conflict' | 'unavailable'; reason: string };
 
+export type ReopenAcceptedModelBatchResult =
+  | { status: 'open'; admission: AcceptedModelBatchAdmission }
+  | { status: 'checkpointed'; checkpoint: AcceptedModelBatchCheckpoint }
+  | { status: 'conflict' | 'unavailable'; reason: string };
+
 export type RecoverAcceptedModelBatchResult =
   | { status: 'ready'; checkpoint: AcceptedModelBatchCheckpoint }
   | { status: 'reconciliation_required'; checkpoint: AcceptedModelBatchCheckpoint; reason: string }
@@ -249,6 +265,43 @@ function sameExecutionBinding(
       && left.graphEventId === right.graphEventId
       && left.graphHash === right.graphHash
       && left.workContractId === right.workContractId;
+}
+
+/**
+ * An accepted frame is admitted before classification, preparation, consent,
+ * or body execution.  A frame immediately following `plan_task` can therefore
+ * be admitted while the accepted source is still graph-neutral, then observe
+ * the exact immutable plan binding once the already-settled plan activation is
+ * published.  Finalization has always admitted that one monotonic transition;
+ * recovery/reopen must apply the identical relational proof or it can strand
+ * an otherwise durable result after the body has returned.
+ *
+ * No other drift is accepted: a non-null binding must remain byte-for-byte
+ * identical, and null -> bound requires the complete same-source settled-plan
+ * coexistence proof (including its contract, activation receipt, delivery,
+ * result handle, and crossing evidence).
+ */
+function sameExecutionBindingOrProvenPlanActivation(input: {
+  db: HarnessDb;
+  row: {
+    session_id: string;
+    source_user_seq: number;
+    graph_event_id: string | null;
+    graph_hash: string | null;
+    work_contract_id: string | null;
+  };
+  current: ExecutionBinding | null;
+}): boolean {
+  const persisted = executionBindingFromRow(input.row);
+  if (sameExecutionBinding(persisted, input.current)) return true;
+  return persisted === null
+    && input.current !== null
+    && proveHostPlannedResolutionCoexistenceInTransaction({
+      db: input.db,
+      sessionId: input.row.session_id,
+      sourceUserSeq: input.row.source_user_seq,
+      phase: 'existing',
+    });
 }
 
 function currentExecutionBinding(
@@ -603,6 +656,75 @@ export function admitAcceptedModelBatch(input: {
   }
 }
 
+/**
+ * Re-open one exact accepted frame without minting a replacement identity.
+ * Approval resume uses this before any preparation or body edge.  The optional
+ * history is the paused call-bearing prefix; matching it here prevents a
+ * forged or stale state blob from borrowing a live admission reference.
+ */
+export function reopenAcceptedModelBatch(
+  ref: AcceptedModelBatchRef,
+  options: { openHistory?: readonly AgentInputItem[] } = {},
+): ReopenAcceptedModelBatchResult {
+  const root = exactOpenHostRoot(ref);
+  if (
+    !root
+    || root.accepted_task_id !== ref.acceptedTaskId
+    || root.authority_digest !== ref.authorityDigest
+  ) {
+    return { status: 'conflict', reason: 'accepted model batch no longer has its exact open host root' };
+  }
+  try {
+    const db = openEventLog();
+    const row = db.prepare(`
+      SELECT * FROM accepted_model_batch_admissions
+       WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?
+    `).get(ref.sessionId, ref.sourceUserSeq, ref.batchOrdinal) as AdmissionRow | undefined;
+    if (
+      !row
+      || row.batch_id !== ref.batchId
+      || row.accepted_task_id !== ref.acceptedTaskId
+      || row.authority_digest !== ref.authorityDigest
+    ) {
+      return { status: 'conflict', reason: 'accepted model batch admission does not match its exact reference' };
+    }
+    const currentBinding = currentExecutionBinding(
+      db,
+      ref.sessionId,
+      ref.sourceUserSeq,
+      ref.acceptedTaskId,
+    );
+    const checkpoint = checkpointRowFor(db, ref);
+    // A committed checkpoint seals the post-frame binding.  An open admission
+    // instead retains its pre-frame binding and may advance only through the
+    // exact settled-plan transition proven above.
+    if (!sameExecutionBindingOrProvenPlanActivation({
+      db,
+      row: checkpoint ?? row,
+      current: currentBinding,
+    })) {
+      return { status: 'conflict', reason: 'accepted model batch execution binding changed while paused' };
+    }
+    if (options.openHistory) {
+      const admittedOpenHistory = [
+        ...parseHistory(row.pre_history_json),
+        ...parseHistory(row.frame_history_json),
+      ];
+      if (
+        acceptedModelBatchHistoryDigest(admittedOpenHistory)
+        !== acceptedModelBatchHistoryDigest(options.openHistory)
+      ) {
+        return { status: 'conflict', reason: 'paused history does not match the exact admitted model batch' };
+      }
+    }
+    return checkpoint
+      ? { status: 'checkpointed', checkpoint: checkpointFromRow(checkpoint) }
+      : { status: 'open', admission: admissionFromRow(row) };
+  } catch (error) {
+    return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function durableEvidenceForAdmission(input: {
   db: HarnessDb;
   row: AdmissionRow;
@@ -611,34 +733,449 @@ function durableEvidenceForAdmission(input: {
 }): Record<string, MigrationEvidence> | null {
   const evidence: Record<string, MigrationEvidence> = {};
   for (const callId of input.callIds) {
-    const exact = durableConversationProtocolEvidenceForCall({
-      db: input.db,
-      sessionId: input.row.session_id,
-      history: input.openHistory,
-      callId,
-    });
+    const identities = input.db.prepare(`
+      SELECT DISTINCT logical.source_user_seq, logical.accepted_task_id,
+             logical.logical_tool_call_id
+        FROM logical_tool_calls logical
+        LEFT JOIN logical_call_settlements settlement
+          ON settlement.session_id = logical.session_id
+         AND settlement.source_user_seq = logical.source_user_seq
+         AND settlement.logical_tool_call_id = logical.logical_tool_call_id
+       WHERE logical.session_id = ?
+         AND (logical.logical_tool_call_id = ? OR settlement.observer_call_id = ?)
+       ORDER BY logical.source_user_seq, logical.logical_tool_call_id
+    `).all(input.row.session_id, callId, callId) as Array<{
+      source_user_seq: number;
+      accepted_task_id: string;
+      logical_tool_call_id: string;
+    }>;
+    // Visible call ids are not globally unique across accepted sources.  The
+    // settlement projector is session-scoped for legacy repair, so bind its
+    // answer back to this exact admission before it can prove anything here.
+    const exactIdentity = identities.length === 1
+      && identities[0]!.source_user_seq === input.row.source_user_seq
+      && identities[0]!.accepted_task_id === input.row.accepted_task_id
+      ? identities[0]!
+      : null;
+    const exact = exactIdentity
+      ? durableConversationProtocolEvidenceForCall({
+          db: input.db,
+          sessionId: input.row.session_id,
+          history: input.openHistory,
+          callId,
+        })
+      : undefined;
     if (exact) {
+      // An outcome settlement proves what happened, not the exact transformed
+      // bytes that were handed to the model.  Open-admission recovery may
+      // reconstruct only the settlement projector's own result when an
+      // append-only projection receipt proves those were the bytes originally
+      // built.  A guardrail/media/structured projection whose bytes live only
+      // in private HostRecoveryState must stay held until that state supplies
+      // them; metadata alone is deliberately not a payload store.
+      const receipt = logicalModelResultProjectionReceiptForAdmissionCall({
+        db: input.db,
+        sessionId: input.row.session_id,
+        sourceUserSeq: input.row.source_user_seq,
+        batchOrdinal: input.row.batch_ordinal,
+        batchId: input.row.batch_id,
+        callId,
+      });
+      if (
+        exact.kind !== 'settled_result'
+        || !receipt
+        || receipt.settlementLogicalToolCallId !== exactIdentity!.logical_tool_call_id
+        || !logicalModelResultProjectionReceiptMatchesItem(receipt, exact.result)
+      ) return null;
       evidence[callId] = exact;
       continue;
     }
-    const identities = input.db.prepare(`
-      SELECT state FROM logical_tool_calls
-       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
-    `).all(input.row.session_id, input.row.source_user_seq, callId) as Array<{ state: string }>;
-    // The append-only admitted frame proves this exact call was accepted by the
-    // host.  No logical identity means it never crossed the common invocation
-    // wall; pairing a no-effect result is therefore recovery, not execution.
-    if (identities.length === 0) {
+    const hostReceipt = hostModelResultReceiptForAdmissionCall({
+      db: input.db,
+      sessionId: input.row.session_id,
+      sourceUserSeq: input.row.source_user_seq,
+      batchOrdinal: input.row.batch_ordinal,
+      batchId: input.row.batch_id,
+      callId,
+    });
+    if (hostReceipt) {
+      const committed = input.openHistory.find((item) => {
+        const record = itemRecord(item);
+        return record.type === 'function_call_result' && record.callId === callId;
+      });
+      let result: AgentInputItem;
+      if (committed && hostModelResultReceiptMatchesItem(hostReceipt, committed)) {
+        result = committed;
+      } else {
+        try {
+          result = resultItemFromHostModelResultReceipt(hostReceipt);
+        } catch {
+          return null;
+        }
+      }
       evidence[callId] = {
-        kind: 'proven_no_crossing',
-        executionKind: 'not_started',
-        physicalDispatchCount: 0,
+        kind: 'settled_result',
+        result,
+        resultBytesSha256: conversationProtocolItemBytesSha256(result),
       };
       continue;
     }
+    // Admission alone proves only that the model frame was accepted.  It does
+    // not prove whether classification, approval, preparation or a body edge
+    // happened before a crash.  Without an exact logical outcome or immutable
+    // host-result receipt, recovery must hold rather than mint different
+    // result bytes into the append-only checkpoint.
     return null;
   }
   return evidence;
+}
+
+function resultForCall(
+  history: readonly AgentInputItem[],
+  callId: string,
+): AgentInputItem | undefined {
+  return history.find((item) => {
+    const row = itemRecord(item);
+    return row.type === 'function_call_result' && row.callId === callId;
+  });
+}
+
+function callForId(
+  history: readonly AgentInputItem[],
+  callId: string,
+): AgentInputItem | undefined {
+  return history.find((item) => {
+    const row = itemRecord(item);
+    return row.type === 'function_call' && row.callId === callId;
+  });
+}
+
+function exactProjectionIdentity(
+  call: AgentInputItem,
+  result: AgentInputItem,
+): boolean {
+  const callRow = itemRecord(call);
+  const resultRow = itemRecord(result);
+  return resultRow.type === 'function_call_result'
+    && resultRow.status === 'completed'
+    && resultRow.callId === callRow.callId
+    && resultRow.name === callRow.name
+    && (resultRow.namespace ?? null) === (callRow.namespace ?? null);
+}
+
+/**
+ * A successful result is reopened only through the authoritative result-handle
+ * projector above.  A failed/non-success result has no successful payload
+ * handle by design, but the live checkpoint owner still holds its exact
+ * model-visible bytes and seals them with a projection receipt.  Admit that
+ * projection only when the immutable settlement proves it is ordinary model
+ * data rather than an unresolved mutation.
+ *
+ * This is deliberately effect- and provider-neutral.  A local plan refusal, a
+ * connected read error, and a native carrier corrective all use the same
+ * closed settlement fields.  Mutating unknown/ignored outcomes remain outside
+ * this lane and therefore cannot advance past reconciliation.
+ */
+function settledNonSuccessProjectionDisposition(input: {
+  db: HarnessDb;
+  row: AdmissionRow;
+  logicalToolCallId: string;
+  hostClass: CanonicalHostModelResultClass | null;
+}): 'ready' | 'reconciliation_required' | null {
+  const rows = input.db.prepare(`
+    SELECT logical.state, settlement.execution_kind, settlement.outcome_kind,
+           settlement.business_call, settlement.mutating,
+           settlement.physical_crossing_count, settlement.host_crossing_count,
+           settlement.result_handle_id, settlement.recovery_action,
+           settlement.requires_reconciliation,
+           (SELECT COUNT(*) FROM physical_dispatches crossing
+             WHERE crossing.session_id = settlement.session_id
+               AND crossing.source_user_seq = settlement.source_user_seq
+               AND crossing.logical_tool_call_id = settlement.logical_tool_call_id
+               AND crossing.state <> 'returned') AS nonreturned_crossing_count
+      FROM logical_tool_calls logical
+      JOIN logical_call_settlements settlement
+        ON settlement.session_id = logical.session_id
+       AND settlement.source_user_seq = logical.source_user_seq
+       AND settlement.logical_tool_call_id = logical.logical_tool_call_id
+     WHERE logical.session_id = ? AND logical.source_user_seq = ?
+       AND logical.accepted_task_id = ?
+       AND logical.logical_tool_call_id = ?
+  `).all(
+    input.row.session_id,
+    input.row.source_user_seq,
+    input.row.accepted_task_id,
+    input.logicalToolCallId,
+  ) as Array<{
+    state: string;
+    execution_kind: string;
+    outcome_kind: string;
+    business_call: number;
+    mutating: number;
+    physical_crossing_count: number;
+    host_crossing_count: number;
+    result_handle_id: string | null;
+    recovery_action: string;
+    requires_reconciliation: number;
+    nonreturned_crossing_count: number;
+  }>;
+  const settlement = rows.length === 1 ? rows[0]! : null;
+  if (
+    !settlement
+    || settlement.state !== 'settled'
+    // Successful bytes retain the stronger result-handle/redemption bar.
+    || settlement.outcome_kind === 'succeeded'
+    || settlement.outcome_kind === 'empty_result'
+    || settlement.result_handle_id !== null
+  ) return null;
+
+  const mutatingSafeFailure = new Set([
+    'invalid_arguments',
+    'transient',
+    'unsupported_capability',
+    'input_required',
+    'auth_failure',
+    'policy_denial',
+  ]).has(settlement.outcome_kind);
+  const reconciliationRequired = settlement.requires_reconciliation === 1
+    || settlement.outcome_kind === 'uncertain_write'
+    || (
+      settlement.mutating === 1
+      && (
+        settlement.nonreturned_crossing_count > 0
+        || !mutatingSafeFailure
+      )
+    );
+  if (reconciliationRequired) {
+    return input.hostClass === 'effect_unknown'
+      ? 'reconciliation_required'
+      : null;
+  }
+  if (input.hostClass === 'effect_unknown') return null;
+
+  if (
+    input.hostClass === 'refused_pre_dispatch'
+    || input.hostClass === 'not_started'
+    || input.hostClass === 'user_rejected'
+  ) {
+    const exactPreDispatchClosure = settlement.execution_kind === 'refused_pre_dispatch'
+      && settlement.physical_crossing_count === 0
+      && settlement.host_crossing_count === 0;
+    if (exactPreDispatchClosure) return 'ready';
+    // The host's replan marker also closes one narrow post-entry failure:
+    // a declared non-business read/compute whose immutable settlement says
+    // no provider bytes crossed, no mutation is possible, and the recovery
+    // directive is transient retry.  This is safe model feedback even though
+    // the local body entered.  `not_started` and `user_rejected` retain their
+    // literal zero-crossing meaning, and every mutating/uncertain timeout stays
+    // outside this lane.
+    return input.hostClass === 'refused_pre_dispatch'
+      && settlement.mutating === 0
+      && settlement.business_call === 0
+      && settlement.physical_crossing_count === 0
+      && settlement.requires_reconciliation === 0
+      && settlement.recovery_action === 'retry_with_backoff'
+      ? 'ready'
+      : null;
+  }
+  return 'ready';
+}
+
+/** Validate exact model-visible result bytes against the durable outcome
+ * owner without requiring the settlement projector to synthesize the same
+ * display representation.  This is what permits structured/file/image and
+ * output-guardrail projections while keeping effect provenance closed. */
+function validateCommittedProjection(input: {
+  db: HarnessDb;
+  row: AdmissionRow;
+  history: readonly AgentInputItem[];
+  callIds: readonly string[];
+}): ConversationMigration | null {
+  if (inspectConversationProtocol(input.history).status !== 'valid') return null;
+  let reconciliationRequired = false;
+  let markerFrameDigest: string | null = null;
+  let markerCount = 0;
+  let countingRefusals = 0;
+
+  for (let index = 0; index < input.callIds.length; index += 1) {
+    const callId = input.callIds[index]!;
+    const call = callForId(input.history, callId);
+    const result = resultForCall(input.history, callId);
+    if (!call || !result || !exactProjectionIdentity(call, result)) return null;
+
+    const identities = input.db.prepare(`
+      SELECT DISTINCT logical.source_user_seq, logical.accepted_task_id,
+             logical.logical_tool_call_id
+        FROM logical_tool_calls logical
+        LEFT JOIN logical_call_settlements settlement
+          ON settlement.session_id = logical.session_id
+         AND settlement.source_user_seq = logical.source_user_seq
+         AND settlement.logical_tool_call_id = logical.logical_tool_call_id
+       WHERE logical.session_id = ?
+         AND (logical.logical_tool_call_id = ? OR settlement.observer_call_id = ?)
+       ORDER BY logical.source_user_seq, logical.logical_tool_call_id
+    `).all(input.row.session_id, callId, callId) as Array<{
+      source_user_seq: number;
+      accepted_task_id: string;
+      logical_tool_call_id: string;
+    }>;
+    const exactIdentity = identities.length === 1
+      && identities[0]!.source_user_seq === input.row.source_user_seq
+      && identities[0]!.accepted_task_id === input.row.accepted_task_id
+      ? identities[0]!
+      : null;
+    const exact = exactIdentity
+      ? durableConversationProtocolEvidenceForCall({
+          db: input.db,
+          sessionId: input.row.session_id,
+          history: input.history,
+          callId,
+        })
+      : undefined;
+    const hostClass = canonicalHostModelResultClass(result);
+
+    const projectionReceipt = exactIdentity
+      ? logicalModelResultProjectionReceiptForAdmissionCall({
+          db: input.db,
+          sessionId: input.row.session_id,
+          sourceUserSeq: input.row.source_user_seq,
+          batchOrdinal: input.row.batch_ordinal,
+          batchId: input.row.batch_id,
+          callId,
+      })
+      : null;
+    const exactProjectionReceipt = Boolean(
+      projectionReceipt
+      && projectionReceipt.settlementLogicalToolCallId
+        === exactIdentity?.logical_tool_call_id
+      && logicalModelResultProjectionReceiptMatchesItem(projectionReceipt, result)
+    );
+    if (
+      exact
+      && !exactProjectionReceipt
+    ) return null;
+
+    if (hostClass && hostClass !== 'user_rejected') {
+      const output = itemRecord(result).output as ItemRecord;
+      const marker = JSON.parse(String(output.text)) as {
+        frameDigest: string;
+        frameIndex: number;
+        frameSize: number;
+        countsRefusal?: true;
+      };
+      if (
+        marker.frameIndex !== index
+        || marker.frameSize !== input.callIds.length
+        || (markerFrameDigest !== null && marker.frameDigest !== markerFrameDigest)
+      ) return null;
+      markerFrameDigest = marker.frameDigest;
+      markerCount += 1;
+      if (marker.countsRefusal === true) countingRefusals += 1;
+    }
+
+    if (exact) {
+      if (exact.kind === 'settled_result') {
+        if (hostClass === 'effect_unknown') {
+          reconciliationRequired = true;
+          continue;
+        }
+        // A successful settlement may carry any exact structured projection,
+        // but never a reserved host refusal/rejection marker.
+        if (hostClass !== null) return null;
+        continue;
+      }
+      if (exact.kind === 'proven_no_crossing') {
+        if (
+          hostClass === 'refused_pre_dispatch'
+          || hostClass === 'not_started'
+          || hostClass === 'user_rejected'
+        ) continue;
+        // A typed pre-dispatch corrective is ordinary model data, not a
+        // synthetic refusal marker.  The same exact projection receipt and
+        // closed settlement class used below must prove those bytes before
+        // they can advance the provider transcript.
+        if (exactIdentity && exactProjectionReceipt) {
+          const settledProjection = settledNonSuccessProjectionDisposition({
+            db: input.db,
+            row: input.row,
+            logicalToolCallId: exactIdentity.logical_tool_call_id,
+            hostClass,
+          });
+          if (settledProjection === 'ready') continue;
+          if (settledProjection === 'reconciliation_required') {
+            // Zero provider crossings do not prove zero effect for a host-owned
+            // mutating carrier. The immutable settlement remains the stronger
+            // effect authority and the exact effect_unknown projection must be
+            // checkpointed into reconciliation, never left as a retryable hold.
+            reconciliationRequired = true;
+            continue;
+          }
+        }
+        return null;
+      }
+      if (exact.kind === 'physical_crossing_unreadable') {
+        if (exactIdentity && exactProjectionReceipt) {
+          const settledProjection = settledNonSuccessProjectionDisposition({
+            db: input.db,
+            row: input.row,
+            logicalToolCallId: exactIdentity.logical_tool_call_id,
+            hostClass,
+          });
+          if (settledProjection === 'ready') continue;
+          if (settledProjection === 'reconciliation_required') {
+            reconciliationRequired = true;
+            continue;
+          }
+        }
+        if (hostClass !== 'effect_unknown') return null;
+        reconciliationRequired = true;
+        continue;
+      }
+      return null;
+    }
+
+    // Failed/non-success settlements intentionally have no successful result
+    // handle, so the generic conversation projector cannot reconstruct their
+    // payload.  During the live commit, however, the checkpoint owner holds
+    // the exact bytes and the append-only projection receipt binds those bytes
+    // to this exact same-source settlement.  Preserve that ordinary repair
+    // result without manufacturing payload bytes during restart.
+    if (exactIdentity && exactProjectionReceipt) {
+      const settledProjection = settledNonSuccessProjectionDisposition({
+        db: input.db,
+        row: input.row,
+        logicalToolCallId: exactIdentity.logical_tool_call_id,
+        hostClass,
+      });
+      if (settledProjection === 'ready') continue;
+      if (settledProjection === 'reconciliation_required') {
+        reconciliationRequired = true;
+        continue;
+      }
+    }
+
+    // A host receipt is valid only for a call with no logical identity at all;
+    // an ambiguous/cross-source identity cannot fall through into this lane.
+    if (identities.length !== 0) return null;
+    const receipt = hostModelResultReceiptForAdmissionCall({
+      db: input.db,
+      sessionId: input.row.session_id,
+      sourceUserSeq: input.row.source_user_seq,
+      batchOrdinal: input.row.batch_ordinal,
+      batchId: input.row.batch_id,
+      callId,
+    });
+    if (!receipt || !hostModelResultReceiptMatchesItem(receipt, result)) return null;
+  }
+  if (markerCount > 0 && (!markerFrameDigest || countingRefusals > 1)) return null;
+
+  const history = [...input.history] as AgentInputItem[];
+  return {
+    disposition: reconciliationRequired ? 'reconciliation_required' : 'ready',
+    migration: 'none',
+    history,
+    providerHistory: reconciliationRequired ? null : [...history],
+  };
 }
 
 function reconstructAdmission(
@@ -673,12 +1210,22 @@ function exactCheckpointStillReopens(input: {
     input.row.source_user_seq,
     input.row.accepted_task_id,
   );
-  return sameExecutionBinding(current, executionBindingFromRow(input.row));
+  return sameExecutionBindingOrProvenPlanActivation({
+    db: input.db,
+    row: input.row,
+    current,
+  });
 }
 
 export function finalizeAcceptedModelBatch(
   ref: AcceptedModelBatchRef,
-  options: { now?: () => string } = {},
+  options: {
+    now?: () => string;
+    /** Exact model-visible results already built by the history-commit owner.
+     * When supplied, validation proves them against durable settlement/host
+     * receipts and checkpoints these bytes without reordering the frame. */
+    committedResultItems?: readonly AgentInputItem[];
+  } = {},
 ): FinalizeAcceptedModelBatchResult {
   const root = exactOpenHostRoot(ref);
   if (!root || root.accepted_task_id !== ref.acceptedTaskId || root.authority_digest !== ref.authorityDigest) {
@@ -729,7 +1276,35 @@ export function finalizeAcceptedModelBatch(
     if (admissionBinding && !sameExecutionBinding(admissionBinding, currentBinding)) {
       return { status: 'conflict', reason: 'model batch graph/work-contract binding changed after admission' };
     }
-    const reconstructed = reconstructAdmission(db, row);
+    const reconstructed = options.committedResultItems
+      ? (() => {
+          const preHistory = parseHistory(row.pre_history_json);
+          const frameHistory = parseHistory(row.frame_history_json);
+          const callIds = parseCallIds(row.call_ids_json);
+          const history = [
+            ...preHistory,
+            ...frameHistory,
+            ...options.committedResultItems,
+          ];
+          if (inspectConversationProtocol(history).status !== 'valid') return null;
+          const resultCallIds = options.committedResultItems.flatMap((item) => {
+            const record = itemRecord(item);
+            return record.type === 'function_call_result' && typeof record.callId === 'string'
+              ? [record.callId]
+              : [];
+          });
+          if (
+            resultCallIds.length !== callIds.length
+            || exactJson(resultCallIds) !== exactJson(callIds)
+          ) return null;
+          return validateCommittedProjection({
+            db,
+            row,
+            history,
+            callIds,
+          });
+        })()
+      : reconstructAdmission(db, row);
     if (!reconstructed) {
       return { status: 'evidence_unavailable', reason: 'one or more admitted calls lack exact durable outcome evidence' };
     }
@@ -788,6 +1363,13 @@ function validateCheckpointEvidence(
   checkpoint: AcceptedModelBatchCheckpoint,
 ): ConversationMigration | null {
   const callIds = parseCallIds(admission.call_ids_json);
+  const committed = validateCommittedProjection({
+    db,
+    row: admission,
+    history: checkpoint.history,
+    callIds,
+  });
+  if (committed) return committed;
   const evidenceByCallId = durableEvidenceForAdmission({
     db,
     row: admission,

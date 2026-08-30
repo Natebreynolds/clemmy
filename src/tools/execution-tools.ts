@@ -183,13 +183,21 @@ function decodedEvidenceToolInput(value: unknown): unknown {
   try { return JSON.parse(text) as unknown; } catch { return value; }
 }
 
-function evidenceToolCallData(data: unknown): { toolName: string; input: unknown } | null {
+function evidenceToolCallData(data: unknown): {
+  toolName: string;
+  effectiveToolName?: string;
+  input: unknown;
+} | null {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
   const row = data as Record<string, unknown>;
   const toolName = typeof row.tool === 'string' ? row.tool.trim() : '';
   if (!toolName) return null;
+  const effectiveToolName = typeof row.effectiveTool === 'string'
+    ? row.effectiveTool.trim()
+    : '';
   return {
     toolName,
+    ...(effectiveToolName ? { effectiveToolName } : {}),
     input: decodedEvidenceToolInput(row.arguments ?? row.args ?? row.input ?? {}),
   };
 }
@@ -498,7 +506,17 @@ function reconcileExternalWriteUnlocked(input: {
   if (!evidenceCall || (evidence.tool && evidence.tool !== evidenceCall.toolName)) {
     return `Reconciliation refused: evidence call ${input.evidenceCallId} has inconsistent tool identity.`;
   }
-  const evidenceEffect = classifyRuntimeToolEffect(evidenceCall.toolName, evidenceCall.input);
+  // Current provider calls persist the compact, transport-normalized operation
+  // identity before their bounded argument preview is written. Re-open effect
+  // authority from that exact operation's current callable manifest. The
+  // operation string is identity only: it contributes no read/write semantics,
+  // and an absent/stale/ambiguous manifest therefore still fails closed. Keep
+  // the outer carrier fallback solely for historical lifecycle rows which did
+  // not yet persist `effectiveTool`.
+  const evidenceEffect = classifyRuntimeToolEffect(
+    evidenceCall.effectiveToolName ?? evidenceCall.toolName,
+    evidenceCall.input,
+  );
   if (evidenceEffect.effect !== 'read' || evidenceEffect.mutating) {
     return `Reconciliation refused: evidence call ${input.evidenceCallId} is not a provably read-only tool call.`;
   }

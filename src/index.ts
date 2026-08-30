@@ -14,6 +14,8 @@ import { startSupervisorIpcHeartbeat } from './daemon/phase.js';
 import { startDaemon } from './daemon/runner.js';
 import { startCliHealthSweep } from './integrations/cli-catalog/auth-health.js';
 import { registerCliAuthRecoverySweep } from './execution/cli-auth-recovery.js';
+import { reconcileCatalogReviewedCliReads } from './runtime/harness/catalog-reviewed-cli-reconcile.js';
+import { autoPromoteInstalledClis } from './integrations/cli-catalog/catalog.js';
 import {
   acquireDaemonLease,
   daemonPidIsForeignReuse,
@@ -53,6 +55,20 @@ const logger = pino({ name: 'clementine-next' });
 // the lease moments later. Packaged starts remain fast; this is only the upper
 // bound, and dead children are still detected immediately in the poll loop.
 const DAEMON_START_HANDSHAKE_TIMEOUT_MS = 30_000;
+
+async function startConnectedCliSurfaces(): Promise<void> {
+  try {
+    autoPromoteInstalledClis();
+  } catch (err) {
+    logger.warn({ err }, 'catalog CLI auto-promote failed — continuing');
+  }
+  try {
+    await reconcileCatalogReviewedCliReads({ rehash: true });
+  } catch (err) {
+    logger.warn({ err }, 'catalog reviewed CLI reconcile failed — continuing');
+  }
+  startCliHealthSweep();
+}
 
 function printUsage(): void {
   console.log(`
@@ -533,7 +549,7 @@ async function main(): Promise<void> {
         await shutdownLocalTranscriptionRuntime();
       });
       await prepareLocalTranscriptionRuntime();
-      startCliHealthSweep();
+      await startConnectedCliSurfaces();
       registerCliAuthRecoverySweep();
       logger.info({ pid: process.pid }, 'Daemon starting in foreground mode');
       const assistant = new ClementineAssistant(createRuntimeFromConfig());
@@ -568,7 +584,7 @@ async function main(): Promise<void> {
       await shutdownLocalTranscriptionRuntime();
     });
     await prepareLocalTranscriptionRuntime();
-    startCliHealthSweep();
+    await startConnectedCliSurfaces();
     registerCliAuthRecoverySweep();
     const assistant = new ClementineAssistant(createRuntimeFromConfig());
     await startDaemon(assistant);
@@ -769,7 +785,7 @@ async function main(): Promise<void> {
       await shutdownLocalTranscriptionRuntime();
     });
     await prepareLocalTranscriptionRuntime();
-    startCliHealthSweep();
+    await startConnectedCliSurfaces();
     registerCliAuthRecoverySweep();
     // Warm the markitdown runtime in the background so a user's FIRST file
     // conversion doesn't eat a ~½GB download under the per-conversion timeout.

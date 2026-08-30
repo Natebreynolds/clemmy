@@ -243,6 +243,59 @@ test('direct_reply skipCapabilityHunt leaves the packet conversational and skips
   assert.match(packet.text, /AGENT CONTEXT PACKET/);
 });
 
+test('proven plain conversation omits only action-semantic context and states the zero-tool boundary', () => {
+  const packet = buildAgentContextPacket(
+    'Who was Ada Lovelace?',
+    {
+      enabled: true,
+      hitCount: 0,
+      source: 'unified',
+      injected: false,
+      skippedReason: 'plain_conversation_surface',
+    },
+    {
+      sessionKind: 'chat',
+      sessionId: 'context-proven-plain-conversation',
+      sourceUserSeq: 1,
+      suppressConfirmBeat: true,
+      skipCapabilityHunt: true,
+      plainConversationSurface: true,
+    },
+  );
+
+  assert.equal(packet.semanticEnrichmentSkippedReason, 'plain_conversation_surface');
+  assert.deepEqual(packet.skills, []);
+  assert.deepEqual(packet.workflows, []);
+  assert.deepEqual(packet.projectCommands, []);
+  assert.deepEqual(packet.mcp, []);
+  assert.deepEqual(packet.healthWarnings, []);
+  assert.deepEqual(packet.capabilityResolution.entries, []);
+  assert.equal(packet.toolScope.authority, 'none');
+  assert.equal(packet.multiItem.detected, false);
+  assert.equal(packet.agentSystem.injected, false);
+  assert.match(packet.text, /Memory preflight: 0 hits via unified \(plain_conversation_surface\)/i);
+  assert.doesNotMatch(packet.text, /declined the prior proposal/i);
+  assert.doesNotMatch(packet.text, /Provider access \(harness facts/i);
+});
+
+test('near-action input without the plain proof retains action-semantic context', () => {
+  const packet = buildAgentContextPacket(
+    'Hi, email the limerick to Alex.',
+    { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    {
+      sessionKind: 'chat',
+      sessionId: 'context-near-action-control',
+      sourceUserSeq: 1,
+      suppressConfirmBeat: true,
+      skipCapabilityHunt: true,
+    },
+  );
+
+  assert.equal(packet.semanticEnrichmentSkippedReason, null);
+  assert.notEqual(packet.toolScope.authority, 'none');
+  assert.match(packet.text, /Provider access \(harness facts/i);
+});
+
 test('compound decline scopes private context to the fresh clause without scripting the reply', () => {
   const fullMessage = 'No—leave that email unsent. Instead, what is 15 × 9? Answer naturally without tools.';
   const activeClause = 'what is 15 × 9? Answer naturally without tools.';

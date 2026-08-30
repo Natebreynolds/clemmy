@@ -298,6 +298,20 @@ test('golden true punt: "I\'ll run the Outlook search now." is a punt, decision 
   assert.equal(decision, null);
 });
 
+test('OPEN-THE-GATES 5.2b: a present-tense work promise with zero tools is a punt', () => {
+  const promises = [
+    "I'll pull the Platform 4.9 tracker log and rank requests.",
+    'Pulling the Platform 4.9 request log now.',
+    'On it — reading the log sheet now.',
+    'Reading the Platform 4.9 log sheet now.',
+  ];
+  for (const text of promises) {
+    const { kind, decision } = classifyTurnText(text, { toolCalls: 0 });
+    assert.equal(kind, 'punt', text);
+    assert.equal(decision, null, text);
+  }
+});
+
 test('missing-tool-access regression: self-reported no tool access is a punt, not a completed answer', () => {
   const text =
     'Nothing new - this environment has no tool access (Composio, Google Sheets, DataForSEO, or file I/O are not exposed to me here), so I cannot fetch search volumes, create a Google Sheet, or verify anything.';

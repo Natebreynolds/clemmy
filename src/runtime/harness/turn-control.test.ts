@@ -38,6 +38,10 @@ const {
   effectiveTurnObjective,
   answerAffirmsTurnSourceStrategyBinding,
   sourceStrategyBindingAffirmedByAnswer,
+  sourceStrategyBindingsEqual,
+  sourceStrategyTopologyDigestFor,
+  materialSourceReplacementBindingIsCompatible,
+  materiallyVariantSourceStrategyDecision,
   recordTurnPreflightDecision,
   PREFLIGHT_ALIGNMENT_SOURCE,
 } = await import('./turn-control.js');
@@ -1097,6 +1101,126 @@ test('fresh material-source alignment cannot be bypassed by the beat kill switch
   assert.deepEqual(decision.sourceStrategyBinding, NAMED_SOURCE_STRATEGY_BINDING);
   assert.ok((decision.allowedMutationEffects ?? []).includes('external_write'));
   assert.ok((decision.allowedDestinations ?? []).includes('google_sheets'));
+});
+
+test('material source replacement keeps the task contract and creates no confirmation authority', () => {
+  const parentDraft = {
+    ...NAMED_SOURCE_STRATEGY_BINDING,
+    topologyDigest: '0'.repeat(64),
+  };
+  const parentBinding = {
+    ...parentDraft,
+    topologyDigest: sourceStrategyTopologyDigestFor(parentDraft)!,
+  };
+  const replacementDraft = {
+    ...parentBinding,
+    primary: {
+      capabilityId: 'capability:composio:DATAFORSEO_AGGREGATE_READ',
+      accountIdentity: 'account:dataforseo-primary',
+      schemaFingerprint: 'schema:dataforseo-v1',
+    },
+    equivalentFallbacks: [],
+    topologyDigest: '0'.repeat(64),
+  };
+  const replacement = {
+    ...replacementDraft,
+    topologyDigest: sourceStrategyTopologyDigestFor(replacementDraft)!,
+  };
+  assert.equal(materialSourceReplacementBindingIsCompatible({
+    parent: parentBinding,
+    replacement,
+  }), true);
+
+  const parentDecision = {
+    phase: 'align',
+    consequential: true,
+    destination: 'a new Google Sheet',
+    intentKey: 'parent-intent',
+    objective: 'Collect the records and create a Google Sheet.',
+    allowedMutationEffects: ['external_write'],
+    allowedDestinations: ['google_sheets'],
+    allowedActionFamilies: ['create'],
+    sourceStrategyPosture: 'materially_variant',
+    confirmationDisposition: 'material_source_strategy',
+    sourceStrategyBinding: parentBinding,
+    reason: 'collect_then_construct',
+  } as const satisfies import('./turn-control.js').TurnPreflightDecision;
+  const decision = materiallyVariantSourceStrategyDecision({
+    parentDecision,
+    parentBinding,
+    replacementBinding: replacement,
+    acceptedAnswer: 'Use DataForSEO instead.',
+  });
+  assert.ok(decision);
+  assert.equal(decision!.phase, 'align');
+  assert.equal(decision!.sourceStrategyPosture, 'materially_variant');
+  assert.equal(decision!.confirmedIntentKey, undefined);
+  assert.equal(decision!.objective, parentDecision.objective);
+  assert.deepEqual(decision!.allowedMutationEffects, parentDecision.allowedMutationEffects);
+  assert.deepEqual(decision!.allowedDestinations, parentDecision.allowedDestinations);
+  assert.deepEqual(decision!.allowedActionFamilies, parentDecision.allowedActionFamilies);
+  assert.equal(sourceStrategyBindingsEqual(decision!.sourceStrategyBinding, replacement), true);
+
+  const reordered = {
+    effect: replacement.effect,
+    destination: {
+      posture: replacement.destination.posture,
+      family: replacement.destination.family,
+    },
+    topologyDigest: replacement.topologyDigest,
+    topology: replacement.topology,
+    equivalentFallbacks: replacement.equivalentFallbacks,
+    primary: {
+      schemaFingerprint: replacement.primary.schemaFingerprint,
+      accountIdentity: replacement.primary.accountIdentity,
+      capabilityId: replacement.primary.capabilityId,
+    },
+    version: replacement.version,
+  };
+  assert.equal(sourceStrategyBindingsEqual(replacement, reordered), true,
+    'property serialization order is not authority identity');
+});
+
+test('material source replacement refuses topology, destination, effect, and digest drift', () => {
+  const parentDraft = {
+    ...NAMED_SOURCE_STRATEGY_BINDING,
+    topologyDigest: '0'.repeat(64),
+  };
+  const parent = {
+    ...parentDraft,
+    topologyDigest: sourceStrategyTopologyDigestFor(parentDraft)!,
+  };
+  const replacementDraft = {
+    ...parent,
+    primary: { capabilityId: 'capability:mcp:new_source__aggregate_read' },
+    equivalentFallbacks: [],
+    topologyDigest: '0'.repeat(64),
+  };
+  const replacement = {
+    ...replacementDraft,
+    topologyDigest: sourceStrategyTopologyDigestFor(replacementDraft)!,
+  };
+  const compatible = (candidate: unknown): boolean =>
+    materialSourceReplacementBindingIsCompatible({ parent, replacement: candidate });
+  assert.equal(compatible({ ...replacement, topologyDigest: 'f'.repeat(64) }), false);
+  assert.equal(compatible({
+    ...replacement,
+    destination: { family: 'email', posture: 'create_new' },
+    topologyDigest: sourceStrategyTopologyDigestFor({
+      ...replacement,
+      destination: { family: 'email', posture: 'create_new' },
+    })!,
+  }), false);
+  assert.equal(compatible({
+    ...replacement,
+    effect: 'local_write',
+    topologyDigest: sourceStrategyTopologyDigestFor({ ...replacement, effect: 'local_write' })!,
+  }), false);
+  assert.equal(compatible({
+    ...replacement,
+    primary: parent.primary,
+    topologyDigest: sourceStrategyTopologyDigestFor({ ...replacement, primary: parent.primary })!,
+  }), false, 'the old primary is not a replacement');
 });
 
 test('quick reads and chit-chat stay silent', () => {

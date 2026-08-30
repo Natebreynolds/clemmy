@@ -276,20 +276,100 @@ export function providerToBackendConfig(p: ByoProvider): ByoBackendConfig {
   };
 }
 
+export interface ByoRoutingProviderSnapshot {
+  readonly provider: Readonly<Omit<ByoProvider, 'modelIds'> & { modelIds: readonly string[] }>;
+  readonly backend: Readonly<ByoBackendConfig>;
+}
+
+export interface ByoRoutingSnapshot {
+  readonly mode: ModelRoutingMode;
+  readonly workerModel: string;
+  readonly defaultBackend: Readonly<ByoBackendConfig>;
+  readonly claudeAvailable: boolean;
+  readonly providers: readonly ByoRoutingProviderSnapshot[];
+  readonly ownersForModel: (modelId: string) => readonly ByoRoutingProviderSnapshot[];
+  readonly configuredOwnersForModel: (modelId: string) => readonly ByoRoutingProviderSnapshot[];
+  readonly hasConnectedModel: (modelId: string) => boolean;
+}
+
+/**
+ * One coherent, request-scoped view of dynamic BYO routing state.
+ *
+ * The snapshot is intentionally NOT memoized across requests: Settings writes
+ * mutate runtime env live, and the next request must see them. Within one
+ * derivation, however, model ownership/configuration is indexed once so a
+ * provider catalog with hundreds of models never rereads `.env` per model.
+ */
+export function captureByoRoutingSnapshot(): ByoRoutingSnapshot {
+  const mode = getModelRoutingMode();
+  const workerModel = (getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '').trim();
+  const defaultBackend = Object.freeze({ ...getByoBackendConfig() });
+  const providers = Object.freeze(getByoProviders().map((rawProvider) => {
+    const provider = Object.freeze({
+      ...rawProvider,
+      modelIds: Object.freeze([...rawProvider.modelIds]),
+    });
+    const backend = Object.freeze({ ...providerToBackendConfig(rawProvider) });
+    return Object.freeze({ provider, backend });
+  }));
+
+  const owners = new Map<string, ByoRoutingProviderSnapshot[]>();
+  const configuredOwners = new Map<string, ByoRoutingProviderSnapshot[]>();
+  const connectedModels = new Set<string>();
+  for (const row of providers) {
+    for (const modelId of row.provider.modelIds) {
+      const allRows = owners.get(modelId);
+      if (allRows) allRows.push(row);
+      else owners.set(modelId, [row]);
+      if (!row.backend.configured) continue;
+      connectedModels.add(modelId);
+      const configuredRows = configuredOwners.get(modelId);
+      if (configuredRows) configuredRows.push(row);
+      else configuredOwners.set(modelId, [row]);
+    }
+  }
+  const freezeIndex = (
+    source: Map<string, ByoRoutingProviderSnapshot[]>,
+  ): Map<string, readonly ByoRoutingProviderSnapshot[]> => {
+    const target = new Map<string, readonly ByoRoutingProviderSnapshot[]>();
+    for (const [modelId, rows] of source) target.set(modelId, Object.freeze([...rows]));
+    return target;
+  };
+  const frozenOwners = freezeIndex(owners);
+  const frozenConfiguredOwners = freezeIndex(configuredOwners);
+  const none = Object.freeze([]) as readonly ByoRoutingProviderSnapshot[];
+
+  return Object.freeze({
+    mode,
+    workerModel,
+    defaultBackend,
+    claudeAvailable: claudeAvailable(),
+    providers,
+    ownersForModel: (modelId: string) => frozenOwners.get(modelId) ?? none,
+    configuredOwnersForModel: (modelId: string) => frozenConfiguredOwners.get(modelId) ?? none,
+    hasConnectedModel: (modelId: string) => connectedModels.has(modelId),
+  });
+}
+
 /** Configured BYO providers that explicitly expose a model id. This includes
  * the migrated default provider's worker slot for collision detection even
  * though that legacy slot alone is not strong enough to claim a built-in-shaped
  * id during normal routing. */
 export function configuredByoProvidersForModel(modelId: string): ByoProvider[] {
-  const id = (modelId || '').trim();
-  if (!id) return [];
-  return getByoProviders().filter((provider) =>
-    provider.modelIds.includes(id) && providerToBackendConfig(provider).configured,
-  );
+  return configuredByoProvidersForModelFromSnapshot(modelId, captureByoRoutingSnapshot())
+    .map((row) => ({ ...row.provider, modelIds: [...row.provider.modelIds] }));
 }
 
-function providerList(owners: ByoProvider[]): string {
-  return owners.map((owner) => owner.label || owner.id).join(', ');
+export function configuredByoProvidersForModelFromSnapshot(
+  modelId: string,
+  snapshot: ByoRoutingSnapshot,
+): readonly ByoRoutingProviderSnapshot[] {
+  const id = (modelId || '').trim();
+  return id ? snapshot.configuredOwnersForModel(id) : [];
+}
+
+function providerList(owners: readonly ByoRoutingProviderSnapshot[]): string {
+  return owners.map(({ provider }) => provider.label || provider.id).join(', ');
 }
 
 /** Why an unqualified model id cannot be routed safely. Model ids are legacy
@@ -299,11 +379,20 @@ function providerList(owners: ByoProvider[]): string {
  * there, but two BYO owners remain ambiguous in every mode. */
 export function unqualifiedModelCollisionReason(
   modelId: string,
-  mode: ModelRoutingMode = getModelRoutingMode(),
+  mode?: ModelRoutingMode,
+): string | undefined {
+  const snapshot = captureByoRoutingSnapshot();
+  return unqualifiedModelCollisionReasonFromSnapshot(modelId, snapshot, mode ?? snapshot.mode);
+}
+
+export function unqualifiedModelCollisionReasonFromSnapshot(
+  modelId: string,
+  snapshot: ByoRoutingSnapshot,
+  mode: ModelRoutingMode = snapshot.mode,
 ): string | undefined {
   const id = (modelId || '').trim();
   if (!id) return undefined;
-  const owners = configuredByoProvidersForModel(id);
+  const owners = snapshot.configuredOwnersForModel(id);
   if (owners.length > 1) {
     return `Model ${id} is exposed by multiple connected BYO providers (${providerList(owners)}). `
       + 'Provider-qualified model identity is required; remove the duplicate model id before selecting or binding it.';
@@ -319,9 +408,18 @@ export function unqualifiedModelCollisionReason(
 
 export function assertUnambiguousModelRouting(
   modelId: string,
-  mode: ModelRoutingMode = getModelRoutingMode(),
+  mode?: ModelRoutingMode,
 ): void {
-  const reason = unqualifiedModelCollisionReason(modelId, mode);
+  const snapshot = captureByoRoutingSnapshot();
+  assertUnambiguousModelRoutingFromSnapshot(modelId, snapshot, mode ?? snapshot.mode);
+}
+
+export function assertUnambiguousModelRoutingFromSnapshot(
+  modelId: string,
+  snapshot: ByoRoutingSnapshot,
+  mode: ModelRoutingMode = snapshot.mode,
+): void {
+  const reason = unqualifiedModelCollisionReasonFromSnapshot(modelId, snapshot, mode);
   if (reason) throw new Error(reason);
 }
 
@@ -330,11 +428,20 @@ export function assertUnambiguousModelRouting(
  * ownership and all-in provider isolation. It throws on identity collisions. */
 export function resolveEffectiveProviderForModel(
   modelId: string,
-  mode: ModelRoutingMode = getModelRoutingMode(),
+  mode?: ModelRoutingMode,
+): ModelProviderClass {
+  const snapshot = captureByoRoutingSnapshot();
+  return resolveEffectiveProviderForModelFromSnapshot(modelId, snapshot, mode ?? snapshot.mode);
+}
+
+export function resolveEffectiveProviderForModelFromSnapshot(
+  modelId: string,
+  snapshot: ByoRoutingSnapshot,
+  mode: ModelRoutingMode = snapshot.mode,
 ): ModelProviderClass {
   const id = (modelId || '').trim();
-  assertUnambiguousModelRouting(id, mode);
-  const owners = configuredByoProvidersForModel(id);
+  assertUnambiguousModelRoutingFromSnapshot(id, snapshot, mode);
+  const owners = snapshot.configuredOwnersForModel(id);
   if (mode === 'all_in') {
     // Explicit claude ids dispatch on the claude lane (2026-07-24, second
     // pass): the all-in collapse silently rewrote a workflow's Sonnet pin to
@@ -345,13 +452,8 @@ export function resolveEffectiveProviderForModel(
     // justified the collapse is retired. gpt-shaped ids keep the collapse
     // (the 2026-07-22 undeclared-worker-default guard); a disconnected
     // Claude falls through to the collapse as before.
-    if (owners.length === 0 && resolveProvider(id) === 'claude') {
-      try {
-        if (claudeAvailable()) return 'claude';
-      } catch { /* availability probe is best-effort */ }
-    }
-    const defaultByo = getByoBackendConfig();
-    if (defaultByo.configured || owners.length === 1) return 'byo';
+    if (owners.length === 0 && resolveProvider(id) === 'claude' && snapshot.claudeAvailable) return 'claude';
+    if (snapshot.defaultBackend.configured || owners.length === 1) return 'byo';
   }
   if (owners.length === 1) return 'byo';
   return resolveProvider(id);
@@ -395,8 +497,9 @@ export function looksLikeUnknownModelError(text: string | null | undefined): boo
 export function repairByoRoutedModelId(modelId: string): string {
   const id = (modelId || '').trim();
   if (!id) return id;
-  if (!isByoModelNotServed(id) && configuredByoProvidersForModel(id).length > 0) return id;
-  const cfg = getByoBackendConfig();
+  const snapshot = captureByoRoutingSnapshot();
+  if (!isByoModelNotServed(id) && snapshot.configuredOwnersForModel(id).length > 0) return id;
+  const cfg = snapshot.defaultBackend;
   const primary = cfg.configured && cfg.primaryId ? cfg.primaryId : id;
   // Never "repair" to another known-dead id.
   return isByoModelNotServed(primary) ? id : primary;
@@ -410,21 +513,29 @@ export function repairByoRoutedModelId(modelId: string): string {
  * claims the id, so this never broadens which ids hit BYO.
  */
 export function resolveByoProviderForModel(modelId: string): ByoBackendConfig | undefined {
+  const backend = resolveByoProviderForModelFromSnapshot(modelId, captureByoRoutingSnapshot());
+  return backend ? { ...backend } : undefined;
+}
+
+export function resolveByoProviderForModelFromSnapshot(
+  modelId: string,
+  snapshot: ByoRoutingSnapshot,
+): Readonly<ByoBackendConfig> | undefined {
   const id = (modelId || '').trim();
   if (!id) return undefined;
-  const providers = getByoProviders();
+  const providers = snapshot.providers;
   if (providers.length === 0) return undefined;
 
-  const collision = unqualifiedModelCollisionReason(id, 'all_in');
+  const collision = unqualifiedModelCollisionReasonFromSnapshot(id, snapshot, 'all_in');
   if (collision) throw new Error(collision);
 
-  const configuredOwners = configuredByoProvidersForModel(id);
-  if (configuredOwners.length === 1) return providerToBackendConfig(configuredOwners[0]);
-  const anyOwner = providers.find((p) => p.modelIds.includes(id));
-  if (anyOwner) return providerToBackendConfig(anyOwner);
+  const configuredOwners = snapshot.configuredOwnersForModel(id);
+  if (configuredOwners.length === 1) return configuredOwners[0].backend;
+  const anyOwner = snapshot.ownersForModel(id)[0];
+  if (anyOwner) return anyOwner.backend;
 
   // Single provider owns everything (byte-identical single-backend behavior).
-  if (providers.length === 1) return providerToBackendConfig(providers[0]);
+  if (providers.length === 1) return providers[0].backend;
 
   return undefined;
 }
@@ -436,21 +547,28 @@ export function resolveByoProviderForModel(modelId: string): ByoBackendConfig | 
  * The migrated default owns its primary/judge ids, plus its explicit worker id
  * only in all_in where the routing mode has already selected BYO. */
 export function resolveDeclaredByoProviderForModel(modelId: string): ByoBackendConfig | undefined {
+  const backend = resolveDeclaredByoProviderForModelFromSnapshot(modelId, captureByoRoutingSnapshot());
+  return backend ? { ...backend } : undefined;
+}
+
+export function resolveDeclaredByoProviderForModelFromSnapshot(
+  modelId: string,
+  snapshot: ByoRoutingSnapshot,
+): Readonly<ByoBackendConfig> | undefined {
   const id = (modelId || '').trim();
   if (!id) return undefined;
-  const collision = unqualifiedModelCollisionReason(id, 'all_in');
+  const collision = unqualifiedModelCollisionReasonFromSnapshot(id, snapshot, 'all_in');
   if (collision) throw new Error(collision);
-  const owners = configuredByoProvidersForModel(id);
-  const explicit = owners.find((provider) => provider.id !== 'default');
-  if (explicit) return providerToBackendConfig(explicit);
-  const defaultProvider = owners.find((provider) => provider.id === 'default');
+  const owners = snapshot.configuredOwnersForModel(id);
+  const explicit = owners.find(({ provider }) => provider.id !== 'default');
+  if (explicit) return explicit.backend;
+  const defaultProvider = owners.find(({ provider }) => provider.id === 'default');
   if (!defaultProvider) return undefined;
-  const declared = getByoBackendConfig();
-  const worker = (getRuntimeEnv('OPENAI_MODEL_WORKER', '') || '').trim();
+  const declared = snapshot.defaultBackend;
   const ownsModel = id === declared.primaryId
     || id === declared.judgeId
-    || (getModelRoutingMode() === 'all_in' && id === worker);
-  return ownsModel ? providerToBackendConfig(defaultProvider) : undefined;
+    || (snapshot.mode === 'all_in' && id === snapshot.workerModel);
+  return ownsModel ? defaultProvider.backend : undefined;
 }
 
 // ── persistence helpers (pure — the console route does the updateEnvKey writes) ──
@@ -491,18 +609,21 @@ export interface ByoProviderSnapshot {
 
 /** Non-secret snapshot of every connected provider, for the settings API/UI. */
 export function getByoProviderSnapshots(): ByoProviderSnapshot[] {
-  return getByoProviders().map((p) => {
-    const cfg = providerToBackendConfig(p);
-    return {
-      id: p.id,
-      label: p.label,
-      baseURL: p.baseURL,
-      modelIds: p.modelIds,
-      hasKey: Boolean(cfg.apiKey),
-      configured: cfg.configured,
-      isDefault: p.id === 'default',
-    };
-  });
+  return getByoProviderSnapshotsFromRoutingSnapshot(captureByoRoutingSnapshot());
+}
+
+export function getByoProviderSnapshotsFromRoutingSnapshot(
+  snapshot: ByoRoutingSnapshot,
+): ByoProviderSnapshot[] {
+  return snapshot.providers.map(({ provider, backend }) => ({
+    id: provider.id,
+    label: provider.label,
+    baseURL: provider.baseURL,
+    modelIds: [...provider.modelIds],
+    hasKey: Boolean(backend.apiKey),
+    configured: backend.configured,
+    isDefault: provider.id === 'default',
+  }));
 }
 
 // ── model discovery (generic — any OpenAI-compatible provider) ──────────────
@@ -678,4 +799,3 @@ export async function warmByoProviderCatalogs(timeoutMs = 8_000): Promise<number
   } catch { /* warm is additive — never breaks startup */ }
   return recorded;
 }
-

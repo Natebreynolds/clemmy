@@ -206,6 +206,12 @@ const STANDALONE_PROHIBITION_OBJECT_RE = /\b(?:this|that|it|these|those)\b|\b(?:
 const CLEMENTINE_VISION_RE = /\b(?:i want|i need|we need)\s+(?:clementine|clemmy|the agent|my (?:agent|assistant))\s+to\b|\b(?:north star|main goal)\b/i;
 const ONE_OFF_VALIDATION_RE = /\b(?:live\s+validation(?:\s+only)?|validation\s+only|live\s+read[- ]only\s+validation|read[- ]only\s+live\s+validation|read[- ]only\s+validation\s+after|live\s+validation\s+after|live\s+(?:local\s+)?safety\s+validation|(?:this\s+is\s+(?:a\s+)?)?(?:live|read[- ]only|local|safety)\s+diagnostic(?:\s+(?:only|probe|run|test))?|diagnostic\s+(?:only|probe|run|test))\b/i;
 const MEMORY_CAPTURE_OPTOUT_RE = /\b(?:do\s+not|don'?t|do n'?t)\s+(?:(?:save|store|remember|capture|persist)\s+(?:this|it|that|the request|this request)?\s*(?:as|to|in)?\s*(?:a\s+)?(?:memory|durable memory|long[- ]term memory)?|(?:write(?:\s+to)?|change|modify|update)\s+(?:my\s+|the\s+|any\s+)?(?:memory|durable memory|long[- ]term memory))\b/i;
+// A local task can be explicitly excluded from memory while another clause in
+// the same turn explicitly grants durable authority ("do not save this task;
+// remember X"). This shape is deliberately narrower than the general opt-out:
+// only a named task object earns clause-local scope. Generic "this", "anything
+// from this turn", and direct memory-store prohibitions remain turn-wide.
+const TASK_SCOPED_MEMORY_OPTOUT_RE = /\b(?:do\s+not|don'?t|do n'?t)\s+(?:save|store|remember|capture|persist)\s+(?:(?:this|that|the)\s+)?(?:[\w-]+\s+){0,4}task\s+(?:as|to|in)\s+(?:a\s+)?(?:memory|durable memory|long[- ]term memory)\b/i;
 const MUST_CALL_TOOL_RE = /\byou\s+must\s+call\s+\w+/i;
 const DO_NOT_CALL_TOOL_RE = /\bdo\s+not\s+call\s+\w+/i;
 const NO_EXTERNAL_CHANGES_RE = /\bdo\s+not\s+make\s+any\s+external\s+changes\b/i;
@@ -485,6 +491,26 @@ function parseRememberInstruction(text: string): MemoryClauseIsolation | null {
   };
 }
 
+/** Whether privacy/scope language cancels an otherwise explicit memory clause.
+ * The isolated memory content is authoritative for same-content scope. A
+ * preceding, specifically task-scoped opt-out may coexist with a later memory
+ * command; every broader or ambiguous opt-out remains fail-closed. */
+function explicitMemoryInstructionIsSuppressed(
+  text: string,
+  instruction: ExplicitMemoryInstructionParse,
+): boolean {
+  if (
+    MEMORY_CAPTURE_OPTOUT_RE.test(instruction.memoryContent)
+    || EXPLICIT_EPHEMERAL_SCOPE_RE.test(instruction.memoryContent)
+  ) return true;
+
+  if (!MEMORY_CAPTURE_OPTOUT_RE.test(text)) return false;
+  const commandStart = explicitRememberCommandStart(text);
+  if (commandStart === null) return true;
+  const beforeCommand = text.slice(0, commandStart);
+  return !TASK_SCOPED_MEMORY_OPTOUT_RE.test(beforeCommand);
+}
+
 // A user can explicitly revise durable knowledge without repeating the word
 // "remember". Keep this deliberately narrower than the general correction
 // detector: future-reference language grants durable intent, while the
@@ -565,6 +591,12 @@ function extractPreferredName(message: string): string | undefined {
 }
 
 export function extractProfilePatchFromMessage(message: string): Record<string, unknown> | undefined {
+  // Profile adaptation is a durable write independent of fact extraction. It
+  // must honor the same privacy boundary instead of leaking a name/tone through
+  // this side channel after candidate capture correctly returned nothing.
+  if (MEMORY_CAPTURE_OPTOUT_RE.test(message) || EXPLICIT_EPHEMERAL_SCOPE_RE.test(message)) {
+    return undefined;
+  }
   const patch: Record<string, unknown> = {};
   const preferredName = extractPreferredName(message);
   if (preferredName) patch.preferredName = preferredName;
@@ -603,19 +635,28 @@ export function extractAutoMemoryCandidates(message: string, maxCandidates = 3):
   // they were being pinned as "Standing prohibition" and injected into every
   // chat + voice prompt (2026-06-23 fact pollution).
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return [];
+  // Parse explicit durable authority before applying whole-turn task/probe
+  // heuristics. The parser isolates a separate "remember X" clause, while the
+  // suppression check keeps same-content and turn-wide privacy language
+  // authoritative.
+  const parsedExplicitMemoryInstruction = parseExplicitMemoryInstruction(text);
+  const explicitMemoryInstruction = parsedExplicitMemoryInstruction
+    && !explicitMemoryInstructionIsSuppressed(text, parsedExplicitMemoryInstruction)
+    ? parsedExplicitMemoryInstruction
+    : null;
   // One-off validation/probe prompts often contain durable-looking words such as
   // "instead of" or "must", but they describe this smoke turn, not user memory.
-  if (isOneOffValidationOrToolProbe(text)) return [];
+  if (isOneOffValidationOrToolProbe(text) && !explicitMemoryInstruction) return [];
   // An explicit current-task scope belongs in working memory, even when the
-  // sentence also contains durable-looking markers such as "always".
-  if (EXPLICIT_EPHEMERAL_SCOPE_RE.test(text)) return [];
+  // sentence also contains durable-looking markers such as "always". A separate
+  // isolated memory command is the only exception.
+  if (EXPLICIT_EPHEMERAL_SCOPE_RE.test(text) && !explicitMemoryInstruction) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = isSafetyProhibition(text);
   const taskRequest = looksLikeOneOffTaskRequest(text);
   const persistentScope = PERSISTENT_SCOPE_RE.test(text);
   const explicitPreference = EXPLICIT_PREFERENCE_CUES.test(text);
-  const explicitMemoryInstruction = parseExplicitMemoryInstruction(text);
   const explicitRemember = explicitMemoryInstruction?.kind === 'remember';
   const explicitDurableCorrection = explicitMemoryInstruction?.kind === 'future_reference_correction';
 

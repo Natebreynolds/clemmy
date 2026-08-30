@@ -159,3 +159,28 @@ export function parseControlReceiptFinalOutput(value: unknown): string | null {
   const text = value.slice(CONTROL_RECEIPT_FINAL_OUTPUT_PREFIX.length + 1).trim();
   return text || null;
 }
+
+/**
+ * Machine-readable finalOutput contract for a REAL user-input pause on the
+ * Codex loop lane. A question is terminal for the current provider activation,
+ * but it is deliberately NOT a completed foreground request: the shared
+ * conversation reducer must publish needs_input + resumable ownership.
+ *
+ * Keep this distinct from CONTROL_RECEIPT_FINAL_OUTPUT_PREFIX. Treating an
+ * ask_user_question result as a completed control receipt produced the
+ * internally impossible sequence `awaiting_user_input` followed by a public
+ * done/answer terminal (live 2026-08-29, source 100077).
+ */
+export const AWAITING_USER_INPUT_FINAL_OUTPUT_PREFIX =
+  '[clementine:awaiting-user-input:final]';
+
+export function formatAwaitingUserInputFinalOutput(text: string): string {
+  return `${AWAITING_USER_INPUT_FINAL_OUTPUT_PREFIX}\n${text}`;
+}
+
+export function parseAwaitingUserInputFinalOutput(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  if (!value.startsWith(`${AWAITING_USER_INPUT_FINAL_OUTPUT_PREFIX}\n`)) return null;
+  const text = value.slice(AWAITING_USER_INPUT_FINAL_OUTPUT_PREFIX.length + 1).trim();
+  return text || null;
+}

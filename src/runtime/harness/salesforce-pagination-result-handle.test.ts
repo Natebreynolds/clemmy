@@ -23,8 +23,15 @@ const outcomes = await import('./attempt-outcome.js');
 const facts = await import('./result-facts.js');
 const resultHandles = await import('./result-handle.js');
 const settlements = await import('./logical-call-settlement-store.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'salesforce_query',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

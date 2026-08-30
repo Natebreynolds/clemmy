@@ -35,7 +35,11 @@ const identities = await import('./attempt-identity.js');
 /** The settlement spine refuses dispatch without an accepted source AND a
  *  persisted turn graph — every fixture that drives a wrapped tool anchors
  *  both (chat sessions only; TurnGraph v1 contracts chat sources). */
-function anchorAcceptedTask(sessionId: string, text: string): { seq: number; turn: number } {
+function anchorAcceptedTask(
+  sessionId: string,
+  text: string,
+  surface: 'direct' | 'background' | 'workflow' = 'direct',
+): { seq: number; turn: number } {
   const source = appendEvent({
     sessionId,
     turn: 1,
@@ -45,6 +49,7 @@ function anchorAcceptedTask(sessionId: string, text: string): { seq: number; tur
   });
   const shadow = recordTurnGraphShadow({
     identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn },
+    surface,
   });
   assert.ok(shadow, 'fixture persisted the turn graph for the accepted task');
   return { seq: source.seq, turn: source.turn };
@@ -325,8 +330,24 @@ test('the send floor gates irreversible sends on EVERY session kind, not just ch
     // turn graph now, so a non-chat send settles through the same spine.
     for (const kind of ['execution', 'workflow'] as const) {
       resetEventLog();
-      const sess = createSession({ kind });
-      const accepted = anchorAcceptedTask(sess.id, 'work the reactivation list for the prospects');
+      const owner = kind === 'workflow'
+        ? {
+            channel: 'workflow',
+            metadata: {
+              source: 'workflow',
+              workflowName: 'Send Floor Fixture',
+              workflowRunId: 'send-floor-run',
+              stepId: 'send_batch',
+              sessionIdSuffix: 'send-floor-run:send_batch',
+            },
+          }
+        : {};
+      const sess = createSession({ kind, ...owner });
+      const accepted = anchorAcceptedTask(
+        sess.id,
+        'work the reactivation list for the prospects',
+        kind === 'workflow' ? 'workflow' : 'background',
+      );
       const wrapped = wrapToolForHarness({ name: 'composio_execute_tool', execute: async () => 'sent' });
       const send = (n: number) => withHarnessRunContext(
         { sessionId: sess.id, turn: accepted.turn, sourceUserSeq: accepted.seq, counter: new ToolCallsCounter(50) },

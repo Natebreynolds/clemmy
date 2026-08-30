@@ -69,7 +69,7 @@ test('describeInputs: none / required / defaulted', () => {
 
 // ─── describeStep ────────────────────────────────────────────────────
 
-test('describeStep: detokenizes prompt + annotates forEach / approval / skill / script', () => {
+test('describeStep: detokenizes prompt + annotates forEach / approval / skill / reviewed transform / script', () => {
   assert.match(
     describeStep({ id: 'x', prompt: 'analyze {{steps.fetch.output}} for {{input.url}}' }, 0),
     /1\. analyze the result of "fetch" for the url/,
@@ -89,6 +89,15 @@ test('describeStep: detokenizes prompt + annotates forEach / approval / skill / 
   assert.match(
     describeStep({ id: 'x', prompt: 'transform rows', deterministic: { runner: 'scripts/x.ts' } }, 4),
     /runs a script \(no AI\)/,
+  );
+  assert.match(
+    describeStep({
+      id: 'x',
+      prompt: '',
+      sideEffect: 'read',
+      transform: { version: 1, expression: { op: 'literal', value: { ok: true } } },
+    }, 5),
+    /runs a reviewed data transform \(no AI\)/,
   );
 });
 
@@ -188,6 +197,28 @@ test('deriveStepDataSources: forEach + mcp tool names are surfaced', () => {
   assert.match(out, /mcp__claude_ai_Gmail__authenticate/);
   assert.match(out, /forEach leads/);
   assert.match(out, /item/);
+});
+
+test('deriveStepDataSources: reviewed transform sources come from its typed expression', () => {
+  const out = deriveStepDataSources({
+    id: 'shape',
+    prompt: '',
+    dependsOn: ['pull'],
+    sideEffect: 'read',
+    transform: {
+      version: 1,
+      expression: {
+        op: 'object',
+        fields: [
+          { key: 'rows', value: { op: 'get', from: 'steps.pull.output' } },
+          { key: 'segment', value: { op: 'get', from: 'input.segment' } },
+        ],
+      },
+    },
+  }).join(' · ');
+  assert.match(out, /steps\.pull\.output/);
+  assert.match(out, /input\.segment/);
+  assert.match(out, /side-effect: read/);
 });
 
 test('describeWorkflowOneLine: compact list summary', () => {

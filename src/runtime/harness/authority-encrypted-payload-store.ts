@@ -47,6 +47,9 @@ const PAYLOAD_ID_RE = /^authority-payload:[a-f0-9]{64}$/;
 const SEALED_FILE_RE = /^([a-f0-9]{64})\.sealed\.json$/;
 const TEMP_FILE_RE = /^\.[a-f0-9]{64}\.[1-9][0-9]*\.[a-f0-9-]{36}\.tmp$/;
 const FIXED_BASE_DIRECTORY = path.resolve(BASE_DIR);
+const PUBLICATION_LINK_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
+const PUBLICATION_LINK_RETRY_ATTEMPTS = 400;
+const PUBLICATION_LINK_RETRY_INTERVAL_MS = 5;
 export const AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY = path.join(
   FIXED_BASE_DIRECTORY,
   'state',
@@ -57,7 +60,8 @@ export const AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY = path.join(
 export type AuthorityEncryptedPayloadKind =
   | 'physical_return'
   | 'staged_transfer_manifest'
-  | 'staged_signed_url';
+  | 'staged_signed_url'
+  | 'model_request_snapshot';
 
 export interface AuthorityEncryptedPayloadReference {
   version: typeof AUTHORITY_ENCRYPTED_PAYLOAD_VERSION;
@@ -124,7 +128,8 @@ function sha256(value: string | Buffer): string {
 function validKind(value: unknown): value is AuthorityEncryptedPayloadKind {
   return value === 'physical_return'
     || value === 'staged_transfer_manifest'
-    || value === 'staged_signed_url';
+    || value === 'staged_signed_url'
+    || value === 'model_request_snapshot';
 }
 
 function validNonNegativeSafeInteger(value: unknown): value is number {
@@ -238,6 +243,60 @@ function readSealedFile(input: {
     if (code === 'ELOOP') return { status: 'corrupt', reason: 'encrypted authority payload path is unsafe' };
     return { status: 'storage_error', reason: 'encrypted authority payload could not be read' };
   }
+}
+
+type PublicationReadResult = ReturnType<typeof readSealedFile>;
+let publicationReadObserverForTests:
+  | ((input: { target: string; read: PublicationReadResult }) => void)
+  | null = null;
+
+export function setAuthorityEncryptedPayloadPublicationReadObserverForTests(
+  observer: ((input: { target: string; read: PublicationReadResult }) => void) | null,
+): void {
+  publicationReadObserverForTests = observer;
+}
+
+/** A hard-link publication is visible with two names for the few instructions
+ * between link(temp, target) and unlink(temp). Ordinary readers keep requiring
+ * one link; only a competing publisher may wait briefly for that exact 0600
+ * regular-file transition to finish. A crashed/stuck publisher remains corrupt
+ * after the bounded wait and can never be adopted as authority. */
+function readSealedFileForPublication(input: {
+  payloadId: string;
+  expectedBytes?: number;
+  expectedDigest?: string;
+}): ReturnType<typeof readSealedFile> {
+  const target = authorityEncryptedPayloadFilePath(input.payloadId);
+  for (let attempt = 0; attempt <= PUBLICATION_LINK_RETRY_ATTEMPTS; attempt += 1) {
+    const read = readSealedFile(input);
+    if (read.status !== 'corrupt') return read;
+    publicationReadObserverForTests?.({ target, read });
+    const entry = lstatOrMissing(target);
+    const safeRegularFile = entry !== null
+      && !entry.isSymbolicLink()
+      && entry.isFile()
+      && (entry.mode & 0o777) === FILE_MODE
+      && entry.size <= AUTHORITY_ENCRYPTED_PAYLOAD_MAX_FILE_BYTES;
+    const transitional = safeRegularFile && entry.nlink === 2;
+    const settledAfterRead = safeRegularFile
+      && entry.nlink === 1
+      && (
+        read.reason === 'encrypted authority payload metadata is invalid'
+        || read.reason === 'encrypted authority payload file changed while opening'
+      );
+    if ((!transitional && !settledAfterRead) || attempt === PUBLICATION_LINK_RETRY_ATTEMPTS) {
+      return read;
+    }
+    if (transitional) {
+      Atomics.wait(
+        PUBLICATION_LINK_RETRY_WAIT,
+        0,
+        0,
+        PUBLICATION_LINK_RETRY_INTERVAL_MS,
+      );
+    }
+  }
+  throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed');
 }
 
 function parseStored(bytes: Buffer): StoredEncryptedPayload | null {
@@ -354,7 +413,7 @@ export function persistAuthorityEncryptedPayload(input: {
     }
     ensurePayloadDirectory();
     const target = authorityEncryptedPayloadFilePath(payloadId);
-    const existing = readSealedFile({ payloadId });
+    const existing = readSealedFileForPublication({ payloadId });
     if (existing.status === 'ok') {
       const parsed = parseStored(existing.bytes);
       if (!parsed) throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed');
@@ -396,7 +455,7 @@ export function persistAuthorityEncryptedPayload(input: {
       closeSync(fd);
       fd = null;
       requireRealDirectory(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY, false);
-      const raced = readSealedFile({ payloadId });
+      const raced = readSealedFileForPublication({ payloadId });
       if (raced.status === 'ok') {
         const parsed = parseStored(raced.bytes);
         if (!parsed) throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed');
@@ -412,7 +471,7 @@ export function persistAuthorityEncryptedPayload(input: {
         linkSync(temp, target);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        const winner = readSealedFile({ payloadId });
+        const winner = readSealedFileForPublication({ payloadId });
         if (winner.status !== 'ok') {
           throw new AuthorityEncryptedPayloadError('authority_payload_storage_failed');
         }
@@ -600,9 +659,14 @@ function hasReclamationReferenceSchema(db: Database.Database): boolean {
       (db.prepare('PRAGMA table_info(staged_transfer_secret_payloads)').all() as Array<{ name: string }>)
         .map((row) => row.name),
     );
+    const modelRequestColumns = new Set(
+      (db.prepare('PRAGMA table_info(model_request_provenance)').all() as Array<{ name: string }>)
+        .map((row) => row.name),
+    );
     return planColumns.has('manifest_payload_id')
       && checkpointColumns.has('payload_id')
-      && secretColumns.has('payload_id');
+      && secretColumns.has('payload_id')
+      && modelRequestColumns.has('payload_id');
   } catch {
     return false;
   }
@@ -652,7 +716,7 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
   };
 
   ensurePayloadDirectory();
-  let referenceStatement: Database.Statement<[string, string, string]> | null = null;
+  let referenceStatement: Database.Statement<[string, string, string, string]> | null = null;
   let deleteOrphanUnderLock:
     | ((payloadId: string, file: ReclaimableFile) => ReclaimAttempt)
     | null = null;
@@ -670,6 +734,10 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
         SELECT 1 AS referenced
         FROM staged_transfer_secret_payloads
         WHERE payload_id = ?
+        UNION ALL
+        SELECT 1 AS referenced
+        FROM model_request_provenance
+        WHERE payload_id = ?
         LIMIT 1
       `);
       const transaction = input.db.transaction((payloadId: string, file: ReclaimableFile): ReclaimAttempt => {
@@ -679,7 +747,7 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
           // This is deliberately the final operation before unlink. BEGIN
           // IMMEDIATE prevents another connection from inserting an owner row
           // until this transaction commits.
-          if (referenceStatement!.get(payloadId, payloadId, payloadId) !== undefined) return 'referenced';
+          if (referenceStatement!.get(payloadId, payloadId, payloadId, payloadId) !== undefined) return 'referenced';
           unlinkSync(file.target);
           return 'deleted';
         } finally {
@@ -756,7 +824,7 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
       }
       const payloadId = `authority-payload:${sealedMatch[1]}`;
       try {
-        if (referenceStatement.get(payloadId, payloadId, payloadId) !== undefined) {
+        if (referenceStatement.get(payloadId, payloadId, payloadId, payloadId) !== undefined) {
           result.retainedReferenced += 1;
           continue;
         }

@@ -18,8 +18,9 @@ import { BASE_DIR, PKG_DIR, getRuntimeEnv } from '../../config.js';
 import {
   actionTopologyRoleFor,
   deriveSdkProfile,
-  terminalAuthoringResultIsProven,
+  registeredToolSideEffect,
 } from '../../tools/tool-registry.js';
+import { hostLocalWriteCommitResultIsProven } from './host-local-write-commit.js';
 import { mergedSpawnEnv } from '../spawn-env.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
@@ -35,6 +36,11 @@ import { renderTranscriptTurns } from './session-transcript.js';
 import { estimateTokens } from './budget.js';
 import { recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
 import { recordModelUsage } from '../usage-log.js';
+import {
+  recordModelRouteDecision,
+  recordModelRouteOutcome,
+  type ModelRouteMetricsContext,
+} from '../model-route-metrics.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { appendEvent, listEvents, listToolOutputInvocationNonces, writeToolOutput } from './eventlog.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
@@ -958,7 +964,9 @@ function appendSdkTopLevelToolEvent(
           ...(result?.successful === true
             && topologyRole === 'control'
             && metadata.effectiveTool
-            && terminalAuthoringResultIsProven(metadata.effectiveTool, result.output)
+            && metadata.effect === 'local_write'
+            && registeredToolSideEffect(metadata.effectiveTool) === 'write'
+            && hostLocalWriteCommitResultIsProven(result.output)
             ? { successfulAuthoringResult: true }
             : {}),
           ...(result?.invocationNonce ? { invocationNonce: result.invocationNonce } : {}),
@@ -1425,6 +1433,9 @@ export interface ClaudeAgentSdkRunResult {
   successfulToolUses?: string[];
   usage?: unknown;
   modelUsage?: unknown;
+  /** Content-free provider accounting for the exact SDK query. Cost is present
+   * only when Claude's result frame explicitly supplied total_cost_usd. */
+  modelRouteUsage?: ClaudeAgentSdkRouteUsage;
   /** Present only after a create/exact-id verification caused durable artifact
    * lineage to exist. Ordinary SDK turns leave this absent. */
   artifactRunScopeId?: string;
@@ -1443,6 +1454,69 @@ export interface ClaudeAgentSdkRunResult {
    *  auto-continue (fresh context — tool RESULTS are lost) can pull earlier
    *  results via tool_output_query by call id instead of re-fetching. */
   toolCallLedger?: Array<{ callId: string; name: string; argsPreview: string }>;
+}
+
+export interface ClaudeAgentSdkRouteUsage {
+  inputTokens?: number;
+  cachedTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  costUsd?: number;
+}
+
+/**
+ * Record one physical Claude Agent SDK query at the same model-call granularity
+ * as the Agents `Model` adapters. Callers invoke this for each bounded replay or
+ * continuation; the SDK result remains the sole authority for token/cache/cost
+ * fields, and prompts/results never enter the route ledger.
+ */
+export async function runClaudeAgentSdkRouteAttempt(
+  run: (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>,
+  options: ClaudeAgentSdkRunOptions,
+  context: ModelRouteMetricsContext,
+): Promise<ClaudeAgentSdkRunResult> {
+  const startedAt = Date.now();
+  const decisionId = recordModelRouteDecision(context);
+  const finish = (
+    status: 'success' | 'failed' | 'cancelled',
+    usage: ClaudeAgentSdkRouteUsage | undefined,
+    errorClass?: string,
+    metadata: Record<string, unknown> = {},
+  ): void => {
+    recordModelRouteOutcome({
+      decisionId,
+      status,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      inputTokens: usage?.inputTokens,
+      outputTokens: usage?.outputTokens,
+      cachedTokens: usage?.cachedTokens,
+      totalTokens: usage?.totalTokens,
+      costUsd: usage?.costUsd,
+      errorClass,
+      metadata: { path: 'claude_agent_sdk_query', ...metadata },
+    });
+  };
+  try {
+    const result = await run(options);
+    finish(
+      result.stoppedReason === 'cancelled' ? 'cancelled' : 'success',
+      result.modelRouteUsage,
+      undefined,
+      {
+        ...(result.model ? { actualResolvedModel: result.model } : {}),
+        ...(result.stoppedReason ? { stoppedReason: result.stoppedReason } : {}),
+      },
+    );
+    return result;
+  } catch (error) {
+    const usage = (error as { modelRouteUsage?: ClaudeAgentSdkRouteUsage } | null)?.modelRouteUsage;
+    const errorClass = error instanceof Error ? error.name : typeof error;
+    const cancelled = options.abortSignal?.aborted === true
+      || errorClass === 'AbortError'
+      || errorClass === 'AgentRuntimeCancelledError';
+    finish(cancelled ? 'cancelled' : 'failed', usage, errorClass);
+    throw error;
+  }
 }
 
 /**
@@ -1805,6 +1879,29 @@ function usageTotalsFromResult(result: SDKResultMessage | null): ClaudeAgentSdkU
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
     outputTokens,
     totalTokens: inputTokens + outputTokens,
+  };
+}
+
+function claudeAgentSdkRouteUsage(
+  result: SDKResultMessage | null,
+  fallback?: ClaudeAgentSdkUsageFallback | null,
+): ClaudeAgentSdkRouteUsage | undefined {
+  const totals = usageTotalsFromResult(result) ?? fallback ?? null;
+  const rawCost = (result as { total_cost_usd?: unknown } | null)?.total_cost_usd;
+  const costUsd = typeof rawCost === 'number' && Number.isFinite(rawCost) && rawCost >= 0
+    ? rawCost
+    : undefined;
+  if (!totals && costUsd === undefined) return undefined;
+  return {
+    ...(totals
+      ? {
+          inputTokens: totals.inputTokens,
+          cachedTokens: totals.cachedInputTokens,
+          outputTokens: totals.outputTokens,
+          totalTokens: totals.totalTokens,
+        }
+      : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
   };
 }
 
@@ -2929,6 +3026,48 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   let init: SDKSystemMessage | null = null;
   const assistantUsageByResponseId = new Map<string, ClaudeAgentSdkUsageTotals>();
   let latestAssistantUsageResponseId: string | undefined;
+  const assistantUsageFallback = (): ClaudeAgentSdkUsageFallback | null => {
+    if (assistantUsageByResponseId.size === 0) return null;
+    let inputTokens = 0;
+    let cachedInputTokens = 0;
+    let cacheCreationInputTokens = 0;
+    let cacheCreationRecordedCalls = 0;
+    let outputTokens = 0;
+    for (const usage of assistantUsageByResponseId.values()) {
+      inputTokens += usage.inputTokens;
+      cachedInputTokens += usage.cachedInputTokens;
+      if (usage.cacheCreationInputTokens !== undefined) {
+        cacheCreationInputTokens += usage.cacheCreationInputTokens;
+        cacheCreationRecordedCalls += 1;
+      }
+      outputTokens += usage.outputTokens;
+    }
+    return {
+      inputTokens,
+      cachedInputTokens,
+      ...(cacheCreationRecordedCalls === assistantUsageByResponseId.size
+        ? { cacheCreationInputTokens }
+        : {}),
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      ...(latestAssistantUsageResponseId ? { responseId: latestAssistantUsageResponseId } : {}),
+    };
+  };
+  const modelRouteUsageFields = (): Pick<ClaudeAgentSdkRunResult, 'modelRouteUsage'> => {
+    const modelRouteUsage = claudeAgentSdkRouteUsage(result, assistantUsageFallback());
+    return modelRouteUsage ? { modelRouteUsage } : {};
+  };
+  const withModelRouteUsageError = <T extends Error>(error: T): T => {
+    const { modelRouteUsage } = modelRouteUsageFields();
+    if (modelRouteUsage) {
+      Object.defineProperty(error, 'modelRouteUsage', {
+        value: modelRouteUsage,
+        enumerable: false,
+        configurable: false,
+      });
+    }
+    return error;
+  };
   let toolUses: string[] = [];
   let successfulToolUses: string[] = [];
   const toolCallLedger: Array<{ callId: string; name: string; argsPreview: string }> = [];
@@ -3708,12 +3847,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           await sleep(toolSurfaceBackoffMs(attempt));
           continue;
         }
-        throw err;
+        throw withModelRouteUsageError(err);
       } else if (isProviderCapacityExhausted(msg)) {
         // Anthropic can surface a model-scoped weekly cap as HTTP 400:
         // "You're out of extra usage." Same-model retry is guaranteed waste;
         // type it so commit-safe callers switch to another connected brain.
-        throw new ClaudeSdkCapacityExhaustedError(msg, toolUses.length > 0 || streamedAny);
+        throw withModelRouteUsageError(
+          new ClaudeSdkCapacityExhaustedError(msg, toolUses.length > 0 || streamedAny),
+        );
       } else if (isProviderOverloadMessage(msg)) {
         const committed = toolUses.length > 0 || streamedAny;
         // Safe legacy/startup retry: nothing committed, budget remains, and
@@ -3726,17 +3867,21 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         }
         // Give up — surface a TYPED error so a caller that can switch providers
         // re-dispatches when it's safe (committed=false), else surfaces it.
-        throw new ClaudeSdkProviderOverloadError(msg, committed);
+        throw withModelRouteUsageError(new ClaudeSdkProviderOverloadError(msg, committed));
       } else if (isAuthRecoverableError(msg)) {
         // Expired/invalid Claude credential. Retrying the SAME dead token is
         // pointless, so throw immediately (no in-lane retry) — TYPED so the
         // caller's cross-brain fallover routes to a brain whose auth is valid,
         // instead of hard-failing the turn/step with other brains connected.
-        throw new ClaudeSdkAuthExpiredError(msg, toolUses.length > 0 || streamedAny);
+        throw withModelRouteUsageError(
+          new ClaudeSdkAuthExpiredError(msg, toolUses.length > 0 || streamedAny),
+        );
       } else if (isContextOverflowMessage(msg)) {
         // Context-window overflow surfaced as a thrown stream error. TYPED so the
         // brain can salvage (committed) or retry once with reduced context.
-        throw new ClaudeSdkContextOverflowError(msg, toolUses.length > 0 || streamedAny);
+        throw withModelRouteUsageError(
+          new ClaudeSdkContextOverflowError(msg, toolUses.length > 0 || streamedAny),
+        );
       } else {
         throw err;
       }
@@ -3752,34 +3897,6 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   // Prefer the self-stop reason (ceiling/wall-clock) over the generic turn-budget
   // copy so the user sees WHY Clem held off.
   const partialLimitText = (): string => ceilingState.stopped ?? bestLimitHitText(lastAssistantText, streamedText);
-  const assistantUsageFallback = (): ClaudeAgentSdkUsageFallback | null => {
-    if (assistantUsageByResponseId.size === 0) return null;
-    let inputTokens = 0;
-    let cachedInputTokens = 0;
-    let cacheCreationInputTokens = 0;
-    let cacheCreationRecordedCalls = 0;
-    let outputTokens = 0;
-    for (const usage of assistantUsageByResponseId.values()) {
-      inputTokens += usage.inputTokens;
-      cachedInputTokens += usage.cachedInputTokens;
-      if (usage.cacheCreationInputTokens !== undefined) {
-        cacheCreationInputTokens += usage.cacheCreationInputTokens;
-        cacheCreationRecordedCalls += 1;
-      }
-      outputTokens += usage.outputTokens;
-    }
-    return {
-      inputTokens,
-      cachedInputTokens,
-      ...(cacheCreationRecordedCalls === assistantUsageByResponseId.size
-        ? { cacheCreationInputTokens }
-        : {}),
-      outputTokens,
-      totalTokens: inputTokens + outputTokens,
-      ...(latestAssistantUsageResponseId ? { responseId: latestAssistantUsageResponseId } : {}),
-    };
-  };
-
   const exactApprovalBoundary = approvalBoundary as ClaudeAgentApprovalBoundary | null;
   if (exactApprovalBoundary) {
     if (exactApprovalBoundary.conversational) {
@@ -3795,13 +3912,14 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           toolCallLedger,
           usage: result?.usage,
           modelUsage: result?.modelUsage,
+          ...modelRouteUsageFields(),
           limitHit: false,
           stoppedReason: 'pending-approval',
           ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
         };
       }
     }
-    throw new ClaudeAgentSdkApprovalBoundaryError(exactApprovalBoundary);
+    throw withModelRouteUsageError(new ClaudeAgentSdkApprovalBoundaryError(exactApprovalBoundary));
   }
 
   if (terminalToolReply) {
@@ -3815,6 +3933,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       toolCallLedger,
       usage: result?.usage,
       modelUsage: result?.modelUsage,
+      ...modelRouteUsageFields(),
       limitHit: false,
       stoppedReason: terminalToolReason,
       ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
@@ -3832,6 +3951,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       toolCallLedger,
       usage: result?.usage,
       modelUsage: result?.modelUsage,
+      ...modelRouteUsageFields(),
       limitHit: true,
       selfStopped: String(ceilingState.stoppedKind) === 'loop', // cast: the 'loop' set-site is a closure alias TS can't flow-narrow
       ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
@@ -3855,6 +3975,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         toolCallLedger,
         usage: result.usage,
         modelUsage: result.modelUsage,
+        ...modelRouteUsageFields(),
         limitHit: true,
         ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
       };
@@ -3874,13 +3995,17 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
       errorFields.error,
     ].filter((v) => v !== undefined && v !== null).map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join('\n');
     if (isProviderCapacityExhausted(errorText)) {
-      throw new ClaudeSdkCapacityExhaustedError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny);
+      throw withModelRouteUsageError(
+        new ClaudeSdkCapacityExhaustedError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny),
+      );
     }
     if (isContextOverflowMessage(errorText)) {
       // TYPED so the brain's salvage/reduced-retry path runs.
-      throw new ClaudeSdkContextOverflowError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny);
+      throw withModelRouteUsageError(
+        new ClaudeSdkContextOverflowError(errorText.slice(0, 800), toolUses.length > 0 || streamedAny),
+      );
     }
-    throw new Error(`Claude Agent SDK failed: ${resultText.slice(0, 800)}`);
+    throw withModelRouteUsageError(new Error(`Claude Agent SDK failed: ${resultText.slice(0, 800)}`));
   }
   recordClaudeAgentSdkUsage(options, result, init, { firstByteMs });
   return {
@@ -3893,6 +4018,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     toolCallLedger,
     usage: result.usage,
     modelUsage: result.modelUsage,
+    ...modelRouteUsageFields(),
     ...(resolvedArtifactRunScopeId ? { artifactRunScopeId: resolvedArtifactRunScopeId } : {}),
   };
 }

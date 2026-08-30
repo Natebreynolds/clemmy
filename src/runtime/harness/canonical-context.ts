@@ -41,6 +41,9 @@ export interface BuildCanonicalContextPackOptions {
   /** A typed decline still needs the ordinary conversational/history surface,
    *  but not semantic recall, ranking, capability resolution, or schema warm. */
   suppressSemanticEnrichment?: boolean;
+  /** Exact accepted-source proof that the host mounted a closed-world,
+   * zero-tool conversation surface. Action-only context may be omitted. */
+  plainConversationSurface?: boolean;
   /** The exact accepted turn declined its parent and supplied an independent
    * fresh clause. This is a policy cue only; provider-visible wording stays
    * byte-exact elsewhere. */
@@ -74,6 +77,7 @@ export function buildCanonicalContextPack(opts: BuildCanonicalContextPackOptions
     sourceUserSeq: opts.sourceUserSeq,
     suppressConfirmBeat: opts.suppressConfirmBeat,
     suppressSemanticEnrichment: opts.suppressSemanticEnrichment,
+    plainConversationSurface: opts.plainConversationSurface,
     authorityInput: opts.authorityInput,
     declinedParentWithNewTask: opts.declinedParentWithNewTask,
     skipCapabilityHunt: opts.skipCapabilityHunt,

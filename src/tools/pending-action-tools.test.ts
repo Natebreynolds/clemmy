@@ -636,6 +636,32 @@ test('pending_action_queue keeps a reversible local action on the lighter conver
   assert.doesNotMatch(response.content[0].text, /REQUIRED NEXT TOOL/);
 });
 
+test('request_now repairs a reversible write back to ordinary execution instead of creating approval ceremony', async () => {
+  const session = createSession({ kind: 'chat' });
+  const response = await withToolOutputContext({ sessionId: session.id }, () =>
+    handlerFor('pending_action_queue')({
+      title: 'Save local draft',
+      summary: 'Save a reversible local draft in the current workspace.',
+      kind: 'local_file_write',
+      toolName: 'write_file',
+      payloadJson: JSON.stringify({
+        path: 'draft.md',
+        content: 'Local draft only.',
+      }),
+      approvalIntent: 'request_now',
+    }));
+
+  assert.match(response.content[0].text, /PENDING_ACTION_APPROVAL_NOT_REQUIRED/);
+  assert.match(response.content[0].text, /ordinary work boundary/i);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 0);
+  assert.equal(
+    listEvents(session.id, { types: ['autonomy_note'] })
+      .filter((event) => event.data.kind === 'pending_action_queued').length,
+    0,
+    'a non-approval repair must not leave an inert queue or card edge behind',
+  );
+});
+
 test('pending_action_queue keeps ambient session ownership over model-supplied null or foreign ids', async () => {
   const ambient = createSession({ kind: 'chat' });
   const victim = createSession({ kind: 'chat' });

@@ -12,9 +12,11 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 delete process.env.OPENAI_MODEL_FAST;
 delete process.env.OPENAI_MODEL_PRIMARY;
 delete process.env.OPENAI_MODEL_DEEP;
+delete process.env.OPENAI_MODEL_RESCUE;
 delete process.env.OPENAI_AGENTS_DISABLE_TRACING;
 
 const config = await import('./config.js');
+const { resolveProvider } = await import('./runtime/harness/model-wire-registry.js');
 
 test('Agents SDK tracing is quiet by default when no export API key exists', () => {
   assert.equal(config.resolveOpenAiAgentsTracingDisabled(undefined, ''), '1');
@@ -49,7 +51,7 @@ test('model settings snapshot reports process env overrides', () => {
   const original = process.env.OPENAI_MODEL_PRIMARY;
   process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.4-mini';
   try {
-    const snapshot = config.getModelSettingsSnapshot();
+    const snapshot = config.getModelSettingsSnapshot(resolveProvider);
     assert.equal(snapshot.models.primary, 'gpt-5.4-mini');
     assert.equal(snapshot.processEnvOverrides.primary, true);
     assert.equal(snapshot.processEnvOverrides.fast, false);
@@ -58,10 +60,67 @@ test('model settings snapshot reports process env overrides', () => {
       'gpt-5.4-mini',
       'gpt-5.4',
       'gpt-5.5',
+      'gpt-5.6-luna',
+      'gpt-5.6-terra',
+      'gpt-5.6-sol',
     ]);
   } finally {
     if (original === undefined) delete process.env.OPENAI_MODEL_PRIMARY;
     else process.env.OPENAI_MODEL_PRIMARY = original;
+  }
+});
+
+test('Codex rescue is explicit when configured and otherwise follows only a Codex live primary', () => {
+  const originalPrimary = process.env.OPENAI_MODEL_PRIMARY;
+  const originalRescue = process.env.OPENAI_MODEL_RESCUE;
+  try {
+    process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.6-sol';
+    delete process.env.OPENAI_MODEL_RESCUE;
+    assert.deepEqual(config.getCodexRescueModelSelection(resolveProvider), {
+      modelId: 'gpt-5.6-sol',
+      inheritedModelId: 'gpt-5.6-sol',
+      envKey: 'OPENAI_MODEL_RESCUE',
+      configured: false,
+    });
+
+    process.env.OPENAI_MODEL_RESCUE = 'gpt-5.6-luna';
+    const snapshot = config.getModelSettingsSnapshot(resolveProvider);
+    assert.deepEqual(snapshot.codexRescue, {
+      modelId: 'gpt-5.6-luna',
+      inheritedModelId: 'gpt-5.6-sol',
+      envKey: 'OPENAI_MODEL_RESCUE',
+      configured: true,
+    });
+
+    process.env.OPENAI_MODEL_RESCUE = 'not a model id';
+    assert.deepEqual(config.getCodexRescueModelSelection(resolveProvider), {
+      modelId: 'gpt-5.6-sol',
+      inheritedModelId: 'gpt-5.6-sol',
+      envKey: 'OPENAI_MODEL_RESCUE',
+      configured: false,
+    });
+
+    process.env.OPENAI_MODEL_PRIMARY = 'glm-5.3';
+    delete process.env.OPENAI_MODEL_RESCUE;
+    assert.deepEqual(config.getCodexRescueModelSelection(resolveProvider), {
+      modelId: 'gpt-5.4',
+      inheritedModelId: 'gpt-5.4',
+      envKey: 'OPENAI_MODEL_RESCUE',
+      configured: false,
+    }, 'a BYO primary cannot become the claimed Codex rescue target');
+
+    process.env.OPENAI_MODEL_RESCUE = 'gpt-5.6-luna';
+    assert.deepEqual(config.getCodexRescueModelSelection(resolveProvider), {
+      modelId: 'gpt-5.6-luna',
+      inheritedModelId: 'gpt-5.4',
+      envKey: 'OPENAI_MODEL_RESCUE',
+      configured: true,
+    }, 'an explicit validated Codex selection still outranks safe inheritance');
+  } finally {
+    if (originalPrimary === undefined) delete process.env.OPENAI_MODEL_PRIMARY;
+    else process.env.OPENAI_MODEL_PRIMARY = originalPrimary;
+    if (originalRescue === undefined) delete process.env.OPENAI_MODEL_RESCUE;
+    else process.env.OPENAI_MODEL_RESCUE = originalRescue;
   }
 });
 

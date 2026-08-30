@@ -26,7 +26,7 @@ import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gauntlet-sheet-admission-'));
 const PROMPT = 'Make me a google sheet called Gauntlet Sheet with a header row: Scenario, Status, Notes';
-const SHEET_URL = 'https://docs.google.com/spreadsheets/d/gauntlet-sheet/edit';
+const SHEET_URL = 'https://docs.google.com/spreadsheets/d/fixture-gauntlet-sheet-0001/edit';
 const SUCCESS = `Created the Gauntlet Sheet with its header row: ${SHEET_URL}`;
 const PREAMBLE = 'I’ll create one new Google Sheet named Gauntlet Sheet with the header row Scenario, Status, Notes.';
 const SHEET_OPERATION = 'GOOGLESHEETS_CREATE_SPREADSHEET';
@@ -475,7 +475,7 @@ test('S1 prompt: prep-frozen turn still admits and dispatches the same-turn-disc
     `at most one approval may interpose: ${JSON.stringify(approvalStops)}`);
 });
 
-test('read-fast-path: a proven read-effect provider call dispatches without frozen-catalog membership', { timeout: 120_000 }, async () => {
+test('read surface: an exact disclosed read is admitted through the business carrier', { timeout: 120_000 }, async () => {
   // Gauntlet hole 12 (S5B, seq 82691): GOOGLEDRIVE_FIND_FILE, effect 'read',
   // was refused with "only admits configured harness-bounded tools" — the
   // boundary computed the read effect and the gate ignored it. A discovery
@@ -543,12 +543,19 @@ test('read-fast-path: a proven read-effect provider call dispatches without froz
       },
     },
   });
+  // Selected-definition revalidation consumes the prepared connected-account
+  // snapshot. The prior subtest prepared a Sheets-only account, so refresh the
+  // fixture observation after replacing the loader with Drive.
+  await composioClient.listUsableConnectedToolkits();
 
   let step = 0;
   let readResultSeen = '';
   const scriptedModel = {
     async getResponse(rawRequest: unknown) {
       const serialized = JSON.stringify(rawRequest ?? {});
+      const tools = ((rawRequest as { tools?: Array<{ name?: string }> })?.tools ?? [])
+        .map((entry) => entry.name ?? '')
+        .filter(Boolean);
       step += 1;
       let output: unknown[];
       if (step === 1) {
@@ -560,10 +567,53 @@ test('read-fast-path: a proven read-effect provider call dispatches without froz
       } else if (step === 2) {
         assert.match(serialized, new RegExp(DRIVE_OPERATION),
           'foreground discovery returns and proves the drive read');
-        output = [functionCall('gauntlet-drive-find', 'composio_execute_tool', {
-          tool_slug: DRIVE_OPERATION,
-          arguments: JSON.stringify({ query: 'Gauntlet Sheet' }),
-          connected_account_id: 'conn-googledrive',
+        assert.ok(tools.includes(PLAN_CONTROL),
+          'the exact disclosure makes plan_task reachable');
+        output = [functionCall('admit-gauntlet-drive-read', PLAN_CONTROL, {
+          preamble: 'I’ll check Google Drive for the existing Gauntlet Sheet.',
+          draft: {
+            criteria: ['The matching Google Drive file result is returned from the connected account.'],
+            cardinality: { count: 1, fields: ['id', 'name'] },
+            destination: { posture: 'named_existing', family: 'googledrive', handleRequired: false },
+            topology: {
+              version: 1,
+              operations: [{
+                id: 'find_existing_sheet',
+                effect: 'read',
+                coverage: 'complete_set',
+                dependsOn: [],
+                dataFrom: [],
+                cardinality: { kind: 'once' },
+              }],
+              universes: [],
+            },
+            bindings: [{
+              operationId: 'find_existing_sheet',
+              role: 'source',
+              capabilityRef: 'cap:resolved:googledrive_find_file',
+              evidence: ['records'],
+            }],
+            deliverables: [{ id: 'drive-search-results', kind: 'evidence' }],
+            evidenceRequirements: ['records'],
+          },
+        })];
+      } else if (step === 3) {
+        const plan = eventlog.getToolOutput(session.id, 'admit-gauntlet-drive-read') as { output?: unknown } | null;
+        assert.match(String(plan?.output ?? ''), /"ok":\s*true/,
+          `the exact read plan is durably admitted before execution: ${JSON.stringify(plan)}`);
+        assert.ok(tools.includes('work_call'),
+          'the admitted exact read is reachable through the business carrier');
+        output = [functionCall('gauntlet-drive-find', 'work_call', {
+          requirement_id: 'find_existing_sheet',
+          universe_item_id: null,
+          universe_selector: null,
+          seal_amendment: null,
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: DRIVE_OPERATION,
+            arguments: JSON.stringify({ query: 'Gauntlet Sheet' }),
+            connected_account_id: 'conn-googledrive',
+          }),
         })];
       } else {
         const readResult = (rawRequest as { input?: unknown[] }).input?.find((item) =>
@@ -613,11 +663,14 @@ test('read-fast-path: a proven read-effect provider call dispatches without froz
     },
   });
 
-  assert.equal(step, 3, JSON.stringify(eventlog.listEvents(session.id).map((event) => ({
+  assert.ok(step === 3 || step === 4, JSON.stringify(eventlog.listEvents(session.id).map((event) => ({
     seq: event.seq, type: event.type, data: event.data,
   }))));
+  const durableRead = eventlog.getToolOutput(session.id, 'gauntlet-drive-find') as { output?: unknown } | null;
+  readResultSeen ||= JSON.stringify(durableRead?.output ?? durableRead ?? '');
+  const readPlan = eventlog.getToolOutput(session.id, 'admit-gauntlet-drive-read');
   assert.match(readResultSeen, /Gauntlet Sheet/,
-    `the model received the read payload, not a refusal: ${readResultSeen}`);
+    `the model received the read payload, not a refusal: ${readResultSeen}; plan=${JSON.stringify(readPlan)}`);
   assert.doesNotMatch(readResultSeen, /refused before dispatch/,
     'a proven discovery read must never die at the harness provenance wall');
   assert.equal(driveReads, 1, 'the proven read crossed the provider wire exactly once');

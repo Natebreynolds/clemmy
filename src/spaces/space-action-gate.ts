@@ -49,6 +49,11 @@ import {
   type SpaceActionAuthorityResult,
 } from './space-action-authority.js';
 import {
+  acquireApprovedSpaceActionV3Authority,
+  prepareSpaceActionV3Approval,
+  SPACE_ACTION_V3_AUTHORIZATION_FIELD,
+} from './space-action-v3-authority.js';
+import {
   createWorkspaceObservationMemoryBridge,
   type WorkspaceMemorySignal,
 } from '../memory/workspace-observation-bridge.js';
@@ -268,6 +273,9 @@ export function enqueueSpaceActionApproval(
   const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
   const sessionId = ensureSpaceSession(rec);
   const standingEligible = standingActionTrustEligible(action);
+  const exactV3 = action.composioSlug?.trim()
+    ? prepareSpaceActionV3Approval({ slug: rec.id, action, callerArgs })
+    : null;
   const args = {
     spaceSlug: rec.id,
     actionId: action.id,
@@ -275,6 +283,9 @@ export function enqueueSpaceActionApproval(
     composioSlug: action.composioSlug ?? null,
     spaceActionExecutionVersion: SPACE_ACTION_EXECUTION_VERSION,
     actionSnapshot: actionApprovalSnapshot(rec, action),
+    ...(exactV3?.ok && exactV3.value.contract
+      ? { [SPACE_ACTION_V3_AUTHORIZATION_FIELD]: exactV3.value.contract }
+      : {}),
     ...(standingEligible
       ? { reason: STANDING_RUNNER_ACTION_REASON }
       : action.runner?.trim() ? { reason: RUNNER_ACTION_SCOPE_REASON } : {}),
@@ -401,11 +412,28 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
     recordApprovedActionNotRun(slug, label, actionId, row.approvalId, error);
     return;
   }
+  let composioAuthority: import('./runner.js').SpaceSharedDurableComposioAuthority | undefined;
+  if (approvedAction.composioSlug?.trim()) {
+    const acquired = acquireApprovedSpaceActionV3Authority({
+      approvalId: row.approvalId,
+      slug,
+      action: approvedAction,
+      callerArgs,
+    });
+    if (!acquired.ok) {
+      recordApprovedActionNotRun(slug, label, actionId, row.approvalId, acquired.error);
+      return;
+    }
+    composioAuthority = acquired.authority;
+  }
   const result = await runSpaceAction(
     slug,
     approvedAction,
     callerArgs,
-    { approvalId: row.approvalId },
+    {
+      approvalId: row.approvalId,
+      ...(composioAuthority ? { composioAuthority } : {}),
+    },
   );
   if (result.ok) {
     recordApprovedActionSuccess(slug, label, actionId, row.approvalId);

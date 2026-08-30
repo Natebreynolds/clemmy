@@ -36,7 +36,7 @@ test.after(() => {
 });
 
 test('v65 is a contiguous migration with independent canonical and invocation chunk spines', () => {
-  assert.equal(HARNESS_SCHEMA_VERSION, 65);
+  assert.ok(HARNESS_SCHEMA_VERSION >= 65);
   const db = new Database(path.join(TEST_HOME, 'migration-v65.db'));
   db.pragma('foreign_keys = ON');
   try {

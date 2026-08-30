@@ -18,7 +18,15 @@ import {
 } from '../execution/background-tasks.js';
 import { enqueueDurableChatTask, shouldPromoteToDurable } from '../execution/background-promote.js';
 import { parseApprovalIntent } from '../channels/discord-harness.js';
-import { addRunEvent, finishRun, getRun, listRuns, startRun, type RunRecord } from '../runtime/run-events.js';
+import {
+  addRunEvent,
+  finishRun,
+  getRun,
+  listRuns,
+  startRun,
+  type RunRecord,
+  type RunStatus,
+} from '../runtime/run-events.js';
 import { applyProposedFix, dismissProposedFix, listProposedFixes, loadProposedFix, revertWorkflowFix } from '../execution/workflow-diagnosis.js';
 import { requeueWorkflowFromRun } from '../tools/workflow-run-queue.js';
 import {
@@ -63,7 +71,12 @@ import {
   type TurnOutcome,
 } from '../runtime/harness/turn-outcome.js';
 import { deriveTitle } from '../memory/derive-title.js';
-import type { AssistantResponse, AssistantRouteDiagnostics, ToolActivity } from '../types.js';
+import type {
+  AssistantResponse,
+  AssistantRouteDiagnostics,
+  RunStoppedReason,
+  ToolActivity,
+} from '../types.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 
 const logger = pino({ name: 'clementine-next.gateway' });
@@ -99,6 +112,10 @@ export interface GatewayRequest {
 export interface GatewayResponse {
   text: string;
   sessionId: string;
+  /** Canonical durable terminal projection. Transport prose and HTTP status
+   * must never be used to reconstruct this status. Absent only while durable
+   * work is still nonterminal (for example a workflow dispatch). */
+  terminal?: PresentationEvent;
   queuedTaskId?: string;
   pendingApprovalId?: string;
   handledControl?: boolean;
@@ -106,7 +123,7 @@ export interface GatewayResponse {
   /** Why the underlying runtime stopped. When 'max-turns-with-grace',
    *  channel UIs should surface a [Continue] affordance so the user
    *  can resume without typing "continue" by hand. */
-  stoppedReason?: string;
+  stoppedReason?: RunStoppedReason;
   /** How many turns were consumed before stopping. */
   turnsUsed?: number;
   /** Best-effort model route diagnostics for caller/debug parity. */
@@ -576,14 +593,21 @@ function gatewayResponseFromTerminal(
     ? 'cancelled'
     : presentation.needs?.kind === 'continue'
       ? 'max-turns-with-grace'
-      : presentation.needs?.kind === 'input'
-        ? 'awaiting-input'
-      : presentation.status === 'failed' || presentation.status === 'blocked'
-        ? 'error'
-        : undefined;
+      : presentation.needs?.kind === 'approval'
+        ? 'pending-approval'
+        : presentation.needs?.kind === 'input'
+          ? 'awaiting-input'
+          : presentation.status === 'failed'
+            ? 'error'
+            : presentation.status === 'uncertain'
+              ? 'unverified'
+              : presentation.status === 'blocked'
+                ? 'blocked'
+                : undefined;
   return {
     text: presentation.text,
     sessionId: event.sessionId,
+    terminal: presentation,
     runId,
     ...(typeof event.data.queuedTaskId === 'string' ? { queuedTaskId: event.data.queuedTaskId } : {}),
     ...(pendingApprovalId ? { pendingApprovalId } : {}),
@@ -592,6 +616,18 @@ function gatewayResponseFromTerminal(
       ? { route: event.data.route as AssistantRouteDiagnostics }
       : {}),
   };
+}
+
+function gatewayRunStatusForPresentation(
+  presentation: PresentationEvent,
+): Exclude<RunStatus, 'received' | 'running'> {
+  if (presentation.status === 'cancelled') return 'cancelled';
+  if (presentation.status === 'failed') return 'failed';
+  if (presentation.status === 'blocked' || presentation.status === 'uncertain') return 'blocked';
+  if (presentation.needs?.kind === 'approval') return 'awaiting_approval';
+  if (presentation.needs?.kind === 'input') return 'awaiting_input';
+  if (presentation.needs?.kind === 'continue') return 'blocked';
+  return 'completed';
 }
 
 function gatewayResponseFromDispatch(
@@ -1087,13 +1123,7 @@ export class ClementineGateway {
       finishRun(run.id, {
         status: replay.kind === 'dispatched'
           ? 'queued'
-          : replay.presentation.status === 'cancelled'
-            ? 'cancelled'
-            : replay.presentation.status === 'failed' || replay.presentation.status === 'blocked'
-              ? 'failed'
-              : replay.presentation.needs?.kind === 'approval'
-                ? 'awaiting_approval'
-                : 'completed',
+          : gatewayRunStatusForPresentation(replay.presentation),
         message: replay.kind === 'dispatched'
           ? 'Replayed the durable workflow dispatch acknowledgement.'
           : 'Replayed the durable gateway turn outcome.',
@@ -1273,21 +1303,15 @@ export class ClementineGateway {
         // response, and do not propose a second terminal merely to lose the
         // idempotent race. Re-read and return the durable typed winner.
         const presentation = sourceOutcomeAfterResponse.presentation;
-        const runStatus = presentation.status === 'cancelled'
-          ? 'cancelled'
-          : presentation.status === 'failed' || presentation.status === 'blocked'
-            ? 'failed'
-            : presentation.needs?.kind === 'approval'
-              ? 'awaiting_approval'
-              : presentation.needs?.kind === 'input'
-                ? 'awaiting_input'
-                : presentation.needs?.kind === 'continue'
-                  ? 'failed'
-                  : 'completed';
+        const runStatus = gatewayRunStatusForPresentation(presentation);
         try {
           settleGatewayAttempt(
             activeAttempt,
-            runStatus === 'cancelled' ? 'cancelled' : runStatus === 'failed' ? 'failed' : 'completed',
+            runStatus === 'cancelled'
+              ? 'cancelled'
+              : runStatus === 'failed' || runStatus === 'blocked'
+                ? 'failed'
+                : 'completed',
           );
         } catch { /* bridge may already have settled the shared physical attempt */ }
         const durableResponse = gatewayResponseFromTerminal(sourceOutcomeAfterResponse, run.id);
@@ -1443,6 +1467,7 @@ export class ClementineGateway {
       return {
         text: committed.presentation.text,
         sessionId: response.sessionId,
+        terminal: committed.presentation,
         pendingApprovalId: committed.presentation.kind === 'approval'
           ? committed.presentation.approvalId
           : response.pendingApprovalId,
@@ -1451,9 +1476,13 @@ export class ClementineGateway {
           ? response.stoppedReason ?? 'max-turns-with-grace'
           : committed.presentation.status === 'cancelled'
             ? 'cancelled'
-            : committed.presentation.status === 'failed' || committed.presentation.status === 'blocked'
+            : committed.presentation.status === 'failed'
               ? 'error'
-              : response.stoppedReason,
+              : committed.presentation.status === 'uncertain'
+                ? 'unverified'
+                : committed.presentation.status === 'blocked'
+                  ? 'blocked'
+                  : response.stoppedReason,
         turnsUsed: response.turnsUsed,
         route,
       };
@@ -1479,13 +1508,7 @@ export class ClementineGateway {
         finishRun(run.id, {
           status: durable.kind === 'dispatched'
             ? 'queued'
-            : durable.presentation.status === 'cancelled'
-              ? 'cancelled'
-              : durable.presentation.status === 'failed' || durable.presentation.status === 'blocked'
-                ? 'failed'
-                : durable.presentation.needs?.kind === 'approval'
-                  ? 'awaiting_approval'
-                  : 'completed',
+            : gatewayRunStatusForPresentation(durable.presentation),
           message: durable.kind === 'dispatched'
             ? 'Workflow dispatch survived a foreground transport failure.'
             : 'Recovered the durable gateway turn outcome after a foreground failure.',

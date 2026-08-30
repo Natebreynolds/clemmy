@@ -14,8 +14,21 @@ const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const resolution = await import('./resolution-ledger.js');
 const manifests = await import('./obligation-manifest.js');
+const operationSemantics = await import('../../integrations/composio/operation-semantics.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const sheetFromJsonSemantics = operationSemantics
+  .documentedComposioManifestOperationSemantics('GOOGLESHEETS_SHEET_FROM_JSON');
+assert.ok(sheetFromJsonSemantics?.atomicInputContent, 'fixture requires reviewed atomic Sheet semantics');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+  providerKind: 'composio',
+  effect: 'external_write',
+  destination: { family: 'googlesheets', posture: 'create_new' },
+  operationSemantics: sheetFromJsonSemantics,
+}]);
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -99,7 +112,7 @@ test('a source-backed replacement still owes derivation and stale reconciliation
     && edge.fromObligation === 'source_completeness'));
 });
 
-test('only exact documented Sheet-from-JSON uses content commit instead of readback', () => {
+test('only the current Sheet-from-JSON operation identity uses content commit instead of readback', () => {
   const atomic = compileFor('read the source and create one Sheet from those rows', [
     { operationId: 'read', resolvedTool: 'source_list_records' },
     { operationId: 'write', resolvedTool: 'GOOGLESHEETS_SHEET_FROM_JSON' },
@@ -110,9 +123,14 @@ test('only exact documented Sheet-from-JSON uses content commit instead of readb
   assert.equal(write?.obligations.includes('verify_committed_readback'), false);
   assert.ok(write?.obligations.includes('derivation_from_current_source'));
 
+  const transportNeutralSpelling = compileFor('create one Sheet from these rows', [
+    { operationId: 'write', resolvedTool: 'GOOGLE_SHEETS_SHEET_FROM_JSON' },
+  ]).nodes[0];
+  assert.equal(transportNeutralSpelling?.contentCommitMode, 'documented_atomic_input',
+    'underscore/case transport spelling resolves to the same sealed operation identity');
+
   for (const resolvedTool of [
     'GOOGLESHEETS_SHEET_FROM_JSON_PREVIEW',
-    'GOOGLE_SHEETS_SHEET_FROM_JSON',
     'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
     'GOOGLESHEETS_UPDATE_SHEET',
     'GOOGLESHEETS_CREATE_GOOGLE_SHEET',

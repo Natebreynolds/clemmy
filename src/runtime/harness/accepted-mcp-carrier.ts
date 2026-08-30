@@ -43,6 +43,7 @@ import { ExternalWritePreDispatchError } from './external-write-admission.js';
 import { PhysicalDispatchPreDispatchError } from './attempt-identity.js';
 import { loadToolContract, type ToolContract } from '../../tools/tool-contract-store.js';
 import { stripMcpToolCarrier } from '../mcp-tool-authority.js';
+import { currentLiveReadPlanningDefinitionFromEntry } from './live-read-planning-authority.js';
 
 export class ExactMcpCarrierPreDispatchError extends ExternalWritePreDispatchError {
   override readonly name = 'ExactMcpCarrierPreDispatchError';
@@ -130,7 +131,6 @@ export function resolveAcceptedExactMcpCarrier(
       !stored
       || !manifest
       || manifest.providerKind !== 'native_mcp'
-      || manifest.provenance.issuer !== 'host:native-mcp-live-materializer:v1'
       || stored.digest !== attestation.manifestDigest
       || capabilityManifestDigest(manifest) !== attestation.manifestDigest
       || manifest.manifestId !== attestation.manifestId
@@ -168,6 +168,19 @@ export function resolveAcceptedExactMcpCarrier(
       || canonical.argumentCompiler.id !== manifest.argumentCompiler.id
       || canonical.argumentCompiler.version !== manifest.argumentCompiler.version
     ) return refused('the exact catalog identity is absent or drifted');
+
+    const currentDefinition = currentLiveReadPlanningDefinitionFromEntry(catalogEntry);
+    if (
+      !currentDefinition
+      || currentDefinition.providerInputSchemaDigest
+        !== manifest.externalDefinition.providerInputSchemaDigest
+      || currentDefinition.providerInputSchemaDigest !== attestation.providerInputSchemaDigest
+      || currentDefinition.definitionFingerprint !== manifest.definitionFingerprint
+      || currentDefinition.providerOperationVersion !== manifest.operationVersion
+      || currentDefinition.providerOutputSchemaDigest
+        !== (manifest.externalDefinition.providerOutputSchemaDigest ?? null)
+      || currentDefinition.invokePortId !== manifest.invokePortId
+    ) return refused('the exact current provider definition is absent or drifted');
 
     const port = resolveProductionPortsForManifest(manifest);
     if (

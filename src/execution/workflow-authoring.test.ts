@@ -91,6 +91,10 @@ test('applyWorkflowTriggerPatch clears and replaces trigger fields in one shared
 });
 
 test('shared step normalization and graph validation preserve execution fields', () => {
+  const transformJson = JSON.stringify({
+    version: 1,
+    expression: { op: 'literal', value: [{ name: 'A' }, { name: 'B' }] },
+  });
   const steps = normalizeWorkflowSteps([{
     id: 'send',
     prompt: undefined,
@@ -113,6 +117,11 @@ test('shared step normalization and graph validation preserve execution fields',
         { id: 'risks', prompt: 'Inspect risks.' },
       ],
     },
+  }, {
+    id: 'constants',
+    prompt: '',
+    sideEffect: 'read',
+    transform: transformJson,
   }]);
   assert.equal(steps[0].prompt, '');
   assert.equal(steps[0].project, 'clementine-next');
@@ -120,6 +129,10 @@ test('shared step normalization and graph validation preserve execution fields',
   assert.deepEqual(steps[0].codifiedFrom, { prompt: 'Send adaptively.', allowedTools: ['GMAIL_SEND_EMAIL'] });
   assert.equal(steps[0].forEachNewOnly, true);
   assert.deepEqual(steps[1].subgraph?.specialists.map((specialist) => specialist.id), ['facts', 'risks']);
+  assert.deepEqual(steps[2].transform, {
+    version: 1,
+    expression: { op: 'literal', value: [{ name: 'A' }, { name: 'B' }] },
+  });
   assert.match(validateWorkflowStepGraph(steps) ?? '', /depends on unknown step "pull"/);
 });
 
@@ -178,12 +191,7 @@ test('shared step normalization treats model-emitted null optionals as absent', 
   assert.deepEqual(prepared.errors, []);
 });
 
-test('prepareWorkflowCreateForWrite leaves an eligible mechanical step as a model step — codify-to-call is currently a no-op', () => {
-  // Regression pin (2026-08-26): codifyMechanicalSteps stands down while a
-  // bare `call` step has no production dispatch authority (see
-  // workflow-codify.ts). This step used to get converted to a `call` node
-  // through this exact shared path; it must now stay the working model step
-  // it was authored as.
+test('prepareWorkflowCreateForWrite codifies an eligible mechanical step into a runtime-bound call', () => {
   const prepared = prepareWorkflowCreateForWrite({
     name: 'codify-create-wf',
     description: 'Codify create test.',
@@ -199,13 +207,20 @@ test('prepareWorkflowCreateForWrite leaves an eligible mechanical step as a mode
       sideEffect: 'read',
     }],
   });
-  assert.equal(prepared.def.steps[0].call, undefined);
-  assert.equal(prepared.def.steps[0].codifiedFrom, undefined);
+  assert.deepEqual(prepared.def.steps[0].call, {
+    tool: 'dataforseo_domain_rank_overview',
+    args: { target: '{{input.domain}}' },
+  });
+  assert.deepEqual(prepared.def.steps[0].codifiedFrom, {
+    prompt: 'Fetch the domain rank overview.',
+    allowedTools: ['dataforseo_domain_rank_overview'],
+  });
   assert.equal(prepared.def.steps[0].prompt, 'Fetch the domain rank overview.');
-  assert.equal(prepared.codifyNotes.length, 0);
+  assert.equal(prepared.def.steps[0].invocationPlan, undefined);
+  assert.equal(prepared.codifyNotes.length, 1);
 });
 
-test('prepareWorkflowUpdateForWrite: requesting codify stays a no-op either way', () => {
+test('prepareWorkflowUpdateForWrite codifies only when the caller requests the compiler pass', () => {
   const before = {
     name: 'codify-update-wf',
     description: 'Codify update test.',
@@ -227,8 +242,11 @@ test('prepareWorkflowUpdateForWrite: requesting codify stays a no-op either way'
   };
   assert.equal(prepareWorkflowUpdateForWrite(before, next).def.steps[0].call, undefined);
   const prepared = prepareWorkflowUpdateForWrite(before, next, { codifyMechanicalSteps: true });
-  assert.equal(prepared.def.steps[0].call, undefined);
-  assert.equal(prepared.codifyNotes.length, 0);
+  assert.deepEqual(prepared.def.steps[0].call, {
+    tool: 'reporter_fetch',
+    args: { id: '{{input.id}}' },
+  });
+  assert.equal(prepared.codifyNotes.length, 1);
 });
 
 test('portable model normalization strips exact pins but preserves intent/default routing', () => {

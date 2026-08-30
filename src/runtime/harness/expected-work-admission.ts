@@ -18,7 +18,8 @@ import {
   generatedArtifactWriteContentVerified,
   hostArtifactContentDigest,
 } from './artifact-ledger.js';
-import { compileGoogleSheetsSheetFromJsonContract } from './sheet-from-json-content-contract.js';
+import { compileAtomicInputContentContract } from './atomic-input-content-contract.js';
+import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import {
@@ -83,6 +84,7 @@ import {
   loadSealedNodeBinding,
   type SealedNodeBinding,
 } from './host-capability-catalog-factory.js';
+import { proveFrozenMutationVerification } from './mutation-verification-proof.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
   /** RFC 6901 pointer into the normalized inner tool arguments. */
@@ -800,6 +802,12 @@ function dischargedRequirementSettlements(
     // artifact write discharges only after a downstream exact-ID read, bound
     // to this same contract, proves the frozen content contract.
     if (row.effect_kind !== 'read') {
+      const frozenVerification = proveFrozenMutationVerification({
+        sessionId: contract.identity.sessionId,
+        sourceUserSeq: contract.identity.sourceUserSeq,
+        ownerLogicalToolCallId: row.logical_tool_call_id,
+      });
+      if (frozenVerification.status === 'verified') return true;
       return generatedArtifactWriteContentVerified({
         sessionId: contract.identity.sessionId,
         sourceUserSeq: contract.identity.sourceUserSeq,
@@ -1136,26 +1144,53 @@ function dependencyReadyForCurrentOperation(
  * requires deriving the mapping from the settled source result, not consulting
  * a table of request shapes someone enumerated ahead of time.
  */
-function generatedSheetContentContractForAdmission(input: {
+function generatedAtomicContentContractForAdmission(input: {
   contract: AcceptedTaskWorkContractV1;
   operation: ExpectedWorkOperationV1;
   tool: string;
-  args: unknown;
+  callArgs: unknown;
+  providerArguments: unknown;
+  providerArgumentsVisible: boolean;
 }): { ok: true; contentContract: unknown } | { ok: false; reason: string } | null {
-  const sheetContract = compileGoogleSheetsSheetFromJsonContract(input.tool, input.args);
-  if (!sheetContract) return null;
-  if (input.operation.cardinality.kind !== 'once' || input.operation.effect !== 'external_write') {
-    return { ok: false, reason: 'a generated Sheet requires one declared create operation' };
+  if (!input.providerArgumentsVisible) return null;
+  const effective = unwrapRuntimeEffectiveToolIdentity(input.tool, input.callArgs);
+  if (!effective.toolName) return null;
+  const sealed = loadSealedNodeBinding(
+    input.contract.identity.sessionId,
+    input.contract.identity.sourceUserSeq,
+    input.operation.id,
+  );
+  if (sealed && sealed.providerOperationId.trim().toLowerCase() !== effective.toolName.trim().toLowerCase()) {
+    return { ok: false, reason: 'atomic content call contradicts its sealed operation identity' };
+  }
+  const declaration = sealed
+    ? sealed.operationSemantics?.atomicInputContent
+    : currentManifestOperationSemantics(effective.toolName)?.semantics.atomicInputContent;
+  if (!declaration) return null;
+  const contentContract = compileAtomicInputContentContract({
+    declaration,
+    providerArguments: input.providerArguments === input.callArgs
+      ? effective.args
+      : input.providerArguments,
+  });
+  if (!contentContract) {
+    return { ok: false, reason: 'atomic content arguments do not satisfy the sealed compiler contract' };
+  }
+  if (
+    input.operation.cardinality.kind !== 'once'
+    || (input.operation.effect !== 'external_write' && input.operation.effect !== 'local_write')
+  ) {
+    return { ok: false, reason: 'atomic generated content requires one declared create operation' };
   }
   const sourceRequirements = input.operation.dataFrom;
   if (sourceRequirements.length !== 1) {
-    return { ok: false, reason: 'generated Sheet create requires exactly one declared dataFrom source' };
+    return { ok: false, reason: 'atomic generated content requires exactly one declared dataFrom source' };
   }
   const sourceOperation = input.contract.operations.find((operation) => operation.id === sourceRequirements[0]);
   if (!sourceOperation || sourceOperation.effect !== 'read' || sourceOperation.cardinality.kind !== 'once') {
-    return { ok: false, reason: 'generated Sheet dataFrom source must be one exact read' };
+    return { ok: false, reason: 'atomic generated content dataFrom source must be one exact read' };
   }
-  return { ok: true, contentContract: sheetContract };
+  return { ok: true, contentContract };
 }
 
 function exactContentDigestOccurrences(value: unknown, targetDigest: string, depth = 0): number {
@@ -1450,8 +1485,7 @@ function hostSealedContentContractForAdmission(input: {
     input.operation.id,
   );
   if (!sealedCreate) return { ok: false, reason: 'generated artifact create binding is unreadable' };
-  const createOperationName = sealedCreate.providerOperationId.toUpperCase();
-  if (!/(?:^|_)(?:CREATE|PROVISION|REGISTER)(?:_|$)/.test(createOperationName)) return null;
+  if (sealedCreate.destination?.posture !== 'create_new') return null;
   if (
     sealedCreate.nodeId !== input.operation.id
     || sealedCreate.bindingDigest !== createBindingRow.binding_digest
@@ -2690,16 +2724,18 @@ export function admitExpectedWorkInvocation(input: {
         }
       }
 
-      const generatedSheetContract = generatedSheetContentContractForAdmission({
+      const generatedAtomicContract = generatedAtomicContentContractForAdmission({
         contract,
         operation,
         tool: input.tool,
-        args: input.args,
+        callArgs: input.args,
+        providerArguments: evidenceArgs,
+        providerArgumentsVisible: !input.hostSealedEffect,
       });
-      if (generatedSheetContract && !generatedSheetContract.ok) {
-        return refusedWithPlan('work_source_witness_missing', generatedSheetContract.reason);
+      if (generatedAtomicContract && !generatedAtomicContract.ok) {
+        return refusedWithPlan('work_source_witness_missing', generatedAtomicContract.reason);
       }
-      const generatedArtifactContract = generatedSheetContract ?? hostSealedContentContractForAdmission({
+      const generatedArtifactContract = generatedAtomicContract ?? hostSealedContentContractForAdmission({
         db,
         contract,
         operation,

@@ -1,7 +1,7 @@
 /** Run: node scripts/run-tests-isolated.mjs src/execution/automation-pilot-production-convergence.test.ts */
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -30,6 +30,15 @@ const productionPorts = await import('../runtime/harness/production-capability-p
 const registry = await import('../runtime/harness/production-live-read-acquisition-registry.js');
 const spaces = await import('../spaces/store.js');
 const projections = await import('../memory/workflow-result-projection-contract.js');
+const runner = await import('./workflow-runner.js');
+const recurrenceRuntime = await import('./automation-recurrence-runtime.js');
+const recurrenceControl = await import('./automation-recurrence-control-plane.js');
+const scheduler = await import('./workflow-scheduler.js');
+const intervalScheduler = await import('./workflow-interval-scheduler.js');
+const workflowStore = await import('../memory/workflow-store.js');
+const workflowQueue = await import('../tools/workflow-run-queue.js');
+const shared = await import('../tools/shared.js');
+import type { ClementineAssistant } from '../assistant/core.js';
 
 function generated(label: string): string {
   return `${label}_${randomUUID().replaceAll('-', '').slice(0, 12)}`.toLowerCase();
@@ -106,7 +115,7 @@ function opportunity(label: string) {
     missingInputs: [],
     successCriteria: [{
       id: 'complete',
-      description: 'The bounded result is complete.',
+      description: 'Step "read-result" output includes required keys: version, kind, activationId, authorityRootId, logicalCallId',
       evidence: ['The records collection is non-empty.'],
     }],
     pilot: {
@@ -298,7 +307,13 @@ test('approved proposal advances without another chat turn through exact chooser
     },
     async callTool() {
       counts.call += 1;
-      return [{ type: 'text', text: '{"records":[]}' }] as unknown as Awaited<ReturnType<MCPServer['callTool']>>;
+      const payload = { records: [{ key: generated('record'), name: generated('value') }] };
+      const result = [{
+        type: 'text',
+        text: JSON.stringify(payload),
+      }] as unknown as Awaited<ReturnType<MCPServer['callTool']>> & Record<string, unknown>;
+      Object.assign(result, { structuredContent: structuredClone(payload), isError: false });
+      return result;
     },
   };
   const configuredServer: ManagedMcpServer = {
@@ -406,4 +421,230 @@ test('approved proposal advances without another chat turn through exact chooser
   assert.equal(counts.model.length, 1);
   assert.equal(counts.call, 0);
   assert.ok(counts.list > 0, 'the configured external carrier was observed live');
+
+  const queuedPilot = pilot.loadAutomationReadPilotProjection(saga.pilotProjectionId!);
+  assert.ok(queuedPilot?.runId);
+  await runner.processWorkflowRuns({} as ClementineAssistant);
+  assert.equal(counts.call, 1, 'the real pilot crosses the reviewed provider body exactly once');
+  const runBytes = readFileSync(
+    path.join(shared.WORKFLOW_RUNS_DIR, `${queuedPilot!.runId}.json`),
+    'utf8',
+  );
+  const terminal = JSON.parse(runBytes) as {
+    status?: string;
+    terminalOutcome?: string;
+    goalOutcome?: string;
+    goalValidation?: {
+      pass?: boolean;
+      judgeFailedOpen?: boolean;
+      perCriterion?: Array<{ pass?: boolean; method?: string; detail?: string }>;
+    };
+    stepOutputs?: Record<string, unknown>;
+  };
+  const retainedProviderResults = eventlog.openEventLog().prepare(`
+    SELECT raw_payload_json FROM durable_result_handles ORDER BY created_at ASC
+  `).all();
+  assert.equal(
+    terminal.status,
+    'completed',
+    `${runBytes}\n${JSON.stringify(retainedProviderResults, null, 2)}`,
+  );
+  assert.equal(
+    terminal.goalOutcome,
+    'satisfied',
+    JSON.stringify({
+      goalValidation: terminal.goalValidation,
+      stepOutputs: terminal.stepOutputs,
+    }, null, 2),
+  );
+  assert.equal(terminal.terminalOutcome, 'succeeded', runBytes);
+  assert.equal(terminal.goalValidation?.pass, true);
+  assert.equal(terminal.goalValidation?.judgeFailedOpen, false);
+  assert.deepEqual(
+    terminal.goalValidation?.perCriterion?.map((criterion) => ({
+      pass: criterion.pass,
+      method: criterion.method,
+    })),
+    [{ pass: true, method: 'deterministic' }],
+    'the exact full targeted pilot persists the real criterion verdict',
+  );
+  const pilotSuccess = recurrenceRuntime.projectAutomationRecurrencePilotSuccess(queuedPilot!.runId!);
+  assert.equal(pilotSuccess.ok, true, JSON.stringify(pilotSuccess));
+  if (!pilotSuccess.ok) return;
+
+  const recurrenceDurableState = () => {
+    recurrenceControl.listAutomationRecurrenceActivationsForReconciliation();
+    const db = eventlog.openEventLog();
+    return {
+      activations: (db.prepare(
+        'SELECT COUNT(*) AS count FROM automation_recurrence_activations',
+      ).get() as { count: number }).count,
+      receipts: (db.prepare(
+        'SELECT COUNT(*) AS count FROM automation_recurrence_activation_receipts',
+      ).get() as { count: number }).count,
+      approvals: approvals.listPending({ status: 'any' })
+        .map((approval) => approval.approvalId)
+        .sort(),
+      definition: workflowStore.readWorkflow(pilotSuccess.evidence.workflowId)?.data,
+    };
+  };
+
+  // A judge outage/advisory cannot be upgraded into recurrence authority. Use
+  // the real admitted run and change only its persisted goal receipt, then put
+  // the exact original bytes back before exercising the positive lane.
+  const runPath = path.join(shared.WORKFLOW_RUNS_DIR, `${queuedPilot.runId}.json`);
+  const unavailableTerminal = JSON.parse(runBytes) as {
+    goalValidation?: Record<string, unknown>;
+  };
+  assert.ok(unavailableTerminal.goalValidation);
+  unavailableTerminal.goalValidation = {
+    ...unavailableTerminal.goalValidation,
+    pass: false,
+    judgeFailedOpen: true,
+    perCriterion: [{
+      criterion: opportunity(label).successCriteria[0]!.description,
+      pass: false,
+      method: 'skipped',
+      detail: 'judge unavailable: isolated outage',
+    }],
+  };
+  const beforeUnavailableRequest = recurrenceDurableState();
+  try {
+    writeFileSync(runPath, JSON.stringify(unavailableTerminal, null, 2), 'utf8');
+    const unavailableRequest = recurrenceRuntime.requestAutomationRecurrenceActivation({
+      pilotRunId: queuedPilot.runId,
+      approvalSessionId: sessionId,
+      cadence: {
+        every: 2,
+        unit: 'hour',
+        overlapPolicy: 'skip',
+        catchUpPolicy: 'run_once',
+      },
+      previewedAt: '2026-08-27T12:00:00.000Z',
+    });
+    assert.equal(unavailableRequest.ok, false, JSON.stringify(unavailableRequest));
+    if (unavailableRequest.ok) assert.fail('judge-unavailable pilot created recurrence authority');
+    assert.equal(unavailableRequest.code, 'pilot_goal_validation_invalid');
+    assert.deepEqual(
+      recurrenceDurableState(),
+      beforeUnavailableRequest,
+      'judge-unavailable validation changed activation/receipt/card/workflow state',
+    );
+  } finally {
+    writeFileSync(runPath, runBytes, 'utf8');
+  }
+
+  const requestedRecurrence = recurrenceRuntime.requestAutomationRecurrenceActivation({
+    pilotRunId: queuedPilot.runId,
+    approvalSessionId: sessionId,
+    cadence: {
+      every: 2,
+      unit: 'hour',
+      overlapPolicy: 'skip',
+      catchUpPolicy: 'run_once',
+    },
+    previewedAt: '2026-08-27T12:00:00.000Z',
+  });
+  assert.equal(requestedRecurrence.ok, true, JSON.stringify(requestedRecurrence));
+  if (!requestedRecurrence.ok) return;
+  assert.equal(requestedRecurrence.activation.status, 'approval_pending');
+  assert.equal(requestedRecurrence.preview.interval.every, 2);
+  assert.equal(requestedRecurrence.preview.interval.unit, 'hour');
+  assert.equal(requestedRecurrence.preview.interval.overlapPolicy, 'skip');
+  assert.equal(requestedRecurrence.preview.interval.catchUpPolicy, 'run_once');
+  assert.equal(
+    recurrenceControl.listAutomationRecurrenceActivationsForReconciliation()
+      .filter((activation) => activation.activationId === requestedRecurrence.activation.activationId).length,
+    1,
+    'one durable activation row owns the consent request',
+  );
+  assert.equal(approvals.resolve(
+    requestedRecurrence.approval.approvalId,
+    'approved',
+    'human.recurrence-owner',
+  ).ok, true);
+  const reconciled = recurrenceRuntime.reconcileAutomationRecurrences();
+  assert.equal(reconciled.failed, 0, JSON.stringify(reconciled));
+  assert.ok(reconciled.active >= 1, JSON.stringify(reconciled));
+  const active = recurrenceControl.getAutomationRecurrenceActivation(
+    requestedRecurrence.activation.activationId,
+  );
+  const activationReceipt = recurrenceControl.getAutomationRecurrenceActivationReceipt(
+    requestedRecurrence.activation.activationId,
+  );
+  assert.equal(active?.status, 'active');
+  assert.ok(activationReceipt);
+  assert.equal(activationReceipt?.interval.every, 2);
+  assert.equal(activationReceipt?.interval.unit, 'hour');
+  assert.equal(workflowStore.readWorkflow(pilotSuccess.evidence.workflowId)?.data.enabled, true);
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS count
+      FROM automation_recurrence_activation_receipts
+     WHERE activation_id = ?
+  `).get(requestedRecurrence.activation.activationId) as { count: number }).count, 1);
+
+  const firstFire = await scheduler.processWorkflowSchedules(
+    new Date(requestedRecurrence.preview.firstFireAt),
+  );
+  assert.equal(
+    firstFire.fired.filter((workflowId) => workflowId === pilotSuccess.evidence.workflowId).length,
+    1,
+    JSON.stringify(firstFire),
+  );
+  const intervalRuns = () => readdirSync(shared.WORKFLOW_RUNS_DIR)
+    .filter((file) => file.endsWith('.json'))
+    .map((file) => JSON.parse(readFileSync(path.join(shared.WORKFLOW_RUNS_DIR, file), 'utf8')) as {
+      id?: string;
+      workflow?: string;
+      source?: string;
+      status?: string;
+      triggerReceiptId?: string;
+      workflowRecurringReadAdmission?: {
+        activationAuthority?: { activationId?: string };
+        occurrenceOrdinal?: number;
+        runOccurrenceId?: string;
+      };
+    })
+    .filter((run) => (
+      run.source === 'schedule'
+      && run.workflow === pilotSuccess.evidence.workflowId
+      && run.workflowRecurringReadAdmission?.activationAuthority?.activationId
+        === requestedRecurrence.activation.activationId
+    ));
+  const firstIntervalRuns = intervalRuns();
+  assert.equal(firstIntervalRuns.length, 1, JSON.stringify(firstIntervalRuns));
+  const firstIntervalRun = firstIntervalRuns[0]!;
+  assert.equal(firstIntervalRun.status, 'queued');
+  assert.equal(firstIntervalRun.workflowRecurringReadAdmission?.occurrenceOrdinal, 1);
+  assert.equal(
+    firstIntervalRun.workflowRecurringReadAdmission?.runOccurrenceId,
+    firstIntervalRun.triggerReceiptId,
+  );
+  assert.equal(
+    workflowQueue.readWorkflowTriggerReceiptAcceptance(firstIntervalRun.triggerReceiptId!),
+    firstIntervalRun.id,
+    'the first interval occurrence has one durable queue acceptance owner',
+  );
+
+  // Restart cut: forget only the scheduler cursor after the durable queue
+  // acceptance exists. The trigger receipt must adopt the same run instead of
+  // creating a second occurrence.
+  rmSync(intervalScheduler.workflowIntervalSchedulerInternalsForTest.intervalStateFile, {
+    force: true,
+  });
+  eventlog.closeEventLog();
+  const replayedFirstFire = await scheduler.processWorkflowSchedules(
+    new Date(requestedRecurrence.preview.firstFireAt),
+  );
+  assert.equal(
+    replayedFirstFire.deduped.filter((workflowId) => workflowId === pilotSuccess.evidence.workflowId).length,
+    1,
+    JSON.stringify(replayedFirstFire),
+  );
+  assert.equal(intervalRuns().length, 1, 'restart replay did not mint a second interval run');
+  assert.equal(
+    workflowQueue.readWorkflowTriggerReceiptAcceptance(firstIntervalRun.triggerReceiptId!),
+    firstIntervalRun.id,
+  );
 });

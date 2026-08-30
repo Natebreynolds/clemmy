@@ -35,8 +35,13 @@ import assert from 'node:assert/strict';
 const {
   __test__,
   bustComposioDashboardCaches,
+  listUsableConnectedToolkits,
   resetComposioClient,
 } = await import('../integrations/composio/client.js');
+const {
+  rememberToolSchema,
+  resetToolSchemaCache,
+} = await import('./composio-schema-cache.js');
 const {
   resolveComposioDispatch,
   dispatchComposioTool,
@@ -520,7 +525,7 @@ test('CLI default-account authority uses the longest known toolkit prefix and pr
   }
 });
 
-test('operator-authorized CLI default dispatches end-to-end with no false connected-account pin', async () => {
+test('operator-authorized CLI default resolves, but the prepared gateway refuses a CLI subprocess before dispatch', async () => {
   const previousBackend = process.env.COMPOSIO_BACKEND;
   const previousCliPath = process.env.COMPOSIO_CLI_PATH;
   const shimPath = path.join(TMP_HOME, 'composio-gateway-cli-proof.mjs');
@@ -550,35 +555,47 @@ test('operator-authorized CLI default dispatches end-to-end with no false connec
   resetComposioClient();
   bustComposioDashboardCaches();
   try {
+    const resolution = await withAnchoredTurn('create the proof record', () => resolveComposioDispatch(
+      'PROOF_CREATE_RECORD',
+      { fields: { Name: 'End-to-end CLI proof' } },
+      undefined,
+      {},
+    ));
+    assert.equal(resolution.ok, true, 'the durable operator grant makes the CLI default a valid destination');
+    if (resolution.ok) {
+      assert.equal(resolution.connectionId, undefined, 'CLI resolution never invents a targetable SDK account');
+      assert.ok(resolution.notes.some((note) => /operator authority scoped specifically to proof/i.test(note)));
+    }
+
+    rememberToolSchema(
+      'PROOF_CREATE_RECORD',
+      {
+        type: 'object',
+        additionalProperties: false,
+        required: ['fields'],
+        properties: { fields: { type: 'object', additionalProperties: true } },
+      },
+      Date.now(),
+      '20260827_01',
+      { type: 'object', additionalProperties: true },
+    );
     const out = await withAnchoredTurn('create the proof record', () => dispatchComposioTool(
       'PROOF_CREATE_RECORD',
       { fields: { Name: 'End-to-end CLI proof' } },
       {},
     ));
-    assert.equal(out.ok, true, 'the gateway must reach the real CLI client path, not stop at resolver-only ok:true');
-    if (out.ok) {
-      assert.equal(out.connectionId, undefined, 'CLI execute has no account selector; never claim a routed SDK owner');
-      assert.deepEqual(out.result, {
-        successful: true,
-        data: {
-          slug: 'PROOF_CREATE_RECORD',
-          arguments: { fields: { Name: 'End-to-end CLI proof' } },
-        },
-      });
+    assert.equal(out.ok, false, 'operator account authority does not substitute for an exact one-request carrier');
+    if (!out.ok) {
+      assert.equal(out.reason, 'invalid-args');
+      assert.match(out.message, /CLI cannot prove one provider request/i);
+      assert.match(out.message, /No provider dispatch was started/i);
     }
     const invocations = readFileSync(shimLog, 'utf-8')
       .trim()
       .split(/\r?\n/)
       .map((line) => JSON.parse(line) as string[]);
     const executes = invocations.filter((argv) => argv[0] === 'execute');
-    assert.equal(executes.length, 1, 'exactly one provider dispatch');
-    assert.deepEqual(executes[0]?.slice(0, 3), [
-      'execute',
-      'PROOF_CREATE_RECORD',
-      '-d',
-    ]);
-    assert.ok(!JSON.stringify(executes[0]).includes('connected_account_id'));
-    assert.ok(!JSON.stringify(executes[0]).includes('ca_'));
+    assert.equal(executes.length, 0, 'the prepared business gateway never spawns an unbounded CLI execute');
   } finally {
     __gatewayTest__.setRuntimeStatusLoader(null);
     delete process.env.CLEMMY_COMPOSIO_SHIM_LOG;
@@ -587,6 +604,7 @@ test('operator-authorized CLI default dispatches end-to-end with no false connec
     await revokeComposioCliDefaultAccountAuthority('proof');
     if (previousBackend === undefined) delete process.env.COMPOSIO_BACKEND;
     else process.env.COMPOSIO_BACKEND = previousBackend;
+    resetToolSchemaCache();
     resetComposioClient();
     bustComposioDashboardCaches();
   }
@@ -948,17 +966,52 @@ test('worker compose-only boundary: mutations dispatch zero, reads work, and the
   process.env.COMPOSIO_API_KEY = 'worker-compose-boundary-test-key';
   const workerAnchor = anchoredCtx('compose the outlook draft for the worker boundary');
   const sessionId = workerAnchor.sessionId;
-  setAccounts([account('ca_worker_outlook', 'outlook', 'worker-owner@example.test')]);
-  let providerDispatches = 0;
-  __test__.setComposioClient({
-    tools: {
-      execute: async (slug: string) => {
-        providerDispatches += 1;
-        return slug === 'OUTLOOK_LIST_MESSAGES'
-          ? { successful: true, data: { messages: [] } }
-          : { successful: true, data: { id: 'draft-parent-1' } };
+  setAccounts([{
+    ...account('ca_worker_outlook', 'outlook', 'worker-owner@example.test'),
+    user_id: 'worker-owner-provider-id',
+  }]);
+  await listUsableConnectedToolkits({ requireFresh: true });
+  const observedAt = Date.now();
+  rememberToolSchema(
+    'OUTLOOK_LIST_MESSAGES',
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: { folder: { type: 'string' } },
+    },
+    observedAt,
+    '20260827_01',
+    { type: 'object', additionalProperties: true },
+  );
+  rememberToolSchema(
+    'OUTLOOK_CREATE_DRAFT',
+    {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        to_email: { type: 'string' },
+        subject: { type: 'string' },
+        body: { type: 'string' },
       },
     },
+    observedAt,
+    '20260827_01',
+    { type: 'object', additionalProperties: true },
+  );
+  let providerDispatches = 0;
+  const providerTools = {
+    execute: async (slug: string) => {
+      providerDispatches += 1;
+      return slug === 'OUTLOOK_LIST_MESSAGES'
+        ? { successful: true, error: null, data: { messages: [] } }
+        : { successful: true, error: null, data: { id: 'draft-parent-1' } };
+    },
+  };
+  __test__.setComposioClient({
+    tools: providerTools,
+    getClient: () => ({
+      withOptions: () => ({ tools: providerTools }),
+    }),
   });
   try {
     await harnessRunContextStorage.run({
@@ -983,7 +1036,7 @@ test('worker compose-only boundary: mutations dispatch zero, reads work, and the
         sessionId,
         connectedAccountId: 'ca_worker_outlook',
       });
-      assert.equal(read.ok, true, 'worker Composio reads remain executable');
+      assert.equal(read.ok, true, `worker Composio reads remain executable: ${JSON.stringify(read)}`);
       assert.equal(providerDispatches, 1, 'the allowed worker read dispatches exactly once');
     });
 
@@ -1004,6 +1057,7 @@ test('worker compose-only boundary: mutations dispatch zero, reads work, and the
     assert.equal(workerBlocks.length, 1, 'the compose-only refusal is ledgered exactly once');
   } finally {
     __test__.setConnectedAccountsLoader(null);
+    resetToolSchemaCache();
     resetComposioClient();
     if (previousApiKey === undefined) delete process.env.COMPOSIO_API_KEY;
     else process.env.COMPOSIO_API_KEY = previousApiKey;

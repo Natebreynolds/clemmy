@@ -214,6 +214,51 @@ test('read_parallel_v1 specialist topology round-trips through write→read', ()
   assert.match(readFileSync(wf!.filePath, 'utf-8'), /mode: read_parallel_v1/);
 });
 
+test('reviewed transform expression round-trips byte-for-byte through write→read', () => {
+  const transform = {
+    version: 1 as const,
+    expression: {
+      op: 'object' as const,
+      fields: [
+        { key: 'rows', value: { op: 'get' as const, from: 'steps.pull.output.data.records' } },
+        {
+          key: 'count',
+          value: {
+            op: 'count' as const,
+            value: { op: 'get' as const, from: 'steps.pull.output.data.records' },
+          },
+        },
+        {
+          key: 'content',
+          value: {
+            op: 'jsonStringify' as const,
+            value: { op: 'get' as const, from: 'steps.pull.output.data.records' },
+          },
+        },
+      ],
+    },
+  };
+  writeWorkflow('transform-rt', {
+    name: 'transform-rt',
+    description: 'Reviewed transform round trip.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      { id: 'pull', prompt: 'Pull records.', sideEffect: 'read' },
+      {
+        id: 'shape',
+        prompt: '',
+        dependsOn: ['pull'],
+        sideEffect: 'read',
+        transform,
+        output: { type: 'object', required_keys: ['rows', 'count', 'content'] },
+      },
+    ],
+  });
+
+  assert.deepEqual(readWorkflow('transform-rt')?.data.steps[1]?.transform, transform);
+});
+
 test('malformed hand-authored subgraph is preserved and rejected instead of silently flattened', () => {
   const dir = path.join(WORKFLOWS_DIR, 'subgraph-invalid');
   mkdirSync(dir, { recursive: true });

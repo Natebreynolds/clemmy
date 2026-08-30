@@ -8,6 +8,10 @@ import {
   restoreLegacyInstructionOrder,
   estimateTokens,
   CACHE_BREAK_SENTINEL,
+  CACHE_MEMORY_APPEND_DELIM,
+  CACHE_MEMORY_APPEND_SENTINEL,
+  CACHE_MEMORY_CONTEXT_SENTINEL,
+  CACHE_MEMORY_CONTEXT_DELIM,
   INSTRUCTION_CACHE_DELIM,
 } from './model-wire-registry.js';
 
@@ -74,16 +78,37 @@ test('sentinel: stripCacheBreakSentinel replaces the marker with a plain separat
   assert.equal(stripCacheBreakSentinel(undefined), '');
 });
 
-test('restoreLegacyInstructionOrder: rebuilds the EXACT pre-parity dynamic-first order (Codex byte-identity)', () => {
+test('restoreLegacyInstructionOrder: a no-memory turn suffix remains role-first', () => {
   const role = 'ROLE INSTRUCTIONS BODY';
-  const ctx = 'DYNAMIC CONTEXT\n## Focus\n- x';
-  const assembledParity = `${role}${INSTRUCTION_CACHE_DELIM}${ctx}`; // what the assembler emits, parity on
-  const legacy = `${ctx}\n\n---\n\n${role}`; // what it emitted before
-  assert.equal(restoreLegacyInstructionOrder(assembledParity), legacy);
+  const turn = 'CURRENT TURN AUTHORITY';
+  const assembledParity = `${role}${INSTRUCTION_CACHE_DELIM}${turn}`;
+  assert.equal(restoreLegacyInstructionOrder(assembledParity), `${role}\n\n${turn}`);
   assert.equal(restoreLegacyInstructionOrder(assembledParity).includes(CACHE_BREAK_SENTINEL), false);
   // No sentinel → unchanged (sub-agent prompt that didn't pass through the assembler).
   assert.equal(restoreLegacyInstructionOrder('plain role only'), 'plain role only');
   assert.equal(restoreLegacyInstructionOrder(undefined), '');
+});
+
+test('layered restore appends externally-rendered Tool Memory exactly once', () => {
+  const role = 'ROLE';
+  const turn = 'CURRENT TURN AUTHORITY';
+  const externalMemory = 'LEARNED TOOL MEMORY';
+  const assembled = `${role}${INSTRUCTION_CACHE_DELIM}${turn}${CACHE_MEMORY_APPEND_DELIM}${externalMemory}`;
+  const restored = restoreLegacyInstructionOrder(assembled);
+  assert.equal(restored, `${role}\n\n${turn}\n\n${externalMemory}`);
+  assert.equal(restored.split(externalMemory).length - 1, 1);
+  assert.equal(restored.includes(CACHE_MEMORY_APPEND_SENTINEL), false);
+});
+
+test('layered restore keeps legacy memory-first order and strips both transport markers', () => {
+  const role = 'ROLE';
+  const turn = 'CURRENT TURN CATALOG';
+  const memory = 'CURRENT MEMORY';
+  const assembled = `${role}${INSTRUCTION_CACHE_DELIM}${turn}${CACHE_MEMORY_CONTEXT_DELIM}${memory}`;
+  const restored = restoreLegacyInstructionOrder(assembled);
+  assert.equal(restored, `${memory}\n\n---\n\n${role}\n\n${turn}`);
+  assert.equal(restored.includes(CACHE_BREAK_SENTINEL), false);
+  assert.equal(restored.includes(CACHE_MEMORY_CONTEXT_SENTINEL), false);
 });
 
 test('estimateTokens is roughly chars/4', () => {

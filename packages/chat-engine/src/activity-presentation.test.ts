@@ -13,7 +13,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import test from 'node:test';
-import { presentWorkingNow, type WorkingNowEntryLike } from './activity-presentation.js';
+import { narrateActivity, presentWorkingNow, type WorkingNowEntryLike } from './activity-presentation.js';
+import type { ActivityItem } from './types.js';
 
 function entry(overrides: Partial<WorkingNowEntryLike> & { runKey: string }): WorkingNowEntryLike {
   return {
@@ -123,4 +124,31 @@ test('every Working-Now surface renders the shared presenter', () => {
   for (const forbidden of ['needsAttention', 'listWorkingNow', 'ActivityEntry']) {
     assert.ok(!topBar.includes(forbidden), `TopBar reaches into raw activity data (${forbidden})`);
   }
+});
+
+test('live discovery stand-in names the current phase, not the first lookup forever', () => {
+  const row = (over: Partial<ActivityItem> & { label: string }): ActivityItem => ({
+    id: over.label + Math.random(),
+    kind: 'tool',
+    status: 'done',
+    ...over,
+  });
+  const looking = narrateActivity([
+    row({ label: 'tool_search', status: 'running', startedAt: 1 }),
+  ], { live: true });
+  assert.equal(looking[0]?.label, 'Finding the right tool…');
+  assert.equal(looking[0]?.status, 'running');
+
+  const waiting = narrateActivity([
+    row({ label: 'tool_search', status: 'done', startedAt: 1 }),
+  ], { live: true });
+  assert.equal(waiting[0]?.label, 'Working on it…',
+    'after lookup settles, the stand-in is the wait on the next step');
+  assert.equal(waiting[0]?.status, 'running');
+
+  const planned = narrateActivity([
+    row({ label: 'tool_search', status: 'done' }),
+    row({ label: 'plan task', status: 'running' }),
+  ], { live: true });
+  assert.equal(planned[0]?.label, 'plan task');
 });

@@ -1,6 +1,5 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
 import {
-  stepLooksMultiItemWithoutForEach,
   validateWorkflowDefinition,
   type WorkflowFrontmatter,
   type WorkflowStepShape,
@@ -58,6 +57,7 @@ function toFrontmatter(def: WorkflowDefinition): WorkflowFrontmatter {
       // effectful specialist graphs cannot bypass the validator and later run
       // as an accidental flat step.
       subgraph: s.subgraph,
+      transform: s.transform,
       deterministic: s.deterministic,
       call: s.call,
       invocationPlan: s.invocationPlan,
@@ -366,6 +366,7 @@ function executionSurfaceProjection(def: WorkflowDefinition): string {
       forEach: s.forEach ?? null,
       forEachNewOnly: s.forEachNewOnly ?? false,
       subgraph: s.subgraph ?? null,
+      transform: s.transform ?? null,
       deterministic: s.deterministic ?? null,
       call: s.call ?? null,
       allowedTools: s.allowedTools ?? [],
@@ -434,9 +435,9 @@ export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
       );
       continue;
     }
-    if (step.forEach || step.deterministic) {
+    if (step.forEach || step.transform || step.deterministic) {
       errors.push(
-        `Step "${step.id}" declares loop_until on a ${step.forEach ? 'forEach' : 'deterministic'} step — loop_until applies to plain LLM steps only. Remove loop_until or restructure the step.`,
+        `Step "${step.id}" declares loop_until on a ${step.forEach ? 'forEach' : step.transform ? 'transform' : 'deterministic'} step — loop_until applies to plain LLM steps only. Remove loop_until or restructure the step.`,
       );
       continue;
     }
@@ -695,43 +696,6 @@ export function autoRepairWorkflowDefinition(
   let contractChanged = false;
   let goalChanged = false;
   let repairedGoal = def.goal;
-  // T2.4: multi-item prose without forEach is the single most common
-  // loop-authoring defect — the step saves, runs serially in one context, and
-  // silently drops the tail of the list. When exactly ONE upstream dependency
-  // declares an array-ish output (type 'array' or a min_items contract), the
-  // fan-out is mechanically derivable: wire forEach to that upstream.
-  // Ambiguous cases (zero or multiple array upstreams) keep today's warning.
-  for (const step of steps) {
-    if (step.forEach || step.deterministic) continue;
-    if (!step.prompt || !stepLooksMultiItemWithoutForEach({ id: step.id, prompt: step.prompt, forEach: step.forEach, output: step.output as Record<string, unknown> | undefined })) continue;
-    const arrayUpstreams = (step.dependsOn ?? []).filter((depId) => {
-      const dep = steps.find((s) => s.id === depId);
-      const out = dep?.output;
-      return Boolean(out && (out.type === 'array' || (out.min_items && Object.keys(out.min_items).length > 0)));
-    });
-    if (arrayUpstreams.length !== 1) continue;
-    // NEVER auto-fan-out an effectful step. Adding forEach turns ONE crossing
-    // into N -- one per item -- so on a write/send step this repair would
-    // silently multiply an irreversible effect the user never approved (N
-    // emails, N posts, N rows) purely because an upstream happened to return an
-    // array. Fanning out a READ is safe and is the case this repair was written
-    // for; everything else keeps today's advisory and stays the author's call.
-    const fanoutClass = classifyStepSideEffect({
-      ...(step.prompt ? { prompt: step.prompt } : {}),
-      ...(step.sideEffect ? { sideEffect: step.sideEffect } : {}),
-      ...(step.allowedTools ? { allowedTools: step.allowedTools } : {}),
-      ...(step.usesSkill ? { usesSkill: step.usesSkill } : {}),
-      ...(step.call?.tool ? { call: { tool: step.call.tool } } : {}),
-    });
-    // Only a proven READ fans out automatically. 'unknown' is excluded too --
-    // an unclassifiable step is exactly the one not to multiply silently.
-    if (fanoutClass !== 'read') continue;
-    step.forEach = arrayUpstreams[0];
-    repairs.push(
-      `Added forEach: "${arrayUpstreams[0]}" to step "${step.id}" — its prompt is multi-item work, and "${arrayUpstreams[0]}" produces the array; the runner now fans out per item (bounded concurrency, per-item resume) instead of running the whole list serially in one context.`,
-    );
-  }
-
   const proposalBase: WorkflowDefinition = {
     ...def,
     steps,

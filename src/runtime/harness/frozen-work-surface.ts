@@ -6,10 +6,16 @@
  * frozen, and (2) names a unique proven how when memory or the connected
  * catalog can do so without guessing.
  */
-import { documentedComposioOperationSemantic } from '../../integrations/composio/operation-semantics.js';
 import { peekToolChoice } from '../../memory/tool-choice-store.js';
+import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import type { AcceptedTaskWorkContractV1 } from './expected-work-contract.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { getTurnGraphEventForSource } from './eventlog.js';
+import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
+import {
+  isCurrentCallableCatalogEntry,
+  peekHostCapabilityCatalogFactory,
+} from './host-capability-catalog-factory.js';
 import {
   validatedTurnSourceStrategyBinding,
   type TurnSourceStrategyBindingV1,
@@ -22,6 +28,16 @@ export interface FrozenNodeToolBinding {
   requirementId: string;
   identifier: string;
   source: 'source_strategy' | 'memory_pin' | 'catalog_semantic';
+}
+
+/** Provider-neutral create candidate. `bindingIdentity` distinguishes two
+ * accounts/definitions that happen to expose the same operation spelling. */
+export interface FrozenCatalogBindingDescriptorV1 {
+  identifier: string;
+  bindingIdentity: string;
+  effect: 'local_write' | 'external_write' | 'read' | 'admin' | 'other';
+  destinationFamily: string | null;
+  destinationPosture: 'create_new' | 'named_existing' | null;
 }
 
 /** Exact-intent structural pins, never fuzzy recall of the user's sentence. */
@@ -50,6 +66,34 @@ export function loadBoundExpectedWorkContract(
   return loaded.status === 'ok' ? loaded.contract : null;
 }
 
+/** Exact single create sink from the same durable graph frozen into the work
+ * contract. Multiple/no create sinks are intentionally not a binding hint. */
+export function frozenCreateDestinationFamily(
+  contract: AcceptedTaskWorkContractV1,
+): string | null {
+  const graph = turnGraphFromShadowEvent(getTurnGraphEventForSource(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+  ));
+  if (
+    !graph
+    || graph.graphId !== contract.graphId
+    || graph.compiler.graphHash !== contract.graphHash
+    || graph.identity.turn !== contract.identity.turn
+  ) return null;
+  const goal = graph.classification.goalConstraints;
+  const destinations = goal?.destinations?.length
+    ? goal.destinations
+    : goal?.destination
+      ? [goal.destination]
+      : [];
+  const createFamilies = [...new Set(destinations
+    .filter((destination) => destination.posture === 'create_new')
+    .map((destination) => destination.family.trim())
+    .filter(Boolean))];
+  return createFamilies.length === 1 ? createFamilies[0]! : null;
+}
+
 function formatOperationLine(operation: AcceptedTaskWorkContractV1['operations'][number]): string {
   const coverage = operation.coverage ? ` coverage=${operation.coverage}` : '';
   const cardinality = operation.cardinality.kind === 'each'
@@ -71,25 +115,81 @@ export function formatFrozenWorkAuthority(contract: AcceptedTaskWorkContractV1):
   ].join('\n');
 }
 
-/** A unique connected create-from-set tool may name the write node. */
-export function uniqueCatalogCreateBinding(
+function descriptorsForCatalogIdentifiers(
   catalogIdentifiers: readonly string[],
-): string | null {
-  const creates = new Map<string, string>();
-  for (const name of catalogIdentifiers) {
-    const trimmed = name.trim();
-    if (!trimmed) continue;
-    const semantic = documentedComposioOperationSemantic(trimmed);
-    if (semantic?.consequence !== 'create' || !semantic.rootArtifact) continue;
-    const family = `${semantic.rootArtifact.provider}:${semantic.rootArtifact.kind}`;
-    if (!creates.has(family)) creates.set(family, trimmed);
+): FrozenCatalogBindingDescriptorV1[] {
+  const requested = new Set(catalogIdentifiers.map((name) => name.trim()).filter(Boolean));
+  const descriptors: FrozenCatalogBindingDescriptorV1[] = [];
+  for (const entry of peekHostCapabilityCatalogFactory()?.snapshot() ?? []) {
+    const manifest = entry.manifest;
+    if (!manifest || (!requested.has(entry.toolName) && !requested.has(manifest.operationId))) continue;
+    if (!isCurrentCallableCatalogEntry(entry)) continue;
+    descriptors.push({
+      identifier: entry.toolName,
+      bindingIdentity: entry.manifestDigest,
+      effect: manifest.effect === 'local_write' || manifest.effect === 'external_write'
+        || manifest.effect === 'read' || manifest.effect === 'admin'
+        ? manifest.effect
+        : 'other',
+      destinationFamily: manifest.destination?.family?.trim() || null,
+      destinationPosture: manifest.destination?.posture === 'create_new'
+        || manifest.destination?.posture === 'named_existing'
+        ? manifest.destination.posture
+        : null,
+    });
   }
-  return creates.size === 1 ? creates.values().next().value ?? null : null;
+  // Local declarations are adapter-authored descriptors. They can name a how,
+  // but the later local-definition revalidation still owns execution authority.
+  for (const declaration of TOOL_REGISTRY) {
+    if (!requested.has(declaration.name) || !declaration.localPlanning) continue;
+    descriptors.push({
+      identifier: declaration.name,
+      bindingIdentity: `local_registry:${declaration.name}`,
+      effect: declaration.sideEffect === 'write'
+        ? 'local_write'
+        : declaration.sideEffect === 'read'
+          ? 'read'
+          : declaration.sideEffect === 'admin'
+            ? 'admin'
+            : 'other',
+      destinationFamily: declaration.localPlanning.deliverableKind.trim() || null,
+      destinationPosture: declaration.localPlanning.destinationPosture,
+    });
+  }
+  return descriptors;
+}
+
+/** A unique sealed/adaptor-authored create capability may name the write node. */
+export function uniqueCatalogCreateBinding(
+  catalog: readonly (string | FrozenCatalogBindingDescriptorV1)[],
+  destinationFamily: string | null | undefined,
+): string | null {
+  const requiredFamily = String(destinationFamily ?? '').trim();
+  if (!requiredFamily) return null;
+  const direct = catalog.filter((item): item is FrozenCatalogBindingDescriptorV1 => (
+    typeof item !== 'string'
+  ));
+  const identifiers = catalog.filter((item): item is string => typeof item === 'string');
+  const candidates = [...direct, ...descriptorsForCatalogIdentifiers(identifiers)];
+  const creates = new Map<string, FrozenCatalogBindingDescriptorV1>();
+  for (const descriptor of candidates) {
+    if (
+      (descriptor.effect !== 'external_write' && descriptor.effect !== 'local_write')
+      || descriptor.destinationPosture !== 'create_new'
+      || descriptor.destinationFamily !== requiredFamily
+      || !descriptor.identifier.trim()
+      || !descriptor.bindingIdentity.trim()
+    ) continue;
+    creates.set(descriptor.bindingIdentity, descriptor);
+  }
+  return creates.size === 1 ? creates.values().next().value?.identifier ?? null : null;
 }
 
 export function resolveFrozenNodeBindings(input: {
   contract: AcceptedTaskWorkContractV1;
   catalogIdentifiers?: readonly string[];
+  catalogDescriptors?: readonly FrozenCatalogBindingDescriptorV1[];
+  destinationFamily?: string | null;
   sourceStrategyBinding?: TurnSourceStrategyBindingV1;
 }): FrozenNodeToolBinding[] {
   const bindings: FrozenNodeToolBinding[] = [];
@@ -136,7 +236,10 @@ export function resolveFrozenNodeBindings(input: {
       });
       continue;
     }
-    const catalog = uniqueCatalogCreateBinding(input.catalogIdentifiers ?? []);
+    const catalog = uniqueCatalogCreateBinding(
+      [...(input.catalogIdentifiers ?? []), ...(input.catalogDescriptors ?? [])],
+      input.destinationFamily,
+    );
     if (catalog) {
       bindings.push({
         requirementId: operation.id,
@@ -159,12 +262,16 @@ export function formatFrozenNodeBindings(bindings: readonly FrozenNodeToolBindin
 export function formatFrozenWorkCallDescription(input: {
   frozenContract?: AcceptedTaskWorkContractV1 | null;
   catalogIdentifiers?: readonly string[];
+  catalogDescriptors?: readonly FrozenCatalogBindingDescriptorV1[];
+  destinationFamily?: string | null;
   sourceStrategyBinding?: TurnSourceStrategyBindingV1;
 }): string | null {
   if (!input.frozenContract) return null;
   const bindings = resolveFrozenNodeBindings({
     contract: input.frozenContract,
     catalogIdentifiers: input.catalogIdentifiers,
+    catalogDescriptors: input.catalogDescriptors,
+    destinationFamily: input.destinationFamily,
     sourceStrategyBinding: input.sourceStrategyBinding,
   });
   return [

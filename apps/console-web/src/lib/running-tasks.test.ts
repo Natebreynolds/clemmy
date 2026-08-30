@@ -126,10 +126,11 @@ test('the running-task affordance mounts at every continuable desktop composer, 
   );
 
   const drawer = readFileSync(new URL('../components/chat/RunningTasksDrawer.tsx', import.meta.url), 'utf8');
-  assert.match(drawer, /const rows = \(activity\.data\?\.entries \?\? \[\]\)\.slice\(0, MAX_RENDERED_TASKS\)/);
-  assert.match(drawer, /const total = activity\.data\?\.entries\.length \?\? 0/);
-  assert.match(drawer, /\{total\} current \{total === 1 \? 'task' : 'tasks'\}/);
-  assert.match(drawer, />Current · \{total\}</);
+  assert.match(drawer, /const view = presentWorkingNow\([\s\S]*activity\.data\?\.entries \?\? \[\][\s\S]*activity\.data\?\.observedAt \?\? ''[\s\S]*\)/);
+  assert.match(drawer, /const rows = view\.entries\.slice\(0, MAX_RENDERED_TASKS\)/);
+  assert.match(drawer, /const total = view\.total/);
+  assert.match(drawer, /const pillLabel = view\.label/);
+  assert.equal(drawer.match(/\{pillLabel\}/g)?.length, 2, 'trigger and drawer header share one presenter label');
   assert.doesNotMatch(drawer, /more running|\{total\} running|>Running · \{total\}</,
     'aggregate copy must not flatten queued, waiting, blocked, or paused rows into running');
   assert.match(drawer, /total === 0 && !activity\.isLoading[\s\S]*composerRef\.current\?\.focus\(\)/,

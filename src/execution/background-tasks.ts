@@ -102,6 +102,24 @@ import {
 
 const logger = pino({ name: 'clementine-next.background-tasks' });
 
+type BackgroundResponseExecutor = (
+  assistant: ClementineAssistant,
+  request: Parameters<typeof respondPreferHarness>[1],
+) => Promise<AssistantResponse>;
+
+const defaultBackgroundResponseExecutor: BackgroundResponseExecutor = (assistant, request) =>
+  respondPreferHarness('background', request, (nextRequest) => assistant.respond(nextRequest));
+
+let backgroundResponseExecutor: BackgroundResponseExecutor = defaultBackgroundResponseExecutor;
+
+/** Test-only seam for lifecycle fixtures that need to supply an exact worker
+ * response. Production always retains the canonical harness bridge above. */
+export function _setBackgroundResponseExecutorForTests(
+  executor: BackgroundResponseExecutor | null,
+): void {
+  backgroundResponseExecutor = executor ?? defaultBackgroundResponseExecutor;
+}
+
 type DrainApprovalResolver = typeof import('./approval-drain.js')['resolveDrainApproval'];
 let drainApprovalResolverForTests: DrainApprovalResolver | null = null;
 
@@ -5653,13 +5671,14 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      let contractSuperseded = false;
 	      while (true) {
 	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
-	        // gated harness loop; legacy fallback only pre-run. The shouldCancel
+	        // gated harness loop; the test executor above defaults to this bridge.
+	        // The shouldCancel
 	        // deadline contract is preserved — the bridge maps it onto the harness
 	        // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
 	        // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
 	        const remainingWallMs = Math.max(1, wallClockDeadlineMs - Date.now());
 	        const requestedModel = task.model ?? MODELS.deep;
-	        response = await respondPreferHarness('background', {
+	        response = await backgroundResponseExecutor(assistant, {
 	          sessionId: task.runSessionId,
 	          channel: task.channel ?? 'background',
 	          userId: task.userId,
@@ -5719,7 +5738,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	              },
 	            });
 	          },
-	        }, (req) => assistant.respond(req));
+	        });
 	        task = recordBackgroundTaskRoute(task, run.id, response, requestedModel);
 	        const latestContractTask = getBackgroundTask(task.id);
 	        if ((latestContractTask?.contractVersion ?? 1) > acceptedContractVersion) {

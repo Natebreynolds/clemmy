@@ -12,6 +12,7 @@ import { actionExpectedWorkState } from './expected-work-admission.js';
 import {
   expectedTaskFor,
   finalizeResolutionAgainstExpectedWork,
+  resolvedOperationsFor,
 } from './resolution-ledger.js';
 import { compileObligationManifest } from './obligation-manifest.js';
 import {
@@ -56,6 +57,48 @@ export type AcceptedTaskTerminalPreparation =
       reason: string;
       missing?: string[];
     };
+
+export interface PendingAcceptedReadPlan {
+  contractId: string;
+  requirementIds: string[];
+  readyRequirementIds: string[];
+}
+
+/**
+ * Exact durable shape that may receive one automatic execution continuation:
+ * the foreground model already froze a non-empty read-only plan, but no
+ * accepted business operation has begun to discharge it.
+ *
+ * This is intentionally narrower than "terminal evidence is incomplete".
+ * Writes/admin work never auto-continue from this predicate, deterministic
+ * retrieve contracts keep their existing lane, and partial plans are left to
+ * their normal dependency/recovery machinery. A store read failure also
+ * returns null; this helper grants continuation, never terminal permission.
+ */
+export function pendingAcceptedReadPlan(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): PendingAcceptedReadPlan | null {
+  const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+  if (
+    loaded.status !== 'ok'
+    || loaded.contract.plannerSource !== 'structured_model'
+    || loaded.contract.operations.length === 0
+    || loaded.contract.operations.some((operation) => operation.effect !== 'read')
+  ) return null;
+  const observed = resolvedOperationsFor(input.sessionId, input.sourceUserSeq);
+  if (observed.length !== 0) return null;
+  const requirementIds = loaded.contract.operations.map((operation) => operation.id);
+  const readyRequirementIds = loaded.contract.operations
+    .filter((operation) => operation.dependsOn.length === 0)
+    .map((operation) => operation.id);
+  if (readyRequirementIds.length === 0) return null;
+  return {
+    contractId: loaded.contract.contractId,
+    requirementIds,
+    readyRequirementIds,
+  };
+}
 
 function boundedReason(value: unknown): string {
   return String(value instanceof Error ? value.message : value).replace(/\s+/g, ' ').slice(0, 300);
@@ -430,6 +473,45 @@ function sourceHasCertifiedLocalRegistryRead(
 
 type AcceptedSourceFreshnessRequirement = 'none' | 'current_state';
 
+const CURRENT_STATE_SOURCE_PATTERN =
+  /\b(?:today|tonight|now|currently|current|latest|newest|most\s+recent|right\s+now|up[ -]to[ -]date|what\s+(?:time|day|date)|time\s+is\s+it|this\s+(?:morning|afternoon|evening|week|month|quarter|year))\b/i;
+
+function acceptedSourceText(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): string | null {
+  try {
+    const source = listEvents(input.sessionId, {
+      sinceSeq: input.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    })[0];
+    if (!source || source.seq !== input.sourceUserSeq) return null;
+    return typeof source.data.text === 'string' ? source.data.text : null;
+  } catch {
+    return null;
+  }
+}
+
+function acceptedSourceRequestsCurrentState(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  const text = acceptedSourceText(input);
+  return text !== null && CURRENT_STATE_SOURCE_PATTERN.test(text);
+}
+
+function acceptedSourceRequestsCatalogIntrospection(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  const text = acceptedSourceText(input);
+  if (text === null) return false;
+  return /\b(?:which|what)\s+(?:tools?|capabilit(?:y|ies)|integrations?)\b/i.test(text)
+    || /\b(?:tools?|capabilit(?:y|ies)|integrations?)\s+(?:are|is)\s+(?:available|enabled|connected|installed)\b/i.test(text)
+    || /\b(?:tool|capability|integration)\s+catalog\b/i.test(text);
+}
+
 function acceptedSourceFreshnessRequirement(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -437,18 +519,62 @@ function acceptedSourceFreshnessRequirement(input: {
   try {
     const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
     if (expected.status !== 'ok' || expected.graph.classification.route !== 'retrieve') return 'none';
-    const source = listEvents(input.sessionId, {
-      sinceSeq: input.sourceUserSeq - 1,
-      types: ['user_input_received'],
-      limit: 1,
-    })[0];
-    if (!source || source.seq !== input.sourceUserSeq) return 'none';
-    const text = typeof source.data.text === 'string' ? source.data.text : '';
-    return /\b(?:today|tonight|now|currently|current|latest|newest|most\s+recent|right\s+now|up[ -]to[ -]date|what\s+(?:time|day|date)|time\s+is\s+it|this\s+(?:morning|afternoon|evening|week|month|quarter|year))\b/i.test(text)
+    return acceptedSourceRequestsCurrentState(input)
       ? 'current_state'
       : 'none';
   } catch {
     return 'none';
+  }
+}
+
+function acceptedSourceRequiresBusinessRead(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  // When the catalog itself is the requested information, tool_search is the
+  // business answer rather than preparation for some external read. A failed
+  // catalog lookup may still be reported conversationally and must not be
+  // mislabeled as an unperformed provider operation.
+  if (acceptedSourceRequestsCatalogIntrospection(input)) return false;
+  try {
+    const expected = expectedTaskFor(input.sessionId, input.sourceUserSeq);
+    if (expected.status === 'ok') return expected.graph.classification.route === 'retrieve';
+  } catch { /* fall through to the source-local current-state signal */ }
+  // Host-v1 can start discovery before graph persistence. In that exact gap,
+  // current-state wording is the narrow source-local proof that a catalog
+  // lookup was only preparation for a business read, not the requested result.
+  return acceptedSourceRequestsCurrentState(input);
+}
+
+/**
+ * Did this source itself decide it needed to ACT?
+ *
+ * A turn with no admitted expected-work contract looks, from the contract table
+ * alone, exactly like ordinary conversation. It is not the same thing: a turn
+ * that reached for plan_task and never got one admitted is action work that
+ * FAILED to admit, and answering it as conversation lets a turn which provably
+ * performed nothing publish a confident specific answer.
+ *
+ * Live 2026-08-26: seven refused plan_task attempts, zero business calls, and a
+ * terminal that read "I can confirm 120 accounts across 8 active sellers" —
+ * both figures invented. The attempts are durable; the intent is not a guess.
+ */
+function sourceAttemptedActionAdmission(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    return openEventLog().prepare(`
+      SELECT 1 FROM events
+       WHERE session_id = ? AND type = 'tool_called'
+         AND json_extract(data_json, '$.sourceUserSeq') = ?
+         AND json_extract(data_json, '$.tool') = 'plan_task'
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq) !== undefined;
+  } catch {
+    // Unreadable history cannot manufacture permission to answer, but it also
+    // must not invent a hold: the existing gates below still apply.
+    return false;
   }
 }
 
@@ -467,6 +593,86 @@ function sourceHasFreshReadEvidence(input: {
   } catch {
     return false;
   }
+}
+
+/**
+ * A pre-planning discovery attempt is durable intent, but only a successful
+ * governor outcome says discovery produced a usable capability. Host-v1 can
+ * begin this lane before expected-task authority is persisted; if every exact
+ * tool_search owner timed out, failed, or was refused, the contract tables
+ * alone make the turn look like ordinary conversation.
+ *
+ * Bind negative outcomes to the canonical top-level call ids for this source.
+ * A successful discovery wins here: catalog/tool-introspection answers are
+ * legitimate control-plane results and must retain their existing path.
+ */
+function sourceAttemptedOnlyFailedDiscovery(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    const events = turnEventsForWorkEvidence(input.sessionId, input.sourceUserSeq);
+    const callIds = new Set(events
+      .filter((event) => event.type === 'tool_called')
+      .filter((event) => event.data.sourceUserSeq === input.sourceUserSeq)
+      .filter((event) => event.data.tool === 'tool_search')
+      .filter((event) => event.data.accounting === 'top_level')
+      .map((event) => exactCanonicalCallId(event.data))
+      .filter((callId): callId is string => callId !== null));
+    if (callIds.size === 0) return false;
+
+    const exactDiscoveryEvent = (event: ReturnType<typeof turnEventsForWorkEvidence>[number]): boolean =>
+      event.data.sourceUserSeq === input.sourceUserSeq
+      && typeof event.data.callId === 'string'
+      && callIds.has(event.data.callId);
+    if (events.some((event) =>
+      event.type === 'discovery_governor_outcome'
+      && exactDiscoveryEvent(event)
+      && event.data.outcome === 'succeeded')) return false;
+
+    return events.some((event) => {
+      if (!exactDiscoveryEvent(event)) return false;
+      if (event.type === 'discovery_governor_outcome') {
+        return event.data.outcome === 'failed' || event.data.outcome === 'timed_out';
+      }
+      if (event.type === 'discovery_governor_decision') return event.data.decision === 'denied';
+      if (event.type !== 'tool_attempt_settled' || event.data.tool !== 'tool_search') return false;
+      return event.data.kind !== 'succeeded'
+        || event.data.executionKind === 'refused_pre_dispatch';
+    });
+  } catch {
+    return false;
+  }
+}
+
+function failedBusinessReadDiscoveryHold(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): AcceptedTaskTerminalPreparation | null {
+  if (
+    !acceptedSourceRequiresBusinessRead(input)
+    || !sourceAttemptedOnlyFailedDiscovery(input)
+    || sourceHasFreshReadEvidence(input)
+  ) return null;
+  return {
+    status: 'needs_verification',
+    reason: 'this source requested an external read, but every owned discovery attempt failed '
+      + 'or was refused and no successful business read settled',
+    missing: ['discovery_attempted_without_business_evidence'],
+  };
+}
+
+function attemptedActionAdmissionHold(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): AcceptedTaskTerminalPreparation | null {
+  if (!sourceAttemptedActionAdmission(input) || sourceHasWorkEvidence(input)) return null;
+  return {
+    status: 'needs_verification',
+    reason: 'this source attempted action admission, never obtained an admitted plan, '
+      + 'and settled no business call — it has no evidence to answer from',
+    missing: ['action_attempted_without_evidence'],
+  };
 }
 
 function verdictResult(
@@ -517,8 +723,25 @@ export function prepareAcceptedTaskTerminal(input: {
     if (legacyManifest.status === 'ambiguous') {
       return { status: 'conflict', reason: legacyManifest.reason };
     }
+    // Host-v1 may enter tool_search before planning persists a graph or action
+    // authority. When that discovery never succeeds, missing contract rows are
+    // not permission to reinterpret a current-state business read as ordinary
+    // conversation (live source 91056: eight discovery calls, zero Outlook
+    // calls, truthful failure prose durably stamped success/done).
+    const failedDiscovery = failedBusinessReadDiscoveryHold(input);
+    if (failedDiscovery) return failedDiscovery;
     const action = actionExpectedWorkState(input);
     if (action.status === 'not_action') {
+      // WHAT THE TURN DID, NOT HOW THE USER PHRASED IT.
+      //
+      // The freshness rule below asks a regex whether the wording sounded
+      // current ("today", "latest"). That decides nothing real: "how many
+      // accounts does my team have by seller" carries no such word and still
+      // demands live data. The durable record already answers the question —
+      // this source reached for action admission and never obtained one, while
+      // settling no business call. It has nothing to answer FROM.
+      const attemptedActionHold = attemptedActionAdmissionHold(input);
+      if (attemptedActionHold) return attemptedActionHold;
       const freshness = acceptedSourceFreshnessRequirement(input);
       if (freshness === 'current_state' && !sourceHasFreshReadEvidence(input)) {
         return {
@@ -653,6 +876,18 @@ export function prepareAcceptedTaskTerminal(input: {
   }
   if (contract.status !== 'ok') {
     return { status: 'conflict', reason: `expected-work contract is ${contract.status}: ${contract.reason}` };
+  }
+
+  // A deterministic conversation contract contains zero operations. If this
+  // same accepted source later reached for action admission and never produced
+  // any successful business evidence, that frozen empty topology must not turn
+  // the failed action attempt into an ordinary answer. Hold before resolution
+  // finalization: closing the zero-op contract first would make the fabricated
+  // terminal durable and leave no repairable work slot. Non-empty admitted
+  // contracts continue through their existing requirement/proof gates below.
+  if (contract.contract.operations.length === 0) {
+    const attemptedActionHold = attemptedActionAdmissionHold(input);
+    if (attemptedActionHold) return attemptedActionHold;
   }
 
   // Current-state honesty precedes finalization. A zero-read answer to a

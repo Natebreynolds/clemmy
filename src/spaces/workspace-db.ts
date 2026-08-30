@@ -36,6 +36,9 @@ export interface IndexWorkspaceOptions {
    * new state transition. Manifest mutation callers leave this enabled.
    */
   appendStateEvent?: boolean;
+  /** Authoring completion paths set true so they cannot claim a committed
+   * revision while the rebuildable index still describes earlier bytes. */
+  strict?: boolean;
 }
 
 export interface WorkspaceIndexRow {
@@ -48,6 +51,11 @@ export interface WorkspaceIndexRow {
 
 export type WorkspaceDatasetObservationStatus = 'ok' | 'error' | 'awaiting_approval';
 export type WorkspaceProjectionMode = 'source' | 'document';
+export type WorkspaceApprovalTerminalResolution =
+  | 'rejected'
+  | 'expired'
+  | 'cancelled_by_user'
+  | 'cancelled_by_system';
 
 export interface WorkspaceObservationCommitItem {
   /** Durable logical source id. This deliberately does not depend on a manifest-row FK. */
@@ -137,6 +145,22 @@ export interface HealWorkspaceDataProjectionOptions {
   rootDir?: string;
 }
 
+export interface ProjectWorkspaceApprovalDecisionInput extends HealWorkspaceDataProjectionOptions {
+  workspaceId: string;
+  sourceKey: string;
+  approvalId: string;
+  resolution: WorkspaceApprovalTerminalResolution;
+  resolvedAt: string | Date;
+  /** Safe, user-facing explanation rendered into data.json and Space health. */
+  explanation: string;
+}
+
+export interface ProjectWorkspaceApprovalDecisionResult {
+  matched: number;
+  transitioned: number;
+  projection: WorkspaceProjectionResult | null;
+}
+
 export interface PruneWorkspaceDatasetHistoryOptions {
   db?: Database.Database;
   maxObservationsPerSource?: number;
@@ -180,6 +204,8 @@ const PROVENANCE_ALLOWLIST = new Set([
   'attempt',
   'sourceVersion',
   'fetchedAt',
+  'approvalResolution',
+  'approvalResolvedAt',
 ]);
 
 let cachedDb: Database.Database | null = null;
@@ -216,8 +242,8 @@ export function indexWorkspaceRecord(record: SpaceRecord, options: IndexWorkspac
   const db = options.db ?? openWorkspaceDb();
   const rootDir = options.rootDir ?? resolveWorkspaceRoot(record.id);
   const now = (options.now ?? new Date()).toISOString();
+  let retiredSourceKeys: string[] = [];
   try {
-    let retiredSourceKeys: string[] = [];
     const tx = db.transaction(() => {
       upsertWorkspace(db, record, rootDir);
       retiredSourceKeys = replaceDataSources(db, record, now);
@@ -238,13 +264,21 @@ export function indexWorkspaceRecord(record: SpaceRecord, options: IndexWorkspac
       }
     });
     tx();
-    if (retiredSourceKeys.length > 0) {
-      // Retirement is committed before the compatibility projection. If the
-      // process stops between these steps, boot healing reads the durable
-      // tombstone and converges data.json to the same retired/absent state.
-      healWorkspaceDataProjection(record.id, { db, rootDir });
-    }
-    if (options.emitOperational !== false && !options.db) {
+  } catch (error) {
+    // Ordinary callers keep the historical rebuildable-index posture.
+    // Authoring completion callers opt into strictness so no success receipt
+    // can be stamped over a stale file digest/version.
+    if (options.strict) throw error;
+    return;
+  }
+  if (retiredSourceKeys.length > 0) {
+    // Retirement is committed before the compatibility projection. If the
+    // process stops between these steps, boot healing reads the durable
+    // tombstone and converges data.json to the same retired/absent state.
+    try { healWorkspaceDataProjection(record.id, { db, rootDir }); } catch { /* rebuildable projection */ }
+  }
+  if (options.emitOperational !== false && !options.db) {
+    try {
       recordOperationalEvent({
         source: 'workspace',
         type: options.eventType ?? 'workspace_file_changed',
@@ -261,9 +295,9 @@ export function indexWorkspaceRecord(record: SpaceRecord, options: IndexWorkspac
           ...(options.payload ?? {}),
         },
       });
+    } catch {
+      // Telemetry is not part of the exact file/index commit.
     }
-  } catch {
-    // Rebuildable index; never break Space writes because the index is unavailable.
   }
 }
 
@@ -522,6 +556,98 @@ export function healWorkspaceDataProjection(
   const serialized = serializeWorkspaceProjection(projection.document);
   atomicWriteWorkspaceProjection(rootDir, serialized.text);
   return { bytes: serialized.bytes, sources: projection.sources };
+}
+
+/**
+ * Close the dependent observation when a legacy runner/CLI trust card reaches
+ * a non-approved terminal decision. The observation remains part of history,
+ * but it is no longer live work: `error` is the existing terminal store state
+ * and exact approval resolution/date metadata explains why no refresh ran.
+ *
+ * This is deliberately an in-place state-machine transition rather than a new
+ * refresh observation. Replaying the same approval-resolution hook therefore
+ * cannot append facts, revive authority, or create a second projection row.
+ */
+export function projectWorkspaceApprovalDecision(
+  input: ProjectWorkspaceApprovalDecisionInput,
+): ProjectWorkspaceApprovalDecisionResult {
+  const db = input.db ?? openWorkspaceDb();
+  const workspaceId = normalizeWorkspaceId(input.workspaceId);
+  const sourceKey = normalizeSourceKeyForLookup(input.sourceKey);
+  const approvalId = normalizeBoundedText(input.approvalId, 'approvalId', 200);
+  const resolution = normalizeWorkspaceApprovalTerminalResolution(input.resolution);
+  const resolvedAt = normalizeTimestamp(input.resolvedAt, 'resolvedAt');
+  const explanation = scrubWorkspaceObservationError(
+    normalizeBoundedText(input.explanation, 'explanation', MAX_OBSERVATION_ERROR_CHARS),
+  );
+  const rootDir = input.rootDir ?? workspaceRootFromDb(db, workspaceId);
+
+  const rows = db.prepare(`
+    SELECT *
+    FROM workspace_dataset_observations
+    WHERE workspace_id = ?
+      AND source_key = ?
+      AND status IN ('awaiting_approval', 'error')
+      AND CASE
+        WHEN json_valid(provenance_json) = 1
+          THEN json_extract(provenance_json, '$.approvalId')
+        ELSE NULL
+      END = ?
+    ORDER BY rowid ASC
+  `).all(workspaceId, sourceKey, approvalId) as WorkspaceObservationRow[];
+  if (rows.length === 0) {
+    return { matched: 0, transitioned: 0, projection: null };
+  }
+
+  const transition = db.transaction((): number => {
+    let transitioned = 0;
+    for (const row of rows) {
+      if (row.status !== 'awaiting_approval') continue;
+      const provenance = {
+        ...parseProvenanceJson(row.provenance_json),
+        approvalId,
+        approvalResolution: resolution,
+        approvalResolvedAt: resolvedAt,
+      };
+      const provenanceJson = stableStringify(provenance);
+      if (Buffer.byteLength(provenanceJson, 'utf-8') > MAX_PROVENANCE_BYTES) {
+        throw new Error(`Workspace observation provenance exceeds ${MAX_PROVENANCE_BYTES} byte cap`);
+      }
+      const commitHash = hashString(stableStringify({
+        sourceKey: row.source_key,
+        refreshId: row.refresh_id,
+        cause: row.cause,
+        status: 'error',
+        projectionMode: row.projection_mode,
+        contentHash: row.content_hash,
+        error: explanation,
+        provenance,
+      }));
+      transitioned += db.prepare(`
+        UPDATE workspace_dataset_observations
+        SET status = 'error',
+            provenance_json = ?,
+            error = ?,
+            commit_hash = ?
+        WHERE id = ?
+          AND workspace_id = ?
+          AND status = 'awaiting_approval'
+      `).run(
+        provenanceJson,
+        explanation,
+        commitHash,
+        row.id,
+        workspaceId,
+      ).changes;
+    }
+    return transitioned;
+  });
+  const transitioned = transition.immediate();
+
+  // Rebuild even on an idempotent replay. A prior process may have committed
+  // SQLite and died before replacing data.json; replay is the recovery seam.
+  const projection = healWorkspaceDataProjection(workspaceId, { db, rootDir });
+  return { matched: rows.length, transitioned, projection };
 }
 
 /**
@@ -1239,9 +1365,16 @@ function buildWorkspaceProjection(
     }
     const provenance = parseProvenanceJson(event.provenance_json);
     const approvalId = (
-      event.status === 'awaiting_approval'
-      && typeof provenance.approvalId === 'string'
+      typeof provenance.approvalId === 'string'
     ) ? provenance.approvalId : undefined;
+    const approvalResolution = (
+      event.status === 'error'
+      && typeof provenance.approvalResolution === 'string'
+    ) ? provenance.approvalResolution : undefined;
+    const approvalResolvedAt = (
+      event.status === 'error'
+      && typeof provenance.approvalResolvedAt === 'string'
+    ) ? provenance.approvalResolvedAt : undefined;
     document = applySourceMeta(document, event.source_key, {
       refreshedAt: event.observed_at,
       ok: event.status === 'awaiting_approval' ? null : false,
@@ -1250,6 +1383,8 @@ function buildWorkspaceProjection(
         event.status === 'awaiting_approval' ? 'awaiting approval' : 'refresh failed'
       ),
       ...(approvalId ? { approvalId } : {}),
+      ...(approvalResolution ? { approvalResolution } : {}),
+      ...(approvalResolvedAt ? { approvalResolvedAt } : {}),
     });
   }
   return { document, sources: sources.size };
@@ -1563,6 +1698,18 @@ function normalizeSourceKeyForLookup(value: string): string {
 function normalizeObservationStatus(value: unknown): WorkspaceDatasetObservationStatus {
   if (value === 'ok' || value === 'error' || value === 'awaiting_approval') return value;
   throw new Error(`invalid Workspace observation status: ${String(value)}`);
+}
+
+function normalizeWorkspaceApprovalTerminalResolution(
+  value: unknown,
+): WorkspaceApprovalTerminalResolution {
+  if (
+    value === 'rejected'
+    || value === 'expired'
+    || value === 'cancelled_by_user'
+    || value === 'cancelled_by_system'
+  ) return value;
+  throw new Error(`invalid Workspace approval terminal resolution: ${String(value)}`);
 }
 
 function normalizeBoundedText(value: unknown, field: string, max: number): string {

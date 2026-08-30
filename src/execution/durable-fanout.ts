@@ -32,7 +32,13 @@ import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
 import { updateLinkedFocusAction } from '../memory/focus.js';
 import { addNotification } from '../runtime/notifications.js';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, openEventLog } from '../runtime/harness/eventlog.js';
+import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
+import { redeemDurableLogicalCallSettlementForHost } from '../runtime/harness/logical-call-settlement-store.js';
+import {
+  redeemSuccessfulSettlementResultForHost,
+  type SuccessfulSettlementResultEvidence,
+} from '../runtime/harness/result-handle.js';
 import {
   admitWorkDisposition,
   dispositionToDurableWork,
@@ -91,9 +97,35 @@ export interface FanoutActivationRow {
   phaseId: string;
   status: FanoutActivationStatus;
   receiptRef: string | null;
+  dataResult: FanoutDataResultBinding | null;
   workerTaskId: string | null;
   attempt: number;
   updatedAt: string;
+}
+
+/** Metadata-only binding to the ONE raw payload already retained by the
+ * harness result store. fanout.db never copies provider bytes. */
+export interface FanoutDataResultBinding {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  physicalDispatchId: string;
+  resultHandleId: string;
+  toolName: string;
+  rawPayloadSha256: string;
+  rawByteCount: number;
+  bindingDigest: string;
+}
+
+/** What a worker names when it judges an activation to be data-producing.
+ * Digest/bytes/physical identity are host-derived from the immutable result. */
+export interface FanoutDataResultReference {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  resultHandleId: string;
 }
 
 export interface FanoutWindowRow {
@@ -163,6 +195,16 @@ function db(): Database.Database {
       phase_id    TEXT NOT NULL,
       status      TEXT NOT NULL CHECK (status IN ('pending','running','done','failed')),
       receipt_ref TEXT,
+      result_session_id TEXT,
+      result_source_user_seq INTEGER,
+      result_accepted_task_id TEXT,
+      result_logical_call_id TEXT,
+      result_physical_dispatch_id TEXT,
+      result_handle_id TEXT,
+      result_tool_name TEXT,
+      result_payload_sha256 TEXT,
+      result_byte_count INTEGER,
+      result_binding_digest TEXT,
       worker_task_id TEXT,
       attempt     INTEGER NOT NULL DEFAULT 0,
       updated_at  TEXT NOT NULL,
@@ -181,6 +223,33 @@ function db(): Database.Database {
       updated_at    TEXT NOT NULL,
       PRIMARY KEY (plan_id, window_index)
     );
+  `);
+  // Append-only upgrade for active pre-result-binding plans. Provider bytes
+  // remain in durable_result_handles; this journal stores lineage only.
+  const activationColumns = new Set(
+    (handle.prepare('PRAGMA table_info(activations)').all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  for (const [name, declaration] of [
+    ['result_session_id', 'TEXT'],
+    ['result_source_user_seq', 'INTEGER'],
+    ['result_accepted_task_id', 'TEXT'],
+    ['result_logical_call_id', 'TEXT'],
+    ['result_physical_dispatch_id', 'TEXT'],
+    ['result_handle_id', 'TEXT'],
+    ['result_tool_name', 'TEXT'],
+    ['result_payload_sha256', 'TEXT'],
+    ['result_byte_count', 'INTEGER'],
+    ['result_binding_digest', 'TEXT'],
+  ] as const) {
+    if (!activationColumns.has(name)) {
+      handle.exec(`ALTER TABLE activations ADD COLUMN ${name} ${declaration}`);
+    }
+  }
+  handle.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS activations_one_data_result_per_plan
+      ON activations (plan_id, result_handle_id)
+      WHERE result_handle_id IS NOT NULL
   `);
   return handle;
 }
@@ -216,6 +285,58 @@ export function activationDigest(planId: string, itemId: string, phaseId: string
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function hydrateDataResult(raw: Record<string, unknown>): FanoutDataResultBinding | null {
+  const fields = [
+    raw.result_session_id,
+    raw.result_accepted_task_id,
+    raw.result_logical_call_id,
+    raw.result_physical_dispatch_id,
+    raw.result_handle_id,
+    raw.result_tool_name,
+    raw.result_payload_sha256,
+    raw.result_binding_digest,
+  ];
+  if (fields.every((field) => field === null || field === undefined)
+    && (raw.result_source_user_seq === null || raw.result_source_user_seq === undefined)
+    && (raw.result_byte_count === null || raw.result_byte_count === undefined)) return null;
+  if (
+    fields.some((field) => typeof field !== 'string' || !field)
+    || !Number.isSafeInteger(raw.result_source_user_seq)
+    || Number(raw.result_source_user_seq) <= 0
+    || !Number.isSafeInteger(raw.result_byte_count)
+    || Number(raw.result_byte_count) < 0
+  ) return null;
+  return {
+    sessionId: String(raw.result_session_id),
+    sourceUserSeq: Number(raw.result_source_user_seq),
+    acceptedTaskId: String(raw.result_accepted_task_id),
+    logicalToolCallId: String(raw.result_logical_call_id),
+    physicalDispatchId: String(raw.result_physical_dispatch_id),
+    resultHandleId: String(raw.result_handle_id),
+    toolName: String(raw.result_tool_name),
+    rawPayloadSha256: String(raw.result_payload_sha256),
+    rawByteCount: Number(raw.result_byte_count),
+    bindingDigest: String(raw.result_binding_digest),
+  };
+}
+
+function dataResultBindingDigest(input: {
+  planId: string;
+  itemId: string;
+  phaseId: string;
+  workerTaskId: string;
+  binding: Omit<FanoutDataResultBinding, 'bindingDigest'>;
+}): string {
+  const value = input.binding;
+  return sha256(JSON.stringify([
+    'durable-fanout-data-result', 1,
+    input.planId, input.itemId, input.phaseId, input.workerTaskId,
+    value.sessionId, value.sourceUserSeq, value.acceptedTaskId,
+    value.logicalToolCallId, value.physicalDispatchId, value.resultHandleId,
+    value.toolName, value.rawPayloadSha256, value.rawByteCount,
+  ]));
 }
 
 function hydratePlan(raw: Record<string, unknown>): FanoutPlanRow | null {
@@ -294,6 +415,13 @@ export interface FanoutAdmissionInput {
   route?: FanoutDeliveryRoute;
   /** The rest of the agreed contract (plan text, context refs, duration…). */
   contract?: Record<string, unknown>;
+  /** Host-owned scheduling pressure for this admitted plan. The value limits
+   * simultaneously claimed worker windows; it never truncates canonical items
+   * or changes reducer readiness. Omission preserves the existing behavior. */
+  maxConcurrentWindows?: number;
+  /** Maximum durable claims for one window, including its first claim. The
+   * existing three-attempt policy remains authoritative when omitted. */
+  maxWindowAttempts?: number;
 }
 
 /**
@@ -306,6 +434,26 @@ export function admitDurableFanoutPlan(
   proposed: WorkDisposition,
   input: FanoutAdmissionInput = {},
 ): FanoutAdmission {
+  if (
+    input.maxConcurrentWindows !== undefined
+    && (!Number.isSafeInteger(input.maxConcurrentWindows) || input.maxConcurrentWindows < 1)
+  ) {
+    return {
+      ok: false,
+      kind: 'invalid',
+      errors: ['maxConcurrentWindows must be a positive safe integer'],
+    };
+  }
+  if (
+    input.maxWindowAttempts !== undefined
+    && (!Number.isSafeInteger(input.maxWindowAttempts) || input.maxWindowAttempts < 1)
+  ) {
+    return {
+      ok: false,
+      kind: 'invalid',
+      errors: ['maxWindowAttempts must be a positive safe integer'],
+    };
+  }
   const withManifest: WorkDisposition = proposed.manifest
     ? proposed
     : {
@@ -329,6 +477,18 @@ export function admitDurableFanoutPlan(
     disposition,
     ...(input.contract ?? {}),
     route: input.route ?? {},
+    ...(input.maxConcurrentWindows !== undefined || input.maxWindowAttempts !== undefined
+      ? {
+          fanoutExecution: {
+            ...(input.maxConcurrentWindows !== undefined
+              ? { maxConcurrentWindows: input.maxConcurrentWindows }
+              : {}),
+            ...(input.maxWindowAttempts !== undefined
+              ? { maxWindowAttempts: input.maxWindowAttempts }
+              : {}),
+          },
+        }
+      : {}),
   };
   // Identity = the COMPLETE normalized contract + the accepted activation. A
   // model-authored manifestId is not unique; the contract is. Same bytes,
@@ -408,6 +568,7 @@ export function listFanoutActivations(planId: string): FanoutActivationRow[] {
     phaseId: String(raw.phase_id),
     status: raw.status as FanoutActivationStatus,
     receiptRef: (raw.receipt_ref as string | null) ?? null,
+    dataResult: hydrateDataResult(raw),
     workerTaskId: (raw.worker_task_id as string | null) ?? null,
     attempt: Number(raw.attempt ?? 0),
     updatedAt: String(raw.updated_at),
@@ -425,11 +586,17 @@ export function listFanoutWindows(planId: string): FanoutWindowRow[] {
 export function listFanoutSettlements(
   planId: string,
   options: { offset?: number; limit?: number } = {},
-): Array<{ itemId: string; phaseId: string; receiptRef: string | null; updatedAt: string }> {
+): Array<{
+  itemId: string;
+  phaseId: string;
+  receiptRef: string | null;
+  dataResult: FanoutDataResultBinding | null;
+  updatedAt: string;
+}> {
   const limit = Math.max(1, Math.min(options.limit ?? 200, 500));
   const offset = Math.max(0, options.offset ?? 0);
   const raws = db().prepare(`
-    SELECT item_id, phase_id, receipt_ref, updated_at FROM activations
+    SELECT * FROM activations
     WHERE plan_id = ? AND status = 'done'
     ORDER BY item_id, phase_id LIMIT ? OFFSET ?
   `).all(planId, limit, offset) as Array<Record<string, unknown>>;
@@ -437,8 +604,230 @@ export function listFanoutSettlements(
     itemId: String(raw.item_id),
     phaseId: String(raw.phase_id),
     receiptRef: (raw.receipt_ref as string | null) ?? null,
+    dataResult: hydrateDataResult(raw),
     updatedAt: String(raw.updated_at),
   }));
+}
+
+type VerifiedFanoutDataResult =
+  | { ok: true; evidence: SuccessfulSettlementResultEvidence }
+  | { ok: false; reason: string };
+
+function verifyFanoutDataResult(
+  reference: FanoutDataResultReference,
+  expectedWorkerSessionId: string,
+): VerifiedFanoutDataResult {
+  if (
+    reference.sessionId !== expectedWorkerSessionId
+    || reference.acceptedTaskId !== acceptedTaskIdFor(reference.sessionId, reference.sourceUserSeq)
+  ) return { ok: false, reason: 'the data result does not belong to this worker and accepted source' };
+  const settlement = redeemDurableLogicalCallSettlementForHost({
+    sessionId: reference.sessionId,
+    sourceUserSeq: reference.sourceUserSeq,
+    acceptedTaskId: reference.acceptedTaskId,
+    logicalToolCallId: reference.logicalToolCallId,
+  });
+  if (settlement.status !== 'ok') {
+    return { ok: false, reason: `the named source settlement is ${settlement.status}: ${settlement.reason}` };
+  }
+  if (
+    !['succeeded', 'empty_result'].includes(settlement.settlement.outcome.kind)
+    || settlement.settlement.recovery.mutating
+    || settlement.settlement.outcome.directive.requiresReconciliation
+    || settlement.settlement.resultHandleId !== reference.resultHandleId
+  ) return { ok: false, reason: 'the named call is not a successful data-producing settlement with that result handle' };
+  const result = redeemSuccessfulSettlementResultForHost({
+    sessionId: reference.sessionId,
+    sourceUserSeq: reference.sourceUserSeq,
+    acceptedTaskId: reference.acceptedTaskId,
+    logicalToolCallId: reference.logicalToolCallId,
+  });
+  if (result.status !== 'ok') {
+    return { ok: false, reason: `the named source result is ${result.status}: ${result.reason}` };
+  }
+  if (result.value.resultHandleId !== reference.resultHandleId) {
+    return { ok: false, reason: 'the named result handle is not the handle bound to that settlement' };
+  }
+  return { ok: true, evidence: result.value };
+}
+
+/** Exact successful, non-mutating results in this accepted worker
+ * source which no activation in this plan has claimed. Auto-binding is safe
+ * only when this returns exactly one row; callers must refuse ambiguity. */
+export function unboundFanoutDataResults(input: {
+  planId: string;
+  callerRunSessionId: string;
+  sourceUserSeq: number;
+}): FanoutDataResultReference[] {
+  if (!input.callerRunSessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return [];
+  const acceptedTaskId = acceptedTaskIdFor(input.callerRunSessionId, input.sourceUserSeq);
+  const bound = new Set(
+    listFanoutActivations(input.planId)
+      .map((activation) => activation.dataResult?.resultHandleId)
+      .filter((handleId): handleId is string => Boolean(handleId)),
+  );
+  try {
+    const candidates = openEventLog().prepare(`
+      SELECT s.logical_tool_call_id, s.result_handle_id
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l
+          ON l.session_id = s.session_id
+         AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+       WHERE s.session_id = ? AND s.source_user_seq = ?
+         AND l.accepted_task_id = ?
+         AND s.mutating = 0 AND s.requires_reconciliation = 0
+         AND s.outcome_kind IN ('succeeded','empty_result')
+         AND s.result_handle_id IS NOT NULL
+       ORDER BY s.settled_at, s.logical_tool_call_id
+    `).all(input.callerRunSessionId, input.sourceUserSeq, acceptedTaskId) as Array<{
+      logical_tool_call_id: string;
+      result_handle_id: string;
+    }>;
+    return candidates
+      .filter((candidate) => !bound.has(candidate.result_handle_id))
+      .map((candidate) => ({
+        sessionId: input.callerRunSessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId,
+        logicalToolCallId: candidate.logical_tool_call_id,
+        resultHandleId: candidate.result_handle_id,
+      }))
+      .filter((candidate) => verifyFanoutDataResult(candidate, input.callerRunSessionId).ok);
+  } catch {
+    return [];
+  }
+}
+
+export type FanoutDataResultResolution =
+  | { ok: true; reference: FanoutDataResultReference }
+  | { ok: false; reason: string };
+
+/** Resolve the model-visible logical call id to the immutable result handle
+ * already bound by harness settlement. The model chooses WHICH source call
+ * belongs to the activation; the host owns the opaque `rh_…` identity and
+ * never asks the model to copy or preserve it. */
+export function resolveUnboundFanoutDataResultByLogicalCall(input: {
+  planId: string;
+  callerRunSessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+}): FanoutDataResultResolution {
+  const logicalToolCallId = input.logicalToolCallId.trim();
+  if (!logicalToolCallId) {
+    return { ok: false, reason: 'an exact source logical call id is required' };
+  }
+  const candidates = unboundFanoutDataResults(input);
+  const matches = candidates.filter((candidate) => (
+    candidate.logicalToolCallId === logicalToolCallId
+  ));
+  if (matches.length !== 1) {
+    return {
+      ok: false,
+      reason: matches.length === 0
+        ? 'the named source call is not one unclaimed successful non-mutating result in this accepted worker source'
+        : 'the named source call does not resolve to one exact retained result',
+    };
+  }
+  return { ok: true, reference: matches[0]! };
+}
+
+export type FanoutDataResultRedemption =
+  | {
+      status: 'ok';
+      binding: FanoutDataResultBinding;
+      rawPayload: unknown;
+      rawPayloadJson: string;
+    }
+  | { status: 'missing' | 'forbidden' | 'corrupt' | 'storage_error'; reason: string };
+
+/** Redeem a data activation from the existing result store after restart. */
+export function redeemFanoutSettlementData(input: {
+  planId: string;
+  itemId: string;
+  phaseId: string;
+}): FanoutDataResultRedemption {
+  try {
+    const activation = listFanoutActivations(input.planId)
+      .find((row) => row.itemId === input.itemId && row.phaseId === input.phaseId);
+    if (!activation || activation.status !== 'done' || !activation.dataResult) {
+      return { status: 'missing', reason: 'the activation has no completed data-result binding' };
+    }
+    if (!activation.workerTaskId) {
+      return { status: 'corrupt', reason: 'the data activation has no worker task owner' };
+    }
+    const owner = getBackgroundTask(activation.workerTaskId);
+    if (!owner || owner.runSessionId !== activation.dataResult.sessionId) {
+      return { status: 'forbidden', reason: 'the retained result does not belong to the activation worker session' };
+    }
+    const { bindingDigest: _storedDigest, ...withoutDigest } = activation.dataResult;
+    const expectedDigest = dataResultBindingDigest({
+      ...input,
+      workerTaskId: activation.workerTaskId,
+      binding: withoutDigest,
+    });
+    if (expectedDigest !== activation.dataResult.bindingDigest) {
+      return { status: 'corrupt', reason: 'the fan-out data-result binding digest does not recompute' };
+    }
+    const verified = verifyFanoutDataResult({
+      sessionId: activation.dataResult.sessionId,
+      sourceUserSeq: activation.dataResult.sourceUserSeq,
+      acceptedTaskId: activation.dataResult.acceptedTaskId,
+      logicalToolCallId: activation.dataResult.logicalToolCallId,
+      resultHandleId: activation.dataResult.resultHandleId,
+    }, activation.dataResult.sessionId);
+    if (!verified.ok) return { status: 'corrupt', reason: verified.reason };
+    const evidence = verified.evidence;
+    if (
+      evidence.physicalDispatchId !== activation.dataResult.physicalDispatchId
+      || evidence.toolName !== activation.dataResult.toolName
+      || evidence.rawPayloadSha256 !== activation.dataResult.rawPayloadSha256
+      || evidence.rawByteCount !== activation.dataResult.rawByteCount
+    ) return { status: 'corrupt', reason: 'the retained result bytes disagree with the fan-out binding' };
+    return {
+      status: 'ok',
+      binding: activation.dataResult,
+      rawPayload: evidence.rawPayload,
+      rawPayloadJson: evidence.rawPayloadJson,
+    };
+  } catch (error) {
+    return { status: 'storage_error', reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export type FanoutDataPage =
+  | {
+      status: 'ok';
+      binding: FanoutDataResultBinding;
+      text: string;
+      offset: number;
+      nextOffset: number | null;
+      totalChars: number;
+    }
+  | { status: 'missing' | 'forbidden' | 'corrupt' | 'storage_error'; reason: string };
+
+/** Bounded, restart-safe read of one activation's exact retained JSON. Paging
+ * happens over the already-local string; it never re-invokes the source. */
+export function readFanoutSettlementDataPage(input: {
+  planId: string;
+  itemId: string;
+  phaseId: string;
+  offset?: number;
+  limit?: number;
+}): FanoutDataPage {
+  const redeemed = redeemFanoutSettlementData(input);
+  if (redeemed.status !== 'ok') return redeemed;
+  const offset = Math.max(0, Math.min(Math.floor(input.offset ?? 0), redeemed.rawPayloadJson.length));
+  const limit = Math.max(1, Math.min(Math.floor(input.limit ?? 16_000), 20_000));
+  const end = Math.min(redeemed.rawPayloadJson.length, offset + limit);
+  return {
+    status: 'ok',
+    binding: redeemed.binding,
+    text: redeemed.rawPayloadJson.slice(offset, end),
+    offset,
+    nextOffset: end < redeemed.rawPayloadJson.length ? end : null,
+    totalChars: redeemed.rawPayloadJson.length,
+  };
 }
 
 export type FanoutSettlement =
@@ -458,8 +847,37 @@ export function settleFanoutActivation(input: {
   status: 'done' | 'failed';
   receiptRef?: string;
   workerTaskId?: string;
+  workerRunSessionId?: string;
+  dataResult?: FanoutDataResultReference;
 }): FanoutSettlement {
+  const plan = loadFanoutPlan(input.planId);
+  const phase = plan?.manifest.manifest?.phases.find((candidate) => candidate.id === input.phaseId);
+  if (!plan || !phase) return { settled: false, reason: 'no such phase in the fan-out plan' };
   const database = db();
+  const beforeValidation = database.prepare(
+    'SELECT status FROM activations WHERE plan_id = ? AND item_id = ? AND phase_id = ?',
+  ).get(input.planId, input.itemId, input.phaseId) as { status: string } | undefined;
+  if (!beforeValidation) return { settled: false, reason: 'no such item×phase in the plan journal' };
+  if (beforeValidation.status === 'done') return { settled: true, alreadySettled: true };
+  const dataRequired = phase.resultKind === 'data';
+  let verifiedData: SuccessfulSettlementResultEvidence | null = null;
+  if (input.status === 'done' && dataRequired) {
+    if (!input.dataResult) {
+      return { settled: false, reason: 'a data-producing phase requires an exact successful source result; a bare receipt is not data completion' };
+    }
+    if (!input.workerTaskId || !input.workerRunSessionId) {
+      return { settled: false, reason: 'a data-producing phase requires exact worker task and session authority' };
+    }
+    const worker = getBackgroundTask(input.workerTaskId);
+    if (!worker || worker.runSessionId !== input.workerRunSessionId) {
+      return { settled: false, reason: 'the worker task does not own the calling run session' };
+    }
+    const verified = verifyFanoutDataResult(input.dataResult, input.workerRunSessionId);
+    if (!verified.ok) return { settled: false, reason: verified.reason };
+    verifiedData = verified.evidence;
+  } else if (input.dataResult) {
+    return { settled: false, reason: 'only a successful data-producing phase may bind a source result' };
+  }
   const run = database.transaction((): FanoutSettlement => {
     const current = database.prepare(
       'SELECT status FROM activations WHERE plan_id = ? AND item_id = ? AND phase_id = ?',
@@ -468,8 +886,6 @@ export function settleFanoutActivation(input: {
     if (current.status === 'done') return { settled: true, alreadySettled: true };
     // Durable dependency gate: every prerequisite phase must be done for
     // THIS item before a dependent phase may settle.
-    const plan = loadFanoutPlan(input.planId);
-    const phase = plan?.manifest.manifest?.phases.find((p) => p.id === input.phaseId);
     for (const dependency of phase?.dependsOn ?? []) {
       const prerequisite = database.prepare(
         'SELECT status FROM activations WHERE plan_id = ? AND item_id = ? AND phase_id = ?',
@@ -481,15 +897,53 @@ export function settleFanoutActivation(input: {
         };
       }
     }
-    database.prepare(`
-      UPDATE activations SET status = ?, receipt_ref = COALESCE(?, receipt_ref),
-        worker_task_id = COALESCE(?, worker_task_id),
-        attempt = attempt + 1, updated_at = ?
-      WHERE plan_id = ? AND item_id = ? AND phase_id = ?
-    `).run(
-      input.status, input.receiptRef ?? null, input.workerTaskId ?? null, now(),
-      input.planId, input.itemId, input.phaseId,
-    );
+    if (verifiedData && input.dataResult && input.workerTaskId) {
+      const bindingWithoutDigest: Omit<FanoutDataResultBinding, 'bindingDigest'> = {
+        sessionId: input.dataResult.sessionId,
+        sourceUserSeq: input.dataResult.sourceUserSeq,
+        acceptedTaskId: input.dataResult.acceptedTaskId,
+        logicalToolCallId: input.dataResult.logicalToolCallId,
+        physicalDispatchId: verifiedData.physicalDispatchId,
+        resultHandleId: verifiedData.resultHandleId,
+        toolName: verifiedData.toolName,
+        rawPayloadSha256: verifiedData.rawPayloadSha256,
+        rawByteCount: verifiedData.rawByteCount,
+      };
+      const bindingDigest = dataResultBindingDigest({
+        planId: input.planId,
+        itemId: input.itemId,
+        phaseId: input.phaseId,
+        workerTaskId: input.workerTaskId,
+        binding: bindingWithoutDigest,
+      });
+      database.prepare(`
+        UPDATE activations SET status = ?, receipt_ref = COALESCE(?, receipt_ref),
+          worker_task_id = ?, result_session_id = ?, result_source_user_seq = ?,
+          result_accepted_task_id = ?, result_logical_call_id = ?,
+          result_physical_dispatch_id = ?, result_handle_id = ?, result_tool_name = ?,
+          result_payload_sha256 = ?, result_byte_count = ?, result_binding_digest = ?,
+          attempt = attempt + 1, updated_at = ?
+        WHERE plan_id = ? AND item_id = ? AND phase_id = ?
+      `).run(
+        input.status, input.receiptRef ?? null, input.workerTaskId,
+        bindingWithoutDigest.sessionId, bindingWithoutDigest.sourceUserSeq,
+        bindingWithoutDigest.acceptedTaskId, bindingWithoutDigest.logicalToolCallId,
+        bindingWithoutDigest.physicalDispatchId, bindingWithoutDigest.resultHandleId,
+        bindingWithoutDigest.toolName, bindingWithoutDigest.rawPayloadSha256,
+        bindingWithoutDigest.rawByteCount, bindingDigest, now(),
+        input.planId, input.itemId, input.phaseId,
+      );
+    } else {
+      database.prepare(`
+        UPDATE activations SET status = ?, receipt_ref = COALESCE(?, receipt_ref),
+          worker_task_id = COALESCE(?, worker_task_id),
+          attempt = attempt + 1, updated_at = ?
+        WHERE plan_id = ? AND item_id = ? AND phase_id = ?
+      `).run(
+        input.status, input.receiptRef ?? null, input.workerTaskId ?? null, now(),
+        input.planId, input.itemId, input.phaseId,
+      );
+    }
     return { settled: true, alreadySettled: false };
   });
   try {
@@ -532,6 +986,7 @@ export function settleFanoutActivationAs(input: {
   phaseId: string;
   status: 'done' | 'failed';
   receiptRef?: string;
+  dataResult?: FanoutDataResultReference;
   callerRunSessionId: string;
 }): FanoutSettlement {
   const authority = windowAuthorityFor(input.planId, input.callerRunSessionId);
@@ -547,7 +1002,9 @@ export function settleFanoutActivationAs(input: {
     phaseId: input.phaseId,
     status: input.status,
     ...(input.receiptRef ? { receiptRef: input.receiptRef } : {}),
+    ...(input.dataResult ? { dataResult: input.dataResult } : {}),
     ...(authority.workerTaskId ? { workerTaskId: authority.workerTaskId } : {}),
+    workerRunSessionId: input.callerRunSessionId,
   });
 }
 
@@ -556,7 +1013,17 @@ export function fanoutReducerReady(planId: string): { ready: boolean; missing: L
   const plan = loadFanoutPlan(planId);
   if (!plan) return { ready: false, missing: [] };
   const completed: LedgerEntry[] = listFanoutActivations(planId)
-    .filter((a) => a.status === 'done')
+    .filter((activation) => {
+      if (activation.status !== 'done') return false;
+      const phase = plan.manifest.manifest?.phases.find((candidate) => candidate.id === activation.phaseId);
+      if (phase?.resultKind !== 'data') return true;
+      return activation.dataResult !== null
+        && redeemFanoutSettlementData({
+          planId,
+          itemId: activation.itemId,
+          phaseId: activation.phaseId,
+        }).status === 'ok';
+    })
     .map((a) => ({ itemId: a.itemId, phaseId: a.phaseId }));
   const verdict = reducerReady({ plan: plan.durable, completed });
   const windows = listFanoutWindows(planId);
@@ -612,6 +1079,9 @@ const WORKER_PROMPT_ITEM_CAP = 300;
 
 function windowWorkerPrompt(plan: FanoutPlanRow, window: FanoutWindowRow, openItems: string[]): string {
   const phases = plan.durable.requiredPhases.join(', ');
+  const dataPhases = plan.manifest.manifest?.phases
+    .filter((phase) => phase.resultKind === 'data')
+    .map((phase) => phase.id) ?? [];
   const shown = openItems.slice(0, WORKER_PROMPT_ITEM_CAP);
   return [
     `Objective: ${plan.objective}`,
@@ -621,6 +1091,12 @@ function windowWorkerPrompt(plan: FanoutPlanRow, window: FanoutWindowRow, openIt
     `finish, call fanout_settle_item with plan_id="${plan.planId}", the item_id, the phase_id, and`,
     'status "done" (or "failed" with a receipt note if the item genuinely cannot be processed).',
     'Settlement is bound to YOUR window — items outside it are other workers\' work and will refuse.',
+    ...(dataPhases.length > 0 ? [
+      `Data-producing phase(s): ${dataPhases.join(', ')}. For each one, fanout_settle_item must name`,
+      'the exact source_call_id returned by the source call; the host reopens its settlement-bound result handle. A receipt is not data.',
+      'Before repeating any source/read after a restart, call fanout_list_settlements, then page the',
+      'named payload with fanout_read_settlement_data. Both read local retained bytes; neither re-runs the source.',
+    ] : []),
     'An item already settled by a previous attempt returns alreadySettled — skip it, never redo it.',
     'The combined result is produced by the plan reducer after every window settles; do not report',
     'results to the user yourself.',
@@ -637,6 +1113,38 @@ export interface ScheduledFanout {
   planId: string;
   workerTasks: BackgroundTaskRecord[];
   skippedWindows: number[];
+}
+
+function planWindowConcurrency(plan: FanoutPlanRow): number {
+  const execution = plan.contract.fanoutExecution;
+  if (!execution || typeof execution !== 'object' || Array.isArray(execution)) {
+    return Math.max(1, plan.durable.windows.length);
+  }
+  const candidate = (execution as Record<string, unknown>).maxConcurrentWindows;
+  return Number.isSafeInteger(candidate) && Number(candidate) > 0
+    ? Math.min(Number(candidate), Math.max(1, plan.durable.windows.length))
+    : Math.max(1, plan.durable.windows.length);
+}
+
+function planWindowRetryCap(plan: FanoutPlanRow): number {
+  const execution = plan.contract.fanoutExecution;
+  if (!execution || typeof execution !== 'object' || Array.isArray(execution)) {
+    return WINDOW_RETRY_CAP;
+  }
+  const candidate = (execution as Record<string, unknown>).maxWindowAttempts;
+  return Number.isSafeInteger(candidate) && Number(candidate) > 0
+    ? Number(candidate)
+    : WINDOW_RETRY_CAP;
+}
+
+function fanoutWindowTaskId(planId: string, windowIndex: number, generation: number): string {
+  return `bg-fanout-${sha256(JSON.stringify({
+    domain: 'durable-fanout-window-task',
+    version: 1,
+    planId,
+    windowIndex,
+    generation,
+  })).slice(0, 24)}`;
 }
 
 /**
@@ -658,8 +1166,13 @@ export function scheduleDurableFanout(planId: string): ScheduledFanout | null {
   const phaseCount = plan.durable.requiredPhases.length;
   const workerTasks: BackgroundTaskRecord[] = [];
   const skippedWindows: number[] = [];
+  const windows = listFanoutWindows(planId);
+  let availableClaims = Math.max(
+    0,
+    planWindowConcurrency(plan) - windows.filter((window) => window.status === 'claimed').length,
+  );
 
-  for (const window of listFanoutWindows(planId)) {
+  for (const window of windows) {
     const open = window.itemIds.filter((itemId) => (doneByItem.get(itemId) ?? 0) < phaseCount);
     if (open.length === 0) {
       // A claimed window remains claimed until reconciliation observes its
@@ -674,18 +1187,62 @@ export function scheduleDurableFanout(planId: string): ScheduledFanout | null {
       skippedWindows.push(window.windowIndex);
       continue;
     }
-    if (window.status === 'claimed') { skippedWindows.push(window.windowIndex); continue; }
-    if (window.attempts >= WINDOW_RETRY_CAP) { skippedWindows.push(window.windowIndex); continue; }
-    // Atomic claim BEFORE task creation: the generation bump plus the status
-    // CAS means two schedulers cannot both own this window.
-    const claimed = database.prepare(`
-      UPDATE windows SET status = 'claimed', generation = generation + 1,
-        attempts = attempts + 1, updated_at = ?
-      WHERE plan_id = ? AND window_index = ? AND status IN ('unclaimed','failed')
-    `).run(now(), planId, window.windowIndex);
-    if (claimed.changes !== 1) { skippedWindows.push(window.windowIndex); continue; }
+    if (window.status === 'claimed') {
+      if (window.workerTaskId) {
+        skippedWindows.push(window.windowIndex);
+        continue;
+      }
+      // A process may stop after the durable claim commit but before the task
+      // file and journal pointer are materialized. Generation-derived task
+      // identity makes that cut claim-or-rejoin instead of duplicate work.
+      const task = createBackgroundTask({
+        explicitId: fanoutWindowTaskId(planId, window.windowIndex, window.generation),
+        title: `${plan.objective} — window ${window.windowIndex + 1}/${plan.durable.windows.length}`,
+        prompt: windowWorkerPrompt(plan, window, open),
+        internal: true,
+        source: plan.route.source ?? 'gateway',
+        ...(plan.durable.workerModel ? { model: plan.durable.workerModel } : {}),
+      });
+      const bound = database.prepare(`
+        UPDATE windows SET worker_task_id = ?, run_session_id = ?, updated_at = ?
+        WHERE plan_id = ? AND window_index = ? AND status = 'claimed'
+          AND generation = ? AND worker_task_id IS NULL
+      `).run(
+        task.id, task.runSessionId, now(), planId, window.windowIndex, window.generation,
+      );
+      if (bound.changes === 1) {
+        const bind = database.prepare(`
+          UPDATE activations SET worker_task_id = ?, updated_at = ?
+          WHERE plan_id = ? AND item_id = ? AND status != 'done'
+        `);
+        for (const itemId of open) bind.run(task.id, now(), planId, itemId);
+        workerTasks.push(task);
+      } else {
+        skippedWindows.push(window.windowIndex);
+      }
+      continue;
+    }
+    if (window.attempts >= planWindowRetryCap(plan)) { skippedWindows.push(window.windowIndex); continue; }
+    if (availableClaims <= 0) { skippedWindows.push(window.windowIndex); continue; }
+    // The pressure check and claim CAS share one IMMEDIATE transaction. Two
+    // processes racing different windows therefore cannot each observe the
+    // same final slot and exceed the persisted concurrency ceiling.
+    const claimed = database.transaction((): boolean => {
+      const liveClaims = (database.prepare(`
+        SELECT COUNT(*) AS n FROM windows WHERE plan_id = ? AND status = 'claimed'
+      `).get(planId) as { n: number }).n;
+      if (liveClaims >= planWindowConcurrency(plan)) return false;
+      return database.prepare(`
+        UPDATE windows SET status = 'claimed', generation = generation + 1,
+          attempts = attempts + 1, updated_at = ?
+        WHERE plan_id = ? AND window_index = ? AND status IN ('unclaimed','failed')
+      `).run(now(), planId, window.windowIndex).changes === 1;
+    }).immediate();
+    if (!claimed) { skippedWindows.push(window.windowIndex); continue; }
+    availableClaims -= 1;
 
     const task = createBackgroundTask({
+      explicitId: fanoutWindowTaskId(planId, window.windowIndex, window.generation + 1),
       title: `${plan.objective} — window ${window.windowIndex + 1}/${plan.durable.windows.length}`,
       prompt: windowWorkerPrompt(plan, window, open),
       // INTERNAL: no origin chat, no per-window report-back, no completion
@@ -772,7 +1329,8 @@ export function maybeAdmitFanoutReducer(
       + `(${settledCount} settlement(s)). Produce the combined result the user asked for `
       + `(output contract: ${plan.manifest.manifest?.reducer.outputContract ?? 'report@1'}) and report it back.`,
       'Read the settlements with fanout_list_settlements (plan_id, offset, limit) — page through ALL of',
-      'them; the journal is the complete record and no prompt excerpt is. Do not reprocess items.',
+      'them, then page each retained payload with fanout_read_settlement_data. These tools redeem exact',
+      'local source bytes after restart. The journal is complete; do not reprocess items.',
     ].join('\n'),
     ...(plan.originSessionId ? { originSessionId: plan.originSessionId } : {}),
     source: plan.route.source ?? 'gateway',
@@ -883,7 +1441,7 @@ export function reconcileDurableFanout(input: {
         UPDATE windows SET status = 'failed', worker_task_id = NULL, run_session_id = NULL, updated_at = ?
         WHERE plan_id = ? AND window_index = ?
       `).run(now(), plan.planId, window.windowIndex);
-      if (window.attempts >= WINDOW_RETRY_CAP) exhausted = true;
+      if (window.attempts >= planWindowRetryCap(plan)) exhausted = true;
     }
     if (exhausted) {
       database.prepare("UPDATE plans SET status = 'failed', updated_at = ? WHERE plan_id = ?")

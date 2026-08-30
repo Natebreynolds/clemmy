@@ -30,7 +30,15 @@ const { withHarnessRunContext, ToolCallsCounter } = await import('./harness/brac
 const { appendEvent, createSession, getSession } = await import('./harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 const { ToolAttemptSettlementAuthorityError } = await import('./harness/attempt-settlement.js');
+const currentCapabilityFixtures = await import('./harness/current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'dataforseo__serp_organic_live_advanced',
+  providerKind: 'native_mcp',
+  effect: 'read',
+}]);
 type HarnessRunContext = import('./harness/brackets.js').HarnessRunContext;
+
+after(() => currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory));
 
 /** The settlement spine refuses wrapped dispatch without an accepted source AND
  *  a persisted turn graph for the accepted task. Create the fixture session

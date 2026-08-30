@@ -3,9 +3,9 @@
  *
  * Universal provider/CLI-I/O containment for workflow admission. Queueing and
  * catch-up decisions are local control-plane operations: neither may shell out
- * to Salesforce merely to decide whether a run is ready. Until an admitted
- * read carrier can attest the exact org, a required sf account fails closed as
- * a typed readiness blocker with zero physical process calls.
+ * to Salesforce merely to decide whether a run is ready. A required account
+ * without an admitted exact-account snapshot is a warning, not a blocker
+ * (OPEN-THE-GATES Slice 4). Zero physical process calls either way.
  */
 import { after, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -83,17 +83,17 @@ function writeSalesforceWorkflow(): void {
   });
 }
 
-function assertTypedSalesforceBlock(result: ReturnType<typeof queueWorkflowRun>): void {
-  assert.equal(result.status, 'blocked_readiness');
-  assert.equal(result.readiness?.ok, false);
-  const blocker = result.readiness?.blockers.find((item) => item.name === 'sf:salesforce_org');
-  assert.ok(blocker, `expected a typed sf resource blocker: ${result.message}`);
-  assert.equal(blocker.kind, 'cli');
-  assert.equal(blocker.status, 'unknown');
-  assert.match(blocker.reason, /admitted .*read|execution authority|cannot be verified/i);
+function assertAdmittedSalesforceWarning(result: ReturnType<typeof queueWorkflowRun>): void {
+  assert.notEqual(result.status, 'blocked_readiness');
+  assert.equal(result.readiness?.ok, true);
+  const warning = result.readiness?.warnings.find((item) => item.name === 'sf:salesforce_org');
+  assert.ok(warning, `expected a typed sf resource warning: ${result.message}`);
+  assert.equal(warning.kind, 'cli');
+  assert.equal(warning.status, 'unknown');
+  assert.match(warning.reason, /admitted .*read|execution authority|cannot be verified/i);
 }
 
-test('production queue admission blocks an unattested Salesforce account without spawning sf', () => {
+test('production queue admission warns on an unattested Salesforce account without spawning sf', () => {
   writeSalesforceWorkflow();
 
   const result = queueWorkflowRun('Salesforce Dashboard', {}, {
@@ -102,7 +102,7 @@ test('production queue admission blocks an unattested Salesforce account without
     workflowSlug: 'salesforce-dashboard',
   });
 
-  assertTypedSalesforceBlock(result);
+  assertAdmittedSalesforceWarning(result);
   assert.deepEqual(sfSpawnCalls, [], 'queue readiness must perform zero Salesforce CLI process calls');
 });
 
@@ -129,11 +129,12 @@ test('production held-catch-up resume rechecks locally and never spawns sf', () 
     expectedWorkflow: 'salesforce-dashboard',
   });
 
-  assert.equal(resumed.status, 'blocked_readiness');
-  assert.equal(resumed.readiness?.ok, false);
-  const blocker = resumed.readiness?.blockers.find((item) => item.name === 'sf:salesforce_org');
-  assert.ok(blocker, `expected the admitted snapshot to retain the sf blocker: ${resumed.message}`);
-  assert.equal(blocker.kind, 'cli');
-  assert.equal(blocker.status, 'unknown');
+  assert.equal(resumed.status, 'resumed');
+  assert.equal(resumed.run?.readiness?.ok, true);
+  const warning = (resumed.run?.readiness?.warnings as Array<{ name?: string; kind?: string; status?: string }> | undefined)
+    ?.find((item) => item.name === 'sf:salesforce_org');
+  assert.ok(warning, `expected the admitted snapshot to retain the sf warning: ${resumed.message}`);
+  assert.equal(warning.kind, 'cli');
+  assert.equal(warning.status, 'unknown');
   assert.deepEqual(sfSpawnCalls, [], 'catch-up Resume must perform zero Salesforce CLI process calls');
 });

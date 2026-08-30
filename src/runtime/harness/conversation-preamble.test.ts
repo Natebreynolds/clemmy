@@ -185,7 +185,7 @@ test('restart recovery does not mistake a preamble for an accepted-source outcom
   const resumed: number[] = [];
   const summary = recoverInterruptedChatRuns(
     () => Date.now() + 1_000,
-    async (_sessionId, _directive, sourceUserSeq) => { resumed.push(sourceUserSeq); },
+    async (dispatch) => { resumed.push(dispatch.sourceUserSeq); },
     { bootCutoffMs: Date.now() + 1_000 },
   );
   assert.equal(summary.records[0]?.terminalReconciled, false);

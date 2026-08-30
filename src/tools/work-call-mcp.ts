@@ -115,7 +115,7 @@ export function registerClaudeActionWorkCall(
 
   const registered = server.tool(
     'work_call',
-    base.description ?? 'Invoke one business tool under the exact frozen semantic work contract.',
+    base.description ?? 'Invoke one plan-selected local read or business tool under the exact frozen semantic work contract.',
     WorkCallInputSchema.shape,
     async (input: WorkCallInput) => {
       const claim = claimClaudeLocalPermissionAdmission({

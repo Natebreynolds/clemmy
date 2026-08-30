@@ -60,6 +60,8 @@ async function invokeWrappedDiscoveryInFreshProcess(input: {
   key: { sessionId: string; sourceUserSeq: number };
   callId: string;
   markerPath: string;
+  raceCallPrefix?: string;
+  raceSize?: number;
 }): Promise<{ callId: string; providerRan: boolean; result: string }> {
   const code = `
     const { appendFileSync } = await import('node:fs');
@@ -81,7 +83,18 @@ async function invokeWrappedDiscoveryInFreshProcess(input: {
       execute: async () => {
         providerRan = true;
         appendFileSync(process.env.CLEM_PROVIDER_MARKER, callId + '\\n', 'utf8');
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        const raceCallPrefix = process.env.CLEM_RACE_CALL_PREFIX;
+        const raceSize = Number(process.env.CLEM_RACE_SIZE ?? 0);
+        if (raceCallPrefix && raceSize > 1) {
+          const deadline = Date.now() + 10_000;
+          while (Date.now() < deadline) {
+            const decisions = eventlog.listEvents(key.sessionId, {
+              types: ['discovery_governor_decision'],
+            }).filter((event) => String(event.data.callId ?? '').startsWith(raceCallPrefix));
+            if (decisions.length >= raceSize) break;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
         return 'provider-result:' + callId;
       },
     }));
@@ -114,6 +127,12 @@ async function invokeWrappedDiscoveryInFreshProcess(input: {
         CLEM_DISCOVERY_TASK_KEY: JSON.stringify(input.key),
         CLEM_DISCOVERY_CALL_ID: input.callId,
         CLEM_PROVIDER_MARKER: input.markerPath,
+        ...(input.raceCallPrefix && input.raceSize
+          ? {
+              CLEM_RACE_CALL_PREFIX: input.raceCallPrefix,
+              CLEM_RACE_SIZE: String(input.raceSize),
+            }
+          : {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
@@ -194,7 +213,7 @@ test('boundary bypasses legacy callers without accepted task identity', () => {
   }), null);
 });
 
-test('one physical broad call settles; repeat ids are typed pre-dispatch denials', () => {
+test('successful broad discovery transfers one claim to a fresh continuation; replay and concurrent ids deny', () => {
   const key = acceptedTask('novel');
   const first = admitDiscoveryBoundary({
     ...key,
@@ -226,16 +245,37 @@ test('one physical broad call settles; repeat ids are typed pre-dispatch denials
       && error.reason === 'same_call_replay',
   );
 
+  const continuation = admitDiscoveryBoundary({
+    ...key,
+    toolName: 'composio_search_tools',
+    input: { query: 'outlook list unread mail, next page' },
+    callId: 'provider-broad-2',
+  });
+  assert.ok(continuation);
+  const continuationDecision = eventlog.listEvents(key.sessionId, {
+    types: ['discovery_governor_decision'],
+  }).at(-1);
+  assert.equal(continuationDecision?.data.reason, 'settled_continuation_admitted');
+  assert.equal(continuationDecision?.data.priorOutcome, 'succeeded');
+
+  const duringContinuation = discoveryGovernor.getTaskState(key);
+  assert.equal(duringContinuation?.policy.epoch, 0, 'a continuation does not mint an evidence epoch');
+  assert.equal(duringContinuation?.epochClaims.length, 1, 'the existing subject claim transfers instead of multiplying');
+  assert.equal(duringContinuation?.claims.broad_discovery?.callId, 'provider-broad-2');
+  assert.equal(duringContinuation?.claims.broad_discovery?.outcome, 'pending');
+
   assert.throws(
     () => admitDiscoveryBoundary({
       ...key,
-      toolName: 'local_cli_list',
-      input: { filter: 'gh' },
-      callId: 'provider-broad-2',
+      toolName: 'composio_search_tools',
+      input: { query: 'outlook list unread mail, another refinement' },
+      callId: 'provider-broad-3',
     }),
     (error: unknown) => error instanceof DiscoveryBudgetDeniedError
       && error.reason === 'new_call_requires_retry_epoch',
+    'a continuation cannot overlap the one physical owner that is still pending',
   );
+  settleDiscoveryBoundary(continuation, 'succeeded');
 
   assert.equal(
     discoveryGovernor.getTaskState(key)?.claims.broad_discovery?.outcome,
@@ -286,32 +326,56 @@ test('known tasks retain one bounded broad discovery and one exact schema refres
   );
 });
 
-test('execute-only discovery stays conservatively charged and denies before a second provider call', async () => {
+test('execute-only discovery keeps one in-flight owner and admits a fresh id only after durable success', async () => {
   const key = acceptedTask('wrapped');
   let providerCalls = 0;
-  let claimObservedInsideExecute = false;
+  const observedCallIds: string[] = [];
+  let announceFirstProvider: (() => void) | undefined;
+  let releaseFirstProvider: (() => void) | undefined;
+  const firstProviderStarted = new Promise<void>((resolve) => { announceFirstProvider = resolve; });
+  const holdFirstProvider = new Promise<void>((resolve) => { releaseFirstProvider = resolve; });
   const wrapped = wrapToolForHarness({
     name: 'composio_search_tools',
     execute: async () => {
       providerCalls += 1;
-      claimObservedInsideExecute = Boolean(
-        discoveryGovernor.getTaskState(key)?.claims.broad_discovery,
-      );
+      const claim = discoveryGovernor.getTaskState(key)?.claims.broad_discovery;
+      observedCallIds.push(claim?.callId ?? '');
+      if (providerCalls === 1) {
+        announceFirstProvider?.();
+        await holdFirstProvider;
+      }
       return 'provider result';
     },
   });
   const ctx = { ...key, counter: new ToolCallsCounter(10) };
 
-  const first = await withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'outlook unread mail' }));
+  const firstPending = withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'outlook unread mail' }));
+  await firstProviderStarted;
+  const concurrent = await withHarnessRunContext(
+    ctx,
+    () => wrapped.execute!({ query: 'gmail unread mail while the first body is pending' }),
+  );
+  assert.equal(providerCalls, 1, 'a second call cannot overlap a pending provider owner');
+  assert.match(String(concurrent), /new_call_requires_retry_epoch/);
+  releaseFirstProvider?.();
+  const first = await firstPending;
   assert.equal(first, 'provider result');
-  assert.equal(claimObservedInsideExecute, true);
-  // A second, different physical id is a new provider authorization even when
-  // it maps to the same durable subject. It is refused before execute.
-  const second = await withHarnessRunContext(ctx, () => wrapped.execute!({ query: 'gmail unread mail' }));
-  assert.equal(providerCalls, 1, 'the second search must not re-enter provider code');
-  assert.match(String(second), /new_call_requires_retry_epoch/);
+  assert.ok(observedCallIds[0], 'the durable claim must predate execute/provider code');
+
+  const continuation = await withHarnessRunContext(
+    ctx,
+    () => wrapped.execute!({ query: 'outlook unread mail, refined after the first result' }),
+  );
+  assert.equal(continuation, 'provider result');
+  assert.equal(providerCalls, 2);
+  assert.ok(observedCallIds[1]);
+  assert.notEqual(observedCallIds[1], observedCallIds[0], 'the continuation has a fresh physical identity');
+  const state = discoveryGovernor.getTaskState(key);
+  assert.equal(state?.policy.epoch, 0);
+  assert.equal(state?.epochClaims.length, 1, 'the continuation transfers the same claim row');
+  assert.equal(state?.claims.broad_discovery?.callId, observedCallIds[1]);
   assert.equal(
-    discoveryGovernor.getTaskState(key)?.claims.broad_discovery?.outcome,
+    state?.claims.broad_discovery?.outcome,
     'succeeded',
   );
 });
@@ -366,15 +430,25 @@ test('SDK-local validation is free, then the first validated discovery is atomic
   );
   assert.equal(providerCalls, 1, 'the exact same call id cannot re-enter provider code');
 
-  // A further valid search under a different id also lacks provider authority
-  // until the runtime opens a typed evidence epoch.
-  const extra = await invoke(JSON.stringify({ query: 'gmail unread mail' }), 'sdk-extra');
-  assert.match(String(extra), /new_call_requires_retry_epoch/);
-  assert.equal(providerCalls, 1, 'only the first validated search reaches provider code');
+  // A fresh physical id after durable success is a continuation of the same
+  // admitted subject. It transfers the one claim; it does not mint an epoch.
+  const extra = await invoke(JSON.stringify({ query: 'outlook unread mail, refined' }), 'sdk-extra');
+  assert.equal(extra, 'provider result for outlook unread mail, refined');
+  assert.equal(providerCalls, 2);
+  const afterContinuation = discoveryGovernor.getTaskState(key);
+  assert.equal(afterContinuation?.policy.epoch, 0);
+  assert.equal(afterContinuation?.epochClaims.length, 1);
+  assert.equal(afterContinuation?.claims.broad_discovery?.callId, 'sdk-extra');
+  assert.equal(afterContinuation?.claims.broad_discovery?.outcome, 'succeeded');
+  const extraDecision = eventlog.listEvents(key.sessionId, {
+    types: ['discovery_governor_decision'],
+  }).find((event) => event.data.callId === 'sdk-extra' && event.data.decision === 'admitted');
+  assert.equal(extraDecision?.data.reason, 'settled_continuation_admitted');
+  assert.equal(extraDecision?.data.priorOutcome, 'succeeded');
   assert.equal(ctx.counter.calls, 4, 'the earlier logical replay denial does not spend a tool attempt');
 });
 
-test('wrapped discovery elects one provider body across processes and restart until a typed epoch opens', async () => {
+test('wrapped discovery elects one pending owner across processes, then preserves replay and epoch causality', async () => {
   const key = acceptedTask('cross-process-provider-body');
   discoveryGovernor.initializeRoles({
     ...key,
@@ -387,19 +461,22 @@ test('wrapped discovery elects one provider body across processes and restart un
     brokerCoverage: 'authorized_external_v1',
   });
   const markerPath = path.join(TMP_HOME, 'discovery-provider-bodies.log');
+  const raceCallPrefix = 'cross-process-distinct-';
   const racedCallIds = [
-    'cross-process-shared',
-    'cross-process-shared',
+    'cross-process-distinct-0',
     'cross-process-distinct-1',
     'cross-process-distinct-2',
     'cross-process-distinct-3',
     'cross-process-distinct-4',
+    'cross-process-distinct-5',
   ];
   const raced = await Promise.all(
     racedCallIds.map((callId) => invokeWrappedDiscoveryInFreshProcess({
       key,
       callId,
       markerPath,
+      raceCallPrefix,
+      raceSize: racedCallIds.length,
     })),
   );
   const winner = raced.find((result) => result.providerRan);
@@ -408,7 +485,7 @@ test('wrapped discovery elects one provider body across processes and restart un
   assert.equal(
     readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length,
     1,
-    'the shared provider body ran exactly once',
+    'the claim has exactly one provider owner while that owner remains pending',
   );
   assert.equal(
     raced.filter((result) => !result.providerRan)
@@ -428,9 +505,20 @@ test('wrapped discovery elects one provider body across processes and restart un
   });
   assert.equal(sameIdAfterRestart.providerRan, false);
   assert.match(sameIdAfterRestart.result, /logical call is already settled/i);
-  assert.equal(newIdAfterRestart.providerRan, false);
-  assert.match(newIdAfterRestart.result, /new_call_requires_retry_epoch/);
-  assert.equal(readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length, 1);
+  assert.equal(newIdAfterRestart.providerRan, true,
+    'a fresh id may continue only after the first owner has durably succeeded');
+  assert.equal(newIdAfterRestart.result, 'provider-result:post-restart-distinct');
+  assert.equal(readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length, 2);
+  const beforeEvidence = discoveryGovernor.getTaskState(key);
+  assert.equal(beforeEvidence?.policy.epoch, 0, 'restart continuation stays in the original evidence epoch');
+  assert.equal(beforeEvidence?.epochClaims.length, 1, 'restart continuation transfers the existing claim');
+  assert.equal(beforeEvidence?.claims.broad_discovery?.callId, 'post-restart-distinct');
+  assert.equal(beforeEvidence?.claims.broad_discovery?.outcome, 'succeeded');
+  const restartDecision = eventlog.listEvents(key.sessionId, {
+    types: ['discovery_governor_decision'],
+  }).find((event) => event.data.callId === 'post-restart-distinct' && event.data.decision === 'admitted');
+  assert.equal(restartDecision?.data.reason, 'settled_continuation_admitted');
+  assert.equal(restartDecision?.data.priorOutcome, 'succeeded');
 
   assert.equal(discoveryGovernor.recordEvidence({
     ...key,
@@ -443,16 +531,17 @@ test('wrapped discovery elects one provider body across processes and restart un
     markerPath,
   });
   assert.equal(authorizedRetry.providerRan, true);
-  assert.equal(readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length, 2);
+  assert.equal(readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean).length, 3);
 
   const state = discoveryGovernor.getTaskState(key);
+  assert.equal(state?.policy.epoch, 1);
   assert.deepEqual(state?.allClaims.map((claim) => claim.outcome), ['succeeded', 'succeeded']);
   const recordedOutcomes = eventlog.listEvents(key.sessionId, {
     types: ['discovery_governor_outcome'],
   }).filter((event) => event.data.recorded === true);
   assert.deepEqual(
     recordedOutcomes.map((event) => event.data.callId).sort(),
-    [winner.callId, 'typed-epoch-1'].sort(),
+    [winner.callId, 'post-restart-distinct', 'typed-epoch-1'].sort(),
     'every admitted provider body has one exact durable settlement',
   );
   assert.equal(existsSync(markerPath), true);

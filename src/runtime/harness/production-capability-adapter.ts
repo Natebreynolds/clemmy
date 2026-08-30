@@ -9,6 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 import { realpathSync, statSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { persistCapabilityLiveIdentity } from './capability-live-identity.js';
 import { observeComposioIndependently } from './production-capability-adapters.js';
@@ -167,7 +168,16 @@ function observeReviewedCli(manifest: CapabilityManifestV1): LiveCapabilityObser
     const binaryFingerprint = sha256(readFileSync(real));
     const port = resolveProductionPortsForManifest(manifest);
     const argv = port?.argv ? [...port.argv] : null;
-    if (!argv || argv.length === 0 || argv.some((part) => part.includes('|') || part.includes(' '))) {
+    if (
+      !argv
+      || argv.length === 0
+      || (argv[0] !== real && argv[0] !== path.basename(real))
+      || argv.some((part) => (
+        typeof part !== 'string'
+        || part.includes('\0')
+        || Buffer.byteLength(part, 'utf8') > 65_536
+      ))
+    ) {
       return 'unknown';
     }
     return {
@@ -210,7 +220,15 @@ export function observationMatchesManifest(
     if (!cli || cli.shell !== false || !Array.isArray(cli.argv) || cli.argv.length === 0) {
       return { ok: false, reason: 'unknown' };
     }
-    if (cli.argv.some((part) => typeof part !== 'string' || part.includes('|'))) {
+    if (
+      cli.argv[0] !== cli.executableRealpath
+      && cli.argv[0] !== path.basename(cli.executableRealpath)
+    ) return { ok: false, reason: 'unknown' };
+    if (cli.argv.some((part) => (
+      typeof part !== 'string'
+      || part.includes('\0')
+      || Buffer.byteLength(part, 'utf8') > 65_536
+    ))) {
       return { ok: false, reason: 'unknown' };
     }
     if (cli.executableRealpath !== manifest.providerIdentity) {
@@ -310,6 +328,10 @@ export function createProductionCapabilityAdapter(input: {
         if (scope && !scope.has(entry.manifest.manifestId)) continue;
         const current = currentCapabilityManifest(entry.manifest);
         if (!current) {
+          // The factory row holds a registration-time copy whose lifecycle
+          // still says current. Durable revocation/supersession is the owner;
+          // leaving that copy callable lets exact-name binding bypass it.
+          factory.forget(entry.manifest.manifestId);
           refused.push({
             manifestId: entry.manifest.manifestId,
             reason: entry.manifest.lifecycle.state === 'revoked'
@@ -343,6 +365,12 @@ export function createProductionCapabilityAdapter(input: {
           ? observe[current.providerKind]
           : (port?.observe && (port.observe as unknown) !== observeHostCallable ? port.observe : undefined);
         const observed = (liveObserver ?? observe[current.providerKind])(current);
+        // Only a reader of real PROVIDER BYTES may claim independence. The
+        // host-callable observer must never, which is why the liveObserver
+        // resolution above already excludes it — a pack-attested or
+        // host-callable observation populating an executable catalog is a
+        // genuine safety hole, and capability-authority pins it.
+
         let matched = observationMatchesManifest(current, observed);
         if (!matched.ok && (observed === 'missing' || observed === 'unknown')) {
           const prior = independentlyObserveCapability(current.operationId, current.accountId);

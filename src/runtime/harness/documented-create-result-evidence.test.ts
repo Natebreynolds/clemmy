@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { documentedComposioManifestOperationSemantics } from '../../integrations/composio/operation-semantics.js';
 import {
   admitDocumentedCreateResultProjection,
   projectDocumentedCreateResult,
@@ -14,6 +15,9 @@ const DIGEST_C = 'c'.repeat(64);
 const OPERATION = 'GOOGLESHEETS_SHEET_FROM_JSON';
 const SHEET_ID = 'sheet_Abc-123';
 const SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
+const SHEET_SEMANTICS = documentedComposioManifestOperationSemantics(OPERATION);
+assert.ok(SHEET_SEMANTICS?.atomicInputContent);
+const RESULT_IDENTITY = SHEET_SEMANTICS.atomicInputContent.resultIdentity;
 
 const authority: DocumentedCreateResultAuthorityV1 = {
   version: 1,
@@ -25,6 +29,7 @@ const authority: DocumentedCreateResultAuthorityV1 = {
   providerInputSchemaDigest: DIGEST_A,
   argumentDigest: DIGEST_B,
   submittedContentDigest: DIGEST_C,
+  resultIdentity: RESULT_IDENTITY,
   effect: 'external_write',
 };
 
@@ -36,6 +41,7 @@ const actual: DocumentedCreateResultActualCallV1 = {
   providerInputSchemaDigest: authority.providerInputSchemaDigest,
   argumentDigest: authority.argumentDigest,
   submittedContentDigest: authority.submittedContentDigest,
+  resultIdentity: authority.resultIdentity,
   effect: authority.effect,
 };
 
@@ -85,6 +91,55 @@ test('documented Sheet create projection accepts exact direct, nested, and id-on
   }
 });
 
+test('an opaque adapter contract projects atomic evidence without any provider or tool registration in the kernel', () => {
+  const resultIdentity = {
+    version: 1 as const,
+    kind: 'pointer_resource_identity_v1' as const,
+    idPointers: ['/data/resource_id'],
+    handlePointers: ['/data/resource_uri'],
+    handleTemplate: {
+      version: 1 as const,
+      kind: 'prefix_suffix_v1' as const,
+      prefix: 'https://opaque.invalid/resources/',
+      suffix: '',
+    },
+  };
+  const opaqueAuthority: DocumentedCreateResultAuthorityV1 = {
+    ...authority,
+    acceptedTaskId: 'task:opaque-create',
+    logicalToolCallId: 'call:opaque-create',
+    operationId: 'OP_QZXJKV_73',
+    resultIdentity,
+  };
+  const opaqueActual: DocumentedCreateResultActualCallV1 = {
+    ...opaqueAuthority,
+  };
+  const admitted = admitDocumentedCreateResultProjection({
+    authority: opaqueAuthority,
+    actual: opaqueActual,
+  });
+  assert.equal(admitted.status, 'ready');
+  if (admitted.status !== 'ready') return;
+  const raw = {
+    successful: true,
+    data: {
+      resource_id: 'qzx-73',
+      resource_uri: 'https://opaque.invalid/resources/qzx-73',
+    },
+  };
+  const projected = projectDocumentedCreateResult(admitted, raw);
+  assert.equal(projected.status, 'projected');
+  if (projected.status !== 'projected') return;
+  assert.deepEqual(projected.value.created.id, 'qzx-73');
+  assert.deepEqual(projected.value.created.handle, raw.data.resource_uri);
+  assert.equal(verifyCanonicalDocumentedCreateResult({ value: projected.value }).status, 'verified');
+
+  for (const ambiguous of [
+    { ...raw, data: { ...raw.data, resource_id: 'other' } },
+    { ...raw, data: { ...raw.data, resource_uri: 'https://opaque.invalid/resources/other' } },
+  ]) assert.equal(projectDocumentedCreateResult(admitted, ambiguous).status, 'uncertain');
+});
+
 test('missing, conflicting, contradicted, and lookalike Sheet identities never project success', () => {
   const invalid = [
     {},
@@ -120,7 +175,7 @@ test('projection admission is exact across task, call, operation, account, schem
   const changed: Array<[keyof DocumentedCreateResultActualCallV1, unknown, string]> = [
     ['acceptedTaskId', 'task:other', 'accepted_task_mismatch'],
     ['logicalToolCallId', 'call:other', 'logical_call_mismatch'],
-    ['operationId', 'GOOGLESHEETS_SHEET_FROM_JSON_PREVIEW', 'operation_is_not_a_documented_root_create'],
+    ['operationId', 'GOOGLESHEETS_SHEET_FROM_JSON_PREVIEW', 'operation_mismatch'],
     ['accountId', 'conn-other', 'account_mismatch'],
     ['providerInputSchemaDigest', 'c'.repeat(64), 'schema_mismatch'],
     ['argumentDigest', 'd'.repeat(64), 'argument_mismatch'],
@@ -130,7 +185,7 @@ test('projection admission is exact across task, call, operation, account, schem
   for (const [key, value, reason] of changed) {
     const next = { ...actual, [key]: value } as DocumentedCreateResultActualCallV1;
     assert.deepEqual(admitDocumentedCreateResultProjection({ authority, actual: next }), {
-      status: reason === 'operation_is_not_a_documented_root_create' ? 'not_applicable' : 'refused',
+      status: 'refused',
       reason,
     });
   }

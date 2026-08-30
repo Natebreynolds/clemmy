@@ -7,6 +7,7 @@ import { test } from 'node:test';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-ventura-email-card-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.COMPOSIO_BACKEND = 'sdk';
 process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -23,41 +24,81 @@ const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const expectedWork = await import('./expected-work-admission.js');
 const expectedWorkContract = await import('./expected-work-contract.js');
-const artifactLedger = await import('./artifact-ledger.js');
-const dispatchLedger = await import('./dispatch-ledger.js');
 const brackets = await import('./brackets.js');
 const continuityRuntime = await import('./task-continuity-runtime.js');
 const turnControl = await import('./turn-control.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { recordAcceptedSourceGraph } = await import('./record-accepted-source-graph.js');
-const pendingActions = await import('./pending-actions.js');
-const pendingTransitions = await import('./pending-action-transition.js');
-const approvals = await import('./approval-registry.js');
 const composio = await import('../../tools/composio-tools.js');
 const composioSchema = await import('../../tools/composio-schema-cache.js');
-const pendingTools = await import('../../tools/pending-action-tools.js');
 const { buildWorkerAgent } = await import('../../agents/sub-agents.js');
-const {
-  _setInnerDispatchToolsForTests,
-  dispatchBatchItemTool,
-} = await import('../../tools/inner-dispatch.js');
-const { withToolOutputContext } = await import('./tool-output-context.js');
+const { _setInnerDispatchToolsForTests } = await import('../../tools/inner-dispatch.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const capabilityCatalog = await import('./host-capability-catalog-factory.js');
+const operationSemantics = await import('../../integrations/composio/operation-semantics.js');
+
+const SOURCE_TOOL = 'APIFY_TEST_VENTURA_TOP_5_RESTAURANTS_GET';
+const sheetFromJsonSemantics = operationSemantics
+  .documentedComposioManifestOperationSemantics('GOOGLESHEETS_SHEET_FROM_JSON');
+assert.ok(sheetFromJsonSemantics?.atomicInputContent, 'fixture requires reviewed atomic Sheet semantics');
+const sheetReadbackVerification = operationSemantics
+  .documentedComposioReadbackVerification('GOOGLESHEETS_BATCH_GET');
+assert.ok(sheetReadbackVerification, 'fixture requires reviewed Sheet readback semantics');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: SOURCE_TOOL,
+    providerKind: 'composio',
+    effect: 'read',
+  },
+  {
+    operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'googlesheets', posture: 'create_new' },
+    operationSemantics: sheetFromJsonSemantics,
+  },
+  {
+    operationId: 'GOOGLESHEETS_BATCH_GET',
+    providerKind: 'composio',
+    effect: 'read',
+    verification: sheetReadbackVerification,
+  },
+  {
+    operationId: 'GMAIL_SEND_EMAIL',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'message', posture: 'named_existing' },
+    operationSemantics: { version: 1, reversibility: 'irreversible' },
+  },
+]);
+const sourceCatalogEntry = capabilityCatalog.peekHostCapabilityCatalogFactory()
+  ?.snapshot()
+  .find((entry) => entry.toolName === SOURCE_TOOL);
+assert.ok(sourceCatalogEntry, 'fixture installed the exact current Ventura source capability');
 
 test.after(() => {
   _setInnerDispatchToolsForTests(null);
   composioSchema.resetToolSchemaCache();
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
 const REQUEST = 'Pull the top 5 restaurants in Ventura CA from the Apify API, put them in a new Google Sheet with name, rating, and address, then email me the link.';
-const SHEET_ID = 'ventura-sheet-verified';
-const SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
-const SOURCE_TOOL = 'APIFY_TEST_VENTURA_TOP_5_RESTAURANTS_GET';
 const SOURCE_SCHEMA = {
   type: 'object',
   properties: {},
+  additionalProperties: false,
+} as const;
+const SHEET_CREATE_SCHEMA = {
+  type: 'object',
+  required: ['title', 'sheet_name', 'sheet_json'],
+  properties: {
+    title: { type: 'string' },
+    sheet_name: { type: 'string' },
+    sheet_json: { type: 'array', items: { type: 'object' } },
+  },
   additionalProperties: false,
 } as const;
 const ROWS = [
@@ -109,34 +150,33 @@ type Invokable = {
   ) => Promise<unknown>;
 };
 
-function pendingHandler(name: string) {
-  const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{
-    content: Array<{ type: 'text'; text: string }>;
-  }>>();
-  pendingTools.registerPendingActionTools({
-    tool(toolName: string, ...args: unknown[]) {
-      handlers.set(toolName, args.at(-1) as (input: Record<string, unknown>) => Promise<{
-        content: Array<{ type: 'text'; text: string }>;
-      }>);
-    },
-  } as never);
-  const handler = handlers.get(name);
-  if (!handler) throw new Error(`missing ${name}`);
-  return handler;
-}
-
-test('verified Ventura Sheet yields exactly one email approval card and zero sends across an identical retry', async () => {
+test('a direct worker bypass cannot mint Ventura Sheet or email authority after a safe source read', async () => {
   // This integration owns the Sheet/readback/email lifecycle, not provider
   // argument-template selection. Model the already-selected Apify recipe as a
   // parameterless action so its V1 source binding is executable without
   // weakening the production rule that rejects unattested nonempty args.
   composioSchema.rememberToolSchema(SOURCE_TOOL, SOURCE_SCHEMA, Date.now());
+  composioSchema.rememberToolSchema(
+    'GOOGLESHEETS_SHEET_FROM_JSON',
+    SHEET_CREATE_SCHEMA,
+    Date.now(),
+    'fixture-ventura-sheet-from-json-v1',
+    {
+      type: 'object',
+      properties: {
+        spreadsheetId: { type: 'string' },
+        spreadsheetUrl: { type: 'string' },
+      },
+    },
+  );
   const sourceSchemaFingerprint = composioSchema.liveComposioSchemaFingerprint(SOURCE_TOOL);
-  assert.ok(sourceSchemaFingerprint, 'the fixture source owns a live schema observation');
+  assert.ok(sourceSchemaFingerprint, 'the fixture source owns a live selector-schema observation');
+  sourceCatalogEntry!.sourceSchemaFingerprint = sourceSchemaFingerprint;
   const sourceStrategyBinding = {
     version: 1 as const,
     primary: {
       capabilityId: `capability:composio:${SOURCE_TOOL}`,
+      accountIdentity: sourceCatalogEntry!.account!,
       schemaFingerprint: sourceSchemaFingerprint,
     },
     equivalentFallbacks: [],
@@ -217,7 +257,12 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
   });
   assert.equal(inspection.status, 'verified', JSON.stringify(inspection));
   if (inspection.status !== 'verified') throw new Error('formal Ventura A/Q/B inspection failed');
-  turnControl.recordTurnPreflightDecision(session.id, inspection.decision, source.seq);
+  turnControl.recordTurnPreflightDecision(session.id, {
+    phase: 'execute',
+    consequential: true,
+    reason: 'continuation_approved',
+    sourceUserSeq: source.seq,
+  }, source.seq);
   const task = { sessionId: session.id, sourceUserSeq: source.seq, turn: 2 };
   assert.ok(await recordAcceptedSourceGraph({
     identity: task,
@@ -232,11 +277,7 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
     activated.status === 'activated' || activated.status === 'replayed',
     JSON.stringify(activated),
   );
-
-  let emailProviderSends = 0;
   const providerCalls: string[] = [];
-  let providerReadySheetRows: unknown;
-  let sheetReadCalls = 0;
   _setInnerDispatchToolsForTests(new Map([[
     'composio_execute_tool',
     {
@@ -257,54 +298,13 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
             if (parsed.tool_slug === SOURCE_TOOL) {
               return { successful: true, data: { items: SOURCE_ROWS } };
             }
-            if (parsed.tool_slug === 'GOOGLESHEETS_SHEET_FROM_JSON') {
-              providerReadySheetRows = args.sheet_json;
-              return {
-                successful: true,
-                data: {
-                  spreadsheetId: SHEET_ID,
-                  spreadsheetUrl: SHEET_URL,
-                  account: { id: 'ambient-account-id-must-not-become-the-sheet' },
-                },
-              };
-            }
-            if (parsed.tool_slug === 'GOOGLESHEETS_BATCH_GET') {
-              sheetReadCalls += 1;
-              assert.equal(
-                args.valueRenderOption,
-                'UNFORMATTED_VALUE',
-                'numeric ratings require unformatted provider values',
-              );
-              const correctContent = args.majorDimension === 'ROWS';
-              const providerRows = providerReadySheetRows as typeof ROWS;
-              const headers = Object.keys(providerRows[0]!) as Array<keyof typeof ROWS[number]>;
-              const readRows = correctContent
-                ? providerRows
-                : providerRows.map((row, index) => index === 2
-                  ? { ...row, Address: 'WRONG CONTENT' }
-                  : row);
-              return {
-                successful: true,
-                data: {
-                  spreadsheetId: SHEET_ID,
-                  spreadsheetUrl: SHEET_URL,
-                  valueRanges: [{
-                    range: "'Restaurants'!A1:C6",
-                    values: [
-                      headers,
-                      ...readRows.map((row) => headers.map((header) => row[header])),
-                    ],
-                  }],
-                },
-              };
-            }
-            if (parsed.tool_slug === 'GMAIL_SEND_EMAIL') {
-              emailProviderSends += 1;
-              return { successful: true, data: { message_id: 'must-not-send-before-approval' } };
-            }
-            throw new Error(`unexpected provider tool ${parsed.tool_slug}`);
+            throw new Error(`unauthorized provider tool crossed the fixture boundary: ${parsed.tool_slug}`);
           }) as never,
           task.sessionId,
+          capabilityCatalog.peekHostCapabilityCatalogFactory()
+            ?.snapshot()
+            .find((entry) => entry.toolName === parsed.tool_slug)
+            ?.account,
         );
       },
     },
@@ -318,18 +318,18 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
   assert.ok(workCall?.invoke, 'activated accepted work owns the production work_call carrier');
   const counter = new brackets.ToolCallsCounter(20);
   const invokeWork = (callId: string, input: Record<string, unknown>) => brackets.withHarnessRunContext(
-    {
-      ...task,
-      directOrchestrator: true,
-      behaviorScopeId: 'ventura-email-card-run',
-      counter,
-    },
-    () => workCall!.invoke!(
-      { context: task },
-      JSON.stringify(input),
-      { toolCall: { callId } },
-    ),
-  );
+      {
+        ...task,
+        directOrchestrator: true,
+        behaviorScopeId: 'ventura-email-card-run',
+        counter,
+      },
+      () => workCall!.invoke!(
+        { context: task },
+        JSON.stringify(input),
+        { toolCall: { callId } },
+      ),
+    );
 
   const fetched = String(await invokeWork('ventura-fetch', {
     proposal,
@@ -367,262 +367,15 @@ test('verified Ventura Sheet yields exactly one email approval card and zero sen
       connected_account_id: null,
     }),
   }));
-  assert.match(created, new RegExp(SHEET_ID));
-  assert.deepEqual(
-    providerReadySheetRows,
-    ROWS,
-    'the Sheet provider receives all five source records in the exact source order and requested column order',
-  );
-  assert.deepEqual(
-    Object.keys((providerReadySheetRows as typeof ROWS)[0]!),
-    ['Name', 'Rating', 'Address'],
-    'provider-visible key iteration retains the user-requested column order',
-  );
-  const generatedArtifactRows = artifactLedger.listRunArtifacts(task.sessionId);
-  assert.equal(generatedArtifactRows.length, 1);
-  assert.deepEqual({
-    sourceCallId: generatedArtifactRows[0]!.sourceCallId,
-    resourceId: generatedArtifactRows[0]!.resourceId,
-    uri: generatedArtifactRows[0]!.uri,
-    status: generatedArtifactRows[0]!.status,
-  }, {
-    sourceCallId: 'ventura-create-sheet',
-    resourceId: SHEET_ID,
-    uri: SHEET_URL,
-    status: 'bound',
-  }, 'create binds one stable generated Sheet artifact, ignoring ambient account.id');
-  assert.equal(artifactLedger.generatedArtifactContentVerificationForTests({
-    ...task,
-    createLogicalToolCallId: 'ventura-create-sheet',
-  })?.contentVerifiedAt, null);
-
-  const wrongReadback = String(await invokeWork('ventura-verify-sheet-wrong-content', {
-    proposal: null,
-    requirement_id: 'verify_sheet',
-    universe_item_id: null,
-    universe_selector: null,
-    name: 'composio_execute_tool',
-    args_json: JSON.stringify({
-      tool_slug: 'GOOGLESHEETS_BATCH_GET',
-      arguments: JSON.stringify({
-        spreadsheet_id: SHEET_ID,
-        ranges: ["'Restaurants'!A1:C6"],
-        valueRenderOption: 'UNFORMATTED_VALUE',
-      }),
-      connected_account_id: null,
-    }),
-  }));
-  assert.match(wrongReadback, /WRONG CONTENT/);
-
-  const emailPayload = {
-    tool_slug: 'GMAIL_SEND_EMAIL',
-    arguments: JSON.stringify({
-      recipient_email: 'owner@example.com',
-      subject: 'Top 5 Ventura restaurants',
-      body: `Here is the verified Google Sheet: ${SHEET_URL}`,
-    }),
-    connected_account_id: 'ca_gmail_owner',
-  };
-  const sendBeforeContentProof = String(await invokeWork('ventura-send-before-content-proof', {
-    proposal: null,
-    requirement_id: 'send_link',
-    universe_item_id: null,
-    universe_selector: null,
-    name: 'composio_execute_tool',
-    args_json: JSON.stringify(emailPayload),
-  }));
   assert.match(
-    sendBeforeContentProof,
-    /work_dependency_pending/,
-    'a same-id readback with one wrong cell cannot authorize the irreversible email',
+    created,
+    /host call attestation is missing/,
+    'the obsolete direct-worker fixture cannot substitute for plan_task plus host-v1 invocation authority',
   );
-  assert.equal(emailProviderSends, 0);
-  assert.equal(pendingActions.listPendingActions({ sessionId: task.sessionId }).length, 0);
+  assert.deepEqual(providerCalls, [SOURCE_TOOL], 'only the safe source read crosses the replaced provider boundary');
+  assert.equal(providerCalls.includes('GMAIL_SEND_EMAIL'), false);
 
-  const verified = String(await invokeWork('ventura-verify-sheet-correct-content', {
-    proposal: null,
-    requirement_id: 'verify_sheet',
-    universe_item_id: null,
-    universe_selector: null,
-    name: 'composio_execute_tool',
-    args_json: JSON.stringify({
-      tool_slug: 'GOOGLESHEETS_BATCH_GET',
-      arguments: JSON.stringify({
-        spreadsheet_id: SHEET_ID,
-        ranges: ["'Restaurants'!A1:C6"],
-        majorDimension: 'ROWS',
-        valueRenderOption: 'UNFORMATTED_VALUE',
-      }),
-      connected_account_id: null,
-    }),
-  }));
-  assert.match(verified, /Restaurants.*A1:C6/);
-  assert.doesNotMatch(verified, /WRONG CONTENT/);
-
-  const contentVerification = artifactLedger.generatedArtifactContentVerificationForTests({
-    sessionId: task.sessionId,
-    sourceUserSeq: task.sourceUserSeq,
-    createLogicalToolCallId: 'ventura-create-sheet',
-  });
-  assert.equal(
-    contentVerification?.verificationLogicalToolCallId,
-    'ventura-verify-sheet-correct-content',
-    `corrected exact readback must persist the content proof: ${JSON.stringify(contentVerification)}`,
-  );
-  const sendAttempt = String(await invokeWork('ventura-send-link', {
-    proposal: null,
-    requirement_id: 'send_link',
-    universe_item_id: null,
-    universe_selector: null,
-    name: 'composio_execute_tool',
-    args_json: JSON.stringify(emailPayload),
-  }));
-  assert.match(
-    sendAttempt,
-    /PENDING_ACTION_APPROVAL_REQUIRED/,
-    `the satisfied verify_sheet dependency must reach the irreversible-send floor: ${JSON.stringify({ sendAttempt, contentVerification })}`,
-  );
-  assert.doesNotMatch(sendAttempt, /work_dependency_pending/);
-  assert.equal(emailProviderSends, 0, 'work_call cannot send while approval is pending');
-  assert.equal(providerCalls.filter((name) => name === 'GMAIL_SEND_EMAIL').length, 0);
-
-  const queue = pendingHandler('pending_action_queue');
-  const queueInput = {
-    title: 'Email the verified Ventura Sheet',
-    summary: 'Send the verified Google Sheet link to the request owner.',
-    kind: 'external_send',
-    toolName: 'composio_execute_tool',
-    payloadJson: JSON.stringify(emailPayload),
-    approvalIntent: 'request_now',
-    targetSummary: 'owner@example.com',
-    preview: `Here is the verified Google Sheet: ${SHEET_URL}`,
-    risk: 'Email delivery is irreversible.',
-    rollback: 'A delivered email cannot be recalled reliably.',
-  };
-  const queueOnce = () => withToolOutputContext(
-    {
-      sessionId: task.sessionId,
-      runScopeId: 'ventura-email-card-run',
-      callId: 'ventura-queue-email',
-    },
-    () => brackets.withHarnessRunContext(
-      {
-        ...task,
-        directOrchestrator: true,
-        behaviorScopeId: 'ventura-email-card-run',
-        counter,
-      },
-      () => queue(queueInput),
-    ),
-  );
-  const firstQueue = await queueOnce();
-  const retryQueue = await queueOnce();
-  assert.match(firstQueue.content[0]!.text, /Pending action queued/);
-  assert.match(retryQueue.content[0]!.text, /Pending action reused/);
-
-  const pending = pendingActions.listPendingActions({ sessionId: task.sessionId });
-  assert.equal(pending.length, 1, 'an identical queue retry reuses one byte-pinned action');
-  const transitions = pendingTransitions.queuedApprovalTransitionsForRequest(
-    task.sessionId,
-    task.sourceUserSeq,
-  );
-  assert.equal(transitions.length, 1, 'same-request retry projects one queue→card edge');
-
-  const firstMaterialization = pendingTransitions.materializeQueuedApprovals(
-    task.sessionId,
-    task.turn,
-    task.sourceUserSeq,
-    transitions,
-  );
-  const secondMaterialization = pendingTransitions.materializeQueuedApprovals(
-    task.sessionId,
-    task.turn,
-    task.sourceUserSeq,
-    transitions,
-  );
-  assert.equal(firstMaterialization.length, 1);
-  assert.equal(secondMaterialization.length, 0, 'a consumed transition cannot mint a second card');
-  const cards = approvals.listPending({ sessionId: task.sessionId, status: 'pending' });
-  assert.equal(cards.length, 1, 'exactly one formal approval card owns the email');
-  assert.equal(firstMaterialization[0]!.approval.approvalId, cards[0]!.approvalId);
-  assert.equal(pendingActions.listPendingActions({ sessionId: task.sessionId }).length, 1);
-  assert.equal(emailProviderSends, 0, 'card materialization and retry never dispatch the email');
-  assert.deepEqual(providerCalls, [
-    SOURCE_TOOL,
-    'GOOGLESHEETS_SHEET_FROM_JSON',
-    'GOOGLESHEETS_BATCH_GET',
-    'GOOGLESHEETS_BATCH_GET',
-  ], 'one create crosses once; only the safe changed readback retries; email never crosses');
-  const crossingCounts = new Map<string, number>();
-  for (const crossing of dispatchLedger.physicalCrossingsFor(task.sessionId, task.sourceUserSeq)) {
-    crossingCounts.set(crossing.tool, (crossingCounts.get(crossing.tool) ?? 0) + 1);
-  }
-  assert.deepEqual([...crossingCounts.entries()].sort(([left], [right]) => left.localeCompare(right)), [
-    [SOURCE_TOOL.toLowerCase(), 1],
-    ['googlesheets_batch_get', 2],
-    ['googlesheets_sheet_from_json', 1],
-  ], 'durable crossings agree with the provider seam and contain no email');
-
-  _setInnerDispatchToolsForTests(new Map([[
-    'carrier_context_probe',
-    {
-      name: 'carrier_context_probe',
-      invoke: async () => {
-        const active = brackets.harnessRunContextStorage.getStore();
-        return {
-          batchItem: active?.batchItem === true,
-          certifiedBatch: active?.certifiedBatch !== undefined,
-        };
-      },
-    },
-  ]] as never));
-  const probeSession = eventlog.createSession({ id: 'carrier-batch-item-parity', kind: 'chat' });
-  const probeSource = eventlog.appendEvent({
-    sessionId: probeSession.id,
-    turn: 1,
-    role: 'user',
-    type: 'user_input_received',
-    data: { text: 'hello' },
-  });
-  assert.ok(shadow.recordTurnGraphShadow({
-    identity: { sessionId: probeSession.id, sourceUserSeq: probeSource.seq, turn: 1 },
-  }));
-  const probeCounter = new brackets.ToolCallsCounter(10);
-  const mirror = await brackets.withHarnessRunContext(
-    { sessionId: probeSession.id, sourceUserSeq: probeSource.seq, turn: 1, counter: probeCounter },
-    () => dispatchBatchItemTool(
-      'carrier_context_probe',
-      {},
-      probeSession.id,
-      probeCounter,
-      undefined,
-      { accounting: 'transport_mirror', canonicalCallId: 'probe-transport-mirror' },
-    ),
-  ) as { batchItem: boolean; certifiedBatch: boolean };
-  const realBatch = await brackets.withHarnessRunContext(
-    { sessionId: probeSession.id, sourceUserSeq: probeSource.seq, turn: 1, counter: probeCounter },
-    () => dispatchBatchItemTool(
-      'carrier_context_probe',
-      {},
-      probeSession.id,
-      probeCounter,
-      { batchId: 'batch-proof', payloadHash: 'payload-proof' },
-    ),
-  ) as { batchItem: boolean; certifiedBatch: boolean };
-  assert.deepEqual(mirror, { batchItem: false, certifiedBatch: false },
-    'work_call transport mirrors retain normal artifact ownership');
-  assert.deepEqual(realBatch, { batchItem: true, certifiedBatch: true },
-    'real certified batch items retain outer-owned artifact semantics');
-  const probeEvents = eventlog.listEvents(probeSession.id, { types: ['tool_called'] })
-    .filter((event) => event.data.tool === 'carrier_context_probe')
-    .map((event) => ({
-      callId: event.data.callId,
-      batchMode: event.data.batchMode,
-      accounting: event.data.accounting ?? null,
-    }));
-  assert.deepEqual(probeEvents, [
-    { callId: 'probe-transport-mirror', batchMode: false, accounting: 'transport_mirror' },
-    { callId: probeEvents[1]?.callId, batchMode: true, accounting: null },
-  ]);
-  assert.equal(emailProviderSends, 0, 'carrier parity probes add no provider crossing');
+  // Positive end-to-end plan/read/create coverage lives in
+  // restaurant-sheet-natural-request.integration.test.ts; exact host-planned
+  // email approval authority is pinned in host-consent-grant-admission.test.ts.
 });

@@ -62,7 +62,6 @@ import {
   deriveExternalCapabilityCallSignalsV1,
   loadExternalCapabilityRiskAttestationV1,
 } from './external-capability-risk-loader.js';
-import { documentedComposioOperationSemantic } from '../../integrations/composio/operation-semantics.js';
 import {
   getCachedToolSchema,
   liveComposioOperationVersion,
@@ -666,8 +665,6 @@ function stagedConsentRisk(input: {
   if (!['create_new', 'named_existing', 'not_applicable'].includes(posture)) {
     return { status: 'unknown' };
   }
-  const documented = documentedComposioOperationSemantic(input.capability.operationId);
-  const documentedEffect = documented?.effect === 'read' ? 'read' : 'external_write';
   const projected = loadExternalCapabilityRiskAttestationV1({
     version: 1,
     manifest: input.capability,
@@ -695,19 +692,6 @@ function stagedConsentRisk(input: {
       }),
     },
     callSignals: callSignals.callSignals,
-    documentedSemantic: documented
-      ? {
-          sourceDigest: digest({
-            protocol: 'staged_documented_operation_semantic_v1',
-            operationId: input.capability.operationId,
-            documented,
-          }),
-          effect: documentedEffect,
-          reversibility: documented.reversibility,
-          consequence: documented.consequence === 'other' ? 'unknown' : documented.consequence,
-          destructive: documented.consequence === 'delete',
-        }
-      : null,
     safety: 'admissible',
   });
   if (!projected.ok) return { status: 'unknown' };

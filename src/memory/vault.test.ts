@@ -7,16 +7,40 @@
  * (so it stays searchable / doesn't thrash the vault index), and a marker pasted
  * into curated text can't silently truncate the file on the next regeneration.
  */
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-vault-read-test-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+
+const {
   splitCuratedMemory,
   composeCuratedMemory,
   sanitizeCuratedMemory,
-  MEMORY_AUTO_SECTION_MARKER as MARKER,
-} from './vault.js';
+  MEMORY_AUTO_SECTION_MARKER: MARKER,
+  loadMemoryContext,
+  VAULT_DIR,
+  SYSTEM_DIR,
+} = await import('./vault.js');
+
+test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
 
 const FULL = `# Memory\n\nNate is a coach.\nPrefers terse replies.\n\n${MARKER}\n\n## User\n- learned fact one\n- learned fact two\n`;
+
+test('loadMemoryContext is read-only when the vault has not been scaffolded', () => {
+  assert.equal(existsSync(VAULT_DIR), false, 'precondition: vault is absent');
+  assert.deepEqual(loadMemoryContext(), {
+    soul: undefined,
+    memory: undefined,
+    identity: undefined,
+    workingMemory: undefined,
+  });
+  assert.equal(existsSync(VAULT_DIR), false, 'read does not create the vault');
+  assert.equal(existsSync(SYSTEM_DIR), false, 'read does not create system directories');
+});
 
 test('splitCuratedMemory returns only the curated prefix, marker stripped', () => {
   const s = splitCuratedMemory(FULL);

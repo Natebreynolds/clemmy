@@ -73,6 +73,45 @@ export function objectiveExplicitlyNamesWorkflow(objective: string, candidate: s
   return forward.test(normalizedObjective);
 }
 
+/** A matched workflow is a resource identity, not permission to execute it.
+ * Promote the immediate run control only from affirmative execution text;
+ * explicit prohibitions are constraints and must never become positive intent. */
+export function requestsWorkflowExecution(input: string): boolean {
+  const positive = input.replace(
+    /\b(?:do\s+not|don'?t|dont|never|without)\b[^.!?;\n]{0,180}/gi,
+    ' prohibited_workflow_action ',
+  );
+  return /\b(?:run|start|execute|launch|trigger|kick\s+off|fire(?:\s+off)?)\b/i.test(positive);
+}
+
+/**
+ * A run request that does not itself name a catalog entry may inherit the
+ * unique workflow already established by prior accepted sources in this
+ * session. Live 2026-08-29: "What's the latest on the platform 49 updates"
+ * uniquely matched, then "Can you just run that workflow and get the sheet
+ * updated please" planned twice and never called workflow_run. Identity
+ * comes only from accepted user text — not model drafts, not the whole
+ * catalog by default. Zero or two+ prior identities stay unclaimed.
+ */
+export function uniqueWorkflowRunRequest(
+  query: string | undefined | null,
+  priorAcceptedTexts?: readonly string[],
+): UniqueEnabledWorkflowMatch | null {
+  const text = typeof query === 'string' ? query.trim() : '';
+  if (!text || !requestsWorkflowExecution(text)) return null;
+  const named = uniqueEnabledWorkflowMatch(text);
+  if (named) return named;
+  if (!priorAcceptedTexts || priorAcceptedTexts.length === 0) return null;
+  const inherited = new Map<string, UniqueEnabledWorkflowMatch>();
+  for (const prior of priorAcceptedTexts) {
+    const match = uniqueEnabledWorkflowMatch(prior);
+    if (!match) continue;
+    inherited.set(match.slug, match);
+    if (inherited.size > 1) return null;
+  }
+  return inherited.size === 1 ? [...inherited.values()][0]! : null;
+}
+
 export function uniqueEnabledWorkflowMatch(
   query: string | undefined | null,
 ): UniqueEnabledWorkflowMatch | null {

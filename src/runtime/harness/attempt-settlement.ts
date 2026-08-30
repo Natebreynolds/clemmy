@@ -52,6 +52,7 @@ import {
 } from './accepted-turn-call-authority.js';
 import { currentHostToolInvocationObservation } from './tool-invocation-observation-context.js';
 import { ExternalWritePreDispatchResult } from './external-write-admission.js';
+import { CurrentCapabilityDefinitionUnavailableError } from './production-capability-ports.js';
 
 export { normalizeCallableArguments, toResultHandle };
 
@@ -508,6 +509,9 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
     signals.preDispatch = true;
     signals.policyRefused = true;
   }
+  if (thrown instanceof CurrentCapabilityDefinitionUnavailableError) {
+    signals.capabilityDefinitionUnavailable = true;
+  }
   const status = numericStatus(
     asRecord?.status ?? asRecord?.statusCode ?? asRecord?.status_code ?? asRecord?.httpStatus,
   );
@@ -835,7 +839,16 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       extracted.emptyResult = true;
     }
   } else {
-    const laundered = sdkLaunderedErrorString(input.result);
+    // `errorFunction` owns this exact prefix on the Claude SDK lane and on the
+    // model-neutral `plan_task` carrier that forwards the same SDK-shaped
+    // refusal. A local/provider read can legitimately return file/log bytes
+    // beginning with the same sentence; treating those bytes as host policy
+    // would let arbitrary result prose forge a failure verdict. Other carrier
+    // wrappers already supply their nominal failure signals before this
+    // fallback.
+    const laundered = input.lane === 'claude_sdk' || input.toolName === 'plan_task'
+      ? sdkLaunderedErrorString(input.result)
+      : null;
     if (laundered === 'invalid_input' && extracted.argumentValidationFailed === undefined) {
       extracted.preDispatch = true;
       extracted.argumentValidationFailed = true;
@@ -846,6 +859,22 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       if (negative) {
         extracted.envelopeSuccessful = false;
         if (negative.errorCode !== undefined) extracted.envelopeErrorCode = negative.errorCode;
+        // `plan_task` owns this exact JSON-string refusal. Its schema rejected
+        // model-authored arguments before the plan body could admit work, but
+        // the host invocation itself DID return through its already-recorded
+        // local crossing. Preserve that crossing truth (do not mark
+        // preDispatch) while giving the model the shared repair_arguments
+        // recovery instead of laundering the refusal into unknown /
+        // stop_and_explain. Restrict the lift to the host-only tool and exact
+        // machine code: another tool/provider cannot mint repair authority by
+        // returning similar prose.
+        if (
+          input.toolName === 'plan_task'
+          && negative.errorCode === 'plan_invalid_input'
+          && extracted.argumentValidationFailed === undefined
+        ) {
+          extracted.argumentValidationFailed = true;
+        }
       }
     }
   }

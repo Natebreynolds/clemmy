@@ -33,6 +33,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
+import {
+  stableJsonDigest,
+  stableJsonFingerprint,
+} from '../shared/stable-json-digest.js';
 
 const CONTRACTS_ROOT = path.join(BASE_DIR, 'memory', 'tool-contracts');
 /** Generous: a provider contract under a stable name changes rarely, and the
@@ -214,22 +218,11 @@ export function contractFileName(identifier: string): string {
  * complete digest; the historical cache/selector identity below intentionally
  * retains its 128-bit wire shape. Both are derived by this one encoder. */
 export function digestSchema(schema: unknown): string {
-  return createHash('sha256').update(stableStringify(schema)).digest('hex');
+  return stableJsonDigest(schema);
 }
 
 export function fingerprintSchema(schema: unknown): string {
-  return digestSchema(schema).slice(0, 32);
-}
-
-/** Key order must not change the fingerprint — otherwise a re-serialised but
- *  identical schema reads as drift and we throw away a good contract. */
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+  return stableJsonFingerprint(schema);
 }
 
 /**

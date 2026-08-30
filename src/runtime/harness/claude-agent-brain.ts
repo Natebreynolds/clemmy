@@ -29,8 +29,6 @@ import {
   evaluateLearningCandidate,
   recordLearningDecision,
 } from '../../memory/learning-receipt.js';
-import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
-import { isUserFacingSession } from '../../execution/scope.js';
 import { handoffTransferForAttempt } from '../../execution/continuation-capsule.js';
 import { searchFactsHybrid } from '../../memory/facts.js';
 import { recallMemory } from '../../memory/recall-memory.js';
@@ -71,6 +69,7 @@ import { AgentRuntimeCancelledError } from '../provider.js';
 import type { AssistantRequest, AssistantResponse } from '../../types.js';
 import { enabledExternalServerNames } from '../mcp-servers.js';
 import { appendEvent } from './eventlog.js';
+import { modelVisibleTextSha256 } from './model-visible-text-digest.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
 // lane (guardrail mandates are constructible only from proof).
 import '../../tools/callable-surface-registration.js';
@@ -168,6 +167,7 @@ import {
   claudeAgentSdkAdvertisableLocalTools,
   claudeToolSearchEnabled,
   runClaudeAgentSdk,
+  runClaudeAgentSdkRouteAttempt,
   ClaudeSdkProviderOverloadError,
   ClaudeSdkCapacityExhaustedError,
   ClaudeSdkContextOverflowError,
@@ -194,7 +194,7 @@ import {
   resolveMcpToolScopeWithRecall,
   type McpToolScope,
 } from '../mcp-tool-scope.js';
-import { pinnedCalendarRuleLabels } from './constraint-guard.js';
+import { composioStandingPolicyCapabilityHints } from '../../integrations/composio/standing-policy-adapter.js';
 import {
   listRunArtifacts,
   listUnverifiedRunArtifacts,
@@ -1605,6 +1605,7 @@ function emitClaudeAgentSdkBrainContextTelemetry(
         candidateCount: primer?.candidateCount ?? includedCount + omittedCount,
         injected,
         injectedBytes,
+        visibleTextSha256: modelVisibleTextSha256(recallText),
         source: primer?.source ?? (unified ? 'unified' : injected ? 'legacy_fallback' : null),
         recallId: primer?.recallId ?? recallId,
         answerability: primer?.answerability ?? answerability,
@@ -2553,7 +2554,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     ? resolveMcpToolScopeWithRecall({
         userInput: declinedParentWithNewTask ? taskInput : request.message,
         priorUserInputs: priorBrainInputs,
-        pinnedCalendarLabels: pinnedCalendarRuleLabels(),
+        standingCapabilityHints: composioStandingPolicyCapabilityHints(),
         configuredServerNames: enabledExternalServerNames(),
         ...(request.turnCandidates?.matches.length
           ? { learnedMatches: request.turnCandidates.matches }
@@ -2784,7 +2785,20 @@ async function respondViaClaudeAgentSdkBrainAttempt(
     });
     let revokedAfterFailure = false;
     try {
-      return await runClaudeAgentSdkImpl({ ...opts, dispatchLease });
+      const physicalOptions = { ...opts, dispatchLease };
+      return await runClaudeAgentSdkRouteAttempt(
+        runClaudeAgentSdkImpl,
+        physicalOptions,
+        {
+          sessionId,
+          role: 'brain',
+          requestedModel: opts.modelId,
+          resolvedModel: opts.modelId ?? modelId,
+          provider: 'claude',
+          source: 'explicit',
+          reason: { lane: 'claude_agent_sdk_brain' },
+        },
+      );
     } catch (err) {
       await revokeDispatchLeaseBeforeRecovery(dispatchLease);
       revokedAfterFailure = true;
@@ -3966,7 +3980,8 @@ async function respondViaClaudeAgentSdkBrainAttempt(
         // able to verify the result yet" and then intercepted the next attempt
         // at the same work (live 2026-08-12).
         result = { ...result, stoppedReason: 'unverified' };
-      } else if (repaired.status === 'blocked_repaired') {
+      } else if (repaired.status === 'blocked_repaired'
+        || repaired.status === 'blocked_truth_projected') {
         // The model wrote its own account of what it could not confirm. That is
         // a better disclosure than any sentence the harness owns, so it becomes
         // the delivered answer. A FALLBACK render is canned prose instead, so
@@ -4204,19 +4219,9 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   if (terminalEventRecorded) {
     clearRunInFlightAfterTerminal(sessionId, attempt.attemptId, userInputEvent.seq);
   }
-  // The transcript reader consumes conversation_completed, so refresh only
-  // after that terminal row is durable. The old pre-dispatch hook always wrote
-  // a user-only snapshot and lagged the assistant by one turn. Keep this
-  // per-session-only so the model-authored global scratchpad is never clobbered.
-  if (terminalEventRecorded) {
-    try {
-      const wmSession = getSession(sessionId);
-      const wmChannel = wmSession?.channel ?? undefined;
-      if (wmSession?.kind === 'chat' && isUserFacingSession(sessionId, wmChannel)) {
-        refreshWorkingMemoryForSession(sessionId, wmChannel);
-      }
-    } catch { /* working-memory observability must never affect delivery */ }
-  }
+  // Working memory is a derived projection, not part of terminal delivery.
+  // Its central reader compares a sidecar to this durable terminal and rebuilds
+  // on demand, including after restart; no filesystem work delays this edge.
   // Post-turn hooks (correction detection then auto-credit) via the ONE shared
   // spine — identical on every brain lane. New post-turn behavior wires there.
   try {

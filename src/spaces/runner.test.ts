@@ -30,6 +30,67 @@ const runnerTrust = await import('./space-data-runner-trust.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const operationalTelemetry = await import('../runtime/operational-telemetry.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+
+const CURRENT_READ_OPERATION = 'PROOF_SPACE_RUNTIME_READ_CURRENT';
+const CURRENT_WRITE_OPERATION = 'PROOF_SPACE_RUNTIME_WRITE_CURRENT';
+const STALE_READ_OPERATION = 'PROOF_SPACE_RUNTIME_READ_STALE';
+const UNREGISTERED_OPERATION = 'PROOF_SPACE_RUNTIME_READ_UNREGISTERED';
+
+function installEffectFixture(
+  operationId: string,
+  effect: 'read' | 'external_write',
+  lifecycle: 'current' | 'revoked' = 'current',
+): void {
+  const fingerprint = createHash('sha256')
+    .update(`space-runner:${operationId}:${effect}`, 'utf8')
+    .digest('hex');
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `manifest.space.runner.${operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'provider.space-runner-fixture',
+    providerVersion: 'fixture.1',
+    operationVersion: '1',
+    definitionFingerprint: fingerprint,
+    effect,
+    accountId: 'account.space-runner-fixture',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: effect === 'read' ? 'read_bounded_records' : 'bounded_write',
+    acceptedInputKinds: ['scope'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'space.runner.test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: lifecycle },
+    advisoryRoles: [effect === 'read' ? 'source' : 'write'],
+  });
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory()
+    ?? capabilityCatalogs.createHostCapabilityCatalogFactory();
+  factory.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => { throw new Error('effect fixture must never own provider I/O'); },
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+}
+
+installEffectFixture(CURRENT_READ_OPERATION, 'read');
+installEffectFixture(CURRENT_WRITE_OPERATION, 'external_write');
+installEffectFixture(STALE_READ_OPERATION, 'read', 'revoked');
 
 test('importing the Workspace runner registers trust recovery without opening the event log', async () => {
   // Registration used to enqueue an unowned setImmediate scan. Besides making
@@ -178,9 +239,9 @@ test('runtime refuses unsafe Composio sources and contains exact reads until sha
   });
   try {
     for (const composioSlug of [
-      'GOOGLESHEETS_UPDATE_SPREADSHEET',
-      'GMAIL_MARK_AS_READ',
-      'ACME_DO_THING',
+      CURRENT_WRITE_OPERATION,
+      STALE_READ_OPERATION,
+      UNREGISTERED_OPERATION,
     ]) {
       const res = await runner.runSpaceDataSource('runtime-source-policy', {
         id: 'pull',
@@ -193,7 +254,7 @@ test('runtime refuses unsafe Composio sources and contains exact reads until sha
 
     const read = await runner.runSpaceDataSource('runtime-source-policy', {
       id: 'events',
-      composioSlug: 'GOOGLECALENDAR_LIST_EVENTS',
+      composioSlug: CURRENT_READ_OPERATION,
     });
     assert.equal(read.ok, false);
     assert.match(read.ok ? '' : read.error, /no shared durable call authority/i);
@@ -493,7 +554,13 @@ process.stdout.write('{}');`,
     const spawnedPath = store.resolveInSpace(slug, 'data/decision-spawned.txt');
     await new Promise((resolve) => setTimeout(resolve, 100));
     const current = dataStore.readData(slug) as {
-      _meta?: { pull?: { status?: string; approvalId?: string } };
+      _meta?: { pull?: {
+        status?: string;
+        approvalId?: string;
+        approvalResolution?: string;
+        approvalResolvedAt?: string;
+        error?: string;
+      } };
     };
     assert.equal(
       (await import('node:fs')).existsSync(spawnedPath),
@@ -527,10 +594,20 @@ process.stdout.write('{}');`,
         'async approval work never fabricates a foreground turn terminal',
       );
     } else {
-      assert.equal(current._meta?.pull?.status, 'awaiting_approval');
+      assert.equal(current._meta?.pull?.status, 'error');
       assert.equal(current._meta?.pull?.approvalId, approvalId);
+      assert.equal(current._meta?.pull?.approvalResolution, 'rejected');
+      assert.match(current._meta?.pull?.approvalResolvedAt ?? '', /^\d{4}-\d{2}-\d{2}T/);
+      assert.match(current._meta?.pull?.error ?? '', /You declined approval .* on \d{4}-\d{2}-\d{2}.*not executed/i);
       assert.equal(note.meta?.staleDataStatus, true);
-      assert.match(note.text, /runner remains blocked/i);
+      assert.match(note.text, /You declined approval .*not executed/i);
+      assert.equal(
+        workspaceDb.listWorkspaceDatasetObservations(slug, {
+          sourceKey: source.id,
+          limit: 10,
+        }).some((observation) => observation.status === 'awaiting_approval'),
+        false,
+      );
     }
   }
 });
@@ -617,7 +694,18 @@ process.stdout.write('{}');`,
     'UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?',
   ).run('2000-01-01T00:00:00.000Z', firstCard.approvalId);
 
-  const renewed = await runner.runSpaceDataSource(slug, source);
+  const automaticRetry = await runner.runSpaceDataSource(slug, source);
+  assert.equal(automaticRetry.ok, false);
+  assert.match(automaticRetry.ok ? '' : automaticRetry.error, /expired.*new approval/i);
+  assert.equal(
+    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    0,
+    'a background-style retry does not silently replace the expired decision',
+  );
+
+  const renewed = await runner.runSpaceDataSource(slug, source, {
+    requestFreshTrustApproval: true,
+  });
   assert.equal(renewed.ok, false);
   assert.equal(
     (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/expired-card-spawned.txt')),
@@ -741,7 +829,11 @@ test('Composio actions require approval when applicable and shared durable autho
     };
   });
   try {
-    for (const composioSlug of ['GMAIL_SEND_EMAIL', 'ACME_DO_THING']) {
+    for (const composioSlug of [
+      CURRENT_WRITE_OPERATION,
+      STALE_READ_OPERATION,
+      UNREGISTERED_OPERATION,
+    ]) {
       const res = await runner.runSpaceAction(
         'runtime-action-policy',
         { id: 'act', composioSlug },
@@ -754,7 +846,7 @@ test('Composio actions require approval when applicable and shared durable autho
 
     const read = await runner.runSpaceAction(
       'runtime-action-policy',
-      { id: 'list', composioSlug: 'GOOGLECALENDAR_LIST_EVENTS' },
+      { id: 'list', composioSlug: CURRENT_READ_OPERATION },
       {},
     );
     assert.equal(read.ok, false);

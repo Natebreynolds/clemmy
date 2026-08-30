@@ -18,6 +18,10 @@ import {
   type WorkflowToolReadinessItem,
   type WorkflowToolReadinessKind,
 } from '../dashboard/workflow-execution-plan.js';
+import {
+  workflowRawSubprocessDeclarations,
+  workflowRawSubprocessRetirementReason,
+} from './workflow-raw-subprocess-policy.js';
 
 // Only capabilities we can authoritatively verify from LOCAL state hard-block a
 // run: a `usesSkill` whose skill is not installed, a `deterministic.runner`
@@ -105,20 +109,37 @@ export function checkWorkflowRunReadiness(
   const { targetStepId, ...planOptions } = options;
   const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, planOptions);
   const capabilityReadiness = partitionWorkflowReadiness(plan.toolReadiness.items, targetStepId);
-  // A declared deterministic.runner / loopUntil.probe.runner is authoritative
-  // via the SAME 'script' readiness item buildWorkflowExecutionPlan already
-  // emits (workflow-execution-plan.ts, source 'deterministic_runner' /
-  // 'loop_probe_runner') by checking the script's actual presence under the
-  // workflow's own scripts/ directory — 'script' is already in
-  // BLOCKING_READINESS_KINDS above, so a genuinely missing script already
-  // hard-blocks. 60db67d8 (2026-08-25) briefly layered an unconditional
-  // "retired" blocker on top of this — and filtered the real script-existence
-  // item OUT of blockers to make room for it — refusing every declaration
-  // whether or not its script existed, which starved 5 live owner workflows
-  // (3 on live cron schedules) of a run record entirely. Restored: this
-  // function trusts the existing, narrower, already-correct check again.
+  // Script presence proves only that a body could be launched. It does not
+  // represent that body's filesystem/network/CLI/child-process effects in the
+  // shared capability kernel, so legacy declarations fail closed even when
+  // their files still exist. The files remain untouched for migration.
+  const rawSubprocessBlockers: WorkflowToolReadinessItem[] = def.steps
+    .flatMap((step) => workflowRawSubprocessDeclarations(step))
+    .filter((declaration) => !targetStepId || declaration.stepId === targetStepId)
+    .map((declaration) => ({
+      kind: 'script' as const,
+      name: declaration.runner,
+      status: 'missing' as const,
+      reason: workflowRawSubprocessRetirementReason(declaration),
+      stepIds: [declaration.stepId],
+      sources: [declaration.kind === 'deterministic.runner'
+        ? 'deterministic_runner' as const
+        : 'loop_probe_runner' as const],
+      evidence: [{
+        kind: 'script' as const,
+        name: declaration.runner,
+        status: 'missing' as const,
+        detail: 'execution authority unavailable; script body was not admitted',
+      }],
+    }));
   const resourceReadiness = requiredResourceReadiness(def);
-  const blockers = [...capabilityReadiness.blockers, ...resourceReadiness.blockers];
+  const blockers = [
+    ...capabilityReadiness.blockers.filter((item) => !(item.sources ?? []).some((source) => (
+      source === 'deterministic_runner' || source === 'loop_probe_runner'
+    ))),
+    ...rawSubprocessBlockers,
+    ...resourceReadiness.blockers,
+  ];
   const warnings = [...capabilityReadiness.warnings, ...resourceReadiness.warnings];
   return {
     ok: blockers.length === 0,
@@ -143,18 +164,6 @@ function requiredResourceReadiness(
     const cli = resource.cli?.trim().toLowerCase();
     if (!cli) continue;
     const resourceId = resource.id?.trim() || fallbackId;
-    if (cli !== 'sf') {
-      warnings.push(resourceProbeItem({
-        resourceId,
-        cli,
-        status: 'unknown',
-        reason: `Required account resource "${resourceId}" uses CLI "${cli}"; no authoritative local account snapshot is available for it yet.`,
-        detail: 'unsupported account CLI; execution must verify through its admitted transport',
-        stepIds,
-      }));
-      continue;
-    }
-
     const account = resource.account?.trim();
     if (!account || !SAFE_ACCOUNT_SELECTOR.test(account)) {
       blockers.push(resourceProbeItem({
@@ -168,13 +177,11 @@ function requiredResourceReadiness(
       continue;
     }
 
-    // connected-clis.json proves only that the binary was registered, while
-    // cli-auth-health.json is a generic, staleable cache and the Salesforce
-    // catalog has no exact-org auth probe. Neither can attest this selector.
-    // Readiness also owns no physical provider/CLI authority, so it must not
-    // execute `sf org display` or `sf org list`. Fail closed until an admitted
-    // carrier can provide a bounded, exact-account snapshot.
-    blockers.push(resourceProbeItem({
+    // Readiness owns no physical provider/CLI authority and must not shell
+    // out to attest an account. A missing local snapshot is a host-internal
+    // gap: warn and admit. The admitted carrier verifies the exact account
+    // at execution. No CLI is special-cased here (OPEN-THE-GATES Slice 4).
+    warnings.push(resourceProbeItem({
       resourceId,
       cli,
       status: 'unknown',

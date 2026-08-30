@@ -24,7 +24,8 @@ based on importer/behavior closure, not only these filenames.
 ### Task-shape and provider routing
 
 - `src/runtime/tool-composition-detector.ts`
-- `src/execution/workflow-builder-analysis.ts`
+- ~~`src/execution/workflow-builder-analysis.ts`~~ — eliminated; the primary
+  model now authors the explicit semantic graph passed to `workflow_create`.
 - `src/execution/controller.ts`
 - `src/execution/workflow-resource-binding.ts`
 - `src/runtime/capability-registry.ts`

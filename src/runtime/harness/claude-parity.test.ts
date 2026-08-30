@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyClaudeEnvelope, buildClaudeSystemBlocks, claudeWireDebugEnabled, logClaudeRequestShape, logClaudeResponseUsage, hoistSystemMessagesIntoSystem } from './claude-model.js';
-import { resolveModelCapability, CACHE_BREAK_SENTINEL } from './model-wire-registry.js';
+import {
+  resolveModelCapability,
+  CACHE_BREAK_SENTINEL,
+  CACHE_MEMORY_CONTEXT_DELIM,
+  CACHE_MEMORY_CONTEXT_SENTINEL,
+} from './model-wire-registry.js';
 
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const OPUS = resolveModelCapability('claude-opus-4-8');
@@ -35,6 +40,14 @@ test('blocks: a sentinel split with a large stable prefix gets a cache_control b
   assert.deepEqual((blocks[1] as any).cache_control, { type: 'ephemeral' });
   assert.equal((blocks[2] as any).text, 'DYNAMIC');
   assert.equal((blocks[2] as any).cache_control, undefined, 'dynamic context stays uncached');
+});
+
+test('blocks: current-turn and memory suffixes remain ordered but internal layer markers never reach Claude', () => {
+  const stable = 'S'.repeat(20000);
+  const sys = `${stable}${CACHE_BREAK_SENTINEL}TURN${CACHE_MEMORY_CONTEXT_DELIM}MEMORY`;
+  const { blocks } = buildClaudeSystemBlocks(sys, OPUS, true);
+  assert.equal((blocks[2] as any).text, 'TURN\n\nMEMORY');
+  assert.equal(JSON.stringify(blocks).includes(CACHE_MEMORY_CONTEXT_SENTINEL), false);
 });
 
 test('blocks: a stable prefix below cacheMinTokens is NOT cached (avoids the write premium for a 0% hit)', () => {

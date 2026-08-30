@@ -18,6 +18,10 @@ const {
   buildScopedLocalToolSearch,
 } = await import('./local-runtime-tools.js');
 const { toolOutputContextFromSdk } = await import('../runtime/harness/tool-output-context.js');
+const {
+  InvalidArgumentsPreDispatchResult,
+  attemptSignalsFromTypedResult,
+} = await import('../runtime/harness/attempt-settlement.js');
 
 test('OpenAI local-runtime context preserves the exact accepted source turn', () => {
   const context = toolOutputContextFromSdk(
@@ -84,6 +88,33 @@ test('local tool catalog is the exact loaded surface without schemas', () => {
     tools.map((entry) => entry.name),
   );
   assert.ok(catalog.every((entry) => typeof entry.description === 'string'));
+});
+
+test('local runtime preserves file_query argument refusal as a nominal invalid-arguments carrier', async () => {
+  const fileQuery = getLocalRuntimeTools()
+    .find((candidate) => (candidate as { name?: string }).name === 'file_query');
+  assert.ok(fileQuery && fileQuery.type === 'function');
+
+  const output = await fileQuery.invoke(
+    new RunContext({ sessionId: 'local-file-query-invalid-arguments' }),
+    JSON.stringify({
+      query: 'missing sources',
+      file: null,
+      call_id: null,
+      top_k: null,
+    }),
+  );
+
+  assert.ok(output instanceof InvalidArgumentsPreDispatchResult,
+    'the adapter must not flatten the marked MCP refusal into success-shaped text');
+  assert.equal(output.outcomeKind, 'invalid_arguments');
+  assert.deepEqual(attemptSignalsFromTypedResult(output), {
+    preDispatch: true,
+    argumentValidationFailed: true,
+    schemaAvailable: true,
+  });
+  assert.match(String(output), /pass exactly ONE of `file` \/ `call_id`/i,
+    'the model-facing corrective text remains unchanged');
 });
 
 test('scoped tool_search tells the model to dispatch deferred tools through call_tool', async () => {

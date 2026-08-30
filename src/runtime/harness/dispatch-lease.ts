@@ -225,7 +225,8 @@ export function activateDispatchLease(input: {
       recovery_argument_cipher = excluded.recovery_argument_cipher,
       recovery_turn = excluded.recovery_turn,
       activated_at = excluded.activated_at,
-      revoked_at = NULL
+      revoked_at = NULL,
+      revocation_reason = NULL
   `).run(
     lease.scopeId,
     lease.sessionId,
@@ -258,6 +259,45 @@ export function revokeDispatchLease(lease: DispatchLeaseRef | undefined): void {
        AND session_id = ?
        AND lease_id = ?
   `).run(new Date().toISOString(), lease.scopeId, lease.sessionId, lease.leaseId);
+}
+
+export const TERMINAL_RUN_ATTEMPT_BOOT_REVOCATION_REASON =
+  'terminal_run_attempt_at_daemon_boot' as const;
+
+/**
+ * DAEMON-BOOT ONLY: quarantine every unreleased dispatch generation whose
+ * exact session + run-attempt owner is already terminal.
+ *
+ * `interruptOrphanedRunAttemptsAtBoot` first converts predecessor-owned active
+ * attempts into terminal rows. This one SQL owner then fences their dispatch
+ * generations across chat, workflow, execution, agent, and future session
+ * kinds without inspecting provider/tool names or invoking a physical surface.
+ * Missing attempts, cross-session references, still-active attempts, unbound
+ * leases, and generations another owner already revoked are intentionally left
+ * untouched.
+ */
+export function reconcileTerminalRunAttemptDispatchLeasesAtBoot(
+  nowMs = Date.now(),
+): number {
+  const revokedAt = new Date(nowMs).toISOString();
+  return openEventLog().prepare(`
+    UPDATE run_dispatch_leases
+       SET revoked_at = ?,
+           revocation_reason = ?
+     WHERE revoked_at IS NULL
+       AND run_attempt_id IS NOT NULL
+       AND EXISTS (
+         SELECT 1
+           FROM run_attempts AS attempt
+          WHERE attempt.attempt_id = run_dispatch_leases.run_attempt_id
+            AND attempt.session_id = run_dispatch_leases.session_id
+            AND attempt.finished_at IS NOT NULL
+            AND attempt.status != 'active'
+       )
+  `).run(
+    revokedAt,
+    TERMINAL_RUN_ATTEMPT_BOOT_REVOCATION_REASON,
+  ).changes;
 }
 
 /**

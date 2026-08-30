@@ -25,7 +25,7 @@ import type { AgentInputItem } from '@openai/agents';
 
 // Dynamic imports: BASE_DIR is read at module load (see config.ts:11),
 // so anything that touches it must be imported AFTER the env is set.
-const { closeEventLog, resetEventLog, listEvents } = await import('./eventlog.js');
+const { closeEventLog, resetEventLog, listEvents, openEventLog } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 
 test.after(() => {
@@ -88,6 +88,80 @@ test('recordTurnResult persists history and lastResponseId across reopen', () =>
   const ended = listEvents(sess.id, { types: ['turn_ended'] });
   assert.equal(ended.length, 1);
   assert.equal(ended[0].data.lastResponseId, 'resp_abc');
+});
+
+test('recordCompletedTurnResult atomically persists the snapshot, ordered events, and turn watermark', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const items: AgentInputItem[] = [
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: 'hello back' }],
+    },
+  ];
+
+  sess.recordCompletedTurnResult({
+    history: items,
+    lastResponseId: 'resp_completed',
+    turn: 1,
+    finalOutputPreview: 'hello back',
+    toolCalls: 0,
+  });
+
+  const reloaded = HarnessSession.load(sess.id);
+  assert.ok(reloaded);
+  assert.deepEqual(reloaded.toInputItems(), items);
+  assert.equal(reloaded.previousResponseId(), 'resp_completed');
+  assert.equal(reloaded.sessionRow.metadata.__turn, 1);
+  const boundary = listEvents(sess.id, { types: ['turn_ended', 'run_completed'] });
+  assert.deepEqual(boundary.map((event) => event.type), ['turn_ended', 'run_completed']);
+  assert.equal(boundary[0].data.lastResponseId, 'resp_completed');
+  assert.deepEqual(boundary[1].data, {
+    finalOutputPreview: 'hello back',
+    toolCalls: 0,
+  });
+});
+
+test('recordCompletedTurnResult rolls back every completed-turn write when the terminal insert fails', () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat', metadata: { retained: 'sibling' } });
+  const db = openEventLog();
+  db.exec(`
+    CREATE TEMP TRIGGER force_completed_turn_rollback
+    BEFORE INSERT ON events
+    WHEN NEW.type = 'run_completed'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced completed-turn rollback');
+    END;
+  `);
+  try {
+    assert.throws(
+      () => sess.recordCompletedTurnResult({
+        history: [{ role: 'user', content: 'must not persist' }],
+        lastResponseId: 'must-not-persist',
+        turn: 1,
+        finalOutputPreview: 'must not publish',
+        toolCalls: 0,
+      }),
+      /forced completed-turn rollback/,
+    );
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS force_completed_turn_rollback');
+  }
+
+  const reloaded = HarnessSession.load(sess.id);
+  assert.ok(reloaded);
+  assert.deepEqual(reloaded.toInputItems(), []);
+  assert.equal(reloaded.previousResponseId(), undefined);
+  assert.equal(reloaded.sessionRow.metadata.__turn, undefined);
+  assert.equal(reloaded.sessionRow.metadata.retained, 'sibling');
+  assert.deepEqual(
+    listEvents(sess.id, { types: ['turn_ended', 'run_completed'] }),
+    [],
+    'the failed transaction leaves neither boundary event visible',
+  );
 });
 
 test('injectSyntheticUserTurn stages an outcome turn into the snapshot the orchestrator replays + is idempotent', () => {

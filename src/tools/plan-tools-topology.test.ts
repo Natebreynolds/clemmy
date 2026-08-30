@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   FreshActionPlanDraftSchema,
+  collectConstructLineageCompleteness,
   derivePlanConstructFromTopology,
 } from './plan-tools.js';
 import type { WorkTopologyV1 } from '../runtime/graph/work-topology.js';
@@ -43,6 +44,20 @@ test('plan construct is host-derived from canonical topology, never item count o
     }],
     universes: [],
   }), 'single_act');
+  assert.equal(derivePlanConstructFromTopology({
+    version: 1,
+    operations: [
+      {
+        id: 'read_gate', effect: 'read', coverage: 'single',
+        dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+      },
+      {
+        id: 'ordered_static_write', effect: 'external_write',
+        dependsOn: ['read_gate'], dataFrom: [], cardinality: { kind: 'once' },
+      },
+    ],
+    universes: [],
+  }), 'single_act', 'dependsOn alone is ordering, never inferred payload lineage');
 });
 
 test('fresh plan schema has one topology and capability-only bindings', () => {
@@ -66,6 +81,14 @@ test('fresh plan schema has one topology and capability-only bindings', () => {
     evidenceRequirements: ['records', 'receipt'],
   };
   assert.equal(FreshActionPlanDraftSchema.safeParse(valid).success, true);
+  assert.deepEqual(collectConstructLineageCompleteness(valid), { ok: true });
+  const missingLineage = structuredClone(valid);
+  missingLineage.topology.operations[1]!.dataFrom = [];
+  assert.deepEqual(collectConstructLineageCompleteness(missingLineage), {
+    ok: false,
+    writeOperationIds: ['write_once'],
+    sourceOperationIds: ['read_source'],
+  });
   assert.equal(FreshActionPlanDraftSchema.safeParse({
     ...valid,
     construct: 'fanout',

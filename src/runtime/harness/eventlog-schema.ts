@@ -22,6 +22,288 @@ interface EventLogMigration {
    *  integrity checks before the schema version is committed. */
   foreignKeysOff?: true;
 }
+
+type LogicalModelResultProjectionClassForMigration =
+  | 'text'
+  | 'structured'
+  | 'media'
+  | 'refused_pre_dispatch'
+  | 'not_started'
+  | 'user_rejected'
+  | 'effect_unknown';
+
+interface LogicalModelResultProjectionMaterialForMigration {
+  callId: string;
+  toolName: string;
+  callNamespace: string | null;
+  resultClass: LogicalModelResultProjectionClassForMigration;
+  resultItemBytes: number;
+  resultItemSha256: string;
+}
+
+const HOST_RESULT_PROTOCOL_FOR_MIGRATION = 'host_tool_disposition_v1';
+const USER_REJECTED_RESULT_FOR_MIGRATION =
+  'The user rejected this action. Do not retry it; continue without it or explain what changes.';
+const LOWER_HEX_SHA256 = /^[a-f0-9]{64}$/;
+
+/** Schema migrations cannot import the runtime receipt writer without making
+ * the cutover process load the event log recursively. Keep this small
+ * canonical whole-result serializer byte-identical to the runtime helper and
+ * pin that equality through the v69 backfill test. */
+function canonicalProjectionJsonForMigration(
+  value: unknown,
+  ancestors = new Set<object>(),
+): string {
+  if (value === null) return 'null';
+  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('logical model result contains a non-finite number');
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'undefined') return 'null';
+  if (typeof value !== 'object') throw new Error('logical model result is not JSON-serializable');
+  if (ancestors.has(value)) throw new Error('logical model result is cyclic');
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => canonicalProjectionJsonForMigration(entry, ancestors)).join(',')}]`;
+    }
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalProjectionJsonForMigration(record[key], ancestors)}`)
+      .join(',')}}`;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function hostDispositionMessageForMigration(
+  disposition: 'refused_pre_dispatch' | 'not_started' | 'effect_unknown',
+  retry: 'replan' | 'do_not_retry',
+): string {
+  if (disposition === 'effect_unknown') {
+    return 'Execution may have started. Do not retry this call; reconciliation is required.';
+  }
+  if (retry === 'do_not_retry') {
+    return 'This exact call is unavailable for this request. Do not retry it; use another capability or explain the limitation.';
+  }
+  return disposition === 'not_started'
+    ? 'This call was not started because another call in the same frame could not safely proceed. No effect occurred; replan from the paired results.'
+    : 'This call was refused before execution. No effect occurred; correct the call or choose another capability.';
+}
+
+function exactHostProjectionClassForMigration(
+  item: Record<string, unknown>,
+  callId: string,
+  toolName: string,
+): Exclude<LogicalModelResultProjectionClassForMigration, 'text' | 'structured' | 'media'> | null {
+  const rejected = {
+    type: 'function_call_result',
+    callId,
+    name: toolName,
+    status: 'completed',
+    output: { type: 'text', text: USER_REJECTED_RESULT_FOR_MIGRATION },
+  };
+  if (canonicalProjectionJsonForMigration(item) === canonicalProjectionJsonForMigration(rejected)) {
+    return 'user_rejected';
+  }
+  const output = item.output && typeof item.output === 'object' && !Array.isArray(item.output)
+    ? item.output as Record<string, unknown>
+    : null;
+  if (output?.type !== 'text' || typeof output.text !== 'string') return null;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(output.text) as unknown;
+  } catch {
+    return null;
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return null;
+  const marker = decoded as Record<string, unknown>;
+  const disposition = marker.disposition;
+  if (
+    marker.protocol !== HOST_RESULT_PROTOCOL_FOR_MIGRATION
+    || (disposition !== 'refused_pre_dispatch'
+      && disposition !== 'not_started'
+      && disposition !== 'effect_unknown')
+    || typeof marker.frameDigest !== 'string'
+    || !LOWER_HEX_SHA256.test(marker.frameDigest)
+    || !Number.isSafeInteger(marker.frameIndex)
+    || Number(marker.frameIndex) < 0
+    || !Number.isSafeInteger(marker.frameSize)
+    || Number(marker.frameSize) <= 0
+    || Number(marker.frameIndex) >= Number(marker.frameSize)
+    || (marker.retry !== 'replan' && marker.retry !== 'do_not_retry')
+  ) return null;
+  const unknown = disposition === 'effect_unknown';
+  if (
+    (unknown && (
+      marker.countsRefusal !== undefined
+      || marker.effect !== 'may_have_started'
+      || marker.retry !== 'do_not_retry'
+      || marker.requiresReconciliation !== true
+      || marker.diagnostic !== undefined
+    ))
+    || (!unknown && (
+      marker.effect !== 'none'
+      || marker.requiresReconciliation !== false
+      || (marker.countsRefusal !== undefined && marker.countsRefusal !== true)
+      || (marker.diagnostic !== undefined
+        && (typeof marker.diagnostic !== 'string' || !marker.diagnostic))
+      || (disposition === 'not_started'
+        && (marker.retry !== 'replan' || marker.countsRefusal !== undefined))
+    ))
+  ) return null;
+  const rebuiltMarker = {
+    protocol: HOST_RESULT_PROTOCOL_FOR_MIGRATION,
+    disposition,
+    frameDigest: marker.frameDigest,
+    frameIndex: Number(marker.frameIndex),
+    frameSize: Number(marker.frameSize),
+    ...(marker.countsRefusal === true ? { countsRefusal: true } : {}),
+    effect: unknown ? 'may_have_started' : 'none',
+    retry: marker.retry,
+    requiresReconciliation: unknown,
+    message: hostDispositionMessageForMigration(disposition, marker.retry),
+    ...(typeof marker.diagnostic === 'string' ? { diagnostic: marker.diagnostic } : {}),
+  };
+  const rebuilt = {
+    type: 'function_call_result',
+    callId,
+    name: toolName,
+    status: 'completed',
+    output: { type: 'text', text: JSON.stringify(rebuiltMarker) },
+  };
+  return canonicalProjectionJsonForMigration(item) === canonicalProjectionJsonForMigration(rebuilt)
+    ? disposition
+    : null;
+}
+
+function projectionClassForMigration(
+  item: Record<string, unknown>,
+  callId: string,
+  toolName: string,
+): LogicalModelResultProjectionClassForMigration {
+  const reserved = exactHostProjectionClassForMigration(item, callId, toolName);
+  if (reserved) return reserved;
+  const output = item.output;
+  const entries = Array.isArray(output) ? output : [output];
+  if (entries.some((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const type = (entry as Record<string, unknown>).type;
+    return type === 'image' || type === 'file' || type === 'input_image' || type === 'input_file';
+  })) return 'media';
+  if (
+    typeof output === 'string'
+    || (
+      output !== null && typeof output === 'object' && !Array.isArray(output)
+      && (output as Record<string, unknown>).type === 'text'
+      && typeof (output as Record<string, unknown>).text === 'string'
+      && Object.keys(output as Record<string, unknown>).every((key) => key === 'type' || key === 'text')
+    )
+  ) return 'text';
+  return 'structured';
+}
+
+function projectionMaterialForMigration(item: unknown): LogicalModelResultProjectionMaterialForMigration | null {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+  const row = item as Record<string, unknown>;
+  const callId = typeof row.callId === 'string' ? row.callId.trim() : '';
+  const toolName = typeof row.name === 'string' ? row.name.trim() : '';
+  if (row.namespace !== undefined && typeof row.namespace !== 'string') return null;
+  const callNamespace = typeof row.namespace === 'string' ? row.namespace : null;
+  if (
+    row.type !== 'function_call_result'
+    || row.status !== 'completed'
+    || !callId
+    || !toolName
+    || row.output === undefined
+  ) return null;
+  const canonicalBytes = canonicalProjectionJsonForMigration(row);
+  return {
+    callId,
+    toolName,
+    callNamespace,
+    resultClass: projectionClassForMigration(row, callId, toolName),
+    resultItemBytes: Buffer.byteLength(canonicalBytes, 'utf8'),
+    resultItemSha256: createHash('sha256').update(canonicalBytes, 'utf8').digest('hex'),
+  };
+}
+
+type MigrationProtocolOpenCall = { name: string; namespace: string | null };
+
+function inspectProtocolForMigration(history: unknown[], requireBalanced: boolean): {
+  valid: boolean;
+  open: Map<string, MigrationProtocolOpenCall>;
+} {
+  const calls = new Map<string, MigrationProtocolOpenCall>();
+  const open = new Map<string, MigrationProtocolOpenCall>();
+  const results = new Set<string>();
+  let valid = true;
+  for (const candidate of history) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const item = candidate as Record<string, unknown>;
+    if (item.type === 'function_call') {
+      const callId = typeof item.callId === 'string' && item.callId ? item.callId : '';
+      const name = typeof item.name === 'string' && item.name ? item.name : '';
+      if (
+        !callId || !name || calls.has(callId)
+        || (item.namespace !== undefined && typeof item.namespace !== 'string')
+      ) {
+        valid = false;
+        continue;
+      }
+      const call = {
+        name,
+        namespace: typeof item.namespace === 'string' ? item.namespace : null,
+      };
+      calls.set(callId, call);
+      open.set(callId, call);
+      continue;
+    }
+    if (item.type === 'function_call_result') {
+      const callId = typeof item.callId === 'string' && item.callId ? item.callId : '';
+      const call = calls.get(callId);
+      if (!call || results.has(callId)) {
+        valid = false;
+        continue;
+      }
+      if (
+        (item.name !== undefined && item.name !== call.name)
+        || (item.namespace !== undefined && item.namespace !== call.namespace)
+      ) valid = false;
+      results.add(callId);
+      open.delete(callId);
+      continue;
+    }
+    if (
+      (item.role === 'user' || item.role === 'assistant' || item.role === 'system')
+      && open.size > 0
+    ) valid = false;
+  }
+  if (requireBalanced && open.size > 0) valid = false;
+  return { valid, open };
+}
+
+function exactOpenAdmissionFrameForMigration(preHistory: unknown[], frameHistory: unknown[]): boolean {
+  const pre = inspectProtocolForMigration(preHistory, true);
+  if (!pre.valid) return false;
+  if (frameHistory.some((candidate) => (
+    candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+    && (candidate as Record<string, unknown>).type === 'function_call_result'
+  ))) return false;
+  const frameCalls = frameHistory.filter((candidate) => (
+    candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+    && (candidate as Record<string, unknown>).type === 'function_call'
+  ));
+  if (frameCalls.length === 0) return false;
+  const combined = inspectProtocolForMigration([...preHistory, ...frameHistory], false);
+  if (!combined.valid || combined.open.size !== frameCalls.length) return false;
+  const ids = frameCalls.map((candidate) => (candidate as Record<string, unknown>).callId);
+  return ids.every((callId) => typeof callId === 'string' && combined.open.has(callId))
+    && new Set(ids).size === ids.length;
+}
 export interface AcceptedTurnSourceEventDigestInput {
   id: string;
   sessionId: string;
@@ -1948,6 +2230,333 @@ function createV57HostCallCapabilityBindingSchema(db: Database.Database): void {
   if (!parents.has('events') || !parents.has('logical_tool_calls') || !parents.has('accepted_turn_call_authorities')) {
     throw new Error('schema v57 host-call capability binding foreign keys are incomplete');
   }
+}
+
+function canonicalHistoricalTriggerSql(sql: string): string {
+  let canonical = '';
+  let inString = false;
+  for (let index = 0; index < sql.length; index += 1) {
+    const character = sql[index]!;
+    if (inString) {
+      canonical += character;
+      if (character === "'") {
+        if (sql[index + 1] === "'") {
+          canonical += sql[index + 1];
+          index += 1;
+        } else {
+          inString = false;
+        }
+      }
+      continue;
+    }
+    if (character === "'") {
+      inString = true;
+      canonical += character;
+      continue;
+    }
+    if (/\s/.test(character)) continue;
+    canonical += character.toLowerCase();
+  }
+  if (inString) throw new Error('schema v70 amendment trigger SQL has an unterminated string');
+  canonical = canonical.replace(/^createtriggerifnotexists/, 'createtrigger');
+  return canonical.replace(/;+$/, '');
+}
+
+const EXACT_AMENDMENT_TRIGGER_SQL = new Map<string, string>([
+  [
+    'trg_expected_work_universe_amendment_update_immutable',
+    `CREATE TRIGGER trg_expected_work_universe_amendment_update_immutable
+     BEFORE UPDATE ON expected_work_universe_amendments
+     BEGIN
+       SELECT RAISE(ABORT, 'a universe amendment is immutable');
+     END`,
+  ],
+  [
+    'trg_expected_work_universe_amendment_delete_immutable',
+    `CREATE TRIGGER trg_expected_work_universe_amendment_delete_immutable
+     BEFORE DELETE ON expected_work_universe_amendments
+     WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+     BEGIN
+       SELECT RAISE(ABORT, 'a universe amendment is immutable');
+     END`,
+  ],
+].map(([name, sql]): [string, string] => [name, canonicalHistoricalTriggerSql(sql)]));
+
+function assertExactAmendmentImmutabilityTriggers(
+  objects: Array<{ type: 'index' | 'trigger'; name: string; sql: string }>,
+): void {
+  const triggers = objects.filter((object) => object.type === 'trigger');
+  if (triggers.length !== EXACT_AMENDMENT_TRIGGER_SQL.size) {
+    throw new Error('schema v70 amendment trigger set is not exact');
+  }
+  for (const trigger of triggers) {
+    const expected = EXACT_AMENDMENT_TRIGGER_SQL.get(trigger.name);
+    if (!expected || canonicalHistoricalTriggerSql(trigger.sql) !== expected) {
+      throw new Error(`schema v70 amendment trigger is not exact: ${trigger.name}`);
+    }
+  }
+}
+
+/** V37 made a source-universe amendment immutable, but its two parents used
+ * ON DELETE RESTRICT and the row carried no FK to its session. That meant the
+ * retention owner's one sanctioned delete -- deleting an old terminal
+ * session -- could never cross an amendment row. Retarget all three identities
+ * together so only the exact session -> contract/event cascade can remove it;
+ * the existing trigger still refuses every standalone delete while the
+ * session exists. */
+function rebuildExpectedWorkUniverseAmendmentCascade(db: Database.Database): void {
+  const tableName = 'expected_work_universe_amendments';
+  const table = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
+  ).get(tableName) as { sql: string | null } | undefined;
+  if (!table?.sql) return;
+
+  const prerequisites = ['sessions', 'events', 'accepted_task_work_contracts'];
+  const tables = new Set((db.prepare(
+    `SELECT name FROM sqlite_master WHERE type = 'table'`,
+  ).all() as Array<{ name: string }>).map((row) => row.name));
+  for (const prerequisite of prerequisites) {
+    if (!tables.has(prerequisite)) {
+      throw new Error(`schema v70 prerequisite missing: ${prerequisite}`);
+    }
+  }
+
+  const expectedColumns = [
+    'session_id',
+    'source_user_seq',
+    'contract_id',
+    'universe_id',
+    'prior_member_id_pointer',
+    'member_id_pointer',
+    'motivating_refusal',
+    'sealed_member_count',
+    'amended_at',
+    'amendment_event_id',
+  ];
+  const columns = (db.prepare(
+    `PRAGMA table_info(${quotedSchemaIdentifier(tableName)})`,
+  ).all() as Array<{ name: string }>).map((column) => column.name);
+  if (JSON.stringify(columns) !== JSON.stringify(expectedColumns)) {
+    throw new Error('schema v70 amendment columns are not exact');
+  }
+
+  const objects = db.prepare(`
+    SELECT type, name, sql FROM sqlite_master
+     WHERE tbl_name = ?
+       AND type IN ('index','trigger')
+       AND sql IS NOT NULL
+     ORDER BY type, name
+  `).all(tableName) as Array<{ type: 'index' | 'trigger'; name: string; sql: string }>;
+  // Validate the historical authority boundary before creating even the two
+  // parent indexes. A same-named no-op trigger must never be preserved and
+  // stamped as v70 merely because it contains a suggestive token.
+  assertExactAmendmentImmutabilityTriggers(objects);
+
+  // SQLite requires a declared UNIQUE parent key for each composite FK. Both
+  // are already unique by their narrower historical keys (contract_id and id),
+  // so these indexes add no new semantic restriction.
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_accepted_task_work_contract_exact_identity
+      ON accepted_task_work_contracts(session_id, source_user_seq, contract_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_event_exact_session_identity
+      ON events(session_id, id);
+  `);
+  const exactIndexSql = new Map((db.prepare(`
+    SELECT name, sql FROM sqlite_master
+     WHERE type = 'index'
+       AND name IN (
+         'uq_accepted_task_work_contract_exact_identity',
+         'uq_event_exact_session_identity'
+       )
+  `).all() as Array<{ name: string; sql: string | null }>).map((row) => [row.name, row.sql ?? '']));
+  if (
+    !/accepted_task_work_contracts\s*\(\s*session_id\s*,\s*source_user_seq\s*,\s*contract_id\s*\)/i
+      .test(exactIndexSql.get('uq_accepted_task_work_contract_exact_identity') ?? '')
+    || !/events\s*\(\s*session_id\s*,\s*id\s*\)/i
+      .test(exactIndexSql.get('uq_event_exact_session_identity') ?? '')
+  ) {
+    throw new Error('schema v70 exact parent identity index is missing or incompatible');
+  }
+
+  type ForeignKeyRow = {
+    id: number;
+    seq: number;
+    table: string;
+    from: string;
+    to: string;
+    on_delete: string;
+  };
+  const exactCascade = (): boolean => {
+    const foreignKeys = db.prepare(
+      `PRAGMA foreign_key_list(${quotedSchemaIdentifier(tableName)})`,
+    ).all() as ForeignKeyRow[];
+    const groups = new Map<number, ForeignKeyRow[]>();
+    for (const row of foreignKeys) {
+      const group = groups.get(row.id) ?? [];
+      group.push(row);
+      groups.set(row.id, group);
+    }
+    const canonical = [...groups.values()].map((group) => group
+      .sort((left, right) => left.seq - right.seq)
+      .map((row) => `${row.from}:${row.table}.${row.to}:${row.on_delete.toUpperCase()}`)
+      .join('|'));
+    return canonical.length === 3
+      && canonical.includes('session_id:sessions.id:CASCADE')
+      && canonical.includes(
+        'session_id:accepted_task_work_contracts.session_id:CASCADE'
+        + '|source_user_seq:accepted_task_work_contracts.source_user_seq:CASCADE'
+        + '|contract_id:accepted_task_work_contracts.contract_id:CASCADE',
+      )
+      && canonical.includes(
+        'session_id:events.session_id:CASCADE|amendment_event_id:events.id:CASCADE',
+      );
+  };
+
+  const verify = (): void => {
+    if (!exactCascade()) {
+      throw new Error('schema v70 amendment session/contract/event cascade is not exact');
+    }
+    const finalObjects = db.prepare(`
+      SELECT type, name, sql FROM sqlite_master
+       WHERE tbl_name = ?
+         AND type IN ('index','trigger')
+         AND sql IS NOT NULL
+       ORDER BY type, name
+    `).all(tableName) as Array<{ type: 'index' | 'trigger'; name: string; sql: string }>;
+    assertExactAmendmentImmutabilityTriggers(finalObjects);
+    const relevantTables = foreignKeyClosure(db, [tableName]);
+    const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+      .filter((violation) => relevantTables.has(violation.table));
+    if (violations.length > 0) {
+      throw new Error(`schema v70 foreign-key check failed for ${violations.length} amendment row(s)`);
+    }
+    const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
+    if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
+      throw new Error(`schema v70 integrity check failed: ${JSON.stringify(integrity).slice(0, 240)}`);
+    }
+  };
+  if (exactCascade()) {
+    verify();
+    return;
+  }
+
+  const legacyExists = db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type = 'table'
+      AND name = 'expected_work_universe_amendments_v69'`,
+  ).get();
+  if (legacyExists) throw new Error('schema v70 amendment rebuild source already exists');
+
+  // Refuse mixed identities rather than blessing them into the new exact FKs.
+  const mismatchedContracts = (db.prepare(`
+    SELECT COUNT(*) AS n
+      FROM expected_work_universe_amendments a
+      LEFT JOIN accepted_task_work_contracts c
+        ON c.session_id = a.session_id
+       AND c.source_user_seq = a.source_user_seq
+       AND c.contract_id = a.contract_id
+     WHERE c.contract_id IS NULL
+  `).get() as { n: number }).n;
+  const mismatchedEvents = (db.prepare(`
+    SELECT COUNT(*) AS n
+      FROM expected_work_universe_amendments a
+      LEFT JOIN events e
+        ON e.session_id = a.session_id
+       AND e.id = a.amendment_event_id
+     WHERE e.id IS NULL
+  `).get() as { n: number }).n;
+  if (mismatchedContracts > 0 || mismatchedEvents > 0) {
+    throw new Error(
+      `schema v70 refuses mixed amendment identities: contracts=${mismatchedContracts}, events=${mismatchedEvents}`,
+    );
+  }
+
+  const beforeRows = (db.prepare(
+    'SELECT COUNT(*) AS n FROM expected_work_universe_amendments',
+  ).get() as { n: number }).n;
+  const beforeBytes = JSON.stringify(db.prepare(`
+    SELECT * FROM expected_work_universe_amendments
+     ORDER BY session_id, source_user_seq, contract_id, universe_id
+  `).all());
+  const dependentObjectsBefore = JSON.stringify(db.prepare(`
+    SELECT type, name, tbl_name, sql FROM sqlite_master
+     WHERE tbl_name != 'expected_work_universe_amendments'
+       AND sql IS NOT NULL
+       AND lower(sql) LIKE '%expected_work_universe_amendments%'
+     ORDER BY type, name
+  `).all());
+
+  const priorLegacyRename = Number(db.pragma('legacy_alter_table', { simple: true })) === 1;
+  db.pragma('legacy_alter_table = ON');
+  try {
+    for (const object of objects) {
+      db.exec(`DROP ${object.type.toUpperCase()} ${quotedSchemaIdentifier(object.name)}`);
+    }
+    db.exec(`
+      ALTER TABLE expected_work_universe_amendments
+        RENAME TO expected_work_universe_amendments_v69;
+
+      CREATE TABLE expected_work_universe_amendments (
+        session_id              TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_user_seq         INTEGER NOT NULL CHECK (source_user_seq > 0),
+        contract_id             TEXT NOT NULL,
+        universe_id             TEXT NOT NULL,
+        prior_member_id_pointer TEXT NOT NULL,
+        member_id_pointer       TEXT NOT NULL
+                                CHECK (member_id_pointer != prior_member_id_pointer),
+        motivating_refusal      TEXT NOT NULL,
+        sealed_member_count     INTEGER NOT NULL CHECK (sealed_member_count > 0),
+        amended_at              TEXT NOT NULL,
+        amendment_event_id      TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq, contract_id, universe_id),
+        FOREIGN KEY (session_id, source_user_seq, contract_id)
+          REFERENCES accepted_task_work_contracts(session_id, source_user_seq, contract_id)
+          ON DELETE CASCADE,
+        FOREIGN KEY (session_id, amendment_event_id)
+          REFERENCES events(session_id, id)
+          ON DELETE CASCADE
+      );
+
+      INSERT INTO expected_work_universe_amendments (
+        session_id, source_user_seq, contract_id, universe_id,
+        prior_member_id_pointer, member_id_pointer, motivating_refusal,
+        sealed_member_count, amended_at, amendment_event_id
+      )
+      SELECT session_id, source_user_seq, contract_id, universe_id,
+             prior_member_id_pointer, member_id_pointer, motivating_refusal,
+             sealed_member_count, amended_at, amendment_event_id
+        FROM expected_work_universe_amendments_v69;
+
+      DROP TABLE expected_work_universe_amendments_v69;
+    `);
+    for (const object of objects) db.exec(object.sql);
+  } finally {
+    db.pragma(`legacy_alter_table = ${priorLegacyRename ? 'ON' : 'OFF'}`);
+  }
+
+  const afterRows = (db.prepare(
+    'SELECT COUNT(*) AS n FROM expected_work_universe_amendments',
+  ).get() as { n: number }).n;
+  const afterBytes = JSON.stringify(db.prepare(`
+    SELECT * FROM expected_work_universe_amendments
+     ORDER BY session_id, source_user_seq, contract_id, universe_id
+  `).all());
+  const dependentObjectsAfter = JSON.stringify(db.prepare(`
+    SELECT type, name, tbl_name, sql FROM sqlite_master
+     WHERE tbl_name != 'expected_work_universe_amendments'
+       AND sql IS NOT NULL
+       AND lower(sql) LIKE '%expected_work_universe_amendments%'
+     ORDER BY type, name
+  `).all());
+  if (
+    beforeRows !== afterRows
+    || beforeBytes !== afterBytes
+    || dependentObjectsBefore !== dependentObjectsAfter
+  ) {
+    throw new Error(
+      `schema v70 changed amendment rows or dependent objects: ${beforeRows} -> ${afterRows}`,
+    );
+  }
+  verify();
 }
 
 const MIGRATIONS: EventLogMigration[] = [
@@ -9219,6 +9828,709 @@ const MIGRATIONS: EventLogMigration[] = [
       }
     },
   },
+  {
+    // Exact, encrypted provider-request reconstruction. The append-only owner
+    // row contains only hashes, durable source references, and an encrypted
+    // payload reference; raw model-visible bytes remain outside SQLite.
+    version: 66,
+    sql: '',
+    backfill: (db) => {
+      const existing = db.prepare(
+        `SELECT 1 AS ok FROM sqlite_master
+          WHERE type = 'table' AND name = 'model_request_provenance'`,
+      ).get() as { ok: number } | undefined;
+      if (existing) {
+        throw new Error('schema v66 refuses preexisting unsanctioned table model_request_provenance');
+      }
+      const prerequisites = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!prerequisites.has('sessions') || !prerequisites.has('events')) {
+        throw new Error('schema v66 prerequisite missing: sessions/events');
+      }
+      db.exec(`
+        CREATE TABLE model_request_provenance (
+          record_id                  TEXT PRIMARY KEY,
+          session_id                 TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          source_user_seq            INTEGER NOT NULL CHECK (source_user_seq > 0),
+          source_event_id            TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          request_ordinal            INTEGER NOT NULL CHECK (request_ordinal > 0),
+          protocol_version           INTEGER NOT NULL CHECK (protocol_version = 1),
+          boundary                   TEXT NOT NULL
+                                     CHECK (boundary IN ('whole_instructions','layered')),
+          normalized_request_digest  TEXT NOT NULL
+                                     CHECK (length(normalized_request_digest) = 64
+                                       AND normalized_request_digest NOT GLOB '*[^0-9a-f]*'),
+          host_projection_digest     TEXT NOT NULL
+                                     CHECK (length(host_projection_digest) = 64
+                                       AND host_projection_digest NOT GLOB '*[^0-9a-f]*'),
+          provenance_digest          TEXT NOT NULL
+                                     CHECK (length(provenance_digest) = 64
+                                       AND provenance_digest NOT GLOB '*[^0-9a-f]*'),
+          provenance_json            TEXT NOT NULL CHECK (length(provenance_json) BETWEEN 2 AND 1048576),
+          payload_id                 TEXT NOT NULL UNIQUE,
+          payload_binding_digest     TEXT NOT NULL
+                                     CHECK (length(payload_binding_digest) = 64
+                                       AND payload_binding_digest NOT GLOB '*[^0-9a-f]*'),
+          payload_reference_json     TEXT NOT NULL
+                                     CHECK (length(payload_reference_json) BETWEEN 2 AND 8192),
+          created_at                 TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, request_ordinal)
+        );
+        CREATE INDEX idx_model_request_provenance_source
+          ON model_request_provenance(session_id, source_user_seq, request_ordinal);
+
+        CREATE TRIGGER trg_model_request_provenance_exact_source
+        BEFORE INSERT ON model_request_provenance
+        WHEN NOT EXISTS (
+          SELECT 1 FROM events source
+           WHERE source.id = NEW.source_event_id
+             AND source.session_id = NEW.session_id
+             AND source.seq = NEW.source_user_seq
+             AND source.role = 'user'
+             AND source.type = 'user_input_received'
+             AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'model request provenance requires its exact accepted source');
+        END;
+
+        CREATE TRIGGER trg_model_request_provenance_immutable
+        BEFORE UPDATE ON model_request_provenance
+        BEGIN
+          SELECT RAISE(ABORT, 'model request provenance is immutable');
+        END;
+
+        CREATE TRIGGER trg_model_request_provenance_delete_immutable
+        BEFORE DELETE ON model_request_provenance
+        -- A parent-session retention delete remains the only deletion
+        -- authority. Direct deletion while that parent exists is forbidden.
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'model request provenance is immutable');
+        END;
+      `);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((row) => row.table === 'model_request_provenance');
+      if (violations.length > 0) {
+        throw new Error(`schema v66 foreign-key check failed for ${violations.length} model request row(s)`);
+      }
+    },
+  },
+  {
+    /**
+     * Exact, non-business results committed by the foreground host.
+     *
+     * A locally refused/not-started/user-rejected function call has no logical
+     * settlement because it crossed neither the logical-call nor provider
+     * boundary. Those results are still model-visible history, so durable
+     * request provenance needs an immutable receipt for the exact output field.
+     * The receipt is deliberately metadata-only: no provider response and no
+     * raw output are duplicated here. Its parent model-batch admission proves
+     * the exact accepted source, call id, and tool name.
+     */
+    version: 67,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_turn_call_authorities',
+        'accepted_model_batch_admissions',
+        'logical_tool_calls',
+        'logical_call_settlements',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v67 prerequisite missing: ${prerequisite}`);
+        }
+      }
+      if (tables.has('host_model_result_receipts')) {
+        throw new Error('schema v67 refuses preexisting unsanctioned table host_model_result_receipts');
+      }
+      db.exec(`
+        CREATE TABLE host_model_result_receipts (
+          receipt_id          TEXT PRIMARY KEY CHECK (
+                                length(receipt_id) = 64
+                                AND receipt_id NOT GLOB '*[^0-9a-f]*'
+                              ),
+          session_id          TEXT NOT NULL,
+          source_user_seq     INTEGER NOT NULL CHECK (source_user_seq > 0),
+          source_event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          accepted_task_id    TEXT NOT NULL CHECK (length(accepted_task_id) BETWEEN 1 AND 512),
+          batch_ordinal       INTEGER NOT NULL CHECK (batch_ordinal > 0),
+          batch_id            TEXT NOT NULL CHECK (length(batch_id) = 64),
+          call_id             TEXT NOT NULL CHECK (length(call_id) BETWEEN 1 AND 512),
+          tool_name           TEXT NOT NULL CHECK (length(tool_name) BETWEEN 1 AND 512),
+          disposition         TEXT NOT NULL CHECK (disposition IN (
+                                'refused_pre_dispatch','not_started','user_rejected'
+                              )),
+          frame_digest        TEXT CHECK (
+                                frame_digest IS NULL OR (
+                                  length(frame_digest) = 64
+                                  AND frame_digest NOT GLOB '*[^0-9a-f]*'
+                                )
+                              ),
+          frame_index         INTEGER CHECK (frame_index IS NULL OR frame_index >= 0),
+          frame_size          INTEGER CHECK (frame_size IS NULL OR frame_size > 0),
+          counts_refusal      INTEGER NOT NULL DEFAULT 0 CHECK (counts_refusal IN (0, 1)),
+          retry_mode          TEXT NOT NULL CHECK (retry_mode IN ('replan','do_not_retry')),
+          output_bytes        INTEGER NOT NULL CHECK (output_bytes > 0),
+          output_sha256       TEXT NOT NULL CHECK (
+                                length(output_sha256) = 64
+                                AND output_sha256 NOT GLOB '*[^0-9a-f]*'
+                              ),
+          recorded_at         TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, call_id),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_turn_call_authorities(session_id, source_user_seq)
+            ON DELETE CASCADE,
+          FOREIGN KEY (session_id, source_user_seq, batch_ordinal, batch_id)
+            REFERENCES accepted_model_batch_admissions(
+              session_id, source_user_seq, batch_ordinal, batch_id
+            ) ON DELETE CASCADE,
+          CHECK (
+            (disposition = 'user_rejected'
+              AND frame_digest IS NULL AND frame_index IS NULL AND frame_size IS NULL
+              AND counts_refusal = 0 AND retry_mode = 'do_not_retry')
+            OR
+            (disposition = 'not_started'
+              AND frame_digest IS NOT NULL AND frame_index IS NOT NULL
+              AND frame_size IS NOT NULL AND frame_index < frame_size
+              AND counts_refusal = 0 AND retry_mode = 'replan')
+            OR
+            (disposition = 'refused_pre_dispatch'
+              AND frame_digest IS NOT NULL AND frame_index IS NOT NULL
+              AND frame_size IS NOT NULL AND frame_index < frame_size)
+          )
+        );
+
+        CREATE INDEX idx_host_model_result_receipts_call
+          ON host_model_result_receipts(session_id, call_id, source_user_seq);
+
+        CREATE TRIGGER trg_host_model_result_receipt_exact_lineage
+        BEFORE INSERT ON host_model_result_receipts
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM accepted_model_batch_admissions admission
+            JOIN accepted_turn_call_authorities root
+              ON root.session_id = admission.session_id
+             AND root.source_user_seq = admission.source_user_seq
+            JOIN events source ON source.id = root.source_event_id
+           WHERE admission.session_id = NEW.session_id
+             AND admission.source_user_seq = NEW.source_user_seq
+             AND admission.accepted_task_id = NEW.accepted_task_id
+             AND admission.batch_ordinal = NEW.batch_ordinal
+             AND admission.batch_id = NEW.batch_id
+             AND root.accepted_task_id = NEW.accepted_task_id
+             AND root.source_event_id = NEW.source_event_id
+             AND root.state = 'open'
+             AND source.session_id = NEW.session_id
+             AND source.seq = NEW.source_user_seq
+             AND source.role = 'user'
+             AND source.type = 'user_input_received'
+             AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+             AND (
+               SELECT COUNT(*)
+                 FROM json_each(admission.frame_history_json) item
+                WHERE json_extract(item.value, '$.type') = 'function_call'
+                  AND json_extract(item.value, '$.callId') = NEW.call_id
+                  AND json_extract(item.value, '$.name') = NEW.tool_name
+             ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'host model result receipt requires exact accepted source/call lineage');
+        END;
+
+        CREATE TRIGGER trg_host_model_result_receipt_no_business_call
+        BEFORE INSERT ON host_model_result_receipts
+        WHEN EXISTS (
+          SELECT 1 FROM logical_tool_calls logical
+           WHERE logical.session_id = NEW.session_id
+             AND logical.logical_tool_call_id = NEW.call_id
+        ) OR EXISTS (
+          SELECT 1 FROM logical_call_settlements settlement
+           WHERE settlement.session_id = NEW.session_id
+             AND (settlement.logical_tool_call_id = NEW.call_id
+               OR settlement.observer_call_id = NEW.call_id)
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'host model result receipt cannot replace logical settlement evidence');
+        END;
+
+        CREATE TRIGGER trg_host_model_result_receipt_immutable
+        BEFORE UPDATE ON host_model_result_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'host model result receipts are immutable');
+        END;
+
+        CREATE TRIGGER trg_host_model_result_receipt_delete_immutable
+        BEFORE DELETE ON host_model_result_receipts
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'host model result receipts are immutable');
+        END;
+      `);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((row) => row.table === 'host_model_result_receipts');
+      if (violations.length > 0) {
+        throw new Error(`schema v67 foreign-key check failed for ${violations.length} host result row(s)`);
+      }
+    },
+  },
+  {
+    /**
+     * Durable reason for the one boot-only dispatch quarantine.
+     *
+     * `revoked_at` predates reasoned revocation and therefore remains valid on
+     * its own. New daemon-boot quarantine writes use the one closed reason
+     * below, while ordinary exact-generation release stays backward-compatible
+     * with a NULL reason. The lease row is reused by scope, so a successor
+     * generation clears both fields when it wins that scope.
+     */
+    version: 68,
+    sql: '',
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 AS ok FROM sqlite_master
+          WHERE type = 'table' AND name = 'run_dispatch_leases'`,
+      ).get() as { ok: number } | undefined;
+      if (!table) throw new Error('schema v68 prerequisite missing: run_dispatch_leases');
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(run_dispatch_leases)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('revocation_reason')) {
+        db.exec(`
+          ALTER TABLE run_dispatch_leases
+          ADD COLUMN revocation_reason TEXT
+            CHECK (
+              revocation_reason IS NULL
+              OR revocation_reason = 'terminal_run_attempt_at_daemon_boot'
+            )
+        `);
+      }
+    },
+  },
+  {
+    /**
+     * Immutable evidence for the exact model-visible projection of a settled
+     * logical call. Logical settlement/result-handle rows prove provider-side
+     * outcome bytes, but the host may preserve structured SDK content or apply
+     * a deterministic presentation transform before the next model request.
+     * This metadata receipt seals that whole `function_call_result` item's
+     * canonical byte count and SHA-256 without copying either the projection
+     * payload or a separate raw provider payload into SQLite.
+     *
+     * Existing ready checkpoints are safe backfill authority: only an exact
+     * admission call/result pair with one unambiguous same-source/task logical
+     * or observer settlement is adopted. Ambiguous and unsettled history is
+     * deliberately skipped rather than inferred.
+     */
+    version: 69,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_turn_call_authorities',
+        'accepted_model_batch_admissions',
+        'accepted_model_batch_checkpoints',
+        'logical_tool_calls',
+        'logical_call_settlements',
+      ]) {
+        if (!tables.has(prerequisite)) {
+          throw new Error(`schema v69 prerequisite missing: ${prerequisite}`);
+        }
+      }
+      if (tables.has('logical_model_result_projection_receipts')) {
+        throw new Error(
+          'schema v69 refuses preexisting unsanctioned table logical_model_result_projection_receipts',
+        );
+      }
+      db.exec(`
+        CREATE TABLE logical_model_result_projection_receipts (
+          receipt_id                       TEXT PRIMARY KEY CHECK (
+                                             length(receipt_id) = 64
+                                             AND receipt_id NOT GLOB '*[^0-9a-f]*'
+                                           ),
+          protocol_version                 INTEGER NOT NULL CHECK (protocol_version = 1),
+          session_id                       TEXT NOT NULL,
+          source_user_seq                  INTEGER NOT NULL CHECK (source_user_seq > 0),
+          source_event_id                  TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          accepted_task_id                 TEXT NOT NULL CHECK (
+                                             length(accepted_task_id) BETWEEN 1 AND 512
+                                           ),
+          batch_ordinal                    INTEGER NOT NULL CHECK (batch_ordinal > 0),
+          batch_id                         TEXT NOT NULL CHECK (
+                                             length(batch_id) = 64
+                                             AND batch_id NOT GLOB '*[^0-9a-f]*'
+                                           ),
+          call_id                          TEXT NOT NULL CHECK (length(call_id) BETWEEN 1 AND 512),
+          tool_name                        TEXT NOT NULL CHECK (length(tool_name) BETWEEN 1 AND 512),
+          call_namespace                   TEXT CHECK (
+                                             call_namespace IS NULL
+                                             OR length(call_namespace) <= 512
+                                           ),
+          settlement_identity_kind         TEXT NOT NULL CHECK (
+                                             settlement_identity_kind IN ('logical','observer')
+                                           ),
+          settlement_logical_tool_call_id  TEXT NOT NULL CHECK (
+                                             length(settlement_logical_tool_call_id) BETWEEN 1 AND 512
+                                           ),
+          settlement_observer_call_id      TEXT CHECK (
+                                             settlement_observer_call_id IS NULL
+                                             OR length(settlement_observer_call_id) BETWEEN 1 AND 256
+                                           ),
+          settlement_event_id              TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+          settlement_semantic_digest       TEXT NOT NULL CHECK (
+                                             length(settlement_semantic_digest) = 64
+                                             AND settlement_semantic_digest NOT GLOB '*[^0-9a-f]*'
+                                           ),
+          result_class                     TEXT NOT NULL CHECK (result_class IN (
+                                             'text','structured','media',
+                                             'refused_pre_dispatch','not_started',
+                                             'user_rejected','effect_unknown'
+                                           )),
+          result_item_bytes                INTEGER NOT NULL CHECK (result_item_bytes > 0),
+          result_item_sha256               TEXT NOT NULL CHECK (
+                                             length(result_item_sha256) = 64
+                                             AND result_item_sha256 NOT GLOB '*[^0-9a-f]*'
+                                           ),
+          recorded_at                      TEXT NOT NULL,
+          UNIQUE (session_id, source_user_seq, call_id),
+          FOREIGN KEY (session_id, source_user_seq)
+            REFERENCES accepted_turn_call_authorities(session_id, source_user_seq)
+            ON DELETE CASCADE,
+          FOREIGN KEY (session_id, source_user_seq, batch_ordinal, batch_id)
+            REFERENCES accepted_model_batch_admissions(
+              session_id, source_user_seq, batch_ordinal, batch_id
+            ) ON DELETE CASCADE,
+          FOREIGN KEY (session_id, source_user_seq, settlement_logical_tool_call_id)
+            REFERENCES logical_call_settlements(
+              session_id, source_user_seq, logical_tool_call_id
+            ) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_logical_model_result_projection_receipts_call
+          ON logical_model_result_projection_receipts(
+            session_id, call_id, source_user_seq, batch_ordinal
+          );
+        CREATE INDEX idx_logical_model_result_projection_receipts_settlement
+          ON logical_model_result_projection_receipts(
+            session_id, source_user_seq, settlement_logical_tool_call_id
+          );
+
+        CREATE TRIGGER trg_logical_model_result_projection_exact_lineage
+        BEFORE INSERT ON logical_model_result_projection_receipts
+        WHEN NOT EXISTS (
+          SELECT 1
+            FROM accepted_model_batch_admissions admission
+            JOIN accepted_turn_call_authorities root
+              ON root.session_id = admission.session_id
+             AND root.source_user_seq = admission.source_user_seq
+            JOIN events source ON source.id = root.source_event_id
+           WHERE admission.session_id = NEW.session_id
+             AND admission.source_user_seq = NEW.source_user_seq
+             AND admission.accepted_task_id = NEW.accepted_task_id
+             AND admission.batch_ordinal = NEW.batch_ordinal
+             AND admission.batch_id = NEW.batch_id
+             AND root.accepted_task_id = NEW.accepted_task_id
+             AND root.source_event_id = NEW.source_event_id
+             AND source.session_id = NEW.session_id
+             AND source.seq = NEW.source_user_seq
+             AND source.role = 'user'
+             AND source.type = 'user_input_received'
+             AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+             AND (
+               SELECT COUNT(*)
+                 FROM json_each(admission.frame_history_json) item
+                WHERE json_extract(item.value, '$.type') = 'function_call'
+                  AND json_extract(item.value, '$.callId') = NEW.call_id
+                  AND json_extract(item.value, '$.name') = NEW.tool_name
+                  AND json_extract(item.value, '$.namespace') IS NEW.call_namespace
+             ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT,
+            'logical model result projection requires exact accepted source/call lineage');
+        END;
+
+        CREATE TRIGGER trg_logical_model_result_projection_exact_settlement
+        BEFORE INSERT ON logical_model_result_projection_receipts
+        WHEN (
+          SELECT COUNT(*)
+            FROM logical_call_settlements settlement
+            JOIN logical_tool_calls logical
+              ON logical.session_id = settlement.session_id
+             AND logical.source_user_seq = settlement.source_user_seq
+             AND logical.logical_tool_call_id = settlement.logical_tool_call_id
+           WHERE settlement.session_id = NEW.session_id
+             AND settlement.source_user_seq = NEW.source_user_seq
+             AND logical.accepted_task_id = NEW.accepted_task_id
+             AND logical.state = 'settled'
+             AND logical.settlement_event_id = settlement.settlement_event_id
+             AND (
+               settlement.logical_tool_call_id = NEW.call_id
+               OR settlement.observer_call_id = NEW.call_id
+             )
+        ) != 1
+        OR NOT EXISTS (
+          SELECT 1
+            FROM logical_call_settlements settlement
+            JOIN logical_tool_calls logical
+              ON logical.session_id = settlement.session_id
+             AND logical.source_user_seq = settlement.source_user_seq
+             AND logical.logical_tool_call_id = settlement.logical_tool_call_id
+           WHERE settlement.session_id = NEW.session_id
+             AND settlement.source_user_seq = NEW.source_user_seq
+             AND settlement.logical_tool_call_id = NEW.settlement_logical_tool_call_id
+             AND settlement.observer_call_id IS NEW.settlement_observer_call_id
+             AND settlement.settlement_event_id = NEW.settlement_event_id
+             AND settlement.semantic_digest = NEW.settlement_semantic_digest
+             AND logical.accepted_task_id = NEW.accepted_task_id
+             AND logical.state = 'settled'
+             AND logical.settlement_event_id = settlement.settlement_event_id
+             AND (
+               (NEW.settlement_identity_kind = 'logical'
+                 AND settlement.logical_tool_call_id = NEW.call_id
+                 AND logical.tool_name = NEW.tool_name)
+               OR
+               (NEW.settlement_identity_kind = 'observer'
+                 AND settlement.observer_call_id = NEW.call_id
+                 AND (
+                   settlement.logical_tool_call_id != NEW.call_id
+                   OR logical.tool_name != NEW.tool_name
+                 ))
+             )
+        )
+        BEGIN
+          SELECT RAISE(ABORT,
+            'logical model result projection requires one exact settled logical identity');
+        END;
+
+        CREATE TRIGGER trg_logical_model_result_projection_immutable
+        BEFORE UPDATE ON logical_model_result_projection_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'logical model result projections are immutable');
+        END;
+
+        CREATE TRIGGER trg_logical_model_result_projection_delete_immutable
+        BEFORE DELETE ON logical_model_result_projection_receipts
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+        BEGIN
+          SELECT RAISE(ABORT, 'logical model result projections are immutable');
+        END;
+      `);
+
+      const checkpointRows = db.prepare(`
+        SELECT checkpoint.session_id, checkpoint.source_user_seq,
+               checkpoint.accepted_task_id, checkpoint.batch_ordinal,
+               checkpoint.batch_id, checkpoint.history_json,
+               checkpoint.committed_at, admission.pre_history_json,
+               admission.frame_history_json,
+               root.source_event_id
+          FROM accepted_model_batch_checkpoints checkpoint
+          JOIN accepted_model_batch_admissions admission
+            ON admission.session_id = checkpoint.session_id
+           AND admission.source_user_seq = checkpoint.source_user_seq
+           AND admission.batch_ordinal = checkpoint.batch_ordinal
+           AND admission.batch_id = checkpoint.batch_id
+          JOIN accepted_turn_call_authorities root
+            ON root.session_id = checkpoint.session_id
+           AND root.source_user_seq = checkpoint.source_user_seq
+           AND root.accepted_task_id = checkpoint.accepted_task_id
+         WHERE checkpoint.disposition = 'ready'
+         ORDER BY checkpoint.session_id, checkpoint.source_user_seq, checkpoint.batch_ordinal
+      `).all() as Array<{
+        session_id: string;
+        source_user_seq: number;
+        accepted_task_id: string;
+        batch_ordinal: number;
+        batch_id: string;
+        history_json: string;
+        committed_at: string;
+        pre_history_json: string;
+        frame_history_json: string;
+        source_event_id: string;
+      }>;
+      const settlementCandidates = db.prepare(`
+        SELECT settlement.logical_tool_call_id,
+               logical.tool_name AS logical_tool_name,
+               settlement.observer_call_id,
+               settlement.settlement_event_id,
+               settlement.semantic_digest
+          FROM logical_call_settlements settlement
+          JOIN logical_tool_calls logical
+            ON logical.session_id = settlement.session_id
+           AND logical.source_user_seq = settlement.source_user_seq
+           AND logical.logical_tool_call_id = settlement.logical_tool_call_id
+         WHERE settlement.session_id = ?
+           AND settlement.source_user_seq = ?
+           AND logical.accepted_task_id = ?
+           AND logical.state = 'settled'
+           AND logical.settlement_event_id = settlement.settlement_event_id
+           AND (settlement.logical_tool_call_id = ? OR settlement.observer_call_id = ?)
+         ORDER BY settlement.logical_tool_call_id
+      `);
+      const insertReceipt = db.prepare(`
+        INSERT INTO logical_model_result_projection_receipts
+          (receipt_id, protocol_version, session_id, source_user_seq,
+           source_event_id, accepted_task_id, batch_ordinal, batch_id,
+           call_id, tool_name, call_namespace, settlement_identity_kind,
+           settlement_logical_tool_call_id, settlement_observer_call_id,
+           settlement_event_id, settlement_semantic_digest, result_class,
+           result_item_bytes, result_item_sha256, recorded_at)
+        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const checkpoint of checkpointRows) {
+        let preHistory: unknown;
+        let frameHistory: unknown;
+        let history: unknown;
+        try {
+          preHistory = JSON.parse(checkpoint.pre_history_json) as unknown;
+          frameHistory = JSON.parse(checkpoint.frame_history_json) as unknown;
+          history = JSON.parse(checkpoint.history_json) as unknown;
+        } catch {
+          continue;
+        }
+        if (
+          !Array.isArray(preHistory)
+          || !Array.isArray(frameHistory)
+          || !Array.isArray(history)
+          || !exactOpenAdmissionFrameForMigration(preHistory, frameHistory)
+          || !inspectProtocolForMigration(history, true).valid
+        ) continue;
+        for (const candidateCall of frameHistory) {
+          if (!candidateCall || typeof candidateCall !== 'object' || Array.isArray(candidateCall)) continue;
+          const call = candidateCall as Record<string, unknown>;
+          const callId = typeof call.callId === 'string' ? call.callId : '';
+          const toolName = typeof call.name === 'string' ? call.name : '';
+          if (
+            call.type !== 'function_call' || !callId || !toolName
+            || (call.namespace !== undefined && typeof call.namespace !== 'string')
+          ) continue;
+          const callNamespace = typeof call.namespace === 'string' ? call.namespace : null;
+          const resultCandidates = history.filter((candidate) => {
+            if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+            const result = candidate as Record<string, unknown>;
+            return result.type === 'function_call_result'
+              && result.callId === callId
+              && result.name === toolName;
+          });
+          if (resultCandidates.length !== 1) continue;
+          let material: LogicalModelResultProjectionMaterialForMigration | null = null;
+          try {
+            material = projectionMaterialForMigration(resultCandidates[0]);
+          } catch {
+            material = null;
+          }
+          if (
+            !material
+            || material.callId !== callId
+            || material.toolName !== toolName
+            || material.callNamespace !== callNamespace
+          ) continue;
+          const settlements = settlementCandidates.all(
+            checkpoint.session_id,
+            checkpoint.source_user_seq,
+            checkpoint.accepted_task_id,
+            callId,
+            callId,
+          ) as Array<{
+            logical_tool_call_id: string;
+            logical_tool_name: string;
+            observer_call_id: string | null;
+            settlement_event_id: string;
+            semantic_digest: string;
+          }>;
+          if (settlements.length !== 1) continue;
+          const settlement = settlements[0]!;
+          const logicalMatch = settlement.logical_tool_call_id === callId;
+          const observerMatch = settlement.observer_call_id === callId;
+          if (!logicalMatch && !observerMatch) continue;
+          if (settlement.logical_tool_name !== toolName && !observerMatch) continue;
+          const identityKind = logicalMatch && settlement.logical_tool_name === toolName
+            ? 'logical'
+            : 'observer';
+          const receiptIdentity = {
+            protocol: 'clementine.logical_model_result_projection_receipt.v1',
+            sessionId: checkpoint.session_id,
+            sourceUserSeq: checkpoint.source_user_seq,
+            sourceEventId: checkpoint.source_event_id,
+            acceptedTaskId: checkpoint.accepted_task_id,
+            batchOrdinal: checkpoint.batch_ordinal,
+            batchId: checkpoint.batch_id,
+            callId,
+            toolName,
+            callNamespace,
+            settlementIdentityKind: identityKind,
+            settlementLogicalToolCallId: settlement.logical_tool_call_id,
+            settlementObserverCallId: settlement.observer_call_id,
+            settlementEventId: settlement.settlement_event_id,
+            settlementSemanticDigest: settlement.semantic_digest,
+            resultClass: material.resultClass,
+            resultItemBytes: material.resultItemBytes,
+            resultItemSha256: material.resultItemSha256,
+          };
+          const receiptId = createHash('sha256')
+            .update(canonicalProjectionJsonForMigration(receiptIdentity), 'utf8')
+            .digest('hex');
+          insertReceipt.run(
+            receiptId,
+            checkpoint.session_id,
+            checkpoint.source_user_seq,
+            checkpoint.source_event_id,
+            checkpoint.accepted_task_id,
+            checkpoint.batch_ordinal,
+            checkpoint.batch_id,
+            callId,
+            toolName,
+            callNamespace,
+            identityKind,
+            settlement.logical_tool_call_id,
+            settlement.observer_call_id,
+            settlement.settlement_event_id,
+            settlement.semantic_digest,
+            material.resultClass,
+            material.resultItemBytes,
+            material.resultItemSha256,
+            checkpoint.committed_at,
+          );
+        }
+      }
+
+      const relevantTables = foreignKeyClosure(db, [
+        'logical_model_result_projection_receipts',
+      ]);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((violation) => relevantTables.has(violation.table));
+      if (violations.length > 0) {
+        throw new Error(
+          `schema v69 foreign-key check failed for ${violations.length} logical result projection row(s)`,
+        );
+      }
+    },
+  },
+  {
+    // Session retention is the sole sanctioned owner of durable task cleanup.
+    // V37 amendments accidentally used RESTRICT parents and had no session FK,
+    // so one valid amendment stranded the entire old terminal session. Rebuild
+    // only that child with exact session-bound contract/event CASCADE parents;
+    // its retention-aware immutability trigger continues to reject standalone
+    // deletion while the session exists.
+    version: 70,
+    sql: '',
+    foreignKeysOff: true,
+    backfill: rebuildExpectedWorkUniverseAmendmentCascade,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
@@ -9284,6 +10596,38 @@ if (newestMigrationVersion !== HARNESS_SCHEMA_VERSION) {
 }
 
 /** Production migration entry used by rehearsal. Callers must already bind CLEMENTINE_HOME. */
+/**
+ * Tables owned by a refuse-on-existence migration.
+ *
+ * v65, v66, v67 and v69 each REFUSE their table name when their version row is
+ * absent: those names had no sanctioned predecessor, so a preexisting lookalike
+ * must never be blessed as durable authority. That guard is correct and is why
+ * a real store is protected.
+ *
+ * It also means a migration REHEARSAL — which rewinds schema_version and
+ * replays — must shed these first, or a migration fails on the structure its
+ * own earlier run created. The shed list used to be hand-maintained beside the
+ * guards and rotted twice: v66's table was added, v67's was not, and 46 tests
+ * failed with "schema v67 refuses preexisting unsanctioned table
+ * host_model_result_receipts" while production was perfectly fine.
+ *
+ * This is the single source of truth. A pin asserts it covers every table named
+ * by a guard, so adding a guarded migration without listing it here fails
+ * loudly instead of silently breaking every rehearsal.
+ */
+export const STRICT_TAIL_TABLES: readonly string[] = Object.freeze([
+  // v65
+  'tool_output_chunks',
+  'tool_output_invocation_chunks',
+  'tool_search_continuations',
+  // v66
+  'model_request_provenance',
+  // v67
+  'host_model_result_receipts',
+  // v69
+  'logical_model_result_projection_receipts',
+]);
+
 export function applyHarnessMigrations(db: Database.Database): void {
   runMigrations(db);
   ensureAuthorityPrivacySchema(db);

@@ -170,35 +170,6 @@ function reconcileTableExists(db: ReconcileDb, name: string): boolean {
   ).get(name));
 }
 
-/** A finished run attempt invalidates its exact dispatch generation (the same
- * condition enforced by `isDispatchLeaseCurrent`). Closing only those proven
- * generations prevents a historical lease row from masquerading as a live
- * resume owner; missing/unbound/active-attempt leases remain fail-closed. */
-function revokeFinishedAttemptDispatchLeases(
-  db: ReconcileDb,
-  sessionId: string,
-  revokedAt: string,
-): void {
-  if (
-    !reconcileTableExists(db, 'run_dispatch_leases')
-    || !reconcileTableExists(db, 'run_attempts')
-  ) return;
-  db.prepare(`
-    UPDATE run_dispatch_leases
-       SET revoked_at = COALESCE(revoked_at, ?)
-     WHERE session_id = ?
-       AND revoked_at IS NULL
-       AND run_attempt_id IS NOT NULL
-       AND EXISTS (
-         SELECT 1
-           FROM run_attempts attempt
-          WHERE attempt.attempt_id = run_dispatch_leases.run_attempt_id
-            AND attempt.session_id = run_dispatch_leases.session_id
-            AND attempt.finished_at IS NOT NULL
-       )
-  `).run(revokedAt, sessionId);
-}
-
 function hasDurableResumeOwner(
   db: ReconcileDb,
   sessionId: string,
@@ -238,8 +209,9 @@ function hasDurableResumeOwner(
     sessionId,
   )) return true;
 
-  // A lease is live/ambiguous unless it is bound to a matching FINISHED
-  // attempt. Those exact invalid generations were revoked immediately above.
+  // A lease is live/ambiguous unless it is bound to a matching finished
+  // attempt. The daemon's boot-wide dispatch quarantine owns revocation; this
+  // retention query only decides whether a durable resume owner still exists.
   if (reconcileTableExists(db, 'run_dispatch_leases') && exists(
     `SELECT 1
        FROM run_dispatch_leases lease
@@ -305,9 +277,10 @@ function workflowRunRecordMayStillOwnSession(
 
 /** Retention-age alone never proves failure. This path is restricted to
  * non-chat work with no terminal event, no explicit resume lifecycle, and no
- * durable/live owner. It closes only already-invalid finished-attempt leases,
- * then CAS-marks the abandoned session failed so normal terminal retention can
- * reclaim it on a later sweep. Reusable chat sessions never enter this path. */
+ * durable/live owner. It CAS-marks the abandoned session failed so normal
+ * terminal retention can reclaim it on a later sweep. Dispatch quarantine is
+ * deliberately owned by the separate boot-wide reconciler; reusable chat
+ * sessions never enter this path. */
 function reconcileRetentionAgedWorkOrphan(
   session: SessionRow,
   options: { nowMs: number; staleMs: number },
@@ -367,7 +340,6 @@ function reconcileRetentionAgedWorkOrphan(
     if (isExplicitlyResumableLifecycle(lifecycle)) return false;
 
     const now = new Date(options.nowMs).toISOString();
-    revokeFinishedAttemptDispatchLeases(db, session.id, now);
     if (hasDurableResumeOwner(db, session.id, current.metadata_json, options.nowMs)) return false;
     const result = db.prepare(`
       UPDATE sessions

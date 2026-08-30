@@ -11,7 +11,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const PAPER = '#fcf9f4';
+// Owner directive 2026-08-27: "the app kind of needs to have a white
+// background". The page, the manifest splash, the theme-color and the iOS
+// container must agree on ONE value — a mismatch shows as a tinted flash
+// before first paint and a tinted band under the over-scroll bounce.
+const PAPER = '#ffffff';
 const read = (rel: string) =>
   readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
@@ -102,6 +106,32 @@ test('the brain switcher renders from the live catalog, never a hardcoded roster
     assert.doesNotMatch(sheet, re, `model id "${literal}" must not be hardcoded in the sheet`);
     assert.doesNotMatch(settings, re, `model id "${literal}" must not be hardcoded in Settings`);
   }
+});
+
+test('the mobile model API owns an exact rescue snapshot and credential-free save call', () => {
+  const api = read('../lib/api.ts');
+  assert.match(api, /codexRescue\?: CodexRescueSettings/,
+    'the model-settings response carries the daemon-owned rescue snapshot');
+  assert.match(api, /setCodexRescueModel\(modelId: string \| null\)/);
+  assert.match(api, /\/m\/api\/settings\/models\/codex-rescue/);
+  assert.match(api, /modelId === null \? \{ clear: true \} : \{ modelId \}/,
+    'the only mobile write is an exact model id or a clear request');
+  assert.doesNotMatch(api, /codexRescue[\s\S]{0,500}(apiKey|accessToken|refreshToken|password)/i,
+    'the rescue API never carries credentials');
+});
+
+test('Settings shows rescue only for a meaningful live catalog and refreshes after save', () => {
+  const settings = read('../screens/Settings.tsx');
+  assert.match(settings, /settings\.options\.filter\(\(option\) => option\.available\)\.length < 2\) return null/,
+    'one/no connected Codex choice does not create a meaningless selector');
+  assert.match(settings, /settings\.options\.map\(\(option\)/,
+    'every concrete option is rendered from the daemon response');
+  assert.match(settings, /value=\{option\.id\}/,
+    'the selected value is the exact catalog id, never a label heuristic');
+  assert.match(settings, /await setCodexRescueModel[\s\S]*?await onChanged\(\)/,
+    'a successful save refreshes the parent model snapshot before settling');
+  assert.match(settings, /Follow primary \(\{settings\.inheritedModelId\}\)/,
+    'the clear choice displays the live inherited primary rather than a hardcoded model');
 });
 
 test('the keyboard stays in daylight: color-scheme meta + shell trait override', () => {

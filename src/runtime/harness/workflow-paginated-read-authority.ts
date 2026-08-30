@@ -55,6 +55,7 @@ import {
 } from '../../memory/workflow-node-invocation-plan.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { projectProviderResultEvidenceView } from './result-facts.js';
 
 const EFFECT_BOUNDS_JSON = JSON.stringify(WORKFLOW_READ_ONLY_EFFECT_BOUNDS);
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -1029,6 +1030,59 @@ export function workflowReadPagePhysicalClaimAttestationMatches(input: {
   );
 }
 
+export function workflowReadPagePreparationPhysicalDispatchId(input: {
+  activationDigest: string;
+  pageOrdinal: number;
+  logicalCallId: string;
+  toolName: string;
+  argumentDigest: string;
+}): string {
+  return `workflow-page-preparation-dispatch:${sha256(closedCanonicalJson({
+    domain: 'workflow-paginated-read-page-preparation',
+    version: 1,
+    ...input,
+  }))}`;
+}
+
+/** Opaque page-attestation check for the separate live-definition probe that
+ * precedes a prepared paginated business call. The probe id is derived from
+ * the exact attested page bytes; copyable lineage cannot mint another probe. */
+export function workflowReadPagePreparationClaimAttestationMatches(input: {
+  sessionId: string;
+  sourceEventSeq: number;
+  authorityRootId: string;
+  activationId: string;
+  activationDigest: string;
+  authorityDigest: string;
+  authorityRevision: number;
+  pageOrdinal: number;
+  logicalCallId: string;
+  physicalDispatchId: string;
+  toolName: string;
+}): boolean {
+  const attested = pageAttestationStorage.getStore();
+  return Boolean(
+    attested
+    && attested.sessionId === input.sessionId
+    && attested.sourceEventSeq === input.sourceEventSeq
+    && attested.authorityRootId === input.authorityRootId
+    && attested.activationId === input.activationId
+    && attested.activationDigest === input.activationDigest
+    && attested.authorityDigest === input.authorityDigest
+    && attested.authorityRevision === input.authorityRevision
+    && attested.pageOrdinal === input.pageOrdinal
+    && attested.logicalCallId === input.logicalCallId
+    && attested.toolName === input.toolName
+    && input.physicalDispatchId === workflowReadPagePreparationPhysicalDispatchId({
+      activationDigest: attested.activationDigest,
+      pageOrdinal: attested.pageOrdinal,
+      logicalCallId: attested.logicalCallId,
+      toolName: attested.toolName,
+      argumentDigest: attested.argumentDigest,
+    })
+  );
+}
+
 export type MintWorkflowReadPageAttestationResult =
   | {
       status: 'minted';
@@ -1280,6 +1334,107 @@ function nonEmpty(value: unknown): boolean {
   return true;
 }
 
+const STREAMING_EVIDENCE_RESERVED_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+/**
+ * Hash the same sorted-key closed JSON bytes without materializing the whole
+ * encoding. This is used only after the legacy bounded encoder refuses a page
+ * that carries an independently reviewed result projection. Its byte ceiling
+ * comes from that projection, so a provider cannot turn page evidence into an
+ * unbounded traversal merely by returning a large object.
+ */
+function streamingClosedCanonicalDigest(value: unknown, maxTotalBytes: number): string {
+  const hash = createHash('sha256');
+  const seen = new Set<object>();
+  let bytes = 0;
+  let nodes = 0;
+  const token = (text: string): void => {
+    bytes += Buffer.byteLength(text, 'utf8');
+    if (bytes > maxTotalBytes) throw new Error('streamed canonical evidence exceeds reviewed bytes');
+    hash.update(text, 'utf8');
+  };
+  const string = (text: string): void => {
+    if (Buffer.byteLength(text, 'utf8') > 64_000) {
+      throw new Error('streamed canonical evidence contains an oversized string');
+    }
+    token(JSON.stringify(text));
+  };
+  const visit = (input: unknown, depth: number): void => {
+    nodes += 1;
+    // Every JSON node consumes at least one encoded byte. This secondary
+    // guard bounds traversal even before punctuation is emitted.
+    if (nodes > maxTotalBytes * 2) throw new Error('streamed canonical evidence has too many nodes');
+    if (depth > 24) throw new Error('streamed canonical evidence is too deep');
+    if (input === null) { token('null'); return; }
+    if (typeof input === 'string') { string(input); return; }
+    if (typeof input === 'boolean') { token(input ? 'true' : 'false'); return; }
+    if (typeof input === 'number') {
+      if (!Number.isFinite(input)) throw new Error('streamed canonical evidence has a non-finite number');
+      token(JSON.stringify(input));
+      return;
+    }
+    if (typeof input !== 'object') throw new Error('streamed evidence is outside closed JSON');
+    if (seen.has(input)) throw new Error('streamed canonical evidence is cyclic');
+    if (Object.getOwnPropertySymbols(input).length > 0) {
+      throw new Error('streamed canonical evidence has symbol keys');
+    }
+    const prototype = Object.getPrototypeOf(input);
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    if (Array.isArray(input)) {
+      if (prototype !== Array.prototype) throw new Error('streamed evidence array has a foreign prototype');
+      for (const name of Object.getOwnPropertyNames(input)) {
+        if (name === 'length') continue;
+        if (!/^(0|[1-9]\d*)$/.test(name) || Number(name) >= input.length) {
+          throw new Error('streamed evidence array has an extra property');
+        }
+      }
+      seen.add(input);
+      try {
+        token('[');
+        for (let index = 0; index < input.length; index += 1) {
+          const descriptor = descriptors[String(index)];
+          if (!descriptor) throw new Error('streamed evidence array is sparse');
+          if ('get' in descriptor || 'set' in descriptor) {
+            throw new Error('streamed evidence array has an accessor');
+          }
+          if (index > 0) token(',');
+          visit(descriptor.value, depth + 1);
+        }
+        token(']');
+      } finally {
+        seen.delete(input);
+      }
+      return;
+    }
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error('streamed evidence object has a foreign prototype');
+    }
+    const keys = Object.getOwnPropertyNames(input).sort();
+    seen.add(input);
+    try {
+      token('{');
+      for (const [index, key] of keys.entries()) {
+        if (STREAMING_EVIDENCE_RESERVED_KEYS.has(key)) {
+          throw new Error('streamed evidence contains a reserved key');
+        }
+        const descriptor = descriptors[key];
+        if (!descriptor || !descriptor.enumerable || 'get' in descriptor || 'set' in descriptor) {
+          throw new Error('streamed evidence object has a hidden or accessor property');
+        }
+        if (index > 0) token(',');
+        string(key);
+        token(':');
+        visit(descriptor.value, depth + 1);
+      }
+      token('}');
+    } finally {
+      seen.delete(input);
+    }
+  };
+  visit(value, 0);
+  return hash.digest('hex');
+}
+
 function evidenceOf(plan: WorkflowNodeInvocationPlanV1, result: unknown): {
   valid: boolean;
   digest: string;
@@ -1303,19 +1458,28 @@ function evidenceOf(plan: WorkflowNodeInvocationPlanV1, result: unknown): {
     if (minimum !== undefined && (!Array.isArray(value) || value.length < minimum)) valid = false;
     if (Array.isArray(value)) itemCount = Math.max(itemCount, value.length);
   }
-  let bytes: string;
+  let digest: string;
   try {
-    bytes = closedCanonicalJson({ contract: plan.evidence, observed }, {
+    const bytes = closedCanonicalJson({ contract: plan.evidence, observed }, {
       maxDepth: 24,
       maxNodes: 20_000,
       maxStringBytes: 64_000,
       maxTotalBytes: 512_000,
     });
+    digest = sha256(bytes);
   } catch {
-    valid = false;
-    bytes = closedCanonicalJson({ contract: plan.evidence, malformed: true });
+    try {
+      if (!plan.resultProjection) throw new Error('large evidence lacks a reviewed result projection');
+      digest = streamingClosedCanonicalDigest(
+        { contract: plan.evidence, observed },
+        plan.resultProjection.bounds.maxPageBytes + 512_000,
+      );
+    } catch {
+      valid = false;
+      digest = sha256(closedCanonicalJson({ contract: plan.evidence, malformed: true }));
+    }
   }
-  return { valid, digest: sha256(bytes), itemCount };
+  return { valid, digest, itemCount };
 }
 
 function pageReceiptDigest(input: {
@@ -1431,12 +1595,16 @@ export function settleWorkflowReadPage(input: {
         return { status: 'conflict', reason: 'paginated page retained result belongs to another physical child' };
       }
       const result = redeemed.value.rawPayload;
-      const exhaustedValue = valueAtPath(result, loaded.ref.exhaustedPath);
+      const evidenceView = projectProviderResultEvidenceView(result);
+      const evidenceResult = evidenceView.kind === 'provider_payload'
+        ? evidenceView.payload
+        : undefined;
+      const exhaustedValue = valueAtPath(evidenceResult, loaded.ref.exhaustedPath);
       const exhaustedTruth: WorkflowPageExhaustedTruth = exhaustedValue === true
         ? 'true' : exhaustedValue === false ? 'false' : 'unknown';
-      const nextCursor = valueAtPath(result, loaded.ref.nextCursorPath);
+      const nextCursor = valueAtPath(evidenceResult, loaded.ref.nextCursorPath);
       const nextDigest = cursorDigest(nextCursor);
-      const evidence = evidenceOf(parsed.plan, result);
+      const evidence = evidenceOf(parsed.plan, evidenceResult);
       const priorVisit = nextDigest ? db.prepare(`
         SELECT first_page_ordinal FROM workflow_paginated_cursor_visits
          WHERE activation_id = ? AND cursor_digest = ?
@@ -1825,6 +1993,150 @@ export function redeemClosedWorkflowPaginatedRead(input: {
   }
 }
 
+/**
+ * Redeem the one failure shape that can still carry trustworthy partial data:
+ * at least one ordered page settled, then the immediately following provider
+ * page failed and the durable aggregate closed as `page_execution_failed`.
+ * Missing/repeated cursors and budget stops remain partial, not failures, and
+ * are deliberately excluded from this authority.
+ */
+export function redeemFailedWorkflowPaginatedRead(input: {
+  activationId: string;
+  workflowId: string;
+  workflowRevision: number;
+  workflowDigest: string;
+  runId: string;
+  runOccurrenceId: string;
+  nodeId: string;
+  nodeAttempt: number;
+  invocationPlanDigest: string;
+  bindingSnapshotDigest: string;
+  controlDigest: string;
+}): RedeemClosedWorkflowPaginatedReadResultV1 {
+  try {
+    const loaded = readWorkflowPaginatedReadAuthority(input.activationId);
+    if (loaded.status !== 'ok') return loaded;
+    const ref = loaded.ref;
+    if (
+      loaded.authority.state !== 'closed'
+      || ref.aggregateState !== 'failed'
+      || ref.workflowId !== input.workflowId
+      || ref.workflowRevision !== input.workflowRevision
+      || ref.workflowDigest !== input.workflowDigest
+      || ref.runId !== input.runId
+      || ref.runOccurrenceId !== input.runOccurrenceId
+      || ref.nodeId !== input.nodeId
+      || ref.nodeAttempt !== input.nodeAttempt
+      || ref.invocationPlanDigest !== input.invocationPlanDigest
+      || ref.bindingSnapshotDigest !== input.bindingSnapshotDigest
+      || ref.controlDigest !== input.controlDigest
+    ) return { status: 'conflict', reason: 'failed paginated authority does not match the exact workflow/run lineage' };
+    const aggregateResult = redeemWorkflowPaginatedAggregate(input.activationId);
+    if (aggregateResult.status !== 'ok') return aggregateResult;
+    const aggregate = aggregateResult.receipt;
+    if (
+      aggregate.outcome !== 'failed'
+      || aggregate.reason !== 'page_execution_failed'
+      || aggregate.coverageState !== 'partial'
+      || aggregate.finalExhaustedTruth !== 'false'
+      || aggregate.pageCount < 1
+      || aggregate.activationId !== ref.activationId
+      || aggregate.activationDigest !== ref.activationDigest
+      || aggregate.authorityRootId !== ref.authorityRootId
+      || aggregate.invocationPlanDigest !== ref.invocationPlanDigest
+      || aggregate.bindingSnapshotDigest !== ref.bindingSnapshotDigest
+      || aggregate.controlDigest !== ref.controlDigest
+    ) return { status: 'conflict', reason: 'paginated aggregate lacks exact failed-page authority' };
+
+    const db = openEventLog();
+    const rows = db.prepare(`
+      SELECT * FROM workflow_paginated_read_pages
+       WHERE activation_id = ? ORDER BY page_ordinal
+    `).all(input.activationId) as PageRow[];
+    const failedRow = rows.at(-1);
+    if (
+      rows.length !== aggregate.pageCount + 1
+      || !failedRow
+      || failedRow.page_ordinal !== aggregate.pageCount
+      || failedRow.state !== 'failed'
+      || failedRow.page_receipt_id !== null
+      || failedRow.page_receipt_digest !== null
+      || failedRow.result_handle_id !== null
+      || rows.slice(0, -1).some((row, index) => row.page_ordinal !== index || row.state !== 'settled')
+    ) return { status: 'conflict', reason: 'failed paginated page is not the exact successor of its settled prefix' };
+    const pages: RedeemedClosedWorkflowReadPageV1[] = [];
+    for (const [index, row] of rows.slice(0, -1).entries()) {
+      const projection = settledPageProjection(ref, row);
+      if (!projection || !row.settled_at || row.page_ordinal !== index) {
+        return { status: 'conflict', reason: 'failed paginated settled prefix is not exactly ordered' };
+      }
+      const recomputed = pageReceiptDigest({
+        activationDigest: ref.activationDigest,
+        page: row,
+        resultHandleId: projection.resultHandleId,
+        settledResultDigest: projection.settledResultDigest,
+        nextCursorDigest: projection.nextCursorDigest,
+        exhaustedTruth: projection.exhaustedTruth,
+        itemCount: projection.itemCount,
+        evidenceDigest: projection.evidenceDigest,
+        evidenceValid: projection.evidenceValid,
+        continuationState: projection.continuationState,
+      });
+      if (
+        !projection.evidenceValid
+        || recomputed !== projection.pageReceiptDigest
+        || projection.pageReceiptId !== `workflow-page-receipt:${recomputed}`
+        || projection.pageReceiptDigest !== aggregate.pageReceiptDigests[index]
+        || projection.resultHandleId !== aggregate.pageResultHandleIds[index]
+        || projection.continuationState !== 'continue'
+        || projection.exhaustedTruth !== 'false'
+        || projection.nextCursorDigest === null
+      ) return { status: 'conflict', reason: 'failed paginated prefix receipt does not recompute' };
+      const redeemed = redeemSuccessfulSettlementResultForHost({
+        sessionId: ref.sessionId,
+        sourceUserSeq: ref.sourceEventSeq,
+        acceptedTaskId: ref.authorityRootId,
+        logicalToolCallId: row.logical_call_id,
+      });
+      if (redeemed.status !== 'ok') {
+        return redeemed.status === 'missing'
+          ? { status: 'missing', reason: 'failed paginated prefix result is missing' }
+          : { status: 'conflict', reason: `failed paginated prefix result is not redeemable: ${redeemed.reason}` };
+      }
+      if (
+        redeemed.value.physicalDispatchId !== row.physical_dispatch_id
+        || redeemed.value.resultHandleId !== projection.resultHandleId
+        || redeemed.value.rawPayloadSha256 !== projection.settledResultDigest
+      ) return { status: 'conflict', reason: 'failed paginated prefix handle disagrees with its receipt' };
+      pages.push({
+        pageOrdinal: row.page_ordinal,
+        pageReceiptId: projection.pageReceiptId,
+        pageReceiptDigest: projection.pageReceiptDigest,
+        resultHandleId: projection.resultHandleId,
+        settledResultDigest: projection.settledResultDigest,
+        logicalCallId: row.logical_call_id,
+        physicalDispatchId: row.physical_dispatch_id,
+        priorPageReceiptDigest: row.prior_page_receipt_digest,
+        inputCursorDigest: row.input_cursor_digest,
+        nextCursorDigest: projection.nextCursorDigest,
+        exhaustedTruth: projection.exhaustedTruth,
+        continuationState: projection.continuationState,
+        itemCount: projection.itemCount,
+        settledAt: row.settled_at,
+        rawPayload: redeemed.value.rawPayload,
+        rawPayloadJson: redeemed.value.rawPayloadJson,
+        rawByteCount: redeemed.value.rawByteCount,
+      });
+    }
+    if (pages.reduce((total, page) => total + page.itemCount, 0) !== aggregate.totalItemCount) {
+      return { status: 'conflict', reason: 'failed paginated aggregate item total differs from its settled prefix' };
+    }
+    return { status: 'ok', value: { authority: ref, aggregate, pages } };
+  } catch (error) {
+    return { status: 'storage_error', reason: boundedReason(error) };
+  }
+}
+
 export type CloseWorkflowPaginatedReadAuthorityResult =
   | { status: 'closed' | 'replayed'; receipt: WorkflowPaginatedAggregateReceipt }
   | { status: 'not_ready' | 'missing' | 'conflict' | 'storage_error'; reason: string };
@@ -2010,7 +2322,10 @@ export function closeWorkflowPaginatedReadAuthority(input: {
         createdAt, reason, input.activationId,
       ).changes;
       if (activationUpdated !== 1) throw new Error('paginated aggregate close lost its activation CAS');
-      const rootState = input.outcome === 'failed' || input.outcome === 'conflict' ? 'conflict' : 'closed';
+      // A receipt-supported provider failure is a known terminal outcome, not
+      // an authority-integrity conflict. Keep only contradictory roots in the
+      // conflict state so the exact failed aggregate remains redeemable.
+      const rootState = input.outcome === 'conflict' ? 'conflict' : 'closed';
       const rootUpdated = db.prepare(`
         UPDATE accepted_turn_call_authorities
            SET state = ?, revision = revision + 1, closed_at = ?, close_reason = ?

@@ -58,7 +58,8 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
 
 const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason']);
 const RAW_TOOL_OR_REASONING_PROTOCOL_RE = /(?:<\/?(?:analysis|reasoning|invoke|tool_call)\b|\[tool\s*:|"tool_call"\s*:)/i;
-const SAFE_TERMINAL_FALLBACK = 'I finished the turn, but the final reply was not safe to display. Please ask me to continue.';
+const SAFE_TERMINAL_FALLBACK =
+  'I finished the turn, but the final reply was not safe to display. The activity log has the technical details.';
 export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
   'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.';
@@ -655,6 +656,22 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'user_steer_note': {
       const text = typeof data.text === 'string' ? data.text : '';
       return text ? { text } : null;
+    }
+    case 'turn_model_routed': {
+      // Route identity is useful, but route diagnostics are not presentation:
+      // expose only bounded provider/model names plus two closed transition
+      // bits. Internal failure reasons, abandoned brains, transport, attempts,
+      // and route topology stay in the audit ledger.
+      const model = publicToolIdentifier(data.model);
+      const provider = publicToolIdentifier(data.provider);
+      if (!model && !provider) return null;
+      return {
+        phase: 'model',
+        ...(model ? { model } : {}),
+        ...(provider ? { provider } : {}),
+        fallover: data.fallover === true,
+        preselected: data.preselected === true,
+      };
     }
     // The compiled turn plan, as a SHAPE summary only: route + fast-path +
     // node count. The chat header uses route/fast-path to name the kind of

@@ -19,8 +19,36 @@ const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const resultHandles = await import('./result-handle.js');
 const settlements = await import('./logical-call-settlement-store.js');
+const currentCapabilities = await import('./current-capability-manifest.fixture.js');
+const composioSemantics = await import('../../integrations/composio/operation-semantics.js');
+
+const sheetFromJsonSemantics = composioSemantics.documentedComposioManifestOperationSemantics(
+  'GOOGLESHEETS_SHEET_FROM_JSON',
+);
+assert.ok(sheetFromJsonSemantics, 'fixture requires the reviewed atomic Sheet operation');
+const priorCapabilityCatalog = currentCapabilities.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+    providerKind: 'composio',
+    effect: 'read',
+  },
+  {
+    operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'googlesheets', posture: 'create_new' },
+    operationSemantics: sheetFromJsonSemantics,
+  },
+  {
+    operationId: 'GMAIL_SEND_EMAIL',
+    providerKind: 'composio',
+    effect: 'external_write',
+    operationSemantics: { version: 1, reversibility: 'irreversible' },
+  },
+]);
 
 test.after(() => {
+  currentCapabilities.restoreCurrentCapabilityManifestFixtures(priorCapabilityCatalog);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

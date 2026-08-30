@@ -93,20 +93,12 @@ test('checkWorkflowForWrite: exact scheduled call authority sees the typed allow
     trigger: { schedule: '0 9 * * 1-5', timezone: 'UTC' },
     steps: [
       {
-        id: 'render',
-        prompt: '',
-        deterministic: { runner: 'render.mjs' },
-        sideEffect: 'write',
-        output: { type: 'object', required_keys: ['summary'], non_empty: ['summary'] },
-      },
-      {
         id: 'deliver',
         prompt: '',
-        dependsOn: ['render'],
         sideEffect: 'send',
         call: {
           tool: 'MESSAGING_SEND_MESSAGE',
-          args: { destination: 'fixed-room', body: '{{steps.render.output.summary}}' },
+          args: { destination: 'fixed-room', body: 'Scheduled status update.' },
         },
         output: {
           type: 'object',
@@ -329,7 +321,7 @@ test('autoRepair: {{steps.X.output}} with a subpath still wires the dependsOn', 
   assert.deepEqual(repaired.steps[1].dependsOn, ['fetch']);
 });
 
-test('autoRepair T2.4: multi-item prose with ONE array upstream gets forEach wired mechanically', () => {
+test('autoRepair never invents fan-out topology from multi-item prose', () => {
   const def = wf({
     steps: [
       { id: 'gather', prompt: 'gather the prospect list', output: { type: 'array', min_items: { '': 1 } } },
@@ -337,8 +329,12 @@ test('autoRepair T2.4: multi-item prose with ONE array upstream gets forEach wir
     ],
   });
   const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
-  assert.equal(repaired.steps[1].forEach, 'gather');
-  assert.match(repairs.join(' '), /Added forEach: "gather"/);
+  assert.equal(repaired.steps[1].forEach, undefined);
+  assert.doesNotMatch(repairs.join(' '), /Added forEach/);
+  assert.ok(
+    checkWorkflowForWrite(def).warnings.some((warning) => warning.includes('has no forEach')),
+    'the validator still gives the author an actionable advisory',
+  );
 });
 
 test('autoRepair T2.4: ambiguous (zero or multiple array upstreams) leaves the step alone', () => {
@@ -545,6 +541,23 @@ test('workflowExecutionSurfaceChanged: specialist topology is execution surface'
   });
   const after = JSON.parse(JSON.stringify(before)) as WorkflowDefinition;
   after.steps[0].subgraph!.specialists[1].prompt = 'Check current risks and cite evidence.';
+  assert.equal(workflowExecutionSurfaceChanged(before, after), true);
+});
+
+test('workflowExecutionSurfaceChanged: reviewed transform semantics are authority-bearing surface', () => {
+  const before = wf({
+    steps: [{
+      id: 'shape',
+      prompt: '',
+      sideEffect: 'read',
+      transform: { version: 1, expression: { op: 'literal', value: { ok: true } } },
+    }],
+  });
+  const after = JSON.parse(JSON.stringify(before)) as WorkflowDefinition;
+  after.steps[0].transform = {
+    version: 1,
+    expression: { op: 'literal', value: { ok: false } },
+  };
   assert.equal(workflowExecutionSurfaceChanged(before, after), true);
 });
 
@@ -847,14 +860,7 @@ test('workflowNeedsCreationTest: true when any step is a testable read, false ot
   );
 });
 
-// REGRESSION PIN: auto-repair must never MULTIPLY an effect.
-// Adding forEach turns one crossing into N -- one per item -- so on a
-// write/send step this repair would silently fan out an irreversible effect the
-// user never approved (N emails, N posts, N rows) purely because an upstream
-// happened to return an array.
-test('autoRepair never adds forEach to an effectful step', () => {
-  // Same shape as the T2.4 fixture that this repair was written for -- only the
-  // consumer's side-effect class varies, which is exactly what is under test.
+test('autoRepair never multiplies read, write, or send work from prose', () => {
   const producer = { id: 'gather', prompt: 'gather the prospect list', output: { type: 'array', min_items: { '': 1 } } };
   const consumerPrompt = 'For each of the 25 prospects, scrape their site and draft a summary one by one.';
   const build = (sideEffect?: string) => wf({
@@ -869,25 +875,13 @@ test('autoRepair never adds forEach to an effectful step', () => {
     ],
   } as never);
 
-  // READ is the case this repair exists for -- it still fans out.
-  assert.equal(
-    autoRepairWorkflowDefinition(build('read')).def.steps[1].forEach,
-    'gather',
-    'a read step over one array upstream should still gain forEach',
-  );
-
-  // SEND and WRITE must never be fanned out: that turns one approved crossing
-  // into N unapproved ones.
-  assert.equal(
-    autoRepairWorkflowDefinition(build('send')).def.steps[1].forEach,
-    undefined,
-    'auto-repair must never fan out a send step into N irreversible crossings',
-  );
-  assert.equal(
-    autoRepairWorkflowDefinition(build('write')).def.steps[1].forEach,
-    undefined,
-    'auto-repair must never fan out a write step',
-  );
+  for (const effect of ['read', 'write', 'send'] as const) {
+    assert.equal(
+      autoRepairWorkflowDefinition(build(effect)).def.steps[1].forEach,
+      undefined,
+      `auto-repair must never fan out an authored ${effect} step`,
+    );
+  }
 });
 
 // REGRESSION PIN: pinning a goal ARMS goal-judging, and a missed goal is

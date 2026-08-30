@@ -340,6 +340,8 @@ test('accepted host gateway exception reduces to one stable failed terminal', as
 
   assert.equal(response.text, PUBLIC_RUN_FAILURE_TEXT);
   assert.equal(response.stoppedReason, 'error');
+  assert.equal(response.sessionId, session.id);
+  assert.equal(response.terminal?.status, 'failed');
   assert.equal(legacyCalls(), 0);
   const [accepted] = listEvents(session.id, { types: ['user_input_received'] });
   const terminals = listEvents(session.id, { types: ['conversation_completed'] });
@@ -907,11 +909,107 @@ test('gateway records an intentionally stopped run as cancelled exactly once', a
   });
 
   assert.equal(response.stoppedReason, 'cancelled');
+  assert.equal(response.terminal?.status, 'cancelled');
   assert.equal(legacyCalls(), 0);
   const run = getRun('run-gateway-cancelled');
   assert.equal(run?.status, 'cancelled');
   assert.equal(run?.events.filter((event) => event.type === 'cancelled').length, 1);
   assert.equal(run?.events.filter((event) => event.type === 'failed').length, 0);
+});
+
+test('gateway preserves blocked, uncertain, input, and cancelled terminals as typed client outcomes', async () => {
+  const cases = [
+    { status: 'blocked' as const, stoppedReason: 'blocked' as const, runStatus: 'blocked' as const },
+    { status: 'uncertain' as const, stoppedReason: 'unverified' as const, runStatus: 'blocked' as const },
+    { status: 'needs_input' as const, stoppedReason: 'awaiting-input' as const, runStatus: 'awaiting_input' as const },
+    { status: 'cancelled' as const, stoppedReason: 'cancelled' as const, runStatus: 'cancelled' as const },
+  ];
+
+  for (const item of cases) {
+    const sessionId = `sess-gateway-typed-${item.status}`;
+    const runId = `run-gateway-typed-${item.status}`;
+    const text = item.status === 'needs_input'
+      ? 'Which exact input should I use?'
+      : item.status === 'cancelled'
+        ? 'The exact turn was cancelled.'
+        : item.status === 'uncertain'
+          ? 'The exact crossing requires reconciliation.'
+          : 'The exact turn is blocked before execution.';
+    const { gateway, legacyCalls } = hostGatewayForTest(async (options) => {
+      const source = acceptedHostSource(options);
+      const identity = { sessionId: source.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+      if (item.status === 'needs_input') {
+        appendEvent({
+          sessionId: source.sessionId,
+          turn: source.turn,
+          role: 'system',
+          type: 'awaiting_user_input',
+          data: { question: text, sourceUserSeq: source.seq },
+        });
+      }
+      const outcome = item.status === 'needs_input'
+        ? {
+            version: 2 as const,
+            id: turnOutcomeId(identity),
+            identity,
+            status: 'needs_input' as const,
+            resumable: true as const,
+            needs: { kind: 'input' as const },
+            presentation: { kind: 'question' as const, text },
+          }
+        : item.status === 'cancelled'
+          ? {
+              version: 2 as const,
+              id: turnOutcomeId(identity),
+              identity,
+              status: 'cancelled' as const,
+              resumable: false as const,
+              presentation: { kind: 'stopped' as const, text },
+            }
+          : {
+              version: 2 as const,
+              id: turnOutcomeId(identity),
+              identity,
+              status: item.status,
+              resumable: true as const,
+              presentation: { kind: 'blocked' as const, text },
+            };
+      const committed = commitTurnOutcome(outcome, {
+        legacyReason: item.status === 'uncertain'
+          ? 'reconciliation_required'
+          : item.status === 'needs_input'
+            ? 'awaiting_user_input'
+            : item.status,
+      });
+      return {
+        sessionId: options.sessionId,
+        status: item.status === 'needs_input'
+          ? 'awaiting_user_input'
+          : item.status === 'cancelled'
+            ? 'killed'
+            : 'blocked',
+        steps: 1,
+        lastTurn: source.turn,
+        lastDecision: { reply: text },
+        publicPresentation: committed.presentation,
+      };
+    });
+
+    const response = await gateway.handleMessage({
+      message: `exercise typed ${item.status}`,
+      sessionId,
+      channel: 'mobile',
+      source: 'mobile',
+      runId,
+    });
+    assert.equal(response.sessionId, sessionId);
+    assert.equal(response.text, text);
+    assert.equal(response.stoppedReason, item.stoppedReason);
+    assert.equal(response.terminal?.status, item.status);
+    assert.equal(response.terminal?.identity.sessionId, sessionId);
+    assert.equal(getRun(runId)?.status, item.runStatus);
+    assert.equal(legacyCalls(), 0);
+  }
 });
 
 test('gateway returns and records model route diagnostics', async () => {
@@ -968,7 +1066,8 @@ test('gateway terminal-less host completion rejects an unhonorable RESUME and co
   const replay = await gateway.handleMessage(request);
 
   assert.equal(first.text, authoredText, 'the shared hold keeps an already-authored blocker account');
-  assert.equal(first.stoppedReason, 'error');
+  assert.equal(first.stoppedReason, 'blocked');
+  assert.equal(first.terminal?.status, 'blocked');
   assert.equal(replay.text, authoredText);
   assert.equal(hostCalls, 1, 'durable replay must not run the host activation again');
   assert.equal(legacyCalls(), 0);
@@ -989,7 +1088,7 @@ test('gateway terminal-less host completion rejects an unhonorable RESUME and co
   assert.equal(terminals[0].data.terminalJudgeFamily, undefined);
   assert.equal(terminals[0].data.terminalJudgeResumeCount, undefined,
     'a RESUME the legacy carrier cannot honor must not consume a strike');
-  assert.equal(getRun(request.runId)?.status, 'failed');
+  assert.equal(getRun(request.runId)?.status, 'blocked');
 });
 
 test('gateway terminal-less host completion publishes a different-family ASK as the only terminal', async () => {

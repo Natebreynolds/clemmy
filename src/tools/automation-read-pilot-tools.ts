@@ -7,7 +7,10 @@ import {
   type AutomationReadPilotTypedContractV1,
 } from '../execution/automation-read-pilot-control-plane.js';
 import { automationCapabilityRequirementDigest } from '../execution/automation-workflow-bridge.js';
-import { createWorkflowCanonicalEntityResultProjection } from '../memory/workflow-result-projection-contract.js';
+import {
+  createWorkflowCanonicalEntityResultProjection,
+  createWorkflowCanonicalEntityResultProjectionV2,
+} from '../memory/workflow-result-projection-contract.js';
 import { canonicalEntityWorkspaceSelectionDigest } from '../spaces/canonical-entity-workspace-binding-contract.js';
 import { spaceStore } from '../spaces/store.js';
 import { requestAutomationReadPilotWorkspaceCreation } from '../execution/automation-read-pilot-workspace-control-plane.js';
@@ -68,8 +71,32 @@ const continuationArgumentBindingSchema = z.object({
   type: z.literal('string'),
 }).strict();
 
+const legacyIdentityRuleSchema = z.object({
+  rule_id: z.string().regex(EXACT_REF_RE),
+  fields: z.array(z.string().regex(EXACT_KEY_RE)).min(1).max(32),
+  normalizers: z.array(z.enum(['trim', 'case_fold', 'unicode_nfkc', 'numeric'])).min(1).max(8),
+  exact_identifier_namespace: z.string().regex(EXACT_REF_RE),
+}).strict();
+
+const currentIdentityRuleSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('exact_identifier'),
+    rule_id: z.string().regex(EXACT_REF_RE),
+    fields: z.array(z.string().regex(EXACT_KEY_RE)).min(1).max(32),
+    normalizers: z.array(z.enum(['trim', 'case_fold', 'unicode_nfkc', 'numeric'])).min(1).max(8),
+    namespace: z.string().regex(EXACT_REF_RE),
+  }).strict(),
+  z.object({
+    kind: z.literal('compound_signal'),
+    rule_id: z.string().regex(EXACT_REF_RE),
+    fields: z.array(z.string().regex(EXACT_KEY_RE)).min(2).max(32),
+    normalizers: z.array(z.enum(['trim', 'case_fold', 'unicode_nfkc', 'numeric'])).min(1).max(8),
+    signal_name: z.string().regex(EXACT_REF_RE),
+  }).strict(),
+]);
+
 const resultProjectionSchema = z.object({
-  version: z.literal(1),
+  version: z.union([z.literal(1), z.literal(2)]),
   records_path: z.string().trim().min(1).max(512),
   fields: z.array(z.object({
     field: z.string().regex(EXACT_KEY_RE),
@@ -88,12 +115,10 @@ const resultProjectionSchema = z.object({
     ]),
   }).strict(),
   entity_kind: z.string().regex(EXACT_REF_RE),
-  identity_rules: z.array(z.object({
-    rule_id: z.string().regex(EXACT_REF_RE),
-    fields: z.array(z.string().regex(EXACT_KEY_RE)).min(1).max(32),
-    normalizers: z.array(z.enum(['trim', 'case_fold', 'unicode_nfkc', 'numeric'])).min(1).max(8),
-    exact_identifier_namespace: z.string().regex(EXACT_REF_RE),
-  }).strict()).min(1).max(64),
+  identity_rules: z.array(z.union([
+    legacyIdentityRuleSchema,
+    currentIdentityRuleSchema,
+  ])).min(1).max(64),
   resolution_policy: z.object({
     policy_id: z.string().regex(EXACT_REF_RE),
     merge_threshold: z.number().nonnegative(),
@@ -119,8 +144,16 @@ const resultProjectionSchema = z.object({
   partition: z.object({
     kind: z.literal('workflow_run'),
     coverage_items: z.literal('source_record_occurrences'),
-    denominator: z.literal('settled_record_count'),
+    denominator: z.union([z.literal('settled_record_count'), z.literal('unknown')]),
     completion: z.literal('closed_authority_exhaustion'),
+    outcome_authority: z.object({
+      version: z.literal(1),
+      kind: z.literal('workflow_read_aggregate'),
+      accepted_terminal_states: z.union([
+        z.tuple([z.literal('completed')]),
+        z.tuple([z.literal('completed'), z.literal('failed')]),
+      ]),
+    }).strict().optional(),
   }).strict(),
   bounds: z.object({
     max_pages: z.number().int().min(1).max(10_000),
@@ -130,7 +163,40 @@ const resultProjectionSchema = z.object({
     max_record_bytes: z.number().int().min(1).max(8_000_000),
     max_total_bytes: z.number().int().min(1).max(64_000_000),
   }).strict(),
-}).strict();
+}).strict().superRefine((projection, context) => {
+  const legacy = projection.identity_rules.every((rule) => 'exact_identifier_namespace' in rule);
+  const current = projection.identity_rules.every((rule) => 'kind' in rule);
+  if ((projection.version === 1 && !legacy) || (projection.version === 2 && !current)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['identity_rules'],
+      message: `version ${projection.version} identity rules use a different contract shape`,
+    });
+  }
+  if (projection.version === 1 && projection.partition.denominator !== 'settled_record_count') {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['partition', 'denominator'],
+      message: 'version 1 requires settled_record_count',
+    });
+  }
+  if ((projection.version === 1 && projection.partition.outcome_authority !== undefined)
+    || (projection.version === 2 && projection.partition.outcome_authority === undefined)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['partition', 'outcome_authority'],
+      message: `version ${projection.version} uses a different partition outcome authority shape`,
+    });
+  }
+  if (projection.partition.outcome_authority?.accepted_terminal_states.some((state) => state === 'failed')
+    && projection.partition.denominator !== 'unknown') {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['partition', 'denominator'],
+      message: 'failed partition projection requires an unknown denominator',
+    });
+  }
+});
 
 const typedContractSchema = z.object({
   phase_id: z.string().regex(EXACT_REF_RE),
@@ -258,6 +324,128 @@ function acquisitionScope(input: {
 
 function internalContract(input: z.infer<typeof typedContractSchema>): AutomationReadPilotTypedContractV1 {
   const projection = input.result_projection;
+  const projectionBase = projection ? {
+    recordsPath: projection.records_path,
+    fields: projection.fields.map((field) => ({
+      field: field.field,
+      recordPath: field.record_path,
+      type: field.type,
+      required: field.required,
+      sensitivity: field.sensitivity,
+      confidence: field.confidence,
+    })),
+    sourceRecord: {
+      idPath: projection.source_record.id_path,
+      ...(projection.source_record.revision_path
+        ? { revisionPath: projection.source_record.revision_path }
+        : {}),
+      observedAt: projection.source_record.observed_at.kind === 'record_path'
+        ? { kind: 'record_path' as const, path: projection.source_record.observed_at.path }
+        : { kind: 'page_settled_at' as const },
+    },
+    entityKind: projection.entity_kind,
+    resolutionPolicy: {
+      policyId: projection.resolution_policy.policy_id,
+      mergeThreshold: projection.resolution_policy.merge_threshold,
+      distinctThreshold: projection.resolution_policy.distinct_threshold,
+      ambiguityMargin: projection.resolution_policy.ambiguity_margin,
+      weights: {
+        defaultExactIdentifierMatch: projection.resolution_policy.weights.default_exact_identifier_match,
+        ...(projection.resolution_policy.weights.exact_identifier_matches
+          ? { exactIdentifierMatches: structuredClone(projection.resolution_policy.weights.exact_identifier_matches) }
+          : {}),
+        defaultCompoundSignalMatch: projection.resolution_policy.weights.default_compound_signal_match,
+        ...(projection.resolution_policy.weights.compound_signal_matches
+          ? { compoundSignalMatches: structuredClone(projection.resolution_policy.weights.compound_signal_matches) }
+          : {}),
+      },
+      ...(projection.resolution_policy.exclusive_identifier_namespaces
+        ? { exclusiveIdentifierNamespaces: [...projection.resolution_policy.exclusive_identifier_namespaces] }
+        : {}),
+    },
+    fieldResolution: {
+      kind: projection.field_resolution.kind,
+      selection: projection.field_resolution.selection,
+      conflict: projection.field_resolution.conflict,
+    },
+    provenance: {
+      kind: projection.provenance.kind,
+      retainSourceSnapshots: true as const,
+    },
+    partition: {
+      kind: projection.partition.kind,
+      coverageItems: projection.partition.coverage_items,
+      denominator: projection.partition.denominator,
+      completion: projection.partition.completion,
+      ...(projection.partition.outcome_authority ? {
+        outcomeAuthority: {
+          version: projection.partition.outcome_authority.version,
+          kind: projection.partition.outcome_authority.kind,
+          acceptedTerminalStates: projection.partition.outcome_authority.accepted_terminal_states.length === 2
+            ? ['completed', 'failed'] as ['completed', 'failed']
+            : ['completed'] as ['completed'],
+        },
+      } : {}),
+    },
+    bounds: {
+      maxPages: projection.bounds.max_pages,
+      maxRecordsPerPage: projection.bounds.max_records_per_page,
+      maxRecords: projection.bounds.max_records,
+      maxPageBytes: projection.bounds.max_page_bytes,
+      maxRecordBytes: projection.bounds.max_record_bytes,
+      maxTotalBytes: projection.bounds.max_total_bytes,
+    },
+  } : null;
+  const resultProjection = projection && projectionBase
+    ? projection.version === 1
+      ? createWorkflowCanonicalEntityResultProjection({
+          ...projectionBase,
+          partition: {
+            kind: projectionBase.partition.kind,
+            coverageItems: projectionBase.partition.coverageItems,
+            denominator: 'settled_record_count',
+            completion: projectionBase.partition.completion,
+          },
+          identityRules: projection.identity_rules.map((rule) => {
+            if (!('exact_identifier_namespace' in rule)) {
+              throw new Error('version-1 result projection contains a version-2 identity rule');
+            }
+            return {
+              ruleId: rule.rule_id,
+              fields: [...rule.fields],
+              normalizers: [...rule.normalizers],
+              exactIdentifierNamespace: rule.exact_identifier_namespace,
+            };
+          }),
+        })
+      : createWorkflowCanonicalEntityResultProjectionV2({
+          ...projectionBase,
+          partition: {
+            ...projectionBase.partition,
+            outcomeAuthority: projectionBase.partition.outcomeAuthority!,
+          },
+          identityRules: projection.identity_rules.map((rule) => {
+            if (!('kind' in rule)) {
+              throw new Error('version-2 result projection contains a version-1 identity rule');
+            }
+            return rule.kind === 'exact_identifier'
+              ? {
+                  kind: rule.kind,
+                  ruleId: rule.rule_id,
+                  fields: [...rule.fields],
+                  normalizers: [...rule.normalizers],
+                  namespace: rule.namespace,
+                }
+              : {
+                  kind: rule.kind,
+                  ruleId: rule.rule_id,
+                  fields: [...rule.fields],
+                  normalizers: [...rule.normalizers],
+                  signalName: rule.signal_name,
+                };
+          }),
+        })
+    : undefined;
   return {
     phaseId: input.phase_id,
     requirementId: input.requirement_id,
@@ -291,78 +479,8 @@ function internalContract(input: z.infer<typeof typedContractSchema>): Automatio
               },
         }
       : {}),
-    ...(projection
-      ? {
-          resultProjection: createWorkflowCanonicalEntityResultProjection({
-            recordsPath: projection.records_path,
-            fields: projection.fields.map((field) => ({
-              field: field.field,
-              recordPath: field.record_path,
-              type: field.type,
-              required: field.required,
-              sensitivity: field.sensitivity,
-              confidence: field.confidence,
-            })),
-            sourceRecord: {
-              idPath: projection.source_record.id_path,
-              ...(projection.source_record.revision_path
-                ? { revisionPath: projection.source_record.revision_path }
-                : {}),
-              observedAt: projection.source_record.observed_at.kind === 'record_path'
-                ? { kind: 'record_path' as const, path: projection.source_record.observed_at.path }
-                : { kind: 'page_settled_at' as const },
-            },
-            entityKind: projection.entity_kind,
-            identityRules: projection.identity_rules.map((rule) => ({
-              ruleId: rule.rule_id,
-              fields: [...rule.fields],
-              normalizers: [...rule.normalizers],
-              exactIdentifierNamespace: rule.exact_identifier_namespace,
-            })),
-            resolutionPolicy: {
-              policyId: projection.resolution_policy.policy_id,
-              mergeThreshold: projection.resolution_policy.merge_threshold,
-              distinctThreshold: projection.resolution_policy.distinct_threshold,
-              ambiguityMargin: projection.resolution_policy.ambiguity_margin,
-              weights: {
-                defaultExactIdentifierMatch: projection.resolution_policy.weights.default_exact_identifier_match,
-                ...(projection.resolution_policy.weights.exact_identifier_matches
-                  ? { exactIdentifierMatches: structuredClone(projection.resolution_policy.weights.exact_identifier_matches) }
-                  : {}),
-                defaultCompoundSignalMatch: projection.resolution_policy.weights.default_compound_signal_match,
-                ...(projection.resolution_policy.weights.compound_signal_matches
-                  ? { compoundSignalMatches: structuredClone(projection.resolution_policy.weights.compound_signal_matches) }
-                  : {}),
-              },
-              ...(projection.resolution_policy.exclusive_identifier_namespaces
-                ? { exclusiveIdentifierNamespaces: [...projection.resolution_policy.exclusive_identifier_namespaces] }
-                : {}),
-            },
-            fieldResolution: {
-              kind: projection.field_resolution.kind,
-              selection: projection.field_resolution.selection,
-              conflict: projection.field_resolution.conflict,
-            },
-            provenance: {
-              kind: projection.provenance.kind,
-              retainSourceSnapshots: true,
-            },
-            partition: {
-              kind: projection.partition.kind,
-              coverageItems: projection.partition.coverage_items,
-              denominator: projection.partition.denominator,
-              completion: projection.partition.completion,
-            },
-            bounds: {
-              maxPages: projection.bounds.max_pages,
-              maxRecordsPerPage: projection.bounds.max_records_per_page,
-              maxRecords: projection.bounds.max_records,
-              maxPageBytes: projection.bounds.max_page_bytes,
-              maxRecordBytes: projection.bounds.max_record_bytes,
-              maxTotalBytes: projection.bounds.max_total_bytes,
-            },
-          }),
-        }
+    ...(resultProjection
+      ? { resultProjection }
       : {}),
     ...(input.workspace_binding_selection
       ? {

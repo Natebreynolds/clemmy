@@ -22,6 +22,7 @@ import { validateCronExpression } from '../shared/cron.js';
 import { codifyMechanicalSteps } from './workflow-codify.js';
 import { exactScheduledSendCandidateToolSlugs } from './workflow-validator.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
+import { parseWorkflowTransformAuthoringValue } from './workflow-transform.js';
 export {
   deleteWorkflowAndSyncTriggers,
   syncWorkflowTriggersBestEffort,
@@ -174,7 +175,25 @@ function optionalSideEffect(value: unknown): WorkflowStepInput['sideEffect'] | u
   return value === 'read' || value === 'write' || value === 'send' ? value : undefined;
 }
 
-export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> & { id: string }>): WorkflowStepInput[] {
+type WorkflowStepNormalizeInput = Omit<Partial<WorkflowStepInput>, 'transform'> & {
+  id: string;
+  /** MCP authoring carries the recursive contract as exact JSON text. */
+  transform?: unknown;
+};
+
+function optionalTransform(value: unknown): WorkflowStepInput['transform'] | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed = parseWorkflowTransformAuthoringValue(value);
+  // Preserve malformed executable semantics for the canonical validator. A
+  // lossy drop here would turn a rejected transform into an unrelated model
+  // step. The return type is intentionally asserted only at this parse seam;
+  // validation still runs before any enabled definition can execute.
+  return parsed.ok
+    ? parsed.transform
+    : value as WorkflowStepInput['transform'];
+}
+
+export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): WorkflowStepInput[] {
   return steps.map((raw) => {
     const s = raw as Partial<WorkflowStepInput> & Record<string, unknown>;
     return {
@@ -194,6 +213,7 @@ export function normalizeWorkflowSteps(steps: Array<Partial<WorkflowStepInput> &
       // validate its exact shape; dashboard/file inputs still fail closed in
       // checkWorkflowForWrite instead of being normalized into a flat step.
       subgraph: optionalObject<WorkflowStepInput['subgraph']>(s.subgraph),
+      transform: optionalTransform(s.transform),
       deterministic: optionalObject<WorkflowStepInput['deterministic']>(s.deterministic),
       call: optionalObject<WorkflowStepInput['call']>(s.call),
       invocationPlan: optionalObject<WorkflowStepInput['invocationPlan']>(

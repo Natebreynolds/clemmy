@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { exactProviderDataPayload, projectProviderResult } from './provider-read-evidence.js';
+import {
+  exactProviderDataEnvelopeAcknowledged,
+  exactProviderDataPayload,
+  projectProviderResult,
+} from './provider-read-evidence.js';
 
 test('exact provider payload accepts only the closed successful SDK envelope, including durable JSON bytes', () => {
   const envelope = {
@@ -11,13 +15,20 @@ test('exact provider payload accepts only the closed successful SDK envelope, in
     logId: 'log-1',
     sessionInfo: { id: 'sdk-session-1' },
   };
+  assert.equal(exactProviderDataEnvelopeAcknowledged(envelope), true);
+  assert.equal(exactProviderDataEnvelopeAcknowledged(JSON.stringify(envelope)), true);
   assert.deepEqual(exactProviderDataPayload(envelope), envelope.data);
   assert.deepEqual(exactProviderDataPayload(JSON.stringify(envelope)), envelope.data);
+  const nullData = { data: null, error: null, successful: true };
+  assert.equal(exactProviderDataEnvelopeAcknowledged(nullData), true);
+  assert.equal(exactProviderDataPayload(nullData), null);
 
   const arbitrary = { data: envelope.data, successful: true, modelClaim: 'not provider authority' };
+  assert.equal(exactProviderDataEnvelopeAcknowledged(arbitrary), false);
   assert.equal(exactProviderDataPayload(arbitrary), arbitrary);
   assert.equal(exactProviderDataPayload(JSON.stringify(arbitrary)), JSON.stringify(arbitrary));
   const failed = { data: envelope.data, successful: false, error: 'denied' };
+  assert.equal(exactProviderDataEnvelopeAcknowledged(failed), false);
   assert.equal(exactProviderDataPayload(failed), failed);
 });
 

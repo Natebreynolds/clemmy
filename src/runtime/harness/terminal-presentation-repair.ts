@@ -16,6 +16,7 @@ import { publicUserInputText } from './public-presentation.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
 import { actionExpectedWorkState } from './expected-work-admission.js';
 import { prepareAcceptedTaskTerminal } from './accepted-task-terminal-preparation.js';
+import { exactPartialMutationPresentation } from './mutation-verification-presentation.js';
 
 export const TERMINAL_PRESENTATION_REPAIR_VERSION = 1 as const;
 export const TERMINAL_PRESENTATION_REPAIR_INSTRUCTION = [
@@ -75,7 +76,7 @@ export type TerminalPresentationRepairResult =
 export type PrecommitTerminalPresentationResult =
   | { status: 'unchanged'; text: string }
   | {
-      status: 'blocked_repaired' | 'blocked_fallback';
+      status: 'blocked_repaired' | 'blocked_fallback' | 'blocked_truth_projected';
       text: string;
       missing: string[];
       grantId?: string;
@@ -332,6 +333,19 @@ export async function repairActionTerminalBeforeCommit(input: {
   const missing = preparation.missing?.length
     ? [...preparation.missing]
     : ['verification_unavailable'];
+  // A sealed exact mutation receipt is stronger than generated terminal prose.
+  // When it proves partial progress, publish the smallest truthful projection
+  // of those durable facts. This prevents a repair model from repeating the
+  // original full-completion claim. Other action lanes retain the existing
+  // one-shot model repair unchanged.
+  const partialTruth = exactPartialMutationPresentation(input);
+  if (partialTruth) {
+    return {
+      status: 'blocked_truth_projected',
+      text: partialTruth,
+      missing,
+    };
+  }
   const repaired = await repairTerminalPresentation({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,

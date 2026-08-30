@@ -16,7 +16,11 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import { BASE_DIR } from '../config.js';
-import { classifyConstraintEnforcement } from './policy-enforcement.js';
+import {
+  classifyConstraintEnforcementV1 as classifyConstraintEnforcement,
+  compileComposioStandingPolicy,
+} from '../integrations/composio/standing-policy-compiler.js';
+import { compilePromptStandingPolicyDescriptor } from './policy-enforcement.js';
 
 // The real default home (~/.clementine-next). A full memory-DB reset against THIS
 // permanently destroys the user's long-term memory (facts/entities/embeddings are
@@ -2032,6 +2036,107 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
         SELECT RAISE(ABORT, 'memory learning shard identity is immutable');
       END;
     `,
+  },
+  {
+    // v36 — compiled standing policies become the sole dispatch authority.
+    // v28 truthfully separated prompt-only from dispatch-enforced rows, but
+    // execution still reparsed fact prose to recover operands. Recompile every
+    // active projection into the sealed v2 contract at the Composio adapter
+    // edge. Triggers remain conservative: direct SQL writes are prompt-only
+    // until a canonical writer compiles and seals the exact content.
+    version: 36,
+    run: (db: Database.Database) => {
+      db.transaction(() => {
+        db.exec(`
+          DROP TRIGGER IF EXISTS memory_policy_fact_ai;
+          DROP TRIGGER IF EXISTS memory_policy_fact_au;
+
+          CREATE TRIGGER memory_policy_fact_ai
+          AFTER INSERT ON consolidated_facts
+          WHEN NEW.active = 1 AND (NEW.kind = 'constraint' OR NEW.pinned = 1)
+          BEGIN
+            INSERT OR REPLACE INTO memory_policies
+              (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+            VALUES (
+              NEW.id,
+              CASE WHEN NEW.kind = 'user' THEN 'core_profile' ELSE 'standing_preference' END,
+              'prompt',
+              '{"schemaVersion":2,"status":"awaiting_canonical_compilation"}',
+              CAST(ROUND(COALESCE(NEW.importance, 5) * 10) AS INTEGER),
+              NEW.created_at,
+              NEW.updated_at
+            );
+          END;
+
+          CREATE TRIGGER memory_policy_fact_au
+          AFTER UPDATE OF active, kind, pinned, importance, content, updated_at ON consolidated_facts
+          BEGIN
+            DELETE FROM memory_policies WHERE fact_id = NEW.id;
+            INSERT INTO memory_policies
+              (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+            SELECT NEW.id,
+              CASE WHEN NEW.kind = 'user' THEN 'core_profile' ELSE 'standing_preference' END,
+              'prompt',
+              '{"schemaVersion":2,"status":"awaiting_canonical_compilation"}',
+              CAST(ROUND(COALESCE(NEW.importance, 5) * 10) AS INTEGER),
+              NEW.created_at,
+              NEW.updated_at
+            WHERE NEW.active = 1 AND (NEW.kind = 'constraint' OR NEW.pinned = 1);
+          END;
+        `);
+
+        const rows = db.prepare(`
+          SELECT id, kind, content, importance, created_at, updated_at
+          FROM consolidated_facts
+          WHERE active = 1 AND (kind = 'constraint' OR pinned = 1)
+        `).all() as Array<{
+          id: number; kind: string; content: string; importance: number | null;
+          created_at: string; updated_at: string;
+        }>;
+        const upsert = db.prepare(`
+          INSERT INTO memory_policies
+            (fact_id, policy_type, enforcement, applies_to_json, priority, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(fact_id) DO UPDATE SET
+            policy_type = excluded.policy_type,
+            enforcement = excluded.enforcement,
+            applies_to_json = excluded.applies_to_json,
+            priority = excluded.priority,
+            updated_at = excluded.updated_at
+        `);
+        let dispatchPolicies = 0;
+        for (const row of rows) {
+          const descriptor = row.kind === 'constraint'
+            ? compileComposioStandingPolicy(row.content)
+            : compilePromptStandingPolicyDescriptor(
+                row.content,
+                row.kind === 'user' ? 'core_profile' : 'standing_preference',
+              );
+          const deterministic = row.kind === 'constraint' && descriptor.deterministic;
+          if (deterministic) dispatchPolicies += 1;
+          upsert.run(
+            row.id,
+            deterministic
+              ? 'hard_constraint'
+              : row.kind === 'user' ? 'core_profile' : 'standing_preference',
+            deterministic ? 'dispatch' : 'prompt',
+            JSON.stringify(descriptor),
+            Math.round((row.importance ?? 5) * 10),
+            row.created_at,
+            row.updated_at,
+          );
+        }
+        db.prepare(`
+          INSERT INTO memory_migration_audit
+            (migration_version, action, affected_rows, detail_json, created_at)
+          VALUES (36, 'compile_sealed_standing_policy_v2', ?, ?, ?)
+        `).run(
+          rows.length,
+          JSON.stringify({ policiesScanned: rows.length, dispatchPolicies }),
+          new Date().toISOString(),
+        );
+      })();
+    },
   },
 ];
 

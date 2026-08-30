@@ -329,7 +329,7 @@ test('send-trust: a domain-scoped grant auto-approves a send where EVERY recipie
   grantSendTrust({ domains: ['breakthroughcoaching.ai'], note: 'my team' });
   const d = evaluateAutoApprove({
     sessionId: 's-dom', toolName: 'composio_execute_tool',
-    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'nathan@breakthroughcoaching.ai', cc: 'sam@breakthroughcoaching.ai' } },
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'avery@breakthroughcoaching.ai', cc: 'sam@breakthroughcoaching.ai' } },
     scope: 'yolo', insideWorkspace: false, kindHint: 'send',
   });
   assert.equal(d.autoApproved, true, 'all recipients in the trusted domain → auto');
@@ -340,7 +340,7 @@ test('send-trust: a MIXED send (one recipient OUT of scope) is still held', () =
   grantSendTrust({ domains: ['breakthroughcoaching.ai'] });
   const d = evaluateAutoApprove({
     sessionId: 's-mix', toolName: 'composio_execute_tool',
-    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'nathan@breakthroughcoaching.ai', cc: 'outsider@rival.com' } },
+    args: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'avery@breakthroughcoaching.ai', cc: 'outsider@rival.com' } },
     scope: 'yolo', insideWorkspace: false, kindHint: 'send',
   });
   assert.equal(d.autoApproved, false, 'one out-of-scope recipient → the whole send is held');

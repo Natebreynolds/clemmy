@@ -69,7 +69,7 @@ test('answerability is consumed: a thin recall ships the PARTIAL/INSUFFICIENT ru
   });
   assert.equal(primer.status, 'ok');
   if (primer.answerability === 'supported') {
-    assert.match(primer.text ?? '', /answer directly from a complete evidence-backed FACT/);
+    assert.match(primer.text ?? '', /Answer local-memory questions from a complete evidence-backed FACT/);
   } else {
     assert.match(primer.text ?? '', /memory_recall_all/, 'a non-supported primer names the one-call escalation');
   }

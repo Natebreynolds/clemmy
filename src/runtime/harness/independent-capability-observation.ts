@@ -217,6 +217,80 @@ export function registerIndependentCapabilityObservation(
   return { ok: true };
 }
 
+/**
+ * Compare-and-set a provider observation after its exact manifest lineage has
+ * advanced.
+ *
+ * Ordinary registration intentionally rejects a changed identity for the same
+ * operation+account. Definition drift needs one narrower path: a caller that
+ * already holds the exact prior snapshot may replace it with a freshly
+ * re-observable independent identity. The CAS prevents a stale/concurrent
+ * publisher from overwriting newer provider bytes, and the observer must
+ * reproduce the proposed identity before anything is stored.
+ */
+export function compareAndSetIndependentCapabilityObservation(input: {
+  expected: IndependentCapabilityObservation;
+  next: IndependentObservationRegistration & { origin: 'independent'; observe: NonNullable<IndependentObservationRegistration['observe']> };
+}): { ok: true } | {
+  ok: false;
+  reason: 'identity_missing' | 'identity_changed' | 'lineage_mismatch' | 'observer_required';
+} {
+  if (
+    input.expected.operationId !== input.next.operationId
+    || input.expected.accountId !== input.next.accountId
+  ) return { ok: false, reason: 'lineage_mismatch' };
+  const key = keyOf(input.expected.operationId, input.expected.accountId);
+  const prior = observations.get(key);
+  if (!prior) return { ok: false, reason: 'identity_missing' };
+  if (observationDigestOf(prior.snapshot) !== observationDigestOf(input.expected)) {
+    return { ok: false, reason: 'identity_changed' };
+  }
+  let observerImplementationId: string;
+  try {
+    observerImplementationId = shippedObserverImplementationId();
+  } catch {
+    return { ok: false, reason: 'observer_required' };
+  }
+  let live: ReturnType<NonNullable<IndependentObservationRegistration['observe']>>;
+  try {
+    live = input.next.observe();
+  } catch {
+    return { ok: false, reason: 'observer_required' };
+  }
+  if (
+    live.operationId !== input.next.operationId
+    || live.accountId !== input.next.accountId
+    || live.definitionFingerprint !== input.next.definitionFingerprint
+    || live.providerVersion !== input.next.providerVersion
+    || live.operationVersion !== input.next.operationVersion
+  ) return { ok: false, reason: 'lineage_mismatch' };
+  const snapshot: IndependentCapabilityObservation = {
+    operationId: input.next.operationId,
+    accountId: input.next.accountId,
+    definitionFingerprint: input.next.definitionFingerprint,
+    providerVersion: input.next.providerVersion,
+    operationVersion: input.next.operationVersion,
+    observedAt: live.observedAt,
+    origin: 'independent',
+    observationId: observationIdOf(live),
+    observerImplementationId,
+    observedBytesDigest: observedBytesDigestOf(live),
+  };
+  observations.set(key, { snapshot, observe: input.next.observe });
+  return { ok: true };
+}
+
+/** Read the registered snapshot without invoking, refreshing, or restamping
+ * its observer. Materializers use this only to reject an identity conflict
+ * before installing any other authority-bearing surface. */
+export function peekIndependentCapabilityObservation(
+  operationId: string,
+  accountId: string,
+): IndependentCapabilityObservation | null {
+  const prior = observations.get(keyOf(operationId, accountId));
+  return prior ? { ...prior.snapshot } : null;
+}
+
 export function independentlyObserveCapability(
   operationId: string,
   accountId: string,

@@ -88,3 +88,30 @@ test('production reducer preserves an authored completed reply as done', () => {
   assert.equal((terminal.data.turnOutcome as { status?: string }).status, 'done');
   assert.equal(terminal.data.reason, 'success');
 });
+
+test('an internal no-progress stop cannot become a resumable user continuation', () => {
+  const sessionId = 'internal-no-progress-stop';
+  const source = acceptedSource(sessionId);
+  const text = 'I hit an internal host error before any external action. Nothing was executed or changed.';
+
+  const reduced = reduceStandardConversationTerminal({
+    sourceUserSeq: source.sourceUserSeq,
+    result: {
+      sessionId,
+      status: 'blocked',
+      steps: 1,
+      lastTurn: source.turn,
+      error: text,
+      blockedResumable: false,
+    },
+  });
+
+  assert.equal(reduced.status, 'blocked');
+  assert.equal(reduced.publicPresentation?.kind, 'blocked');
+  assert.equal(reduced.publicPresentation?.text, text);
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.ok(terminal);
+  const outcome = terminal.data.turnOutcome as { status?: string; resumable?: boolean };
+  assert.equal(outcome.status, 'blocked');
+  assert.equal(outcome.resumable, false);
+});

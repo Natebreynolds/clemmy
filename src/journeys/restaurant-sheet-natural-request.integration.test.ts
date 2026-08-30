@@ -16,7 +16,8 @@ import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-natural-restaurant-sheet-'));
 const PROMPT = 'Find me 10 restaurants in Santa Clarita and put them in a new Google Sheet';
-const SHEET_URL = 'https://docs.google.com/spreadsheets/d/santa-clarita-restaurants/edit';
+const SHEET_ID = 'fixture-santa-clarita-restaurants';
+const SHEET_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 const SUCCESS = `Created a new Google Sheet with 10 Santa Clarita restaurants: ${SHEET_URL}`;
 const PREAMBLE = 'I’ll find ten Santa Clarita restaurants and put the results into one new Google Sheet.';
 const BOUNDED_LOCATIONS = Object.freeze([
@@ -27,7 +28,10 @@ const BOUNDED_LOCATIONS = Object.freeze([
   'Copper Hill', 'Circle J Ranch', 'Happy Valley', 'Five Knolls',
   'Valencia Summit', 'Mountain View', 'River Village', 'Val Verde',
 ] as const);
-const BOUNDED_PROMPT = `Collect exactly 20 restaurant records from each of these Santa Clarita areas and summarize the complete collection: ${BOUNDED_LOCATIONS.join(', ')}.`;
+const BOUNDED_PROMPT = [
+  'Collect exactly 20 restaurant records from each of these Santa Clarita areas and summarize the complete collection:',
+  ...BOUNDED_LOCATIONS.map((location) => `- ${location}`),
+].join('\n');
 const BOUNDED_SUCCESS = `Collected 480 restaurant records across ${BOUNDED_LOCATIONS.length} Santa Clarita areas.`;
 
 const RESTAURANT_OPERATION = 'RESTAURANTS_SEARCH';
@@ -149,6 +153,10 @@ const learningIntake = await import('../memory/learning-intake.js');
 const sourceMap = await import('../memory/source-map.js');
 const reflection = await import('../memory/reflection.js');
 const memoryDb = await import('../memory/db.js');
+const {
+  comparePromptCacheRequests,
+  observePromptCacheRequest,
+} = await import('../runtime/harness/prompt-cache-observation.js');
 
 let learningModelCalls = 0;
 reflection._testOnly_setReflectionExtractor(async () => {
@@ -201,6 +209,9 @@ async function* streamResponse(
       id: typeof response.responseId === 'string' ? response.responseId : 'fixture-response',
       usage: response.usage ?? { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
       output,
+      ...(response.providerData && typeof response.providerData === 'object'
+        ? { providerData: response.providerData }
+        : {}),
     },
   } as never;
 }
@@ -446,7 +457,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     assert.deepEqual(sheetRows, settledReadRows, 'the Sheet contains all and only the settled restaurant rows');
     return {
       successful: true,
-      spreadsheetId: 'santa-clarita-restaurants',
+      spreadsheetId: SHEET_ID,
       spreadsheetUrl: SHEET_URL,
     };
   };
@@ -556,6 +567,60 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   ]));
 
   const modelRequests: Array<{ phase: 'hidden' | 'primary'; tools: string[]; bytes: number }> = [];
+  type CacheRun = 'cold' | 'warm';
+  type CacheObservation = ReturnType<typeof observePromptCacheRequest>;
+  const cacheUsageRecords: Array<{
+    run: CacheRun;
+    inputTokens: number;
+    cachedInputTokens: number;
+    uncachedInputTokens: number;
+    observation: CacheObservation;
+  }> = [];
+  let previousCacheObservation: CacheObservation | null = null;
+  const recordNaturalPromptCacheUsage = (run: CacheRun, rawRequest: unknown) => {
+    const observation = observePromptCacheRequest(rawRequest as never);
+    const transition = comparePromptCacheRequests(previousCacheObservation, observation);
+    const promptLayers = ['stablePolicy', 'turnContext', 'memoryContext', 'catalog', 'task'] as const;
+    // This deterministic tokenizer belongs to the recording provider boundary.
+    // The harness consumes the returned receipt; it does not estimate usage.
+    const tokens = Object.fromEntries(promptLayers.map((name) => [
+      name,
+      observation.layers[name].bytes === 0
+        ? 0
+        : Math.max(1, Math.ceil(observation.layers[name].bytes / 4)),
+    ])) as Record<(typeof promptLayers)[number], number>;
+    const inputTokens = promptLayers.reduce((sum, name) => sum + tokens[name], 0);
+    const cachedInputTokens = transition.reusableLayers
+      .filter((name): name is (typeof promptLayers)[number] => promptLayers.includes(name as never))
+      .reduce((sum, name) => sum + tokens[name], 0);
+    const uncachedInputTokens = inputTokens - cachedInputTokens;
+    previousCacheObservation = observation;
+    cacheUsageRecords.push({
+      run,
+      inputTokens,
+      cachedInputTokens,
+      uncachedInputTokens,
+      observation,
+    });
+    return {
+      usage: {
+        requests: 1,
+        inputTokens,
+        outputTokens: 1,
+        totalTokens: inputTokens + 1,
+        inputTokensDetails: { cachedTokens: cachedInputTokens },
+      },
+      providerData: {
+        promptCacheUsage: {
+          version: 1,
+          cacheDialect: 'inclusive',
+          inputTokens,
+          cachedInputTokens,
+          uncachedInputTokens,
+        },
+      },
+    } as const;
+  };
   let primaryStep = 0;
   const scriptedModel = {
     async getResponse(rawRequest: unknown) {
@@ -566,12 +631,13 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       const hiddenPreflight = tools.length === 0
         && /Clementine Preflight Conversation|immediately before consequential work|Openness verdict: SETTLED/i.test(serialized);
       modelRequests.push({ phase: hiddenPreflight ? 'hidden' : 'primary', tools, bytes: requestBytes });
+      const cacheReceipt = recordNaturalPromptCacheUsage('cold', rawRequest);
       if (hiddenPreflight) {
         // Keep current broken bytes observable long enough to reach the final
         // assertion; this response is never accepted as proof.  The release
         // contract requires ZERO such calls.
         return {
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          ...cacheReceipt,
           output: [textMessage(PREAMBLE)],
           responseId: 'forbidden-hidden-preflight-response',
         };
@@ -702,7 +768,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         }))];
       }
       return {
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        ...cacheReceipt,
         output,
         responseId: `primary-response-${primaryStep}`,
       };
@@ -793,7 +859,12 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   'the cold request never acquires a planted source-strategy binding');
 
   assert.equal(restaurantReads, 1);
-  assert.equal(sheetCreates, 1);
+  assert.equal(sheetCreates, 1, JSON.stringify({
+    trace,
+    deliveryErrors: delivery.errors,
+    providerCalls,
+    events: events.map((event) => ({ type: event.type, data: event.data })),
+  }));
   assert.equal(providerCalls.length, 2);
   assert.equal(rawBusinessRequests, 2, 'one raw no-retry request owns each physical business row');
   assert.equal(legacyHighLevelExecuteCalls, 0, 'the legacy high-level execute path is never a fallback');
@@ -1088,6 +1159,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     workBindings,
     observedOperations,
     manifestNodes: obligationManifest?.nodes ?? [],
+    failureEvents: events.filter((event) => (
+      /fail|error|uncertain|artifact|evidence|settle|terminal/i.test(event.type)
+    )).map((event) => ({ type: event.type, data: event.data })),
   };
   assert.equal((completions[0]?.data.presentation as { status?: unknown } | undefined)?.status, 'done',
     JSON.stringify({ completion: completions[0], terminalAuthorityDiagnostics }));
@@ -1242,6 +1316,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           const tools = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
           const serialized = JSON.stringify(rawRequest ?? {});
           warmModelRequests.push({ tools, bytes: Buffer.byteLength(serialized, 'utf8') });
+          const cacheReceipt = recordNaturalPromptCacheUsage('warm', rawRequest);
           if (warmStep === 1) {
             assert.ok(warmAcceptedSource, 'the warm source is durable before memory reaches the model');
             const warmSeq = warmAcceptedSource!.seq;
@@ -1267,33 +1342,10 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
             assert.match(serialized, /advisory|nothing here is pre-authorized/i);
             assert.ok(tools.includes(PLAN_CONTROL));
             assert.ok(tools.includes('work_call'));
-            return {
-              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
-              output: [functionCall('warm-unplanned-read', 'work_call', {
-                requirement_id: READ_REQUIREMENT,
-                universe_item_id: null,
-                universe_selector: null,
-                seal_amendment: null,
-                name: 'composio_execute_tool',
-                args_json: JSON.stringify({
-                  tool_slug: RESTAURANT_OPERATION,
-                  arguments: JSON.stringify({
-                    location: 'Santa Clarita, CA',
-                    category: 'restaurant',
-                    limit: 10,
-                  }),
-                  connected_account_id: 'conn-restaurants',
-                }),
-              })],
-              responseId: 'warm-response-1',
-            };
-          }
-          if (warmStep === 2) {
             assert.deepEqual({ restaurantReads, sheetCreates, calls: providerCalls.length }, providerBefore,
-              'an exact remembered slug/account still cannot cross before a fresh accepted plan');
-            assert.match(serialized, /plan_task|plan required|fresh plan/i);
+              'remembered capability context cannot cross before this response admits a fresh plan');
             return {
-              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+              ...cacheReceipt,
               output: [
                 functionCall('admit-warm-natural-task', PLAN_CONTROL, {
                   preamble: PREAMBLE,
@@ -1361,14 +1413,14 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
                   }),
                 }),
               ],
-              responseId: 'warm-response-2',
+              responseId: 'warm-response-1',
             };
           }
-          if (warmStep === 3) {
+          if (warmStep === 2) {
             assert.equal(tools.includes(PLAN_CONTROL), false);
             assert.ok(settledReadRows);
             return {
-              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+              ...cacheReceipt,
               output: [functionCall('warm-sheet-create', 'work_call', {
                 requirement_id: WRITE_REQUIREMENT,
                 universe_item_id: null,
@@ -1385,11 +1437,11 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
                   connected_account_id: 'conn-googlesheets',
                 }),
               })],
-              responseId: 'warm-response-3',
+              responseId: 'warm-response-2',
             };
           }
           return {
-            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+            ...cacheReceipt,
             output: [textMessage(JSON.stringify({
               summary: SUCCESS,
               reply: SUCCESS,
@@ -1397,7 +1449,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
               nextAction: 'completed',
               reason: null,
             }))],
-            responseId: `warm-response-${warmStep}`,
+            responseId: 'warm-response-3',
           };
         },
         getStreamedResponse: streamResponse,
@@ -1427,8 +1479,45 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       });
 
       assert.ok(preModelAuthority);
-      assert.equal(warmStep, 4);
-      assert.equal(warmModelRequests.length, 4);
+      assert.equal(warmStep, 3,
+        'verified capability memory removes discovery without adding a refusal/model round');
+      assert.equal(warmModelRequests.length, 3);
+      const coldCacheUsage = cacheUsageRecords.filter((entry) => entry.run === 'cold');
+      const warmCacheUsage = cacheUsageRecords.filter((entry) => entry.run === 'warm');
+      assert.equal(coldCacheUsage.length, 4);
+      assert.equal(warmCacheUsage.length, 3);
+      const coldUncachedInputTokens = coldCacheUsage.reduce(
+        (sum, entry) => sum + entry.uncachedInputTokens,
+        0,
+      );
+      const warmUncachedInputTokens = warmCacheUsage.reduce(
+        (sum, entry) => sum + entry.uncachedInputTokens,
+        0,
+      );
+      const warmCachedInputTokens = warmCacheUsage.reduce(
+        (sum, entry) => sum + entry.cachedInputTokens,
+        0,
+      );
+      assert.ok(warmCachedInputTokens > 0,
+        'the recording provider certifies a reused stable prefix on the verified warm journey');
+      assert.ok(
+        warmUncachedInputTokens * 100 <= coldUncachedInputTokens * 70,
+        `verified warm natural journey must use <=70% of cold uncached input: ${JSON.stringify({
+          coldUncachedInputTokens,
+          warmUncachedInputTokens,
+          warmCachedInputTokens,
+          cold: coldCacheUsage.map(({ inputTokens, cachedInputTokens, uncachedInputTokens }) => ({
+            inputTokens,
+            cachedInputTokens,
+            uncachedInputTokens,
+          })),
+          warm: warmCacheUsage.map(({ inputTokens, cachedInputTokens, uncachedInputTokens }) => ({
+            inputTokens,
+            cachedInputTokens,
+            uncachedInputTokens,
+          })),
+        })}`,
+      );
       assert.deepEqual({
         restaurantReads: restaurantReads - providerBefore.restaurantReads,
         sheetCreates: sheetCreates - providerBefore.sheetCreates,
@@ -1552,7 +1641,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
                 functionCall(`bounded-read-${String(offset + index + 1).padStart(2, '0')}`, 'work_call', {
                   requirement_id: 'read_each_area',
                   universe_item_id: location,
-                  universe_selector: null,
+                  universe_selector: { argument_pointer: '/location', member_id_pointer: null },
                   seal_amendment: null,
                   name: 'composio_execute_tool',
                   args_json: JSON.stringify({
@@ -1619,6 +1708,24 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       assert.ok(boundedProviderPayloadBytes > 16 * 1024 * 1024,
         `fixture must materially outgrow model context: ${boundedProviderPayloadBytes}`);
       const seq = accepted!.seq;
+      const boundedBindings = db.prepare(`
+        SELECT COUNT(*) AS n,
+               COUNT(DISTINCT universe_item_id) AS item_n,
+               COUNT(DISTINCT logical_tool_call_id) AS logical_n
+          FROM expected_work_call_bindings
+         WHERE session_id = ? AND source_user_seq = ?
+           AND requirement_id = 'read_each_area'
+           AND universe_selector_json = ?
+      `).get(
+        boundedSession.id,
+        seq,
+        JSON.stringify({ argumentPointer: '/location', memberIdPointer: null }),
+      ) as { n: number; item_n: number; logical_n: number };
+      assert.deepEqual(boundedBindings, {
+        n: BOUNDED_LOCATIONS.length,
+        item_n: BOUNDED_LOCATIONS.length,
+        logical_n: BOUNDED_LOCATIONS.length,
+      }, 'every requested area owns one exact immutable work binding');
       const durable = db.prepare(`
         SELECT COUNT(*) AS n,
                SUM(raw_byte_count) AS raw_bytes,

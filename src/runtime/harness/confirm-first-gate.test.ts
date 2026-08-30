@@ -13,6 +13,16 @@ import {
   isConfirmFirstEnabled,
 } from './confirm-first-gate.js';
 
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+  { operationId: 'GOOGLESHEETS_VALUES_GET', providerKind: 'composio', effect: 'read' },
+  { operationId: 'GOOGLESHEETS_BATCH_GET', providerKind: 'composio', effect: 'read' },
+]);
+
+test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
+});
+
 // ─── classifyExternalWrite ────────────────────────────────────────
 
 test('classifyExternalWrite: a mutating composio write gets a shapeKey = slug', () => {

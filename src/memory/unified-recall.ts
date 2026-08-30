@@ -49,10 +49,22 @@ function asksForCompleteSet(objective: string): boolean {
   return asksForCompleteRecallSet(objective);
 }
 
+const LIVE_WORLD_ASK_RE =
+  /\b(this month|this week|today|right now|currently|yet to close|set to close|how many|closing)\b/i;
+
+function isLiveWorldAsk(objective: string): boolean {
+  return LIVE_WORLD_ASK_RE.test(objective);
+}
+
 export function projectedRecallAnswerability(
   result: Pick<UnifiedRecallResult, 'objective' | 'answerability'>,
   hits: UnifiedHit[],
 ): UnifiedRecallResult['answerability'] {
+  const entityOrDeliverableOnly = hits.length > 0
+    && hits.every((hit) => hit.type === 'entity' || hit.type === 'deliverable');
+  if (entityOrDeliverableOnly && isLiveWorldAsk(result.objective)) {
+    return 'partial';
+  }
   if (!asksForCompleteSet(result.objective) || result.answerability !== 'supported') return result.answerability;
   // Entity/resource stubs can corroborate a roster but cannot contain the full
   // requested set. Only the long-value durable projection is allowed to certify

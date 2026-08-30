@@ -160,6 +160,33 @@ function freshSource(text: string) {
   return { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
 }
 
+test('legacy admission never mints capability proof from the hidden connected-goal selector', async () => {
+  resetCatalog();
+  installTurnSemanticModelPort(null);
+  let registryReads = 0;
+  installConnectedRegistryPort(() => {
+    registryReads += 1;
+    return {
+      connectedToolkits: ['shape_registry'],
+      tools: [{
+        slug: 'SHAPE_REGISTRY_QUERY_RECORDS',
+        schema: READ_SCHEMA,
+      }],
+    };
+  });
+  const objective = 'Collect the current zephyr lattice records for review.';
+  const identity = freshSource(objective);
+
+  await admitAndCompileAcceptedSource({ identity, surface: 'direct' });
+  assert.equal(registryReads, 0, 'admission must not run a provider-specific hidden selector');
+  assert.equal(
+    listEvents(identity.sessionId, { types: ['capability_resolution'] })
+      .filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq).length,
+    0,
+    'a schema/lexical shape guess must never be stamped as proven authority',
+  );
+});
+
 test('a unique collection read plus unique inspect binds the collection shape', () => {
   resetCatalog();
   registerAttested({ slug: COLLECT_SLUG, effect: 'read', roles: ['collection'] });

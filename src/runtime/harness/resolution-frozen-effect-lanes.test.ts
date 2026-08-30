@@ -20,8 +20,15 @@ const attempts = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const resolution = await import('./resolution-ledger.js');
 const writeEvidence = await import('./write-evidence-store.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
 
 after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

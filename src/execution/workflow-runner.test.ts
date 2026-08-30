@@ -1789,6 +1789,39 @@ function restoreEnv(key: string, value: string | undefined): void {
   else process.env[key] = value;
 }
 
+type CanonicalWorkflowHarnessRequest = {
+  sessionId: string;
+  input?: string;
+};
+
+/** Exercise the production workflow-owned host loop without a live provider.
+ * The responder stands in for the final model only; accepted-source creation,
+ * run-attempt identity, fan-out scheduling, retry, evidence, and settlement
+ * remain owned by `runStepViaHarness`. */
+function installCanonicalWorkflowTextHarness(
+  responder: (request: CanonicalWorkflowHarnessRequest) => string | Promise<string>,
+): void {
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (request: CanonicalWorkflowHarnessRequest) => {
+      const text = await responder(request);
+      return {
+        sessionId: request.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: {
+          summary: text,
+          reply: text,
+          done: true,
+          nextAction: 'completed',
+        },
+      };
+    }) as never,
+  });
+}
+
 test('capability blocks are typed control flow only for externally recoverable gateway reasons', () => {
   assert.equal(workflowCapabilityBlockIsRecoverable('not-connected'), true);
   assert.equal(workflowCapabilityBlockIsRecoverable('identity-absent'), true);
@@ -3488,6 +3521,23 @@ test('workflow harness resume reuses already parked legacy approval session', ()
 
   assert.equal(resumed.id, legacy.id);
   assert.equal(HarnessSession.load('workflow:run-123:surface_for_approval'), null);
+  assert.deepEqual(
+    {
+      source: resumed.sessionRow.metadata.source,
+      workflowName: resumed.sessionRow.metadata.workflowName,
+      workflowRunId: resumed.sessionRow.metadata.workflowRunId,
+      stepId: resumed.sessionRow.metadata.stepId,
+      sessionIdSuffix: resumed.sessionRow.metadata.sessionIdSuffix,
+    },
+    {
+      source: 'workflow',
+      workflowName: 'Daily Outreach',
+      workflowRunId: 'run-123',
+      stepId: 'surface_for_approval',
+      sessionIdSuffix: 'run-123:surface_for_approval',
+    },
+    'the current workflow owner upgrades the reused legacy session before resuming it',
+  );
 });
 
 test('deterministic workflow step runs a bundled scripts/ helper with JSON stdin', async () => {
@@ -3830,77 +3880,48 @@ test('warning-only stderr is retained as a diagnostic but never promoted to root
   assert.doesNotMatch(failure.message, /Reported reason: .*Warning/i);
 });
 
-// RESTORED (2026-08-26): 60db67d8 renamed this to 'a persisted deterministic
-// workflow is blocked before its body or voice model can run' and gutted its
-// assertions to pin the wave's own retirement instead of what this test was
-// built to prove — that a REAL deterministic-runner failure reaches the
-// terminal record faithfully. Restored to its original form now that the
-// lane runs again.
-test('deterministic structured failure reaches the terminal record unchanged and bypasses the voice model', async () => {
-  const { writeWorkflow } = await import('../memory/workflow-store.js');
-  const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const slug = `det-terminal-failure-${stamp}`;
-  const workflowName = `Det terminal failure ${stamp}`;
-  const runId = `det-terminal-failure-run-${stamp}`;
-  writeWorkflow(slug, {
-    name: workflowName,
-    description: 'Pins faithful deterministic failure reporting.',
-    enabled: true,
-    trigger: { manual: true },
-    steps: [{
-      id: 'pull',
-      prompt: '',
-      deterministic: {
-        runner: 'fail.mjs',
-        source: [
-          'process.stderr.write("Warning: sf CLI update available.\\n");',
-          'process.stdout.write(JSON.stringify({ found: false, kind: "deterministic_source_failure", code: "salesforce_provider_error", failedRead: "salesforce-org-readiness", providerErrorId: "INVALID_SESSION_ID", error: "Salesforce target org nathan@example.test is not authenticated." }));',
-          'process.exit(1);',
-        ].join('\n'),
-      },
-      sideEffect: 'read',
-    }],
-  });
-  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
-  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-  writeFileSync(runFile, JSON.stringify({
-    id: runId,
-    workflow: workflowName,
-    status: 'queued',
+test('a persisted raw runner is a typed zero-process refusal', async () => {
+  const slug = 'raw-runner-zero-process-refusal';
+  const runId = 'raw-runner-zero-process-refusal-run';
+  const marker = path.join(tmp, 'raw-runner-zero-process-spawned');
+  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  writeFileSync(
+    path.join(scriptsDir, 'fail.mjs'),
+    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned');\n`,
+    'utf-8',
+  );
+  const step = {
+    id: 'pull',
+    prompt: '',
+    sideEffect: 'read',
+    deterministic: { runner: 'fail.mjs' },
+  };
+  const ctx = {
+    workflow: { name: slug, description: '', enabled: true, trigger: { manual: true }, steps: [step] },
+    workflowSlug: slug,
+    runId,
     inputs: {},
-    createdAt: new Date().toISOString(),
-  }), 'utf-8');
+    stepOutputs: {},
+    assistant: { respond: async () => { throw new Error('the model must not run'); } },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
 
-  let voiceCalls = 0;
-  _setWorkflowVoiceRewriteForTests((async () => {
-    voiceCalls += 1;
-    return { message: 'Warning was the root cause. Next step: apply fix <id>', nothingHappened: false };
-  }) as never);
-  try {
-    await processWorkflowRuns({} as never);
-  } finally {
-    _setWorkflowVoiceRewriteForTests(null);
-  }
-
-  const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, any>;
-  assert.equal(terminal.status, 'error');
-  assert.equal(voiceCalls, 0, 'typed deterministic failures cannot be semantically rewritten by a model');
-  assert.equal(terminal.failure?.kind, 'deterministic_runner');
-  assert.equal(terminal.failure?.summary, 'Salesforce target org nathan@example.test is not authenticated.');
-  assert.equal(terminal.failure?.structuredFailureSource, 'stdout');
-  assert.deepEqual(terminal.failure?.sourceFailure, {
-    kind: 'deterministic_source_failure',
-    code: 'salesforce_provider_error',
-    failedRead: 'salesforce-org-readiness',
-    providerErrorId: 'INVALID_SESSION_ID',
-  });
-  assert.equal(terminal.failure?.stdout, undefined);
-  assert.match(terminal.error ?? '', /Reported reason: Salesforce target org nathan@example\.test is not authenticated\./);
-  assert.match(terminal.error ?? '', /stderr diagnostic: Warning: sf CLI update available\./);
-  assert.equal(terminal.reportBack?.detail, terminal.error);
-  assert.doesNotMatch(terminal.reportBack?.detail ?? '', /apply fix <id>/i);
-  const failedEvent = readWorkflowEvents(slug, runId).find((event) => event.kind === 'step_failed');
-  assert.equal((failedEvent?.meta?.failure as Record<string, unknown> | undefined)?.kind, 'deterministic_runner');
+  await assert.rejects(
+    () => executeStep(step as never, ctx),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+      assert.match(
+        error.reason,
+        /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i,
+      );
+      return true;
+    },
+  );
+  assert.equal(existsSync(marker), false, 'the legacy subprocess body never starts');
+  assert.equal(readWorkflowEvents(slug, runId).some((event) => event.kind === 'step_started'), false);
 });
 
 test('deterministic workflow step now runs a .ts runner via the shared tsx interpreter', async () => {
@@ -3946,28 +3967,10 @@ test('deterministic workflow step rejects runners outside scripts/', async () =>
   );
 });
 
-// RESTORED (2026-08-26): this test was invented by 60db67d8 itself (no
-// pre-wave twin) purely to pin the retirement ("refuse before spawn"). Now
-// that a deterministic step runs again, its only remaining value is proving
-// it reaches the SAME shared finalizeStepOutput contract chokepoint as every
-// other step shape — rewritten to prove that instead of a blanket refusal.
-test('deterministic steps run and their output contract is enforced at the shared chokepoint', async () => {
-  const scriptsDir = path.join(tmp, 'vault', '00-System', 'workflows', 'det-contract-test', 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  const marker = path.join(tmp, 'det-contract-test-spawned');
-  writeFileSync(
-    path.join(scriptsDir, 'emit.mjs'),
-    [
-      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
-      'let i = ""; process.stdin.setEncoding("utf-8");',
-      'process.stdin.on("data", (c) => i += c);',
-      'process.stdin.on("end", () => process.stdout.write(JSON.stringify({ ok: true })));',
-    ].join('\n'),
-    'utf-8',
-  );
+test('an exact call result reaches the shared output-contract chokepoint', async () => {
   const mkCtx = (runId: string) => ({
-    workflow: { name: 'Det Contract Test', steps: [] },
-    workflowSlug: 'det-contract-test',
+    workflow: { name: 'Exact Call Contract Test', steps: [] },
+    workflowSlug: 'exact-call-contract-test',
     runId,
     inputs: {},
     stepOutputs: {},
@@ -3976,38 +3979,53 @@ test('deterministic steps run and their output contract is enforced at the share
     forEachFailures: [],
   } as unknown as Parameters<typeof executeStep>[1]);
 
-  // A declared output contract the script's real output does not satisfy
-  // (missing "url") still spawns the script, then fails at the SAME
-  // finalizeStepOutput chokepoint every other step shape uses.
-  const failStep = { id: 'd_fail', prompt: 'x', deterministic: { runner: 'emit.mjs' }, output: { type: 'object', required_keys: ['url'] } } as unknown as Parameters<typeof executeStep>[0];
-  await assert.rejects(
-    () => executeStep(failStep, mkCtx('det-fail')),
-    (error: unknown) => {
-      assert.ok(error instanceof WorkflowContractViolationError);
-      assert.match(error.message, /output failed its contract/);
-      return true;
-    },
-  );
-  assert.equal(existsSync(marker), true, 'the script body runs before its output is verified');
-  const failKinds = readWorkflowEvents('det-contract-test', 'det-fail').map((e) => e.kind);
-  assert.ok(failKinds.includes('step_started'));
-  assert.ok(failKinds.includes('step_failed'));
-  assert.ok(!failKinds.includes('step_completed'));
+  let calls = 0;
+  _setWorkflowCallNodeForTests(async (step) => {
+    calls += 1;
+    assert.equal(step.call?.tool, 'SALESFORCE_GET_RECORDS');
+    return { ok: true };
+  });
+  try {
+    const failStep = {
+      id: 'read_fail',
+      prompt: '',
+      sideEffect: 'read',
+      call: { tool: 'SALESFORCE_GET_RECORDS', args: { objectName: 'Account' } },
+      output: { type: 'object', required_keys: ['url'] },
+    } as unknown as Parameters<typeof executeStep>[0];
+    await assert.rejects(
+      () => executeStep(failStep, mkCtx('call-fail')),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowContractViolationError);
+        assert.match(error.message, /output failed its contract/);
+        return true;
+      },
+    );
+    const failKinds = readWorkflowEvents('exact-call-contract-test', 'call-fail').map((e) => e.kind);
+    assert.ok(failKinds.includes('step_started'));
+    assert.ok(failKinds.includes('step_failed'));
+    assert.ok(!failKinds.includes('step_completed'));
 
-  // No output contract → the raw deterministic output completes the step.
-  const okStep = { id: 'd_ok', prompt: 'x', deterministic: { runner: 'emit.mjs' } } as unknown as Parameters<typeof executeStep>[0];
-  const okResult = await executeStep(okStep, mkCtx('det-ok'));
-  assert.deepEqual(okResult, { ok: true });
-  assert.ok(readWorkflowEvents('det-contract-test', 'det-ok').map((e) => e.kind).includes('step_completed'));
+    const okStep = {
+      id: 'read_ok',
+      prompt: '',
+      sideEffect: 'read',
+      call: { tool: 'SALESFORCE_GET_RECORDS', args: { objectName: 'Account' } },
+    } as unknown as Parameters<typeof executeStep>[0];
+    const okResult = await executeStep(okStep, mkCtx('call-ok'));
+    assert.deepEqual(okResult, { ok: true });
+    assert.ok(readWorkflowEvents('exact-call-contract-test', 'call-ok').map((e) => e.kind).includes('step_completed'));
+    assert.equal(calls, 2);
+  } finally {
+    _setWorkflowCallNodeForTests();
+  }
 });
 
 // ─── Owner-workflow shapes (2026-08-26) ────────────────────────────────────
-// 60db67d8 retired deterministic.runner wholesale and broke 5 of the owner's
-// live workflows — 3 of them on live cron schedules (friday-dashboard-daily-
-// refresh, social-manager-rc-1785193205, team-activity-slack-updates). These
-// pins mirror each one's real step shape (mirrored, not copied verbatim from
-// the vault) and prove it validates and actually dispatches through the
-// restored sandboxed executor.
+// These mirrored shapes pin the migration rule: external work stays on an
+// exact call; pure data shaping uses the closed in-process transform; literal
+// fan-out data is a declared workflow input. No fixture restores subprocess
+// authority merely because an old workflow happened to use a script.
 function ownerShapeCtx(slug: string, runId: string, step: Record<string, unknown>, stepOutputs: Record<string, unknown> = {}) {
   return {
     workflow: {
@@ -4021,23 +4039,23 @@ function ownerShapeCtx(slug: string, runId: string, step: Record<string, unknown
     runId,
     inputs: {},
     stepOutputs,
-    assistant: { respond: async () => { throw new Error('owner shape must dispatch deterministically, not via the model'); } },
+    assistant: { respond: async () => { throw new Error('owner shape unexpectedly dispatched through the model'); } },
     completedItems: new Map(),
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
 }
 
-test('owner shape — friday-dashboard-daily-refresh: single read-only .mjs runner on a live cron schedule', async () => {
+test('migrated owner shape — friday-dashboard-daily-refresh uses a reviewed literal transform', async () => {
   const slug = 'friday-dashboard-daily-refresh-shape';
-  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(path.join(scriptsDir, 'refresh.mjs'), 'process.stdout.write(JSON.stringify({ ok: true }));\n', 'utf-8');
   const step = {
     id: 'pull',
     prompt: '',
     sideEffect: 'read',
-    deterministic: { runner: 'refresh.mjs' },
+    transform: {
+      version: 1,
+      expression: { op: 'literal', value: { ok: true } },
+    },
     output: { type: 'object', required_keys: ['ok'] },
   };
   const validation = validateWorkflowDefinition({
@@ -4053,122 +4071,371 @@ test('owner shape — friday-dashboard-daily-refresh: single read-only .mjs runn
   assert.ok(readWorkflowEvents(slug, 'run-1').map((e) => e.kind).includes('step_completed'));
 });
 
-test('owner shape — monday-salesforce-opportunity-report: a .sh runner via the shell interpreter', async () => {
+test('migrated owner shape — monday Salesforce report uses one exact read call', async () => {
   const slug = 'monday-salesforce-opportunity-report-shape';
-  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'pull-open-opportunities.sh'),
-    '#!/bin/sh\ncat > /dev/null\necho \'{"records":[{"Id":"006-1"}]}\'\n',
-    { mode: 0o755 },
-  );
   const step = {
     id: 'pull_open_opportunities',
     prompt: '',
     sideEffect: 'read',
-    deterministic: { runner: 'pull-open-opportunities.sh' },
-    allowedTools: ['run_shell_command'],
+    call: {
+      tool: 'SALESFORCE_RUN_SOQL_QUERY',
+      args: {
+        query: 'SELECT Id FROM Opportunity WHERE IsClosed = false',
+      },
+    },
     output: { type: 'object', required_keys: ['records'], non_empty: ['records'] },
   };
-  const result = await executeStep(step as never, ownerShapeCtx(slug, 'run-1', step));
-  assert.deepEqual(result, { records: [{ Id: '006-1' }] });
-  assert.ok(readWorkflowEvents(slug, 'run-1').map((e) => e.kind).includes('step_completed'));
+  const validation = validateWorkflowDefinition({
+    name: slug,
+    description: 'Read open Salesforce opportunities.',
+    enabled: true,
+    trigger: { manual: true, schedule: '0 7 * * 1' },
+    steps: [step],
+  } as never);
+  assert.equal(validation.ok, true, validation.errors.join('\n'));
+
+  let crossings = 0;
+  _setWorkflowCallNodeForTests(async (actual) => {
+    crossings += 1;
+    assert.equal(actual.call?.tool, 'SALESFORCE_RUN_SOQL_QUERY');
+    assert.deepEqual(actual.call?.args, {
+      query: 'SELECT Id FROM Opportunity WHERE IsClosed = false',
+    });
+    return { records: [{ Id: '006-1' }] };
+  });
+  try {
+    const result = await executeStep(step as never, ownerShapeCtx(slug, 'run-1', step));
+    assert.deepEqual(result, { records: [{ Id: '006-1' }] });
+    assert.equal(crossings, 1);
+    assert.ok(readWorkflowEvents(slug, 'run-1').map((e) => e.kind).includes('step_completed'));
+  } finally {
+    _setWorkflowCallNodeForTests();
+  }
 });
 
-test('owner shape — salesforce-quarterly-to-sheets: a dependsOn chain of deterministic steps threads stepOutputs', async () => {
+test('migrated owner shape — salesforce-quarterly-to-sheets keeps the provider read exact and reshapes in-process', async () => {
   const slug = 'salesforce-quarterly-to-sheets-shape';
-  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'sf-query.mjs'),
-    'process.stdout.write(JSON.stringify([{ Id: "opp-1" }]));\n',
-    'utf-8',
-  );
-  writeFileSync(
-    path.join(scriptsDir, 'to-sheets-grid.mjs'),
-    [
-      'let i = ""; process.stdin.setEncoding("utf-8");',
-      'process.stdin.on("data", (c) => i += c);',
-      'process.stdin.on("end", () => {',
-      '  const payload = JSON.parse(i);',
-      '  process.stdout.write(JSON.stringify({ data: payload.stepOutputs.opportunities, counts: { opportunities: payload.stepOutputs.opportunities.length }, tabsWritten: ["Opportunities"] }));',
-      '});',
-    ].join('\n'),
-    'utf-8',
-  );
-  const oppsStep = { id: 'opportunities', prompt: '', sideEffect: 'read', deterministic: { runner: 'sf-query.mjs' } };
-  const oppsOutput = await executeStep(oppsStep as never, ownerShapeCtx(slug, 'run-1', oppsStep));
-  assert.deepEqual(oppsOutput, [{ Id: 'opp-1' }]);
+  const oppsStep = {
+    id: 'opportunities',
+    prompt: '',
+    sideEffect: 'read',
+    call: {
+      tool: 'SALESFORCE_RUN_SOQL_QUERY',
+      args: { query: 'SELECT Id, Name, Amount FROM Opportunity WHERE IsClosed = false' },
+    },
+  };
 
   const gridStep = {
     id: 'grid',
     prompt: '',
     dependsOn: ['opportunities'],
     sideEffect: 'read',
-    deterministic: { runner: 'to-sheets-grid.mjs' },
+    transform: {
+      version: 1,
+      expression: {
+        op: 'object',
+        fields: [
+          { key: 'data', value: { op: 'get', from: 'steps.opportunities.output.data.records' } },
+          {
+            key: 'grid',
+            value: {
+              op: 'map',
+              value: { op: 'get', from: 'steps.opportunities.output.data.records' },
+              each: {
+                op: 'array',
+                items: [
+                  { op: 'get', from: 'item.Id' },
+                  { op: 'get', from: 'item.Name' },
+                  { op: 'get', from: 'item.Amount' },
+                ],
+              },
+            },
+          },
+          {
+            key: 'counts',
+            value: {
+              op: 'object',
+              fields: [{
+                key: 'opportunities',
+                value: { op: 'count', value: { op: 'get', from: 'steps.opportunities.output.data.records' } },
+              }],
+            },
+          },
+          { key: 'tabsWritten', value: { op: 'literal', value: ['Opportunities'] } },
+        ],
+      },
+    },
     output: { type: 'object', required_keys: ['data', 'counts', 'tabsWritten'] },
   };
-  const gridOutput = await executeStep(
-    gridStep as never,
-    ownerShapeCtx(slug, 'run-1', gridStep, { opportunities: oppsOutput }),
-  ) as { data: unknown; counts: { opportunities: number }; tabsWritten: string[] };
-  assert.deepEqual(gridOutput.data, [{ Id: 'opp-1' }]);
-  assert.equal(gridOutput.counts.opportunities, 1);
-  assert.deepEqual(gridOutput.tabsWritten, ['Opportunities']);
-});
-
-test('owner shape — social-manager-rc-1785193205: a deterministic array output feeds a downstream forEach', async () => {
-  const slug = 'social-manager-rc-shape';
-  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'define-competitors.mjs'),
-    'process.stdout.write(JSON.stringify([{ name: "A" }, { name: "B" }, { name: "C" }]));\n',
-    'utf-8',
-  );
-  const step = {
-    id: 'define_competitors',
-    prompt: '',
-    sideEffect: 'read',
-    deterministic: { runner: 'define-competitors.mjs' },
-    output: { type: 'array', min_items: { '': 3 } },
+  const workflow = {
+    name: slug,
+    description: 'Read opportunities and shape the Sheets payload.',
+    enabled: true,
+    trigger: { manual: true, schedule: '0 7 1 */3 *' },
+    steps: [oppsStep, gridStep],
   };
-  const result = await executeStep(step as never, ownerShapeCtx(slug, 'run-1', step)) as unknown[];
-  assert.equal(result.length, 3);
-  assert.ok(readWorkflowEvents(slug, 'run-1').map((e) => e.kind).includes('step_completed'));
+  const validation = validateWorkflowDefinition(workflow as never);
+  assert.equal(validation.ok, true, validation.errors.join('\n'));
+
+  let crossings = 0;
+  _setWorkflowCallNodeForTests(async (actual) => {
+    crossings += 1;
+    assert.equal(actual.call?.tool, 'SALESFORCE_RUN_SOQL_QUERY');
+    return {
+      successful: true,
+      data: { records: [{ Id: 'opp-1', Name: 'Alpha', Amount: 12 }] },
+    };
+  });
+  try {
+    const oppsOutput = await executeStep(oppsStep as never, ownerShapeCtx(slug, 'run-1', oppsStep));
+    const gridOutput = await executeStep(
+      gridStep as never,
+      ownerShapeCtx(slug, 'run-1', gridStep, { opportunities: oppsOutput }),
+    ) as {
+      data: unknown;
+      grid: unknown[][];
+      counts: { opportunities: number };
+      tabsWritten: string[];
+    };
+    assert.deepEqual(gridOutput.data, [{ Id: 'opp-1', Name: 'Alpha', Amount: 12 }]);
+    assert.deepEqual(gridOutput.grid, [['opp-1', 'Alpha', 12]]);
+    assert.equal(gridOutput.counts.opportunities, 1);
+    assert.deepEqual(gridOutput.tabsWritten, ['Opportunities']);
+    assert.equal(crossings, 1, 'only the exact Salesforce read crosses a provider boundary');
+  } finally {
+    _setWorkflowCallNodeForTests();
+  }
 });
 
-test('owner shape — team-activity-slack-updates: a scripts/-prefixed WRITE-class runner on a live cron schedule', async () => {
+test('migrated owner shape — team activity keeps the Salesforce read exact and groups rows in-process', async () => {
   const slug = 'team-activity-slack-updates-shape';
-  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'pull-salesforce-activity.mjs'),
-    'process.stdout.write(JSON.stringify({ summary: "8 reps active", totals: { calls: 12 }, runType: "scheduled", baseline: {}, source: { instanceUrl: "https://example.test", occurrenceAt: "2026-08-26T09:00:00.000Z", queriedAt: "2026-08-26T09:00:01.000Z", coreReads: 6 } }));\n',
-    'utf-8',
-  );
-  const step = {
+  const pullStep = {
     id: 'pull_activity',
     prompt: '',
-    // Matches the live shape exactly: sideEffect is WRITE even though the
-    // script only reads — deterministic dispatch does not gate on it.
-    sideEffect: 'write',
-    // The explicit scripts/ prefix form (both forms are valid; the owner's
-    // workflow uses this one).
-    deterministic: { runner: 'scripts/pull-salesforce-activity.mjs' },
-    output: { type: 'object', required_keys: ['summary', 'totals', 'runType', 'baseline', 'source'] },
+    sideEffect: 'read',
+    call: {
+      tool: 'SALESFORCE_RUN_SOQL_QUERY',
+      args: { query: 'SELECT Owner.Name, Type, ActivityDate FROM Task WHERE ActivityDate = TODAY' },
+    },
+  };
+  const groupStep = {
+    id: 'group_activity',
+    prompt: '',
+    dependsOn: ['pull_activity'],
+    sideEffect: 'read',
+    transform: {
+      version: 1,
+      expression: {
+        op: 'object',
+        fields: [
+          {
+            key: 'byRep',
+            value: {
+              op: 'aggregate',
+              value: { op: 'get', from: 'steps.pull_activity.output.data.records' },
+              groupBy: ['owner'],
+              metrics: [{ fn: 'count' }],
+            },
+          },
+          {
+            key: 'totals',
+            value: {
+              op: 'object',
+              fields: [{
+                key: 'activities',
+                value: { op: 'count', value: { op: 'get', from: 'steps.pull_activity.output.data.records' } },
+              }],
+            },
+          },
+        ],
+      },
+    },
+    output: { type: 'object', required_keys: ['byRep', 'totals'] },
   };
   const validation = validateWorkflowDefinition({
     name: slug,
-    description: 'Post the team activity summary.',
+    description: 'Read and summarize team activity.',
     enabled: true,
     trigger: { manual: true, schedule: '0 9,16 * * 1-5' },
-    steps: [step],
+    steps: [pullStep, groupStep],
   } as never);
   assert.equal(validation.ok, true, validation.errors.join('\n'));
-  const result = await executeStep(step as never, ownerShapeCtx(slug, 'run-1', step)) as { summary: string };
-  assert.equal(result.summary, '8 reps active');
-  assert.ok(readWorkflowEvents(slug, 'run-1').map((e) => e.kind).includes('step_completed'));
+
+  let crossings = 0;
+  _setWorkflowCallNodeForTests(async () => {
+    crossings += 1;
+    return {
+      successful: true,
+      data: {
+        records: [
+          { owner: 'Ada', type: 'Call' },
+          { owner: 'Ada', type: 'Email' },
+          { owner: 'Grace', type: 'Call' },
+        ],
+      },
+    };
+  });
+  try {
+    const pullOutput = await executeStep(pullStep as never, ownerShapeCtx(slug, 'run-1', pullStep));
+    const result = await executeStep(
+      groupStep as never,
+      ownerShapeCtx(slug, 'run-1', groupStep, { pull_activity: pullOutput }),
+    ) as { byRep: Array<{ owner: string; count: number }>; totals: { activities: number } };
+    assert.deepEqual(result.byRep, [{ owner: 'Ada', count: 2 }, { owner: 'Grace', count: 1 }]);
+    assert.equal(result.totals.activities, 3);
+    assert.equal(crossings, 1, 'the local aggregate performs no additional provider I/O');
+  } finally {
+    _setWorkflowCallNodeForTests();
+  }
+});
+
+test('reviewed transforms execute end-to-end through the durable workflow graph and output journal', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const slug = `reviewed-transform-e2e-${Date.now()}`;
+  const workflowName = `Reviewed Transform E2E ${Date.now()}`;
+  const runId = `reviewed-transform-e2e-run-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Prove pure transforms survive compilation and durable execution.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [
+      {
+        id: 'seed',
+        prompt: '',
+        sideEffect: 'read',
+        transform: {
+          version: 1,
+          expression: {
+            op: 'literal',
+            value: [{ id: 'A', amount: 4 }, { id: 'B', amount: 7 }],
+          },
+        },
+        output: { type: 'array', min_items: { '': 2 } },
+      },
+      {
+        id: 'shape',
+        prompt: '',
+        dependsOn: ['seed'],
+        sideEffect: 'read',
+        transform: {
+          version: 1,
+          expression: {
+            op: 'object',
+            fields: [
+              {
+                key: 'count',
+                value: { op: 'count', value: { op: 'get', from: 'steps.seed.output' } },
+              },
+              {
+                key: 'grid',
+                value: {
+                  op: 'map',
+                  value: { op: 'get', from: 'steps.seed.output' },
+                  each: {
+                    op: 'array',
+                    items: [
+                      { op: 'get', from: 'item.id' },
+                      { op: 'get', from: 'item.amount' },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        },
+        output: { type: 'object', required_keys: ['count', 'grid'] },
+      },
+    ],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+
+  let modelCalls = 0;
+  await processWorkflowRuns({
+    respond: async () => {
+      modelCalls += 1;
+      throw new Error('a reviewed transform must not dispatch a model');
+    },
+  } as never);
+
+  const terminal = JSON.parse(readFileSync(runFile, 'utf-8')) as {
+    status?: string;
+    stepOutputs?: Record<string, unknown>;
+  };
+  assert.equal(terminal.status, 'completed');
+  assert.deepEqual(
+    JSON.parse(String(terminal.stepOutputs?.seed)),
+    [{ id: 'A', amount: 4 }, { id: 'B', amount: 7 }],
+  );
+  assert.deepEqual(
+    JSON.parse(String(terminal.stepOutputs?.shape)),
+    { count: 2, grid: [['A', 4], ['B', 7]] },
+  );
+  assert.equal(modelCalls, 0);
+  const transformCompletions = readWorkflowEvents(slug, runId)
+    .filter((event) => event.kind === 'step_completed' && event.meta?.mode === 'transform');
+  assert.deepEqual(transformCompletions.map((event) => event.stepId), ['seed', 'shape']);
+});
+
+test('migrated owner shape — social manager fans out from a declared JSON-list input with no synthetic producer', async () => {
+  const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
+  process.env.WORKFLOW_USE_HARNESS = 'on';
+  const seen: string[] = [];
+  installCanonicalWorkflowTextHarness(async (request) => {
+    const name = /Research ([ABC])\./.exec(String(request.input ?? ''))?.[1] ?? '?';
+    seen.push(name);
+    return `done-${name}`;
+  });
+  const step = {
+    id: 'research',
+    prompt: 'Research {{item.name}}.',
+    forEach: 'input.competitors',
+    sideEffect: 'read',
+  };
+  const workflow = {
+    name: 'Social Manager Input Fanout',
+    description: 'Research each explicitly configured competitor.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: {
+      competitors: {
+        type: 'string',
+        default: '[{"name":"A"},{"name":"B"},{"name":"C"}]',
+      },
+    },
+    steps: [step],
+  };
+  const validation = validateWorkflowDefinition(workflow as never);
+  assert.equal(validation.ok, true, validation.errors.join('\n'));
+  const ctx = {
+    workflow,
+    workflowSlug: 'input-fanout',
+    runId: 'input-fanout-run',
+    inputs: { competitors: '[{"name":"A"},{"name":"B"},{"name":"C"}]' },
+    stepOutputs: {},
+    assistant: {
+      respond: async () => { throw new Error('retired assistant.respond lane ran'); },
+    },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+  try {
+    const output = await executeStep(step as never, ctx) as Array<{ itemKey: string }>;
+    assert.deepEqual(seen.sort(), ['A', 'B', 'C']);
+    assert.equal(output.length, 3);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+    restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
+  }
 });
 
 test('forEach batches an oversized fan-out and still attempts every item', async () => {
@@ -4254,29 +4521,25 @@ test('forEach resolves {{steps.x.output.path}} sources at runtime', async () => 
 
 test('forEachNewOnly watermarks completed items and retries failed items on the next run', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
-  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
-  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.WORKFLOW_USE_HARNESS = 'off';
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.WORKFLOW_USE_HARNESS = 'on';
   const workflowSlug = 'foreach-watermark-test';
   const stepId = 'blast';
   clearStepWatermark(workflowSlug, stepId);
   try {
     let failB = true;
-    const respond = async (req: { message?: string }) => {
-      const message = String(req.message ?? '');
+    installCanonicalWorkflowTextHarness(async (request) => {
+      const message = String(request.input ?? '');
       if (failB && message.includes('Item: b')) throw new Error('temporary b failure');
       const item = message.match(/Item: ([^\n]+)/)?.[1] ?? 'unknown';
-      return { text: `done-${item}` };
-    };
+      return `done-${item}`;
+    });
     const mkCtx = (runId: string) => ({
       workflow: { name: 'New Only Fanout Test', steps: [] },
       workflowSlug,
       runId,
       inputs: {},
       stepOutputs: { pull: ['a', 'b', 'c'] },
-      assistant: { respond },
+      assistant: { respond: async () => { throw new Error('retired assistant.respond lane ran'); } },
       completedItems: new Map(),
       forEachFailures: [],
       qualityAdvisories: [],
@@ -4286,7 +4549,6 @@ test('forEachNewOnly watermarks completed items and retries failed items on the 
       prompt: 'Process the item.',
       forEach: 'pull',
       forEachNewOnly: true,
-      useHarness: false,
     } as unknown as Parameters<typeof executeStep>[0];
 
     const first = await executeStep(step, mkCtx('fw-1')) as {
@@ -4310,9 +4572,8 @@ test('forEachNewOnly watermarks completed items and retries failed items on the 
     assert.deepEqual([...readSeenItemKeys(workflowSlug, stepId)].sort(), ['a', 'b', 'c']);
   } finally {
     clearStepWatermark(workflowSlug, stepId);
+    _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
-    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
-    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
@@ -4374,11 +4635,7 @@ test('forEach batching resumes after already-completed items and drains remainin
 
 test('forEach restart hydrates an exact >32KB completed item before draining its pending sibling', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
-  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
-  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.WORKFLOW_USE_HARNESS = 'off';
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.WORKFLOW_USE_HARNESS = 'on';
   const workflowSlug = 'foreach-exact-item-resume';
   const runId = 'foreach-exact-item-run';
   const exactItem = {
@@ -4425,33 +4682,32 @@ test('forEach restart hydrates an exact >32KB completed item before draining its
       /EXACT-ITEM-TAIL-AFTER-RESTART/,
     );
     let modelCalls = 0;
+    installCanonicalWorkflowTextHarness(async (request) => {
+      modelCalls += 1;
+      assert.match(String(request.input ?? ''), /Item: b/);
+      return 'done-b';
+    });
     const ctx = {
       workflow: { name: 'Exact Item Resume', steps: [] },
       workflowSlug,
       runId,
       inputs: {},
       stepOutputs: { pull: ['a', 'b'] },
-      assistant: {
-        respond: async () => {
-          modelCalls += 1;
-          return { text: 'done-b' };
-        },
-      },
+      assistant: { respond: async () => { throw new Error('retired assistant.respond lane ran'); } },
       completedItems: resumed.completedItems.get('fanout') ?? new Map(),
       forEachFailures: [],
       qualityAdvisories: [],
     } as unknown as Parameters<typeof executeStep>[1];
     const output = await executeStep(
-      { id: 'fanout', prompt: 'Process item.', forEach: 'pull', useHarness: false } as never,
+      { id: 'fanout', prompt: 'Process item.', forEach: 'pull' } as never,
       ctx,
     ) as Array<{ itemKey: string; output: unknown }>;
 
     assert.equal(modelCalls, 1, 'only the pending sibling executes after restart');
     assert.match(JSON.stringify(output.find((item) => item.itemKey === 'a')?.output), /EXACT-ITEM-TAIL-AFTER-RESTART/);
   } finally {
+    _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
-    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
-    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
@@ -4496,31 +4752,26 @@ test('missing or malformed item artifact authority fails closed instead of repla
 test('forEach batching attributes item failures to their original keys across windows', async () => {
   const prev = process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
-  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
-  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
   process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = '2';
-  process.env.WORKFLOW_USE_HARNESS = 'off';
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.WORKFLOW_USE_HARNESS = 'on';
   try {
     const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+    installCanonicalWorkflowTextHarness(async (request) => {
+      if (/\bItem:\s*d\b/.test(request.input ?? '')) throw new Error('downstream d failed');
+      return 'done';
+    });
     const ctx = {
       workflow: { name: 'Choke Failure Attribution Test', steps: [] },
       workflowSlug: 'foreach-batch-failure-test',
       runId: 'fc-fail-1',
       inputs: {},
       stepOutputs: { pull: ['a', 'b', 'c', 'd', 'e'] },
-      assistant: {
-        respond: async (req: { message?: string }) => {
-          if (/\bItem:\s*d\b/.test(req.message ?? '')) throw new Error('downstream d failed');
-          return { text: 'done' };
-        },
-      },
+      assistant: { respond: async () => { throw new Error('retired assistant.respond lane ran'); } },
       completedItems: new Map(),
       forEachFailures,
       qualityAdvisories: [],
     } as unknown as Parameters<typeof executeStep>[1];
-    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull' } as unknown as Parameters<typeof executeStep>[0];
 
     const output = await executeStep(step, ctx) as {
       blocked: true;
@@ -4555,42 +4806,36 @@ test('forEach batching attributes item failures to their original keys across wi
   } finally {
     if (prev === undefined) delete process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS;
     else process.env.CLEMENTINE_WORKFLOW_FOREACH_MAX_ITEMS = prev;
+    _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
-    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
-    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 
 test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds', async () => {
   const prevH = process.env.WORKFLOW_USE_HARNESS;
-  const prevB = process.env.CLEMMY_HARNESS_WORKFLOW;
-  const prevL = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.WORKFLOW_USE_HARNESS = 'off';
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.WORKFLOW_USE_HARNESS = 'on';
   try {
     const attempts: Record<string, number> = {};
     const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
+    installCanonicalWorkflowTextHarness(async (request) => {
+      const k = (request.input ?? '').match(/\bItem:\s*(\w+)\b/)?.[1] ?? '?';
+      attempts[k] = (attempts[k] ?? 0) + 1;
+      // item 'd' hits a transient 503 on its FIRST attempt, recovers on retry.
+      if (k === 'd' && attempts[k] === 1) throw new Error('upstream 503 service unavailable');
+      return 'done';
+    });
     const ctx = {
       workflow: { name: 'W1b Item Retry Test', steps: [] },
       workflowSlug: 'w1b-item-retry',
       runId: 'w1b-1',
       inputs: {},
       stepOutputs: { pull: ['a', 'd'] },
-      assistant: {
-        respond: async (req: { message?: string }) => {
-          const k = (req.message ?? '').match(/\bItem:\s*(\w+)\b/)?.[1] ?? '?';
-          attempts[k] = (attempts[k] ?? 0) + 1;
-          // item 'd' hits a transient 503 on its FIRST attempt, recovers on retry.
-          if (k === 'd' && attempts[k] === 1) throw new Error('upstream 503 service unavailable');
-          return { text: 'done' };
-        },
-      },
+      assistant: { respond: async () => { throw new Error('retired assistant.respond lane ran'); } },
       completedItems: new Map(),
       forEachFailures,
       qualityAdvisories: [],
     } as unknown as Parameters<typeof executeStep>[1];
-    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull', useHarness: false } as unknown as Parameters<typeof executeStep>[0];
+    const step = { id: 'blast', prompt: 'Process the item.', forEach: 'pull' } as unknown as Parameters<typeof executeStep>[0];
 
     const output = await executeStep(step, ctx) as Array<{ itemKey: string }>;
 
@@ -4600,9 +4845,8 @@ test('W1b: a forEach item that fails TRANSIENTLY retries and succeeds', async ()
     const retried = readWorkflowEvents('w1b-item-retry', 'w1b-1').find((e) => e.kind === 'item_retry');
     assert.equal(retried?.itemKey, 'd', 'an item_retry advisory was recorded');
   } finally {
+    _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevH);
-    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevB);
-    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevL);
   }
 });
 
@@ -4677,13 +4921,7 @@ test('failed-item retry seeding inherits upstream + completed items but not stal
   assert.equal(seededEvent?.meta?.inheritedItems, 2);
 });
 
-// RESTORED (2026-08-26): 60db67d8 renamed this from 'a failed external loop
-// probe never publishes provisional step completion' to the name below,
-// making assistant.respond throw so it could pin "the primary step never
-// runs" (the retirement). Restored to its original scenario and assertions —
-// the probe runs AFTER a real successful primary attempt, and an unsatisfied
-// probe still owns no completion authority.
-test('a failed external loop probe never publishes provisional step completion', async () => {
+test('a raw external loop probe refuses before the primary model or provisional completion', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -4692,11 +4930,12 @@ test('a failed external loop probe never publishes provisional step completion',
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   const workflowSlug = 'deferred-probe-completion';
   const runId = 'probe-failed-before-commit';
+  const marker = path.join(tmp, 'deferred-probe-process-started');
   const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
     path.join(scriptsDir, 'probe.mjs'),
-    'console.log(JSON.stringify({ pending: true }));\n',
+    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); console.log(JSON.stringify({ pending: true }));\n`,
     'utf-8',
   );
   const step = {
@@ -4710,6 +4949,7 @@ test('a failed external loop probe never publishes provisional step completion',
       until: { type: 'object', required_keys: ['done'] },
     },
   };
+  let primaryCalls = 0;
   const ctx = {
     workflow: {
       name: 'Deferred Probe Completion',
@@ -4722,7 +4962,7 @@ test('a failed external loop probe never publishes provisional step completion',
     runId,
     inputs: {},
     stepOutputs: {},
-    assistant: { respond: async () => ({ text: 'candidate output before probe' }) },
+    assistant: { respond: async () => { primaryCalls += 1; return { text: 'candidate output before probe' }; } },
     completedItems: new Map(),
     forEachFailures: [],
     qualityAdvisories: [],
@@ -4730,13 +4970,22 @@ test('a failed external loop probe never publishes provisional step completion',
   try {
     await assert.rejects(
       () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
-      /loop probe did not satisfy/,
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+        assert.match(
+          error.reason,
+          /workflow_raw_subprocess_authority_unrepresented.*loopUntil\.probe\.runner/i,
+        );
+        return true;
+      },
     );
     const events = readWorkflowEvents(workflowSlug, runId);
+    assert.equal(primaryCalls, 0, 'the primary model does not run before an unrepresentable exit gate');
+    assert.equal(existsSync(marker), false, 'the probe process never starts');
     assert.equal(
       events.some((event) => event.kind === 'step_completed' && event.stepId === step.id),
       false,
-      'an unsatisfied external exit condition owns no completion authority',
+      'an unrepresentable external exit condition owns no completion authority',
     );
     assert.equal(computeResumeState(workflowSlug, runId).completedSteps.has(step.id), false);
   } finally {
@@ -4746,18 +4995,15 @@ test('a failed external loop probe never publishes provisional step completion',
   }
 });
 
-// RESTORED (2026-08-26): 60db67d8 renamed this from 'a read-only structured
-// call also defers completion until its external loop probe passes' to pin
-// the retirement instead (the primary call node stubbed to prove it never
-// ran). Restored — the call runs, then the probe runs after it.
-test('a read-only structured call also defers completion until its external loop probe passes', async () => {
+test('a raw loop probe refuses before its primary exact call', async () => {
   const workflowSlug = 'deferred-call-probe-completion';
   const runId = 'call-probe-failed-before-commit';
+  const marker = path.join(tmp, 'deferred-call-probe-process-started');
   const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
     path.join(scriptsDir, 'probe.mjs'),
-    'console.log(JSON.stringify({ pending: true }));\n',
+    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); console.log(JSON.stringify({ pending: true }));\n`,
     'utf-8',
   );
   const step = {
@@ -4788,12 +5034,25 @@ test('a read-only structured call also defers completion until its external loop
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
-  _setWorkflowCallNodeForTests(async () => ({ exportId: 'exp-1', status: 'pending' }));
+  let primaryCalls = 0;
+  _setWorkflowCallNodeForTests(async () => {
+    primaryCalls += 1;
+    return { exportId: 'exp-1', status: 'pending' };
+  });
   try {
     await assert.rejects(
       () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
-      /loop probe did not satisfy/,
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowHarnessBlockedSignal);
+        assert.match(
+          error.reason,
+          /workflow_raw_subprocess_authority_unrepresented.*loopUntil\.probe\.runner/i,
+        );
+        return true;
+      },
     );
+    assert.equal(primaryCalls, 0, 'the exact provider call does not cross before its exit gate is representable');
+    assert.equal(existsSync(marker), false, 'the probe process never starts');
     assert.equal(
       readWorkflowEvents(workflowSlug, runId)
         .some((event) => event.kind === 'step_completed' && event.stepId === step.id),
@@ -4894,7 +5153,15 @@ test('THE OWNER\'S SHAPE: a bare call step (no invocationPlan) compiles at execu
     trigger: { manual: true },
     inputs: { spreadsheet_id: { type: 'string' } },
     steps: [
-      { id: 'grid', prompt: '', deterministic: { runner: 'scripts/to-sheets-grid.mjs' }, sideEffect: 'read' },
+      {
+        id: 'grid',
+        prompt: '',
+        sideEffect: 'read',
+        transform: {
+          version: 1,
+          expression: { op: 'literal', value: { data: [['a', 'b']] } },
+        },
+      },
       {
         id: 'write',
         prompt: '',
@@ -5035,13 +5302,10 @@ test('workflow conversion: a plain step routes through the GATED harness loop wh
 });
 
 test('executeStep: legacy plain deliverable step records inferred output-contract advisory', async () => {
-  const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
-  const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
-  process.env.CLEMMY_HARNESS_WORKFLOW = 'off';
-  process.env.WORKFLOW_USE_HARNESS = 'off';
-  process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+  process.env.WORKFLOW_USE_HARNESS = 'on';
   try {
+    installCanonicalWorkflowTextHarness(async () => 'No leads found.');
     const qualityAdvisories: Array<{ kind: string; note: string }> = [];
     const ctx = {
       workflow: { name: 'Legacy Deliverable Advisory', steps: [] },
@@ -5049,7 +5313,7 @@ test('executeStep: legacy plain deliverable step records inferred output-contrac
       runId: 'legacy-deliverable-1',
       inputs: {},
       stepOutputs: {},
-      assistant: { respond: async () => ({ text: 'No leads found.' }) },
+      assistant: { respond: async () => { throw new Error('retired assistant.respond lane ran'); } },
       completedItems: new Map(),
       forEachFailures: [],
       qualityAdvisories,
@@ -5057,7 +5321,6 @@ test('executeStep: legacy plain deliverable step records inferred output-contrac
     const step = {
       id: 'lead_list',
       prompt: 'Generate a list of weekly leads.',
-      useHarness: false,
     } as unknown as Parameters<typeof executeStep>[0];
 
     const out = await executeStep(step, ctx);
@@ -5068,9 +5331,8 @@ test('executeStep: legacy plain deliverable step records inferred output-contrac
       .find((ev) => ev.kind === 'step_advisory' && ev.meta?.reason === 'inferred_output_contract');
     assert.equal(event?.stepId, 'lead_list');
   } finally {
-    restoreEnv('CLEMMY_HARNESS_WORKFLOW', prevBridgeHarness);
+    _setWorkflowHarnessLoopImplsForTests();
     restoreEnv('WORKFLOW_USE_HARNESS', prevWorkflowHarness);
-    restoreEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', prevLegacyFallback);
   }
 });
 

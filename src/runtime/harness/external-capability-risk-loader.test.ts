@@ -50,6 +50,11 @@ function fixture(options: {
   effect?: ExternalCapabilityEffect;
   providerKind?: ExternalCapabilityProviderKind;
   operationId?: string;
+  accountId?: string;
+  manifestId?: string;
+  operationSemantics?: CapabilityManifestV1['operationSemantics'];
+  destinationPosture?: 'create_new' | 'named_existing';
+  reconciliationSupported?: boolean;
   hints?: Partial<CurrentExternalCapabilityDefinitionV1['behaviorHints']>;
   outboundDelivery?: boolean | null;
 } = {}): LoadExternalCapabilityRiskAttestationInputV1 {
@@ -68,9 +73,9 @@ function fixture(options: {
   const operationVersion = providerKind === 'composio'
     ? '20260823_00'
     : 'mcp-tool-v1:current';
-  const accountId = providerKind === 'composio'
+  const accountId = options.accountId ?? (providerKind === 'composio'
     ? 'ca_exact_account'
-    : 'native_mcp:configured_server:exact';
+    : 'native_mcp:configured_server:exact');
   const inputSchema = {
     type: 'object',
     properties: {
@@ -93,10 +98,11 @@ function fixture(options: {
   });
   const posture = effect === 'read'
     ? 'not_applicable' as const
-    : semanticName.startsWith('CREATE') ? 'create_new' as const : 'named_existing' as const;
+    : options.destinationPosture
+      ?? (semanticName.startsWith('CREATE') ? 'create_new' as const : 'named_existing' as const);
   const manifest = attachSemanticContract({
     version: 1,
-    manifestId: `cap:test:${providerKind}:${semanticName.toLowerCase()}`,
+    manifestId: options.manifestId ?? `cap:test:${providerKind}:${semanticName.toLowerCase()}`,
     providerKind,
     operationId,
     providerIdentity,
@@ -117,6 +123,9 @@ function fixture(options: {
       },
     },
     effect,
+    ...(options.operationSemantics
+      ? { operationSemantics: options.operationSemantics }
+      : {}),
     ...(effect !== 'read'
       ? { destination: { family: 'external_resource', posture } }
       : {}),
@@ -126,8 +135,10 @@ function fixture(options: {
       policy: effect === 'read' ? 'none' : 'key_before_dispatch',
     },
     reconciliation: {
-      supported: false,
-      policy: effect === 'read' ? 'none' : 'uncertain_if_absent',
+      supported: options.reconciliationSupported ?? false,
+      policy: effect === 'read'
+        ? 'none'
+        : options.reconciliationSupported ? 'exact_artifact' : 'uncertain_if_absent',
     },
     outputContract: { kind: effect === 'read' ? 'records' : 'result' },
     purpose: effect === 'read' ? 'invoke_live_read' : 'invoke_live_operation',
@@ -171,7 +182,6 @@ function fixture(options: {
       posture,
     },
     callSignals: { outboundDelivery: options.outboundDelivery ?? null },
-    documentedSemantic: null,
     safety: 'admissible',
   };
 }
@@ -283,8 +293,8 @@ test('ordinary create and update project identically across Composio and native 
   }
 });
 
-test('prepared catalog_manifest work reopens current authority and documented odd-shaped creates generically', () => {
-  for (const documentedCreate of [
+test('prepared catalog_manifest work consumes sealed reversible semantics independent of operation shape', () => {
+  for (const sealedCreate of [
     {
       semanticName: 'SHEET_FROM_JSON',
       operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
@@ -295,9 +305,13 @@ test('prepared catalog_manifest work reopens current authority and documented od
     },
   ] as const) {
     const input = fixture({
-      ...documentedCreate,
+      ...sealedCreate,
       effect: 'external_write',
       providerKind: 'composio',
+      operationSemantics: { version: 1, reversibility: 'reversible' },
+      destinationPosture: 'create_new',
+      reconciliationSupported: true,
+      hints: { readOnly: false, destructive: false },
     });
     const { authority, binding } = catalogAuthority(input);
     const result = loadCatalogManifestExternalRiskAttestationV1({
@@ -308,7 +322,7 @@ test('prepared catalog_manifest work reopens current authority and documented od
       callSignals: { outboundDelivery: false },
       safety: 'admissible',
     }, authority);
-    if (!result.ok) assert.fail(`${documentedCreate.operationId} catalog loader refused: ${result.reason}`);
+    if (!result.ok) assert.fail(`${sealedCreate.operationId} catalog loader refused: ${result.reason}`);
     assert.equal(result.attestation.manifest.manifestDigest, binding.manifestDigest);
     assert.equal(result.attestation.manifest.accountId, binding.accountId);
     assert.deepEqual(result.attestation.projection.risk, {
@@ -352,6 +366,60 @@ test('prepared catalog_manifest loader has carrier parity and reopens live versi
     callSignals: drifted.callSignals,
     safety: 'admissible',
   }, authority), { ok: false, reason: 'current_definition_unavailable' });
+});
+
+test('parallel accounts load risk from the exact bound provider/account lineage only', () => {
+  const operationId = 'EXAMPLE_UPDATE_PARALLEL_RESOURCE';
+  const accountA = fixture({
+    semanticName: 'UPDATE_PARALLEL_RESOURCE',
+    operationId,
+    accountId: 'acct-parallel-a',
+    manifestId: 'cap:resolved:example_update_parallel_resource',
+  });
+  const accountB = fixture({
+    semanticName: 'UPDATE_PARALLEL_RESOURCE',
+    operationId,
+    accountId: 'acct-parallel-b',
+    manifestId: 'cap:resolved:example_update_parallel_resource:definition:account-b',
+  });
+  const { authority, binding } = catalogAuthority(accountA);
+  const b = catalogAuthority(accountB);
+  assert.equal(authority.manifestStore.install(accountB.manifest).ok, true);
+  authority.catalogFactory.register(
+    b.authority.catalogFactory.get(accountB.manifest.manifestId)!,
+  );
+  const request = {
+    version: 1 as const,
+    binding,
+    inputSchema: accountA.currentDefinition.inputSchema,
+    destination: accountA.destination,
+    callSignals: accountA.callSignals,
+    safety: 'admissible' as const,
+  };
+  const loaded = loadCatalogManifestExternalRiskAttestationV1(request, authority);
+  assert.equal(loaded.ok, true, loaded.ok ? '' : loaded.reason);
+  if (loaded.ok) assert.equal(loaded.attestation.manifest.accountId, 'acct-parallel-a');
+
+  assert.deepEqual(loadCatalogManifestExternalRiskAttestationV1({
+    ...request,
+    binding: { ...binding, accountId: 'acct-parallel-b' },
+  }, authority), { ok: false, reason: 'catalog_binding_mismatch' });
+
+  const duplicateA = fixture({
+    semanticName: 'UPDATE_PARALLEL_RESOURCE',
+    operationId,
+    accountId: 'acct-parallel-a',
+    manifestId: 'cap:resolved:example_update_parallel_resource:definition:duplicate-a',
+  });
+  const duplicate = catalogAuthority(duplicateA);
+  assert.equal(authority.manifestStore.install(duplicateA.manifest).ok, true);
+  authority.catalogFactory.register(
+    duplicate.authority.catalogFactory.get(duplicateA.manifest.manifestId)!,
+  );
+  assert.deepEqual(loadCatalogManifestExternalRiskAttestationV1(request, authority), {
+    ok: false,
+    reason: 'catalog_binding_mismatch',
+  });
 });
 
 test('production catalog loader consumes the fresh shipped independent observer without a parallel direct port', () => {
@@ -625,7 +693,7 @@ test('version, account, materializer-fingerprint, and schema drift are independe
 test('conflicting declared hints and destination drift are typed refusals', () => {
   const hints = fixture({ hints: { readOnly: true, destructive: true } });
   assert.deepEqual(loadExternalCapabilityRiskAttestationV1(hints), {
-    ok: false, reason: 'hint_conflict',
+    ok: false, reason: 'manifest_not_current',
   });
 
   const destination = fixture({ semanticName: 'UPDATE_RECORD' });

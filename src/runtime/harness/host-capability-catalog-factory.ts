@@ -8,12 +8,25 @@
 import { createHash } from 'node:crypto';
 import { openEventLog } from './eventlog.js';
 import { canonicalLogicalToolName } from './logical-call-contract.js';
+import {
+  catalogOperationIdentitiesEqual,
+} from './runtime-tool-identity.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 import type { TurnGraphIR, TurnGraphNode } from '../graph/turn-graph-ir.js';
-import type { CapabilityProviderKind } from './capability-manifest.js';
+import {
+  capabilityManifestDigest,
+  parseCapabilityManifestOperationSemantics,
+  validateCapabilityManifestV1,
+  type CapabilityProviderKind,
+} from './capability-manifest.js';
+import {
+  parseMutationVerificationRecipe,
+  type MutationVerificationRecipeV1,
+} from './mutation-verification-contract.js';
 import {
   peekCapabilityManifestStore,
-  resolveCurrentSuccessorManifest,
+  type CapabilityManifestStore,
+  type InstalledCapabilityManifest,
 } from './capability-manifest-store.js';
 import {
   type BindAdmittedNodeCapabilityInput,
@@ -22,6 +35,10 @@ import {
   type GraphNodeCapabilityInvoke,
   type HostCapabilityCatalog,
 } from './graph-node-capability.js';
+import {
+  sealedNodeBindingDigestOf,
+  type SealedNodeBindingDigestInput,
+} from './sealed-node-binding-digest.js';
 
 export type {
   GraphNodeCapabilityInvoke,
@@ -96,24 +113,7 @@ export interface CanonicalCatalogIdentityV1 {
   argumentCompiler: { id: string; version: string };
 }
 
-export interface SealedNodeBinding {
-  nodeId: string;
-  capabilityId: string;
-  /** Exact provider operation identity as observed in the trusted manifest. */
-  providerOperationId: string;
-  /** Canonical logical-call identity used by admission/settlement ledgers. */
-  logicalToolName: string;
-  /** @deprecated Raw provider operation identity; retained for row compatibility. */
-  toolName: string;
-  schemaVersion: string;
-  /** Exact provider input-schema digest, distinct from schemaDigest once the
-   * latter closes the full input+output+version/account definition. */
-  providerInputSchemaDigest?: string;
-  schemaDigest: string;
-  argumentDigest: string;
-  account?: string;
-  effect: RegisteredHostCapability['effect'];
-  destination?: { family: string; posture: string };
+export interface SealedNodeBinding extends SealedNodeBindingDigestInput {
   bindingDigest: string;
 }
 
@@ -127,6 +127,39 @@ export interface HostCapabilityCatalogFactory {
 }
 
 let installed: HostCapabilityCatalogFactory | null = null;
+
+interface CallableManifestIdentityAttestationV1 {
+  readonly manifestDigest: string;
+  readonly providerVersion: string;
+  readonly liveFingerprint: string;
+  readonly invokePortId: string;
+  readonly reconcilePortId: string | null;
+  readonly argumentCompiler: { readonly id: string; readonly version: string };
+}
+
+/** Registration-time copy of bytes which otherwise live only inside the
+ * mutable manifest object. It is deliberately module-private: consumers may
+ * verify this attestation, but cannot restamp a stale callable row. */
+const callableManifestIdentityAttestations = new WeakMap<
+RegisteredHostCapability,
+CallableManifestIdentityAttestationV1
+>();
+
+function attestCallableManifestIdentity(entry: RegisteredHostCapability): void {
+  const manifest = entry.manifest;
+  if (!manifest || !validateCapabilityManifestV1(manifest).ok) return;
+  callableManifestIdentityAttestations.set(entry, {
+    manifestDigest: entry.manifestDigest ?? '',
+    providerVersion: manifest.providerVersion,
+    liveFingerprint: entry.liveFingerprint ?? '',
+    invokePortId: manifest.invokePortId,
+    reconcilePortId: manifest.reconcilePortId ?? null,
+    argumentCompiler: {
+      id: manifest.argumentCompiler.id,
+      version: manifest.argumentCompiler.version,
+    },
+  });
+}
 
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -215,20 +248,7 @@ export function catalogIdentitiesEqual(
 }
 
 export function bindingDigestOf(binding: Omit<SealedNodeBinding, 'bindingDigest'>): string {
-  return sha256(JSON.stringify({
-    nodeId: binding.nodeId,
-    capabilityId: binding.capabilityId,
-    providerOperationId: binding.providerOperationId,
-    logicalToolName: binding.logicalToolName,
-    toolName: binding.toolName,
-    schemaVersion: binding.schemaVersion,
-    providerInputSchemaDigest: binding.providerInputSchemaDigest ?? null,
-    schemaDigest: binding.schemaDigest,
-    argumentDigest: binding.argumentDigest,
-    account: binding.account ?? null,
-    effect: binding.effect,
-    destination: binding.destination ?? null,
-  }));
+  return sealedNodeBindingDigestOf(binding);
 }
 
 export function destinationBindingMatches(
@@ -264,16 +284,53 @@ function complete(capability: RegisteredHostCapability): boolean {
   );
 }
 
+/** Exact positive attestation for a callable snapshot row. Consumers that use
+ * manifest facts to lower risk must not accept a merely well-shaped/stale row. */
+export function isCurrentCallableCatalogEntry(
+  entry: RegisteredHostCapability,
+): entry is RegisteredHostCapability & {
+  manifest: import('./capability-manifest.js').CapabilityManifestV1;
+  manifestDigest: string;
+} {
+  const manifest = entry.manifest;
+  if (!manifest || !validateCapabilityManifestV1(manifest).ok) return false;
+  const attested = callableManifestIdentityAttestations.get(entry);
+  if (!attested) return false;
+  return complete(entry)
+    && typeof entry.invoke === 'function'
+    && entry.capabilityId === manifest.manifestId
+    && entry.toolName === manifest.operationId
+    && entry.schemaVersion === manifest.operationVersion
+    && entry.schemaDigest === manifest.definitionFingerprint
+    && entry.effect === manifest.effect
+    && entry.providerKind === manifest.providerKind
+    && (entry.account ?? '') === manifest.accountId
+    && JSON.stringify(entry.destination ?? null) === JSON.stringify(manifest.destination ?? null)
+    && entry.manifestDigest === capabilityManifestDigest(manifest)
+    && attested.manifestDigest === entry.manifestDigest
+    && attested.providerVersion === manifest.providerVersion
+    && attested.liveFingerprint === manifest.definitionFingerprint
+    && entry.liveFingerprint === attested.liveFingerprint
+    && attested.invokePortId === manifest.invokePortId
+    && attested.reconcilePortId === (manifest.reconcilePortId ?? null)
+    && attested.argumentCompiler.id === manifest.argumentCompiler.id
+    && attested.argumentCompiler.version === manifest.argumentCompiler.version;
+}
+
 export function createHostCapabilityCatalogFactory(
   initial: readonly RegisteredHostCapability[] = [],
 ): HostCapabilityCatalogFactory {
   const byId = new Map<string, RegisteredHostCapability>();
-  for (const capability of initial) byId.set(capability.capabilityId, capability);
+  for (const capability of initial) {
+    attestCallableManifestIdentity(capability);
+    byId.set(capability.capabilityId, capability);
+  }
   const factory: HostCapabilityCatalogFactory = {
     register(capability) {
       if (!complete(capability)) {
         throw new Error(`registered capability ${capability.capabilityId} is incomplete`);
       }
+      attestCallableManifestIdentity(capability);
       byId.set(capability.capabilityId, capability);
     },
     forget(capabilityId) { byId.delete(capabilityId); },
@@ -298,14 +355,18 @@ function bindFromRegistry(
   const named = (input.node as TurnGraphNode).capabilities
     ?.flatMap((requirement) => requirement.names ?? [])
     ?? [];
-  const trusted = registered.filter((entry) => complete(entry) && Boolean(entry.manifestDigest?.trim()));
+  const trusted = registered.filter(isCurrentCallableCatalogEntry);
   if (named.length !== 1) return null;
   const store = peekCapabilityManifestStore();
-  const successorId = store
-    ? resolveCurrentSuccessorManifest(store, named[0])?.manifest.manifestId
-    : undefined;
-  const capability = trusted.find((entry) => entry.capabilityId === (successorId ?? named[0]))
-    ?? trusted.find((entry) => entry.capabilityId === named[0]);
+  const durable = store ? resolveExplicitCurrentManifest(store, named[0]!) : null;
+  // Once a durable owner exists, its explicit successor chain is exclusive.
+  // A copied predecessor row must never become a fallback when the successor
+  // is missing, revoked, corrupt, or simply not callable in this catalog.
+  if (store && !durable) return null;
+  const capability = trusted.find((entry) => (
+    entry.capabilityId === (durable?.manifest.manifestId ?? named[0])
+    && (!durable || entry.manifestDigest === durable.digest)
+  ));
   if (!capability) return null;
   const nodeEffect = 'effect' in input.node && input.node.effect && typeof input.node.effect === 'object'
     ? String((input.node.effect as { kind?: string }).kind ?? 'unknown')
@@ -357,6 +418,24 @@ function bindFromRegistry(
   };
 }
 
+function resolveExplicitCurrentManifest(
+  store: CapabilityManifestStore,
+  manifestId: string,
+): InstalledCapabilityManifest | null {
+  const seen = new Set<string>();
+  let cursor = manifestId;
+  while (!seen.has(cursor)) {
+    seen.add(cursor);
+    const installed = store.get(cursor);
+    if (!installed) return null;
+    const lifecycle = installed.manifest.lifecycle;
+    if (lifecycle.state === 'current') return installed;
+    if (lifecycle.state !== 'superseded' || !lifecycle.supersededBy) return null;
+    cursor = lifecycle.supersededBy;
+  }
+  return null;
+}
+
 export function installHostCapabilityCatalogFactory(
   factory: HostCapabilityCatalogFactory | null,
 ): void {
@@ -365,6 +444,221 @@ export function installHostCapabilityCatalogFactory(
 
 export function peekHostCapabilityCatalogFactory(): HostCapabilityCatalogFactory | null {
   return installed;
+}
+
+/**
+ * The one canonical host id for a proof-resolved provider operation.
+ *
+ * When a capability's live definition drifts from its installed manifest it is
+ * re-registered under a SUCCESSOR id (`<base>:definition:<24 hex>`) and the
+ * base id is explicitly forgotten (see registerProofProvisionedCapabilities).
+ * The disclosure path minted the base name lexically from the slug, so the
+ * host handed the model a name its own catalog no longer held. Plan admission
+ * compares ids by exact string, missed, and refused "…is absent from the
+ * current host catalog" — then the retry re-ran discovery, re-minted the same
+ * absent base name, and refused identically. Live 2026-08-28: 22 such refusals
+ * in three minutes across both calendar reads, a deterministic loop whose only
+ * exit was killing the turn.
+ *
+ * Both the disclosure mint and the rehydration check call THIS function, so
+ * the boundary invariant is unchanged in kind: a descriptor id must still be
+ * exactly what its provider + operation + account tuple resolves to. What
+ * changed is that "resolves to" now consults both callable and durable current
+ * lineages instead of assuming the base spelling.
+ *
+ * Resolution is scoped to this exact base id, and to the account when one is
+ * known — never a global prefix scan, which would let an unrelated operation's
+ * successor answer for this one. An account-scoped ambiguity returns a
+ * deterministic non-callable token so even a still-live legacy base cannot be
+ * selected by insertion order.
+ */
+export function canonicalResolvedCapabilityId(
+  identifier: string,
+  accountIdentity?: string | null,
+  providerKind?: string | null,
+): string {
+  const normalizedIdentifier = identifier.trim().toLowerCase();
+  const base = `cap:resolved:${normalizedIdentifier}`;
+  const factory = peekHostCapabilityCatalogFactory();
+  const prefix = `${base}:definition:`;
+  const normalizedProvider = providerKind?.trim().toLowerCase() || null;
+  const normalizedAccount = accountIdentity?.trim() || null;
+  const rows = new Map<string, {
+    capabilityId: string;
+    account: string;
+    providerKind: string;
+  }>();
+  const manifestStore = peekCapabilityManifestStore();
+  for (const entry of factory?.snapshot() ?? []) {
+    if (entry.capabilityId !== base && !entry.capabilityId.startsWith(prefix)) continue;
+    const durable = manifestStore?.get(entry.capabilityId);
+    if (durable && durable.manifest.lifecycle.state !== 'current') continue;
+    rows.set(entry.capabilityId, {
+      capabilityId: entry.capabilityId,
+      account: entry.account ?? entry.manifest?.accountId ?? '',
+      providerKind: String(entry.providerKind ?? entry.manifest?.providerKind ?? '').toLowerCase(),
+    });
+  }
+  // A durable current manifest may be awaiting callable re-publication after
+  // restart. It still occupies this identity family: treating the family as
+  // empty would let another account/provider claim its legacy base id, and
+  // the subsequent install would fail with identity_mismatch.
+  for (const installed of manifestStore?.list() ?? []) {
+    const manifest = installed.manifest;
+    const verified = manifestStore?.get(manifest.manifestId);
+    if (!verified || verified.digest !== installed.digest) continue;
+    if (manifest.lifecycle.state !== 'current') continue;
+    if (manifest.manifestId !== base && !manifest.manifestId.startsWith(prefix)) continue;
+    rows.set(manifest.manifestId, {
+      capabilityId: manifest.manifestId,
+      account: manifest.accountId,
+      providerKind: String(manifest.providerKind).toLowerCase(),
+    });
+  }
+  const family = [...rows.values()];
+  if (family.length === 0) return base;
+  const providerScoped = normalizedProvider
+    ? family.filter((entry) => entry.providerKind === normalizedProvider)
+    : family;
+  if (normalizedAccount) {
+    const exact = providerScoped.filter((entry) => entry.account === normalizedAccount);
+    if (exact.length === 1) return exact[0]!.capabilityId;
+    if (exact.length > 1) {
+      // This token is deliberately not a catalog identity. A duplicate
+      // current lineage is corruption/unfinished coordination, never license
+      // to pick whichever row happens to sort first.
+      return `${base}:definition:ambiguous-${sha256(JSON.stringify({
+        provider: normalizedProvider ?? '*',
+        account: normalizedAccount,
+      })).slice(0, 24)}`;
+    }
+    return accountPartitionedResolvedCapabilityId(
+      normalizedIdentifier,
+      normalizedAccount,
+      normalizedProvider ?? 'runtime',
+    );
+  }
+  return providerScoped.length === 1 ? providerScoped[0]!.capabilityId : base;
+}
+
+/**
+ * Deterministic staging/current identity for an additional connected account.
+ *
+ * The first provider/operation/account tuple retains the historical base id.
+ * Once that family is occupied, a different account (or provider using the
+ * same operation spelling) receives this parallel id. The account value is
+ * hashed rather than exposed, while provider + operation + account remain the
+ * complete partition key.
+ */
+export function accountPartitionedResolvedCapabilityId(
+  identifier: string,
+  accountIdentity: string,
+  providerKind: string,
+): string {
+  const normalizedIdentifier = identifier.trim().toLowerCase();
+  const base = `cap:resolved:${normalizedIdentifier}`;
+  const discriminator = sha256(JSON.stringify({
+    version: 1,
+    provider: providerKind.trim().toLowerCase() || 'runtime',
+    operation: normalizedIdentifier,
+    account: accountIdentity.trim() || 'runtime',
+  })).slice(0, 24);
+  return `${base}:definition:account-${discriminator}`;
+}
+
+/**
+ * Reopen one current callable READ for a same-turn proven descent.
+ *
+ * Live 2026-08-29 mobile sheet read: the classifier saw two current
+ * GOOGLESHEETS_BATCH_GET rows (Composio + native spelling), fail-closed as
+ * write, and factory.get(cap:resolved:googlesheets_batch_get) missed because
+ * the live catalog only held a :definition: successor. Desktop and mobile
+ * share host_v1; this is catalog occupancy, not a lane. Writes stay on the
+ * frozen snapshot. Duplicate current reads of the same operation+account
+ * (two transports) are one operation — pick the proven successor, else the
+ * unique account match.
+ */
+export function resolveProvenLiveReadCatalogEntry(input: {
+  capabilityId: string;
+  effectiveName: string;
+  accountIdentity?: string | null;
+}): RegisteredHostCapability | null {
+  const factory = peekHostCapabilityCatalogFactory();
+  if (!factory || !input.effectiveName.trim()) return null;
+  const store = peekCapabilityManifestStore();
+  const account = input.accountIdentity?.trim() || null;
+  const baseIdent = input.capabilityId.replace(/^cap:resolved:/, '').split(':definition:')[0] ?? '';
+  const baseId = `cap:resolved:${baseIdent}`;
+  const sameLineageFamily = (entry: RegisteredHostCapability): boolean => (
+    entry.capabilityId === baseId
+    || entry.capabilityId.startsWith(`${baseId}:definition:`)
+  );
+  const dispatchable = (
+    entry: RegisteredHostCapability | undefined | null,
+  ): entry is RegisteredHostCapability & {
+    manifest: import('./capability-manifest.js').CapabilityManifestV1;
+    manifestDigest: string;
+  } => {
+    if (!entry || !isCurrentCallableCatalogEntry(entry)) return false;
+    const installed = store?.get(entry.capabilityId);
+    if (store && (
+      installed?.manifest.lifecycle.state !== 'current'
+      || installed.digest !== entry.manifestDigest
+    )) return false;
+    return entry.effect === 'read'
+      && entry.manifest.effect === 'read'
+      && (
+        catalogOperationIdentitiesEqual(entry.manifest.operationId, input.effectiveName)
+        || catalogOperationIdentitiesEqual(entry.toolName, input.effectiveName)
+      );
+  };
+  const currentReads = factory.snapshot().filter((entry) => (
+    dispatchable(entry)
+    && (
+      catalogOperationIdentitiesEqual(entry.manifest.operationId, input.effectiveName)
+      || catalogOperationIdentitiesEqual(entry.toolName, input.effectiveName)
+    )
+  ));
+  const accountReads = account
+    ? currentReads.filter((entry) => entry.account === account)
+    : currentReads;
+  const exactAccountLineage = accountReads.filter(sameLineageFamily);
+  if (account && exactAccountLineage.length > 1) return null;
+  const direct = factory.get(input.capabilityId);
+  if (
+    dispatchable(direct)
+    && (!account || direct.account === account)
+    && (!account || !sameLineageFamily(direct) || exactAccountLineage.length === 1)
+  ) return direct;
+  const resolvedId = canonicalResolvedCapabilityId(
+    baseIdent || input.effectiveName.trim().toLowerCase(),
+    input.accountIdentity,
+  );
+  const resolved = factory.get(resolvedId);
+  if (
+    dispatchable(resolved)
+    && (!account || resolved.account === account)
+    && (!account || !sameLineageFamily(resolved) || exactAccountLineage.length === 1)
+  ) return resolved;
+  const prefix = `cap:resolved:${baseIdent}`;
+  const byProven = accountReads.filter((entry) => (
+    entry.capabilityId === input.capabilityId
+    || entry.capabilityId === prefix
+    || entry.capabilityId.startsWith(`${prefix}:`)
+  ));
+  if (byProven.length === 1) return byProven[0]!;
+  if (account) {
+    if (exactAccountLineage.length === 1) return exactAccountLineage[0]!;
+    if (accountReads.length === 1) return accountReads[0]!;
+    return null;
+  }
+  if (currentReads.length === 1) return currentReads[0]!;
+  const accounts = [...new Set(currentReads.map((entry) => entry.account ?? ''))];
+  // One connected account, two transports of the same read: one operation.
+  // A worker session has no capability_resolution proof (live
+  // workflow:1788024507349, proven=none) and must still bind.
+  if (accounts.length <= 1 && currentReads.length > 0) return currentReads[0]!;
+  return null;
 }
 
 export function resolveRuntimeCapabilityCatalog(
@@ -580,6 +874,11 @@ export function loadSealedNodeBinding(
       || canonicalLogicalToolName(binding.providerOperationId) !== binding.logicalToolName
     ) return null;
     if (binding.bindingDigest !== row.binding_digest) return null;
+    if (binding.verification !== undefined && !parseMutationVerificationRecipe(binding.verification)) return null;
+    if (
+      binding.operationSemantics !== undefined
+      && !parseCapabilityManifestOperationSemantics(binding.operationSemantics)
+    ) return null;
     if (bindingDigestOf(binding) !== binding.bindingDigest) return null;
     return binding;
   } catch {
@@ -591,6 +890,9 @@ export function sealBoundCapability(input: {
   nodeId: string;
   binding: BoundNodeCapability;
   argumentDigest: string;
+  /** Receives the base binding digest so the recipe can bind its owner without
+   * creating a digest cycle. The final binding digest covers the recipe. */
+  verification?: (baseBindingDigest: string) => MutationVerificationRecipeV1 | null;
 }): SealedNodeBinding {
   const providerOperationId = input.binding.manifest?.operationId ?? input.binding.toolName;
   const logicalToolName = canonicalLogicalToolName(providerOperationId);
@@ -615,6 +917,13 @@ export function sealBoundCapability(input: {
     account: input.binding.account,
     effect: input.binding.effect,
     destination: input.binding.destination,
+    ...(input.binding.manifest?.operationSemantics
+      ? { operationSemantics: input.binding.manifest.operationSemantics }
+      : {}),
   };
-  return { ...sealed, bindingDigest: bindingDigestOf(sealed) };
+  const baseBindingDigest = bindingDigestOf(sealed);
+  const verification = input.verification?.(baseBindingDigest) ?? null;
+  if (!verification) return { ...sealed, bindingDigest: baseBindingDigest };
+  const withVerification = { ...sealed, verification };
+  return { ...withVerification, bindingDigest: bindingDigestOf(withVerification) };
 }

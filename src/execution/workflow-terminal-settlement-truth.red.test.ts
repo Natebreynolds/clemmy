@@ -123,6 +123,10 @@ test('a step settled unsupported_capability cannot project a succeeded run, what
     runConversation: (async (request: { sessionId?: string }) => {
       const sessionId = String(request.sessionId ?? '');
       const task = stepSource(sessionId);
+      assert.ok(shadow.recordTurnGraphShadow({
+        identity: task,
+        surface: 'workflow',
+      }), 'fixture precondition: the accepted step source has a persisted workflow graph');
       const logicalToolCallId = 'logical:unsupported-pull';
       const begun = dispatch.beginPhysicalDispatch({
         identity: {
@@ -208,6 +212,10 @@ test('a run terminal with a STARTED physical dispatch in a step session is not c
     runConversation: (async (request: { sessionId?: string }) => {
       const sessionId = String(request.sessionId ?? '');
       const task = stepSource(sessionId);
+      assert.ok(shadow.recordTurnGraphShadow({
+        identity: task,
+        surface: 'workflow',
+      }), 'fixture precondition: the accepted step source has a persisted workflow graph');
       // A paid crossing that never came back: dispatch started, never settled.
       const begun = dispatch.beginPhysicalDispatch({
         identity: {
@@ -344,7 +352,18 @@ test('an unconfirmed pre-dispatch external write must surface in the run report,
 test('a later accepted source cannot hide an older in-flight crossing in the same workflow step', () => {
   const runId = 'settlement-history-run';
   const sessionId = `workflow:${runId}:sync_records`;
-  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  eventlog.createSession({
+    id: sessionId,
+    kind: 'workflow',
+    channel: 'workflow',
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Settlement History Fixture',
+      workflowRunId: runId,
+      stepId: 'sync_records',
+      sessionIdSuffix: `${runId}:sync_records`,
+    },
+  });
   const oldSource = eventlog.appendEvent({
     sessionId,
     turn: 1,
@@ -354,6 +373,7 @@ test('a later accepted source cannot hide an older in-flight crossing in the sam
   });
   assert.ok(shadow.recordTurnGraphShadow({
     identity: { sessionId, turn: oldSource.turn, sourceUserSeq: oldSource.seq },
+    surface: 'workflow',
   }), 'fixture precondition: first accepted source has a durable graph');
   const begun = dispatch.beginPhysicalDispatch({
     identity: {

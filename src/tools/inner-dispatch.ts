@@ -203,9 +203,19 @@ export function normalizeInnerDispatchToolResult(
 let toolsByName: Map<string, InvokableTool> | null = null;
 async function realToolsByName(): Promise<Map<string, InvokableTool>> {
   if (toolsByName) return toolsByName;
-  const { getCoreTools } = await import('./registry.js');
+  const [{ getCoreTools }, { getLocalDeferredDispatchTools }] = await Promise.all([
+    import('./registry.js'),
+    import('./local-runtime-tools.js'),
+  ]);
   const m = new Map<string, InvokableTool>();
   for (const t of getCoreTools() as unknown as InvokableTool[]) {
+    if (t && typeof t.name === 'string') m.set(t.name, t);
+  }
+  // Replace only Clementine-local entries with the execution-only args_json
+  // parser. Computer/provider tools keep their own exact first-class schema.
+  // The handler, approval taxonomy, harness brackets, and output context are
+  // identical to the first-class local Tool; only the transport parser differs.
+  for (const t of getLocalDeferredDispatchTools() as unknown as InvokableTool[]) {
     if (t && typeof t.name === 'string') m.set(t.name, t);
   }
   toolsByName = m;

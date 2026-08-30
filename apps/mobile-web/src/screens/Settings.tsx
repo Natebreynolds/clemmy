@@ -6,6 +6,8 @@ import {
   listDevices,
   revokeAllDevices,
   revokeDevice,
+  setCodexRescueModel,
+  type CodexRescueSettings,
   type MobileDeviceRow,
 } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
@@ -61,7 +63,8 @@ export function Settings({ door, doorCopy, onSignOut }: {
         provider={models.data?.brain.provider}
         inactive={models.data?.brain.inactiveBinding}
         actualModelId={models.data?.brain.modelId}
-        onChanged={() => void models.refresh()}
+        codexRescue={models.data?.codexRescue}
+        onChanged={() => models.refresh()}
       />
 
       <ConnectionsCard
@@ -184,12 +187,13 @@ function NotificationsCard() {
   );
 }
 
-function BrainCard({ currentLabel, provider, inactive, actualModelId, onChanged }: {
+function BrainCard({ currentLabel, provider, inactive, actualModelId, codexRescue, onChanged }: {
   currentLabel?: string;
   provider?: string;
   inactive?: { modelId: string; reason: string };
   actualModelId?: string;
-  onChanged: () => void;
+  codexRescue?: CodexRescueSettings;
+  onChanged: () => Promise<void> | void;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -212,8 +216,61 @@ function BrainCard({ currentLabel, provider, inactive, actualModelId, onChanged 
           Saved {inactive.modelId} is unavailable — {actualModelId} answers instead.
         </p>
       ) : null}
+      {codexRescue ? <CodexRescueRow settings={codexRescue} onChanged={onChanged} /> : null}
       <BrainSheet open={open} onClose={() => setOpen(false)} onChanged={onChanged} />
     </section>
+  );
+}
+
+/** Shown only when there is a meaningful choice. Every option id and label is
+ * supplied by the daemon's connected Codex catalog; the phone never guesses a
+ * provider from text or exposes a credential field. */
+function CodexRescueRow({ settings, onChanged }: {
+  settings: CodexRescueSettings;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (settings.options.filter((option) => option.available).length < 2) return null;
+
+  const save = async (value: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await setCodexRescueModel(value === '__primary__' ? null : value);
+      haptic('light');
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save the rescue model');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div class="settings-rescue">
+      <label class="settings-row" for="codex-rescue-model">
+        <span class="brain-dot ok" aria-hidden="true" />
+        <span class="settings-row-main">
+          <span class="settings-row-label">Codex rescue</span>
+          <span class="settings-row-note">Used only if an all-in custom brain fails before answering.</span>
+        </span>
+        <select
+          id="codex-rescue-model"
+          class="settings-select"
+          aria-label="Codex rescue model"
+          disabled={busy}
+          value={settings.configured ? settings.modelId : '__primary__'}
+          onChange={(event) => void save(event.currentTarget.value)}
+        >
+          <option value="__primary__">Follow primary ({settings.inheritedModelId})</option>
+          {settings.options.map((option) => (
+            <option key={option.id} value={option.id} disabled={!option.available}>{option.label}</option>
+          ))}
+        </select>
+      </label>
+      {error ? <p class="error card-note">{error}</p> : null}
+    </div>
   );
 }
 

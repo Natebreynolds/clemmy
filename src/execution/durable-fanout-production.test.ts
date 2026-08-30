@@ -17,20 +17,22 @@ import path from 'node:path';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-durable-fanout-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
-// The scheduler's model boundary: with the harness lane off, the drain hands
-// each worker turn to the injected assistant — the same replaced-model seam
-// every background-task suite uses.
-process.env.CLEMMY_HARNESS_BACKGROUND = 'off';
-process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
+// The scheduler's model boundary is the canonical host loop. Replace only its
+// model/run seam; fresh background turns must never fall back to the retired
+// assistant.respond owner.
+process.env.CLEMMY_HARNESS_BACKGROUND = 'on';
+process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
 
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 
 const fanout = await import('./durable-fanout.js');
 const tasks = await import('./background-tasks.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const bridge = await import('../runtime/harness/respond-bridge.js');
 
 const {
   admitDurableFanoutPlan,
@@ -119,6 +121,39 @@ function workerAssistant(options: {
   };
 }
 
+/** Replace the model behind the one production host loop. The Assistant
+ * passed to processBackgroundTasks remains a retired compatibility argument;
+ * if that callback ever owns a fresh turn again, this fixture no longer proves
+ * the production route. */
+function installCanonicalWorkerModel(worker: ReturnType<typeof workerAssistant>): void {
+  bridge._setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (request: { sessionId: string; input: string }) => {
+      const response = await worker.respond({
+        message: request.input,
+        sessionId: request.sessionId,
+      });
+      return {
+        sessionId: request.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { reply: response.text },
+      };
+    }) as never,
+  });
+}
+
+const retiredAssistant = {
+  getRuntime() { return {} as never; },
+  async respond(): Promise<never> {
+    throw new Error('retired assistant.respond lane ran');
+  },
+};
+
+after(() => bridge._setBridgeImplsForTests({}));
+
 function schedulerTaskState(taskId: string): 'alive' | 'done' | 'failed' | 'missing' {
   const task = tasks.listBackgroundTasks({ includeArchived: true }).find((t) => t.id === taskId);
   if (!task) return 'missing';
@@ -151,10 +186,11 @@ for (const count of [40, 120, 514]) {
 
     let overlapped = false;
     const assistant = workerAssistant({ onOverlap: () => { overlapped = true; } });
+    installCanonicalWorkerModel(assistant);
     for (let round = 0; round < 6; round += 1) {
       const processed = (await Promise.all([
-        tasks.processBackgroundTasks(assistant as never, 2),
-        tasks.processBackgroundTasks(assistant as never, 2),
+        tasks.processBackgroundTasks(retiredAssistant as never, 2),
+        tasks.processBackgroundTasks(retiredAssistant as never, 2),
       ])).reduce((a, b) => a + b, 0);
       if (processed === 0) break;
     }
@@ -212,7 +248,8 @@ test('a crashed worker restarts into reuse: settled items are never redone and t
   scheduleDurableFanout(planId);
 
   const crashy = workerAssistant({ crashAfter: 17 });
-  await tasks.processBackgroundTasks(crashy as never, 1);
+  installCanonicalWorkerModel(crashy);
+  await tasks.processBackgroundTasks(retiredAssistant as never, 1);
   const settledAtCrash = listFanoutActivations(planId).filter((a) => a.status === 'done');
   assert.equal(settledAtCrash.length, 17, 'the crash point drifted — fix the fixture');
   const stamps = new Map(settledAtCrash.map((a) => [`${a.itemId} ${a.phaseId}`, a.updatedAt]));
@@ -222,8 +259,9 @@ test('a crashed worker restarts into reuse: settled items are never redone and t
   assert.equal(outcome.reduced.includes(planId), false, 'the reducer ran before the journal was complete');
 
   const healthy = workerAssistant();
+  installCanonicalWorkerModel(healthy);
   for (let round = 0; round < 4; round += 1) {
-    if (await tasks.processBackgroundTasks(healthy as never, 1) === 0) break;
+    if (await tasks.processBackgroundTasks(retiredAssistant as never, 1) === 0) break;
   }
   const after = listFanoutActivations(planId);
   assert.equal(after.filter((a) => a.status !== 'done').length, 0, 'the remainder never completed after restart');

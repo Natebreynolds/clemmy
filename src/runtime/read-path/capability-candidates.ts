@@ -1006,15 +1006,15 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
             ? ` Bound account: ${identity.accountIdentity}.`
             : '';
           const carrier = kind === 'composio'
-            ? `On an action turn invoke it through \`work_call\` with inner \`name\` exactly \`${identifier}\` and the provider arguments in \`args_json\`; the host maps that exact bound name to \`composio_execute_tool\`.`
+            ? `Via \`work_call\`: set \`name\` to exact \`${identifier}\` and put provider inputs in \`args_json\` (the host maps it to \`composio_execute_tool\`).`
             : kind === 'mcp'
-              ? `On an action turn invoke it through \`work_call\` with inner \`name\` exactly \`${identifier}\` and its arguments in \`args_json\`.`
-              : `Use only the exact runtime carrier for \`${identity.capabilityId}\`.`;
-          return `- ${label}: \`${identity.capabilityId}\`. ${carrier}${required}${account}${schema}`;
+              ? `Via \`work_call\`: set \`name\` to exact \`${identifier}\` and put its inputs in \`args_json\`.`
+              : 'Use only its exact runtime carrier.';
+          return `- ${label} \`${identity.capabilityId}\`: ${carrier}${required}${account}${schema}`;
         };
         return [
           '## Host-bound collection source for this task',
-          'This exact binding is routing data, not effect authorization. Do not rediscover it, approximate its name, switch provider families, or silently substitute another source. Existing physical admission still verifies the live account and schema before any provider call.',
+          'Routing only, not effect authorization. Do not rediscover it or substitute a source; physical admission revalidates the live account and schema.',
           renderIdentity(sourceBinding.primary, 'Primary'),
           ...sourceBinding.equivalentFallbacks.map((fallback, index) =>
             renderIdentity(fallback, `Equivalent fallback ${index + 1}`)),
@@ -1025,21 +1025,21 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
   const lines = rows.map((c) => {
     const provenance = [
       c.klass,
-      c.via === 'semantic' ? `matched by meaning (${c.score.toFixed(2)})` : 'proven for phrasing like this',
-      ...(c.accountIdentity ? [`account ${c.accountIdentity}`] : []),
+      c.via === 'semantic' ? `semantic ${c.score.toFixed(2)}` : 'phrase-proven',
+      ...(c.accountIdentity ? [`acct ${c.accountIdentity}`] : []),
     ].join('; ');
     const contract = c.schemaAuthority === 'live'
       ? ` Live schema${c.requiredFields?.length ? ` requires: ${c.requiredFields.join(', ')}` : ' has no required keys'}.`
       : c.schemaAuthority === 'validation_only'
-        ? ' A cached validation contract exists, but live schema authority must be refreshed exactly if validation rejects the call.'
+        ? ' Cached validation only; refresh exact live schema if rejected.'
         : c.schemaAuthority === 'missing'
-          ? ' No current contract is mounted; one exact-schema refresh remains available.'
+          ? ' No current schema; one exact refresh remains.'
           : '';
     const execution = c.kind === 'composio'
-      ? `Execute with \`composio_execute_tool\`; set \`tool_slug\` to exactly \`${c.identifier}\`.`
-      : `Exact ${c.kind} identifier: \`${c.identifier}\`.`;
-    const role = c.roleKey ? ` Requirement ${c.roleKey}.` : '';
-    return `- ${execution}${contract}${role} Learned intent label (metadata only; NEVER a tool name): ${JSON.stringify(c.intent)} — ${provenance}`;
+      ? `composio \`${c.identifier}\``
+      : `${c.kind} \`${c.identifier}\``;
+    const role = c.roleKey ? ` Role ${c.roleKey}.` : '';
+    return `- ${execution}.${contract}${role} Intent metadata: ${JSON.stringify(c.intent)} (${provenance}).`;
   });
   const unresolved = requirements.filter((requirement) => !requirement.resolved);
   const discovery = requirements.length === 0
@@ -1061,9 +1061,8 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
     ...sourceLines,
     ...discovery,
     ...(lines.length > 0 ? [
-      '## Proven execution paths for this request (advisory)',
-      'These worked before for requests like this one. Verify fit and choose fresh arguments/account — nothing here is pre-authorized.',
-      'A learned intent label is descriptive metadata, not an executable tool. NEVER pass it to `call_tool`. For a Composio row, call `composio_execute_tool` with the exact identifier as `tool_slug`; do not rediscover that capability.',
+      '## Advisory paths (nothing here is pre-authorized)',
+      'Verify fit/account/schema/fresh args. Intent is metadata, never a tool name. Composio: use `composio_execute_tool` with exact `tool_slug`; do not rediscover.',
       ...lines,
     ] : []),
   ].join('\n');

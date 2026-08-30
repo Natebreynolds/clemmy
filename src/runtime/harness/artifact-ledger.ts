@@ -1,21 +1,29 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getSession, listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
-import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import {
+  exactProviderDataEnvelopeAcknowledged,
   exactProviderDataPayload,
   inspectProviderEnvelope,
   projectProviderResult,
   pruneProviderRequestEchoes,
 } from './provider-read-evidence.js';
 import type { ShellExecutionOutcome } from '../shell-execution-outcome.js';
-import { documentedComposioOperationSemantic } from '../../integrations/composio/operation-semantics.js';
 import {
-  authorizeGoogleSheetsSheetFromJsonReadbackRequest,
-  extractGoogleSheetsSheetFromJsonTarget,
-  verifyGoogleSheetsSheetFromJsonReadback,
-  type GoogleSheetsSheetFromJsonContract,
-  type GoogleSheetsSheetTarget,
-} from './sheet-from-json-content-contract.js';
+  parseAtomicResultIdentityProjection,
+  parseAtomicTabularRecordSetContentContract,
+  projectAtomicCreatedResourceIdentity,
+  type AtomicResultIdentityProjectionV1,
+} from './atomic-input-content-contract.js';
+import { verifyCanonicalDocumentedCreateResult } from './documented-create-result-evidence.js';
+import { currentManifestOperationContract } from './current-manifest-operation-semantics.js';
+import { isTrustedDynamicComposioTool, runtimeToolTail } from './runtime-tool-identity.js';
+import {
+  projectMutationVerificationIntent,
+  projectReadbackVerificationResult,
+  resolveVerificationPointer,
+  type MutationVerificationContractV1,
+  type ReadbackVerificationContractV1,
+} from './mutation-verification-contract.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import {
   redeemAuthoritativeResultPayload,
@@ -48,6 +56,10 @@ export interface ArtifactIntent {
   slotKey: string;
   title?: string;
   createShape: string;
+  /** Exact sealed projection for an atomic create result. */
+  resultIdentity?: AtomicResultIdentityProjectionV1;
+  /** Existing manifest verification contract for a non-atomic create. */
+  mutationResultProjection?: MutationVerificationContractV1;
 }
 
 export interface RunArtifact {
@@ -93,6 +105,9 @@ export interface ArtifactVerificationIntent {
    * ambient cwd, or URL-only probe is deliberately insufficient. */
   resourceId: string;
   verificationShape: string;
+  /** Exact adapter-authored response/content projection from the current
+   * callable manifest. Operation/provider names never substitute for it. */
+  readback: ReadbackVerificationContractV1;
 }
 
 export interface HostSealedArtifactContentContractV1 {
@@ -415,6 +430,9 @@ function innerToolCall(toolName: string, rawArgs: unknown): { shape: string; arg
     const shape = String(outer.tool_slug ?? '').trim().toUpperCase();
     return { shape, args: parseObject(outer.arguments) };
   }
+  if (isTrustedDynamicComposioTool(toolName)) {
+    return { shape: runtimeToolTail(toolName).slice(3).trim().toUpperCase(), args: outer };
+  }
   // Keep the MCP provider namespace for native tools.  Looking only at the
   // final segment (`create_document`) loses the fact that this is a Google
   // Docs create and makes production-shaped MCP names invisible here.
@@ -480,255 +498,58 @@ export function scopeArtifactIntentForObjective(
   return identity ? { ...intent, slotKey: `${intent.kind}:${identity}` } : intent;
 }
 
-function normalizedShape(shape: string): string {
-  return shape
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-}
-
-/** Classify only production-shaped, exact-id provider reads. Broad search/list,
- * metadata fragments (for example END_INDEX), ambient `netlify status`, and
- * HTTP probes are not binding proof and intentionally return null. */
+/** Reopen one exact readback descriptor from the current callable manifest. */
 export function artifactVerificationIntentForTool(
   toolName: string,
   rawArgs: unknown,
 ): ArtifactVerificationIntent | null {
   const { shape, args } = innerToolCall(toolName, rawArgs);
-  const normalized = normalizedShape(shape);
-
-  if (
-    /^(?:CX_)?GOOGLE_?DOCS?_(?:GET_DOCUMENT(?:_BY_ID|_PLAINTEXT)?|READ_DOCUMENT)$/.test(normalized)
-  ) {
-    const resourceId = stringField(args, [
-      'document_id', 'documentId', 'documentid', 'doc_id', 'docId', 'id',
-    ]);
-    if (!resourceId) return null;
-    return {
-      kind: 'google_doc',
-      provider: 'Google Docs',
-      resourceId,
-      verificationShape: normalized,
-    };
-  }
-
-  // Google Sheets create is intentionally covered by the generic root-resource
-  // classifier below, but its exact getters still need a provider-shaped
-  // binding proof. A range read names one spreadsheet id and the response
-  // echoes that same id, so it is independent proof that the newly bound root
-  // is readable. Broad list/search operations never enter this branch.
-  if (
-    /^(?:CX_)?GOOGLE_?SHEETS?_(?:BATCH_GET|GET_VALUES|VALUES_(?:BATCH_)?GET|GET_SPREADSHEET(?:_BY_ID)?|SPREADSHEETS_GET)$/.test(normalized)
-  ) {
-    const resourceId = stringField(args, [
-      'spreadsheet_id', 'spreadsheetId', 'spreadsheetid', 'id',
-    ]);
-    if (!resourceId) return null;
-    return {
-      kind: 'resource',
-      provider: 'googlesheets',
-      resourceId,
-      verificationShape: normalized,
-    };
-  }
-
-  if (/^(?:CX_)?NETLIFY_(?:GET_SITE|GETSITE)$/.test(normalized)) {
-    const resourceId = stringField(args, ['site_id', 'siteId', 'siteid', 'id']);
-    if (!resourceId) return null;
-    return {
-      kind: 'site', provider: 'Netlify', resourceId, verificationShape: normalized,
-    };
-  }
-
-  if (toolTail(toolName) === 'run_shell_command') {
-    const command = stringField(args, ['command']) ?? '';
-    const exactGetter = /\b(?:npx\s+(?:--yes\s+)?(?:@netlify\/cli|netlify-cli)\s+|netlify(?:-cli)?\s+)api\s+getsite\b/i;
-    if (!exactGetter.test(command)) return null;
-    // A read-back hidden in a compound create/deploy command is not an
-    // independent observation and must never certify the binding.
-    if (/\bnetlify(?:-cli)?\b[^\n;|&]*(?:sites?:create|site:create|deploy|publish)\b/i.test(command)) return null;
-    const resourceId = command.match(/["']?site_id["']?\s*:\s*["']([A-Za-z0-9_-]+)["']/i)?.[1];
-    if (!resourceId) return null;
-    return {
-      kind: 'site',
-      provider: 'Netlify',
-      resourceId,
-      verificationShape: 'NETLIFY_API_GETSITE',
-    };
-  }
-
-  return null;
+  const current = currentManifestOperationContract(shape);
+  const readback = current?.verification && 'readback' in current.verification
+    ? current.verification.readback
+    : null;
+  if (current?.effect !== 'read' || !readback) return null;
+  const resourceId = resolveVerificationPointer(args, readback.requestTargetPointers[0]);
+  return typeof resourceId === 'string'
+    && resourceId === resourceId.trim()
+    && resourceId.length > 0
+    ? {
+        kind: 'resource',
+        provider: readback.resourceFamily,
+        resourceId,
+        verificationShape: current.operationId,
+        readback,
+      }
+    : null;
 }
 
-/** Identify create operations that must be transactional. Unknown tools remain
- * outside the ledger; a false positive here would remove legitimate features. */
+/** Identify transactional root creates only from a current sealed manifest. */
 export function artifactIntentForTool(toolName: string, rawArgs: unknown): ArtifactIntent | null {
   const { shape, args } = innerToolCall(toolName, rawArgs);
   const upper = shape.toUpperCase();
 
-  // Documented noun-shaped constructors share their operation semantics with
-  // effect/approval classification. A lost provider response must not cause a
-  // duplicate root artifact merely because the action name omits CREATE.
-  const documented = documentedComposioOperationSemantic(shape);
-  if (documented?.rootArtifact) {
-    return {
-      kind: documented.rootArtifact.kind,
-      provider: documented.rootArtifact.provider,
-      slotKey: explicitSlot(args, documented.rootArtifact.kind),
-      title: stringField(args, ['title', 'name']),
-      createShape: upper,
-    };
-  }
-
+  // Noun-shaped root constructors are recognized only from one exact current
+  // callable manifest. Provider/action names are identity, never evidence of
+  // create posture or result shape.
+  const current = currentManifestOperationContract(shape);
+  const atomic = current?.semantics?.atomicInputContent;
+  const mutation = current?.verification && 'mutation' in current.verification
+    && current.verification.mutation.target.source === 'authoritative_result'
+    ? current.verification.mutation
+    : null;
   if (
-    /GOOGLE.*DOC/.test(upper)
-    && /CREATE/.test(upper)
-    && /DOCUMENT|DOC/.test(upper)
-    && !/TAB|HEADER|FOOTER|FOOTNOTE|RANGE|BULLET|TABLE/.test(upper)
-  ) {
-    return {
-      kind: 'google_doc',
-      provider: 'Google Docs',
-      slotKey: explicitSlot(args, 'google_doc'),
-      title: stringField(args, ['title', 'name', 'document_title', 'documentTitle']),
-      createShape: upper,
-    };
-  }
-
-  if (toolTail(toolName) === 'run_shell_command') {
-    const command = stringField(args, ['command']) ?? '';
-    const netlifySiteCreate =
-      /\bnetlify(?:-cli)?\b[^\n]*(?:sites?:create|site:create|sites:create)\b/i.test(command)
-      || /\bnetlify(?:-cli)?\s+api\s+(?:createSite|createSiteInTeam)\b/i.test(command);
-    if (netlifySiteCreate) {
-      const name = command.match(/--(?:name|site)\s+(?:["']([^"']+)["']|([^\s]+))/i);
-      const apiName = command.match(/["']?name["']?\s*:\s*["']([^"']+)["']/i);
-      let resolvedName = name?.[1] ?? name?.[2] ?? apiName?.[1];
-      const variable = resolvedName?.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/)?.[1];
-      if (variable) {
-        const assignment = command.match(new RegExp(`(?:^|[;\\n]\\s*)(?:export\\s+)?${variable}\\s*=\\s*(?:["']([^"']+)["']|([^;\\s]+))`));
-        resolvedName = assignment?.[1] ?? assignment?.[2];
-      }
-      return {
-        kind: 'site',
-        provider: 'Netlify',
-        slotKey: explicitSlot(args, 'site'),
-        title: resolvedName && !resolvedName.startsWith('$') ? resolvedName : undefined,
-        createShape: /\bapi\s+(?:createSite|createSiteInTeam)\b/i.test(command)
-          ? 'NETLIFY_API_CREATE_SITE'
-          : 'NETLIFY_SITE_CREATE',
-      };
-    }
-    // GENERIC CLI create (2026-07-22 restructure — effect-anchored, no product
-    // whitelist): ANY installed CLI running a create-verb subcommand claims a
-    // generic artifact, so a mid-flight death on vercel/gh/wrangler/aws/…
-    // gets the same uncertainty protection + recovery chain Netlify does. The
-    // provider label is DERIVED from the executable, never enumerated.
-    const generic = genericCliCreateIntent(command);
-    if (generic) return generic;
-    return null;
-  }
-
-  // GENERIC provider create (composio slugs / MCP tools): a create-verb shape
-  // whose args carry a name/title identity and NO parent-container reference is
-  // a root deliverable (AIRTABLE_CREATE_BASE, VERCEL_CREATE_PROJECT, …). Item-
-  // level creates (records, rows, messages, comments) always reference their
-  // parent container in args and are deliberately NOT claimed — they belong to
-  // batches and the duplicate-send wall, not the one-deliverable slot model.
-  // The generic branch applies ONLY to EXTERNAL surfaces — a composio slug or a
-  // namespaced MCP tool. Local first-class tools (execution_create, focus_set,
-  // workflow authoring, memory ops) are session bookkeeping, not provider
-  // resources: claiming one parks the run on an "unresolved artifact" that
-  // never existed outside the harness (live 2026-07-22, execution_create).
-  const externalSurface = toolTail(toolName) === 'composio_execute_tool'
-    || toolName === 'composio_execute_tool'
-    || /__/.test(toolName);
-  if (externalSurface && /(?:^|_)(CREATE|PROVISION|REGISTER)(?:_|$)/.test(upper)) {
-    const title = stringField(args, ['title', 'name', 'display_name', 'displayName', 'label', 'slug']);
-    if (title && !argsReferenceParentContainer(args) && !createsStructuralSubPart(upper)) {
-      return {
-        kind: 'resource',
-        provider: providerLabelFromShape(shape),
-        slotKey: explicitSlot(args, 'resource'),
-        title,
-        createShape: upper,
-      };
-    }
-  }
-
-  return null;
-}
-
-/** Creates of structural SUB-PARTS live inside an existing deliverable and are
- * re-inspectable through it — they are not session deliverables. This is a
- * vocabulary of parts applied uniformly to EVERY provider (unlike a provider
- * whitelist, it boxes no CLI/toolkit out of the ledger). */
-const STRUCTURAL_SUB_PART_RE = /(?:^|_)(TAB|HEADER|FOOTER|FOOTNOTE|COMMENT|ROW|RECORD|RECORDS|FIELD|COLUMN|CELL|CARD|ITEM|LABEL|TAG|WEBHOOK|KEY|TOKEN|SECRET|MEMBER|REACTION|REMINDER|EVENT|MESSAGE)S?(?:_|$)/;
-
-function createsStructuralSubPart(upperShape: string): boolean {
-  const afterVerb = upperShape.split(/(?:^|_)(?:CREATE|PROVISION|REGISTER)(?:_|$)/)[1] ?? '';
-  return STRUCTURAL_SUB_PART_RE.test(`_${afterVerb}_`) || STRUCTURAL_SUB_PART_RE.test(upperShape.slice(upperShape.indexOf('CREATE')));
-}
-
-/** Args that point INTO an existing container mark an item-level create. The
- * check is structural (any *_id/parent-ish key besides account routing), not a
- * noun list — AIRTABLE_CREATE_BASE has none; AIRTABLE_CREATE_RECORDS carries
- * baseId; SLACK_SEND has channel. */
-function argsReferenceParentContainer(args: unknown): boolean {
-  if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
-  for (const key of Object.keys(args as Record<string, unknown>)) {
-    const k = key.toLowerCase();
-    if (k === 'connected_account_id' || k === 'connectedaccountid' || k === 'user_id' || k === 'userid') continue;
-    // NOTE: workspace/org/team/account ids are ACCOUNT-SCOPING, not content
-    // parents — a base/project created "in a workspace" is still a root
-    // deliverable (live 2026-07-22: AIRTABLE_CREATE_BASE requires workspaceId
-    // and silently skipped claiming). Only content containers count.
-    if (/(^|_)(parent|base|table|board|channel|thread|folder|project|repo|doc|document|site|list)_?id$/.test(k)) return true;
-    if (k === 'parent' || k === 'channel') return true;
-  }
-  return false;
-}
-
-/** "VERCEL_CREATE_PROJECT" → "vercel"; "mcp__linear__create_issue" → "linear". */
-function providerLabelFromShape(shape: string): string {
-  const mcp = shape.match(/^mcp__([^_]+(?:_[^_]+)*?)__/i)?.[1];
-  if (mcp) return mcp.toLowerCase();
-  const head = shape.replace(/^CX_/i, '').split('_')[0] ?? shape;
-  return head.toLowerCase() || 'provider';
-}
-
-const CLI_CREATE_VERB_RE = /^(create|init|new|provision|register)$|^[a-z]+s?:create$/i;
-
-/** Effect-anchored CLI create detection: `<cli> [sub] <create-verb> …` for ANY
- * executable. Reads the identity from common naming flags or the first bare
- * argument after the verb; fails closed to the primary slot when absent. */
-function genericCliCreateIntent(command: string): ArtifactIntent | null {
-  const cleaned = command.trim();
-  if (!cleaned) return null;
-  // First pipeline segment only — a create buried mid-pipeline is not the
-  // command's primary effect claim.
-  const segment = cleaned.split(/[|;&]/)[0].trim();
-  const tokens = segment.split(/\s+/).filter(Boolean);
-  if (tokens.length < 2) return null;
-  let idx = 0;
-  // Skip env assignments and runners (CI=1 npx --yes <cli> …).
-  while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) idx += 1;
-  if (tokens[idx] === 'npx') { idx += 1; while (idx < tokens.length && tokens[idx].startsWith('-')) idx += 1; }
-  const cli = (tokens[idx] ?? '').replace(/^.*\//, '').replace(/@.*$/, '');
-  if (!cli || /^(bash|sh|zsh|node|python3?|cat|echo|curl|wget|git)$/.test(cli)) return null;
-  const rest = tokens.slice(idx + 1);
-  const verbIndex = rest.findIndex((t) => CLI_CREATE_VERB_RE.test(t));
-  if (verbIndex === -1) return null;
-  const nameFlag = segment.match(/--(?:name|title|site|project|repo|app)[= ]+(?:["']([^"']+)["']|([^\s"']+))/i);
-  const bareArg = rest.slice(verbIndex + 1).find((t) => !t.startsWith('-') && !/^["']?\$/.test(t));
-  const title = nameFlag?.[1] ?? nameFlag?.[2] ?? bareArg?.replace(/^["']|["']$/g, '');
+    (current?.effect !== 'external_write' && current?.effect !== 'local_write')
+    || current.destination?.posture !== 'create_new'
+    || (!atomic && !mutation)
+  ) return null;
   return {
     kind: 'resource',
-    provider: cli.toLowerCase(),
-    slotKey: `resource:primary`,
-    title: title && !title.startsWith('$') ? title : undefined,
-    createShape: `CLI_${cli.toUpperCase()}_${(rest[verbIndex] ?? 'CREATE').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`,
+    provider: current.destination.family,
+    slotKey: explicitSlot(args, 'resource'),
+    title: stringField(args, ['title', 'name']),
+    createShape: upper,
+    ...(atomic ? { resultIdentity: atomic.resultIdentity } : {}),
+    ...(mutation ? { mutationResultProjection: mutation } : {}),
   };
 }
 
@@ -1418,201 +1239,9 @@ export function releaseClaimedArtifact(
   ).changes === 1;
 }
 
-function walkForKey(value: unknown, wanted: Set<string>, depth = 0): string | undefined {
-  if (depth > 7 || value === null || value === undefined) return undefined;
-  if (Array.isArray(value)) {
-    for (const item of value.slice(0, 80)) {
-      const found = walkForKey(item, wanted, depth + 1);
-      if (found) return found;
-    }
-    return undefined;
-  }
-  if (typeof value !== 'object') return undefined;
-  const obj = value as Record<string, unknown>;
-  for (const [key, child] of Object.entries(obj)) {
-    if (wanted.has(key.toLowerCase()) && typeof child === 'string' && child.trim()) return child.trim();
-  }
-  for (const child of Object.values(obj)) {
-    const found = walkForKey(child, wanted, depth + 1);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-function parseLooseResult(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  try { return JSON.parse(value); } catch { /* provider formatter may be JS-ish */ }
-  // Current provider CLIs colorize label/value boundaries even when stdout is
-  // captured non-interactively. Netlify CLI 24, for example, prints
-  // `Project ID: <reset-code><uuid>`. Parse the semantic text, not terminal
-  // decoration, or a successful create is persisted as URL-only and its later
-  // exact-ID readback cannot settle the binding.
-  const text = value.replace(
-    // eslint-disable-next-line no-control-regex
-    /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g,
-    '',
-  );
-  const documentId = text.match(/(?:"documentId"|"document_id"|documentId|document_id)\s*:\s*"([A-Za-z0-9_-]{10,})"/i)?.[1];
-  const siteId = text.match(/(?:"site_id"|"siteId"|site_id|siteId)\s*:\s*"([A-Za-z0-9_-]{6,})"/i)?.[1]
-    ?? text.match(/\bProject\s+ID\s*:\s*([A-Za-z0-9_-]{6,})/i)?.[1]
-    ?? text.match(/\bSite\s+ID\s*:\s*([A-Za-z0-9_-]{6,})/i)?.[1];
-  const uri = text.match(/https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+\/edit/i)?.[0]
-    ?? text.match(/\b(?:Website|Site|Live)\s+URL\s*:\s*(https:\/\/[^\s]+)/i)?.[1]
-    ?? text.match(/https:\/\/[A-Za-z0-9.-]+\.netlify\.app\/?/i)?.[0]
-    ?? text.match(/\bAdmin\s+URL\s*:\s*(https:\/\/[^\s]+)/i)?.[1];
-  return { documentId, siteId, uri };
-}
-
-function canonicalArtifactUri(uri: string | null | undefined): string | null {
-  const trimmed = uri?.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = new URL(trimmed);
-    parsed.hash = '';
-    parsed.search = '';
-    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
-    return parsed.toString().replace(/\/$/, '');
-  } catch {
-    return trimmed.replace(/\/+$/, '');
-  }
-}
-
-function googleDocumentIdFromUri(uri: string | undefined): string | undefined {
-  return uri?.match(/^https:\/\/docs\.google\.com\/document\/d\/([A-Za-z0-9_-]+)(?:\/|$|[?#])/i)?.[1];
-}
-
-function googleSpreadsheetIdFromUri(uri: string | undefined): string | undefined {
-  return uri?.match(/^https:\/\/docs\.google\.com\/spreadsheets\/d\/([A-Za-z0-9_-]+)(?:\/|$|[?#])/i)?.[1];
-}
-
-function jsonRecordFromOutput(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
-  if (typeof value !== 'string') return null;
-  const text = value.trim();
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch { /* shell results wrap stdout in an exit-code envelope */ }
-  const stdout = text.match(/(?:^|\n)stdout:\s*\n([\s\S]*)$/i)?.[1] ?? text;
-  const start = stdout.indexOf('{');
-  const end = stdout.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
-  try {
-    const parsed = JSON.parse(stdout.slice(start, end + 1)) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function directResultObject(value: unknown): Record<string, unknown> | null {
-  const parsed = jsonRecordFromOutput(value);
-  if (!parsed) return null;
-  const data = parsed.data;
-  return data && typeof data === 'object' && !Array.isArray(data)
-    ? data as Record<string, unknown>
-    : parsed;
-}
-
-/** Provider-returned content only. Request/input echo containers are excluded
- * recursively because proving that the caller asked for id X is not proving X
- * was read. Providers nest these echoes under data/response/result as well as
- * at the outer envelope. */
-function readbackResultObjects(value: unknown): Record<string, unknown>[] {
-  const parsed = jsonRecordFromOutput(value);
-  if (!parsed) return [];
-  const pruned = pruneProviderRequestEchoes(parsed) as Record<string, unknown>;
-  const candidates: Record<string, unknown>[] = [];
-  for (const key of ['data', 'response', 'result', 'output']) {
-    const candidate = pruned[key];
-    if (Array.isArray(candidate) && candidate.length > 0) {
-      candidates.push({ items: candidate });
-    } else if (candidate && typeof candidate === 'object') {
-      const record = candidate as Record<string, unknown>;
-      if (Object.keys(record).length > 0) candidates.push(record);
-    }
-  }
-  const outer = Object.fromEntries(Object.entries(pruned)
-    .filter(([key]) => !['data', 'response', 'result', 'output'].includes(key.toLowerCase())));
-  if (Object.keys(outer).length > 0) candidates.push(outer);
-  return candidates;
-}
-
-const RAW_READBACK_FAILURE_RE = /^(?:\[provider-dispatch:[^\]]+\]|[\s⚠️]*(?:(?:[A-Za-z0-9_.:/-]+)\s+)?(?:not found|no such|does not exist|error|failed|failure|unable|could not|cannot|denied|forbidden|unauthori[sz]ed|timed out|timeout|not connected)(?:\b|\s*[:(]))/i;
-
-function rawReadbackUri(output: unknown, pattern: RegExp): string | undefined {
-  if (typeof output !== 'string') return undefined;
-  const text = output.trim();
-  if (RAW_READBACK_FAILURE_RE.test(text)) return undefined;
-  return text.match(pattern)?.[0];
-}
-
-function readbackResource(intent: ArtifactVerificationIntent, output: unknown): ArtifactResource | null {
-  const parsed = jsonRecordFromOutput(output);
-  const candidates = readbackResultObjects(output);
-  if (intent.kind === 'google_doc') {
-    const resources: ArtifactResource[] = [];
-    for (const candidate of candidates) {
-      const uri = walkForKey(candidate, new Set(['display_url', 'documenturl', 'document_url', 'url', 'uri']));
-      const resourceId = walkForKey(candidate, new Set(['documentid', 'document_id', 'docid', 'doc_id']))
-        ?? googleDocumentIdFromUri(uri);
-      if (resourceId) resources.push({ resourceId, uri });
-    }
-    const rawUri = !parsed
-      ? rawReadbackUri(output, /https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)
-      : undefined;
-    if (rawUri) resources.push({ resourceId: googleDocumentIdFromUri(rawUri) ?? '', uri: rawUri });
-    return resources.find((resource) => resource.resourceId === intent.resourceId) ?? resources[0] ?? null;
-  }
-  if (intent.kind === 'resource' && intent.provider === 'googlesheets') {
-    const resources: ArtifactResource[] = [];
-    for (const candidate of candidates) {
-      const uri = walkForKey(candidate, new Set([
-        'display_url', 'spreadsheeturl', 'spreadsheet_url', 'url', 'uri',
-      ]));
-      const resourceId = walkForKey(candidate, new Set([
-        'spreadsheetid', 'spreadsheet_id',
-      ])) ?? googleSpreadsheetIdFromUri(uri);
-      if (resourceId) resources.push({ resourceId, uri });
-    }
-    const rawUri = !parsed
-      ? rawReadbackUri(output, /https:\/\/docs\.google\.com\/spreadsheets\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)
-      : undefined;
-    if (rawUri) resources.push({ resourceId: googleSpreadsheetIdFromUri(rawUri) ?? '', uri: rawUri });
-    return resources.find((resource) => resource.resourceId === intent.resourceId) ?? resources[0] ?? null;
-  }
-  // Netlify getSite returns the site at the top level. Never recursively accept
-  // a generic `id`, which could be an account, owner, deploy, or build id.
-  const resources: ArtifactResource[] = [];
-  for (const candidate of candidates) {
-    const resourceId = stringField(candidate, ['site_id', 'siteId', 'siteid', 'id']);
-    const uri = stringField(candidate, ['ssl_url', 'sslUrl', 'url', 'deploy_url', 'deployUrl']);
-    if (resourceId) resources.push({ resourceId, uri });
-  }
-  return resources.find((resource) => resource.resourceId === intent.resourceId) ?? resources[0] ?? null;
-}
-
-function readbackOutputLooksSuccessful(output: unknown, explicitOk: boolean): boolean {
-  if (!explicitOk || !toolOutputLooksSuccessful(output, explicitOk)) return false;
-  const structured = jsonRecordFromOutput(output);
-  if (structured && inspectProviderEnvelope(structured).verdict !== 'clean') return false;
-  if (typeof output === 'string') {
-    const firstLine = output.trim().split(/\r?\n/, 1)[0] ?? '';
-    if (RAW_READBACK_FAILURE_RE.test(firstLine)) return false;
-    const exitCode = output.match(/(?:^|\n)exit_code:\s*(-?\d+)\b/i)?.[1];
-    if (exitCode !== undefined && Number(exitCode) !== 0) return false;
-  }
-  return true;
-}
-
-/** Persist an exact-id provider read-back. Both halves must agree: the read
- * request names the already-bound id, and the successful response returns that
- * same id (or, for Google Docs, its canonical document URL). Mismatches and
- * failures are no-ops, never exceptions that can break the user's work. */
+/** Persist an exact-id provider read-back. Both halves must agree under the
+ * exact adapter-authored projection sealed into the current callable manifest.
+ * Mismatches and failures are no-ops, never exceptions that break user work. */
 export function verifyArtifactBindingFromToolResult(
   sessionId: string,
   runScopeId: string,
@@ -1623,13 +1252,19 @@ export function verifyArtifactBindingFromToolResult(
   explicitOk = true,
 ): RunArtifact | null {
   const intent = artifactVerificationIntentForTool(toolName, rawArgs);
-  if (!intent || !readbackOutputLooksSuccessful(output, explicitOk)) return null;
-  const response = readbackResource(intent, output);
-  if (!response?.resourceId || response.resourceId !== intent.resourceId) return null;
+  if (!intent || !explicitOk || inspectProviderEnvelope(output).verdict !== 'clean') return null;
+  const projected = projectReadbackVerificationResult({
+    contract: intent.readback,
+    providerArguments: innerToolCall(toolName, rawArgs).args,
+    authoritativeResult: exactProviderDataPayload(output),
+    requireContent: false,
+    providerAcknowledged: exactProviderDataEnvelopeAcknowledged(output),
+  });
+  if (!projected.ok || projected.resourceId !== intent.resourceId) return null;
 
   ensureSchema();
   const db = openEventLog();
-  let row = db.prepare(`
+  const row = db.prepare(`
     SELECT * FROM run_artifacts
      WHERE session_id = ? AND run_scope_id = ? AND kind = ? AND provider = ?
        AND status = 'bound' AND resource_id = ?
@@ -1642,30 +1277,6 @@ export function verifyArtifactBindingFromToolResult(
     intent.provider,
     intent.resourceId,
   ) as ArtifactRow | undefined;
-  // A successful create can legitimately expose only a canonical URL (older
-  // CLI output, provider formatter, or a pre-fix persisted row). An exact-ID
-  // getter is still strong binding proof when BOTH the request and response
-  // agree on the ID and the response URL independently matches exactly one
-  // URL-only row from this run. Promote that row to the returned ID instead of
-  // leaving truthful readback evidence detached forever.
-  if (!row && response.uri) {
-    const expectedUri = canonicalArtifactUri(response.uri);
-    const candidates = db.prepare(`
-      SELECT * FROM run_artifacts
-       WHERE session_id = ? AND run_scope_id = ? AND kind = ? AND provider = ?
-         AND status = 'bound' AND resource_id IS NULL AND uri IS NOT NULL
-       ORDER BY created_at ASC
-    `).all(
-      sessionId,
-      runScopeId,
-      intent.kind,
-      intent.provider,
-    ) as ArtifactRow[];
-    const uriMatches = candidates.filter(
-      (candidate) => canonicalArtifactUri(candidate.uri) === expectedUri,
-    );
-    if (uriMatches.length === 1) row = uriMatches[0];
-  }
   if (!row) return null;
 
   const now = new Date().toISOString();
@@ -1676,8 +1287,7 @@ export function verifyArtifactBindingFromToolResult(
       row.slot_key,
       intent.verificationShape,
       intent.resourceId,
-      response.resourceId,
-      response.uri ?? '',
+      projected.resourceId,
     ].join('\0'))
     .digest('hex')
     .slice(0, 16);
@@ -1694,7 +1304,7 @@ export function verifyArtifactBindingFromToolResult(
        AND (resource_id = ? OR resource_id IS NULL)
   `).run(
     intent.resourceId,
-    response.uri ?? null,
+    null,
     now,
     sourceCallId ?? null,
     intent.verificationShape,
@@ -2048,26 +1658,24 @@ export function authorizeGeneratedArtifactReadback(input: {
       };
     }
     const row = matches[0]!;
-    let contentContract: unknown;
-    try { contentContract = JSON.parse(row.contract_json) as unknown; } catch {
+    let rawContentContract: unknown;
+    try { rawContentContract = JSON.parse(row.contract_json) as unknown; } catch {
       return { status: 'unavailable', reason: 'generated artifact content contract is unreadable' };
     }
-    const contract = contentContract as GoogleSheetsSheetFromJsonContract;
-    if (contract.kind !== 'googlesheets_sheet_from_json_content_v1') {
+    const contentContract = parseAtomicTabularRecordSetContentContract(rawContentContract);
+    if (!contentContract || !read.readback.observedContent) {
       return { status: 'unavailable', reason: 'generated artifact content contract is unsupported' };
     }
-    const request = authorizeGoogleSheetsSheetFromJsonReadbackRequest(
-      contract,
-      {
-        provider: 'googlesheets',
-        spreadsheetId: row.resource_id,
-        spreadsheetUrl: null,
-      },
-      input.readToolName,
-      input.readArgs,
+    const requestedSelectors = resolveVerificationPointer(
+      innerToolCall(input.readToolName, input.readArgs).args,
+      read.readback.observedContent.requestRangePointer,
     );
-    if (!request.authorized) {
-      return { status: 'unavailable', reason: `exact generated readback refused: ${request.reason}` };
+    if (
+      !Array.isArray(requestedSelectors)
+      || requestedSelectors.length !== 1
+      || requestedSelectors[0] !== contentContract.expectedSelector
+    ) {
+      return { status: 'unavailable', reason: 'read does not request the exact generated content selector' };
     }
     return {
       status: 'authorized',
@@ -2206,22 +1814,25 @@ export function verifyGeneratedArtifactContentFromToolResult(input: {
       verificationRequirementId: row.verification_requirement_id,
       verificationLogicalToolCallId: input.verificationLogicalToolCallId,
     })) return false;
-    let contract: GoogleSheetsSheetFromJsonContract;
-    try { contract = JSON.parse(row.contract_json) as GoogleSheetsSheetFromJsonContract; } catch { return false; }
-    if (contract.kind !== 'googlesheets_sheet_from_json_content_v1') return false;
-    const target: GoogleSheetsSheetTarget = {
-      provider: 'googlesheets',
-      spreadsheetId: row.resource_id,
-      spreadsheetUrl: row.uri,
-    };
-    const verdict = verifyGoogleSheetsSheetFromJsonReadback(
-      contract,
-      target,
-      input.readToolName,
-      input.readArgs,
-      input.readResult,
-    );
-    if (!verdict.verified) return false;
+    let rawContract: unknown;
+    try { rawContract = JSON.parse(row.contract_json) as unknown; } catch { return false; }
+    const contract = parseAtomicTabularRecordSetContentContract(rawContract);
+    if (!contract) return false;
+    const projected = projectReadbackVerificationResult({
+      contract: readIntent.readback,
+      providerArguments: innerToolCall(input.readToolName, input.readArgs).args,
+      authoritativeResult: exactProviderDataPayload(input.readResult),
+      requireContent: true,
+      providerAcknowledged: exactProviderDataEnvelopeAcknowledged(input.readResult),
+    });
+    if (
+      !projected.ok
+      || projected.resourceId !== row.resource_id
+      || projected.observedContent?.entries.length !== 1
+      || projected.observedContent.entries[0]?.range !== contract.expectedSelector
+      || canonicalHostArtifactJson(projected.observedContent.entries[0]?.values)
+        !== canonicalHostArtifactJson(contract.expectedValues)
+    ) return false;
     const fingerprint = createHash('sha256')
       .update(JSON.stringify({
         artifactId: row.artifact_id,
@@ -2384,6 +1995,46 @@ export function verifyHostSealedArtifactContentFromReadback(input: {
     } | undefined;
     return persisted?.verification_logical_call_id === input.verificationLogicalToolCallId
       && persisted.verification_fingerprint === fingerprint;
+  } catch {
+    return false;
+  }
+}
+
+/** Verify a readback from the immutable logical settlement rather than from
+ * the tool's model-facing presentation. Carriers may append account, policy,
+ * or recovery notes after the provider JSON; those bytes are useful guidance
+ * but are not provider evidence. The settlement result handle is the one
+ * durable owner of the exact provider return for this accepted call. */
+export function verifyHostSealedArtifactContentFromSettledReadback(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  verificationLogicalToolCallId: string;
+  readToolName: string;
+  readArgs: unknown;
+}): boolean {
+  try {
+    const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
+    if (loaded.status !== 'ok') return false;
+    const redeemed = redeemSuccessfulSettlementResultForHost({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: loaded.contract.acceptedTaskId,
+      logicalToolCallId: input.verificationLogicalToolCallId,
+    });
+    if (redeemed.status !== 'ok') return false;
+    const payload = exactProviderDataPayload(redeemed.value.rawPayload);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const readback = payload as { id?: unknown; content?: unknown };
+    if (typeof readback.id !== 'string' || readback.content === undefined) return false;
+    return verifyHostSealedArtifactContentFromReadback({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      verificationLogicalToolCallId: input.verificationLogicalToolCallId,
+      readToolName: input.readToolName,
+      readArgs: input.readArgs,
+      returnedResourceId: readback.id,
+      readContent: readback.content,
+    });
   } catch {
     return false;
   }
@@ -2827,8 +2478,38 @@ export function generatedArtifactReadContentVerified(input: {
 
 /** Extract only stable artifact identifiers from a successful create result. */
 export function extractArtifactResource(intent: ArtifactIntent, output: unknown): ArtifactResource | null {
-  const parsed = parseLooseResult(output);
-  const commonTitle = walkForKey(parsed, new Set(['title', 'name']));
+  if (intent.resultIdentity) {
+    const projection = parseAtomicResultIdentityProjection(intent.resultIdentity);
+    if (!projection) return null;
+    const canonical = verifyCanonicalDocumentedCreateResult({ value: output });
+    if (canonical.status === 'verified') {
+      if (JSON.stringify(canonical.value.binding.resultIdentity) !== JSON.stringify(projection)) return null;
+      return {
+        resourceId: canonical.value.created.id,
+        uri: canonical.value.created.handle,
+        title: intent.title,
+      };
+    }
+    const created = projectAtomicCreatedResourceIdentity({
+      projection,
+      authoritativeResult: output,
+    });
+    return created
+      ? { resourceId: created.id, uri: created.handle, title: intent.title }
+      : null;
+  }
+  if (intent.mutationResultProjection) {
+    const projected = projectMutationVerificationIntent({
+      contract: intent.mutationResultProjection,
+      providerArguments: {},
+      authoritativeResult: exactProviderDataPayload(output),
+      phase: 'settled_result',
+      providerAcknowledged: exactProviderDataEnvelopeAcknowledged(output),
+    });
+    return projected.ok
+      ? { resourceId: projected.resourceId, title: intent.title }
+      : null;
+  }
   // Host-sealed graph creates have a stronger result contract than the generic
   // effect classifier: an exact clean provider envelope must return both the
   // durable id and provider handle later sealed into the write receipt. Keep
@@ -2844,57 +2525,54 @@ export function extractArtifactResource(intent: ArtifactIntent, output: unknown)
     const resourceId = stringField(created, ['id']);
     const handle = stringField(created, ['handle']);
     return resourceId && handle
-      ? { resourceId, uri: handle, title: commonTitle ?? intent.title }
+      ? { resourceId, uri: handle, title: intent.title }
       : null;
   }
-  if (intent.kind === 'google_doc') {
-    const uri = walkForKey(parsed, new Set(['display_url', 'documenturl', 'document_url', 'url', 'uri']))
-      ?? (typeof output === 'string'
-        ? output.match(/https:\/\/docs\.google\.com\/document\/d\/[A-Za-z0-9_-]+(?:\/edit)?/i)?.[0]
-        : undefined);
-    const resourceId = walkForKey(parsed, new Set(['documentid', 'document_id', 'docid', 'doc_id']))
-      ?? googleDocumentIdFromUri(uri);
-    const canonicalUri = uri ?? (resourceId ? `https://docs.google.com/document/d/${resourceId}/edit` : undefined);
-    return resourceId || canonicalUri ? { resourceId, uri: canonicalUri, title: commonTitle ?? intent.title } : null;
-  }
-  if (intent.kind === 'site') {
-    const direct = directResultObject(output);
-    const resourceId = direct
-      ? stringField(direct, ['siteid', 'site_id', 'siteId', 'id'])
-      : walkForKey(parsed, new Set(['siteid', 'site_id']));
-    const uri = walkForKey(parsed, new Set(['url', 'uri', 'ssl_url', 'sslurl', 'deploy_url']));
-    return resourceId || uri ? { resourceId, uri, title: commonTitle ?? intent.title } : null;
-  }
-  // Reviewed Google Sheets root constructors return `spreadsheetId` (or a
-  // canonical spreadsheet URL). They also commonly include ambient account,
-  // owner, drive-file, and request metadata with generic `id` fields. Never
-  // let the generic resource fallback bind one of those unrelated ids to the
-  // artifact slot: exact-ID readback would then target the wrong object and
-  // the successfully created Sheet could become permanently unverifiable.
-  if (intent.kind === 'resource' && intent.provider === 'googlesheets') {
-    const target = extractGoogleSheetsSheetFromJsonTarget(output);
-    if (!target) return null;
+  // A successful-looking object or familiar provider field is not artifact
+  // identity. Governed creates must carry one sealed projection above.
+  return null;
+}
+
+export type SettledArtifactResourceResult =
+  | { status: 'settled'; resource: ArtifactResource | null }
+  | { status: 'missing' }
+  | { status: 'conflict'; reason: string };
+
+/**
+ * Project a create target from the exact payload already bound to this
+ * logical call's successful settlement. Provider adapters may append trusted
+ * routing or other model-facing notes after formatting their raw result; those
+ * presentation bytes are not artifact identity. The durable settlement is the
+ * provider-neutral authority shared with receipts and terminal proof.
+ *
+ * `missing` is distinct from corruption because legacy and host-owned wrappers
+ * can reach their artifact callback before a separate settlement owner closes
+ * the call. Those callers retain the established direct-result fallback.
+ */
+export function extractArtifactResourceFromSuccessfulSettlement(input: {
+  intent: ArtifactIntent;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+}): SettledArtifactResourceResult {
+  const redeemed = redeemSuccessfulSettlementResultForHost({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: input.acceptedTaskId,
+    logicalToolCallId: input.logicalToolCallId,
+  });
+  if (redeemed.status === 'missing') return { status: 'missing' };
+  if (redeemed.status !== 'ok') {
     return {
-      resourceId: target.spreadsheetId,
-      uri: target.spreadsheetUrl
-        ?? `https://docs.google.com/spreadsheets/d/${target.spreadsheetId}/edit`,
-      title: intent.title ?? commonTitle,
+      status: 'conflict',
+      reason: `artifact settlement result is ${redeemed.status}: ${redeemed.reason}`,
     };
   }
-  // Generic kinds (the effect-anchored classifier): any stable id-shaped key or
-  // canonical URL in the provider result proves the create landed — the same
-  // evidence a human would read. Without this branch every generic claim
-  // settled 'uncertain' even on SUCCESS, turning the broadened classifier into
-  // a park factory instead of a safety net.
-  const resourceId = walkForKey(parsed, new Set([
-    'id', 'resource_id', 'resourceid', 'uid', 'uuid', 'spreadsheet_id', 'spreadsheetid',
-  ]));
-  const uri = walkForKey(parsed, new Set([
-    'url', 'uri', 'html_url', 'web_url', 'link', 'permalink',
-    'display_url', 'spreadsheet_url', 'spreadsheeturl',
-  ]))
-    ?? (typeof output === 'string' ? output.match(/https?:\/\/[^\s"')\]]+/i)?.[0] : undefined);
-  return resourceId || uri ? { resourceId, uri, title: commonTitle ?? intent.title } : null;
+  return {
+    status: 'settled',
+    resource: extractArtifactResource(input.intent, redeemed.value.rawPayload),
+  };
 }
 
 export function artifactReuseMessage(artifact: RunArtifact): string {
@@ -2903,11 +2581,7 @@ export function artifactReuseMessage(artifact: RunArtifact): string {
     if (artifact.bindingVerifiedAt) {
       return `Artifact slot ${artifact.slotKey} is already provider-verified and bound to ${pointer}. Use that existing resource; do not create another. Update it only under a separately declared authorized operation or turn.`;
     }
-    const repair = artifact.kind === 'site' && artifact.resourceId
-      ? ` Read it back exactly with netlify api getSite --data '{"site_id":"${artifact.resourceId}"}', then reconcile this create claim to that existing site; do not run sites:create again. Update it only under a separately declared authorized operation or turn.`
-      : artifact.kind === 'google_doc' && artifact.resourceId
-        ? ` Read it back with GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT using document_id=${artifact.resourceId}. Reconcile this create claim to existing document ${artifact.resourceId}; do not run document create again. Update it only under a separately declared authorized operation or turn.`
-        : ' Verify that exact resource and reconcile the existing create claim; do not create another. Update it only under a separately declared authorized operation or turn.';
+    const repair = ' Verify that exact resource through its admitted readback capability and reconcile the existing create claim; do not create another. Update it only under a separately declared authorized operation or turn.';
     return `Artifact slot ${artifact.slotKey} is already bound but not yet provider-verified: ${pointer}.${repair}`;
   }
   const attempt = artifact.sourceCallId ? `; provider attempt ${artifact.sourceCallId}` : '';

@@ -13,7 +13,9 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    DEVELOPMENT_TEAM: 4AR3Y8XD72
+    # XcodeGen expands this from the developer/CI environment. Keep signing
+    # identity local instead of committing an Apple team identifier.
+    DEVELOPMENT_TEAM: ${APPLE_TEAM_ID}
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.9"
 targets:
@@ -37,5 +39,26 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
         ENABLE_PREVIEWS: true
-        CURRENT_PROJECT_VERSION: 10
+        CURRENT_PROJECT_VERSION: 13
         MARKETING_VERSION: 0.1.0
+  ClemTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - ClemTests
+    dependencies:
+      - target: Clem
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem.tests
+        GENERATE_INFOPLIST_FILE: true
+        CODE_SIGNING_ALLOWED: false
+schemes:
+  Clem:
+    build:
+      targets:
+        Clem: all
+        ClemTests: [test]
+    test:
+      targets:
+        - ClemTests

@@ -8,6 +8,7 @@ import type { Agent, AgentInputItem, Runner } from '@openai/agents';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-conversation-protocol-loop-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.HARNESS_TOOL_BRACKETS = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 

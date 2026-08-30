@@ -20,6 +20,7 @@ const {
   appendConversationPreambleOnce,
   appendEvent,
   createSession,
+  listEvents: listHarnessEvents,
 } = await import('../runtime/harness/eventlog.js');
 const {
   createBackgroundTask,
@@ -32,6 +33,8 @@ const { withToolOutputContext } = await import('../runtime/harness/tool-output-c
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
 const { recordTurnPreflightDecision } = await import('../runtime/harness/turn-control.js');
 const { publishPreflightConversation } = await import('../runtime/harness/preflight-conversation.js');
+const fanout = await import('../execution/durable-fanout.js');
+const { terminalToolShouldHalt } = await import('../runtime/harness/terminal-tool.js');
 
 type ToolHandler = (input: Record<string, unknown>) => Promise<{ content?: Array<{ text?: string }> }>;
 
@@ -97,6 +100,7 @@ async function invokeDispatch(
 }
 
 test.after(() => {
+  fanout.closeDurableFanoutForTests();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -287,4 +291,155 @@ test('dispatch_background_task still refuses a legacy unsafe align row with no s
 
   assert.match(output, /alignment beat owed/i);
   assert.equal(listBackgroundTasks({ includeArchived: true }).length, before);
+});
+
+test('natural 100-account compound manifest repairs untyped phases internally, then admits explicit result kinds', async () => {
+  const dispatch = registeredDispatch();
+  const session = createSession({
+    id: 'fanout-model-surface-100-accounts',
+    kind: 'chat',
+    channel: 'desktop',
+    title: 'Scrape accounts into a sheet',
+  });
+  const items = Array.from({ length: 100 }, (_, index) => `account-${String(index + 1).padStart(3, '0')}`);
+  const base = {
+    objective: 'Scrape 100 accounts, then put them in a sheet.',
+    handoff_note: 'I’m running the account collection in the background and will report back here.',
+    plan: '- Scrape each canonical account\n- Put the retained account data in the sheet',
+    success_criteria: ['All 100 source results are retained', 'Every requested sheet effect is settled'],
+    context_refs: [],
+    max_minutes: 30,
+  };
+  const plansBefore = fanout.listFanoutPlans().length;
+  const tasksBefore = listBackgroundTasks({ includeArchived: true }).length;
+
+  const refusedResult = await withToolOutputContext({ sessionId: session.id }, () => dispatch({
+    ...base,
+    manifest: {
+      items,
+      phases: ['scrape', 'sheet-write'],
+      missing_required_inputs: [],
+      worker_model: null,
+    },
+  }));
+  const refusedText = refusedResult.content?.[0]?.text ?? '';
+  const refused = JSON.parse(refusedText) as { ok?: unknown; code?: unknown; repair?: unknown };
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, 'fanout_manifest_result_kind_required');
+  assert.match(String(refused.repair), /same turn/i);
+  assert.match(String(refused.repair), /Do not ask the user/i);
+  assert.equal(terminalToolShouldHalt('dispatch_background_task', refusedText), false,
+    'an internal manifest repair was mistaken for a successful terminal handoff');
+  assert.equal(fanout.listFanoutPlans().length, plansBefore, 'repair wrote a fan-out plan');
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, tasksBefore, 'repair started a task');
+  assert.equal(listHarnessEvents(session.id, { types: ['awaiting_user_input'] }).length, 0,
+    'an internal result-kind repair became a user question');
+
+  const admittedResult = await withToolOutputContext({ sessionId: session.id }, () => dispatch({
+    ...base,
+    manifest: {
+      items,
+      phases: [
+        { id: 'scrape', result_kind: 'data' },
+        { id: 'sheet-write', result_kind: 'action' },
+      ],
+      missing_required_inputs: [],
+      worker_model: null,
+    },
+  }));
+  const admittedText = admittedResult.content?.[0]?.text ?? '';
+  assert.match(admittedText, /^Admitted durable fan-out plan /);
+  assert.equal(terminalToolShouldHalt('dispatch_background_task', admittedText), true);
+  assert.equal(fanout.listFanoutPlans().length, plansBefore + 1);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, tasksBefore + 1);
+  const admitted = fanout.listFanoutPlans().at(-1);
+  assert.deepEqual(admitted?.manifest.manifest?.phases.map((phase) => [phase.id, phase.resultKind]), [
+    ['scrape', 'data'],
+    ['sheet-write', 'action'],
+  ]);
+});
+
+test('single-stage fan-out repairs null/string phases, then admits explicit data and action kinds', async () => {
+  const dispatch = registeredDispatch();
+  const cases = [
+    {
+      sessionId: 'fanout-single-stage-data',
+      objective: 'Scrape the canonical account batch once.',
+      plan: '- Scrape the canonical account batch once',
+      success: 'The exact source payload is retained',
+      items: ['account-batch'],
+      refusedPhases: null,
+      repairedPhase: { id: 'scrape', result_kind: 'data' as const },
+    },
+    {
+      sessionId: 'fanout-single-stage-action',
+      objective: 'Verify each canonical account once.',
+      plan: '- Verify each canonical account once',
+      success: 'Every account has one action receipt',
+      items: ['account-a', 'account-b'],
+      refusedPhases: ['verify'],
+      repairedPhase: { id: 'verify', result_kind: 'action' as const },
+    },
+  ] as const;
+  const plansBefore = fanout.listFanoutPlans().length;
+  const tasksBefore = listBackgroundTasks({ includeArchived: true }).length;
+
+  for (const fixture of cases) {
+    const session = createSession({
+      id: fixture.sessionId,
+      kind: 'chat',
+      channel: 'desktop',
+      title: fixture.objective,
+    });
+    const base = {
+      objective: fixture.objective,
+      handoff_note: 'I’m running this in the background and will report back here.',
+      plan: fixture.plan,
+      success_criteria: [fixture.success],
+      context_refs: [],
+      max_minutes: 15,
+    };
+    const beforeCasePlans = fanout.listFanoutPlans().length;
+    const beforeCaseTasks = listBackgroundTasks({ includeArchived: true }).length;
+    const refusedResult = await withToolOutputContext({ sessionId: session.id }, () => dispatch({
+      ...base,
+      manifest: {
+        items: [...fixture.items],
+        phases: fixture.refusedPhases,
+        missing_required_inputs: [],
+        worker_model: null,
+      },
+    }));
+    const refusedText = refusedResult.content?.[0]?.text ?? '';
+    const refused = JSON.parse(refusedText) as { ok?: unknown; code?: unknown; repair?: unknown };
+    assert.equal(refused.ok, false);
+    assert.equal(refused.code, 'fanout_manifest_result_kind_required');
+    assert.match(String(refused.repair), /same turn/i);
+    assert.match(String(refused.repair), /Do not ask the user/i);
+    assert.equal(terminalToolShouldHalt('dispatch_background_task', refusedText), false);
+    assert.equal(fanout.listFanoutPlans().length, beforeCasePlans);
+    assert.equal(listBackgroundTasks({ includeArchived: true }).length, beforeCaseTasks);
+    assert.equal(listHarnessEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+
+    const admittedResult = await withToolOutputContext({ sessionId: session.id }, () => dispatch({
+      ...base,
+      manifest: {
+        items: [...fixture.items],
+        phases: [fixture.repairedPhase],
+        missing_required_inputs: [],
+        worker_model: null,
+      },
+    }));
+    assert.match(admittedResult.content?.[0]?.text ?? '', /^Admitted durable fan-out plan /);
+    const admitted = fanout.listFanoutPlans().at(-1);
+    assert.deepEqual(admitted?.manifest.manifest?.phases.map((phase) => ({
+      id: phase.id,
+      resultKind: phase.resultKind,
+    })), [{
+      id: fixture.repairedPhase.id,
+      resultKind: fixture.repairedPhase.result_kind,
+    }]);
+  }
+  assert.equal(fanout.listFanoutPlans().length, plansBefore + cases.length);
+  assert.equal(listBackgroundTasks({ includeArchived: true }).length, tasksBefore + cases.length);
 });

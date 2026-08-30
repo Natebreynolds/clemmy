@@ -39,6 +39,11 @@ import {
 import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
 import { destinationCardSuffix } from './destination-gate.js';
 import {
+  isPlainOrClementineLocalTool,
+  isTrustedComposioGateway,
+} from './runtime-tool-identity.js';
+import { peekCurrentConnectedToolkits } from '../../integrations/composio/client.js';
+import {
   assertNotKilled,
   KillRequested,
   ToolTimeout,
@@ -68,7 +73,12 @@ import {
   renderSessionHistoryForModel,
   renderTranscriptTurns,
 } from './session-transcript.js';
-import { selectReasoningEffort, dynamicReasoningEnabled, continuationClassifyEnabled } from './reasoning-effort.js';
+import {
+  continuationClassifyEnabled,
+  dynamicReasoningEnabled,
+  reasoningEffortSignalsForTurn,
+  selectReasoningEffort,
+} from './reasoning-effort.js';
 import { buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
 import { discoveryGovernor } from './discovery-governor.js';
@@ -107,6 +117,7 @@ import {
   commitTurnOutcome,
   deliveryMustHoldForHuman,
 } from './delivery-committer.js';
+import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
 import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
 import { exactTerminalForAcceptedSource } from './accepted-source-terminal.js';
 import {
@@ -126,6 +137,7 @@ import {
   type TurnIdentity,
   type TurnOutcome,
 } from './turn-outcome.js';
+import { parkObservedConnectionDependencyForSource } from './dependency-request.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import {
   getActiveGoalForSession,
@@ -167,7 +179,7 @@ import { addNotification } from '../notifications.js';
 import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
-import { getRuntimeEnv } from '../../config.js';
+import { getRuntimeEnv, withRuntimeConfigSnapshot } from '../../config.js';
 import {
   autoCaptureProvenanceFromAcceptedEvent,
   captureInteractionSignals,
@@ -184,8 +196,6 @@ import {
   recordLearningDecision,
   type LearningReceipt,
 } from '../../memory/learning-receipt.js';
-import { refreshWorkingMemoryForSession } from '../../memory/working-memory.js';
-import { isUserFacingSession } from '../../execution/scope.js';
 import { handoffTransferForSource } from '../../execution/continuation-capsule.js';
 import { primeTurnRecallVector, recordFactImpression, searchFactsByText, withTurnQueryVectorScope } from '../../memory/facts.js';
 import { appendFactRecallTrace } from '../../memory/recall-trace.js';
@@ -218,6 +228,7 @@ import {
   runTokenBudgetEnforcementEnabled,
 } from './run-token-budget.js';
 import { ContentChantDetector, contentChantDetectionEnabled } from './content-chant-detector.js';
+import { modelVisibleTextSha256 } from './model-visible-text-digest.js';
 import { withModelUsageAttribution } from '../usage-log.js';
 import type {
   ConversationPreambleDeliveryCallback,
@@ -250,11 +261,21 @@ import {
 } from '../semantic-boundary/typed-source-dispatch.js';
 import {
   HostInterruptState,
+  HostRecoveryState,
   hostRunRunner,
   hostToolCallsLimitCheckpointFor,
 } from './host-turn-runner.js';
+import {
+  acceptedModelBatchHistoryDigest,
+  reopenAcceptedModelBatch,
+} from './accepted-model-batch-checkpoint.js';
 import { hostInteractiveConsentApprovalResumeKey } from './host-interactive-consent.js';
-import { isHostTurnEngine, selectTurnEngine, type TurnEngineMode } from './turn-engine-selection.js';
+import {
+  isHostTurnEngine,
+  requireFreshHostTurnEngine,
+  selectTurnEngine,
+  type TurnEngineMode,
+} from './turn-engine-selection.js';
 import {
   ModelStreamStalledError,
   modelFirstByteStallMs,
@@ -975,7 +996,14 @@ function reduceStandardConversationTerminal(input: {
       }
       break;
     }
-    case 'awaiting_user_input':
+    case 'awaiting_user_input': {
+      const question = terminalQuestionText(result);
+      parkObservedConnectionDependencyForSource({
+        sessionId: result.sessionId,
+        sourceUserSeq,
+        turn: result.lastTurn,
+        text: question,
+      });
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
@@ -983,10 +1011,11 @@ function reduceStandardConversationTerminal(input: {
         status: 'needs_input',
         resumable: true,
         needs: { kind: 'input' },
-        presentation: { kind: 'question', text: terminalQuestionText(result) },
+        presentation: { kind: 'question', text: question },
       };
       legacyReason = 'awaiting_user_input';
       break;
+    }
     case 'limit_exceeded':
       // A ceiling is a checkpoint, not an end (budget-settings NEVER-RESTING
       // contract). The terminal must stay continue-shaped: a blocked park here
@@ -1048,13 +1077,14 @@ function reduceStandardConversationTerminal(input: {
       // words — the admission reason or the committed public presentation —
       // because collapsing it into PUBLIC_RUN_FAILURE_TEXT is what turned a
       // legible "I could not admit this turn" into a bare "something went
-      // wrong". Resumable: the user can answer or rephrase and continue.
+      // wrong". A host may additionally prove that this is an internal,
+      // non-user-resumable stop; ordinary admission refusals remain resumable.
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
         identity,
         status: 'blocked',
-        resumable: true,
+        resumable: result.blockedResumable !== false,
         presentation: {
           kind: 'blocked',
           // A committed public presentation already returned above, so the
@@ -1167,7 +1197,6 @@ export function finalizeDeferredToolCallsLimitTerminal(input: {
     const session = HarnessSession.load(checkpoint.sessionId);
     session?.markStatus('failed');
     emitRuntimeTerminalEvent(checkpoint.sessionId, finalized);
-    refreshTerminalWorkingMemory(checkpoint.sessionId);
     return finalized;
   }
   const finalized = reduceStandardConversationTerminal({
@@ -1192,7 +1221,6 @@ export function finalizeDeferredToolCallsLimitTerminal(input: {
     session.markStatus('completed');
   }
   emitRuntimeTerminalEvent(checkpoint.sessionId, finalized);
-  refreshTerminalWorkingMemory(checkpoint.sessionId);
   return finalized;
 }
 
@@ -1524,6 +1552,14 @@ function commitStandardPauseTerminal(input: {
   delivered?: boolean;
 }): void {
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  if (Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0) {
+    parkObservedConnectionDependencyForSource({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq as number,
+      turn: input.turn,
+      text: publicReplyText(input.reply, '') || publicReplyText(input.summary, ''),
+    });
+  }
   commitStandardNeedsInputTerminal({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -2313,6 +2349,8 @@ export interface RunOutcome {
   rawResponses?: unknown[];
   /** Serialized RunState for interrupt-resume; only set when paused. */
   serializedState?: string;
+  /** Private host checkpoint-recovery state. Never projected as an approval. */
+  serializedRecoveryState?: string;
   /** True when the underlying RunResult had interruptions[]. */
   hasInterruptions?: boolean;
   /** Per-interruption details, extracted from RunToolApprovalItem.rawItem. */
@@ -2323,7 +2361,7 @@ export interface RunOutcome {
    * The status travels with the outcome so the caller does not have to
    * re-derive "was this blocked?" from the text it produced.
    */
-  terminal?: { status: 'blocked'; reason: string };
+  terminal?: { status: 'blocked'; reason: string; resumable?: false };
   /** Internal nonterminal recovery ownership. No public terminal is authored. */
   hold?: {
     owner: 'host';
@@ -2516,6 +2554,10 @@ export interface RunTurnOptions {
    * query embedding and the visible vault primer. This is a cost optimization
    * only; any uncertain/action-shaped turn omits it and retains full recall. */
   skipAutomaticMemoryPrimer?: true;
+  /** The same accepted-source proof also mounted an exact zero-tool agent.
+   * This permits action-only context ranking to be omitted without changing
+   * the model-visible user message or conversational context. */
+  plainConversationSurface?: true;
   /** The accepted request opted out of automatic memory for its full logical
    * continuation/fallover chain. This is policy only and carries no task text. */
   suppressAutomaticMemoryForRequest?: true;
@@ -2596,6 +2638,8 @@ export interface RunTurnResult {
   status: RunTurnStatus;
   finalOutput?: unknown;
   error?: string;
+  /** A host-owned factual terminal that has no user-supplied continuation. */
+  blockedResumable?: false;
   /** How many tool/handoff calls fired during this turn. Used by the
    *  outer loop to detect sub-agent stalls (zero tools + short generic
    *  output = the model punted on the directive). */
@@ -2860,6 +2904,8 @@ export interface RunConversationResult {
   lastDecision?: OrchestratorDecisionShape;
   lastTurn: number;
   error?: string;
+  /** Preserve a host proof that the blocked terminal is not user-resumable. */
+  blockedResumable?: false;
   /** Nonterminal exact-source ownership retained by a peer or restart
    * reconciler. No public terminal or user-input dependency exists yet. */
   hold?: {
@@ -2989,6 +3035,7 @@ function hostActivationConversationResult(
     lastTurn: turnResult.turn,
     ...(lastDecision ? { lastDecision } : {}),
     ...(turnResult.error ? { error: turnResult.error } : {}),
+    ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
     ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
   };
 }
@@ -4245,7 +4292,15 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     // above are never lost.
     ...(breadcrumbs ? ['', breadcrumbs] : []),
   ].join('\n');
-  return { enabled: true, query, hitCount: hits.length, injectedBytes: text.length, source, text, recallId };
+  return {
+    enabled: true,
+    query,
+    hitCount: hits.length,
+    injectedBytes: Buffer.byteLength(text, 'utf8'),
+    source,
+    text,
+    recallId,
+  };
 }
 
 async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<typeof searchVault> | null> {
@@ -4531,7 +4586,90 @@ export function shouldElevateOnStepProgress(opts: {
   return opts.stepIndex >= opts.maxSteps; // about to exit on the step cap
 }
 
+type ScheduledHostRecovery = {
+  timer: ReturnType<typeof setTimeout>;
+  attempt: number;
+};
+
+const scheduledHostRecoveries = new Map<string, ScheduledHostRecovery>();
+
+/**
+ * Wake one private same-source checkpoint owner. Timers are process-local and
+ * deliberately unref'd; the serialized HostRecoveryState remains the durable
+ * owner across daemon restart. Each activation re-proves that exact state
+ * before it can adopt history or run another model step.
+ */
+function scheduleHostCheckpointRecovery(
+  options: RunConversationOptions,
+  sourceUserSeq: number,
+  attempt = 0,
+): void {
+  if (options.runRunner !== undefined) return;
+  const key = `${options.sessionId}:${sourceUserSeq}`;
+  if (scheduledHostRecoveries.has(key)) return;
+  const delayMs = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
+  const timer = setTimeout(() => {
+    scheduledHostRecoveries.delete(key);
+    void (async () => {
+      const session = HarnessSession.load(options.sessionId);
+      const recoveryBlob = session?.loadRecoveryState();
+      if (!session || !recoveryBlob) return;
+      let recovery: HostRecoveryState;
+      try {
+        recovery = HostRecoveryState.fromString(recoveryBlob);
+      } catch {
+        return;
+      }
+      if (
+        recovery.sessionId !== options.sessionId
+        || recovery.sourceUserSeq !== sourceUserSeq
+      ) return;
+      const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
+      const sourceText = typeof source.data.text === 'string'
+        ? source.data.text
+        : options.input;
+      const {
+        onChunk: _discardChunk,
+        onConversationPreamble: _discardPreambleDelivery,
+        ...stableOptions
+      } = options;
+      try {
+        const result = await runConversation({
+          ...stableOptions,
+          input: sourceText,
+          sourceUserSeq,
+          reuseRecordedUserInput: true,
+          suppressMemoryCapture: true,
+          mcpToolScope: session.loadRecoveryMcpToolScope()
+            ?? options.mcpToolScope,
+        });
+        if (
+          result.status === 'held'
+          && HarnessSession.load(options.sessionId)?.loadRecoveryState()
+        ) {
+          scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
+        }
+      } catch {
+        // A thrown local/surface failure does not transfer ownership to the
+        // user. If the exact state is still present, retry it with bounded
+        // backoff; no model or body can run before its own ref is reopened.
+        if (HarnessSession.load(options.sessionId)?.loadRecoveryState()) {
+          scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
+        }
+      }
+    })();
+  }, delayMs);
+  timer.unref?.();
+  scheduledHostRecoveries.set(key, { timer, attempt });
+}
+
 export async function runConversation(
+  options: RunConversationOptions,
+): Promise<RunConversationResult> {
+  return withRuntimeConfigSnapshot(() => runConversationWithinRuntimeConfig(options));
+}
+
+async function runConversationWithinRuntimeConfig(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
   // Provider/fallover retries explicitly identify an already-accepted source.
@@ -4551,15 +4689,16 @@ export async function runConversation(
   const acceptedSource = acceptedUserEvent(options.sessionId, sourceUserSeq);
   const acceptedText = typeof acceptedSource.data.text === 'string' ? acceptedSource.data.text : options.input;
   const sessionKind = getSession(options.sessionId)?.kind ?? '';
-  // Only the accepted interactive bridge may opt a fresh conversation into
-  // the canary. Internal/background callers also use runConversation with
-  // chat-shaped sessions; allowing an omitted option to consult the process
-  // environment would silently move those owners off their durable path.
-  const frozenTurnEngine: TurnEngineMode = options.turnEngine ?? 'legacy_sdk';
+  // Freeze one fresh owner from the accepted session before any context,
+  // capability, semantic, model, or tool work. Direct workflow/background
+  // callers and bridge callers now make the same selection; legacy_sdk is
+  // readable only from a serialized rolling-upgrade resume below.
+  const frozenTurnEngine = requireFreshHostTurnEngine(
+    options.turnEngine ?? selectTurnEngine({ sessionKind }),
+  );
   const hostOwnsFreshTurn = options.runRunner === undefined
-    && isHostTurnEngine(frozenTurnEngine)
-    && sessionKind === 'chat';
-  // The host engine is the ordinary-chat owner. Seal that ownership before the
+    && isHostTurnEngine(frozenTurnEngine);
+  // The host engine is the fresh-turn owner. Seal that ownership before the
   // semantic port participates, then compile exactly one durable graph. The
   // graph describes accepted work; it does not transfer execution to the
   // legacy typed dispatcher.
@@ -4823,10 +4962,18 @@ export async function runConversation(
         ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
         ...(options.suppressMemoryCapture ? { suppressMemoryCapture: true as const } : {}),
         ...(contextWarmedAtNode ? { contextWarmedAtNode: true } : {}),
-        ...(hostPlainConversation ? { skipAutomaticMemoryPrimer: true as const } : {}),
+        ...(hostPlainConversation
+          ? {
+              skipAutomaticMemoryPrimer: true as const,
+              plainConversationSurface: true as const,
+            }
+          : {}),
       });
       const result = hostActivationConversationResult(turnResult, sourceUserSeq);
-      if (result.status === 'held') return result;
+      if (result.status === 'held') {
+        scheduleHostCheckpointRecovery(options, sourceUserSeq);
+        return result;
+      }
       const zeroToolTurnAuthority = hostPlainZeroToolTurnAuthority({
         hostPlainConversation,
         sessionId: options.sessionId,
@@ -4873,7 +5020,6 @@ export async function runConversation(
       });
       if (reduced.publicPresentation) {
         emitRuntimeTerminalEvent(options.sessionId, reduced);
-        refreshTerminalWorkingMemory(options.sessionId);
       }
       foregroundRelease = reduced.publicPresentation ? 'terminal' : null;
       return reduced;
@@ -4921,7 +5067,6 @@ export async function runConversation(
         publish: (core) => {
           if (core.kind !== 'reduced') return;
           emitRuntimeTerminalEvent(options.sessionId, core.reduced);
-          refreshTerminalWorkingMemory(options.sessionId);
         },
         // The REAL delivery verdict, phase 1b: a completed reduction delivered
         // its answer; awaiting_user_input (blocked verdict or clarifying
@@ -4962,24 +5107,6 @@ export async function runConversation(
     }
     }),
   );
-}
-
-/** Refresh short-term memory only after the conversation terminal is durable.
- * The transcript reader is event-log-backed, so running this before completion
- * records a user-only snapshot that lags the assistant by one turn. End-of-turn
- * disk work is acceptable here (the public terminal is already committed), and
- * remains best-effort so memory observability can never fail a conversation. */
-function refreshTerminalWorkingMemory(sessionId: string): void {
-  try {
-    const session = getSession(sessionId);
-    if (session?.kind !== 'chat') return;
-    const channel = session.channel ?? undefined;
-    if (!isUserFacingSession(sessionId, channel)) return;
-    refreshWorkingMemoryForSession(sessionId, channel);
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('refreshWorkingMemory failed:', err instanceof Error ? err.message : err);
-  }
 }
 
 async function runConversationCore(
@@ -5145,6 +5272,11 @@ async function runConversationCore(
     reason: string;
     missing?: readonly string[];
   } | undefined;
+  // A frozen primary-model read plan gets one deterministic chance to enter
+  // its already-bound business carrier before any terminal judge may decide
+  // how to present a gap. This is separate from judge RESUME and therefore
+  // cannot spend or be skipped by a model-authored terminal disposition.
+  let acceptedReadPlanContinuationUsed = false;
   let claimGroundingNudged = false;
   let selfResolveNudged = false;
   // Set only by the effect/artifact self-resolve node. The next model turn is
@@ -5827,6 +5959,7 @@ async function runConversationCore(
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
         ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
         ...(turnResult.hold ? { hold: turnResult.hold } : {}),
       };
@@ -6760,6 +6893,38 @@ async function runConversationCore(
       };
     }
     if (doneStands) {
+      const pendingReadPlan = activeSourceUserSeq
+        ? pendingAcceptedReadPlan({
+            sessionId: options.sessionId,
+            sourceUserSeq: activeSourceUserSeq,
+          })
+        : null;
+      if (
+        pendingReadPlan
+        && !acceptedReadPlanContinuationUsed
+        && stepIndex < maxSteps
+      ) {
+        acceptedReadPlanContinuationUsed = true;
+        safeAppend({
+          sessionId: options.sessionId,
+          turn: turnResult.turn,
+          role: 'system',
+          type: 'heartbeat',
+          data: {
+            kind: 'accepted_read_plan_execution_continuation',
+            sourceUserSeq: activeSourceUserSeq,
+            contractId: pendingReadPlan.contractId,
+            readyRequirementIds: pendingReadPlan.readyRequirementIds,
+            message: 'The exact read-only plan is accepted but has not entered downstream business execution; continuing to its bound work call.',
+          },
+        });
+        nextInput = [
+          'ACCEPTED PLAN EXECUTION — the exact read-only plan is already pinned.',
+          `Call work_call now for the ready requirement${pendingReadPlan.readyRequirementIds.length === 1 ? '' : 's'}: ${pendingReadPlan.readyRequirementIds.join(', ')}.`,
+          'Do not call tool_search or plan_task again. Do not answer or declare completion until the bound read settles and you can report its actual result.',
+        ].join(' ');
+        continue;
+      }
       // Goal contract (Phase 3): a session with an ACTIVE parked goal
       // validates self-declared completion against the PARKED criteria — the
       // model saying "done" is a trigger to validate, never the verdict.
@@ -7805,7 +7970,8 @@ async function runConversationCore(
                 publicPresentation,
               };
             }
-            if (repaired.status === 'blocked_repaired') {
+            if (repaired.status === 'blocked_repaired'
+              || repaired.status === 'blocked_truth_projected') {
               userVisibleSummary = repaired.text;
               terminalRepairAlreadyDiscloses = true;
             }
@@ -8555,8 +8721,82 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const turnStartedAtIso = new Date().toISOString();
 
   const turn = nextTurnNumber(row);
+  let persistedRecoveryState: HostRecoveryState | undefined;
+  let adoptedCheckpointContinuation = false;
+  const recoveryBlob = session.loadRecoveryState();
+  if (recoveryBlob) {
+    try {
+      persistedRecoveryState = HostRecoveryState.fromString(recoveryBlob);
+    } catch {
+      // Corrupt private recovery bytes are not authority for a fresh model or
+      // tool attempt. Keep the exact source held for operator/store repair.
+      return {
+        sessionId: options.sessionId,
+        turn,
+        status: 'held',
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      };
+    }
+  }
 
-  if (isKillBeforeStart(options.sessionId, turn, session, options.sourceUserSeq)) {
+  let sourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? options.sourceUserSeq
+    : undefined;
+  if (persistedRecoveryState) {
+    if (
+      persistedRecoveryState.sessionId !== options.sessionId
+      || (sourceUserSeq !== undefined
+        && sourceUserSeq !== persistedRecoveryState.sourceUserSeq)
+    ) {
+      return {
+        sessionId: options.sessionId,
+        turn,
+        status: 'held',
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+      };
+    }
+    sourceUserSeq = persistedRecoveryState.sourceUserSeq;
+    if (persistedRecoveryState.phase === 'continue') {
+      const ref = persistedRecoveryState.acceptedModelBatchRef;
+      let reopened = ref
+        ? reopenAcceptedModelBatch(ref)
+        : { status: 'conflict' as const, reason: 'checkpoint continuation has no exact batch reference' };
+      if (reopened.status === 'unavailable' && ref) {
+        reopened = reopenAcceptedModelBatch(ref);
+      }
+      const checkpoint = reopened.status === 'checkpointed'
+        && reopened.checkpoint.disposition === 'ready'
+        ? reopened.checkpoint
+        : null;
+      if (
+        !checkpoint
+        || checkpoint.historyDigest
+          !== acceptedModelBatchHistoryDigest(persistedRecoveryState.history)
+        || (checkpoint.lastResponseId ?? undefined)
+          !== persistedRecoveryState.lastResponseId
+        || !session.adoptRecoveredConversation({
+          serializedState: recoveryBlob!,
+          history: persistedRecoveryState.history,
+          lastResponseId: persistedRecoveryState.lastResponseId,
+        })
+      ) {
+        return {
+          sessionId: options.sessionId,
+          turn,
+          status: 'held',
+          hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+        };
+      }
+      // The exact checkpoint is now the ordinary conversation snapshot. From
+      // here forward this is a fresh same-source continuation, so all normal
+      // memory/context/tool-surface/model policy layers run in their usual
+      // order; none were allowed to gate the prior bookkeeping adoption.
+      persistedRecoveryState = undefined;
+      adoptedCheckpointContinuation = true;
+    }
+  }
+
+  if (isKillBeforeStart(options.sessionId, turn, session, sourceUserSeq)) {
     return { sessionId: options.sessionId, turn, status: 'killed' };
   }
 
@@ -8567,10 +8807,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     type: 'turn_started',
     data: { input: clip(options.input, 200) },
   });
-  let sourceUserSeq = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
-    ? options.sourceUserSeq
-    : undefined;
-  if (!options.reuseRecordedUserInput && !sourceUserSeq) {
+  if (!persistedRecoveryState && !options.reuseRecordedUserInput && !sourceUserSeq) {
     const recorded = session.recordUserInput(options.authoritativeUserInput ?? options.input, turn);
     sourceUserSeq ??= recorded.seq;
   } else if (!sourceUserSeq) {
@@ -8580,9 +8817,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     sourceUserSeq = listEvents(options.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
   }
 
-  const selectedTurnEngine: TurnEngineMode = options.turnEngine ?? selectTurnEngine({
-    sessionKind: session.sessionRow.kind,
-  });
+  const selectedTurnEngine = requireFreshHostTurnEngine(
+    persistedRecoveryState?.turnEngine
+      ?? options.turnEngine
+      ?? selectTurnEngine({ sessionKind: session.sessionRow.kind }),
+  );
   const usesHostTurnEngine = options.runRunner === undefined
     && isHostTurnEngine(selectedTurnEngine);
   if (usesHostTurnEngine) {
@@ -8599,7 +8838,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       engine: selectedTurnEngine,
     });
   }
-  const hostSourceAlignmentDecision = usesHostTurnEngine && sourceUserSeq
+  // The exact plain-conversation proof has no effect/tool/discovery surface.
+  // Source-strategy alignment is action-semantic work, so do not open its
+  // durable read path on that proof. Near-actions and follow-ups never receive
+  // plainConversationSurface and retain the full alignment boundary.
+  const hostSourceAlignmentDecision = usesHostTurnEngine
+    && !options.plainConversationSurface
+    && sourceUserSeq
     ? confirmedSourceStrategyDecisionForSource(options.sessionId, sourceUserSeq)
     : null;
   const hostSourceConfirmationRequired = Boolean(
@@ -8619,7 +8864,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // (zero broad lookups). Constrained workflow nodes intentionally skip that
   // resolver, so this baseline also prevents their discovery seam from failing
   // merely because no chat-oriented context packet ran.
-  if (Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0) {
+  if (
+    !options.plainConversationSurface
+    && Number.isSafeInteger(sourceUserSeq)
+    && (sourceUserSeq ?? 0) > 0
+  ) {
     try {
       discoveryGovernor.initializeTask({
         sessionId: options.sessionId,
@@ -9016,10 +9265,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     } catch { /* graceful — never block a turn on prefix injection */ }
   }
 
-  const items: AgentInputItem[] = [
-    ...compactedItems,
-    { role: 'user', content: options.input },
-  ];
+  const items: AgentInputItem[] = adoptedCheckpointContinuation
+    ? [...compactedItems]
+    : [
+        ...compactedItems,
+        { role: 'user', content: options.input },
+      ];
 
   // v0.5.19 Bug H + callModelInputFilter adoption (replaces the manual
   // items.push approach). The retry-context inject is now defined
@@ -9243,6 +9494,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     // domain receipts before the first model step without granting authority.
     skipCapabilityHunt: usesHostTurnEngine,
     suppressSemanticEnrichment: declinedContinuation,
+    plainConversationSurface: options.plainConversationSurface === true,
     declinedParentWithNewTask,
     sourceUserSeq,
     memory: {
@@ -9353,12 +9605,23 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     role: 'system',
     type: 'turn_memory_primer',
     data: {
+      // The SOURCE identity, not just the turn number. `turn` is not a stable
+      // key — one exchange writes events at turn 0, 1 and 2 — so anything that
+      // joined this primer to its request by turn found nothing. Live
+      // 2026-08-28: model-request-provenance looked up by turn, missed a primer
+      // that was correct in every other respect, and killed the request before
+      // the model ran. Every other store in the harness joins on
+      // session_id + source_user_seq; this now carries it too.
+      sourceUserSeq: Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+        ? sourceUserSeq
+        : null,
       enabled: turnMemoryPrimer.enabled,
       queryPreview: clip(turnMemoryPrimer.query, 160),
       hitCount: turnMemoryPrimer.hitCount,
       includedCount: turnMemoryPrimer.hitCount,
       injected: Boolean(turnMemoryPrimer.text),
       injectedBytes: turnMemoryPrimer.injectedBytes,
+      visibleTextSha256: modelVisibleTextSha256(turnMemoryPrimer.text),
       source: turnMemoryPrimer.source ?? null,
       skippedReason: turnMemoryPrimer.skippedReason ?? null,
       recallId: turnMemoryPrimer.recallId ?? null,
@@ -9663,9 +9926,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // so this mutation is a no-op the SDK ignores and its default rides.
   if (dynamicReasoningEnabled()) {
     try {
-      const { effort, reason } = selectReasoningEffort(contextPacket.complexity, {
+      const effortSignals = reasoningEffortSignalsForTurn({
         interactive: session.sessionRow.kind === 'chat',
+        turnIntent: contextPacket.turnIntent,
+        multiItem: contextPacket.multiItem.detected,
+        text: classifierInput,
       });
+      const { effort, reason } = selectReasoningEffort(contextPacket.complexity, effortSignals);
       const agentRef = options.agent as unknown as { modelSettings?: Record<string, unknown> };
       const prev = agentRef.modelSettings ?? {};
       agentRef.modelSettings = {
@@ -9678,7 +9945,13 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         turn,
         role: 'system',
         type: 'reasoning_effort',
-        data: { effort, reason, complexity: contextPacket.complexity, kind: session.sessionRow.kind },
+        data: {
+          effort,
+          reason,
+          complexity: contextPacket.complexity,
+          kind: session.sessionRow.kind,
+          boundedForegroundAction: effortSignals.boundedForegroundAction === true,
+        },
       });
     } catch { /* effort selection must never break a turn */ }
   }
@@ -9787,6 +10060,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         );
         harnessCtx = {
           sessionId: options.sessionId,
+          interactiveForeground: session.sessionRow.kind === 'chat',
           turn,
           counter: toolCounter,
           sourceUserSeq,
@@ -9818,7 +10092,38 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         // session id + per-turn budget.
         return await withHarnessRunContext(
           harnessCtx,
-          () => run(runner, options.agent, items, opts),
+          async () => {
+            let outcome = await run(
+              runner,
+              options.agent,
+              (persistedRecoveryState ?? items) as unknown as AgentInputItem[],
+              opts,
+            );
+            if (outcome.hold && outcome.serializedRecoveryState) {
+              session.saveRecoveryState(outcome.serializedRecoveryState, {
+                mcpToolScope: harnessCtx?.mcpToolScope,
+              });
+              // One immediate exact re-entry closes ordinary transient local
+              // store failures. The recovery state replays neither model nor
+              // tool body; a second hold remains durable for the periodic/
+              // restart owner.
+              const recovery = HostRecoveryState.fromString(outcome.serializedRecoveryState);
+              if (recovery.phase !== 'continue') {
+                outcome = await run(
+                  runner,
+                  options.agent,
+                  recovery as unknown as AgentInputItem[],
+                  opts,
+                );
+                if (outcome.hold && outcome.serializedRecoveryState) {
+                  session.saveRecoveryState(outcome.serializedRecoveryState, {
+                    mcpToolScope: harnessCtx?.mcpToolScope,
+                  });
+                }
+              }
+            }
+            return outcome;
+          },
         ) as RunOutcome;
       },
     );
@@ -9829,6 +10134,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // approval_requested. registerAndEmitApprovals registers each
       // interruption in the addressable approval registry AND emits
       // the audit-log event with the approval ID inlined.
+      if (session.loadRecoveryState()) session.clearRecoveryState();
       session.saveInterruptState(outcome.serializedState, {
         mcpToolScope: harnessCtx?.mcpToolScope,
       });
@@ -9844,6 +10150,18 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (outcome.hold) {
       // The durable restart owner remains armed. Do not snapshot a carrier,
       // bump the logical conversation, or manufacture a public terminal.
+      if (outcome.serializedRecoveryState) {
+        session.saveRecoveryState(outcome.serializedRecoveryState, {
+          mcpToolScope: harnessCtx?.mcpToolScope,
+        });
+      }
+      if (outcome.serializedState) {
+        // Reopen failure for an existing approval retains that exact approval
+        // state but emits no new card/request event.
+        session.saveInterruptState(outcome.serializedState, {
+          mcpToolScope: harnessCtx?.mcpToolScope,
+        });
+      }
       return {
         sessionId: options.sessionId,
         turn,
@@ -9851,6 +10169,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         hold: outcome.hold,
       };
     }
+
+    if (session.loadRecoveryState()) session.clearRecoveryState();
 
     if (outcome.terminal?.status === 'blocked') {
       // A host-owned terminal is control data, not a model-authored ordinary
@@ -9869,6 +10189,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         status: 'blocked',
         error: publicReplyText(outcome.finalOutput, '')
           || 'The host stopped this turn at a durable execution boundary.',
+        ...(outcome.terminal.resumable === false ? { blockedResumable: false as const } : {}),
         toolCalls: toolCounter.currentCount,
       };
     }
@@ -9891,20 +10212,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       });
     }
 
-    session.recordTurnResult({
+    session.recordCompletedTurnResult({
       history: compactionRewrite.history,
       lastResponseId: outcome.lastResponseId,
       turn,
-    });
-    safeAppend({
-      sessionId: options.sessionId,
-      turn,
-      role: 'system',
-      type: 'run_completed',
-      data: {
-        finalOutputPreview: previewOutput(outcome.finalOutput),
-        toolCalls: toolCounter.currentCount,
-      },
+      finalOutputPreview: previewOutput(outcome.finalOutput),
+      toolCalls: toolCounter.currentCount,
     });
     // Post-turn hooks (correction detection then auto-credit) via the ONE shared
     // spine — identical on every brain lane. New post-turn behavior wires there.
@@ -9938,7 +10251,6 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (session.sessionRow.kind !== 'chat' && !approvalRegistry.hasPending(options.sessionId)) {
       session.markStatus('completed');
     }
-    bumpTurnNumber(options.sessionId, turn);
     return {
       sessionId: options.sessionId,
       turn,
@@ -10514,6 +10826,7 @@ export async function resumePendingApproval(
         // already installs this context unconditionally.
         resumeCtx = {
           sessionId: options.sessionId,
+          interactiveForeground: session.sessionRow.kind === 'chat',
           turn,
           counter: toolCounter,
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
@@ -10528,12 +10841,38 @@ export async function resumePendingApproval(
         };
         return await withHarnessRunContext(
           resumeCtx,
-          () => run(
-            runner,
-            options.agent,
-            state as unknown as AgentInputItem[],
-            { ...opts, stream: true },
-          ),
+          async () => {
+            let outcome = await run(
+              runner,
+              options.agent,
+              state as unknown as AgentInputItem[],
+              { ...opts, stream: true },
+            );
+            if (outcome.hold && outcome.serializedRecoveryState) {
+              session.saveRecoveryState(outcome.serializedRecoveryState, {
+                mcpToolScope: resumeAgentScopeBinding.bound
+                  ? resumeAgentScopeBinding.scope
+                  : undefined,
+              });
+              const recovery = HostRecoveryState.fromString(outcome.serializedRecoveryState);
+              if (recovery.phase !== 'continue') {
+                outcome = await run(
+                  runner,
+                  options.agent,
+                  recovery as unknown as AgentInputItem[],
+                  { ...opts, stream: true },
+                );
+                if (outcome.hold && outcome.serializedRecoveryState) {
+                  session.saveRecoveryState(outcome.serializedRecoveryState, {
+                    mcpToolScope: resumeAgentScopeBinding.bound
+                      ? resumeAgentScopeBinding.scope
+                      : undefined,
+                  });
+                }
+              }
+            }
+            return outcome;
+          },
         ) as RunOutcome;
       },
     );
@@ -10541,6 +10880,7 @@ export async function resumePendingApproval(
     if (outcome.hasInterruptions && outcome.serializedState) {
       // Same registry + emit pattern as runTurn; consolidated in
       // registerAndEmitApprovals so both surfaces stay in sync.
+      if (session.loadRecoveryState()) session.clearRecoveryState();
       session.saveInterruptState(outcome.serializedState, {
         mcpToolScope: resumeAgentScopeBinding.bound ? resumeAgentScopeBinding.scope : undefined,
       });
@@ -10552,6 +10892,31 @@ export async function resumePendingApproval(
       bumpTurnNumber(options.sessionId, turn);
       return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
     }
+
+    if (outcome.hold) {
+      if (outcome.serializedRecoveryState) {
+        session.saveRecoveryState(outcome.serializedRecoveryState, {
+          mcpToolScope: resumeAgentScopeBinding.bound
+            ? resumeAgentScopeBinding.scope
+            : undefined,
+        });
+      }
+      if (outcome.serializedState) {
+        session.saveInterruptState(outcome.serializedState, {
+          mcpToolScope: resumeAgentScopeBinding.bound
+            ? resumeAgentScopeBinding.scope
+            : undefined,
+        });
+      }
+      return {
+        sessionId: options.sessionId,
+        turn,
+        status: 'held',
+        hold: outcome.hold,
+      };
+    }
+
+    if (session.loadRecoveryState()) session.clearRecoveryState();
 
     if (outcome.terminal?.status === 'blocked') {
       session.recordTurnResult({
@@ -10566,6 +10931,7 @@ export async function resumePendingApproval(
         status: 'blocked',
         error: publicReplyText(outcome.finalOutput, '')
           || 'The host stopped this resumed turn at a durable execution boundary.',
+        ...(outcome.terminal.resumable === false ? { blockedResumable: false as const } : {}),
         toolCalls: toolCounter.currentCount,
       };
     }
@@ -10588,20 +10954,12 @@ export async function resumePendingApproval(
       });
     }
 
-    session.recordTurnResult({
+    session.recordCompletedTurnResult({
       history: compactionRewrite.history,
       lastResponseId: outcome.lastResponseId,
       turn,
-    });
-    safeAppend({
-      sessionId: options.sessionId,
-      turn,
-      role: 'system',
-      type: 'run_completed',
-      data: {
-        finalOutputPreview: previewOutput(outcome.finalOutput),
-        toolCalls: toolCounter.currentCount,
-      },
+      finalOutputPreview: previewOutput(outcome.finalOutput),
+      toolCalls: toolCounter.currentCount,
     });
     // A resumed turn has no memory primer; credit only tool-recorded recall
     // runs. The resumed state's full history stands in for "this turn's"
@@ -10634,7 +10992,6 @@ export async function resumePendingApproval(
     if (session.sessionRow.kind !== 'chat' && !approvalRegistry.hasPending(options.sessionId)) {
       session.markStatus('completed');
     }
-    bumpTurnNumber(options.sessionId, turn);
     return {
       sessionId: options.sessionId,
       turn,
@@ -10753,8 +11110,9 @@ export async function runConversationFromResume(opts: {
   // "I could not finish planning that" -- and on a scheduled owner there is
   // nobody to restate it to.
   const resumeSessionKind = getSession(opts.sessionId)?.kind ?? '';
-  const resumeTurnEngine: TurnEngineMode = opts.turnEngine
-    ?? selectTurnEngine({ sessionKind: resumeSessionKind });
+  const resumeTurnEngine = requireFreshHostTurnEngine(
+    opts.turnEngine ?? selectTurnEngine({ sessionKind: resumeSessionKind }),
+  );
   const resumeHostOwns = opts.runRunner === undefined && isHostTurnEngine(resumeTurnEngine);
   const graphEvent = resumeHostOwns ? null : await recordAcceptedSourceGraph({
     identity: {
@@ -10891,6 +11249,7 @@ export async function runConversationFromResume(opts: {
     // accepted event for telemetry.
     type ResumeSpineCore =
       | { kind: 'dispatched'; result: Awaited<ReturnType<typeof runConversationFromResumeCore>> }
+      | { kind: 'held'; result: Awaited<ReturnType<typeof runConversationFromResumeCore>> }
       | { kind: 'reduced'; reduced: ReturnType<typeof reduceStandardConversationTerminal> };
     const spine = await driveChatTurnSpine<ResumeSpineCore>({
       identity: { sessionId: opts.sessionId, turn: acceptedSource.turn, sourceUserSeq },
@@ -10908,6 +11267,7 @@ export async function runConversationFromResume(opts: {
             sourceUserSeq,
           });
           if (result.status === 'dispatched') return { kind: 'dispatched', result };
+          if (result.status === 'held') return { kind: 'held', result };
           return {
             kind: 'reduced',
             reduced: reduceStandardConversationTerminal({
@@ -10926,10 +11286,9 @@ export async function runConversationFromResume(opts: {
         publish: (core) => {
           if (core.kind !== 'reduced') return;
           emitRuntimeTerminalEvent(opts.sessionId, core.reduced);
-          refreshTerminalWorkingMemory(opts.sessionId);
         },
         delivered: (core) => core.kind === 'dispatched'
-          || core.reduced.status === 'completed',
+          || (core.kind === 'reduced' && core.reduced.status === 'completed'),
       },
     });
     if (spine.engine === 'legacy_order') {
@@ -10941,6 +11300,37 @@ export async function runConversationFromResume(opts: {
     const core = spine.core;
     if (core.kind === 'dispatched') {
       foregroundRelease = 'transfer';
+      return core.result;
+    }
+    if (core.kind === 'held') {
+      const sourceText = typeof acceptedSource.data.text === 'string'
+        ? acceptedSource.data.text
+        : `approval ${opts.decision}`;
+      scheduleHostCheckpointRecovery({
+        ...(opts.agent ? { agent: opts.agent } : {}),
+        ...(opts.buildAgent
+          ? {
+              buildAgent: async (identity) => opts.buildAgent!({
+                ...identity,
+                route: resumeCapabilityRoute,
+              }),
+            }
+          : {}),
+        sessionId: opts.sessionId,
+        input: sourceText,
+        sourceUserSeq,
+        reuseRecordedUserInput: true,
+        suppressMemoryCapture: true,
+        turnEngine: resumeTurnEngine,
+        runAttemptId: opts.runAttemptId,
+        maxSteps: opts.maxSteps,
+        maxWallClockMs: opts.maxWallClockMs,
+        maxTurns: opts.maxTurns,
+        toolCallsPerTurn: opts.toolCallsPerTurn,
+        maxRunTokens: opts.maxRunTokens,
+        makeRunner: opts.makeRunner,
+        runRunner: opts.runRunner,
+      }, sourceUserSeq);
       return core.result;
     }
     if (core.reduced.completedReason) return core.reduced;
@@ -11126,6 +11516,7 @@ async function runConversationFromResumeCore(opts: {
       lastDecision,
       lastTurn,
       error: firstResult.error,
+      ...(firstResult.hold ? { hold: firstResult.hold } : {}),
       ...(firstResult.limitKind ? { limitKind: firstResult.limitKind } : {}),
     };
   }
@@ -11412,7 +11803,8 @@ async function runConversationFromResumeCore(opts: {
                 publicPresentation,
               };
             }
-            if (repaired.status === 'blocked_repaired') {
+            if (repaired.status === 'blocked_repaired'
+              || repaired.status === 'blocked_truth_projected') {
               userVisibleSummary = repaired.text;
               terminalPresentationAlreadyDiscloses = true;
             }
@@ -11734,6 +12126,7 @@ async function runConversationFromResumeCore(opts: {
         lastDecision,
         lastTurn,
         error: turnResult.error,
+        ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
         ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
       };
     }
@@ -13495,8 +13888,10 @@ function extractInterruptionInfo(items: unknown[]): InterruptionInfo[] {
  * with Marlowe Rary'" reads better than "composio_execute_tool".
  *
  * Recognized shapes:
+ *   work_call({ name, args_json })
+ *       → recursively projects the exact stored inner carrier for display
  *   composio_execute_tool({ tool_slug, arguments: <json string> })
- *       → "<Toolkit Verb>: <subject from inner args>"
+ *       → "<Toolkit Verb> · subject/to/when/account from frozen args"
  *   run_shell_command({ command })
  *       → "Shell: <first 80 chars of command>"
  *   write_file({ path, contents? })
@@ -13506,32 +13901,145 @@ function extractInterruptionInfo(items: unknown[]): InterruptionInfo[] {
  *   fallback
  *       → toolName
  */
-function extractApprovalSubject(info: InterruptionInfo): string {
+const APPROVAL_DISPLAY_JSON_MAX_CHARS = 256_000;
+
+function approvalJsonRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (
+    typeof value !== 'string'
+    || !value.trim()
+    || value.length > APPROVAL_DISPLAY_JSON_MAX_CHARS
+  ) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function approvalField(
+  record: Record<string, unknown>,
+  names: readonly string[],
+): unknown {
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(record, name)) return record[name];
+  }
+  const normalizedNames = new Set(names.map((name) => name.toLowerCase().replace(/[^a-z0-9]/g, '')));
+  for (const [name, value] of Object.entries(record)) {
+    if (normalizedNames.has(name.toLowerCase().replace(/[^a-z0-9]/g, ''))) return value;
+  }
+  return undefined;
+}
+
+function approvalDisplayValue(
+  value: unknown,
+  nestedNames: readonly string[] = [],
+  depth = 0,
+): string | null {
+  if (typeof value === 'string') {
+    const text = value.replace(/\s+/g, ' ').trim();
+    return text ? truncate(text, 100) : null;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (Array.isArray(value)) {
+    const entries = value
+      .slice(0, 5)
+      .map((entry) => approvalDisplayValue(entry, nestedNames, depth + 1))
+      .filter((entry): entry is string => Boolean(entry));
+    if (entries.length === 0) return null;
+    return `${entries.join(', ')}${value.length > 5 ? ', …' : ''}`;
+  }
+  if (!value || typeof value !== 'object' || depth >= 3) return null;
+  const record = value as Record<string, unknown>;
+  const nested = approvalField(record, nestedNames);
+  return nested === undefined
+    ? null
+    : approvalDisplayValue(nested, nestedNames, depth + 1);
+}
+
+/**
+ * Build display copy only from the exact frozen gateway arguments stored on
+ * the approval interruption. This projection never changes the outer tool or
+ * args that the registry hashes and the resume path redeems.
+ */
+function composioApprovalSubject(
+  toolName: string,
+  gatewayArgs: Record<string, unknown>,
+): string {
+  const slug = typeof gatewayArgs.tool_slug === 'string' ? gatewayArgs.tool_slug : '';
+  const operation = truncate(humanizeComposioSlug(slug) || toolName, 80);
+  const providerArgs = approvalJsonRecord(gatewayArgs.arguments) ?? {};
+  const subject = approvalDisplayValue(approvalField(providerArgs, [
+    'subject', 'title', 'event_name', 'name', 'summary',
+  ]));
+  const recipient = approvalDisplayValue(approvalField(providerArgs, [
+    'to', 'recipient', 'recipient_email', 'recipient_emails', 'recipients',
+    'attendee', 'attendees', 'attendee_info', 'attendees_info', 'attendee_emails',
+    'invitee', 'invitees',
+    'email', 'emails',
+  ]), ['address', 'email', 'email_address', 'emailAddress', 'name']);
+  const when = approvalDisplayValue(approvalField(providerArgs, [
+    'start_time', 'start_datetime', 'start_date_time', 'start', 'date_time',
+    'datetime', 'scheduled_at', 'send_at', 'time', 'date',
+  ]), ['dateTime', 'date_time', 'datetime', 'time', 'date']);
+  const accountId = approvalDisplayValue(approvalField(gatewayArgs, [
+    'connected_account_id', 'account_id', 'account',
+  ]));
+  const account = (() => {
+    if (!accountId) return null;
+    const current = peekCurrentConnectedToolkits();
+    const connection = current?.find((candidate) => candidate.connectionId === accountId);
+    if (!connection) return `${truncate(accountId, 64)} (current identity unavailable)`;
+    const identity = approvalDisplayValue(
+      connection.accountEmail
+      ?? connection.accountLabel
+      ?? connection.accountName
+      ?? connection.alias,
+    );
+    return identity
+      ? `${truncate(identity, 80)} (${truncate(accountId, 64)})`
+      : `${truncate(accountId, 64)} (connected account has no email or alias)`;
+  })();
+  const details = [
+    subject ? `subject: ${truncate(subject, 80)}` : '',
+    recipient ? `to: ${truncate(recipient, 100)}` : '',
+    when ? `when: ${truncate(when, 80)}` : '',
+    account ? `account: ${account}` : '',
+  ].filter(Boolean);
+  // Bound each field independently, then keep every present field. Truncating
+  // the concatenated suffix used to silently erase the account or time when a
+  // long subject/recipient appeared first on the card.
+  return [operation, ...details].join(' · ');
+}
+
+function extractApprovalSubject(info: InterruptionInfo, unwrapWorkCall = true): string {
   const args = (info.args ?? {}) as Record<string, unknown>;
 
-  // composio_execute_tool: unwrap the inner args JSON.
-  if (info.toolName === 'composio_execute_tool') {
-    const slug = typeof args.tool_slug === 'string' ? args.tool_slug : '';
-    const innerRaw = typeof args.arguments === 'string' ? args.arguments : '';
-    let innerSubject = '';
-    if (innerRaw) {
-      try {
-        const inner = JSON.parse(innerRaw) as Record<string, unknown>;
-        innerSubject =
-          (typeof inner.subject === 'string' && inner.subject)
-          || (typeof inner.title === 'string' && inner.title)
-          || (typeof inner.name === 'string' && inner.name)
-          || (typeof inner.text === 'string' && inner.text)
-          || (typeof inner.message === 'string' && inner.message)
-          || (typeof inner.body === 'string' && (inner.body as string).slice(0, 80))
-          || '';
-      } catch {
-        // Inner args weren't JSON — fall through to slug-only label.
-      }
+  // Plan-bound mutations pause on the outer work_call. Unwrap its exact stored
+  // carrier bytes for display only; approval authority and resume continue to
+  // pin the untouched outer rawArgs/args. A missing or malformed inner record
+  // falls back closed to the outer tool name rather than model-authored prose.
+  if (unwrapWorkCall && isPlainOrClementineLocalTool(info.toolName, 'work_call')) {
+    const targetName = typeof args.name === 'string' ? args.name.trim() : '';
+    const targetArgs = approvalJsonRecord(args.args_json);
+    if (targetName && targetArgs) {
+      return extractApprovalSubject({
+        toolName: targetName,
+        args: targetArgs,
+        rawArgs: typeof args.args_json === 'string' ? args.args_json : JSON.stringify(targetArgs),
+      }, false);
     }
-    const verb = humanizeComposioSlug(slug);
-    if (innerSubject) return `${verb}: ${truncate(innerSubject, 100)}`;
-    return verb || info.toolName;
+    return targetName ? `work_call: ${targetName}` : 'work_call';
+  }
+
+  // composio_execute_tool: unwrap the inner args JSON.
+  if (isTrustedComposioGateway(info.toolName)) {
+    return composioApprovalSubject(info.toolName, args);
   }
 
   // run_batch: the plan carries everything a human needs — side effect, item

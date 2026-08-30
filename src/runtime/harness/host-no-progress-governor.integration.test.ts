@@ -1,0 +1,690 @@
+/**
+ * Causal production-host pin for the live discovery loop:
+ *
+ *   citable discovery -> repeated discovery with no new authority -> one
+ *   control-only recovery request -> hallucinated third discovery is paired
+ *   locally and terminalized without entering its body.
+ */
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, test } from 'node:test';
+
+const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-host-no-progress-'));
+process.env.CLEMENTINE_HOME = TEST_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+process.env.HARNESS_TOOL_BRACKETS = 'on';
+process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+process.env.CLEMMY_UNIFIED_RECALL = 'off';
+process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
+process.env.CLEMMY_SEMANTIC_RECALL = 'off';
+process.env.CLEMMY_DEBATE_MODE = 'off';
+process.env.CLEMMY_CODEX_TOOL_SEARCH = 'on';
+process.env.CLEMMY_TOOL_JIT = 'on';
+mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
+writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-host-no-progress\n', 'utf8');
+
+const eventlog = await import('./eventlog.js');
+const brackets = await import('./brackets.js');
+const catalogs = await import('./host-capability-catalog-factory.js');
+const localPlanning = await import('./local-planning-capability.js');
+const semanticPlanning = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
+const attemptSettlement = await import('./attempt-settlement.js');
+const dispatchLedger = await import('./dispatch-ledger.js');
+const attemptIdentity = await import('./attempt-identity.js');
+const turnGraphShadow = await import('../graph/turn-graph-shadow.js');
+const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+const {
+  HOST_NO_PROGRESS_BLOCKED_TEXT,
+  HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT,
+  HostInterruptState,
+  HostRecoveryState,
+  hostRunRunner,
+} = await import('./host-turn-runner.js');
+const {
+  createNoProgressConsequence,
+  initializeNoProgressGovernor,
+  observeNoProgress,
+} = await import('./no-progress-governor.js');
+const { projectHostNoProgressAuthority } = await import('./host-no-progress-projection.js');
+
+const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
+
+after(() => {
+  catalogs.installHostCapabilityCatalogFactory(priorCatalog);
+  eventlog.closeEventLog();
+  rmSync(TEST_HOME, { recursive: true, force: true });
+});
+
+function functionCall(callId: string, name: string, args: Record<string, unknown>) {
+  return {
+    type: 'function_call',
+    callId,
+    name,
+    arguments: JSON.stringify(args),
+  };
+}
+
+async function* modelStream(
+  this: { getResponse: (request: unknown) => Promise<Record<string, unknown>> },
+  request: unknown,
+) {
+  const response = await this.getResponse(request);
+  const output = Array.isArray(response.output) ? response.output : [];
+  yield { type: 'response_started' } as never;
+  yield {
+    type: 'model',
+    event: {
+      type: 'finish',
+      finishReason: output.some((item) => (
+        (item as { type?: unknown }).type === 'function_call'
+      )) ? 'tool_calls' : 'stop',
+    },
+  } as never;
+  yield {
+    type: 'response_done',
+    response: {
+      id: response.responseId,
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      output,
+    },
+  } as never;
+}
+
+function throwingRunner(): EventEmitter {
+  const runner = new EventEmitter();
+  (runner as unknown as { run: () => never }).run = () => {
+    throw new Error('legacy Runner.run must remain unreachable');
+  };
+  return runner;
+}
+
+test('approval-resume state preserves a spent no-progress retry and exact history cursor', () => {
+  const initial = initializeNoProgressGovernor({
+    taskKey: 'accepted-task:resume-pin',
+    authority: { operation: [], account: [], target: [], evidence: [], effect: [] },
+  });
+  const spent = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'dependency_lookup',
+    authority: initial.authority,
+  }).state;
+  const paused = new HostInterruptState(
+    [{ role: 'user', content: 'accepted source' }] as never,
+    [],
+    'accepted-response',
+    'host_v1',
+    {
+      state: spent,
+      historyCursor: 1,
+      recoveryOnly: true,
+      recoveryDirectiveWritten: true,
+    },
+  );
+  const resumed = HostInterruptState.fromString(paused.toString());
+  assert.equal(resumed.noProgressCheckpoint?.state.retriesRemaining, 0);
+  assert.equal(resumed.noProgressCheckpoint?.state.noProgressAttempts, 1);
+  assert.equal(resumed.noProgressCheckpoint?.historyCursor, 1);
+  assert.equal(resumed.noProgressCheckpoint?.recoveryOnly, true);
+
+  const forged = JSON.parse(paused.toString()) as Record<string, unknown>;
+  const checkpoint = forged.noProgressCheckpoint as {
+    state: { retriesRemaining: number };
+  };
+  checkpoint.state.retriesRemaining = 1;
+  assert.throws(
+    () => HostInterruptState.fromString(JSON.stringify(forged)),
+    /invalid no-progress checkpoint/i,
+  );
+});
+
+test('repeated discovery gets one control-only recovery and no third discovery crossing', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+
+  const prompt = 'Create one new local fixture file with the supplied content.';
+  const session = eventlog.createSession({ id: 'host-no-progress-discovery', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: prompt },
+  });
+  const observed = await localPlanning.observeCurrentLocalPlanningDefinition({
+    name: 'write_file',
+    carrier: 'work_call',
+  });
+  assert.equal(observed.ok, true, JSON.stringify(observed));
+  if (!observed.ok) return;
+  const primed = await semanticPlanning.primePrimaryModelPlanningCatalog({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  assert.deepEqual(primed.planning.capabilities, []);
+
+  let modelCalls = 0;
+  const surfaces: string[][] = [];
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      modelCalls += 1;
+      const surface = (request.tools ?? [])
+        .map((entry) => entry.name ?? '')
+        .filter(Boolean);
+      surfaces.push(surface);
+      if (modelCalls === 1) {
+        assert.ok(surface.includes('tool_search'));
+      } else if (modelCalls === 2) {
+        assert.ok(surface.includes('tool_search'));
+        assert.ok(surface.includes('plan_task'), 'the citable path enables exact plan admission');
+      } else {
+        assert.equal(surface.includes('tool_search'), false,
+          'the clean recovery cannot cross another discovery dependency');
+        assert.ok(surface.every((name) => (
+          name === 'plan_task' || name.split('__').at(-1) === 'ask_user_question'
+        )), JSON.stringify(surface));
+      }
+      return {
+        responseId: `host-no-progress-response-${modelCalls}`,
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        // The third response deliberately hallucinates the now-hidden search.
+        // The host must refuse it before the tool body even though the full
+        // configured agent still owns a real tool_search implementation.
+        output: [functionCall(`discover-${modelCalls}`, 'tool_search', {
+          query: modelCalls === 1 ? 'write_file' : `write_file alternate ${modelCalls}`,
+          role_key: null,
+          limit: 1,
+        })],
+      };
+    },
+    getStreamedResponse: modelStream,
+  };
+
+  const agent = await buildOrchestratorAgent({
+    userInput: prompt,
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    hostFreshPlanning: primed.planning,
+    allowedToolNames: ['write_file', 'tool_search'],
+    allowToolJit: true,
+    mcpToolScope: {
+      authority: 'none',
+      reason: 'local no-progress regression has no external authority',
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    },
+    model: model as never,
+  });
+  const parent = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    counter: new brackets.ToolCallsCounter(6),
+    behaviorScopeId: `${session.id}::turn:1`,
+  };
+
+  const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+    throwingRunner() as never,
+    agent as never,
+    [{ role: 'user', content: prompt }] as never,
+    {
+      maxTurns: 5,
+      hostTurnEngine: 'host_v1',
+      context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    } as never,
+  ));
+
+  assert.equal(modelCalls, 3);
+  assert.deepEqual(outcome.terminal, {
+    status: 'blocked',
+    reason: 'control_no_progress_exhausted',
+    resumable: false,
+  });
+  assert.equal(outcome.finalOutput, HOST_NO_PROGRESS_BLOCKED_TEXT);
+  assert.equal(surfaces[2]?.includes('tool_search'), false);
+  const called = eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] })
+    .map((event) => event.data.callId)
+    .filter((callId) => typeof callId === 'string');
+  assert.deepEqual(called.filter((callId) => String(callId).startsWith('discover-')), [
+    'discover-1',
+    'discover-2',
+  ], 'the hallucinated third discovery never enters the tool body');
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+       AND logical_tool_call_id = 'discover-3'
+  `).get(session.id, source.seq) as { n: number }).n, 0);
+});
+
+test('a host-only materialization gap transfers privately to HostRecoveryState without another model call', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  const prompt = 'Use the already connected account to complete the requested host-only plan.';
+  const session = eventlog.createSession({ id: 'host-no-progress-private-recovery', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: prompt },
+  });
+  assert.ok(turnGraphShadow.recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+  }));
+  const acceptedTaskId = attemptIdentity.acceptedTaskIdFor(session.id, source.seq);
+  const callId = 'plan-host-materialization-gap';
+  const args = { preamble: 'I’ll bind the exact destination.', draft: { criteria: ['one exact result'] } };
+  const refusal = JSON.stringify({
+    ok: false,
+    code: 'plan_not_admitted',
+    detail: 'host_destination_identity_unavailable:cap:fixture:connected-account',
+    repair: 'Refresh the host-owned destination binding and retry the exact plan.',
+  });
+  const physical = dispatchLedger.beginPhysicalDispatch({
+    identity: {
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      acceptedTaskId,
+      logicalToolCallId: callId,
+      physicalDispatchId: `dispatch:host:${callId}`,
+      ordinal: 1,
+    },
+    tool: 'plan_task',
+    args,
+    relation: 'primary',
+    executionSite: 'host',
+  });
+  assert.equal(physical.status, 'inserted');
+  if (physical.status !== 'inserted') return;
+  assert.equal(dispatchLedger.settlePhysicalDispatch({
+    identity: physical.identity,
+    tool: 'plan_task',
+    outcome: 'returned',
+  }).status, 'inserted');
+  const settled = attemptSettlement.settleToolAttempt({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    lane: 'byo',
+    toolName: 'plan_task',
+    callId,
+    args,
+    mutating: false,
+    businessCall: false,
+    result: refusal,
+  });
+  assert.notEqual(settled.outcome.kind, 'succeeded');
+
+  const authority = projectHostNoProgressAuthority({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(authority.status, 'ok');
+  if (authority.status !== 'ok') return;
+  const governor = initializeNoProgressGovernor({
+    taskKey: acceptedTaskId,
+    authority: authority.authority,
+  });
+  const history = [
+    { type: 'message', role: 'user', content: prompt },
+    functionCall(callId, 'plan_task', args),
+    {
+      type: 'function_call_result',
+      callId,
+      name: 'plan_task',
+      output: { type: 'text', text: refusal },
+    },
+  ];
+  const acceptedRef = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    acceptedTaskId,
+    batchOrdinal: 1,
+    batchId: 'a'.repeat(64),
+    authorityDigest: 'b'.repeat(64),
+  };
+  const resumed = new HostInterruptState(
+    history as never,
+    [],
+    'host-materialization-response',
+    'host_v1',
+    {
+      state: governor,
+      historyCursor: 1,
+      recoveryOnly: false,
+      recoveryDirectiveWritten: false,
+    },
+    acceptedRef,
+  );
+  const primed = await semanticPlanning.primePrimaryModelPlanningCatalog({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  let modelCalls = 0;
+  const model = {
+    async getResponse() {
+      modelCalls += 1;
+      throw new Error('host-owned recovery must transfer before another model request');
+    },
+    getStreamedResponse: modelStream,
+  };
+  const agent = await buildOrchestratorAgent({
+    userInput: prompt,
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    hostFreshPlanning: primed.planning,
+    allowedToolNames: ['tool_search'],
+    allowToolJit: true,
+    mcpToolScope: {
+      authority: 'none',
+      reason: 'host-only no-progress recovery regression',
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    },
+    model: model as never,
+  });
+  const parent = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    counter: new brackets.ToolCallsCounter(6),
+    behaviorScopeId: `${session.id}::turn:1`,
+  };
+  const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+    throwingRunner() as never,
+    agent as never,
+    resumed as never,
+    {
+      maxTurns: 5,
+      hostTurnEngine: 'host_v1',
+      context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    } as never,
+  ));
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(outcome.hold, {
+    owner: 'host', wake: 'recovery', reason: 'recovery_pending',
+  });
+  assert.equal(outcome.terminal, undefined);
+  assert.ok(outcome.serializedRecoveryState);
+  const privateState = HostRecoveryState.fromString(outcome.serializedRecoveryState!);
+  assert.equal(privateState.phase, 'continue');
+  assert.equal(privateState.noProgressCheckpoint?.state.lastConsequence?.stage,
+    'semantic_admission:host_destination_identity_unavailable');
+});
+
+test('ask-user recovery publishes only the exact durable question/options/purpose', async () => {
+  const question = 'Which connected account should I use?';
+  const choices = ['Scorpion', 'Breakthrough'];
+  const cases = [
+    {
+      label: 'completed-prose',
+      output: [{
+        type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text: 'Tell me whatever account details you have and ask me to continue.' }],
+      }],
+      exact: false,
+    },
+    {
+      label: 'wrong-question',
+      output: [functionCall('wrong-question', 'ask_user_question', {
+        question: 'Which account, or should I just choose for you?',
+        options: choices,
+        purpose: 'clarification',
+      })],
+      exact: false,
+    },
+    {
+      label: 'reordered-options',
+      output: [functionCall('reordered-options', 'ask_user_question', {
+        question,
+        options: [...choices].reverse(),
+        purpose: 'clarification',
+      })],
+      exact: false,
+    },
+    {
+      label: 'wrong-purpose',
+      output: [functionCall('wrong-ask', 'ask_user_question', {
+        question,
+        options: choices,
+        purpose: 'approval',
+      })],
+      exact: false,
+    },
+    {
+      label: 'exact',
+      output: [functionCall('exact-ask', 'ask_user_question', {
+        question,
+        options: choices,
+        purpose: 'clarification',
+      })],
+      exact: true,
+    },
+  ] as const;
+
+  for (const fixtureCase of cases) {
+    eventlog.resetEventLog();
+    catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+    const session = eventlog.createSession({
+      id: `host-no-progress-exact-ask-${fixtureCase.label}`,
+      kind: 'chat',
+    });
+    const source = eventlog.appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Use the connected account I choose.' },
+    });
+    const initial = initializeNoProgressGovernor({
+      taskKey: attemptIdentity.acceptedTaskIdFor(session.id, source.seq),
+      authority: { operation: [], account: [], target: [], evidence: [], effect: [] },
+    });
+    const asked = observeNoProgress(initial, {
+      taskKey: initial.taskKey,
+      attemptClass: 'plan_admission',
+      authority: initial.authority,
+      consequence: createNoProgressConsequence({
+        stage: 'input_required:account_selection',
+        recovery: 'ask_user',
+        effectState: 'not_started',
+        userInput: { question, choices, purpose: 'clarification' },
+      }),
+    });
+    assert.equal(asked.action, 'continue');
+    const resumed = new HostInterruptState(
+      [{ type: 'message', role: 'user', content: String(source.data.text) }] as never,
+      [],
+      undefined,
+      'host_v1',
+      {
+        state: asked.state,
+        historyCursor: 1,
+        recoveryOnly: true,
+        recoveryDirectiveWritten: false,
+      },
+    );
+    let modelCalls = 0;
+    const model = {
+      async getResponse() {
+        modelCalls += 1;
+        return {
+          responseId: `exact-ask-${fixtureCase.label}`,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          output: fixtureCase.output,
+        };
+      },
+      getStreamedResponse: modelStream,
+    };
+    const agent = await buildOrchestratorAgent({
+      userInput: String(source.data.text),
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      // This recovery fixture intentionally mounts only the host-control ask.
+      // The durable consequence, not an ambient business/catalog surface,
+      // owns its exact question authority.
+      allowedToolNames: ['ask_user_question'],
+      allowToolJit: true,
+      mcpToolScope: {
+        authority: 'none',
+        reason: 'exact no-progress ask regression',
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      },
+      model: model as never,
+    });
+    const parent = {
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      counter: new brackets.ToolCallsCounter(3),
+      behaviorScopeId: `${session.id}::turn:1`,
+    };
+    const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+      throwingRunner() as never,
+      agent as never,
+      resumed as never,
+      {
+        maxTurns: 3,
+        hostTurnEngine: 'host_v1',
+        context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+      } as never,
+    ));
+    assert.equal(modelCalls, 1);
+    const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+    if (fixtureCase.exact) {
+      assert.equal(outcome.terminal, undefined, JSON.stringify({
+        terminal: outcome.terminal,
+        finalOutput: outcome.finalOutput,
+        history: outcome.history,
+      }));
+      assert.equal(asks.length, 1);
+      assert.equal(asks[0]?.data.question, question);
+      assert.deepEqual(asks[0]?.data.options, choices);
+      assert.equal(asks[0]?.data.purpose, 'clarification');
+    } else {
+      assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
+      assert.equal(outcome.terminal?.resumable, false);
+      assert.equal(asks.length, 0);
+      assert.notEqual(outcome.finalOutput,
+        'Tell me whatever account details you have and ask me to continue.');
+    }
+  }
+});
+
+test('stop-factual recovery cannot manufacture an ask or resumable terminal', async () => {
+  for (const [label, text] of [
+    ['ask-marker', 'ASK: Please reconnect the account and tell me to continue.'],
+    ['approval-envelope', JSON.stringify({
+      summary: 'I need your approval to retry.',
+      reply: 'Approve another attempt?',
+      done: false,
+      nextAction: 'awaiting_approval',
+      reason: 'internal retry',
+    })],
+  ] as const) {
+    eventlog.resetEventLog();
+    catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+    const session = eventlog.createSession({
+      id: `host-no-progress-stop-factual-${label}`,
+      kind: 'chat',
+    });
+    const source = eventlog.appendEvent({
+      sessionId: session.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: 'Use the result that is already known.' },
+    });
+    const initial = initializeNoProgressGovernor({
+      taskKey: attemptIdentity.acceptedTaskIdFor(session.id, source.seq),
+      authority: { operation: [], account: [], target: [], evidence: [], effect: [] },
+    });
+    const recovery = observeNoProgress(initial, {
+      taskKey: initial.taskKey,
+      attemptClass: 'plan_admission',
+      authority: initial.authority,
+      consequence: createNoProgressConsequence({
+        stage: 'execution:known_terminal',
+        recovery: 'stop_factual',
+        effectState: 'known_terminal',
+      }),
+    });
+    assert.equal(recovery.action, 'continue');
+    const resumed = new HostInterruptState(
+      [{ type: 'message', role: 'user', content: String(source.data.text) }] as never,
+      [],
+      undefined,
+      'host_v1',
+      {
+        state: recovery.state,
+        historyCursor: 1,
+        recoveryOnly: true,
+        recoveryDirectiveWritten: false,
+      },
+    );
+    let modelCalls = 0;
+    const model = {
+      async getResponse() {
+        modelCalls += 1;
+        return {
+          responseId: `stop-factual-${label}`,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          output: [{
+            type: 'message', role: 'assistant', status: 'completed',
+            content: [{ type: 'output_text', text }],
+          }],
+        };
+      },
+      getStreamedResponse: modelStream,
+    };
+    const agent = await buildOrchestratorAgent({
+      userInput: String(source.data.text),
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      allowedToolNames: [],
+      allowToolJit: true,
+      mcpToolScope: {
+        authority: 'none',
+        reason: 'stop-factual no-progress regression',
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      },
+      model: model as never,
+    });
+    const parent = {
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      counter: new brackets.ToolCallsCounter(1),
+      behaviorScopeId: `${session.id}::turn:1`,
+    };
+    const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
+      throwingRunner() as never,
+      agent as never,
+      resumed as never,
+      {
+        maxTurns: 2,
+        hostTurnEngine: 'host_v1',
+        context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+      } as never,
+    ));
+    assert.equal(modelCalls, 1);
+    assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
+    assert.equal(outcome.terminal?.resumable, false);
+    assert.equal(outcome.finalOutput, HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT);
+    assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+    assert.notEqual(outcome.finalOutput, text);
+  }
+});

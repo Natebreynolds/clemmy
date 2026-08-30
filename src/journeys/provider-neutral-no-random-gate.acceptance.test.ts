@@ -40,14 +40,26 @@ writeFileSync(
 const eventlog = await import('../runtime/harness/eventlog.js');
 const brackets = await import('../runtime/harness/brackets.js');
 const envelopes = await import('../agents/capability-envelope.js');
-const { hostRunRunner, HostInterruptState } = await import('../runtime/harness/host-turn-runner.js');
+const {
+  hostRunRunner,
+  HostInterruptState,
+  HostRecoveryState,
+} = await import('../runtime/harness/host-turn-runner.js');
 const hostInvocation = await import('../runtime/harness/host-tool-invocation.js');
 const { runTurn, __defaultRunRunner } = await import('../runtime/harness/loop.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
+const acceptedModelBatches = await import('../runtime/harness/accepted-model-batch-checkpoint.js');
 const sdk = await import('@openai/agents');
 const { z } = await import('zod');
 const callTools = await import('../tools/call-tool.js');
 const toolRegistry = await import('../tools/tool-registry.js');
+const localWriteCommits = await import('../runtime/harness/host-local-write-commit.js');
+const workflowCommitFixture = (result: string) => localWriteCommits._withHostLocalWriteCommitFactsForTest({
+  createdId: 'fixture-workflow',
+  handle: 'vault/00-System/workflows/fixture-workflow/SKILL.md',
+  contentDigest: 'a'.repeat(64),
+  result,
+});
 const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const manifests = await import('../runtime/harness/capability-manifest.js');
 const ports = await import('../runtime/harness/production-capability-ports.js');
@@ -71,6 +83,7 @@ const capabilityResolution = await import('../runtime/harness/capability-resolut
 const independentObservations = await import('../runtime/harness/independent-capability-observation.js');
 const externalRiskLoader = await import('../runtime/harness/external-capability-risk-loader.js');
 const composioProviderIdentity = await import('../integrations/composio/provider-definition-identity.js');
+const composioOperationSemantics = await import('../integrations/composio/operation-semantics.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const hostConsent = await import('../runtime/harness/host-interactive-consent.js');
 
@@ -149,6 +162,37 @@ const functionCall = (callId: string, name: string, args: Record<string, unknown
   name,
   arguments: JSON.stringify(args),
 });
+
+/** Exact model-wire shape after strict nullable preparation. Workflow steps
+ * have many optional fields, and the current carrier canonicalizes every
+ * omission to null before freezing the effective argument digest. */
+function canonicalWorkflowInspectStep(): Record<string, unknown> {
+  return {
+    id: 'inspect',
+    prompt: 'Inspect the fixture and return a summary.',
+    sideEffect: 'read',
+    project: null,
+    dependsOn: null,
+    model: null,
+    intent: null,
+    tier: null,
+    maxTurns: null,
+    useHarness: null,
+    forEach: null,
+    forEachNewOnly: null,
+    subgraph: null,
+    transform: null,
+    call: null,
+    allowedTools: null,
+    usesSkill: null,
+    requiresApproval: null,
+    approvalPreview: null,
+    inputs: null,
+    output: null,
+    loopUntil: null,
+    loopSafe: null,
+  };
+}
 
 function throwingRunner(): EventEmitter {
   const runner = new EventEmitter();
@@ -633,16 +677,17 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
       label: 'workflow author',
       prompt: 'Author a disabled fixture workflow.',
       name: 'workflow_create',
-      args: { name: 'fixture-workflow', description: 'Fixture workflow', steps: [] },
+      args: {
+        name: 'fixture-workflow',
+        description: 'Fixture workflow',
+        steps: [canonicalWorkflowInspectStep()],
+      },
       properties: {
         name: { type: 'string' }, description: { type: 'string' }, steps: { type: 'array' },
       },
       required: ['name', 'description', 'steps'],
       write: true,
-      result: toolRegistry.withTerminalAuthoringEvidenceReceipt(
-        'workflow_create',
-        'Created disabled workflow fixture-workflow.',
-      ),
+      result: workflowCommitFixture('Created disabled workflow fixture-workflow.'),
     },
     {
       label: 'workflow change',
@@ -660,7 +705,10 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
       args: { name: 'fixture-workflow', inputs: '{}' },
       properties: { name: { type: 'string' }, inputs: { type: 'string' } },
       required: ['name', 'inputs'],
-      write: false,
+      // A run queues durable execution. It is a local mutation even when all
+      // authored workflow steps are reads, so an unplanned direct run belongs
+      // in the same zero-I/O repair matrix as other surprise writes.
+      write: true,
     },
   ];
 
@@ -1080,11 +1128,12 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       label: 'workflow author',
       name: 'workflow_create',
       prompt: 'Author one disabled workflow named planned-fixture-workflow.',
-      args: { name: 'planned-fixture-workflow', description: 'Planned fixture workflow', steps: [] },
-      result: toolRegistry.withTerminalAuthoringEvidenceReceipt(
-        'workflow_create',
-        'Created disabled workflow planned-fixture-workflow.',
-      ),
+      args: {
+        name: 'planned-fixture-workflow',
+        description: 'Planned fixture workflow',
+        steps: [canonicalWorkflowInspectStep()],
+      },
+      result: workflowCommitFixture('Created disabled workflow planned-fixture-workflow.'),
     },
     {
       label: 'workflow change',
@@ -1092,6 +1141,18 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       prompt: 'Change the description of the existing planned-fixture-workflow.',
       args: { name: 'planned-fixture-workflow', description: 'Updated planned fixture workflow' },
       result: JSON.stringify({ ok: true, name: 'planned-fixture-workflow', revision: 2 }),
+    },
+    {
+      label: 'targeted workflow step edit',
+      name: 'workflow_edit_step',
+      prompt: 'Change one exact prompt fragment in the existing planned-fixture-workflow.',
+      args: {
+        name: 'planned-fixture-workflow',
+        step_id: 'inspect',
+        find: 'Inspect the current files.',
+        replace: 'Inspect the current files and summarize the verified result.',
+      },
+      result: workflowCommitFixture('Updated the exact workflow step and preserved its siblings.'),
     },
   ] as const;
 
@@ -1637,7 +1698,11 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
         `${candidate.label}: effective prepared arguments drifted from the frozen work binding`,
       );
       assert.deepEqual(unmatchedFunctionCallIds({ input: outcome.history }), []);
-      assert.doesNotMatch(JSON.stringify(outcome), FORBIDDEN_PUBLIC_GATE, candidate.label);
+      // Search results legitimately contain authoring documentation that says
+      // malformed legacy runners "fail closed". That model-visible schema
+      // prose is not a public terminal. The exact body/result assertions above
+      // prove execution; constrain this oracle to the user-facing outcome.
+      assert.doesNotMatch(String(outcome.finalOutput ?? ''), FORBIDDEN_PUBLIC_GATE, candidate.label);
       assert.ok(modelInputs.length >= 3);
     });
   }
@@ -1900,6 +1965,32 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       source: null,
     },
     {
+      label: 'approved outbound checkpoint recovery never duplicates the send',
+      expected: 'needs_user',
+      resumeScenario: 'approve_checkpoint_recovery',
+      operation: 'FIXTURE_SEND_CHECKPOINT_RECOVERY',
+      destinationFamily: 'fixture',
+      destinationPosture: 'named_existing',
+      prompt: 'Send one exact approved fixture and recover private bookkeeping without sending it twice.',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title', 'recipient', 'send'],
+        properties: {
+          title: { type: 'string' },
+          recipient: { type: 'string' },
+          send: { type: 'boolean' },
+        },
+      },
+      args: {
+        title: 'Release checkpoint recovery fixture',
+        recipient: 'checkpoint-recovery@example.test',
+        send: true,
+      },
+      result: { successful: true, message_id: 'release-checkpoint-recovery-fixture' },
+      source: null,
+    },
+    {
       label: 'approved exact outbound whose tool surface disappears replans before I/O',
       expected: 'needs_user',
       resumeScenario: 'approve_surface_loss',
@@ -2002,19 +2093,30 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       source: null,
     },
     {
-      label: 'missing destination repairs before I/O',
-      expected: 'plan_repair',
-      operation: 'FIXTURE_CREATE_RESOURCE',
+      label: 'destinationless exact outbound derives current destination before consent',
+      expected: 'needs_user',
+      resumeScenario: 'reject',
+      includeDestination: false,
+      operation: 'FIXTURE_SEND_DESTINATIONLESS',
       destinationFamily: 'fixture',
-      prompt: 'Create a resource, but no destination has been selected.',
+      destinationPosture: 'named_existing',
+      prompt: 'Send one exact fixture to the named recipient.',
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['body'],
-        properties: { body: { type: 'string' } },
+        required: ['title', 'recipient', 'send'],
+        properties: {
+          title: { type: 'string' },
+          recipient: { type: 'string' },
+          send: { type: 'boolean' },
+        },
       },
-      args: { body: 'destination-required-fixture' },
-      result: { successful: true, id: 'must-not-run' },
+      args: {
+        title: 'Destinationless exact fixture',
+        recipient: 'destinationless@example.test',
+        send: true,
+      },
+      result: { successful: true, message_id: 'must-not-run-before-consent' },
       source: null,
     },
   ] as const;
@@ -2080,6 +2182,11 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const destinationPosture = 'destinationPosture' in candidate
         ? candidate.destinationPosture
         : 'create_new' as const;
+      const operationSemantics = composioOperationSemantics
+        .validateDocumentedComposioManifestOperationSemantics({
+          operationId: candidate.operation,
+          inputSchema: candidate.schema,
+        });
       const manifest = manifests.attachSemanticContract({
         version: 1,
         manifestId: capabilityRef,
@@ -2102,6 +2209,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           },
         },
         effect: 'external_write',
+        ...(operationSemantics ? { operationSemantics } : {}),
         destination: { family: candidate.destinationFamily, posture: destinationPosture },
         accountId,
         idempotency: { required: true, policy: 'key_before_dispatch' },
@@ -2113,7 +2221,12 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         acceptedInputKinds: ['evidence', 'records'],
         producedOutputKinds: ['evidence', 'created_resource'],
         applicableDeliverableKinds: ['evidence', candidate.destinationFamily],
-        evidenceContract: { kinds: ['receipt'], readbackRequired: false },
+        evidenceContract: operationSemantics?.atomicInputContent
+          ? {
+              kinds: [...operationSemantics.atomicInputContent.evidence],
+              readbackRequired: false,
+            }
+          : { kinds: ['receipt'], readbackRequired: false },
         provenance: {
           issuer: 'journey:provider-neutral-external-fixture',
           issuedAt: '2026-08-23T00:00:00.000Z',
@@ -2524,7 +2637,9 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
                 operationId,
                 capabilityRef,
                 destinationFamily: candidate.destinationFamily,
-                includeDestination: candidate.expected !== 'plan_repair',
+                includeDestination: 'includeDestination' in candidate
+                  ? candidate.includeDestination !== false
+                  : true,
                 destinationPosture,
                 ...(ordinarySiblingOperationId && ordinarySiblingCapabilityRef
                   ? {
@@ -2554,17 +2669,9 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
               SELECT contract_json FROM accepted_task_work_contracts
                WHERE session_id = ? AND source_user_seq = ?
             `).get(plannedSession.id, source.seq) as { contract_json: string } | undefined;
-            if (candidate.expected === 'plan_repair') {
-              assert.match(
-                String(planResult ?? ''),
-                /plan_not_admitted|write_not_aligned|error|refus|invalid|destination/i,
-              );
-              assert.equal(frozen, undefined, 'missing destination must not freeze executable work');
-              output = [assistantText(`${candidate.label} completed from its exact accepted plan.`)];
-            } else {
-              assert.doesNotMatch(String(planResult ?? ''), /error|refus|invalid/i, String(planResult));
-              assert.ok(frozen, `plan_task did not freeze external coverage: ${planResult}`);
-              output = candidate.source
+            assert.doesNotMatch(String(planResult ?? ''), /error|refus|invalid/i, String(planResult));
+            assert.ok(frozen, `plan_task did not freeze external coverage: ${planResult}`);
+            output = candidate.source
               ? [functionCall(sourceCallId, 'work_call', {
                   requirement_id: `external-source-${index}`,
                   universe_item_id: null,
@@ -2604,7 +2711,6 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
                     }),
                   }),
                 ];
-            }
           } else if (candidate.source && modelCalls === workModelCall + 1) {
             assert.equal(
               functionResultTextFor((request as { input?: unknown }).input, sourceCallId),
@@ -2803,42 +2909,37 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const ordinaryHostBindings = hostBindings.filter((row) => (
         (row as { logical_tool_call_id?: unknown }).logical_tool_call_id === ordinarySiblingCallId
       ));
-      if (candidate.expected === 'plan_repair') {
-        assert.equal(workBindings.length, 0, `${candidate.label}: no work may bind`);
-        assert.equal(workHostBindings.length, 0, `${candidate.label}: no call may bind`);
-      } else {
-        // Source-derived content proof is checked before the mutation claim is
-        // minted, so only the already-settled source binding remains. Later
-        // policy refusals retain the exact work claim for durable audit.
-        const expectedWorkBindingCount = candidate.expected === 'source_proof_repair'
-          ? 1
-          : candidate.source ? 2 : ordinarySiblingOperationId ? 2 : 1;
-        assert.equal(
-          workBindings.length,
-          expectedWorkBindingCount,
-          `${candidate.label}: expected-work binding cardinality`,
-        );
-        assert.equal(workHostBindings.length, 1, `${candidate.label}: host binding cardinality`);
-        assert.deepEqual(workHostBindings[0], {
-          logical_tool_call_id: workCallId,
-          binding_kind: 'catalog_manifest',
-          capability_id: capabilityRef,
-          operation_id: candidate.operation,
-          account_id: accountId,
-          provider_input_schema_digest: schemaDigest,
-          effect: 'external_write',
-        });
-        if (ordinarySiblingCallId) {
-          assert.deepEqual(ordinaryHostBindings, [{
-            logical_tool_call_id: ordinarySiblingCallId,
-            binding_kind: 'local_envelope',
-            capability_id: 'work_call',
-            operation_id: 'work_call',
-            account_id: '',
-            provider_input_schema_digest: null,
-            effect: 'local_write',
-          }]);
-        }
+      // Source-derived content proof is checked before the mutation claim is
+      // minted, so only the already-settled source binding remains. Later
+      // policy refusals retain the exact work claim for durable audit.
+      const expectedWorkBindingCount = candidate.expected === 'source_proof_repair'
+        ? 1
+        : candidate.source ? 2 : ordinarySiblingOperationId ? 2 : 1;
+      assert.equal(
+        workBindings.length,
+        expectedWorkBindingCount,
+        `${candidate.label}: expected-work binding cardinality`,
+      );
+      assert.equal(workHostBindings.length, 1, `${candidate.label}: host binding cardinality`);
+      assert.deepEqual(workHostBindings[0], {
+        logical_tool_call_id: workCallId,
+        binding_kind: 'catalog_manifest',
+        capability_id: capabilityRef,
+        operation_id: candidate.operation,
+        account_id: accountId,
+        provider_input_schema_digest: schemaDigest,
+        effect: 'external_write',
+      });
+      if (ordinarySiblingCallId) {
+        assert.deepEqual(ordinaryHostBindings, [{
+          logical_tool_call_id: ordinarySiblingCallId,
+          binding_kind: 'local_envelope',
+          capability_id: 'work_call',
+          operation_id: 'work_call',
+          account_id: '',
+          provider_input_schema_digest: null,
+          effect: 'local_write',
+        }]);
       }
       assert.equal(
         physical.filter((row) => (
@@ -2851,7 +2952,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         settlements.filter((row) => (
           (row as { logical_tool_call_id?: unknown }).logical_tool_call_id === workCallId
         )).length,
-        candidate.expected === 'plan_repair' || candidate.expected === 'needs_user' ? 0 : 1,
+        candidate.expected === 'needs_user' ? 0 : 1,
         `${candidate.label}: settlement cardinality`,
       );
       if (
@@ -2862,7 +2963,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       }
       assert.equal(
         modelCalls,
-        candidate.expected === 'plan_repair' || candidate.expected === 'needs_user'
+        candidate.expected === 'needs_user'
           ? ordinarySiblingOperationId ? 3 : 2
           : candidate.source ? 4 : 3,
       );
@@ -2942,21 +3043,44 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           behaviorScopeId: `${plannedSession.id}::resume:1`,
         };
         if (resumeScenario === 'approve_surface_loss') exactSurfaceAvailable = false;
-        const resumed = await brackets.withHarnessRunContext(resumedParent, () => hostRunRunner(
-          throwingRunner() as never,
-          agent as never,
-          restarted as never,
-          {
-            maxTurns: 6,
-            hostTurnEngine: 'host_v1',
-            hostApprovalId: approval.approvalId,
-            ...(resumeScenario === 'approve_unknown_restart'
-              ? { hostToolDeadlineMs: 250 }
-              : {}),
-            context: { sessionId: plannedSession.id, sourceUserSeq: source.seq, turn: 2 },
-          } as never,
-        ));
+        const projectionFailureTrigger = resumeScenario === 'approve_checkpoint_recovery'
+          ? `reject_external_projection_receipt_${index}`
+          : null;
+        if (projectionFailureTrigger) {
+          const sessionId = plannedSession.id.replaceAll("'", "''");
+          const callId = workCallId.replaceAll("'", "''");
+          eventlog.openEventLog().exec(`
+            CREATE TEMP TRIGGER ${projectionFailureTrigger}
+            BEFORE INSERT ON logical_model_result_projection_receipts
+            WHEN NEW.session_id = '${sessionId}' AND NEW.call_id = '${callId}'
+            BEGIN
+              SELECT RAISE(ABORT, 'fixture external projection receipt unavailable');
+            END
+          `);
+        }
+        let resumed: Awaited<ReturnType<typeof hostRunRunner>>;
+        try {
+          resumed = await brackets.withHarnessRunContext(resumedParent, () => hostRunRunner(
+            throwingRunner() as never,
+            agent as never,
+            restarted as never,
+            {
+              maxTurns: 6,
+              hostTurnEngine: 'host_v1',
+              hostApprovalId: approval.approvalId,
+              ...(resumeScenario === 'approve_unknown_restart'
+                ? { hostToolDeadlineMs: 250 }
+                : {}),
+              context: { sessionId: plannedSession.id, sourceUserSeq: source.seq, turn: 2 },
+            } as never,
+          ));
+        } finally {
+          if (projectionFailureTrigger) {
+            eventlog.openEventLog().exec(`DROP TRIGGER IF EXISTS ${projectionFailureTrigger}`);
+          }
+        }
         const exactApprovedLifecycleScenario = resumeScenario === 'approve_restart'
+          || resumeScenario === 'approve_checkpoint_recovery'
           || resumeScenario === 'approve_surface_loss'
           || resumeScenario === 'approve_unknown_restart';
         if (!exactApprovedLifecycleScenario) {
@@ -3018,6 +3142,224 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           operationId,
           ordinarySiblingOperationId,
         );
+        if (resumeScenario === 'approve_checkpoint_recovery') {
+          assert.equal(resumed.terminal, undefined, 'local checkpoint storage never becomes a public block');
+          assert.equal(resumed.finalOutput, undefined, 'local checkpoint storage authors no retry text');
+          assert.deepEqual(resumed.hold, {
+            owner: 'host',
+            wake: 'recovery',
+            reason: 'recovery_pending',
+          });
+          assert.ok(resumed.serializedRecoveryState, 'the exact settled result remains privately owned');
+          const recovery = HostRecoveryState.fromString(resumed.serializedRecoveryState!);
+          assert.equal(recovery.phase, 'finalize');
+          assert.equal(recovery.acceptedModelBatchRef?.sessionId, plannedSession.id);
+          assert.equal(recovery.acceptedModelBatchRef?.sourceUserSeq, source.seq);
+          assert.equal(modelCalls, 2, 'the uncheckpointed result reaches no later model request');
+          assert.equal(bodies, 1, 'the approved provider body crosses exactly once before recovery');
+          assert.equal(writeBodies, 1);
+          assert.equal(localBodies, 0);
+          assert.deepEqual(bindingCountsAtBody, [{ work: 1, host: 1 }]);
+          assert.deepEqual(seenProviderArgs, [candidate.args]);
+          assert.deepEqual(mutationBodyOrder, ['send']);
+          assert.deepEqual(resumedPhysical, [{
+            logical_tool_call_id: workCallId,
+            tool_name: candidate.operation.toLowerCase(),
+            state: 'returned',
+            execution_site: 'host',
+          }], 'one returned physical row is the host-owned provider crossing oracle');
+          assert.deepEqual(
+            resumedAllSettlements.filter((row) => (
+              (row as { logical_tool_call_id?: unknown }).logical_tool_call_id === workCallId
+            )),
+            [{
+              logical_tool_call_id: workCallId,
+              execution_kind: 'local_execution',
+              outcome_kind: 'succeeded',
+              business_call: 1,
+              mutating: 1,
+              requirement_id: operationId,
+              recovery_action: 'settle',
+              retry_same_candidate: 0,
+              requires_reconciliation: 0,
+              physical_crossing_count: 0,
+            }],
+            'the landed external write is successful and never reconciliation-owned',
+          );
+          assert.deepEqual(resumedDb.prepare(`
+            SELECT
+              (SELECT COUNT(*) FROM logical_model_result_projection_receipts
+                WHERE session_id = ? AND source_user_seq = ? AND call_id = ?) AS receipts,
+              (SELECT COUNT(*) FROM accepted_model_batch_checkpoints
+                WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?) AS checkpoints
+          `).get(
+            plannedSession.id,
+            source.seq,
+            workCallId,
+            plannedSession.id,
+            source.seq,
+            recovery.acceptedModelBatchRef!.batchOrdinal,
+          ), { receipts: 0, checkpoints: 0 });
+
+          const approvalRowsBeforeRecovery = resumedDb.prepare(`
+            SELECT approval_id, status, resolution FROM pending_approvals
+             WHERE session_id = ? ORDER BY approval_id
+          `).all(plannedSession.id);
+          assert.deepEqual(approvalRowsBeforeRecovery, [{
+            approval_id: approval.approvalId,
+            status: 'resolved',
+            resolution: 'approved',
+          }], 'one exact resolved approval remains the only card authority');
+
+          const openRecoveryHistory = [
+            ...recovery.history,
+            ...recovery.frameHistory,
+          ];
+          assert.equal(acceptedModelBatches.reopenAcceptedModelBatch(
+            recovery.acceptedModelBatchRef!,
+            { openHistory: openRecoveryHistory },
+          ).status, 'open', 'the exact proven null-to-plan binding transition reopens');
+          assert.equal(acceptedModelBatches.reopenAcceptedModelBatch({
+            ...recovery.acceptedModelBatchRef!,
+            sourceUserSeq: source.seq + 1,
+          }).status, 'conflict', 'a different source cannot borrow the transition proof');
+          assert.equal(acceptedModelBatches.reopenAcceptedModelBatch({
+            ...recovery.acceptedModelBatchRef!,
+            acceptedTaskId: `${recovery.acceptedModelBatchRef!.acceptedTaskId}:different`,
+          }).status, 'conflict', 'a different task cannot borrow the transition proof');
+
+          const exactResolution = resumedDb.prepare(`
+            SELECT accepted_task_id, graph_hash, state
+              FROM accepted_task_resolutions
+             WHERE session_id = ? AND source_user_seq = ?
+          `).get(plannedSession.id, source.seq) as {
+            accepted_task_id: string;
+            graph_hash: string;
+            state: string;
+          };
+          try {
+            resumedDb.prepare(`
+              UPDATE accepted_task_resolutions SET state = 'legacy_ambiguous'
+               WHERE session_id = ? AND source_user_seq = ?
+            `).run(plannedSession.id, source.seq);
+            assert.ok(['conflict', 'unavailable'].includes(acceptedModelBatches.reopenAcceptedModelBatch(
+              recovery.acceptedModelBatchRef!,
+              { openHistory: openRecoveryHistory },
+            ).status), 'an ambiguous current binding stays fail-closed');
+          } finally {
+            resumedDb.prepare(`
+              UPDATE accepted_task_resolutions SET state = ?
+               WHERE session_id = ? AND source_user_seq = ?
+            `).run(exactResolution.state, plannedSession.id, source.seq);
+          }
+          try {
+            resumedDb.prepare(`
+              UPDATE accepted_task_resolutions SET accepted_task_id = ?
+               WHERE session_id = ? AND source_user_seq = ?
+            `).run(`${exactResolution.accepted_task_id}:different`, plannedSession.id, source.seq);
+            assert.ok(['conflict', 'unavailable'].includes(acceptedModelBatches.reopenAcceptedModelBatch(
+              recovery.acceptedModelBatchRef!,
+              { openHistory: openRecoveryHistory },
+            ).status), 'a missing exact task/contract binding stays fail-closed');
+          } finally {
+            resumedDb.prepare(`
+              UPDATE accepted_task_resolutions SET accepted_task_id = ?
+               WHERE session_id = ? AND source_user_seq = ?
+            `).run(exactResolution.accepted_task_id, plannedSession.id, source.seq);
+          }
+
+          const durableSession = HarnessSession.load(plannedSession.id);
+          assert.ok(durableSession, 'the exact accepted session must survive bookkeeping recovery');
+          durableSession.saveRecoveryState(resumed.serializedRecoveryState!);
+          const recoveryTurnOptions = {
+            sessionId: plannedSession.id,
+            input: candidate.prompt,
+            sourceUserSeq: source.seq,
+            reuseRecordedUserInput: true as const,
+            suppressMemoryCapture: true,
+            turnEngine: 'host_v1' as const,
+            agent: agent as never,
+            makeRunner: throwingRunner as never,
+            maxTurns: 6,
+            toolCallsPerTurn: 12,
+          };
+
+          const finalizedWake = await runTurn(recoveryTurnOptions);
+          assert.equal(finalizedWake.status, 'held', JSON.stringify(finalizedWake));
+          assert.deepEqual(finalizedWake.hold, {
+            owner: 'host',
+            wake: 'recovery',
+            reason: 'recovery_pending',
+          });
+          const continuationBytes = HarnessSession.load(plannedSession.id)?.loadRecoveryState();
+          assert.ok(continuationBytes);
+          const continuation = HostRecoveryState.fromString(continuationBytes!);
+          assert.equal(continuation.phase, 'continue');
+          assert.equal(continuation.acceptedModelBatchRef?.batchId,
+            recovery.acceptedModelBatchRef?.batchId);
+          assert.equal(bodies, 1, 'finalize wake cannot redispatch the provider body');
+          assert.equal(modelCalls, 2, 'finalize wake cannot replay the model');
+          assert.deepEqual(resumedDb.prepare(`
+            SELECT
+              (SELECT COUNT(*) FROM logical_model_result_projection_receipts
+                WHERE session_id = ? AND source_user_seq = ? AND call_id = ?) AS receipts,
+              (SELECT COUNT(*) FROM accepted_model_batch_checkpoints
+                WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?) AS checkpoints
+          `).get(
+            plannedSession.id,
+            source.seq,
+            workCallId,
+            plannedSession.id,
+            source.seq,
+            recovery.acceptedModelBatchRef!.batchOrdinal,
+          ), { receipts: 1, checkpoints: 1 });
+
+          const completedWake = await runTurn(recoveryTurnOptions);
+          assert.equal(completedWake.status, 'completed', JSON.stringify(completedWake));
+          assert.equal(completedWake.finalOutput,
+            `${candidate.label} completed from its exact accepted plan.`);
+          assert.equal(bodies, 1, 'terminal continuation cannot duplicate the approved send');
+          assert.equal(writeBodies, 1);
+          assert.equal(modelCalls, 3, 'only the ordinary post-checkpoint continuation reaches the model');
+          assert.equal(HarnessSession.load(plannedSession.id)?.loadRecoveryState(), null);
+          assert.deepEqual(resumedDb.prepare(`
+            SELECT logical_tool_call_id, state FROM physical_dispatches
+             WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+          `).all(plannedSession.id, source.seq, workCallId), [{
+            logical_tool_call_id: workCallId,
+            state: 'returned',
+          }]);
+          assert.deepEqual(resumedDb.prepare(`
+            SELECT approval_id, status, resolution FROM pending_approvals
+             WHERE session_id = ? ORDER BY approval_id
+          `).all(plannedSession.id), approvalRowsBeforeRecovery,
+          'checkpoint recovery mints no second approval or card');
+          assert.equal(eventlog.listEvents(plannedSession.id, {
+            types: ['approval_requested', 'approval_required', 'request_approval', 'awaiting_user_input'],
+          }).filter((event) => event.data.sourceUserSeq === source.seq).length, 0,
+          'private bookkeeping emits no new user-visible approval/question event');
+          assert.equal(functionResultIds(
+            (modelInputs[2] as { input?: unknown } | undefined)?.input,
+          ).filter((callId) => callId === workCallId).length, 1,
+          'the next model sees the exact result once');
+          assert.deepEqual(unmatchedFunctionCallIds(modelInputs[2]), []);
+          assert.doesNotMatch(JSON.stringify(completedWake), FORBIDDEN_PUBLIC_GATE);
+          try {
+            resumedDb.prepare(`
+              UPDATE accepted_task_resolutions SET graph_hash = ?
+               WHERE session_id = ? AND source_user_seq = ?
+            `).run('f'.repeat(64), plannedSession.id, source.seq);
+            assert.ok(['conflict', 'unavailable'].includes(acceptedModelBatches.reopenAcceptedModelBatch(
+              recovery.acceptedModelBatchRef!,
+            ).status), 'a changed non-null graph binding stays fail-closed');
+          } finally {
+            resumedDb.prepare(`
+              UPDATE accepted_task_resolutions SET graph_hash = ?
+               WHERE session_id = ? AND source_user_seq = ?
+            `).run(exactResolution.graph_hash, plannedSession.id, source.seq);
+          }
+          return;
+        }
         if (resumeScenario === 'approve_surface_loss') {
           assert.equal(surfaceRefreshFailures >= 1, true, 'resume refresh observes the vanished surface');
           assert.equal(resumed.terminal, undefined, 'surface loss is paired for ordinary model replan');
@@ -3301,11 +3643,12 @@ test('retired bare SDK adapter pairs unsupported discovery without becoming a pu
     },
     {
       label: 'workflow author', name: 'workflow_create',
-      args: { name: 'fixture-workflow', description: 'Fixture workflow', steps: [] },
-      result: toolRegistry.withTerminalAuthoringEvidenceReceipt(
-        'workflow_create',
-        'Created disabled workflow fixture-workflow.',
-      ),
+      args: {
+        name: 'fixture-workflow',
+        description: 'Fixture workflow',
+        steps: [canonicalWorkflowInspectStep()],
+      },
+      result: workflowCommitFixture('Created disabled workflow fixture-workflow.'),
     },
     {
       label: 'workflow change', name: 'workflow_update',
@@ -3759,7 +4102,7 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   });
   const toolName = 'workspace_roots';
   const args = {};
-  const sourceACallIds = ['retirement-source-a-1', 'retirement-source-a-2', 'retirement-source-a-3'];
+  const sourceACallIds = ['retirement-source-a-1', 'retirement-source-a-2'];
   let bodies = 0;
   const sourceATools = zeroCrossingRefusalTools(
     [{ name: toolName, args }],
@@ -3793,16 +4136,18 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
     } as never,
   ));
   assert.equal(bodies, 0);
-  assert.equal(sourceAModel.calls(), 3);
+  assert.equal(sourceAModel.calls(), 2,
+    'the no-progress governor stops before paying for a third identical dead call');
   assert.deepEqual(functionResultIds(outcomeA.history), sourceACallIds);
   assert.deepEqual(unmatchedFunctionCallIds({ input: outcomeA.history }), []);
   const sourceAFirst = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[0]!)!);
   const sourceASecond = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[1]!)!);
-  const sourceARetired = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[2]!)!);
-  assert.deepEqual(
-    [sourceAFirst.retry, sourceASecond.retry, sourceARetired.retry],
-    ['replan', 'replan', 'do_not_retry'],
-  );
+  assert.deepEqual([sourceAFirst.retry, sourceASecond.retry], ['replan', 'replan']);
+  assert.deepEqual(outcomeA.terminal, {
+    status: 'blocked',
+    reason: 'control_no_progress_exhausted',
+    resumable: false,
+  });
   retirementSession.recordTurnResult({
     history: outcomeA.history,
     lastResponseId: outcomeA.lastResponseId,

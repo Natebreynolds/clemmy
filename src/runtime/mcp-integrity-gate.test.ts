@@ -34,6 +34,12 @@ const { recordTurnGraphShadow } = await import('./graph/turn-graph-shadow.js');
 const { openPlanScope } = await import('../agents/plan-scope.js');
 const grounding = await import('./harness/grounding-gate.js');
 const outputGrounding = await import('./harness/output-grounding-gate.js');
+const currentCapabilityFixtures = await import('./harness/current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'airtable__list_records',
+  providerKind: 'native_mcp',
+  effect: 'read',
+}]);
 
 /** The settlement spine refuses dispatch without an accepted source AND a
  *  persisted turn graph for the accepted task — every fixture that drives the
@@ -54,6 +60,7 @@ function anchorAcceptedTask(sessionId: string, text: string): { seq: number; tur
 }
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { parseWorkflowNodeInvocationPlan } from '../memory/workflow-node-invocation-plan.js';
 import {
   parseWorkflowCanonicalEntityResultProjection,
-  type WorkflowCanonicalEntityResultProjectionV1,
+  type WorkflowCanonicalEntityResultProjection,
 } from '../memory/workflow-result-projection-contract.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import {
@@ -56,7 +56,7 @@ export interface WorkflowRecurringReadAdmissionV1 {
   controlDigest: string;
   workflowSessionId: string;
   authoritySnapshot: AutomationRecurrenceAuthoritySnapshotV1;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBinding?: CanonicalEntityWorkspaceBindingApprovalV1;
   admissionDigest: string;
 }
@@ -165,7 +165,7 @@ function snapshotIssue(input: {
   intervalDigest: string;
   nodeId: string;
   invocationPlanDigest: string;
-  resultProjection?: WorkflowCanonicalEntityResultProjectionV1;
+  resultProjection?: WorkflowCanonicalEntityResultProjection;
   workspaceBinding?: CanonicalEntityWorkspaceBindingApprovalV1;
 }): string | null {
   let snapshot: WorkflowRunDefinitionSnapshot;

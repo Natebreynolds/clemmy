@@ -905,6 +905,31 @@ test('a wrong member-id pointer is corrected once, in-turn, and the per-item lan
   );
 });
 
+test('session retention reaps an old terminal task after its source-universe amendment', () => {
+  const task = stageCasedSource('amend-retention');
+  const amended = bindMember(task, 'lead-001', 'draft-amended-retention', {
+    universeId: 'leads',
+    memberIdPointer: '/Id',
+  });
+  assert.equal(amended.status, 'bound', JSON.stringify(amended));
+  assert.equal(
+    (eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM expected_work_universe_amendments
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(task.sessionId, task.sourceUserSeq) as { n: number }).n,
+    1,
+    'the fixture must carry the exact v37 amendment row that used to strand retention',
+  );
+
+  eventlog.updateSession(task.sessionId, { status: 'completed' });
+  eventlog.openEventLog().prepare(
+    'UPDATE sessions SET updated_at = ? WHERE id = ?',
+  ).run('2020-01-01T00:00:00.000Z', task.sessionId);
+
+  assert.equal(eventlog.reapStaleSessions(14), 1);
+  assert.equal(eventlog.getSession(task.sessionId), null);
+});
+
 test('the member-id correction is allowed exactly once, and never against evidence that fails', () => {
   const task = stageCasedSource('amend-guards');
 

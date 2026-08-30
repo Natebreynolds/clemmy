@@ -28,20 +28,32 @@ const outputGroundingGate = await import('./output-grounding-gate.js');
 const mcpNamespace = await import('../mcp-namespace-shim.js');
 const { buildWorkCall } = await import('../../tools/work-call.js');
 const { _setInnerDispatchToolsForTests } = await import('../../tools/inner-dispatch.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const capabilityCatalog = await import('./host-capability-catalog-factory.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
+  providerKind: 'composio',
+  effect: 'read',
+}]);
+const apifyCatalogEntry = capabilityCatalog.peekHostCapabilityCatalogFactory()
+  ?.snapshot()
+  .find((entry) => entry.toolName === 'APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS');
+assert.ok(apifyCatalogEntry, 'fixture installed the exact current source capability');
 
 test.after(() => {
   _setInnerDispatchToolsForTests(null);
   groundingGate._setGroundingJudgeForTests(null);
   goalFidelityGate._setGoalFidelityJudgeForTests(null);
   outputGroundingGate._setOutputGroundingJudgeForTests(null);
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
 const APIFY = {
-  capabilityId: 'capability:composio:APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS',
-  accountIdentity: 'research@example.com',
-  schemaFingerprint: 'schema:apify:v7',
+  capabilityId: apifyCatalogEntry!.capabilityId,
+  accountIdentity: apifyCatalogEntry!.account!,
+  schemaFingerprint: apifyCatalogEntry!.schemaDigest,
 } as const;
 const SOURCECO_FALLBACK = {
   capabilityId: 'capability:mcp:sourceco__search_places',
@@ -762,7 +774,7 @@ test('native MCP source mismatch refuses before grounding, goal-fidelity, or out
   }
 });
 
-test('work_call refuses shell/curl before execution and admits the exact bound Composio carrier', async () => {
+test('work_call refuses shell/curl and a model-only provider binding without one host-sealed carrier', async () => {
   const invokeWorkCall = async (input: {
     task: ReturnType<typeof acceptedSourceTask>;
     name: string;
@@ -834,7 +846,7 @@ test('work_call refuses shell/curl before execution and admits the exact bound C
       sourceStrategyBinding: BINDING,
     });
     assert.equal(shellCallbacks, 0, 'the shell process callback is refused before execution');
-    assert.match(String(shellOutput), /cannot present an exact bound capability\/account\/schema identity/i);
+    assert.match(String(shellOutput), /work_authority_unavailable|cannot present an exact bound capability\/account\/schema identity/i);
 
     const unspecifiedCurrentTaskOutput = await invokeWorkCall({
       task: acceptedSourceTask(BINDING, 'confirmed_exact', false),
@@ -886,8 +898,8 @@ test('work_call refuses shell/curl before execution and admits the exact bound C
       callId: 'work-source-composio-admitted',
       sourceStrategyBinding: BINDING,
     });
-    assert.equal(composioCallbacks, 1, String(composioOutput));
-    assert.match(String(composioOutput), /Restaurant A/);
+    assert.equal(composioCallbacks, 0, 'a model-authored binding cannot mint the missing host call attestation');
+    assert.match(String(composioOutput), /work_authority_unavailable/);
   } finally {
     _setInnerDispatchToolsForTests(null);
   }
@@ -1056,7 +1068,7 @@ test('a prep predecessor cannot relabel a trusted CTC source read out of the car
     callId: 'work-source-trusted-ctc-predecessor',
   });
   assert.equal(attempted.providerCallbacks, 0, 'dependent aggregate source callback stays at zero');
-  assert.match(String(attempted.output), /cannot present an exact bound capability\/account\/schema identity/i);
+  assert.match(String(attempted.output), /work_authority_unavailable|cannot present an exact bound capability\/account\/schema identity/i);
 });
 
 test('a source-fetching compute label cannot bypass trusted CTC source admission', async () => {
@@ -1082,7 +1094,7 @@ test('a source-fetching compute label cannot bypass trusted CTC source admission
     callId: 'work-source-trusted-ctc-compute-label',
   });
   assert.equal(attempted.providerCallbacks, 0, 'compute-labelled source callback stays at zero');
-  assert.match(String(attempted.output), /cannot present an exact bound capability\/account\/schema identity/i);
+  assert.match(String(attempted.output), /work_authority_unavailable|cannot present an exact bound capability\/account\/schema identity/i);
 });
 
 test('an intermediate compute source ancestor cannot bypass trusted CTC source admission', async () => {
@@ -1109,7 +1121,7 @@ test('an intermediate compute source ancestor cannot bypass trusted CTC source a
     callId: 'work-source-trusted-ctc-intermediate-compute',
   });
   assert.equal(attempted.providerCallbacks, 0, 'intermediate compute source callback stays at zero');
-  assert.match(String(attempted.output), /cannot present an exact bound capability\/account\/schema identity/i);
+  assert.match(String(attempted.output), /work_authority_unavailable|cannot present an exact bound capability\/account\/schema identity/i);
 });
 
 test('a valid CTC proposal cannot lend an unknown or construct-write requirement id to a source-fetching shell', async () => {
@@ -1126,7 +1138,7 @@ test('a valid CTC proposal cannot lend an unknown or construct-write requirement
       0,
       `${requirementId} cannot open the source callback`,
     );
-    assert.match(String(attempted.output), /cannot present an exact bound capability\/account\/schema identity/i);
+    assert.match(String(attempted.output), /work_authority_unavailable|cannot present an exact bound capability\/account\/schema identity/i);
   }
 });
 
@@ -1154,7 +1166,7 @@ test('an invalid replacement proposal cannot bypass a frozen trusted CTC source 
     callId: 'work-source-invalid-replacement-proposal',
   });
   assert.equal(attempted.providerCallbacks, 0, 'invalid replacement proposal cannot open the source callback');
-  assert.match(String(attempted.output), /cannot present an exact bound capability\/account\/schema identity/i);
+  assert.match(String(attempted.output), /work_authority_unavailable|cannot present an exact bound capability\/account\/schema identity/i);
 });
 
 test('post-construct verification is not relabeled as source before terminal delivery', async () => {

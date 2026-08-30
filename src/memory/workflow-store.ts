@@ -16,8 +16,9 @@ import type { WorkflowIntervalV1 } from '../shared/workflow-interval.js';
  *
  *   ~/.clementine-next/workflows/<name>/
  *     SKILL.md          — required; YAML frontmatter + prompt body
- *     scripts/          — optional; bash/Python the daemon can invoke
- *                         for deterministic steps (no LLM call)
+ *     scripts/          — optional legacy helpers retained for inspection and
+ *                         migration; raw workflow subprocess execution is
+ *                         retired and refuses before launch
  *     references/       — optional; docs loaded on demand
  *     runs/<run-id>/    — append-only event log per run (durability)
  *       events.jsonl
@@ -58,6 +59,46 @@ export interface WorkflowStepSpecialist {
 export interface WorkflowStepSubgraph {
   mode: 'read_parallel_v1';
   specialists: WorkflowStepSpecialist[];
+}
+
+/**
+ * Closed, host-reviewed pure computation for a workflow step.
+ *
+ * This is intentionally an expression tree rather than source code. The model
+ * authors the data semantics once; the host validates and evaluates only the
+ * enumerated operations in-process with fixed resource ceilings. It has no
+ * tool, filesystem, network, environment, clock, module, or subprocess access.
+ */
+export type WorkflowTransformExpressionV1 =
+  | { op: 'literal'; value: unknown }
+  | { op: 'get'; from: string }
+  | { op: 'jsonParse'; value: WorkflowTransformExpressionV1 }
+  | { op: 'jsonStringify'; value: WorkflowTransformExpressionV1 }
+  | { op: 'object'; fields: Array<{ key: string; value: WorkflowTransformExpressionV1 }> }
+  | { op: 'array'; items: WorkflowTransformExpressionV1[] }
+  | { op: 'count'; value: WorkflowTransformExpressionV1 }
+  | { op: 'map'; value: WorkflowTransformExpressionV1; each: WorkflowTransformExpressionV1 }
+  | {
+      op: 'select';
+      value: WorkflowTransformExpressionV1;
+      where?: {
+        column: string;
+        op: 'eq' | 'ne' | 'contains' | 'empty' | 'nonempty';
+        value?: string;
+      };
+      columns?: string[];
+      limit?: number;
+    }
+  | {
+      op: 'aggregate';
+      value: WorkflowTransformExpressionV1;
+      groupBy: string[];
+      metrics?: Array<{ fn: 'count' | 'sum' | 'avg' | 'min' | 'max'; column?: string }>;
+    };
+
+export interface WorkflowTransformV1 {
+  version: 1;
+  expression: WorkflowTransformExpressionV1;
 }
 
 export interface WorkflowStepInput {
@@ -114,19 +155,23 @@ export interface WorkflowStepInput {
    */
   subgraph?: WorkflowStepSubgraph;
   /**
-   * Skip the LLM entirely — call a named helper from scripts/ instead.
-   * Use for repeatable transforms (database writes, formatted exports)
-   * that don't need reasoning. Matches the Anthropic Skills scripts/
-   * convention; OpenAI Skills + Agents SDK blog post calls this "tiny
-   * CLIs that print deterministic stdout."
+   * Execute a closed, resource-bounded pure transform in-process. This is the
+   * reviewed replacement for using deterministic.runner as an arbitrary data
+   * shaping script. Mutually exclusive with every effect/model executor.
+   */
+  transform?: WorkflowTransformV1;
+  /**
+   * Legacy raw subprocess declaration. It remains parseable so existing
+   * workflows and source digests can be inspected and migrated, but runtime
+   * and authoring validation refuse it before launch because a script path
+   * cannot express exact filesystem/network/CLI authority. Use an exact call
+   * for external work or `transform` for pure data shaping.
    *
    * `runner` is a relative script path inside the workflow's own scripts/
    * dir. `source` is the script's SOURCE CODE at AUTHORING time: when
    * present, writeWorkflow materializes it to `scripts/<runner>` and strips
    * it from the persisted frontmatter (the on-disk step stays `{ runner }`,
-   * which is all the runtime reads). This is how the agent "writes code" for
-   * a mechanical step so a freshly-authored deterministic step can run
-   * immediately instead of pointing at a script that does not exist yet.
+   * which preserves the exact legacy declaration for migration tooling).
    */
   deterministic?: { runner: string; source?: string };
   /**
@@ -770,6 +815,12 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
           specialists,
         };
       }
+      // Pure transform is executable semantics. Preserve the exact durable
+      // bytes (including malformed declarations) so the canonical validator
+      // can fail closed; never sanitize a corrupt transform into a model step.
+      if (step.transform !== undefined) {
+        result.transform = structuredClone(step.transform) as WorkflowTransformV1;
+      }
       if (step.deterministic && typeof step.deterministic === 'object') {
         const d = step.deterministic as Record<string, unknown>;
         if (typeof d.runner === 'string') result.deterministic = { runner: d.runner };
@@ -1078,6 +1129,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
           })),
         };
       }
+      if (s.transform !== undefined) out.transform = structuredClone(s.transform);
       if (s.deterministic) {
         // Authoring may carry the script's inline `source`. Materialize it into
         // scripts/<runner> so a freshly-authored deterministic step can run, and

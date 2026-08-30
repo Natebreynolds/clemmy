@@ -57,6 +57,21 @@ test('classifyModelError: 429/529/5xx/401/transport classified; random not retry
   assert.equal(classifyModelError(new Error('bad input')).retryable, false);
 });
 
+test('classifyModelError: a provider-internal generation crash with no HTTP status is infra', () => {
+  // Live 2026-08-28: xAI native SSE finished HTTP 200 then threw this bare
+  // message after plan_task; missing status used to classify as runtime.unknown
+  // and persist a terminal run_failed.
+  assert.deepEqual(
+    pick(classifyModelError(new Error('Internal error during token generation'))),
+    { retryable: true, kind: 'model.http_5xx', isAuth: false },
+  );
+  assert.deepEqual(
+    pick(classifyModelError({ message: 'The server had an error while processing your request.' })),
+    { retryable: true, kind: 'model.http_5xx', isAuth: false },
+  );
+  assert.equal(classifyModelError(new Error('invalid schema for field x')).retryable, false);
+});
+
 test('classifyModelError: usage/plan quota exhausted → rate_limited (fallover), NOT auth, regardless of status', () => {
   // The live failure: Codex prolite "The usage limit has been reached" arriving as 403.
   assert.deepEqual(pick(classifyModelError({ status: 403, message: 'The usage limit has been reached. Reset at 2026-07-01T10:49:18.000Z.' })),
@@ -147,6 +162,22 @@ test('getResponse: 401 triggers a single auth refresh then retries', async () =>
 });
 
 // --- getStreamedResponse resilience (the retry-safety invariant) -----------
+
+test('getStreamedResponse: retries a pre-content generation crash (nothing yielded) and streams the 2nd attempt', async () => {
+  let calls = 0;
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      calls += 1;
+      if (calls === 1) throw new Error('Internal error during token generation');
+      yield { type: 'response_started' } as any;
+      yield { type: 'output_text_delta', delta: 'hello' } as any;
+      yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+    },
+  });
+  const events = await collect(withResilience(inner, policy()).getStreamedResponse(req()));
+  assert.equal(calls, 2);
+  assert.ok(events.some((e: any) => e.type === 'output_text_delta' && e.delta === 'hello'));
+});
 
 test('getStreamedResponse: retries a pre-content 429 (nothing yielded) and streams the 2nd attempt', async () => {
   let calls = 0;

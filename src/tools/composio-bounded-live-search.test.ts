@@ -39,7 +39,22 @@ after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-test('cold Composio discovery uses one bounded SDK search and treats the index as ranking-only', async () => {
+/**
+ * Discovery costs ONE fuzzy provider search, plus at most ONE exact-slug call
+ * that revalidates advisory nominations.
+ *
+ * The second call exists because the fuzzy search provably cannot reach some
+ * capabilities: measured live 2026-08-26, "what's on my calendar tomorrow"
+ * returned thirteen Outlook rows and not one read, and OUTLOOK_GET_CALENDAR_VIEW
+ * was unreachable at every phrasing. The index can NOMINATE that slug; it can
+ * never vouch for it. Only the provider's own exact answer makes it a candidate.
+ *
+ * What must not change is the bound and the authority: the fuzzy search happens
+ * exactly once, revalidation is one batched call and never one per nomination,
+ * and an identifier the provider does not serve never becomes a capability no
+ * matter how confidently memory names it.
+ */
+test('cold Composio discovery is one fuzzy search plus one bounded revalidation, and the index still grants nothing', async () => {
   schemaCache.resetToolSchemaCache();
   capabilityIndex._resetCapabilityIndexForTest();
   composio.resetComposioClient();
@@ -65,13 +80,25 @@ test('cold Composio discovery uses one bounded SDK search and treats the index a
   }]);
 
   let rawSearchCalls = 0;
+  let exactCalls = 0;
   let definitionsLoaded = 0;
+  let exactRequested: string[] = [];
+  let fuzzyInput: Record<string, unknown> | null = null;
   let exactInput: Record<string, unknown> | null = null;
   composio.__test__.setComposioClient({
     tools: {
       async getRawComposioTools(input: Record<string, unknown>) {
+        // A real provider answers an exact-slug request with those slugs only.
+        // The poison slug is indexed but does not exist upstream, so this
+        // returns nothing for it — exactly the production situation.
+        if (Array.isArray(input.tools)) {
+          exactCalls += 1;
+          exactInput = input;
+          exactRequested.push(...(input.tools as string[]));
+          return [];
+        }
         rawSearchCalls += 1;
-        exactInput = input;
+        fuzzyInput = input;
         assert.equal(input.search, 'zephyrquartz arclight sentinel');
         assert.deepEqual(input.toolkits, ['mega']);
         assert.equal(input.limit, 16);
@@ -140,12 +167,23 @@ test('cold Composio discovery uses one bounded SDK search and treats the index a
   });
 
   assert.equal(rawSearchCalls, 1, 'the advisory index cannot suppress or duplicate live search');
-  assert.deepEqual(exactInput, {
+  assert.deepEqual(fuzzyInput, {
     toolkits: ['mega'],
     search: 'zephyrquartz arclight sentinel',
     limit: 16,
   });
   assert.equal(definitionsLoaded, 16);
+  // Revalidation is BATCHED. One call for every nomination, never one each —
+  // otherwise reach would be bought with an unbounded per-turn provider cost.
+  assert.ok(exactCalls <= 1, `revalidation must be one batched call; made ${exactCalls}`);
+  if (exactCalls === 1) {
+    assert.ok(Array.isArray(exactInput!.tools), 'the second call is exact-slug, not another fuzzy search');
+    assert.equal((exactInput as Record<string, unknown>).search, undefined,
+      'revalidation asks for named slugs; it must never widen into a second search');
+    assert.ok((exactInput!.tools as string[]).length <= 6, 'nominations are capped');
+  }
+  assert.ok(exactRequested.every((slug) => slug === slug.toUpperCase()),
+    'exact lookups are made on normalized slugs');
   assert.equal(found.length, 2,
     'a <=16-row provider response containing irrelevant rows is relevance-filtered to the live matches');
   assert.deepEqual(
@@ -156,6 +194,8 @@ test('cold Composio discovery uses one bounded SDK search and treats the index a
   );
   assert.equal(found.some((candidate) => candidate.name === poisonSlug), false,
     'an index-only identifier never enters the live result universe');
+  assert.ok(!exactRequested.includes(poisonSlug) || !found.some((c) => c.name === poisonSlug),
+    'nominating a slug is allowed; the provider refusing it is final');
   assert.equal(found.some((candidate) => candidate.name.startsWith('OTHER_')), false,
     'a result outside the connected toolkit set is filtered');
   assert.equal(found.filter((candidate) => candidate.name === sourceSlug).length, 1,
@@ -206,9 +246,18 @@ test('the broker retains provider rank sixteen despite ten thousand advisory dec
   assert.equal(providerRows[15]?.slug, targetSlug, 'fixture pins the correct operation at provider rank sixteen');
 
   let providerCalls = 0;
+  let revalidationCalls = 0;
+  let revalidatedSlugs: string[] = [];
   composio.__test__.setComposioClient({
     tools: {
       async getRawComposioTools(input: Record<string, unknown>) {
+        if (Array.isArray(input.tools)) {
+          // None of the ten thousand decoys exist upstream. A real provider
+          // answers an exact-slug request for them with nothing.
+          revalidationCalls += 1;
+          revalidatedSlugs.push(...(input.tools as string[]));
+          return [];
+        }
         providerCalls += 1;
         assert.deepEqual(input, {
           toolkits: ['mega'],
@@ -235,6 +284,15 @@ test('the broker retains provider rank sixteen despite ten thousand advisory dec
   });
 
   assert.equal(providerCalls, 1, 'ten thousand local hints cannot create a provider rescan');
+  // The whole point of the decoy flood: discovery cost must be flat in the size
+  // of memory. Ten thousand indexed rows buy the same ONE batched revalidation
+  // that one row would, capped at a handful of slugs.
+  assert.ok(revalidationCalls <= 1,
+    `revalidation must stay one batched call; ten thousand decoys produced ${revalidationCalls}`);
+  assert.ok(revalidatedSlugs.length <= 6,
+    `nominations must be capped regardless of index size; asked for ${revalidatedSlugs.length}`);
+  assert.equal(found.some((candidate) => candidate.name.includes('ADVISORY_DECOY')), false,
+    'no quantity of confident local hints can manufacture a capability the provider does not serve');
   assert.equal(found.length, 16, 'the whole bounded provider oversample remains locally pageable');
   assert.ok(found.some((candidate) => candidate.name === targetSlug),
     'the exact live rank-sixteen operation survives the former eight-row cliff');
@@ -251,11 +309,20 @@ test('a filtered SDK failure never falls back to unfiltered toolkit enumeration'
     user_id: 'bounded-search-user',
     toolkit: { slug: 'mega' },
   }]);
-  let calls = 0;
+  let filteredCalls = 0;
+  let exactNominationCalls = 0;
   composio.__test__.setComposioClient({
     tools: {
       async getRawComposioTools(input: Record<string, unknown>) {
-        calls += 1;
+        if (Array.isArray(input.tools)) {
+          exactNominationCalls += 1;
+          assert.equal(input.search, undefined,
+            'the parallel exact batch is not an unfiltered discovery fallback');
+          assert.ok(input.tools.length <= 6, 'the exact nomination batch stays bounded');
+          assert.equal(input.limit, input.tools.length);
+          return [];
+        }
+        filteredCalls += 1;
         assert.equal(input.search, 'missing sentinel');
         assert.equal(input.limit, 16);
         throw new Error('filtered provider search unavailable');
@@ -286,7 +353,9 @@ test('a filtered SDK failure never falls back to unfiltered toolkit enumeration'
       return true;
     },
   );
-  assert.equal(calls, 1, 'failure must not trigger a 200/250-definition list fallback');
+  assert.equal(filteredCalls, 1, 'failure must not trigger a second fuzzy or unfiltered list search');
+  assert.ok(exactNominationCalls <= 1,
+    'advisory residue may cause only the one bounded exact nomination batch');
 });
 
 test('no connected toolkits is a typed unavailability, never a silent empty result', async () => {

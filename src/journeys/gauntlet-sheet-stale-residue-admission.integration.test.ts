@@ -60,7 +60,7 @@ import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-gauntlet-sheet-stale-residue-'));
 const PROMPT = 'Make me a google sheet called Gauntlet Residue Sheet with a header row: Scenario, Status, Notes';
-const SHEET_URL = 'https://docs.google.com/spreadsheets/d/gauntlet-residue-sheet/edit';
+const SHEET_URL = 'https://docs.google.com/spreadsheets/d/fixture-gauntlet-residue-sheet/edit';
 const SUCCESS = `Created the Gauntlet Residue Sheet with its header row: ${SHEET_URL}`;
 const PREAMBLE = 'I’ll create one new Google Sheet named Gauntlet Residue Sheet with the header row Scenario, Status, Notes.';
 const SHEET_OPERATION = 'GOOGLESHEETS_CREATE_SPREADSHEET';
@@ -388,7 +388,7 @@ test('S1-residue: stale process-wide catalog residue must not sink a same-turn-d
             return {
               data: {
                 successful: true,
-                spreadsheetId: 'gauntlet-residue-sheet',
+                spreadsheetId: 'fixture-gauntlet-residue-sheet',
                 spreadsheetUrl: SHEET_URL,
               },
               error: null,
@@ -704,7 +704,7 @@ test('S2-residue-survives: registering the selected write must not evict unrelat
             return {
               data: {
                 successful: true,
-                spreadsheetId: 'gauntlet-residue-sheet-survives',
+                spreadsheetId: 'fixture-gauntlet-residue-sheet-survives',
                 spreadsheetUrl: SHEET_URL,
               },
               error: null,
@@ -913,19 +913,14 @@ test('S2-residue-survives: registering the selected write must not evict unrelat
 
 
 /**
- * Direction pin for a SECOND, independent mechanism that also empties the
- * frozen catalog (fixed 2026-08-26 in admit-and-compile-accepted-source.ts,
- * "Whatever gets revalidated gets published" — that file is off-limits to
- * this crew, fixed by another): a capability the model selects straight off
- * the LIVE catalog (primePrimaryModelPlanningCatalog's disclosureByName,
- * built once at turn-prime time from whatever the shared factory already
- * holds) rather than through THIS turn's own staged tool_search disclosure
- * was revalidated (connection checked, schema re-fetched live) and then
- * omitted from registerProofProvisionedCapabilities's publication allowlist,
- * which used to be built only from the STAGED selections. Revalidated and
- * never published: plan admission froze a catalog without it and refused the
- * very proposal it had just proven (live 2026-08-26: an active, proven
- * Sheets connection, seven plan_task refusals, zero business calls).
+ * Direction pin for a capability selected straight off the LIVE catalog
+ * (primePrimaryModelPlanningCatalog's disclosureByName) rather than through
+ * this turn's own staged tool_search disclosure. Admission must revalidate
+ * its exact connection/schema/semantic definition and retain the already-live
+ * manifest in the frozen snapshot. Revalidation is distinct from publication:
+ * an initial-live ref is not restamped from a source that emitted no matching
+ * capability_resolution proof, and an entry explicitly evicted after prime
+ * correctly fails the frozen-catalog comparison instead of being resurrected.
  *
  * disclosureByName is computed ONCE per turn from the factory's state AT
  * PRIME TIME — a capability registered later in the SAME turn (e.g. via this
@@ -1002,7 +997,7 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
             return {
               data: {
                 successful: true,
-                spreadsheetId: `gauntlet-live-published-sheet-${providerWrites.length}`,
+                spreadsheetId: `fixture-gauntlet-live-published-sheet-${providerWrites.length}`,
                 spreadsheetUrl: SHEET_URL,
               },
               error: null,
@@ -1228,16 +1223,8 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
     'turn 2 initial planning card ranks in the write capability live from turn 1, unstaged',
   );
 
-  // Disclosure already happened (the assertion above): the descriptor is
-  // captured in this turn's own planning card regardless of what the live
-  // factory does next. Evict the live factory entry now, simulating exactly
-  // what an unrelated collateral eviction (this file's own mechanism, or any
-  // other cause) looks like between disclosure and freeze: the ONLY thing
-  // that can put it back before this turn's freeze is THIS turn's own
-  // selected-path revalidation actually publishing it, which is precisely
-  // what the fixed allowlist does and the old staged-only allowlist did not.
-  factory.forget(liveCapabilityId);
-  assert.equal(factory.get(liveCapabilityId), undefined, 'the live factory entry is evicted after disclosure, before freeze');
+  assert.ok(factory.get(liveCapabilityId),
+    'the initial-live capability remains present between disclosure and freeze');
 
   const turn2Draft = {
     criteria: [
@@ -1327,9 +1314,9 @@ test('S3-live-catalog-published: a write selected straight off the live catalog 
     "a capability SELECTED straight off the live catalog, never staged through turn 2's own disclosure, still lands in turn 2's frozen snapshot",
   );
 
-  // BOTH mechanisms exercised together: the live-selected write published in
-  // turn 2's frozen snapshot, and turn 2's unrelated stale residue never
-  // collaterally evicted from the live factory by that same-turn admission.
+  // BOTH mechanisms exercised together: the live-selected write is retained
+  // in turn 2's frozen snapshot, and turn 2's unrelated stale residue is never
+  // collaterally evicted by selected-definition revalidation.
   for (const id of residueCapabilityIds) {
     assert.ok(factory.get(id), `unrelated stale residue ${id} must survive turn 2's registration in the live factory`);
   }

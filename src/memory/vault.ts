@@ -136,7 +136,9 @@ export function ensureVaultScaffold(): void {
 }
 
 export function loadMemoryContext(): MemoryContext {
-  ensureVaultScaffold();
+  // This is a read boundary. Installation/startup and every vault writer own
+  // scaffolding explicitly; a missing vault therefore means empty context,
+  // not authority to create seven directories during an ordinary turn.
   return {
     soul: readMaybe(SOUL_FILE),
     memory: readCuratedVaultFileMaybe(MEMORY_FILE, MEMORY_PROMPT_READ_CHARS, 'Memory'),

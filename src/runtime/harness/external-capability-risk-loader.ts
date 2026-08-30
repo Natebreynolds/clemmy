@@ -24,14 +24,13 @@ import { createHash } from 'node:crypto';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import {
   capabilityManifestDigest,
+  parseCapabilityManifestOperationSemantics,
   validateCapabilityManifestV1,
   type CapabilityManifestV1,
 } from './capability-manifest.js';
 import {
-  documentedComposioOperationSemantic,
-} from '../../integrations/composio/operation-semantics.js';
-import {
   canonicalCatalogIdentityOf,
+  isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
   type HostCapabilityCatalogFactory,
 } from './host-capability-catalog-factory.js';
@@ -102,7 +101,6 @@ export interface LoadExternalCapabilityRiskAttestationInputV1 {
   destination: InteractiveConsentDestination;
   /** Exact argument-derived signals, never model-authored labels. */
   callSignals: ExternalCapabilityRiskInputV1['callSignals'];
-  documentedSemantic: ExternalCapabilityRiskInputV1['documentedSemantic'];
   safety: CapabilityRiskAttestationV1['safety'];
 }
 
@@ -239,7 +237,6 @@ const TOP_LEVEL_KEYS = new Set([
   'currentDefinition',
   'destination',
   'callSignals',
-  'documentedSemantic',
   'safety',
 ]);
 const CURRENT_DEFINITION_KEYS = new Set([
@@ -270,6 +267,7 @@ const MANIFEST_KEYS = new Set([
   'definitionFingerprint',
   'externalDefinition',
   'effect',
+  'operationSemantics',
   'destination',
   'accountId',
   'idempotency',
@@ -1040,7 +1038,7 @@ export function loadExternalCapabilityRiskAttestationV1(
     },
     behaviorHints: definition.behaviorHints,
     callSignals: input.callSignals,
-    documentedSemantic: input.documentedSemantic,
+    documentedSemantic: sealedSemanticForManifest(manifest),
     safety: input.safety,
   } satisfies ExternalCapabilityRiskInputV1);
   if (!projection.ok) return { ok: false, reason: projection.reason };
@@ -1093,27 +1091,48 @@ function operationOnlySemanticName(operationId: string): string {
     : withoutTransport;
 }
 
-function documentedSemanticForManifest(
+function sealedSemanticForManifest(
   manifest: CapabilityManifestV1,
 ): ExternalCapabilityRiskInputV1['documentedSemantic'] {
-  if (manifest.providerKind !== 'composio') return null;
-  const semantic = documentedComposioOperationSemantic(manifest.operationId);
-  if (!semantic) return null;
-  const consequence = semantic.consequence === 'other'
-    ? 'unknown' as const
-    : semantic.consequence;
+  const semantic = manifest.operationSemantics
+    ? parseCapabilityManifestOperationSemantics(manifest.operationSemantics)
+    : null;
+  if (!semantic?.reversibility) return null;
+
+  const destructive = manifest.externalDefinition?.behaviorHints.destructive === true;
+  const consequence = manifest.effect === 'admin'
+    ? 'admin' as const
+    : manifest.destination?.posture === 'create_new'
+      ? 'create' as const
+      : manifest.destination?.posture === 'named_existing'
+        ? 'update' as const
+        : 'unknown' as const;
+  const positivelyBoundedReversibleCreate = semantic.reversibility === 'reversible'
+    && manifest.effect === 'external_write'
+    && manifest.destination?.posture === 'create_new'
+    && manifest.externalDefinition?.behaviorHints.readOnly === false
+    && manifest.externalDefinition.behaviorHints.destructive === false
+    && manifest.idempotency.required === true
+    && manifest.reconciliation.supported === true;
+  const reversibility = semantic.reversibility === 'irreversible'
+    ? 'irreversible' as const
+    : positivelyBoundedReversibleCreate
+      ? 'reversible' as const
+      : 'unknown' as const;
   return {
     sourceDigest: sha256(closedCanonicalJson({
-      domain: 'documented-external-operation-semantic',
+      domain: 'sealed-external-operation-semantic',
       version: EXTERNAL_CAPABILITY_RISK_LOADER_VERSION,
-      providerKind: manifest.providerKind,
-      operationId: manifest.operationId,
+      manifestDigest: capabilityManifestDigest(manifest),
+      effect: manifest.effect,
+      destination: manifest.destination ?? null,
+      behaviorHints: manifest.externalDefinition?.behaviorHints ?? null,
       semantic,
     })),
-    effect: semantic.effect === 'read' ? 'read' : 'external_write',
-    reversibility: semantic.reversibility,
+    effect: manifest.effect === 'admin' ? 'admin' : 'external_write',
+    reversibility,
     consequence,
-    destructive: consequence === 'delete',
+    destructive,
   };
 }
 
@@ -1189,8 +1208,22 @@ export function loadCatalogManifestExternalRiskAttestationV1(
   }
   const catalog = resolved.catalogFactory.get(binding.capabilityId);
   const canonical = catalog ? canonicalCatalogIdentityOf(catalog) : null;
+  // Parallel connected accounts are separate current authorities for the same
+  // provider operation. Uniqueness belongs to the exact bound tuple, not to a
+  // global operation-name bucket; two rows for the SAME tuple remain an
+  // ambiguity and fail closed.
+  const currentBindingRows = resolved.catalogFactory.snapshot().filter((entry) => (
+    isCurrentCallableCatalogEntry(entry)
+    && entry.manifest.operationId === manifest.operationId
+    && entry.manifest.providerKind === manifest.providerKind
+    && entry.manifest.providerIdentity === manifest.providerIdentity
+    && entry.manifest.accountId === manifest.accountId
+  ));
   if (
     !catalog
+    || !isCurrentCallableCatalogEntry(catalog)
+    || currentBindingRows.length !== 1
+    || currentBindingRows[0] !== catalog
     || !canonical
     || canonical.capabilityId !== binding.capabilityId
     || canonical.manifestId !== binding.manifestId
@@ -1266,7 +1299,6 @@ export function loadCatalogManifestExternalRiskAttestationV1(
     },
     destination: input.destination,
     callSignals: input.callSignals,
-    documentedSemantic: documentedSemanticForManifest(manifest),
     safety: input.safety,
   });
 }

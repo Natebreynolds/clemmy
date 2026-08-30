@@ -16,6 +16,7 @@ const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
 const dispatch = await import('./dispatch-ledger.js');
 const results = await import('./result-handle.js');
+const resultFacts = await import('./result-facts.js');
 const payloadStorage = await import('./result-payload-storage.js');
 const providerEvidence = await import('./provider-read-evidence.js');
 
@@ -556,6 +557,195 @@ test('collection completeness is structural evidence, never a records-array defa
       fixture.expected,
       fixture.name,
     );
+  }
+});
+
+test('MCP structured content owns one page while exact text content remains a fallback', () => {
+  const page = {
+    records: [{ id: 'row-1' }],
+    next_cursor: 'mcp-cursor',
+    has_more: true,
+  };
+  const envelope = {
+    content: [{ type: 'text', text: JSON.stringify(page) }],
+    structuredContent: structuredClone(page),
+    isError: false,
+  };
+  const mirrored = results.deriveResultHandleFactsFromRaw(envelope);
+  assert.deepEqual({
+    success: mirrored.success,
+    recordPath: mirrored.recordPath,
+    recordCount: mirrored.recordCount,
+    completeness: mirrored.completeness,
+    cursor: mirrored.cursor,
+    projectedRecords: mirrored.projectedRecords,
+  }, {
+    success: true,
+    recordPath: 'structuredContent.records',
+    recordCount: 1,
+    completeness: 'partial',
+    cursor: 'mcp-cursor',
+    projectedRecords: [{ id: 'row-1' }],
+  });
+  assert.deepEqual(
+    resultFacts.recordsAtRecordPath(envelope, mirrored.recordPath),
+    [{ id: 'row-1' }],
+    'mirrored content is not a duplicate page',
+  );
+
+  const fallbackEnvelope = {
+    content: [
+      { type: 'text', text: 'provider note' },
+      { type: 'text', text: JSON.stringify({ ...page, next_cursor: null, has_more: false }) },
+    ],
+    isError: false,
+  };
+  const fallback = results.deriveResultHandleFactsFromRaw(fallbackEnvelope);
+  assert.equal(fallback.recordPath, 'content.1.text.records');
+  assert.equal(fallback.recordCount, 1);
+  assert.equal(fallback.completeness, 'complete');
+  assert.equal(fallback.cursor, null);
+  assert.deepEqual(
+    resultFacts.recordsAtRecordPath(fallbackEnvelope, fallback.recordPath),
+    [{ id: 'row-1' }],
+  );
+});
+
+test('ordinary provider content arrays remain root business payloads, not malformed MCP results', () => {
+  const readback = {
+    id: 'fixture-resource-1',
+    handle: 'https://fixture.invalid/resources/fixture-resource-1',
+    content: [{ title: 'alpha', date: '1', link: 'fixture://alpha' }],
+  };
+  const facts = results.deriveResultHandleFactsFromRaw(readback);
+  assert.deepEqual({
+    success: facts.success,
+    recordPath: facts.recordPath,
+    recordCount: facts.recordCount,
+    projectedRecords: facts.projectedRecords,
+  }, {
+    success: true,
+    recordPath: 'content',
+    recordCount: 1,
+    projectedRecords: [{ title: 'alpha', date: '1', link: 'fixture://alpha' }],
+  });
+  assert.equal(resultFacts.resultHasMalformedPagination(readback), false);
+  assert.deepEqual(
+    resultFacts.projectProviderResultEvidenceView(readback),
+    { version: 1, kind: 'provider_payload', owner: 'root', payload: readback },
+  );
+  assert.deepEqual(
+    resultFacts.recordsAtRecordPath(readback, facts.recordPath),
+    readback.content,
+  );
+
+  for (const claimedMcp of [
+    { content: readback.content },
+    { id: 'unexpected-extra', content: [{ type: 'text', text: '{}' }] },
+    { ...readback, _meta: {} },
+  ]) {
+    const claimedFacts = results.deriveResultHandleFactsFromRaw(claimedMcp);
+    assert.deepEqual({
+      success: claimedFacts.success,
+      recordPath: claimedFacts.recordPath,
+      recordCount: claimedFacts.recordCount,
+    }, { success: false, recordPath: null, recordCount: 0 });
+    assert.deepEqual(
+      resultFacts.projectProviderResultEvidenceView(claimedMcp),
+      { version: 1, kind: 'no_evidence', owner: 'mcp', reason: 'mcp_envelope_malformed' },
+    );
+  }
+});
+
+test('the exact sealed invoke wrapper selects MCP business records instead of transport content blocks', () => {
+  const page = { records: [{ id: 'sealed-row' }], has_more: false };
+  const textOnly = {
+    result: { content: [{ type: 'text', text: JSON.stringify(page) }] },
+    complete: true,
+  };
+  const textFacts = results.deriveResultHandleFactsFromRaw(textOnly);
+  assert.deepEqual({
+    success: textFacts.success,
+    recordPath: textFacts.recordPath,
+    recordCount: textFacts.recordCount,
+    projectedRecords: textFacts.projectedRecords,
+  }, {
+    success: true,
+    recordPath: 'result.content.0.text.records',
+    recordCount: 1,
+    projectedRecords: [{ id: 'sealed-row' }],
+  });
+  assert.deepEqual(
+    resultFacts.recordsAtRecordPath(textOnly, textFacts.recordPath),
+    [{ id: 'sealed-row' }],
+  );
+
+  const structured = {
+    result: {
+      content: [{ type: 'text', text: JSON.stringify(page) }],
+      structuredContent: structuredClone(page),
+    },
+    complete: true,
+  };
+  const structuredFacts = results.deriveResultHandleFactsFromRaw(structured);
+  assert.equal(structuredFacts.recordPath, 'result.structuredContent.records');
+  assert.deepEqual(
+    resultFacts.recordsAtRecordPath(structured, structuredFacts.recordPath),
+    [{ id: 'sealed-row' }],
+  );
+
+  for (const rejected of [{
+    ...structured,
+    extra: 'not-part-of-the-closed-wrapper',
+  }, {
+    ...structured,
+    complete: false,
+  }, {
+    result: {
+      content: [{ type: 'text', text: JSON.stringify({ records: [{ id: 'other-row' }] }) }],
+      structuredContent: structuredClone(page),
+    },
+    complete: true,
+  }]) {
+    const facts = results.deriveResultHandleFactsFromRaw(rejected);
+    assert.deepEqual({
+      success: facts.success,
+      recordPath: facts.recordPath,
+      recordCount: facts.recordCount,
+    }, { success: false, recordPath: null, recordCount: 0 });
+    assert.equal(resultFacts.resultHasMalformedPagination(rejected), true);
+  }
+});
+
+test('conflicting or malformed MCP structured content cannot fall back to text', () => {
+  const textPage = { records: [{ id: 'text-row' }], has_more: false };
+  for (const envelope of [
+    {
+      content: [{ type: 'text', text: JSON.stringify(textPage) }],
+      structuredContent: { records: [{ id: 'different-row' }], has_more: false },
+      isError: false,
+    },
+    {
+      content: [{ type: 'text', text: JSON.stringify(textPage) }],
+      structuredContent: 'not-an-object',
+      isError: false,
+    },
+  ]) {
+    const facts = results.deriveResultHandleFactsFromRaw(envelope);
+    assert.deepEqual({
+      success: facts.success,
+      recordPath: facts.recordPath,
+      recordCount: facts.recordCount,
+      completeness: facts.completeness,
+      cursor: facts.cursor,
+    }, {
+      success: false,
+      recordPath: null,
+      recordCount: 0,
+      completeness: 'unknown',
+      cursor: null,
+    });
+    assert.equal(resultFacts.resultHasMalformedPagination(envelope), true);
   }
 });
 

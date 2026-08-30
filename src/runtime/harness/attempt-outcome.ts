@@ -213,6 +213,9 @@ export interface AttemptSignals {
   needsUserInput?: boolean;
   /** Argument validation failed before dispatch (nominal). */
   argumentValidationFailed?: boolean;
+  /** A fresh host-owned observation proved that the selected immutable
+   * capability definition is no longer current. */
+  capabilityDefinitionUnavailable?: boolean;
   /**
    * MCP's own error flag on a returned result. Nominal: the server said so in
    * a field, not in a sentence.
@@ -272,6 +275,9 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   if (signals.needsUserInput) return outcome('input_required', 'nominal', 'input');
   if (signals.connectionMissing) return outcome('auth_failure', 'nominal', 'connection');
   if (signals.argumentValidationFailed) return outcome('invalid_arguments', 'nominal', 'validation');
+  if (signals.capabilityDefinitionUnavailable) {
+    return outcome('unsupported_capability', 'nominal', 'current_definition_unavailable');
+  }
   if (signals.droppedRequiredParameter) {
     return outcome('ignored_requirement', 'nominal', 'required_parameter_dropped');
   }

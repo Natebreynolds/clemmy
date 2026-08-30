@@ -17,6 +17,7 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-goal-loop-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.HARNESS_TOOL_BRACKETS = 'off';
 
 import { test } from 'node:test';

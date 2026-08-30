@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { selectReasoningEffort, continuationClassifyEnabled } from './reasoning-effort.js';
+import {
+  continuationClassifyEnabled,
+  reasoningEffortSignalsForTurn,
+  selectReasoningEffort,
+} from './reasoning-effort.js';
 import { buildAgentContextPacket } from './context-packet.js';
 
 const primer = { enabled: false, hitCount: 0, source: null, injected: false, skippedReason: null };
@@ -21,6 +25,65 @@ test('interactive caps complex at medium (never make a human wait on high)', () 
 test('interactive leaves simple/moderate unchanged (cap only bites at high)', () => {
   assert.equal(selectReasoningEffort('simple', { interactive: true }).effort, 'none');
   assert.equal(selectReasoningEffort('moderate', { interactive: true }).effort, 'medium');
+});
+
+test('bounded foreground action avoids extended reasoning on scalar-only moderate complexity', () => {
+  const input = 'Publish the prepared announcement to my existing website at 9:30 PM with the approved title.';
+  const packet = buildAgentContextPacket(input, primer, { sessionKind: 'chat', sessionId: 'bounded-action' });
+  const signals = reasoningEffortSignalsForTurn({
+    interactive: true,
+    turnIntent: packet.turnIntent,
+    multiItem: packet.multiItem.detected,
+    text: input,
+  });
+
+  assert.equal(packet.complexity, 'moderate', 'the scalar time currently raises classifier complexity');
+  assert.equal(packet.turnIntent, 'action');
+  assert.equal(signals.boundedForegroundAction, true);
+  assert.deepEqual(
+    selectReasoningEffort(packet.complexity, signals),
+    { effort: 'none', reason: 'moderate/interactive-single-action' },
+  );
+});
+
+test('foreground posture preserves reasoning for sequenced, mixed, multi-item, and background work', () => {
+  const cases = [
+    {
+      name: 'sequenced action',
+      input: 'Inspect the source, then publish the verified summary to the website.',
+      interactive: true,
+      multiItem: false,
+    },
+    {
+      name: 'mixed read/write action',
+      input: 'Research the source and publish the verified summary to the website.',
+      interactive: true,
+      multiItem: false,
+    },
+    {
+      name: 'multi-item action',
+      input: 'Publish the prepared announcements to the website.',
+      interactive: true,
+      multiItem: true,
+    },
+    {
+      name: 'background action',
+      input: 'Publish the prepared announcement to the website at 9:30 PM.',
+      interactive: false,
+      multiItem: false,
+    },
+  ] as const;
+
+  for (const value of cases) {
+    const signals = reasoningEffortSignalsForTurn({
+      interactive: value.interactive,
+      turnIntent: 'action',
+      multiItem: value.multiItem,
+      text: value.input,
+    });
+    assert.equal(signals.boundedForegroundAction, false, value.name);
+    assert.equal(selectReasoningEffort('moderate', signals).effort, 'medium', value.name);
+  }
 });
 
 test('simple is byte-identical (none) interactive or not — fastest path untouched', () => {

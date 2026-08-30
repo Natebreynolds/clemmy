@@ -11,20 +11,24 @@
  * structures below are not, so a fixture sheds them before reopening.
  */
 import type Database from 'better-sqlite3';
+import { STRICT_TAIL_TABLES } from './eventlog-schema.js';
 
 /**
- * v65 deliberately REFUSES its chunk/continuation table names when its version
- * row is absent: they had no sanctioned predecessor, so a preexisting lookalike
- * must never be blessed as durable result authority. Its companion index is
- * created unguarded and cannot be created twice either.
+ * v65 and v66 deliberately REFUSE their authority table names when their
+ * version rows are absent: they had no sanctioned predecessor, so a
+ * preexisting lookalike must never be blessed as durable authority. The helper
+ * retains its original name because every caller rewinds to before v65; it now
+ * sheds the complete strict tail that those rehearsals must replay.
  */
 export function removeV65StructuresFromHistoricalMigrationFixture(db: Database.Database): void {
-  db.exec(`
-    DROP INDEX IF EXISTS idx_tool_outputs_session_created_call;
-    DROP TABLE IF EXISTS tool_output_chunks;
-    DROP TABLE IF EXISTS tool_output_invocation_chunks;
-    DROP TABLE IF EXISTS tool_search_continuations;
-  `);
+  // Derived from STRICT_TAIL_TABLES rather than restated here. The previous
+  // hand-maintained copy rotted: v66's table was added to it, v67's was not,
+  // and every rehearsal then failed on a structure its own replay had created.
+  // Dropping a table drops its indexes and triggers with it.
+  db.exec('DROP INDEX IF EXISTS idx_tool_outputs_session_created_call;');
+  for (const table of STRICT_TAIL_TABLES) {
+    db.exec(`DROP TABLE IF EXISTS ${table};`);
+  }
 }
 
 /**

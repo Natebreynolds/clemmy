@@ -12,6 +12,8 @@ import path from 'node:path';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-composio-invalid-args-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.COMPOSIO_BACKEND = 'sdk';
+process.env.CLEMMY_EXECUTION_GATE = 'on';
+process.env.HARNESS_TOOL_BRACKETS = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import assert from 'node:assert/strict';
@@ -20,10 +22,13 @@ import { test } from 'node:test';
 const eventlog = await import('../runtime/harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const {
+  attestToolLocalInputInvalidity,
   ToolCallsCounter,
   withHarnessRunContext,
   wrapToolForHarness,
 } = await import('../runtime/harness/brackets.js');
+const { tool: sdkTool } = await import('@openai/agents');
+const { z } = await import('zod');
 const composioClient = await import('../integrations/composio/client.js');
 const {
   getComposioRuntimeTools,
@@ -71,13 +76,14 @@ async function invokeMalformedAndAssertSettlement(input: unknown, callId: string
   eventlog.resetEventLog();
   const accepted = acceptTask('List the current mailbox messages with the connected provider.');
   const wrapped = productionExecuteTool();
+  const counter = new ToolCallsCounter(10);
 
   const output = await withHarnessRunContext({
     sessionId: accepted.sessionId,
     sourceUserSeq: accepted.sourceUserSeq,
     turn: accepted.turn,
     behaviorScopeId: `${accepted.sessionId}::invalid-args`,
-    counter: new ToolCallsCounter(10),
+    counter,
   }, () => wrapped.invoke(
     { context: { sessionId: accepted.sessionId } },
     JSON.stringify(input),
@@ -91,6 +97,7 @@ async function invokeMalformedAndAssertSettlement(input: unknown, callId: string
     'settlement must not be rescued by the legacy marker parser');
   assert.doesNotMatch(String(output), /^\s*⚠️[^\n]*FAILED/,
     'settlement must not be rescued by the corrective-prose parser');
+  assert.equal(counter.calls, 1, 'the refused malformed attempt still consumes one tool-call unit');
 
   const db = eventlog.openEventLog();
   const settlement = db.prepare(`
@@ -160,6 +167,115 @@ test('direct composio malformed inner JSON remains invalid_arguments after outer
   }, 'direct-composio-inner-invalid');
 });
 
+async function assertExecutionWrapRefusal(input: unknown, callId: string, toolOverride?: ReturnType<typeof sdkTool>) {
+  eventlog.resetEventLog();
+  const accepted = acceptTask('Use the exact connected provider operation once.');
+  const direct = toolOverride ?? getComposioRuntimeTools()
+    .find((candidate) => candidate.name === 'composio_execute_tool');
+  assert.ok(direct);
+  const wrapped = wrapToolForHarness(direct) as typeof direct & {
+    invoke: (runContext: unknown, rawInput: string, details?: unknown) => Promise<unknown>;
+  };
+  const counter = new ToolCallsCounter(10);
+  const output = await withHarnessRunContext({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+    turn: accepted.turn,
+    behaviorScopeId: `${accepted.sessionId}::fail-closed-invalidity-proof`,
+    counter,
+  }, () => wrapped.invoke(
+    { context: { sessionId: accepted.sessionId } },
+    JSON.stringify(input),
+    { toolCall: { callId } },
+  ));
+
+  assert.match(String(output), /EXECUTION_WRAP_REQUIRED/);
+  assert.doesNotMatch(String(output), /rejected locally before provider dispatch/);
+  assert.equal(counter.calls, 1, 'ordinary execution-wrap refusal remains charged once');
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare(`
+    SELECT COUNT(*) AS count
+      FROM physical_dispatches
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(accepted.sessionId, accepted.sourceUserSeq) as { count: number }).count, 0);
+  return output;
+}
+
+test('a valid unknown-effect carrier remains behind EXECUTION_WRAP_REQUIRED with zero provider work', async () => {
+  await assertExecutionWrapRefusal({
+    tool_slug: 'OUTLOOK_LIST_MESSAGES',
+    arguments: '{"folder":"inbox"}',
+    connected_account_id: null,
+  }, 'direct-composio-valid-unknown-effect');
+});
+
+test('unproven, thrown, or ambiguous invalidity validators all fail closed before the tool body', async () => {
+  const cases = [
+    { label: 'unproven', validate: () => 'unproven' as const },
+    { label: 'throw', validate: () => { throw new Error('validator fixture failure'); } },
+    { label: 'ambiguous', validate: () => undefined as never },
+  ];
+
+  for (const fixture of cases) {
+    let providerBodies = 0;
+    const direct = attestToolLocalInputInvalidity(sdkTool({
+      name: 'composio_execute_tool',
+      description: `Fail-closed ${fixture.label} validator fixture.`,
+      parameters: z.object({
+        tool_slug: z.string().min(1),
+        arguments: z.string().nullable(),
+        connected_account_id: z.string().nullable(),
+      }),
+      execute: async () => {
+        providerBodies += 1;
+        return 'provider body ran';
+      },
+    }), fixture.validate);
+
+    await assertExecutionWrapRefusal({
+      tool_slug: 'FIXTURE_UNKNOWN_EFFECT',
+      arguments: '{}',
+      connected_account_id: null,
+    }, `invalidity-${fixture.label}-fails-closed`, direct);
+    assert.equal(providerBodies, 0, `${fixture.label} validator did not bypass effect authority`);
+  }
+});
+
+test('invalidity authority does not survive a copied or invoke-mutated tool identity', async () => {
+  for (const fixture of ['copied', 'invoke-mutated'] as const) {
+    let providerBodies = 0;
+    const attested = attestToolLocalInputInvalidity(sdkTool({
+      name: 'composio_execute_tool',
+      description: `Exact identity ${fixture} fixture.`,
+      parameters: z.object({
+        tool_slug: z.string().min(1),
+        arguments: z.string().nullable(),
+        connected_account_id: z.string().nullable(),
+      }),
+      execute: async () => {
+        providerBodies += 1;
+        return 'provider body ran';
+      },
+    }), () => 'invalid');
+
+    let candidate: typeof attested;
+    if (fixture === 'copied') {
+      candidate = { ...attested };
+    } else {
+      const originalInvoke = attested.invoke;
+      attested.invoke = (runContext, input, details) => originalInvoke(runContext, input, details);
+      candidate = attested;
+    }
+
+    await assertExecutionWrapRefusal({
+      tool_slug: 'FIXTURE_UNKNOWN_EFFECT',
+      arguments: { malformed: true },
+      connected_account_id: null,
+    }, `invalidity-${fixture}-fails-closed`, candidate);
+    assert.equal(providerBodies, 0, `${fixture} tool identity did not inherit invalidity authority`);
+  }
+});
+
 test('generated cx_* outer-schema rejection remains typed and performs zero provider work', async () => {
   eventlog.resetEventLog();
   const accepted = acceptTask('List the matching fixture records with the connected provider.');
@@ -217,12 +333,13 @@ test('generated cx_* outer-schema rejection remains typed and performs zero prov
     const wrapped = wrapToolForHarness(direct!) as typeof direct & {
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     };
+    const counter = new ToolCallsCounter(10);
     const output = await withHarnessRunContext({
       sessionId: accepted.sessionId,
       sourceUserSeq: accepted.sourceUserSeq,
       turn: accepted.turn,
       behaviorScopeId: `${accepted.sessionId}::dynamic-invalid-args`,
-      counter: new ToolCallsCounter(10),
+      counter,
     }, () => wrapped.invoke(
       { context: { sessionId: accepted.sessionId } },
       '{"query":',
@@ -231,6 +348,7 @@ test('generated cx_* outer-schema rejection remains typed and performs zero prov
 
     assert.equal(typeof output, 'string');
     assert.match(String(output), /rejected locally before provider dispatch/);
+    assert.equal(counter.calls, 1, 'the malformed generated-tool attempt is charged once');
     assert.equal(providerBodies, 0, 'the generated tool never entered its provider execute body');
 
     const db = eventlog.openEventLog();

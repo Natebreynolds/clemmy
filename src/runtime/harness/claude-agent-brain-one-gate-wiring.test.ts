@@ -29,7 +29,15 @@ const contracts = await import('./expected-work-contract.js');
 const audit = await import('./accepted-source-settlement-audit.js');
 const delivery = await import('./delivery-committer.js');
 const artifactLedger = await import('./artifact-ledger.js');
-const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const { _withHostLocalWriteCommitFactsForTest } = await import('./host-local-write-commit.js');
+const withLocalWriteCommitFixture = (_tool: string, result: string) =>
+  _withHostLocalWriteCommitFactsForTest({
+    createdId: 'daily-digest',
+    handle: 'vault/00-System/workflows/daily-digest/SKILL.md',
+    contentDigest: 'a'.repeat(64),
+    result,
+  });
 const { presentationEventFromCompletionData } = await import('./turn-outcome.js');
 
 const {
@@ -50,6 +58,7 @@ const UNAVAILABLE_TERMINAL_DELIVERY_JUDGE = {
 } satisfies import('./terminal-delivery-judge.js').TerminalDeliveryJudgePort;
 
 beforeEach(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(null);
   writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
     accessToken: 'sk-ant-oat01-authoring-terminal-evidence',
     refreshToken: 'refresh-authoring-terminal-evidence',
@@ -83,6 +92,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(null);
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkQueryForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
@@ -241,7 +251,7 @@ function workflowCreateSdkQuery() {
       message: { content: [{
         type: 'tool_result',
         tool_use_id: 'toolu_authoring_connection',
-        content: withTerminalAuthoringEvidenceReceipt(
+        content: withLocalWriteCommitFixture(
           'workflow_create',
           'Created workflow "daily_digest".',
         ),
@@ -394,6 +404,11 @@ test('Claude repair DISCLOSES when the shared gate sees successful work beside a
     MODEL_DISCLOSURE,
     'the model-authored disclosure replaces the generic harness disclosure',
   );
+  assert.equal(
+    response.raw?.transport,
+    'claude_agent_sdk_brain',
+    'transport provenance remains on the response instead of overloading the terminal reason',
+  );
   const { terminal, data } = terminalFor(sessionId);
   // The durable accepted-task state machine still refuses to CLOSE a source
   // whose frozen write requirement is incomplete. The committer's documented
@@ -403,8 +418,8 @@ test('Claude repair DISCLOSES when the shared gate sees successful work beside a
   assert.equal(terminal.text, MODEL_DISCLOSURE);
   assert.equal(
     data.reason,
-    'claude_agent_sdk_brain',
-    'the durable row retains the proposing Claude lane while the disclosure marker records the fallback',
+    'verification_required',
+    'the compatibility reason agrees with the durable blocked terminal',
   );
   assert.match(String(data.blockedReason), /no observed operation is bound/i);
   assert.equal(
@@ -414,7 +429,7 @@ test('Claude repair DISCLOSES when the shared gate sees successful work beside a
   );
 });
 
-test('uncertain reversible committed-result salvage reaches repair and the shared DISCLOSE edge', async () => {
+test('uncertain reversible committed-result salvage reaches repair and the shared HOLD edge', async () => {
   const sessionId = 'claude-preterminal-salvage-disclose';
   const disclosure = 'I retrieved the current tracker state, but one reversible update has an unresolved provider result.';
   let sdkRuns = 0;
@@ -448,7 +463,12 @@ test('uncertain reversible committed-result salvage reaches repair and the share
   const { terminal, data } = terminalFor(sessionId);
   assert.equal(terminal.status, 'blocked');
   assert.equal(terminal.text, disclosure);
-  assert.equal(data.deliveryDisclosure, 'state_machine_hold');
+  assert.equal(
+    data.deliveryDisclosure,
+    undefined,
+    'an unresolved external crossing is a direct authoritative hold, not a completion later downgraded by the state machine',
+  );
+  assert.equal(data.blockedReason, 'authoritative_terminal_verification_incomplete');
   assert.ok(
     (data.verificationMissing as unknown[] | undefined)?.includes('external_write_result_unresolved'),
     'the salvage-specific concern reaches the shared committer',
@@ -456,6 +476,21 @@ test('uncertain reversible committed-result salvage reaches repair and the share
 });
 
 test('unresolved artifact verification reaches repair and one typed blocked terminal', async () => {
+  currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+    operationId: 'GOOGLEDOCS_CREATE_DOCUMENT',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'googledocs', posture: 'create_new' },
+    verification: {
+      mutation: {
+        version: 1,
+        resourceFamily: 'googledocs',
+        producedHandleKind: 'created_resource',
+        proof: 'resource_identity_v1',
+        target: { source: 'authoritative_result', pointers: ['/document_id'] },
+      },
+    },
+  }]);
   const sessionId = 'claude-preterminal-artifact-disclose';
   const documentId = 'doc_claude_gate_unverified_123';
   const disclosure = 'I created the brief, but I could not independently read back its exact document ID.';
@@ -537,7 +572,7 @@ test('unresolved artifact verification reaches repair and one typed blocked term
   assert.equal((data.artifactVerification as { status?: string } | undefined)?.status, 'pending');
   assert.ok(
     (data.verificationMissing as unknown[] | undefined)?.some((item) =>
-      String(item).startsWith('artifact_readback:google_doc:')),
+      String(item).startsWith('artifact_readback:resource:')),
     'judge unavailability preserves the Claude-only artifact concern through commit',
   );
 });

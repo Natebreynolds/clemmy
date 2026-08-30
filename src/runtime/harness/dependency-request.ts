@@ -6,7 +6,7 @@
  * compiler failure, and author timeout are not connection_missing.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { appendEvent, openEventLog } from './eventlog.js';
+import { appendEvent, getToolOutput, listEvents, openEventLog } from './eventlog.js';
 import { renderTypedControlState } from './typed-control-state.js';
 
 export const DEPENDENCY_REQUEST_VERSION = 1 as const;
@@ -171,6 +171,92 @@ export function parkDependencyRequest(input: {
     text,
     createdAt: now,
   };
+}
+
+interface ToolSearchUnavailableProjection {
+  code?: unknown;
+}
+
+interface ToolSearchResultProjection {
+  capabilityRef?: unknown;
+  planningProvenance?: unknown;
+}
+
+/**
+ * Project one typed connection dependency from host-owned discovery evidence.
+ *
+ * The model's question/reason is presentation only. It cannot classify a
+ * credential gap. The subtype is earned only when this exact accepted source
+ * has a canonical top-level `tool_search` return whose broker reports a
+ * missing/unauthenticated connection, and that same result supplied no
+ * executable external ref.
+ * A prior source, provider prose, an index miss, timeout, or an ordinary user
+ * choice therefore cannot become `connection_missing`.
+ */
+export function parkObservedConnectionDependencyForSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+  text?: string;
+}): DependencyRequestV1 | null {
+  if (!Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return null;
+  let returned: ReturnType<typeof listEvents>;
+  try {
+    returned = listEvents(input.sessionId, { types: ['tool_returned'] })
+      .filter((event) => (
+        event.data.sourceUserSeq === input.sourceUserSeq
+        && event.data.tool === 'tool_search'
+        && event.data.accounting === 'top_level'
+        && event.data.topologyRole === 'control'
+      ))
+      .reverse();
+  } catch {
+    return null;
+  }
+  for (const event of returned) {
+    const callId = typeof event.data.callId === 'string' ? event.data.callId.trim() : '';
+    const durable = (() => {
+      if (!callId) return null;
+      try { return getToolOutput(input.sessionId, callId); } catch { return null; }
+    })();
+    const raw = durable?.tool === 'tool_search' && !durable.truncatedAtWrite
+      ? durable.output
+      : typeof event.data.result === 'string' ? event.data.result : '';
+    if (!raw) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw) as unknown; } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const body = parsed as {
+      unavailable?: unknown;
+      results?: unknown;
+    };
+    const unavailable = Array.isArray(body.unavailable)
+      ? body.unavailable as ToolSearchUnavailableProjection[]
+      : [];
+    const hostObservedConnectionGap = unavailable.some((entry) => (
+      entry
+      && (entry.code === 'no_connections' || entry.code === 'not_authenticated')
+    ));
+    if (!hostObservedConnectionGap) continue;
+    const results = Array.isArray(body.results)
+      ? body.results as ToolSearchResultProjection[]
+      : [];
+    const suppliedExternalRef = results.some((entry) => (
+      entry
+      && typeof entry.capabilityRef === 'string'
+      && entry.capabilityRef.trim().length > 0
+      && entry.planningProvenance !== 'authorized_local_registry'
+    ));
+    if (suppliedExternalRef) continue;
+    return parkDependencyRequest({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      turn: input.turn,
+      kind: 'connection_missing',
+      ...(input.text?.trim() ? { text: input.text } : {}),
+    });
+  }
+  return null;
 }
 
 export function satisfyOpenDependency(input: {

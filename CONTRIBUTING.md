@@ -91,7 +91,15 @@ This repository is public. Before every commit, review the exact staged diff and
 - screenshots captured from a live personal profile without complete redaction;
 - local absolute paths, private operational runbooks, or generated run artifacts.
 
-Use synthetic names and fixture data in examples and tests. A `.gitignore` rule is a guardrail, not permission to keep sensitive data inside the repository directory.
+Use synthetic names and fixture data in examples and tests. Synthetic email
+addresses must use reserved fixture domains such as `.example`, `.invalid`, or
+`.test` (or `example.com`), rather than a plausible live domain. The hygiene
+gate treats contributor-linked names and addresses as private outside the
+explicit `author`, `contributors`, and `maintainers` metadata of the public
+root `package.json`; private package manifests receive no such exception.
+Never commit an Apple `DEVELOPMENT_TEAM` value. A `.gitignore` rule is a
+guardrail, not permission to keep sensitive data inside the repository
+directory.
 
 `npm run check:public-hygiene` scans existing Git-tracked files only and reports
 prohibited files or sensitive-content categories without printing matched values.

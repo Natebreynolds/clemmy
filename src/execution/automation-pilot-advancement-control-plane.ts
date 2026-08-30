@@ -42,6 +42,7 @@ import {
 import {
   automationCapabilityRequirementDigest,
 } from './automation-workflow-bridge.js';
+import { selectAutomaticReadPilotTarget } from './automation-pilot-target.js';
 import {
   loadAutomationReadPilotWorkspaceCreation,
   reconcileAutomationReadPilotWorkspaceCreation,
@@ -628,24 +629,8 @@ function advancementIdentity(input: {
 }
 
 function supportedProposalIssue(proposal: AutomationOpportunityProposalRecordV1): string | null {
-  const opportunity = proposal.opportunity;
-  if (
-    opportunity.phases.length !== 1
-    || opportunity.capabilityRequirements.length !== 1
-    || opportunity.partition.mode !== 'single'
-  ) return 'The first automatic pilot advancement supports exactly one unpartitioned phase and one capability.';
-  const phase = opportunity.phases[0]!;
-  const requirement = opportunity.capabilityRequirements[0]!;
-  if (
-    phase.capabilityRequirementIds.length !== 1
-    || phase.capabilityRequirementIds[0] !== requirement.id
-  ) return 'The exact pilot phase does not bind its sole capability requirement.';
-  if (
-    phase.effect.class !== 'read'
-    || requirement.minimumEffect !== 'read'
-    || opportunity.effectCeiling.class !== 'read'
-  ) return 'Only an exact read-only proposal can enter automatic pilot advancement.';
-  return null;
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  return target.ok ? null : target.reason;
 }
 
 export function registerAutomationPilotAdvancement(input: {
@@ -914,8 +899,9 @@ function workspaceSelectionCurrent(selection: CanonicalEntityWorkspaceBindingSel
 }
 
 function acquisitionRequest(proposal: AutomationOpportunityProposalRecordV1) {
-  const phase = proposal.opportunity.phases[0]!;
-  const requirement = proposal.opportunity.capabilityRequirements[0]!;
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  if (!target.ok) throw new TypeError(target.reason);
+  const { phase, requirement } = target;
   return {
     proposalId: proposal.proposalId,
     proposalRevision: proposal.revision,
@@ -1004,8 +990,9 @@ function buildAuthoringRequest(input: {
   proposal: AutomationOpportunityProposalRecordV1;
   acquisition: AutomationPilotAcquisitionSnapshotV1;
 }): AutomationPilotAuthoringRequestV1 {
-  const phase = input.proposal.opportunity.phases[0]!;
-  const requirement = input.proposal.opportunity.capabilityRequirements[0]!;
+  const target = selectAutomaticReadPilotTarget(input.proposal.opportunity);
+  if (!target.ok) throw new TypeError(target.reason);
+  const { phase, requirement } = target;
   const requestCore = {
     version: VERSION,
     advancementId: input.current.advancementId,
@@ -1596,8 +1583,9 @@ function authoringResultIssue(input: {
   ) return 'The authoring result does not match the exact retained request or typed object shape.';
   const proposal = loadAutomationOpportunityProposal(current.proposalId);
   if (!proposal) return 'The exact approved proposal is missing.';
-  const phase = proposal.opportunity.phases[0]!;
-  const requirement = proposal.opportunity.capabilityRequirements[0]!;
+  const target = selectAutomaticReadPilotTarget(proposal.opportunity);
+  if (!target.ok) return target.reason;
+  const { phase, requirement } = target;
   if (result.contract.phaseId !== phase.id || result.contract.requirementId !== requirement.id) {
     return 'The authoring result names a different phase or requirement.';
   }

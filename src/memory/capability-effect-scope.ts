@@ -58,6 +58,7 @@ const WRITE_OPERATION_RE = /\b(?:accept|add|append|approve|archive|assign|book|c
 // than forcing rediscovery of the dependency and does not authorize either.
 const READ_DEPENDENCY_RE = /\b(?:latest|recent|current|existing|matching|unread|summary|report|digest|analysis|availability|available|conflicts?|free|slots?)\b|\b(?:from|based\s+on|using)\s+(?:(?:my|our|the)\s+)?(?:[a-z0-9_-]+\s+){0,2}(?:availability|data|emails?|events?|files?|messages?|records?|rows?)\b|\bof\s+(?:(?:my|our|the)\s+)?(?:[a-z0-9_-]+\s+){0,2}(?:data|emails?|events?|files?|messages?|records?|rows?)\b|\b(?:all|each|old|older|matching|unread)\s+(?:[a-z0-9_-]+\s+){0,2}(?:emails?|events?|files?|messages?|records?|rows?)\b|\b(?:emails?|events?|files?|messages?|records?|rows?)\s+(?:after|before|from|matching|with|without)\b/i;
 const CONVERSATIONAL_READ_QUESTION_RE = /^(?:what(?:['’]?s|\s+is|\s+are|\s+was|\s+were)\s+(?:on|in|inside|scheduled|happening|available|due)\b|(?:who|when|where)\b|how\s+many\b)/i;
+const EXPLICIT_READ_ONLY_RE = /\bread[- ]only\b/i;
 // Weak payload grammar on a direct external effect is not itself a source
 // read. A selection/reference cue keeps true read-before-write work mixed.
 const EXPLICIT_SOURCE_SELECTION_RE =
@@ -68,16 +69,32 @@ export function requestedCapabilityEffectScope(text: string): RequestedCapabilit
   const input = text.trim();
   if (!input) return 'unknown';
   const intent = classifyMessageIntent(input).intent;
+  const externalEffect = classifyExternalEffectRequest(input);
+  const conversationalReadQuestion = CONVERSATIONAL_READ_QUESTION_RE.test(input);
 
   // Questions, advice, history, verification, and explicit read operations
   // consume information even when their SUBJECT mentions a send/write.
-  if (intent === 'lookup' || (intent !== 'action' && CONVERSATIONAL_READ_QUESTION_RE.test(input))) {
+  // The broad intent classifier may see subject words such as "set" or
+  // "close" in "How many deals are set to close?" and call the sentence an
+  // action. The request-owned question shape wins unless a later clause
+  // actually requests an external effect.
+  if (intent === 'lookup' || (conversationalReadQuestion && !externalEffect.requested)) {
+    return 'read';
+  }
+  // A read-only request often names forbidden mutations to make the boundary
+  // explicit ("do not send, delete, or modify"). Those negated verbs must not
+  // turn the request into mixed/write discovery when no external effect was
+  // actually requested.
+  if (
+    EXPLICIT_READ_ONLY_RE.test(input)
+    && READ_OPERATION_RE.test(input)
+    && !externalEffect.requested
+  ) {
     return 'read';
   }
   if (intent !== 'action') return 'unknown';
 
-  const externalEffect = classifyExternalEffectRequest(input);
-  const explicitRead = READ_OPERATION_RE.test(input);
+  const explicitRead = READ_OPERATION_RE.test(input) || conversationalReadQuestion;
   const implicitReadDependency = READ_DEPENDENCY_RE.test(input);
   // A direct effect carrying a payload is one write role unless it explicitly
   // selects existing source material. This is effect-topology based: it works

@@ -29,7 +29,10 @@ import {
   type AcceptedTurnCallAuthority,
   type CallAdmissionEffect,
 } from './accepted-turn-call-authority.js';
-import { admitWorkflowPaginatedLogicalCallInTransaction } from './workflow-paginated-read-authority.js';
+import {
+  admitWorkflowPaginatedLogicalCallInTransaction,
+  workflowReadPagePreparationClaimAttestationMatches,
+} from './workflow-paginated-read-authority.js';
 import {
   canonicalLogicalToolName,
   durableLogicalCallContract,
@@ -82,6 +85,7 @@ import {
   type StagedPhysicalDispatchAuthority,
   type StagedPhysicalDispatchAuthorityState,
 } from './staged-transfer-authority.js';
+import { exactVerifiedMutationTargetAdmission } from './mutation-verification-proof.js';
 export { derivePhysicalDispatchId } from './physical-crossing-identity.js';
 
 const WRITE_EFFECTS = new Set(['local_write', 'external_write', 'admin']);
@@ -1035,6 +1039,7 @@ export function beginWorkflowPreparationPhysicalDispatch(input: {
   activationDigest: string;
   authorityDigest: string;
   authorityRevision: number;
+  pageOrdinal?: number;
 }): DispatchAdmissionResult {
   if (input.identity.retryOf) {
     return { status: 'conflict', reason: 'workflow preparation crossing cannot be a retry' };
@@ -1053,6 +1058,13 @@ export function beginWorkflowPreparationPhysicalDispatch(input: {
   if (
     !workflowReadOnlyPhysicalClaimAttestationMatches(exact)
     && !workflowV3PhysicalClaimAttestationMatches(exact)
+    && !(Number.isSafeInteger(input.pageOrdinal) && input.pageOrdinal! >= 0
+      && workflowReadPagePreparationClaimAttestationMatches({
+        ...exact,
+        pageOrdinal: input.pageOrdinal!,
+        physicalDispatchId: input.identity.physicalDispatchId,
+        toolName: input.tool,
+      }))
   ) {
     return { status: 'conflict', reason: 'workflow preparation lacks its exact opaque call attestation' };
   }
@@ -1116,6 +1128,29 @@ function beginPhysicalDispatchCore(
         argumentDigest: staged.state.argumentDigest,
       }
     : durableLogicalCallContract(authority.acceptedTaskId, input.tool, input.args);
+  // Compatibility adapters arrive here only after resolving their actual
+  // provider arguments. A frozen dependent mutation must therefore bind its
+  // target at this final pre-row edge too; the typed lane performs the same
+  // check against its sealed canonical arguments below.
+  if (!typed && !staged && !preparation) {
+    const providerArguments = input.args
+      && typeof input.args === 'object'
+      && !Array.isArray(input.args)
+      ? input.args as Record<string, unknown>
+      : {};
+    const verifiedTarget = exactVerifiedMutationTargetAdmission({
+      sessionId: input.identity.sessionId,
+      sourceUserSeq: input.identity.sourceUserSeq,
+      logicalToolCallId: input.identity.logicalToolCallId,
+      providerArguments,
+    });
+    if (verifiedTarget.status === 'refused') {
+      return {
+        status: 'missing',
+        reason: `exact_verified_mutation_target_required: ${verifiedTarget.reason}`,
+      };
+    }
+  }
   const trustedAdmissionCarrier = inspectTrustedRuntimeEffectCarrier(input.trustedEffectCarrier);
   const trustedAdmissionContract = trustedAdmissionCarrier
     ? durableLogicalCallContract(
@@ -1846,6 +1881,18 @@ export function beginTypedPhysicalDispatch(input: {
     || parsedSealed.authority.canonicalArgumentDigest !== authority.canonicalArgumentDigest
   ) {
     return { status: 'conflict', reason: 'canonical argument digest does not match bound arguments' };
+  }
+  const verifiedTarget = exactVerifiedMutationTargetAdmission({
+    sessionId: authority.acceptedSource.sessionId,
+    sourceUserSeq: authority.acceptedSource.sourceUserSeq,
+    logicalToolCallId: authority.logicalCallId,
+    providerArguments: openedArgs,
+  });
+  if (verifiedTarget.status === 'refused') {
+    return {
+      status: 'missing',
+      reason: `exact_verified_mutation_target_required: ${verifiedTarget.reason}`,
+    };
   }
   return beginPhysicalDispatchCore({
     identity: input.identity,

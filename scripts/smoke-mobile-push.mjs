@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // End-to-end Web Push smoke. Boots `clementine service`, seeds a PIN,
 // logs in (cookie), subscribes a mock browser to the daemon's push
-// endpoint, then triggers a notification via the public daemon API
+// endpoint, then enqueues a notification through the durable store API
 // and asserts the mock push service receives an encrypted POST with
 // VAPID headers. Final step: simulate a 410-Gone response and confirm
 // the daemon reaps the subscription.
@@ -18,6 +18,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { spawn, spawnSync } from 'node:child_process';
 import { createECDH, randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
+import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -128,7 +129,6 @@ let stderr = '';
 child.stderr.on('data', (b) => { stderr += String(b); });
 
 const baseUrl = `http://127.0.0.1:${PORT}`;
-const authHeader = { authorization: `Bearer ${TOKEN}` };
 
 async function tcpProbe() {
   return new Promise((resolve) => {
@@ -233,70 +233,54 @@ const subAuth = randomBytes(16).toString('base64url');
   } else fail(`subscribe returned ${res.status}`);
 }
 
-// 5. Trigger a notification through the daemon API. We hit
-//    /dashboard/actions/notifications/test if it exists, else use the
-//    direct addNotification path via /api/console/notifications/test.
-//    The simplest route: bypass the public API entirely by enqueuing a
-//    notification using the staged daemon — call the CLI to invoke a
-//    test notification. For now we trigger via Bearer-authed dashboard.
-async function triggerTestNotification() {
-  // Try /api/console/notifications/test, /api/console/test-notification,
-  // or fall back to a generic-webhook destination test endpoint.
-  const candidates = [
-    `${baseUrl}/api/console/notifications/test`,
-    `${baseUrl}/api/console/notifications/preview`,
-  ];
-  for (const url of candidates) {
-    const res = await fetch(url, { method: 'POST', headers: authHeader });
-    if (res.ok || res.status === 200 || res.status === 201) return true;
+// 5. Enqueue through the production durable API from a separate process.
+// This intentionally exercises the process-shared notification lock and the
+// daemon's 15-second boot/timer drain. Direct JSON edits are not a supported
+// producer: they bypass frozen destination authority and can manufacture a
+// fake approval that the worker must (correctly) discard as stale.
+function stageNotification(notification) {
+  const notificationsModule = pathToFileURL(path.join(stagedDist, 'runtime', 'notifications.js')).href;
+  const enqueue = spawnSync(process.execPath, [
+    '--input-type=module',
+    '--eval',
+    `const { addNotification } = await import(${JSON.stringify(notificationsModule)}); addNotification(JSON.parse(process.env.CLEMENTINE_PUSH_SMOKE_NOTIFICATION));`,
+  ], {
+    cwd: tmpCwd,
+    env: {
+      PATH: process.env.PATH,
+      LANG: process.env.LANG ?? 'en_US.UTF-8',
+      HOME: tmpHome,
+      CLEMENTINE_HOME: path.join(tmpHome, '.clementine-next'),
+      NODE_ENV: 'test',
+      CLEMENTINE_PUSH_SMOKE_NOTIFICATION: JSON.stringify(notification),
+    },
+    stdio: 'pipe',
+  });
+  if (enqueue.status !== 0) {
+    throw new Error(
+      `durable notification enqueue failed: ${enqueue.stdout?.toString() ?? ''} ${enqueue.stderr?.toString() ?? ''}`.trim(),
+    );
   }
-  return false;
 }
 
-// We use the simplest deterministic path: write a notification
-// directly via the public webhook /api/console endpoint that exists
-// today. If no such endpoint, we POST a stub `proactive-brief` via
-// the dashboard's debug surface. Since neither is guaranteed in older
-// daemons, fall back to driving addNotification through the harness
-// by creating an approval — which is exactly the production path
-// anyway.
-
-// Cleanest deterministic trigger: enqueue a notification by hand via
-// the persisted state file. The daemon's delivery loop picks it up
-// within ~2s.
-const notificationsFile = path.join(stateDir, 'notifications.json');
-const deliveryQueueFile = path.join(stateDir, 'notification-delivery-queue.json');
 {
   const now = new Date().toISOString();
   const notif = {
     id: `smoke-notif-${Date.now().toString(36)}`,
-    kind: 'approval',
-    title: 'Approval pending',
-    body: 'tool test_push',
+    kind: 'system',
+    title: 'Mobile push smoke',
+    body: 'Durable notification delivery test.',
     createdAt: now,
     read: false,
-    metadata: { approvalId: 'apr-smoke', tool: 'test_push' },
+    metadata: { source: 'mobile_push_smoke' },
   };
-  const existing = existsSync(notificationsFile)
-    ? JSON.parse(readFileSync(notificationsFile, 'utf-8'))
-    : [];
-  writeFileSync(notificationsFile, JSON.stringify([...existing, notif], null, 2));
-  const queue = existsSync(deliveryQueueFile)
-    ? JSON.parse(readFileSync(deliveryQueueFile, 'utf-8'))
-    : [];
-  queue.push({
-    notificationId: notif.id,
-    queuedAt: now,
-    completedDestinationIds: [],
-    failedDestinationIds: [],
-    attemptCountByDestination: {},
-    nextAttemptAtByDestination: {},
-    lastErrorByDestination: {},
-  });
-  writeFileSync(deliveryQueueFile, JSON.stringify(queue, null, 2));
-  ok('test notification + delivery job staged');
+  try {
+    stageNotification(notif);
+    ok('test notification + durable delivery job staged');
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
 }
-void triggerTestNotification;
 
 // 6. Wait for the mock to receive the encrypted push.
 {
@@ -324,26 +308,18 @@ void triggerTestNotification;
   const now = new Date().toISOString();
   const notif = {
     id: `smoke-gone-${Date.now().toString(36)}`,
-    kind: 'approval',
-    title: 'Approval pending',
-    body: 'tool gone',
+    kind: 'system',
+    title: 'Mobile push 410 smoke',
+    body: 'This delivery should reap the gone subscription.',
     createdAt: now,
     read: false,
-    metadata: { approvalId: 'apr-gone', tool: 'test_gone' },
+    metadata: { source: 'mobile_push_smoke_410' },
   };
-  const existing = JSON.parse(readFileSync(notificationsFile, 'utf-8'));
-  writeFileSync(notificationsFile, JSON.stringify([...existing, notif], null, 2));
-  const queue = JSON.parse(readFileSync(deliveryQueueFile, 'utf-8'));
-  queue.push({
-    notificationId: notif.id,
-    queuedAt: now,
-    completedDestinationIds: [],
-    failedDestinationIds: [],
-    attemptCountByDestination: {},
-    nextAttemptAtByDestination: {},
-    lastErrorByDestination: {},
-  });
-  writeFileSync(deliveryQueueFile, JSON.stringify(queue, null, 2));
+  try {
+    stageNotification(notif);
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
   // Wait for the gone capture.
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline && captures.length === captureCountBefore) {

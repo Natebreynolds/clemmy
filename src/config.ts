@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -110,11 +111,104 @@ export function isLoopbackWebhookHost(host: string): boolean {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 
-export function getRuntimeEnv(key: string, fallback = ''): string {
+let runtimeEnvReadObserverForTest: ((key: string) => void) | undefined;
+let runtimeConfigCaptureObserverForTest:
+  | ((kind: 'environment' | 'secret_vault') => void)
+  | undefined;
+
+/** Test-only counter seam for proving a derivation does not reread file-backed
+ * runtime configuration once per catalog item. Values are never exposed. */
+export function _setRuntimeEnvReadObserverForTest(observer: ((key: string) => void) | null): void {
+  runtimeEnvReadObserverForTest = observer ?? undefined;
+}
+
+/** Test-only causal seam. It reports captures, never paths, keys, or values. */
+export function _setRuntimeConfigCaptureObserverForTest(
+  observer: ((kind: 'environment' | 'secret_vault') => void) | null,
+): void {
+  runtimeConfigCaptureObserverForTest = observer ?? undefined;
+}
+
+function captureRuntimeEnvironment(): Readonly<Record<string, string>> {
   const activeEnvFiles = envSearchPaths()
     .filter((filePath, index, items) => existsSync(filePath) && items.indexOf(filePath) === index);
   const currentEnv = Object.assign({}, ...activeEnvFiles.map((filePath) => parseEnvFile(filePath)));
-  return process.env[key] ?? currentEnv[key] ?? fallback;
+  runtimeConfigCaptureObserverForTest?.('environment');
+  return Object.freeze(currentEnv);
+}
+
+function captureSecretVault(): Readonly<Record<string, string>> {
+  const vaultPath = path.join(BASE_DIR, 'state', 'secrets-vault.json');
+  let entries: Record<string, string> = {};
+  if (existsSync(vaultPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(vaultPath, 'utf-8')) as {
+        version?: string;
+        entries?: Record<string, string>;
+      };
+      if (parsed.version === 'v1' && parsed.entries) entries = { ...parsed.entries };
+    } catch {
+      entries = {};
+    }
+  }
+  runtimeConfigCaptureObserverForTest?.('secret_vault');
+  return Object.freeze(entries);
+}
+
+/**
+ * One private, coherent filesystem view for one response request. The class
+ * deliberately has only ECMAScript-private fields, so the environment and
+ * secret bytes are neither enumerable nor JSON-serializable. `process.env`
+ * remains live and highest-precedence: Settings writes take effect in the
+ * same request, while file-backed state is stable until an owned writer
+ * explicitly invalidates it.
+ */
+class RuntimeConfigRequestSnapshot {
+  #environment: Readonly<Record<string, string>> | null = captureRuntimeEnvironment();
+  #secretVault: Readonly<Record<string, string>> | null = captureSecretVault();
+
+  environmentValue(key: string): string | undefined {
+    this.#environment ??= captureRuntimeEnvironment();
+    return this.#environment[key];
+  }
+
+  secretValue(name: string): string | undefined {
+    this.#secretVault ??= captureSecretVault();
+    return this.#secretVault[name];
+  }
+
+  invalidate(kind: 'environment' | 'secret_vault'): void {
+    if (kind === 'environment') this.#environment = null;
+    else this.#secretVault = null;
+  }
+}
+
+const runtimeConfigRequestStorage = new AsyncLocalStorage<RuntimeConfigRequestSnapshot>();
+
+/**
+ * Run work under one request-owned runtime configuration snapshot. Nested
+ * bridge/direct-loop scopes reuse their owner; a later request always captures
+ * fresh file state.
+ */
+export function withRuntimeConfigSnapshot<T>(work: () => T): T {
+  if (runtimeConfigRequestStorage.getStore()) return work();
+  return runtimeConfigRequestStorage.run(new RuntimeConfigRequestSnapshot(), work);
+}
+
+/** Notify only the currently executing request after an owned durable write. */
+export function invalidateRuntimeConfigSnapshot(
+  kind: 'environment' | 'secret_vault',
+): void {
+  runtimeConfigRequestStorage.getStore()?.invalidate(kind);
+}
+
+export function getRuntimeEnv(key: string, fallback = ''): string {
+  runtimeEnvReadObserverForTest?.(key);
+  const requestSnapshot = runtimeConfigRequestStorage.getStore();
+  if (requestSnapshot) {
+    return process.env[key] ?? requestSnapshot.environmentValue(key) ?? fallback;
+  }
+  return process.env[key] ?? captureRuntimeEnvironment()[key] ?? fallback;
 }
 
 /**
@@ -127,16 +221,11 @@ export function getRuntimeEnv(key: string, fallback = ''): string {
  * cleanly when absent or unreadable — never throws.
  */
 function readSecretFromFileVaultSync(name: string): string | undefined {
-  const vaultPath = path.join(BASE_DIR, 'state', 'secrets-vault.json');
-  if (!existsSync(vaultPath)) return undefined;
-  try {
-    const parsed = JSON.parse(readFileSync(vaultPath, 'utf-8')) as { version?: string; entries?: Record<string, string> };
-    if (parsed.version !== 'v1' || !parsed.entries) return undefined;
-    const value = parsed.entries[name];
-    return value && value.length > 0 ? value : undefined;
-  } catch {
-    return undefined;
-  }
+  const requestSnapshot = runtimeConfigRequestStorage.getStore();
+  const value = requestSnapshot
+    ? requestSnapshot.secretValue(name)
+    : captureSecretVault()[name];
+  return value && value.length > 0 ? value : undefined;
 }
 
 export function getOpenAiApiKey(): string {
@@ -280,7 +369,16 @@ export const MODEL_PRESETS = [
   { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
   { id: 'gpt-5.4', label: 'GPT-5.4' },
   { id: 'gpt-5.5', label: 'GPT-5.5' },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna (fastest)' },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra (balanced)' },
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol (frontier)' },
 ];
+
+/** A Codex-only last-resort lane for cross-provider brain fallover. This stays
+ * separate from OPENAI_MODEL_PRIMARY because all-in BYO routing may repurpose
+ * the primary tier while an operator still wants a specific, cheaper Codex
+ * rescue. Unset deliberately preserves the legacy "follow primary" behavior. */
+export const CODEX_RESCUE_MODEL_ENV_KEY = 'OPENAI_MODEL_RESCUE';
 
 /** The Codex (gpt-5.x) brain's default model — used both by the Codex runtime
  *  and as the fallback when a Codex brain is selected but the OPENAI_MODEL_* slot
@@ -305,12 +403,50 @@ export const MODELS: Models = {
   get deep() { return getModelForTier('deep'); },
 };
 
-export function getModelSettingsSnapshot(): {
+export interface CodexRescueModelSelection {
+  modelId: string;
+  inheritedModelId: string;
+  envKey: typeof CODEX_RESCUE_MODEL_ENV_KEY;
+  configured: boolean;
+}
+
+export type ModelProviderResolver = (modelId: string) => 'codex' | 'claude' | 'byo';
+
+function codexSafeRescueInheritedModelId(resolveModelProvider: ModelProviderResolver): string {
+  const primary = MODELS.primary;
+  try {
+    return resolveModelProvider(primary) === 'codex' ? primary : DEFAULT_CODEX_MODEL;
+  } catch {
+    return DEFAULT_CODEX_MODEL;
+  }
+}
+
+/** Resolve the explicit Codex rescue setting without guessing from a display
+ * label. Provider ownership is validated at the settings/router edges. The
+ * inherited lane is also provider-attested here so a primary slot repurposed
+ * for GLM/another BYO model cannot make a "Codex rescue" claim that the Codex
+ * adapter later and silently rewrites to its own default. */
+export function getCodexRescueModelSelection(
+  resolveModelProvider: ModelProviderResolver,
+): CodexRescueModelSelection {
+  const inheritedModelId = codexSafeRescueInheritedModelId(resolveModelProvider);
+  const raw = (getRuntimeEnv(CODEX_RESCUE_MODEL_ENV_KEY, '') || '').trim();
+  const configuredModelId = normalizeModelId(raw, '');
+  return {
+    modelId: configuredModelId || inheritedModelId,
+    inheritedModelId,
+    envKey: CODEX_RESCUE_MODEL_ENV_KEY,
+    configured: Boolean(configuredModelId),
+  };
+}
+
+export function getModelSettingsSnapshot(resolveModelProvider: ModelProviderResolver): {
   models: Models;
   defaults: Models;
   envKeys: Record<ModelTier, string>;
   presets: typeof MODEL_PRESETS;
   processEnvOverrides: Record<ModelTier, boolean>;
+  codexRescue: CodexRescueModelSelection;
 } {
   return {
     models: {
@@ -326,6 +462,7 @@ export function getModelSettingsSnapshot(): {
       primary: process.env[MODEL_ENV_KEYS.primary] !== undefined,
       deep: process.env[MODEL_ENV_KEYS.deep] !== undefined,
     },
+    codexRescue: getCodexRescueModelSelection(resolveModelProvider),
   };
 }
 

@@ -71,6 +71,7 @@ const originalUserprofile = process.env.USERPROFILE;
 const originalClemmyHome = process.env.CLEMENTINE_HOME;
 process.env.HOME = tmpHome;
 process.env.CLEMENTINE_HOME = path.join(tmpHome, '.clementine-next');
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 if (process.platform === 'win32') process.env.USERPROFILE = tmpHome;
 
 process.on('exit', () => {

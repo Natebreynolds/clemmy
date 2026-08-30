@@ -16,21 +16,74 @@
  * The kernel invariant is untouched: a genuinely conflicting second
  * refinement still poisons (logical-call-contract-refinement.test.ts).
  */
-import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
 const PRIOR_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
-const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-composio-single-owner-'));
+const PRIOR_TEST_ISOLATED_HOME = process.env.CLEMMY_TEST_ISOLATED_HOME;
+const TEMP_ROOT = (process.env.TMPDIR?.trim() || '/tmp').replace(/\/+$/, '');
+if (!TEMP_ROOT.startsWith('/')) throw new Error('fixture temp root must be absolute');
+const TMP_HOME = `${TEMP_ROOT}/clemmy-composio-single-owner-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+// This assignment deliberately precedes EVERY import. Project modules capture
+// the home during initialization; importing even one of them first can route
+// fixed fixture sessions into the live daemon database.
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.COMPOSIO_BACKEND = 'sdk';
 delete process.env.COMPOSIO_API_KEY;
+
+const { createHash } = await import('node:crypto');
+const { existsSync, mkdirSync, rmSync, writeFileSync } = await import('node:fs');
+const os = await import('node:os');
+const path = await import('node:path');
+const { test } = await import('node:test');
+const { default: assert } = await import('node:assert/strict');
+const { default: Database } = await import('better-sqlite3');
+
+const resolvedTempHome = path.resolve(TMP_HOME);
+assert.ok(
+  resolvedTempHome.startsWith(`${path.resolve(TEMP_ROOT)}${path.sep}`),
+  'fixture home must remain below the resolved temp root',
+);
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'composio-single-owner-test\n', 'utf8');
 
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
+const LIVE_HOME = path.resolve(
+  PRIOR_CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next'),
+);
+const FIXED_FIXTURE_SESSION_IDS = Object.freeze([
+  'sess-single-owner',
+  'sess-production-nested-reservation',
+  'sess-prepared-connection-failure',
+  'sess-prepared-account-absent',
+  'sess-prepared-schema-absent',
+  'sess-no-hidden-receipt-poll',
+]);
+
+function assertFixedFixtureSessionsAbsentFromLiveHome(): void {
+  assert.notEqual(resolvedTempHome, LIVE_HOME, 'fixture and live homes must never coincide');
+  const liveDbPath = path.join(LIVE_HOME, 'state', 'harness.db');
+  if (!existsSync(liveDbPath)) return;
+  const db = new Database(liveDbPath, { readonly: true, fileMustExist: true });
+  try {
+    const placeholders = FIXED_FIXTURE_SESSION_IDS.map(() => '?').join(', ');
+    const rows = db.prepare(`
+      SELECT id
+        FROM sessions
+       WHERE id IN (${placeholders})
+       ORDER BY id
+    `).all(...FIXED_FIXTURE_SESSION_IDS) as Array<{ id: string }>;
+    assert.deepEqual(
+      rows.map((row) => row.id),
+      [],
+      `fixed composio-contract fixture sessions escaped into live home ${LIVE_HOME}`,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+// Pre-import sentinel: a contaminated live home blocks the fixture before any
+// Clementine module initializes. The after-hook repeats it to prove this run
+// did not write those ids outside TMP_HOME.
+assertFixedFixtureSessionsAbsentFromLiveHome();
 
 const { buildCallTool } = await import('./call-tool.js');
 const { _setInnerDispatchToolsForTests } = await import('./inner-dispatch.js');
@@ -70,6 +123,7 @@ const hostBindings = await import('../runtime/harness/host-call-capability-bindi
 const hostInvocation = await import('../runtime/harness/host-tool-invocation.js');
 const manifests = await import('../runtime/harness/capability-manifest.js');
 const manifestStores = await import('../runtime/harness/capability-manifest-store.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const providerIdentity = await import('../integrations/composio/provider-definition-identity.js');
 const { digestSchema } = await import('./tool-contract-store.js');
 
@@ -150,16 +204,50 @@ function firecrawlSearchManifest() {
   });
 }
 
+function registeredFirecrawlSearchCapability(
+  manifest: ReturnType<typeof firecrawlSearchManifest>,
+) {
+  return {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerInputSchemaDigest: manifest.externalDefinition!.providerInputSchemaDigest,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({ successful: true, data: { results: [] } }),
+  };
+}
+
+const PRIOR_HOST_CAPABILITY_CATALOG = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+const FIRECRAWL_MANIFEST = firecrawlSearchManifest();
+capabilityCatalogs.installHostCapabilityCatalogFactory(
+  capabilityCatalogs.createHostCapabilityCatalogFactory([
+    registeredFirecrawlSearchCapability(FIRECRAWL_MANIFEST),
+  ]),
+);
+
 test.after(() => {
-  _setInnerDispatchToolsForTests(null);
-  composioClientTest.setConnectedAccountsLoader(null);
-  resetComposioClient();
-  resetToolSchemaCache();
-  closeEventLog();
-  closeOperationalTelemetryDb();
-  rmSync(TMP_HOME, { recursive: true, force: true });
-  if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
-  else process.env.CLEMENTINE_HOME = PRIOR_CLEMENTINE_HOME;
+  try {
+    _setInnerDispatchToolsForTests(null);
+    composioClientTest.setConnectedAccountsLoader(null);
+    resetComposioClient();
+    resetToolSchemaCache();
+    capabilityCatalogs.installHostCapabilityCatalogFactory(PRIOR_HOST_CAPABILITY_CATALOG);
+    closeEventLog();
+    closeOperationalTelemetryDb();
+    assertFixedFixtureSessionsAbsentFromLiveHome();
+  } finally {
+    rmSync(resolvedTempHome, { recursive: true, force: true });
+    if (PRIOR_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+    else process.env.CLEMENTINE_HOME = PRIOR_CLEMENTINE_HOME;
+    if (PRIOR_TEST_ISOLATED_HOME === undefined) delete process.env.CLEMMY_TEST_ISOLATED_HOME;
+    else process.env.CLEMMY_TEST_ISOLATED_HOME = PRIOR_TEST_ISOLATED_HOME;
+  }
 });
 
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex');

@@ -124,11 +124,21 @@ const finiteCompletionSchema = z.discriminatedUnion('kind', [
   }).strict(),
 ]);
 
+const partitionOutcomeAuthoritySchema = z.object({
+  version: z.literal(1),
+  kind: z.literal('workflow_read_aggregate'),
+  acceptedTerminalStates: z.union([
+    z.tuple([z.literal('completed')]),
+    z.tuple([z.literal('completed'), z.literal('failed')]),
+  ]),
+}).strict();
+
 const partitionSchema = z.discriminatedUnion('mode', [
   z.object({
     mode: z.literal('single'),
     checkpointEvery: z.literal(1),
     completion: terminalEvidenceSchema,
+    outcomeAuthority: partitionOutcomeAuthoritySchema.optional(),
   }).strict(),
   z.object({
     mode: z.literal('finite'),
@@ -187,7 +197,7 @@ const datasetFieldSchema = z.object({
 const identityRuleSchema = z.object({
   id,
   fields: z.array(fieldName).min(1).max(32),
-  match: z.literal('exact'),
+  match: z.enum(['exact', 'compound']),
   normalizers: z.array(z.enum([
     'trim',
     'case_fold',
@@ -555,6 +565,9 @@ function structuralErrors(value: AutomationOpportunityV1): string[] {
       errors.push(`duplicate identity rule id "${duplicate}"`);
     }
     for (const rule of value.dataset.identity.rules) {
+      if (rule.match === 'compound' && rule.fields.length < 2) {
+        errors.push(`compound identity rule "${rule.id}" requires at least two fields`);
+      }
       for (const field of rule.fields) {
         if (!fieldNames.has(field)) {
           errors.push(`identity rule "${rule.id}" references unknown field "${field}"`);

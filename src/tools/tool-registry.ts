@@ -118,10 +118,31 @@ export type LocalPlanningReversibility =
 export interface LocalPlanningSafeMode {
   /** Stable suffix in the citable capability ref. */
   id: string;
-  /** Exact scalar arguments that must be present at dispatch. */
+  /** Exact scalar arguments required by this safe runtime mode. */
   requiredEquals: Readonly<Record<string, string | number | boolean>>;
+  /** Required-equality fields for which schema-level null is explicitly the
+   * runtime spelling of the declared scalar. This is structural authority,
+   * not generic nullable coercion: the current tool schema must admit both
+   * the scalar and null, and the field must also appear in requiredEquals. */
+  nullEquivalentToRequired?: readonly string[];
   /** Arguments whose non-null presence would widen the declared consequence. */
   absentOrNull?: readonly string[];
+  /** Scalar domains that must remain closed even when another field decides
+   * the runtime branch. This is useful for precedence-style APIs: for example
+   * append=true may select append independently of mode, while mode must still
+   * be one of the values admitted by the configured schema. */
+  allowedValues?: Readonly<Record<string, readonly (string | number | boolean | null)[]>>;
+  /** Alternative structural spellings of this same runtime mode. Every branch
+   * is proved against the current configured schema and exactly one declared
+   * variant must match before consent/dispatch. */
+  alternatives?: readonly LocalPlanningSafeModePredicate[];
+}
+
+export interface LocalPlanningSafeModePredicate {
+  requiredEquals: Readonly<Record<string, string | number | boolean>>;
+  nullEquivalentToRequired?: readonly string[];
+  absentOrNull?: readonly string[];
+  allowedValues?: Readonly<Record<string, readonly (string | number | boolean | null)[]>>;
 }
 
 export interface LocalPlanningSemantics {
@@ -138,11 +159,18 @@ export interface LocalPlanningSemantics {
   safeMode?: LocalPlanningSafeMode;
 }
 
-export interface TerminalAuthoringEvidenceContract {
-  /** Exact host-owned first line emitted only after the local authoring commit.
-   * A model/tool summary or ordinary isError:false MCP response cannot forge
-   * completion authority merely by naming the tool. */
-  receiptPrefix: string;
+/**
+ * Closed execution contract for a Clementine-local tool that may enter the
+ * shared workflow call kernel. `localPlanning` alone is discovery metadata;
+ * this additional declaration is the reviewed adapter boundary that says the
+ * exact captured handler is safe to invoke under a frozen schema/argument
+ * digest. Absence remains fail-closed.
+ */
+export interface ReviewedLocalExecutionContractV1 {
+  version: 1;
+  adapter: 'artifact_bundle_v1';
+  idempotency: 'content_addressed';
+  reconciliation: 'artifact_bundle_v1';
 }
 
 export type ActionControlContextRequirement = 'task_recovery' | 'alternate_action_owner';
@@ -206,15 +234,20 @@ export interface ToolDecl {
    * mint future child/provider work without propagating the current source
    * requirement. The parent must propagate that authority or refuse first. */
   delegationPrimitive?: true;
-  /** A successful canonical Claude SDK return from this exact local tool is
-   * itself durable proof of the user-requested authoring deliverable. This is
-   * deliberately independent of `sdkLayer: 'authoring'`: that profile also
-   * contains lifecycle, approval, discovery, and bookkeeping controls which
-   * must never manufacture terminal work evidence. Omitted is fail-closed. */
-  terminalAuthoringEvidence?: TerminalAuthoringEvidenceContract;
   /** Exact structural local-planning semantics. This can make a discovered
    * row citable by plan_task; it never changes dispatch or consent policy. */
   localPlanning?: LocalPlanningSemantics;
+  /** Additional mutually-exclusive argument variants for one configured tool.
+   * Unlike a broad tool-level declaration, every variant must carry a
+   * structural safeMode, receives its own capability ref, and is frozen by the
+   * accepted plan before work_call arguments are admitted. This permits an
+   * irreversible/destructive mode to be planned truthfully without letting it
+   * inherit a reversible sibling's authority. */
+  localPlanningVariants?: readonly LocalPlanningSemantics[];
+  /** Explicit reviewed adapter contract for the shared workflow v3 kernel.
+   * This does not grant consent; the exact v3 activation still owns approval,
+   * one physical crossing, settlement, and replay. */
+  localExecution?: ReviewedLocalExecutionContractV1;
   /** One-line summary (first sentence of the registered tool description, capped
    *  ~90 chars) — the catalog line the Codex lane reads for schema-on-demand. */
   description?: string;
@@ -232,10 +265,11 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'agent_run_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Fetch the full event timeline of a single autonomy cycle by runId.' },
   { name: 'agent_runs_recent', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'List recent autonomy cycles (daemon-source runs).' },
   { name: 'answer_check_in', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Resolve an open check-in with an answer.' },
-  { name: 'ask_user_question', sideEffect: 'read', tier: 'core', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Ask the user a question when the answer would change what you do — scope, target, format, or a boundary only they can decide.' },
+  { name: 'artifact_bundle_save', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', needsApproval: false, loopClass: 'mutating', localPlanning: { consequence: 'local_artifact', reversibility: 'create_only', destructive: false, purpose: 'create_local_artifact_bundle', inputKind: 'artifact_content', outputKind: 'local_artifact', deliverableKind: 'directory', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'], safeMode: { id: 'content_addressed', requiredEquals: { mode: 'content_addressed' } } }, localExecution: { version: 1, adapter: 'artifact_bundle_v1', idempotency: 'content_addressed', reconciliation: 'artifact_bundle_v1' }, description: 'Atomically commit a bounded multi-file local artifact as one immutable content-addressed directory; exact replay verifies and reuses the same revision.' },
+  { name: 'ask_user_question', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Ask the user a question when the answer would change what you do — scope, target, format, or a boundary only they can decide.' },
   { name: 'automation_opportunity_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Read one inert automation opportunity proposal by its exact ID.' },
   { name: 'automation_opportunity_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List inert automation opportunity proposals for review.' },
-  { name: 'automation_opportunity_propose', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Persist an inert, reviewable automation opportunity without granting execution authority.' },
+  { name: 'automation_opportunity_propose', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Persist an inert, reviewable automation opportunity without granting execution authority.' },
   { name: 'automation_opportunity_revise', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Revise an inert automation opportunity without granting execution authority.' },
   { name: 'automation_opportunity_review_request', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', description: 'Stage an exact proposal CAS and formal human decision card without granting execution authority.' },
   { name: 'automation_read_pilot_acquisition_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'read-only', blockedFor: ['workflow-step', 'worker'], loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List exact host-issued live read acquisition references without granting authority.' },
@@ -299,21 +333,21 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'execution_mark_blocked', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', description: 'Mark an execution as blocked with a concrete blocker description.' },
   { name: 'execution_update_step', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', delegationPrimitive: true, description: 'Advance an execution: record the next concrete step and an optional summary of what just…' },
   { name: 'execution_reconcile_write', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'alternate_action_owner', delegationPrimitive: true, description: 'Settle an ambiguous/orphaned external write from read-back evidence: absent unlocks one retry, present records it done.' },
-  { name: 'focus_activate', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Resume a previously parked focus.' },
-  { name: 'focus_clear', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Mark a focus as done.' },
+  { name: 'focus_activate', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Resume a previously parked focus.' },
+  { name: 'focus_clear', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Mark a focus as done.' },
   { name: 'focus_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['focus_set', 'focus_update', 'focus_touch', 'focus_park', 'focus_activate', 'focus_clear'], actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Read the assistant\'s current attention pointer.' },
-  { name: 'focus_park', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Park the active focus — flips it from active to paused so it stays resumable but no longe…' },
-  { name: 'focus_set', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pin a NEW current focus.' },
+  { name: 'focus_park', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Park the active focus — flips it from active to paused so it stays resumable but no longe…' },
+  { name: 'focus_set', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pin a NEW current focus.' },
   { name: 'artifact_claim_resolve', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Resolve an unresolved provider-create claim after read-only verification: bind the found resource id (evidence-gated) or release a provably-absent claim.' },
-  { name: 'focus_touch', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Bump the last-touched time + reset the idle-confirm window for an active focus.' },
-  { name: 'focus_update', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Evolve an existing focus and optionally patch its sparse shared workstate.' },
+  { name: 'focus_touch', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Bump the last-touched time + reset the idle-confirm window for an active focus.' },
+  { name: 'focus_update', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Evolve an existing focus and optionally patch its sparse shared workstate.' },
   { name: 'git_status', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'Run a read-only git status in an allowed workspace directory.' },
   { name: 'goal_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List persistent goals, optionally filtered by owner or status.' },
   { name: 'goal_stale', sideEffect: 'write', tier: 'core', lanes: [], actionTopologyRole: 'control', description: 'Detect or mark long-running goals that have gone stale (not updated in a while).' },
   { name: 'goal_upsert', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Create a persistent goal when no id matches, or update the existing goal when one does — the single durable-goal write tool.' },
   { name: 'harness_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Inspect Clementine harness-internal capability health.' },
   { name: 'hold_task_for_later', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', delegationPrimitive: true, description: 'HOLD an agreed multi-step task for later instead of running it now — the "or you can ask…' },
-  { name: 'list_files', sideEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['write_file', 'replace_file', 'run_shell_command'], description: 'List files in an allowed workspace directory.' },
+  { name: 'list_files', sideEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['write_file', 'artifact_bundle_save', 'replace_file', 'run_shell_command'], description: 'List files in an allowed workspace directory.' },
   { name: 'list_pending_check_ins', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'List open check-ins waiting for a user answer.' },
   { name: 'local_cli_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'read', actionTopologyRole: 'control', delegationPrimitive: true, description: 'List CLIs installed on the local machine and detected on $PATH.' },
   { name: 'local_cli_probe', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'read', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Probe a specific local CLI by running `<command> --version` and `<command> --help`.' },
@@ -323,30 +357,30 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'mcp_reconnect', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Recover an external MCP server that is degraded/unavailable (stuck in the connection back…' },
   { name: 'mcp_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Inspect configured external MCP servers available to Clementine.' },
   { name: 'memory_embed_backfill', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Compute embeddings for vault chunks and/or durable facts using the active embedding provi…' },
-  { name: 'memory_forget', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Soft-delete a fact by id (sets active=0).' },
+  { name: 'memory_forget', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'cli'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Soft-delete a fact by id (sets active=0).' },
   { name: 'memory_import', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Import ANOTHER agent\'s memory files (Claude Code memories, OpenClaw/Fermis stores, bare m…' },
   { name: 'memory_list_facts', sideEffect: 'read', projectEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List or query durable facts as filterable JSON. Pass query for targeted lookup.' },
-  { name: 'memory_pin', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Pin a fact as a STANDING INSTRUCTION (always injected into context, exempt from the recen…' },
+  { name: 'memory_pin', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Pin a fact as a STANDING INSTRUCTION (always injected into context, exempt from the recen…' },
   { name: 'memory_read', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Read a durable memory reference (fact:<id> or policy:<id>), a key memory file, or a vault-relative markdown path.' },
   { name: 'memory_recall', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], actionTopologyRole: 'control', description: 'Recall vault chunks.' },
   { name: 'memory_recall_all', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], actionTopologyRole: 'control', description: 'Recall relevant facts, notes, entities, resources, episodes, policies, and proven tools through one evidence-backed pipeline.' },
-  { name: 'memory_remember', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Record a durable fact in long-term memory.' },
-  { name: 'memory_restore', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Restore (reactivate) a soft-deleted fact by id — the inverse of memory_forget.' },
+  { name: 'memory_remember', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Record a durable fact in long-term memory.' },
+  { name: 'memory_restore', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Restore (reactivate) a soft-deleted fact by id — the inverse of memory_forget.' },
   { name: 'memory_review_instructions', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Before a batch/irreversible external write, review the standing instructions in play.' },
   { name: 'memory_search', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['memory_remember', 'memory_forget'], actionTopologyRole: 'control', description: 'Search the local Clementine vault for relevant notes and memories.' },
-  { name: 'memory_search_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', actionTopologyRole: 'control', description: 'Semantically search durable FACTS (your long-term memory of the user, projects, standing…' },
+  { name: 'memory_search_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', actionTopologyRole: 'control', description: 'Semantically search durable FACTS (your long-term memory of the user, projects, standing…' },
   { name: 'memory_self_heal', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Inspect or run the audited long-term-memory self-heal loop.' },
   { name: 'note_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Create a new note in the vault.' },
   { name: 'notify_user', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Send a notification to the user via the notification queue.' },
   { name: 'pending_action_execute', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['worker'], needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Execute the exact stored payload of an approved single-call pending action.' },
   { name: 'pending_action_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Read one queued action with its exact payload, status, approval id, preview, and result h…' },
   { name: 'pending_action_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'List durable pending actions.' },
-  { name: 'pending_action_queue', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['worker'], actionTopologyRole: 'control', description: 'Queue a fully prepared action payload before an irreversible external write/send/deploy o…' },
+  { name: 'pending_action_queue', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['worker'], actionTopologyRole: 'control', description: 'Queue a fully prepared action payload before an irreversible external write/send/deploy o…' },
   { name: 'pending_action_record_result', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['worker'], actionTopologyRole: 'control', description: 'After executing or cancelling a queued action, record the outcome so Clementine can repor…' },
   { name: 'plan_task', sideEffect: 'write', runtimeEffect: 'host_only', hostControlFrame: 'sole', hostModelFrameClass: 'fresh_plan_barrier', tier: 'core', lanes: [], needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', description: 'Admit and freeze one primary-model action plan for the exact accepted request.' },
   { name: 'ping', sideEffect: 'read', tier: 'discoverable', lanes: ['sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Basic health-check tool for the local Clementine tool runtime.' },
   { name: 'propose_check_in_template', sideEffect: 'read', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Propose a NEW autonomous check-in template the user can approve.' },
-  { name: 'read_file', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['write_file', 'replace_file', 'run_shell_command'], description: 'Read a file from an allowed workspace path.' },
+  { name: 'read_file', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, readMutatedBy: ['write_file', 'artifact_bundle_save', 'replace_file', 'run_shell_command'], description: 'Read a file from an allowed workspace path.' },
   { name: 'recall_tool_result', sideEffect: 'read', projectEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Retrieve the full verbatim output of a prior tool call by its call_id.' },
   { name: 'request_approval', sideEffect: 'write', tier: 'core', lanes: [], blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pause and ask the user to approve a high-risk action or one batch of same-shape external…' },
   { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', actionControlContext: 'task_recovery', delegationPrimitive: true, description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),…' },
@@ -358,7 +392,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // made act-routed fan-out structurally impossible: dropped from the direct
   // surface, absent from the carrier universe, and walled by the work-binding
   // gate (live 2026-08-11: '"run_worker" is not a deferred callable tool').
-  { name: 'run_worker', sideEffect: 'write', tier: 'core', lanes: ['sdk-brain'], sdkLayer: 'full-extra', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Spawn a stateless Worker on ONE item using a structured parent-planned job packet.' },
+  { name: 'run_worker', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'full-extra', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Spawn a stateless Worker on ONE item using a structured parent-planned job packet.' },
   { name: 'session_history', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', actionTopologyRole: 'control', actionControlContext: 'task_recovery', description: 'Read recent conversation history for a session.' },
   { name: 'session_pause', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Save a structured handoff for a session so work can resume cleanly after context drift, a…' },
   { name: 'session_resume', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Summarize a session using its continuity brief and recent transcript so work can resume c…' },
@@ -370,19 +404,19 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'source_map_upsert', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', description: 'Record WHERE a resource lives in one of the user\'s connected sources — a Drive folder, an…' },
   { name: 'space_action_prepare', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Prepare one declared Workspace action for exact approval, or execute it only when an exact existing standing approval covers the current action, arguments, and runner bytes.' },
   { name: 'space_diff', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Compare two retained successful observations for one Workspace data source, defaulting to current versus prior.' },
-  { name: 'space_edit_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Make a TARGETED, reversible edit to a Workspace runner\'s SOURCE — FAST, for changing what…' },
+  { name: 'space_edit_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workspace_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workspace_runner', inputKind: 'workspace_runner_patch', outputKind: 'workspace_revision', deliverableKind: 'workspace', destinationPosture: 'named_existing', advisoryRoles: ['author', 'destination'] }, description: 'Make a TARGETED, reversible edit to a Workspace runner\'s SOURCE — FAST, for changing what…' },
   { name: 'space_edit_view', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', localPlanning: { consequence: 'workspace_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workspace', inputKind: 'workspace_patch', outputKind: 'workspace_revision', deliverableKind: 'workspace', destinationPosture: 'named_existing', advisoryRoles: ['author', 'destination'] }, description: 'Make a TARGETED edit to an existing Workspace view — FAST, for small tweaks (a button, la…' },
   { name: 'space_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Read a Workspace: its manifest (title, status, data sources, re-engage contract), a snaps…' },
   { name: 'space_get_runner', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Read the SOURCE of a Workspace data/action RUNNER (the .mjs/.py/.sh script under data/ th…' },
   { name: 'space_get_view', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Read the CURRENT view HTML of a Workspace, line-numbered — this is the EXACT text you nee…' },
   { name: 'space_history', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List bounded, metadata-only observation history for a Workspace without loading raw retained datasets.' },
   { name: 'space_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'List the user\'s Workspaces (persistent interactive surfaces you built).' },
-  { name: 'space_publish', sideEffect: 'send', tier: 'discoverable', lanes: ['sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', description: 'Export a Workspace as a STATIC, share-ready snapshot — the shareable counterpart to the l…' },
+  { name: 'space_publish', sideEffect: 'send', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', description: 'Export a Workspace as a STATIC, share-ready snapshot — the shareable counterpart to the l…' },
   { name: 'space_refresh', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Re-run a Workspace\'s data source(s) NOW (server-side, no LLM) and persist the fresh datas…' },
   { name: 'space_revert_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Undo the most recent space_edit_runner on a runner, restoring its prior source from the s…' },
   { name: 'space_save', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workspace_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workspace', inputKind: 'workspace_definition', outputKind: 'workspace_revision', deliverableKind: 'workspace', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'] }, description: 'Create or update a Workspace — a persistent, interactive HTML surface you build for the u…' },
   { name: 'space_set_data', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id —…' },
-  { name: 'space_try_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Statically inspect a legacy Workspace runner\'s declared role and provenance without executing it; execution remains behind space_refresh or the normal Workspace action approval path.' },
+  { name: 'space_try_runner', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Statically inspect a legacy Workspace runner\'s declared role and provenance without executing it; execution remains behind space_refresh or the normal Workspace action approval path.' },
   { name: 'surface_plan', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Surface a Plan you just received from `draft_plan` to the user for review.' },
   { name: 'task_add', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Add a passive one-time item to the user\'s TODO list; it does not fire at a scheduled time.' },
   { name: 'task_hygiene', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Repair and compact the task ledger so completed execution-owned tasks do not remain in th…' },
@@ -402,16 +436,16 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'update_agent', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Update an existing team agent.' },
   { name: 'user_profile_read', sideEffect: 'read', projectEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', description: 'Read the user\'s current profile (name, role, timezone, working hours, communication prefe…' },
   { name: 'workflow_apply_contract_fixes', sideEffect: 'write', tier: 'discoverable', lanes: ['cli'], actionTopologyRole: 'control', description: 'Apply safe, machine-readable fixes from a workflow visual contract.' },
-  { name: 'workflow_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, terminalAuthoringEvidence: { receiptPrefix: '[clementine:terminal-authoring:workflow-created:v1]' }, localPlanning: { consequence: 'workflow_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workflow', inputKind: 'workflow_definition', outputKind: 'workflow_revision', deliverableKind: 'workflow', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'] }, description: 'Create a workflow.' },
+  { name: 'workflow_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workflow_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workflow', inputKind: 'workflow_definition', outputKind: 'workflow_revision', deliverableKind: 'workflow', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'] }, description: 'Create a workflow.' },
   { name: 'workflow_delete', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', localPlanning: { consequence: 'workflow_definition', reversibility: 'irreversible', destructive: true, purpose: 'delete_workflow', inputKind: 'workflow_reference', outputKind: 'deletion_receipt', deliverableKind: 'workflow', destinationPosture: 'named_existing', advisoryRoles: ['delete', 'destination'] }, description: 'Permanently delete a workflow definition file.' },
-  { name: 'workflow_edit_step', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Make a TARGETED, reversible edit to ONE step\'s prompt in an existing workflow — the FAST,…' },
+  { name: 'workflow_edit_step', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workflow_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workflow', inputKind: 'workflow_patch', outputKind: 'workflow_revision', deliverableKind: 'workflow', destinationPosture: 'named_existing', advisoryRoles: ['author', 'destination'] }, description: 'Make a TARGETED, reversible edit to ONE step\'s prompt in an existing workflow — the FAST,…' },
   { name: 'workflow_from_session', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Turn what you JUST did in this chat into a reusable, repeatable workflow.' },
   { name: 'workflow_get', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Fetch the full definition of a single workflow by name.' },
   { name: 'workflow_import_framework', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Import workflow framework packages from a local folder or GitHub repo.' },
   { name: 'workflow_import_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Check a workflow framework import job.' },
   { name: 'workflow_list', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'List all workflows with description, steps, and trigger metadata.' },
-  { name: 'workflow_rerun_failed_items', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Re-run only the failed forEach items from a prior workflow run.' },
-  { name: 'workflow_run', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon an…' },
+  { name: 'workflow_rerun_failed_items', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Re-run only the failed forEach items from a prior workflow run.' },
+  { name: 'workflow_run', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workflow_definition', reversibility: 'reversible', destructive: false, purpose: 'dispatch_named_workflow', inputKind: 'workflow_identity', outputKind: 'workflow_run', deliverableKind: 'workflow', destinationPosture: 'create_new', advisoryRoles: ['control', 'destination'] }, description: 'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon an…' },
   { name: 'workflow_run_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Check workflow runs.' },
   { name: 'workflow_schedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Schedule a workflow to fire on a cron expression.' },
   { name: 'workflow_set_enabled', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Approve or disable a workflow.' },
@@ -456,7 +490,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'workspace_info', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Get detailed info about a local project including README, CLAUDE.md, manifest, and struct…' },
   { name: 'workspace_list', sideEffect: 'read', projectEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', description: 'List local projects found in configured workspace directories.' },
   { name: 'workspace_roots', sideEffect: 'read', projectEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', description: 'List directories Clementine is allowed to inspect or operate in.' },
-  { name: 'write_file', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'write', loopClass: 'mutating', localPlanning: { consequence: 'local_artifact', reversibility: 'create_only', destructive: false, purpose: 'create_local_artifact', inputKind: 'artifact_content', outputKind: 'local_artifact', deliverableKind: 'file', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'], safeMode: { id: 'create', requiredEquals: { mode: 'create' }, absentOrNull: ['append'] } }, description: 'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path (content capped ~24KB/call — write big files in append:true chunks).' },
+  { name: 'write_file', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'write', loopClass: 'mutating', localPlanning: { consequence: 'local_artifact', reversibility: 'create_only', destructive: false, purpose: 'create_local_artifact', inputKind: 'artifact_content', outputKind: 'local_artifact', deliverableKind: 'file', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'], safeMode: { id: 'create', requiredEquals: { mode: 'create' }, nullEquivalentToRequired: ['mode'], absentOrNull: ['append'] } }, localPlanningVariants: [{ consequence: 'local_artifact', reversibility: 'irreversible', destructive: false, purpose: 'append_local_artifact', inputKind: 'artifact_content', outputKind: 'local_artifact', deliverableKind: 'file', destinationPosture: 'named_existing', advisoryRoles: ['author', 'update', 'destination'], safeMode: { id: 'append', requiredEquals: {}, alternatives: [{ requiredEquals: { append: true }, allowedValues: { mode: ['create', 'append', 'overwrite', null] } }, { requiredEquals: { mode: 'append' }, absentOrNull: ['append'] }] } }, { consequence: 'local_artifact', reversibility: 'irreversible', destructive: true, purpose: 'overwrite_local_artifact', inputKind: 'artifact_content', outputKind: 'local_artifact', deliverableKind: 'file', destinationPosture: 'named_existing', advisoryRoles: ['author', 'update', 'destination'], safeMode: { id: 'overwrite', requiredEquals: {}, alternatives: [{ requiredEquals: { append: false }, allowedValues: { mode: ['create', 'append', 'overwrite', null] } }, { requiredEquals: { mode: 'overwrite' }, absentOrNull: ['append'] }] } }], description: 'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path (content capped ~24KB/call — write big files in append:true chunks).' },
 ];
 
 // ── Derivations (advisory in step 1; the conformance test locks them to reality) ──
@@ -629,43 +663,12 @@ export function hostReadOnlyExecutionContractFor(
     ?.hostReadOnlyExecution ?? null;
 }
 
-/** Exact registry authority for host-derived authoring completion evidence.
- * Unknown, foreign, carrier-shaped, and merely authoring-profile names all
- * fail closed. Callers must first resolve a trusted local carrier to its
- * canonical effective tool identity. */
-export function isTerminalAuthoringEvidenceTool(toolName: string): boolean {
-  return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
-    ?.terminalAuthoringEvidence !== undefined;
-}
-
-export function terminalAuthoringEvidenceContractFor(
-  toolName: string,
-): TerminalAuthoringEvidenceContract | null {
-  return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
-    ?.terminalAuthoringEvidence ?? null;
-}
-
-/** Stamp a host result only after the authoring implementation has committed
- * its durable artifact. The receipt is deliberately the first line, so echoed
- * user fields inside an error response cannot impersonate it. */
-export function withTerminalAuthoringEvidenceReceipt(toolName: string, result: string): string {
-  const contract = terminalAuthoringEvidenceContractFor(toolName);
-  if (!contract) throw new Error(`Tool ${toolName} has no terminal-authoring evidence contract.`);
-  return `${contract.receiptPrefix}\n${result}`;
-}
-
-/** Verify the exact host receipt at the canonical SDK return boundary. */
-export function terminalAuthoringResultIsProven(toolName: string, result: unknown): boolean {
-  const contract = terminalAuthoringEvidenceContractFor(toolName);
-  return contract !== null
-    && typeof result === 'string'
-    && result.startsWith(`${contract.receiptPrefix}\n`);
-}
-
-/** Conformance/test projection. Kept separate from the SDK authoring profile
- * so expanding tool availability cannot silently expand terminal authority. */
-export function deriveTerminalAuthoringEvidenceNames(): Set<string> {
-  return names((declaration) => declaration.terminalAuthoringEvidence !== undefined);
+/** Exact registry effect for a canonical local tool identity. Unknown and
+ * carrier-shaped names return null. Local-write evidence combines this with
+ * the frozen manifest effect and host execution provenance; no operation-name
+ * registration is needed. */
+export function registeredToolSideEffect(toolName: string): ToolSideEffect | null {
+  return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)?.sideEffect ?? null;
 }
 
 /** B1 — tool-guardrail IDEMPOTENT_TOOLS (safe-to-retry reads → loose thresholds). */

@@ -31,6 +31,7 @@ import {
   assessWorkflowRunMutationRequeue,
   workflowCallMutationSlotHasLedger,
 } from '../execution/workflow-call-receipts.js';
+import { assessWorkflowV3RunMutationRequeue } from '../execution/workflow-v3-call-evidence.js';
 import { withWorkflowRunRecordLock } from '../execution/workflow-run-record.js';
 import {
   createCompiledWorkflowRunDefinitionSnapshot,
@@ -3012,6 +3013,21 @@ export function requeueWorkflowFromRun(
       : undefined;
   const structuredLedgerSteps = new Set<string>();
   try {
+    const v3Assessment = assessWorkflowV3RunMutationRequeue({
+      workflowSlug,
+      runId: originalRunId,
+    });
+    if (!v3Assessment.safeToFreshRun) {
+      const summary = v3Assessment.blocking
+        .map((item) => `${item.stepId} (${item.status})`)
+        .join(', ');
+      return {
+        status: 'ambiguous',
+        message:
+          `Run "${originalRunId}" has workflow-v3 mutations that cannot be transferred to a fresh run: ${summary}. `
+          + 'No rerun was queued. Reconcile the exact durable occurrence before authorizing any repeated effect.',
+      };
+    }
     const receiptAssessment = assessWorkflowRunMutationRequeue({ workflowSlug, runId: originalRunId });
     if (!receiptAssessment.safeToFreshRun) {
       const summary = receiptAssessment.blocking

@@ -24,10 +24,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 
-const { resetEventLog, createSession, listEvents, appendEvent } = await import('../runtime/harness/eventlog.js');
+const {
+  resetEventLog,
+  createSession,
+  listEvents,
+  appendEvent,
+  writeToolOutput,
+} = await import('../runtime/harness/eventlog.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const pendingActions = await import('../runtime/harness/pending-actions.js');
-const { formatAutoResolvedAskUserQuestionOutput } = await import('../runtime/harness/terminal-tool.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+const composioOperationSemantics = await import('../integrations/composio/operation-semantics.js');
+const {
+  formatAutoResolvedAskUserQuestionOutput,
+  formatAwaitingUserInputFinalOutput,
+} = await import('../runtime/harness/terminal-tool.js');
 const { getPlanScope } = await import('./plan-scope.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const {
@@ -56,6 +68,72 @@ const {
 } = await import('../runtime/harness/byo-providers.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+
+function installExactReversibleSheetCapability(): () => void {
+  const prior = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const operationSemantics = composioOperationSemantics
+    .documentedComposioManifestOperationSemantics('GOOGLESHEETS_SHEET_FROM_JSON');
+  assert.ok(operationSemantics?.atomicInputContent, 'fixture must use the reviewed production Sheet semantics');
+  const inputSchemaDigest = 'ab'.repeat(32);
+  const outputSchemaDigest = 'cd'.repeat(32);
+  const definitionFingerprint = 'ef'.repeat(32);
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:test:googlesheets-sheet-from-json',
+    providerKind: 'composio',
+    operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    providerIdentity: 'composio',
+    providerVersion: 'fixture-provider-v1',
+    operationVersion: 'fixture-operation-v1',
+    definitionFingerprint,
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: inputSchemaDigest,
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: outputSchemaDigest,
+      semanticName: 'GOOGLESHEETS_SHEET_FROM_JSON',
+      behaviorHints: {
+        readOnly: false,
+        destructive: false,
+        idempotent: null,
+        openWorld: null,
+      },
+    },
+    effect: 'external_write',
+    operationSemantics,
+    destination: { family: 'googlesheets', posture: 'create_new' },
+    accountId: 'ca_google_sheets_owner',
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: true, policy: 'exact_artifact' },
+    outputContract: { kind: 'created_resource' },
+    evidenceContract: {
+      kinds: operationSemantics.atomicInputContent.evidence,
+      readbackRequired: false,
+    },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-29T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['create', 'destination'],
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(
+    capabilityCatalogs.createHostCapabilityCatalogFactory([{
+      capabilityId: manifest.manifestId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      effect: manifest.effect,
+      destination: manifest.destination,
+      account: manifest.accountId,
+      advisoryRoles: manifest.advisoryRoles,
+      manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      providerInputSchemaDigest: inputSchemaDigest,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => ({}),
+    }]),
+  );
+  return () => capabilityCatalogs.installHostCapabilityCatalogFactory(prior);
+}
 
 /**
  * Production no longer lets a bracketed tool mint settlement authority from a
@@ -319,6 +397,21 @@ test('Orchestrator: user-choice tools terminate only when they really pause', as
   }
 });
 
+test('ask_user_question check-in receipts halt on the question, not the protocol id', () => {
+  const question = 'Did you mean today, Saturday August 29, at 12:00 PM Pacific?';
+  const result = userChoiceToolUseBehavior({}, [
+    {
+      type: 'function_output',
+      tool: { name: 'ask_user_question' },
+      output: 'Check-in created: chk-4b814f04. The user has been notified; you\'ll see their answer in your next cycle\'s inbox.',
+      argumentsJson: JSON.stringify({ question, urgency: 'high' }),
+    },
+  ]);
+  assert.equal(result.isFinalOutput, true);
+  assert.equal(result.finalOutput, formatAwaitingUserInputFinalOutput(question));
+  assert.doesNotMatch(String(result.finalOutput), /Check-in created/);
+});
+
 test('Orchestrator: excludeToolNames narrows the harness surface (unblocks architect/autonomy on the one loop)', async () => {
   // The capability that lets narrowed-surface callers (workflow architect hides
   // workflow_* mutators; autonomy excludes external writes) ride the GATED
@@ -402,6 +495,11 @@ test('Orchestrator is now the single agent — carries the union of all action t
   // which is the stateless parallel-fan-out primitive (kept because
   // it doesn't have the approval-pause/.asTool() composition issue
   // the other sub-agents had).
+  assert.equal(
+    toolNames.length,
+    new Set(toolNames).size,
+    'structural capabilities must not be duplicated by the registry-derived discovery surface',
+  );
   assert.ok(toolNames.includes('run_worker'), 'run_worker should remain available for parallel fan-out');
   for (const name of ['run_researcher', 'run_writer', 'run_reviewer', 'run_executor', 'run_deployer']) {
     assert.equal(toolNames.includes(name), false, `${name} should be removed in Phase 3`);
@@ -1407,45 +1505,59 @@ test('request_approval execute carries auto-approval reason when the action was 
 
 test('request_approval cannot auto-approve a reversible pending action owned by another session', async () => {
   resetEventLog();
-  saveProactivityPolicy({ autoApproveScope: 'strict' });
-  const owner = createSession({ kind: 'chat' });
-  const foreign = createSession({ kind: 'chat' });
-  const action = pendingActions.queuePendingAction({
-    title: 'Create queued draft',
-    summary: 'Create one reversible Outlook draft.',
-    kind: 'external_write',
-    toolName: 'composio_execute_tool',
-    payload: { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: 'Proof' } },
-    sessionId: owner.id,
-  });
-  const args = {
-    // This wording previously activated the local-save shortcut after the
-    // foreign payload made requestApprovalRequiresHuman return false.
-    subject: 'Save this draft rule to memory',
-    reason: 'Store the prepared draft for later.',
-    destructive: false,
-    preview: null,
-    pendingActionId: action.id,
-  };
-  const tool = buildRequestApprovalTool();
-  const needsApproval = tool.needsApproval as unknown as (
-    ctx: unknown,
-    input: typeof args,
-  ) => Promise<boolean>;
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  const restoreCatalog = installExactReversibleSheetCapability();
+  try {
+    const owner = createSession({ kind: 'chat' });
+    const foreign = createSession({ kind: 'chat' });
+    const action = pendingActions.queuePendingAction({
+      title: 'Create reviewed Sheet',
+      summary: 'Create one exact reversible Google Sheet.',
+      kind: 'external_write',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+        arguments: JSON.stringify({
+          title: 'Proof',
+          sheet_name: 'Results',
+          sheet_json: [{ status: 'ready' }],
+        }),
+        connected_account_id: 'ca_google_sheets_owner',
+      },
+      sessionId: owner.id,
+    });
+    const args = {
+      // This wording previously activated the local-save shortcut after the
+      // foreign payload made requestApprovalRequiresHuman return false.
+      subject: 'Save this Sheet recipe to memory',
+      reason: 'Store the prepared Sheet recipe for later.',
+      destructive: false,
+      preview: null,
+      pendingActionId: action.id,
+    };
+    const tool = buildRequestApprovalTool();
+    const needsApproval = tool.needsApproval as unknown as (
+      ctx: unknown,
+      input: typeof args,
+    ) => Promise<boolean>;
 
-  assert.equal(
-    await needsApproval({ context: { sessionId: foreign.id } }, args),
-    true,
-    'a foreign pending action must fail closed before the local-save shortcut',
-  );
-  const result = await invokeFunctionTool(tool, args, { sessionId: foreign.id, turn: 1 });
-  assert.match(result, /different session|does not belong|refused/i);
-  assert.equal(
-    pendingActions.getPendingAction(action.id)?.status,
-    'queued',
-    'foreign-session invocation must not mutate approval state',
-  );
-  assert.equal(getPlanScope(foreign.id), null, 'foreign payload must not open a tool scope');
+    assert.equal(
+      await needsApproval({ context: { sessionId: foreign.id } }, args),
+      true,
+      'even YOLO cannot borrow an exact reversible action owned by another session',
+    );
+    const result = await invokeFunctionTool(tool, args, { sessionId: foreign.id, turn: 1 });
+    assert.match(result, /different session|does not belong|refused/i);
+    assert.equal(
+      pendingActions.getPendingAction(action.id)?.status,
+      'queued',
+      'foreign-session invocation must not mutate approval state',
+    );
+    assert.equal(getPlanScope(foreign.id), null, 'foreign payload must not open a tool scope');
+  } finally {
+    restoreCatalog();
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
 });
 
 test('request_approval human resume preserves linked pending-action provenance', async () => {
@@ -1515,19 +1627,28 @@ test('request_approval opens the queued composio tool_slug scope without reconst
 test('request_approval mints policy provenance only on a true YOLO auto-approval', async () => {
   resetEventLog();
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  const restoreCatalog = installExactReversibleSheetCapability();
   try {
     const sess = createSession({ kind: 'chat' });
     const action = pendingActions.queuePendingAction({
-      title: 'Create queued draft',
-      summary: 'Create one reversible Outlook draft.',
+      title: 'Create reviewed Sheet',
+      summary: 'Create one exact reversible Google Sheet.',
       kind: 'external_write',
       toolName: 'composio_execute_tool',
-      payload: { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: { subject: 'Proof' } },
+      payload: {
+        tool_slug: 'GOOGLESHEETS_SHEET_FROM_JSON',
+        arguments: JSON.stringify({
+          title: 'Proof',
+          sheet_name: 'Results',
+          sheet_json: [{ status: 'ready' }],
+        }),
+        connected_account_id: 'ca_google_sheets_owner',
+      },
       sessionId: sess.id,
     });
     const args = {
-      subject: 'Create one Outlook draft',
-      reason: 'The user requested the reversible draft.',
+      subject: 'Create one Google Sheet',
+      reason: 'The user requested this exact reversible create.',
       destructive: false,
       preview: null,
       pendingActionId: action.id,
@@ -1537,8 +1658,39 @@ test('request_approval mints policy provenance only on a true YOLO auto-approval
     assert.equal(
       await needsApproval({ context: { sessionId: sess.id } }, args),
       false,
-      'YOLO should auto-approve this reversible write in its owning session',
+      'YOLO should auto-approve an exact manifest-proven reversible write in its owning session',
     );
+    assert.equal(
+      await needsApproval({ context: { sessionId: sess.id } }, { ...args, destructive: true }),
+      true,
+      'a destructive or high-risk declaration still requires the human even for the exact operation',
+    );
+
+    const ambiguous = pendingActions.queuePendingAction({
+      title: 'Transform unknown provider blob',
+      summary: 'The provider effect has no exact current semantic contract.',
+      kind: 'external_write',
+      toolName: 'composio_execute_tool',
+      payload: {
+        tool_slug: 'ACME_TRANSFORM_BLOB',
+        arguments: JSON.stringify({ source: 'proof', destination: 'unknown' }),
+        connected_account_id: 'ca_acme_owner',
+      },
+      sessionId: sess.id,
+    });
+    const ambiguousArgs = {
+      subject: 'Transform provider blob',
+      reason: 'The effect is not positively classified.',
+      destructive: false,
+      preview: null,
+      pendingActionId: ambiguous.id,
+    };
+    assert.equal(
+      await needsApproval({ context: { sessionId: sess.id } }, ambiguousArgs),
+      true,
+      'a name-shaped or model-described reversible write cannot replace exact manifest authority',
+    );
+    assert.equal(pendingActions.getPendingAction(ambiguous.id)?.approvedBy, null);
 
     const result = await invokeFunctionTool(tool, args, { sessionId: sess.id, turn: 3 });
     assert.match(result, /Auto-approved by YOLO mode/);
@@ -1546,6 +1698,7 @@ test('request_approval mints policy provenance only on a true YOLO auto-approval
     assert.equal(approved?.approvedBy, 'policy');
     assert.deepEqual(approved?.approvalEvidence, { kind: 'policy', scope: 'yolo' });
   } finally {
+    restoreCatalog();
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
   }
 });
@@ -1653,7 +1806,10 @@ test('ask_user_question preserves exact source provenance and a single typed cla
     purpose: 'clarification',
   });
   assert.equal(terminal.isFinalOutput, true);
-  assert.equal(terminal.finalOutput, 'Question posted: which environment?. Awaiting user reply.');
+  assert.equal(
+    terminal.finalOutput,
+    '[clementine:awaiting-user-input:final]\nwhich environment?',
+  );
 
   const events = listEvents(sess.id, { types: ['awaiting_user_input'] });
   assert.equal(events.length, 1);
@@ -1661,6 +1817,908 @@ test('ask_user_question preserves exact source provenance and a single typed cla
   assert.deepEqual(events[0].data.options, ['staging', 'prod']);
   assert.equal(events[0].data.purpose, 'clarification');
   assert.equal(events[0].data.sourceUserSeq, 41);
+});
+
+test('a unique tool_search account-selection write asks instead of continuing to plan', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send James Marshall an Outlook calendar invite today at 2pm' },
+  });
+  const searchOutput = {
+    query: 'create Outlook calendar event invite attendee',
+    role_key: 'clause-0:write',
+    results: [{
+      name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+      planningRefStatus: 'account_selection_required',
+      accountChoices: ['calendar@scorpion.example', 'calendar@personal.example'],
+    }, {
+      name: 'OUTLOOK_CREATE_CALENDAR_EVENT',
+      planningRefStatus: 'account_selection_required',
+      accountChoices: ['calendar@scorpion.example', 'calendar@personal.example'],
+    }],
+  };
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: searchOutput,
+      argumentsJson: JSON.stringify({
+        query: searchOutput.query,
+        role_key: searchOutput.role_key,
+        limit: 8,
+        cursor: null,
+      }),
+    }],
+    {
+      actionExpectedWork: true,
+      accountSelectionRequirements: [{
+        roleKey: searchOutput.role_key,
+        text: 'Send James Marshall an Outlook calendar invite today at 2pm',
+        resolved: false,
+      }],
+    },
+  );
+  assert.equal(result.isFinalOutput, true, 'the host must halt instead of looping plan_task');
+  assert.match(String(result.finalOutput), /Which connected account should I use\?/);
+  const events = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.question, 'Which connected account should I use?');
+  assert.deepEqual(events[0].data.options, [
+    'calendar@scorpion.example',
+    'calendar@personal.example',
+  ]);
+  assert.equal(events[0].data.purpose, 'clarification');
+});
+
+test('an informational catalog query never turns planning account blockers into a user question', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'List the connected Outlook accounts without reading or changing calendar data.' },
+  });
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        query: 'list connected Outlook accounts',
+        results: [{
+          name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+          planningRefStatus: 'account_selection_required',
+          accountChoices: ['calendar@scorpion.example', 'calendar@personal.example'],
+        }],
+      },
+    }],
+    { actionExpectedWork: false },
+  );
+  assert.equal(result.isFinalOutput, false, 'catalog facts stay model-visible when no action authority is active');
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+function freshPlanningFixture(sessionId: string, sourceUserSeq: number) {
+  return {
+    authority: { scope: 'primary_model_planning_catalog_v1' },
+    identity: { sessionId, sourceUserSeq },
+    capabilities: [],
+    digest: '0'.repeat(64),
+    effectCeiling: 'external_write',
+    withheld: [],
+  } as never;
+}
+
+function unresolvedTurnCandidatesFixture(input: {
+  roleKey: string;
+  text: string;
+  effect: 'read' | 'write';
+}) {
+  return {
+    candidates: [],
+    requirements: [{
+      roleKey: input.roleKey,
+      clauseIndex: 0,
+      text: input.text,
+      effect: input.effect,
+      resolved: false,
+      resolvedCapabilities: [],
+    }],
+    matches: [],
+    pinnedTools: [],
+    semanticApplied: false,
+    roleScopedDiscovery: true,
+  } as never;
+}
+
+function invokeBuiltAgentToolUseBehavior(
+  agent: Awaited<ReturnType<typeof buildOrchestratorAgent>>,
+  context: unknown,
+  toolResults: Parameters<typeof userChoiceToolUseBehavior>[1],
+) {
+  const behavior = agent.toolUseBehavior;
+  assert.equal(typeof behavior, 'function', 'fresh planning must install the production callback wrapper');
+  return (behavior as unknown as typeof userChoiceToolUseBehavior)(context, toolResults);
+}
+
+function accountSelectionSearchResult(input: {
+  query: string;
+  roleKey: string;
+  results: Array<Record<string, unknown>>;
+}) {
+  return {
+    type: 'function_output',
+    tool: { name: 'tool_search' },
+    output: {
+      query: input.query,
+      role_key: input.roleKey,
+      results: input.results,
+    },
+    argumentsJson: JSON.stringify({
+      query: input.query,
+      role_key: input.roleKey,
+      limit: 8,
+      cursor: null,
+    }),
+  } as const;
+}
+
+test('production fresh-host action callback halts on an exact task-required account ambiguity', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const acceptedText = 'Send James Marshall an Outlook calendar invite today at 2pm.';
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: acceptedText },
+  });
+  const roleKey = 'clause-0:write';
+  const agent = await buildOrchestratorAgent({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    userInput: acceptedText,
+    acceptedRoute: 'act',
+    hostFreshPlanning: freshPlanningFixture(sess.id, source.seq),
+    turnCandidates: unresolvedTurnCandidatesFixture({ roleKey, text: acceptedText, effect: 'write' }),
+    allowedToolNames: ['tool_search'],
+    mcpToolScope: {
+      authority: 'none',
+      reason: 'orchestrator account-question fixture',
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    },
+  });
+  const search = accountSelectionSearchResult({
+    query: 'create Outlook calendar event invite attendee',
+    roleKey,
+    results: [{
+      name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+      planningRefStatus: 'account_selection_required',
+      accountChoices: ['calendar@scorpion.example', 'calendar@personal.example'],
+    }],
+  });
+  const result = invokeBuiltAgentToolUseBehavior(
+    agent,
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [search],
+  );
+  assert.equal(result.isFinalOutput, true);
+  assert.match(String(result.finalOutput), /Which connected account should I use\?/);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
+});
+
+test('production fresh-host retrieve callback leaves a relevant account blocker with the model', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const acceptedText = 'Tell me whether the Outlook calendar event capability is available without creating anything.';
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: acceptedText },
+  });
+  const roleKey = 'clause-0:read';
+  const agent = await buildOrchestratorAgent({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    userInput: acceptedText,
+    acceptedRoute: 'retrieve',
+    hostFreshPlanning: freshPlanningFixture(sess.id, source.seq),
+    turnCandidates: unresolvedTurnCandidatesFixture({ roleKey, text: acceptedText, effect: 'read' }),
+    allowedToolNames: ['tool_search'],
+    mcpToolScope: {
+      authority: 'none',
+      reason: 'orchestrator account-question retrieve fixture',
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    },
+  });
+  const result = invokeBuiltAgentToolUseBehavior(
+    agent,
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [accountSelectionSearchResult({
+      query: 'create Outlook calendar event invite attendee',
+      roleKey,
+      results: [{
+        name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+        planningRefStatus: 'account_selection_required',
+        accountChoices: ['calendar@scorpion.example', 'calendar@personal.example'],
+      }],
+    })],
+  );
+  assert.equal(result.isFinalOutput, false);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('production fresh-host action callback ignores an unrelated uniform account blocker', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const acceptedText = 'Put the 100 scraped company accounts into a Google Sheet.';
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: acceptedText },
+  });
+  const roleKey = 'clause-0:write';
+  const agent = await buildOrchestratorAgent({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    userInput: acceptedText,
+    acceptedRoute: 'act',
+    hostFreshPlanning: freshPlanningFixture(sess.id, source.seq),
+    turnCandidates: unresolvedTurnCandidatesFixture({ roleKey, text: acceptedText, effect: 'write' }),
+    allowedToolNames: ['tool_search'],
+    mcpToolScope: {
+      authority: 'none',
+      reason: 'orchestrator unrelated-account-blocker fixture',
+      allowedServerSlugs: [],
+      toolPatterns: [],
+      maxTools: 0,
+    },
+  });
+  const result = invokeBuiltAgentToolUseBehavior(
+    agent,
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [accountSelectionSearchResult({
+      query: 'write scraped company accounts to a Google Sheet',
+      roleKey,
+      results: ['OUTLOOK_CALENDAR_CREATE_EVENT', 'OUTLOOK_CREATE_CALENDAR_EVENT'].map((name) => ({
+        name,
+        planningRefStatus: 'account_selection_required',
+        accountChoices: ['calendar@scorpion.example', 'calendar@personal.example'],
+      })),
+    })],
+  );
+  assert.equal(result.isFinalOutput, false, 'an incidental provider page stays model-visible');
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('live invite: one grounded recipient miss after exact current-text account selection asks once', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Can you send a calendar invite to James Marshall please using my Scorpion email for today at 5 PM and tell him we need to talk about the new project',
+    },
+  });
+  const callId = 'call-live-james-recall';
+  const args = JSON.stringify({ query: 'James Marshall email address contact identity' });
+  const recalled = '[WHO/WHAT] James A. Marshall: person - mentioned 44 times; no exact recipient address stored';
+  const called = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'memory_recall_all',
+      callId,
+      accounting: 'top_level',
+      effect: 'read',
+      arguments: args,
+    },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId,
+    invocationNonce: `nonce-${callId}`,
+    tool: 'memory_recall_all',
+    output: recalled,
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'memory_recall_all',
+      callId,
+      accounting: 'top_level',
+      effect: 'read',
+      result: recalled,
+    },
+  });
+
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        query: 'create Outlook calendar event invite attendee',
+        results: [
+          'OUTLOOK_CALENDAR_CREATE_EVENT',
+          'OUTLOOK_CALENDAR_CREATE_EVENT_ATTACHMENT',
+          'OUTLOOK_CREATE_EVENT',
+          'OUTLOOK_CALENDAR_CANCEL_EVENT',
+          'OUTLOOK_CALENDAR_ACCEPT_EVENT',
+          'OUTLOOK_CALENDAR_DELETE_EVENT',
+          'OUTLOOK_CALENDAR_DECLINE_EVENT',
+          'OUTLOOK_CALENDAR_UPDATE_EVENT',
+        ].map((name) => ({
+          name,
+          planningRefStatus: 'account_selection_required',
+          accountChoices: [
+            'calendar@scorpion.example',
+            'calendar@personal.example',
+          ],
+        })),
+      },
+    }, {
+      type: 'function_output',
+      tool: { name: 'memory_recall_all' },
+      output: recalled,
+      argumentsJson: args,
+      runItem: { rawItem: { callId } },
+    }] as Parameters<typeof userChoiceToolUseBehavior>[1],
+  );
+
+  assert.equal(result.isFinalOutput, true);
+  assert.match(String(result.finalOutput), /exact email address or recipient ID.*James Marshall|James Marshall.*exact email address or recipient ID/i);
+  const events = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.purpose, 'clarification');
+  assert.equal(events[0].data.sourceUserSeq, source.seq);
+});
+
+test('live invite-for three-result batch stages one recipient question before planning', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Can you send a calendar invite for James Marshall through my Scorpion mailbox please for today at 6:30 PM tell him we need to talk about the new AI project please',
+    },
+  });
+  const memoryCallId = 'call-live-for-james-recall';
+  const memoryArgs = JSON.stringify({
+    limit: 10,
+    objective: 'James Marshall contact email — send calendar invite about new AI project',
+  });
+  const recalled = [
+    '[RELEVANT MEMORY — evidence-backed]',
+    '- [FACT] Scorpion sellers include Bobby Romano (seller.record@example.com).',
+    '- [WHO/WHAT] James A. Marshall: person · mentioned 44×',
+  ].join('\n');
+  const called = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'memory_recall_all',
+      callId: memoryCallId,
+      accounting: 'top_level',
+      effect: 'read',
+      arguments: memoryArgs,
+    },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: memoryCallId,
+    invocationNonce: `nonce-${memoryCallId}`,
+    tool: 'memory_recall_all',
+    output: recalled,
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      sourceUserSeq: source.seq,
+      tool: 'memory_recall_all',
+      callId: memoryCallId,
+      accounting: 'top_level',
+      effect: 'read',
+      result: recalled,
+    },
+  });
+
+  const capabilities = [
+    ['OUTLOOK_CREATE_CALENDAR_EVENT_ATTACHMENT', 'cap:resolved:outlook_create_calendar_event_attachment'],
+    ['OUTLOOK_CALENDAR_CREATE_EVENT', 'cap:resolved:outlook_calendar_create_event'],
+    ['OUTLOOK_CREATE_CALENDAR_EVENT', 'cap:resolved:outlook_create_calendar_event'],
+    ['OUTLOOK_CANCEL_CALENDAR_GROUP_CALENDAR_EVENT', 'cap:resolved:outlook_cancel_calendar_group_calendar_event'],
+    ['OUTLOOK_CANCEL_CALENDAR_EVENT', 'cap:resolved:outlook_cancel_calendar_event'],
+  ] as const;
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: {
+      sourceUserSeq: source.seq,
+      capabilities: capabilities.map(([identifier, capabilityRef]) => ({
+        identifier,
+        capabilityRef,
+        effectClass: 'write',
+        accountIdentity: 'ca_uDzrJqqniJFk',
+        providerKind: 'composio',
+      })),
+    },
+  });
+
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'memory_recall_all' },
+      output: recalled,
+      argumentsJson: memoryArgs,
+      runItem: { rawItem: { callId: memoryCallId } },
+    }, {
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        query: 'create Outlook calendar event with required attendee and send invite',
+        results: capabilities.map(([name, capabilityRef]) => ({ name, capabilityRef })),
+      },
+      argumentsJson: JSON.stringify({
+        cursor: 'null',
+        limit: 5,
+        query: 'create Outlook calendar event with required attendee and send invite',
+        role_key: 'null',
+      }),
+      runItem: { rawItem: { callId: 'call-live-for-calendar-search' } },
+    }, {
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: 'Tool call refused by harness: discovery budget denied (new_call_requires_retry_epoch) on tool_search.',
+      argumentsJson: JSON.stringify({
+        cursor: 'null',
+        limit: 5,
+        query: 'run shell command to query Salesforce contacts via sf CLI',
+        role_key: 'null',
+      }),
+      runItem: { rawItem: { callId: 'call-live-for-refused-search' } },
+    }] as Parameters<typeof userChoiceToolUseBehavior>[1],
+  );
+
+  assert.equal(result.isFinalOutput, true, 'the complete first batch must halt before plan_task');
+  assert.match(String(result.finalOutput), /James Marshall.*exact email address or recipient ID/i);
+  const events = listEvents(sess.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.purpose, 'clarification');
+  assert.equal(events[0].data.sourceUserSeq, source.seq);
+});
+
+function appendRecipientReadResult(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+  callId: string;
+  output: string;
+}) {
+  const argumentsJson = JSON.stringify({ query: 'James Marshall email address contact identity' });
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: input.sourceUserSeq,
+      tool: 'memory_recall_all',
+      callId: input.callId,
+      accounting: 'top_level',
+      effect: 'read',
+      arguments: argumentsJson,
+    },
+  });
+  writeToolOutput({
+    sessionId: input.sessionId,
+    callId: input.callId,
+    invocationNonce: `nonce-${input.callId}`,
+    tool: 'memory_recall_all',
+    output: input.output,
+  });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'Clem',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      sourceUserSeq: input.sourceUserSeq,
+      tool: 'memory_recall_all',
+      callId: input.callId,
+      accounting: 'top_level',
+      effect: 'read',
+      result: input.output,
+    },
+  });
+  return {
+    type: 'function_output',
+    tool: { name: 'memory_recall_all' },
+    output: input.output,
+    argumentsJson,
+    runItem: { rawItem: { callId: input.callId } },
+  } as const;
+}
+
+test('recipient clarification reopens a result-batch capabilityRef only through its same-source account', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send a calendar invite to James Marshall today at 5 PM.' },
+  });
+  const capabilities = [
+    ['OUTLOOK_CALENDAR_CREATE_EVENT', 'cap:resolved:outlook_calendar_create_event'],
+    ['OUTLOOK_CALENDAR_CANCEL_EVENT', 'cap:resolved:outlook_calendar_cancel_event'],
+    ['OUTLOOK_CALENDAR_DELETE_EVENT', 'cap:resolved:outlook_calendar_delete_event'],
+  ] as const;
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: {
+      sourceUserSeq: source.seq,
+      capabilities: capabilities.map(([identifier, capabilityRef]) => ({
+        identifier,
+        capabilityRef,
+        accountIdentity: 'calendar@scorpion.example',
+        providerKind: 'composio',
+      })),
+    },
+  });
+  const read = appendRecipientReadResult({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    callId: 'call-capability-james-recall',
+    output: '[WHO/WHAT] James A. Marshall: person record; no exact recipient address stored',
+  });
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        results: capabilities.map(([name, capabilityRef]) => ({ name, capabilityRef })),
+      },
+    }, read],
+  );
+  assert.equal(result.isFinalOutput, true);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
+});
+
+test('recipient clarification never invents account authority from the public search row', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send a calendar invite to James Marshall today at 5 PM.' },
+  });
+  const capabilityRef = 'cap:resolved:outlook_calendar_create_event';
+  const read = appendRecipientReadResult({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    callId: 'call-unproved-account-james-recall',
+    output: '[WHO/WHAT] James A. Marshall: person record; no exact recipient address stored',
+  });
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        results: [{
+          name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+          capabilityRef,
+          accountIdentity: 'model-supplied-placeholder@example.test',
+        }],
+      },
+    }, read],
+  );
+  assert.equal(result.isFinalOutput, false);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('recipient clarification rejects capability sets reopened across mixed accounts', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Send a calendar invite to James Marshall today at 5 PM.' },
+  });
+  const capabilities = [{
+    identifier: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+    capabilityRef: 'cap:resolved:outlook_calendar_create_event',
+    accountIdentity: 'calendar@scorpion.example',
+  }, {
+    identifier: 'OUTLOOK_CALENDAR_CANCEL_EVENT',
+    capabilityRef: 'cap:resolved:outlook_calendar_cancel_event',
+    accountIdentity: 'calendar@personal.example',
+  }];
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: { sourceUserSeq: source.seq, capabilities },
+  });
+  const read = appendRecipientReadResult({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    callId: 'call-mixed-account-james-recall',
+    output: '[WHO/WHAT] James A. Marshall: person record; no exact recipient address stored',
+  });
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        results: capabilities.map(({ identifier: name, capabilityRef }) => ({ name, capabilityRef })),
+      },
+    }, read],
+  );
+  assert.equal(result.isFinalOutput, false);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('recipient clarification rejects blocker sets with mixed account choices', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Send a calendar invite to James Marshall using my Scorpion email today at 5 PM.',
+    },
+  });
+  const read = appendRecipientReadResult({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    callId: 'call-mixed-choices-james-recall',
+    output: '[WHO/WHAT] James A. Marshall: person record; no exact recipient address stored',
+  });
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        results: [{
+          name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+          planningRefStatus: 'account_selection_required',
+          accountChoices: [
+            'calendar@scorpion.example',
+            'calendar@personal.example',
+          ],
+        }, {
+          name: 'OUTLOOK_CALENDAR_CANCEL_EVENT',
+          planningRefStatus: 'account_selection_required',
+          accountChoices: [
+            'calendar@scorpion.example',
+            'calendar@other.example',
+          ],
+        }],
+      },
+    }, read],
+  );
+  assert.equal(result.isFinalOutput, false);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('recipient clarification abstains when a large lookup suppresses tail evidence', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Send a calendar invite to James Marshall using my Scorpion email today at 5 PM.',
+    },
+  });
+  const read = appendRecipientReadResult({
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    turn: 1,
+    callId: 'call-large-james-recall',
+    output: `${'x'.repeat(100_100)}\nJames Marshall email: james.marshall@example.com`,
+  });
+  const result = userChoiceToolUseBehavior(
+    { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+    [{
+      type: 'function_output',
+      tool: { name: 'tool_search' },
+      output: {
+        results: [{
+          name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+          planningRefStatus: 'account_selection_required',
+          accountChoices: [
+            'calendar@scorpion.example',
+            'calendar@personal.example',
+          ],
+        }],
+      },
+    }, read],
+  );
+  assert.equal(result.isFinalOutput, false);
+  assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('request-echo-only read asks, while an exact target-bound identifier suppresses it', () => {
+  for (const fixture of [{
+    suffix: 'echo-only',
+    output: 'James Marshall email address contact identity',
+    asks: true,
+  }, {
+    suffix: 'target-identity',
+    output: 'James Marshall email: james.marshall@example.com',
+    asks: false,
+  }]) {
+    resetEventLog();
+    const sess = createSession({ kind: 'chat' });
+    const source = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: {
+        text: 'Send a calendar invite to James Marshall using my Scorpion email today at 5 PM.',
+      },
+    });
+    const read = appendRecipientReadResult({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      callId: `call-${fixture.suffix}-james-recall`,
+      output: fixture.output,
+    });
+    const result = userChoiceToolUseBehavior(
+      { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+      [{
+        type: 'function_output',
+        tool: { name: 'tool_search' },
+        output: {
+          results: [{
+            name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+            planningRefStatus: 'account_selection_required',
+            accountChoices: [
+              'calendar@scorpion.example',
+              'calendar@personal.example',
+            ],
+          }],
+        },
+      }, read],
+    );
+    assert.equal(result.isFinalOutput, fixture.asks, fixture.suffix);
+    assert.equal(
+      listEvents(sess.id, { types: ['awaiting_user_input'] }).length,
+      fixture.asks ? 1 : 0,
+      fixture.suffix,
+    );
+  }
+});
+
+test('recipient clarification abstains after the same source enters an effect or approval path', () => {
+  for (const disqualifier of ['effect', 'approval'] as const) {
+    resetEventLog();
+    const sess = createSession({ kind: 'chat' });
+    const source = appendEvent({
+      sessionId: sess.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: {
+        text: 'Send a calendar invite to James Marshall using my Scorpion email today at 5 PM.',
+      },
+    });
+    const read = appendRecipientReadResult({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      callId: `call-${disqualifier}-james-recall`,
+      output: '[WHO/WHAT] James A. Marshall: person record; no exact recipient address stored',
+    });
+    if (disqualifier === 'effect') {
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'Clem',
+        type: 'tool_called',
+        data: {
+          sourceUserSeq: source.seq,
+          tool: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+          callId: 'call-effect-entered',
+          effect: 'external_write',
+        },
+      });
+    } else {
+      appendEvent({
+        sessionId: sess.id,
+        turn: 1,
+        role: 'Clem',
+        type: 'approval_requested',
+        data: { subject: 'Create the calendar invitation' },
+      });
+    }
+    const result = userChoiceToolUseBehavior(
+      { context: { sessionId: sess.id, turn: 1, sourceUserSeq: source.seq } },
+      [{
+        type: 'function_output',
+        tool: { name: 'tool_search' },
+        output: {
+          results: [{
+            name: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+            planningRefStatus: 'account_selection_required',
+            accountChoices: [
+              'calendar@scorpion.example',
+              'calendar@personal.example',
+            ],
+          }],
+        },
+      }, read],
+    );
+    assert.equal(result.isFinalOutput, false, disqualifier);
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 0, disqualifier);
+  }
 });
 
 test('parallel ask_user_question candidates become one provider-ordered natural bundle with exact dedupe', async () => {
@@ -1714,7 +2772,7 @@ test('parallel ask_user_question candidates become one provider-ordered natural 
   assert.equal(events[0].data.purpose, 'clarification', 'homogeneous bundle projects its shared purpose');
   assert.equal(events[0].data.sourceUserSeq, 73);
   assert.equal((events[0].data.questions as unknown[]).length, 2);
-  assert.match(String(result.finalOutput), /Question posted:[\s\S]*Zephyr[\s\S]*crew/);
+  assert.match(String(result.finalOutput), /^\[clementine:awaiting-user-input:final\]\n[\s\S]*Zephyr[\s\S]*crew/);
 
   // Retrying arbitration for the same provider turn is idempotent.
   userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 4 } }, [
@@ -2151,6 +3209,114 @@ test('direct_reply accepted route skips factory, MCP, and capability hunt', asyn
   );
   assert.equal(listEvents(sess.id, { types: ['tool_search_scope'] }).length, 0);
   assert.equal(listEvents(sess.id, { types: ['tool_jit_scope'] }).length, 0);
+});
+
+test('host-proven plain conversation ignores action-shaped scope and fanout residue but preserves telemetry', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'discord' });
+  seedUserInput(sess.id, 1, 'send Outlook emails to the 18 contacts');
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'conversation_step',
+    data: {
+      decision: {
+        reply: 'I can send Outlook emails to all 18 contacts.',
+        summary: 'Proposed an 18-contact email batch.',
+      },
+    },
+  });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Thanks for explaining.' },
+  });
+
+  const agent = await buildOrchestratorAgent({
+    userInput: 'Thanks for explaining.',
+    sessionId: sess.id,
+    sourceUserSeq: source.seq,
+    acceptedRoute: 'direct_reply',
+    allowToolJit: true,
+    hostPlainConversation: true,
+  });
+
+  assert.deepEqual(agent.tools ?? [], [], 'the proof remains an exact zero-tool surface');
+  const scope = boundAgentMcpToolScope(agent).scope;
+  assert.equal(scope?.authority, 'none');
+  assert.deepEqual(scope?.allowedServerSlugs ?? [], []);
+  assert.equal(scope?.maxTools, 0);
+  assert.doesNotMatch(
+    await renderAgentInstructions(agent),
+    /THIS TURN IS BATCH-SHAPED/,
+    'stale batch residue cannot add an action-only fanout directive',
+  );
+  assert.equal(listEvents(sess.id, { types: ['mcp_tool_scope'] }).length, 1);
+  assert.equal(listEvents(sess.id, { types: ['rubric_variant'] }).length, 1);
+  assert.equal(listEvents(sess.id, { types: ['tool_policy_resolved'] }).length, 1);
+});
+
+test('near-action and affirmative follow-up without the host plain proof retain semantic scope and fanout', async () => {
+  resetEventLog();
+  const direct = createSession({ kind: 'chat', channel: 'discord' });
+  const nearAction = await buildOrchestratorAgent({
+    userInput: 'Email the limerick to Alex through Outlook.',
+    sessionId: direct.id,
+    allowToolJit: true,
+  });
+  assert.ok((nearAction.tools?.length ?? 0) > 0, 'near-action keeps its executable discovery surface');
+  assert.ok(
+    (boundAgentMcpToolScope(nearAction).scope?.allowedServerSlugs ?? [])
+      .some((slug) => /outlook|microsoft/.test(slug)),
+    'near-action keeps connector scope',
+  );
+
+  const followup = createSession({ kind: 'chat', channel: 'discord' });
+  seedUserInput(followup.id, 1, 'send Outlook emails to the 18 contacts');
+  appendEvent({
+    sessionId: followup.id,
+    turn: 1,
+    role: 'assistant',
+    type: 'conversation_step',
+    data: {
+      decision: {
+        reply: 'Should I send Outlook emails to all 18 contacts?',
+        summary: 'Asked to confirm an 18-contact email batch.',
+      },
+    },
+  });
+  seedUserInput(followup.id, 2, 'Yes.');
+  const affirmed = await buildOrchestratorAgent({
+    userInput: 'Yes.',
+    sessionId: followup.id,
+    allowToolJit: true,
+    taskContinuation: {
+      packetId: 'outlook-batch-affirmation',
+      parentSourceUserSeq: 1,
+      consumingSourceUserSeq: 2,
+      parentInput: 'send Outlook emails to the 18 contacts',
+      question: 'Should I send Outlook emails to all 18 contacts?',
+      options: ['Yes', 'No'],
+      answer: 'Yes.',
+      disposition: 'affirmed',
+      retrievalQuery: 'send Outlook emails to the 18 contacts\nYes.',
+      capabilities: [],
+    },
+    taskContinuationResolved: true,
+  });
+  const affirmedScope = boundAgentMcpToolScope(affirmed).scope;
+  assert.ok(
+    (affirmedScope?.allowedServerSlugs ?? []).some((slug) => /outlook|microsoft/.test(slug)),
+    'the scope-only prior-input read remains active without the proof',
+  );
+  assert.match(
+    await renderAgentInstructions(affirmed),
+    /THIS TURN IS BATCH-SHAPED:.*~18/i,
+    'the fanout conversation read remains active without the proof',
+  );
 });
 
 test('continuity cross-session: a NEW session inherits scope via the continuation lineage', () => {

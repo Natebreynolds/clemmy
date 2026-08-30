@@ -1,7 +1,73 @@
-import { CURATED_TOOLKITS, listCachedToolkits } from './client.js';
+import { CURATED_TOOLKITS, listCachedToolkits, peekConnectedToolkits } from './client.js';
+
+import type {
+  CapabilityNamespaceDescriptorV1,
+} from '../../runtime/semantic-boundary/capability-namespace-alignment.js';
 
 function genericToolkitOfSlug(toolSlug: string): string {
   return toolSlug.trim().toLowerCase().replace(/[-\s]+/g, '_').split('_')[0] ?? '';
+}
+
+function normalizedToolkit(value: string): string {
+  return value.trim().toLowerCase().replace(/[-\s]+/g, '_');
+}
+
+/** Adapter-owned presentation namespaces for source/capability alignment.
+ * These names can only veto a mismatched plan; they are never execution or
+ * discovery authority. The live cached catalog extends the bootstrap list, so
+ * the semantic kernel does not need a provider-name allowlist. */
+export function listRegisteredToolkitNamespaces(): CapabilityNamespaceDescriptorV1[] {
+  const byId = new Map<string, Set<string>>();
+  for (const toolkit of [...CURATED_TOOLKITS, ...listCachedToolkits()]) {
+    const namespaceId = normalizedToolkit(toolkit.slug);
+    if (!namespaceId) continue;
+    const aliases = byId.get(namespaceId) ?? new Set<string>();
+    const displayName = 'displayName' in toolkit ? toolkit.displayName : toolkit.name;
+    const declaredAliases = 'namespaceAliases' in toolkit
+      && Array.isArray(toolkit.namespaceAliases)
+      ? toolkit.namespaceAliases
+      : [];
+    for (const alias of [
+      toolkit.slug.replace(/_/g, ' '),
+      displayName,
+      ...displayName.split('/'),
+      ...declaredAliases,
+    ]) {
+      if (alias.trim()) aliases.add(alias.trim());
+    }
+    byId.set(namespaceId, aliases);
+  }
+  // A newly connected open-catalog toolkit can be usable before the broader
+  // catalog cache has ever been written. Its provider-owned connection slug is
+  // still an exact namespace identity; include that slug without inventing a
+  // display name from operation text.
+  for (const connection of peekConnectedToolkits()) {
+    const namespaceId = normalizedToolkit(connection.slug);
+    if (!namespaceId) continue;
+    const aliases = byId.get(namespaceId) ?? new Set<string>();
+    aliases.add(connection.slug.replace(/_/g, ' '));
+    byId.set(namespaceId, aliases);
+  }
+  return [...byId.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([namespaceId, aliases]) => ({
+      version: 1,
+      namespaceId,
+      aliases: [...aliases].sort(),
+    }));
+}
+
+/** Exact adapter-declared namespace for one operation, or null when the
+ * current provider inventory cannot prove the prefix. */
+export function registeredToolkitNamespaceOfOperation(toolSlug: string): string | null {
+  const normalizedTool = normalizedToolkit(toolSlug);
+  if (!normalizedTool) return null;
+  return listRegisteredToolkitNamespaces()
+    .map((entry) => entry.namespaceId)
+    .sort((left, right) => right.length - left.length)
+    .find((namespaceId) => (
+      normalizedTool === namespaceId || normalizedTool.startsWith(`${namespaceId}_`)
+    )) ?? null;
 }
 
 /**
@@ -19,20 +85,12 @@ function genericToolkitOfSlug(toolSlug: string): string {
  * exact membership, not a longest-prefix guess.
  */
 export function isRegisteredToolkitSlug(value: string): boolean {
-  const normalized = value.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  const normalized = normalizedToolkit(value);
   if (!normalized) return false;
-  return [...CURATED_TOOLKITS, ...listCachedToolkits()]
-    .some((entry) => entry.slug.trim().toLowerCase().replace(/[-\s]+/g, '_') === normalized);
+  return listRegisteredToolkitNamespaces()
+    .some((entry) => entry.namespaceId === normalized);
 }
 
 export function registeredToolkitOfSlug(toolSlug: string): string {
-  const normalizedTool = toolSlug.trim().toLowerCase().replace(/[-\s]+/g, '_');
-  const known = [...new Set(
-    [...CURATED_TOOLKITS, ...listCachedToolkits()]
-      .map((entry) => entry.slug.trim().toLowerCase().replace(/[-\s]+/g, '_'))
-      .filter(Boolean),
-  )].sort((a, b) => b.length - a.length);
-  return known.find((slug) =>
-    normalizedTool === slug || normalizedTool.startsWith(`${slug}_`))
-    ?? genericToolkitOfSlug(toolSlug);
+  return registeredToolkitNamespaceOfOperation(toolSlug) ?? genericToolkitOfSlug(toolSlug);
 }

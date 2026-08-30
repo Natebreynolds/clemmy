@@ -17,8 +17,6 @@ import os from 'node:os';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-bgtasks-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
-process.env.CLEMMY_HARNESS_BACKGROUND = 'off';
-process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const {
@@ -66,6 +64,7 @@ const {
   markBackgroundTaskAwaitingApproval,
   queueBackgroundTaskApprovalResolution,
   reviseBackgroundTaskContract,
+  _setBackgroundResponseExecutorForTests,
 } = await import('./background-tasks.js');
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
@@ -97,7 +96,10 @@ const {
 } = await import('../runtime/prospective-intentions.js');
 const { syncProspectiveIntentions } = await import('../runtime/prospective-sync.js');
 
+_setBackgroundResponseExecutorForTests((assistant, request) => assistant.respond(request));
+
 test.after(() => {
+  _setBackgroundResponseExecutorForTests(null);
   closeProspectiveIntentionsDbForTest();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -1426,10 +1428,13 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   const updated = getBackgroundTask(task.id);
   assert.equal(updated?.status, 'done');
   assert.equal(updated?.requestedModel, 'claude-sonnet-5');
-  assert.equal(updated?.effectiveModel, 'claude-sonnet-5');
-  assert.equal(updated?.modelProvider, 'claude');
-  assert.equal(updated?.modelRouteKind, 'legacy');
-  assert.equal(updated?.modelTransport, 'legacy_assistant');
+  // The explicit lifecycle-test executor supplies a worker response without
+  // pretending that a production provider route ran. Canonical host routing
+  // and the retired-legacy guard are covered at the bridge boundary.
+  assert.equal(updated?.effectiveModel, undefined);
+  assert.equal(updated?.modelProvider, undefined);
+  assert.equal(updated?.modelRouteKind, undefined);
+  assert.equal(updated?.modelTransport, undefined);
 });
 
 test('an in-flight contract correction preserves partial work and re-queues the same task/session at the model boundary', async () => {
@@ -3435,7 +3440,7 @@ test('deriveTaskTitle: the three live raw-strip sightings come out clean; clean 
     deriveTaskTitle('this fully autonomously in the background: research these 6 personal injury law firm websites and build me a comparison table (firm name, practice areas). The sites: a.com...'),
     'Research these 6 personal injury law firm websites and build me a compa…',
   );
-  assert.match(deriveTaskTitle('Great. Now in the background: take the 3 most useful findings from that comparison and email them to nathan@x.com as a short bulleted summary titled PI Firm Research Summary.'), /^Take the 3 most useful findings/);
+  assert.match(deriveTaskTitle('Great. Now in the background: take the 3 most useful findings from that comparison and email them to avery@x.com as a short bulleted summary titled PI Firm Research Summary.'), /^Take the 3 most useful findings/);
   assert.match(deriveTaskTitle('Okay lets try this, I want you to get 30 of my market leaders not touched in 15 days from the report from salesforce, market leaders not touched in 15 days, in my name.'), /^Get 30 of my market leaders/);
   // Clean titles untouched (modulo capitalization) and length-capped.
   assert.equal(deriveTaskTitle('Analyze meeting transcript: Legal Directors Meeting'), 'Analyze meeting transcript: Legal Directors Meeting');

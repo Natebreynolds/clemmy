@@ -855,6 +855,10 @@ export interface SaveSpaceInput {
   status?: SpaceStatus;
   contract?: SpaceContract;
   viewEntry?: string;
+  /** Optional complete view bytes committed in the same Workspace lock as
+   * the manifest/version/index. Used by authoring; omitted for metadata-only
+   * store updates. */
+  viewContent?: string;
   dataSources?: SpaceDataSource[];
   actions?: SpaceAction[];
   reengage?: { triggers: string[]; guidance?: string };
@@ -892,19 +896,41 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
   const actions = input.actions ?? existing?.actions ?? [];
   assertValidWorkspaceIdentities(dataSources, actions);
   assertValidDeclaredRunners(input.dataSources, input.actions);
+  const viewEntry = input.viewEntry ?? existing?.viewEntry ?? 'view/index.html';
+  let version = existing?.version ?? 1;
+  let revisions = existing?.revisions ?? [];
+  if (input.viewContent !== undefined) {
+    const viewFile = resolveInSpace(input.id, viewEntry);
+    const previousView = existsSync(viewFile) ? readFileSync(viewFile, 'utf-8') : null;
+    if (previousView !== input.viewContent) {
+      if (previousView !== null && existing) {
+        const stamp = now.replace(/[:.]/g, '-');
+        const snapshotRel = path.posix.join('view-history', `${stamp}-v${existing.version}.html`);
+        atomicWrite(resolveInSpace(input.id, snapshotRel), previousView);
+        revisions = [...existing.revisions, {
+          version: existing.version,
+          ts: now,
+          bytes: Buffer.byteLength(previousView, 'utf-8'),
+          file: snapshotRel,
+        }].slice(-50);
+        version = existing.version + 1;
+      }
+      atomicWrite(viewFile, input.viewContent);
+    }
+  }
   const record: SpaceRecord = {
     id: input.id,
     title: input.title.trim().slice(0, 200) || input.id,
     status: input.status ?? existing?.status ?? 'active',
     contract: input.contract ?? existing?.contract,
-    viewEntry: input.viewEntry ?? existing?.viewEntry ?? 'view/index.html',
+    viewEntry,
     dataSources,
     actions,
     reengage: input.reengage ?? existing?.reengage,
     originSessionId: input.originSessionId ?? existing?.originSessionId,
     focusId: input.focusId ?? existing?.focusId ?? null,
-    version: existing?.version ?? 1,
-    revisions: existing?.revisions ?? [],
+    version,
+    revisions,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
     lastOpenedAt: existing?.lastOpenedAt,
@@ -920,6 +946,74 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
     payload: { mutation: existing ? 'save:update' : 'save:create' },
   });
   return record;
+}
+
+/**
+ * Commit one complete view revision under the Workspace mutation lock.
+ *
+ * Ordering is deliberate: snapshot V1, atomically replace the view with V2,
+ * atomically publish the V2 manifest, then strictly index those final bytes.
+ * The previous record is never indexed with the incremented version. If the
+ * manifest or index commit fails, restore the exact V1 view/manifest before
+ * returning the failure.
+ */
+function commitSpaceViewRevisionUnlocked(slug: string, nextView: string): SpaceRecord {
+  const existing = readManifest(slug);
+  if (!existing) throw new Error(`No workspace named "${slug}".`);
+  if (existing.manifestErrors && existing.manifestErrors.length > 0) {
+    throw new Error(`Workspace "${slug}" has an invalid manifest.`);
+  }
+  const viewFile = resolveInSpace(slug, existing.viewEntry);
+  if (!existsSync(viewFile)) throw new Error(`Workspace "${slug}" has no view.`);
+  const previousView = readFileSync(viewFile, 'utf-8');
+  const previousManifest = readFileSync(manifestPath(slug), 'utf-8');
+  const now = new Date();
+  const timestamp = now.toISOString();
+  const stamp = timestamp.replace(/[:.]/g, '-');
+  const snapshotRel = path.posix.join('view-history', `${stamp}-v${existing.version}.html`);
+  const snapshotFile = resolveInSpace(slug, snapshotRel);
+  const revision: SpaceRevision = {
+    version: existing.version,
+    ts: timestamp,
+    bytes: Buffer.byteLength(previousView, 'utf-8'),
+    file: snapshotRel,
+  };
+  const updated: SpaceRecord = {
+    ...existing,
+    version: existing.version + 1,
+    revisions: [...existing.revisions, revision].slice(-50),
+    updatedAt: timestamp,
+  };
+  delete updated.manifestErrors;
+
+  atomicWrite(snapshotFile, previousView);
+  try {
+    atomicWrite(viewFile, nextView);
+    atomicWrite(manifestPath(slug), JSON.stringify(persistableRecord(updated), null, 2));
+    indexWorkspaceRecord(updated, {
+      eventType: 'workspace_file_changed',
+      actor: 'space-store',
+      payload: { mutation: 'viewRevision' },
+      strict: true,
+    });
+    return updated;
+  } catch (error) {
+    // Best-effort exact rollback. If rollback itself cannot be indexed, retain
+    // the original error but leave startup reindexing able to converge from
+    // the restored file source of truth.
+    try { atomicWrite(viewFile, previousView); } catch { /* preserve original failure */ }
+    try { atomicWrite(manifestPath(slug), previousManifest); } catch { /* preserve original failure */ }
+    try { rmSync(snapshotFile, { force: true }); } catch { /* preserve original failure */ }
+    try {
+      indexWorkspaceRecord(existing, {
+        eventType: 'workspace_file_changed',
+        actor: 'space-store-rollback',
+        payload: { mutation: 'viewRevision:rollback' },
+        strict: true,
+      });
+    } catch { /* startup reindex remains the final recovery path */ }
+    throw error;
+  }
 }
 
 export class SpaceStore {
@@ -964,6 +1058,16 @@ export class SpaceStore {
     }
     ensureDir(SPACES_DIR);
     return withFileLockSyncStrict(workspaceMutationLockPath(input.id), () => saveSpaceUnlocked(input));
+  }
+
+  /** Snapshot V1 and atomically publish/index one complete V2 view revision. */
+  commitViewRevision(slug: string, nextView: string): SpaceRecord {
+    if (!isValidSpaceSlug(slug)) throw new Error(`invalid workspace slug: ${slug}`);
+    ensureDir(SPACES_DIR);
+    return withFileLockSyncStrict(
+      workspaceMutationLockPath(slug),
+      () => commitSpaceViewRevisionUnlocked(slug, nextView),
+    );
   }
 
   /** Create one exact Space without ever overwriting an existing directory or

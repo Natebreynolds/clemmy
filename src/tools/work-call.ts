@@ -32,7 +32,10 @@ import {
   type AcceptedTaskWorkContractV1,
   type ExpectedWorkProposalV1,
 } from '../runtime/harness/expected-work-contract.js';
-import { formatFrozenWorkCallDescription } from '../runtime/harness/frozen-work-surface.js';
+import {
+  formatFrozenWorkCallDescription,
+  frozenCreateDestinationFamily,
+} from '../runtime/harness/frozen-work-surface.js';
 import { getTurnGraphEventForSource, openEventLog } from '../runtime/harness/eventlog.js';
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import {
@@ -48,7 +51,10 @@ import {
   durableLogicalCallRecoveryMaterial,
 } from '../runtime/harness/logical-call-contract.js';
 import { logicalCallAuthorityState } from '../runtime/harness/dispatch-ledger.js';
-import { currentHostCallAttestation } from '../runtime/harness/accepted-turn-call-authority.js';
+import {
+  currentHostCallAttestation,
+  type HostCallAttestation,
+} from '../runtime/harness/accepted-turn-call-authority.js';
 import {
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
@@ -59,8 +65,11 @@ import { canonicalExternalInputSchemaDigestV1 } from '../runtime/harness/externa
 import { expectedTaskFor } from '../runtime/harness/resolution-ledger.js';
 import {
   inspectExactSourceStrategyDecisionForSource,
+  physicalSourceCapabilityIdentityFromCatalog,
+  sourceCapabilityMatchForBinding,
   turnPreflightDecisionEntersSourceStrategy,
   withSourceStrategyRequirement,
+  type PhysicalSourceCapabilityIdentityV1,
   type SourceStrategyRequirementContext,
 } from '../runtime/harness/source-strategy-admission.js';
 import {
@@ -69,17 +78,33 @@ import {
 } from '../runtime/harness/turn-control.js';
 import { settleResolvedCarrierRefusal } from '../runtime/harness/resolved-carrier-refusal.js';
 import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
-import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
+import {
+  classifyRuntimeToolEffect,
+  unwrapRuntimeEffectiveToolIdentity,
+} from '../runtime/harness/tool-effect.js';
+import {
+  capabilityManifestDigest,
+  currentCapabilityManifest,
+} from '../runtime/harness/capability-manifest.js';
+import {
+  canonicalCatalogIdentityOf,
+  isCurrentCallableCatalogEntry,
+  peekHostCapabilityCatalogFactory,
+  type RegisteredHostCapability,
+} from '../runtime/harness/host-capability-catalog-factory.js';
 import {
   buildCallTool,
   isResolvedDispatchPreparedWithoutExecution,
   resolvedDispatchPreparedWithoutExecution,
   type BuildCallToolOptions,
 } from './call-tool.js';
-import { isMcpNamespacedTool } from './inner-dispatch.js';
 import {
   markHostPlanRequiredWorkCall,
+  registerHostPlanningReadCapabilityResolver,
+  registerHostSingleActionPlanCapabilityResolver,
   registerHostWorkCallPreparer,
+  type HostPlanningReadCapabilityResolver,
+  type HostSingleActionPlanCapabilityResolver,
   type HostWorkCallPreparationRequest,
   type HostWorkCallPreparationResult,
 } from './work-call-mode.js';
@@ -129,7 +154,7 @@ export const WorkCallInputSchema = z.object({
   ),
   requirement_id: IdSchema.describe('Operation id in the frozen proposal discharged by this inner call.'),
   universe_item_id: MemberSchema.nullable().describe(
-    'Exact accepted universe member for cardinality=each; otherwise null.',
+    'Exact accepted universe member for cardinality=each; otherwise use JSON null (not the string "null").',
   ),
   universe_selector: z.object({
     argument_pointer: z.string().max(512),
@@ -147,12 +172,66 @@ export const WorkCallInputSchema = z.object({
   args_json: z.string().describe('JSON object string matching the inner tool schema.'),
 }).strict();
 
-/** Foreground plan_task already owns topology. Removing `proposal` from the
- * post-plan wire saves the large union/examples on every later model step and
- * makes a second semantic writer structurally impossible. */
-export const HostPlannedWorkCallInputSchema = WorkCallInputSchema.omit({ proposal: true }).strict();
+/** Foreground plan_task already owns topology. The execution envelope is
+ * constructed without `proposal` so a second semantic writer is structurally
+ * impossible, and cardinality-once calls are not forced to emit each-only
+ * selector objects as required nulls. */
+export const HostPlannedWorkCallInputSchema = z.object({
+  requirement_id: WorkCallInputSchema.shape.requirement_id,
+  // The frozen requirement already owns cardinality. A once/set call should
+  // not have to manufacture an each-only placeholder merely to satisfy the
+  // transport schema; admission below still requires the member for `each`.
+  universe_item_id: WorkCallInputSchema.shape.universe_item_id.optional(),
+  universe_selector: WorkCallInputSchema.shape.universe_selector.optional(),
+  seal_amendment: WorkCallInputSchema.shape.seal_amendment,
+  name: WorkCallInputSchema.shape.name,
+  args_json: WorkCallInputSchema.shape.args_json,
+}).strict();
 
 export type WorkCallInput = z.infer<typeof WorkCallInputSchema>;
+export type HostPlannedWorkCallInput = z.infer<typeof HostPlannedWorkCallInputSchema>;
+
+/** Cardinality-only projection of an already-reopened frozen work contract. */
+export interface FrozenWorkCardinalityAuthority {
+  operations: ReadonlyArray<{
+    id: string;
+    cardinality: { kind: 'once' | 'each' | 'set' };
+  }>;
+}
+
+/**
+ * Canonicalize one representation-only drift only after exact authority says
+ * the selected requirement is cardinality-once.
+ *
+ * Some OpenAI-compatible providers encode a nullable host control slot as the
+ * JSON string `"null"`. It means absence for `once`, but it may be the exact
+ * accepted member id for `each`; without the frozen operation this function
+ * must not guess. Provider payloads and all non-once member ids remain
+ * byte-for-byte unchanged.
+ */
+export function normalizeWorkCallInputForFrozenCardinality(
+  input: WorkCallInput,
+  authority: FrozenWorkCardinalityAuthority,
+): WorkCallInput {
+  const operation = authority.operations.find((entry) => entry.id === input.requirement_id);
+  return operation?.cardinality.kind === 'once' && input.universe_item_id === 'null'
+    ? { ...input, universe_item_id: null }
+    : input;
+}
+
+/** Lift the host-planned wire object into the internal carrier input. Missing
+ * each-only fields become explicit nulls; the proposal is always host-owned. */
+export function workCallInputFromHostPlan(input: HostPlannedWorkCallInput): WorkCallInput {
+  return {
+    proposal: null,
+    requirement_id: input.requirement_id,
+    universe_item_id: input.universe_item_id ?? null,
+    universe_selector: input.universe_selector ?? null,
+    seal_amendment: input.seal_amendment ?? null,
+    name: input.name,
+    args_json: input.args_json,
+  };
+}
 
 interface WorkCallFrame {
   input: WorkCallInput;
@@ -499,6 +578,76 @@ export function unboundReadComputeAuthority(input: {
   }
 }
 
+/** Admit an ordinary foreground read without manufacturing a turn graph.
+ *
+ * This is not an unbound provider escape hatch: `invokeHostToolCall` has
+ * already opened the accepted-task logical call and durably persisted the
+ * exact catalog-manifest attestation (operation, account, schema, effect and
+ * invoke port) before `work_call` reaches this callback. Re-read that binding
+ * and the still-open logical authority here. Any graph, mutation, local
+ * envelope, stale binding, or mismatched operation stays on the normal
+ * expected-work path and fails closed.
+ */
+export function graphlessForegroundReadAuthority(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+  operationId: string;
+  effect: 'read' | 'compute';
+}): { ok: true } | { ok: false; reason: string } {
+  try {
+    if (getTurnGraphEventForSource(input.sessionId, input.sourceUserSeq)) {
+      return { ok: false, reason: 'foreground read authority cannot replace a persisted turn graph' };
+    }
+    const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+    const attestation = currentHostCallAttestation();
+    if (
+      !attestation
+      || attestation.sessionId !== input.sessionId
+      || attestation.sourceUserSeq !== input.sourceUserSeq
+      || attestation.acceptedTaskId !== acceptedTaskId
+      || attestation.logicalToolCallId !== input.logicalToolCallId
+      || attestation.bindingKind !== 'catalog_manifest'
+      || attestation.effect !== input.effect
+      || attestation.operationId.toLowerCase() !== input.operationId.trim().toLowerCase()
+    ) {
+      return { ok: false, reason: 'foreground read lacks its exact current catalog attestation' };
+    }
+    const logical = logicalCallAuthorityState({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId,
+      logicalToolCallId: input.logicalToolCallId,
+    });
+    if (logical.status !== 'open') {
+      return {
+        ok: false,
+        reason: 'reason' in logical ? logical.reason : `foreground read logical call is ${logical.status}`,
+      };
+    }
+    const durable = loadHostCallCapabilityBinding({
+      db: openEventLog(),
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      logicalToolCallId: input.logicalToolCallId,
+    });
+    if (
+      durable.status !== 'ok'
+      || !hostCallCapabilityBindingMatchesAttestation(durable.binding, attestation)
+    ) {
+      return {
+        ok: false,
+        reason: durable.status === 'ok'
+          ? 'foreground read durable catalog binding differs from its current attestation'
+          : durable.reason,
+      };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function normalizedProposal(input: WorkCallInput['proposal']): ExpectedWorkProposalV1 | null {
   if (!input) return null;
   return {
@@ -784,36 +933,114 @@ export type SourceStrategyWorkCarrierAdmission =
     }
   | { status: 'refused'; reason: string };
 
-/** Resolve only identities that still have a downstream physical verifier.
- * A shell/CLI/browser/HTTP call can reach the network, but it cannot present
- * the capability/account/schema identity consumed by the provider gateway and
- * therefore cannot stand in for a confirmed collection source. */
-function resolvedSourceCarrierCapabilityId(
-  targetName: string,
-  targetArgs: unknown,
-): string | null {
-  if (targetName === 'composio_execute_tool') {
-    if (!targetArgs || typeof targetArgs !== 'object' || Array.isArray(targetArgs)) return null;
-    const slug = (targetArgs as Record<string, unknown>).tool_slug;
-    return typeof slug === 'string' && slug.trim()
-      ? `capability:composio:${slug.trim()}`
-      : null;
-  }
-  return isMcpNamespacedTool(targetName)
-    ? `capability:mcp:${targetName}`
-    : null;
+export interface SealedSourceStrategyWorkCarrierV1 {
+  capability: PhysicalSourceCapabilityIdentityV1;
+  effect: 'read' | 'compute';
 }
 
-/** Provider-neutral routing half of source admission. This does not pretend
- * to verify a live account/schema early: it admits only a carrier that can
- * present the exact bound capability to the existing provider gateway, whose
- * physical seam still resolves and matches account/schema before I/O. */
+export type SourceStrategyWorkCarrierCatalogAttestation = Pick<
+  HostCallAttestation,
+  | 'bindingKind'
+  | 'capabilityId'
+  | 'providerInputSchemaDigest'
+  | 'schemaFingerprint'
+  | 'accountId'
+  | 'invokePortId'
+  | 'operationId'
+  | 'manifestId'
+  | 'manifestDigest'
+  | 'effect'
+>;
+
+/** Project a source identity only from one exact current catalog manifest.
+ *
+ * Carrier names and model arguments are deliberately absent. Composio,
+ * native MCP, and reviewed CLI reads all reach this reducer through the same
+ * immutable manifest/descriptor facts. Unknown effects and local envelopes do
+ * not become source authority merely because they can reach a network or a
+ * process. */
+export function sealedSourceStrategyWorkCarrierFromCatalog(input: {
+  entry: RegisteredHostCapability;
+  attestation: SourceStrategyWorkCarrierCatalogAttestation;
+}): SealedSourceStrategyWorkCarrierV1 | null {
+  if (!isCurrentCallableCatalogEntry(input.entry)) return null;
+  const manifest = currentCapabilityManifest(input.entry.manifest);
+  const canonical = canonicalCatalogIdentityOf(input.entry);
+  const attested = input.attestation;
+  if (
+    attested.bindingKind !== 'catalog_manifest'
+    || (attested.effect !== 'read' && attested.effect !== 'compute')
+    || !manifest
+    || !canonical
+    || manifest.effect !== attested.effect
+    || capabilityManifestDigest(manifest) !== attested.manifestDigest
+    || canonical.capabilityId !== attested.capabilityId
+    || canonical.manifestId !== attested.manifestId
+    || canonical.manifestDigest !== attested.manifestDigest
+    || canonical.operationId !== attested.operationId
+    || canonical.schemaDigest !== attested.schemaFingerprint
+    || canonical.account !== attested.accountId
+    || canonical.invokePortId !== attested.invokePortId
+    || canonical.effect !== attested.effect
+    || (canonical.providerInputSchemaDigest ?? undefined)
+      !== attested.providerInputSchemaDigest
+  ) return null;
+  const capability = physicalSourceCapabilityIdentityFromCatalog({
+    manifest,
+    ...(canonical.sourceSchemaFingerprint
+      ? { sourceSchemaFingerprint: canonical.sourceSchemaFingerprint }
+      : {}),
+  });
+  return capability ? Object.freeze({ capability, effect: attested.effect }) : null;
+}
+
+/** Reopen the process-scoped host attestation and its durable mirror, then
+ * re-read the same current catalog row. This is the sole bridge from the
+ * resolved work carrier into source-strategy identity; target strings and
+ * argument shapes never participate. */
+function currentSealedSourceStrategyWorkCarrier(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+}): SealedSourceStrategyWorkCarrierV1 | null {
+  try {
+    const attestation = currentHostCallAttestation();
+    if (
+      !attestation
+      || attestation.sessionId !== input.sessionId
+      || attestation.sourceUserSeq !== input.sourceUserSeq
+      || attestation.acceptedTaskId !== acceptedTaskIdFor(input.sessionId, input.sourceUserSeq)
+      || attestation.logicalToolCallId !== input.logicalToolCallId
+      || attestation.bindingKind !== 'catalog_manifest'
+    ) return null;
+    const durable = loadHostCallCapabilityBinding({
+      db: openEventLog(),
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      logicalToolCallId: input.logicalToolCallId,
+    });
+    if (
+      durable.status !== 'ok'
+      || !hostCallCapabilityBindingMatchesAttestation(durable.binding, attestation)
+    ) return null;
+    const entry = peekHostCapabilityCatalogFactory()?.get(attestation.capabilityId);
+    return entry
+      ? sealedSourceStrategyWorkCarrierFromCatalog({ entry, attestation })
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Provider-neutral routing half of source admission. The carrier fact is a
+ * sealed current catalog projection, not a registration inferred from the
+ * outer tool name. The physical seam still independently reopens the same
+ * account/schema binding immediately before I/O. */
 export function evaluateSourceStrategyWorkCarrier(input: {
   requirement: SourceStrategyRequirementContext | null;
   binding?: TurnSourceStrategyBindingV1;
   bindingRequired?: boolean;
-  targetName: string;
-  targetArgs: unknown;
+  carrier?: SealedSourceStrategyWorkCarrierV1 | null;
 }): SourceStrategyWorkCarrierAdmission {
   if (input.requirement?.role !== 'source' && input.requirement?.role !== 'collection') {
     return { status: 'not_applicable' };
@@ -826,32 +1053,38 @@ export function evaluateSourceStrategyWorkCarrier(input: {
         }
       : { status: 'not_applicable' };
   }
-  const capabilityId = resolvedSourceCarrierCapabilityId(input.targetName, input.targetArgs);
-  if (!capabilityId) {
+  if (
+    input.requirement.effect !== 'read'
+    && input.requirement.effect !== 'compute'
+  ) {
     return {
       status: 'refused',
-      reason: `The source/collection target ${input.targetName} cannot present an exact bound capability/account/schema identity. Shell, CLI, browser, and generic HTTP substitutes are not admitted for this confirmed source. No inner tool was started.`,
+      reason: 'The source/collection requirement is not an admitted read or compute. Unknown and mutating calls cannot inherit confirmed source authority. No inner tool was started.',
     };
   }
-  const identities = [input.binding.primary, ...input.binding.equivalentFallbacks];
-  const index = identities.findIndex((identity) => identity.capabilityId === capabilityId);
-  if (index < 0) {
+  if (!input.carrier) {
     return {
       status: 'refused',
-      reason: `The source/collection target ${capabilityId} is outside the confirmed source binding. No inner tool was started.`,
+      reason: 'The source/collection target has no exact current sealed manifest/account/schema identity. No inner tool was started.',
     };
   }
-  const matched = identities[index]!;
-  if (capabilityId.startsWith('capability:composio:') && !matched.schemaFingerprint) {
+  if (input.carrier.effect !== input.requirement.effect) {
     return {
       status: 'refused',
-      reason: `The bound Composio source ${capabilityId} has no schema fingerprint for the physical gateway to verify. No inner tool was started.`,
+      reason: `The sealed source effect ${input.carrier.effect} does not match the admitted ${input.requirement.effect} requirement. No inner tool was started.`,
+    };
+  }
+  const match = sourceCapabilityMatchForBinding(input.binding, input.carrier.capability);
+  if (!match) {
+    return {
+      status: 'refused',
+      reason: `The sealed source capability ${input.carrier.capability.capabilityId} is outside the exact confirmed capability/account/schema binding. No inner tool was started.`,
     };
   }
   return {
     status: 'admitted',
-    capabilityId,
-    match: index === 0 ? 'primary' : 'equivalent_fallback',
+    capabilityId: input.carrier.capability.capabilityId,
+    match,
   };
 }
 
@@ -885,6 +1118,17 @@ function repairLineFor(kind: ExpectedWorkAdmissionFailureKind): string {
   }
 }
 
+function repairableWorkInvocationShape(
+  kind: ExpectedWorkAdmissionFailureKind | undefined,
+): boolean {
+  return kind === 'work_contract_required'
+    || kind === 'work_contract_invalid'
+    || kind === 'work_binding_required'
+    || kind === 'work_requirement_unknown'
+    || kind === 'work_effect_mismatch'
+    || kind === 'work_cardinality_mismatch';
+}
+
 function refusalResult(
   kind: ExpectedWorkAdmissionFailureKind,
   reason: string,
@@ -910,6 +1154,8 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
   frozenContract?: AcceptedTaskWorkContractV1 | null;
   /** Reachable inner names the host may uniquely bind onto a frozen write. */
   catalogIdentifiers?: readonly string[];
+  /** Exact create sink family from the accepted graph. */
+  destinationFamily?: string | null;
   /** Fresh host lane: plan_task must freeze the graph-derived contract first,
    * and model-authored work_call proposals are never accepted. */
   requireHostPlan?: boolean;
@@ -917,6 +1163,14 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
    * the exact live planning catalog can also expose plan_task, allowing the
    * sanctioned plan_task + dependency-root work_call frame. */
   hostPlanningReady?: () => boolean | Promise<boolean>;
+  /** Opaque source-bound nomination for an exact read already present on the
+   * foreground model's bounded planning card. Final execution authority stays
+   * in the host runner and its current catalog/manifest checks. */
+  hostPlanningReadCapabilityResolver?: HostPlanningReadCapabilityResolver;
+  /** Opaque source-bound resolver used only when the model emits one sole,
+   * exact, dependency-free once mutation. The host still compiles via the
+   * configured plan_task control before ordinary preparation/execution. */
+  hostSingleActionPlanCapabilityResolver?: HostSingleActionPlanCapabilityResolver;
 }
 
 export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeContextValue> {
@@ -924,13 +1178,18 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     settlementLane = 'agents_runner',
     frozenContract = null,
     catalogIdentifiers,
+    destinationFamily,
     requireHostPlan = false,
     hostPlanningReady,
+    hostPlanningReadCapabilityResolver,
+    hostSingleActionPlanCapabilityResolver,
     ...dispatcherOptions
   } = options;
   const frozenAuthority = formatFrozenWorkCallDescription({
     frozenContract,
     catalogIdentifiers,
+    destinationFamily: destinationFamily
+      ?? (frozenContract ? frozenCreateDestinationFamily(frozenContract) : null),
     sourceStrategyBinding: options.sourceStrategyBinding,
   });
   const suppliedSourceStrategyBinding = validatedTurnSourceStrategyBinding(
@@ -939,9 +1198,8 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   const sourceCarrierAdmission = (input: {
     sessionId: string;
     sourceUserSeq: number;
+    logicalToolCallId: string;
     requirement: SourceStrategyRequirementContext | null;
-    targetName: string;
-    targetArgs: unknown;
   }): SourceStrategyWorkCarrierAdmission => {
     if (input.requirement?.role !== 'source' && input.requirement?.role !== 'collection') {
       return { status: 'not_applicable' };
@@ -979,8 +1237,11 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       requirement: input.requirement,
       ...(durableBinding ? { binding: durableBinding } : {}),
       bindingRequired: requireDurableBinding || Boolean(durableBinding),
-      targetName: input.targetName,
-      targetArgs: input.targetArgs,
+      carrier: currentSealedSourceStrategyWorkCarrier({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        logicalToolCallId: input.logicalToolCallId,
+      }),
     });
   };
   const dispatcher = buildCallTool({
@@ -994,12 +1255,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         extras?: { plan?: unknown; result?: unknown },
       ): ExternalWritePreDispatchResult => {
         const refusal = refusalResult(kind, reason, extras);
-        const repairableInvocationShape = kind === 'work_contract_required'
-          || kind === 'work_contract_invalid'
-          || kind === 'work_binding_required'
-          || kind === 'work_requirement_unknown'
-          || kind === 'work_effect_mismatch'
-          || kind === 'work_cardinality_mismatch';
+        const repairableInvocationShape = repairableWorkInvocationShape(kind);
         // call_tool has already resolved/materialized the INNER invocation and
         // refined this logical call to that exact contract. Settle the refusal
         // here against those exact bytes; letting the outer work_call brackets
@@ -1030,8 +1286,18 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         frame.refusalKind = 'work_authority_unavailable';
         return refuse(frame.refusalKind, 'accepted source or logical call identity is unavailable');
       }
+      const resolvedRuntimeEffect = classifyRuntimeToolEffect(
+        resolved.targetName,
+        resolved.targetArgs,
+      ).effect;
+      // Fresh provider reads share work_call's carrier but do not need its
+      // graph/once-ness contract. The exact resolved effect is known here,
+      // after inner schema/account materialization and before any dispatch.
+      // Unknown and mutating effects retain the plan barrier below.
+      const graphNeutralReadCompute = requireHostPlan
+        && (resolvedRuntimeEffect === 'read' || resolvedRuntimeEffect === 'compute');
       const proposal = normalizedProposal(frame.input.proposal);
-      if (requireHostPlan && proposal !== null) {
+      if (requireHostPlan && !graphNeutralReadCompute && proposal !== null) {
         frame.refusalKind = 'work_contract_required';
         return refuse(
           frame.refusalKind,
@@ -1047,7 +1313,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
             return loaded.status === 'ok' ? loaded.contract : null;
           })()
         : null;
-      if (requireHostPlan && !durableHostContract) {
+      if (requireHostPlan && !graphNeutralReadCompute && !durableHostContract) {
         frame.refusalKind = 'work_contract_required';
         return refuse(
           frame.refusalKind,
@@ -1064,10 +1330,19 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       const sourceContract = frozenContract
         ?? durableHostContract
         ?? (preparedProposal?.status === 'prepared' ? preparedProposal.contract : undefined);
-      const resolvedRuntimeEffect = classifyRuntimeToolEffect(
-        resolved.targetName,
-        resolved.targetArgs,
-      ).effect;
+      // The literal string `"null"` is absence only when the exact reopened
+      // requirement proves cardinality=once. For `each` it remains a possible
+      // real member id and reaches the ordinary immutable-universe checks.
+      const cardinalityAuthority = requireHostPlan ? durableHostContract : sourceContract;
+      const cardinalityBoundInput = cardinalityAuthority
+        ? normalizeWorkCallInputForFrozenCardinality(frame.input, cardinalityAuthority)
+        : frame.input;
+      const graphlessForegroundRead = graphNeutralReadCompute
+        && !sourceContract
+        && getTurnGraphEventForSource(
+          resolved.sessionId,
+          resolved.sourceUserSeq as number,
+        ) === null;
       const preAdmissionSourceRequirement = sourceStrategyRequirementContext({
         sessionId: resolved.sessionId,
         sourceUserSeq: resolved.sourceUserSeq as number,
@@ -1078,27 +1353,69 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       const preAdmissionSourceCarrier = sourceCarrierAdmission({
         sessionId: resolved.sessionId,
         sourceUserSeq: resolved.sourceUserSeq as number,
+        logicalToolCallId: resolved.logicalToolCallId,
         requirement: preAdmissionSourceRequirement,
-        targetName: resolved.targetName,
-        targetArgs: resolved.targetArgs,
       });
       if (preAdmissionSourceCarrier.status === 'refused') {
         frame.refusalKind = 'work_authority_unavailable';
         return refuse(frame.refusalKind, preAdmissionSourceCarrier.reason);
+      }
+      if (
+        graphlessForegroundRead
+        && (resolvedRuntimeEffect === 'read' || resolvedRuntimeEffect === 'compute')
+      ) {
+        const effectiveTarget = unwrapRuntimeEffectiveToolIdentity(
+          resolved.targetName,
+          resolved.targetArgs,
+        );
+        if (!effectiveTarget.toolName) {
+          frame.refusalKind = 'work_authority_unavailable';
+          return refuse(frame.refusalKind, 'foreground read has no exact effective operation');
+        }
+        const foregroundAuthority = graphlessForegroundReadAuthority({
+          sessionId: resolved.sessionId,
+          sourceUserSeq: resolved.sourceUserSeq as number,
+          logicalToolCallId: resolved.logicalToolCallId,
+          operationId: effectiveTarget.toolName,
+          effect: resolvedRuntimeEffect,
+        });
+        if (!foregroundAuthority.ok) {
+          frame.refusalKind = 'work_authority_unavailable';
+          return refuse(frame.refusalKind, foregroundAuthority.reason);
+        }
+        // The requirement label is evidence/dependency context only. Durable
+        // crossing authority is the exact host-call catalog binding re-read
+        // above; no expected-work row or graph is fabricated for this read.
+        const sourceRequirement: SourceStrategyRequirementContext = {
+          role: 'source',
+          effect: resolvedRuntimeEffect,
+        };
+        const sourceCarrier = sourceCarrierAdmission({
+          sessionId: resolved.sessionId,
+          sourceUserSeq: resolved.sourceUserSeq as number,
+          logicalToolCallId: resolved.logicalToolCallId,
+          requirement: sourceRequirement,
+        });
+        if (sourceCarrier.status === 'refused') {
+          frame.refusalKind = 'work_authority_unavailable';
+          return refuse(frame.refusalKind, sourceCarrier.reason);
+        }
+        return withUnboundWorkRequirement(frame.input.requirement_id, () =>
+          withSourceRequirementIfKnown(sourceRequirement, dispatch));
       }
       const admission = admitExpectedWorkInvocation({
         sessionId: resolved.sessionId,
         sourceUserSeq: resolved.sourceUserSeq as number,
         logicalToolCallId: resolved.logicalToolCallId,
         proposal,
-        requirementId: frame.input.requirement_id,
-        universeItemId: frame.input.universe_item_id,
-        universeSelector: normalizedSelector(frame.input.universe_selector),
-        ...(frame.input.seal_amendment
+        requirementId: cardinalityBoundInput.requirement_id,
+        universeItemId: cardinalityBoundInput.universe_item_id,
+        universeSelector: normalizedSelector(cardinalityBoundInput.universe_selector),
+        ...(cardinalityBoundInput.seal_amendment
           ? {
               sealAmendment: {
-                universeId: frame.input.seal_amendment.universe_id,
-                memberIdPointer: frame.input.seal_amendment.member_id_pointer,
+                universeId: cardinalityBoundInput.seal_amendment.universe_id,
+                memberIdPointer: cardinalityBoundInput.seal_amendment.member_id_pointer,
               },
             }
           : {}),
@@ -1139,9 +1456,8 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
             const sourceCarrier = sourceCarrierAdmission({
               sessionId: resolved.sessionId,
               sourceUserSeq: resolved.sourceUserSeq as number,
+              logicalToolCallId: resolved.logicalToolCallId,
               requirement: sourceRequirement,
-              targetName: resolved.targetName,
-              targetArgs: resolved.targetArgs,
             });
             if (sourceCarrier.status === 'refused') {
               frame.refusalKind = 'work_authority_unavailable';
@@ -1249,9 +1565,8 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       const sourceCarrier = sourceCarrierAdmission({
         sessionId: resolved.sessionId,
         sourceUserSeq: resolved.sourceUserSeq as number,
+        logicalToolCallId: resolved.logicalToolCallId,
         requirement: sourceRequirement,
-        targetName: resolved.targetName,
-        targetArgs: resolved.targetArgs,
       });
       if (sourceCarrier.status === 'refused') {
         frame.refusalKind = 'work_authority_unavailable';
@@ -1310,10 +1625,10 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   const built = tool({
     name: 'work_call',
     description: [
-      'Invoke one business tool under the frozen semantic work contract.',
+      'Invoke one plan-selected local read or business tool under the frozen semantic work contract.',
       frozenAuthority
         ?? (requireHostPlan
-          ? 'This is the proposal-free foreground carrier. Before activation it is valid only as the one second call in the same model frame as a direct plan_task, and only for that plan’s dependency-root read/compute requirement. The host settles, delivers, and activates plan_task before admitting the sibling. It refuses alone before activation. After activation, bind one exact requirement_id normally.'
+          ? 'This is the proposal-free foreground carrier. An exact live read/compute may run alone without creating a graph. One sole, fully specified, dependency-free, cardinality-once local_write or external_write may run alone after exact capability disclosure; the host compiles it through the existing plan_task contract before admitting this call. Compound, dependent, each/set, ambiguous, admin, destructive, and unknown-effect work still requires a model-authored plan. The sanctioned same-frame plan sibling remains limited to a dependency-root read/compute requirement. After activation, bind one exact requirement_id normally.'
           : [
               'If the host already froze a contract, pass proposal:null and bind the exact requirement id. Otherwise the FIRST call provides the complete provider-neutral proposal plus the first requirement binding.',
               'The proposal describes only effects, dependencies, coverage, cardinality and universes—never tool names, providers, services or slugs.',
@@ -1330,9 +1645,10 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       if (!requireHostPlan) return true;
       const context = harnessRunContextStorage.getStore();
       // Visibility is not authority. The host exposes this one compact schema
-      // so the primary model can emit the sanctioned plan+root-read frame;
-      // host-model-frame-policy refuses it alone before activation, and the
-      // execution body still requires the exact durable host plan.
+      // so the primary model can emit the sanctioned sole-action Auto frame or
+      // plan+root-read frame. Visibility grants nothing: frame policy plus the
+      // configured object's opaque disclosure resolver admit only the narrow
+      // former shape, and the execution body still requires a durable plan.
       const exactIdentityPresent = Boolean(
         context?.sessionId
         && Number.isSafeInteger(context.sourceUserSeq)
@@ -1351,7 +1667,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     },
     execute: async (input, runContext, details): Promise<string> => {
       const normalizedInput = requireHostPlan
-        ? { ...(input as Omit<WorkCallInput, 'proposal'>), proposal: null }
+        ? workCallInputFromHostPlan(input as HostPlannedWorkCallInput)
         : input as WorkCallInput;
       const { frame, output } = await invokeResolvedCarrier(
         normalizedInput,
@@ -1472,6 +1788,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     if (!parsed.success) {
       return {
         status: 'refused',
+        recovery: 'repair_arguments',
         output: JSON.stringify({
           error: 'work_contract_invalid',
           dispatch_state: 'not_started',
@@ -1483,7 +1800,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       };
     }
     const normalizedInput = requireHostPlan
-      ? { ...(parsed.data as Omit<WorkCallInput, 'proposal'>), proposal: null }
+      ? workCallInputFromHostPlan(parsed.data as HostPlannedWorkCallInput)
       : parsed.data as WorkCallInput;
 
     try {
@@ -1557,7 +1874,13 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
             frame: invoked.frame,
             reason: 'work_call_preparation_refused',
           });
-          return { status: 'refused', output: renderPreparationRefusal(invoked.output) };
+          return {
+            status: 'refused',
+            recovery: repairableWorkInvocationShape(invoked.frame.refusalKind)
+              ? 'repair_arguments'
+              : 'stop_and_explain',
+            output: renderPreparationRefusal(invoked.output),
+          };
         }
 
         const logicalState = logicalCallAuthorityState({
@@ -1620,6 +1943,18 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   };
 
   registerHostWorkCallPreparer(built as object, prepareForHostConsent);
+  if (hostPlanningReadCapabilityResolver) {
+    registerHostPlanningReadCapabilityResolver(
+      built as object,
+      hostPlanningReadCapabilityResolver,
+    );
+  }
+  if (hostSingleActionPlanCapabilityResolver) {
+    registerHostSingleActionPlanCapabilityResolver(
+      built as object,
+      hostSingleActionPlanCapabilityResolver,
+    );
+  }
   return requireHostPlan
     ? markHostPlanRequiredWorkCall(built as object) as Tool<RuntimeContextValue>
     : built;

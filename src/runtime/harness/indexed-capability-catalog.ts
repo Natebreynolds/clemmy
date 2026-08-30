@@ -15,11 +15,51 @@ import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-seman
 import {
   peekCatalogSnapshotForSource,
   peekHostCapabilityCatalogFactory,
+  canonicalCatalogIdentityOf,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
-import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
+import {
+  provenCapabilityEntriesForTurn,
+  resolveTurnCapabilities,
+  type CapabilityResolutionEntry,
+} from './capability-resolution.js';
+import {
+  peekCapabilityManifestStore,
+  type CapabilityManifestStore,
+  type InstalledCapabilityManifest,
+} from './capability-manifest-store.js';
+import { peekProductionCapabilityAdapter } from './production-capability-adapter.js';
+import {
+  capabilityManifestDigest,
+  currentCapabilityManifest,
+  type CapabilityManifestV1,
+} from './capability-manifest.js';
+import { canonicalVerifiedReadReceipt } from '../read-path/verified-read-origin-authority.js';
+import {
+  peekConnectedToolkits,
+  selectToolkitConnection,
+} from '../../integrations/composio/client.js';
+import {
+  resolveCanonicalVerifiedWriteCapabilities,
+  type CanonicalVerifiedWriteCapability,
+} from './verified-write-capability-learning.js';
+import type { AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
+import type { VerifiedWriteCapabilityRecordV1 } from '../../memory/verified-write-capability-store.js';
 
 const INDEX_SHORTLIST = 24;
+
+type VerifiedWriteResolver = (
+  objective: string,
+) => Promise<CanonicalVerifiedWriteCapability[]>;
+let verifiedWriteResolver: VerifiedWriteResolver = resolveCanonicalVerifiedWriteCapabilities;
+
+/** Isolated-test seam for the planning materializer. Production always uses
+ * the canonical receipt/binding/terminal verifier above this seam. */
+export function _setVerifiedWriteResolverForTests(
+  resolver: VerifiedWriteResolver | null,
+): void {
+  verifiedWriteResolver = resolver ?? resolveCanonicalVerifiedWriteCapabilities;
+}
 
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -86,17 +126,225 @@ function catalogEntryIsAttested(entry: RegisteredHostCapability): boolean {
   );
 }
 
+function proofKindMatchesCarrier(
+  kind: string,
+  carrierKind: CapabilityOperationHit['carrierKind'],
+): boolean {
+  return (kind === 'composio' && carrierKind === 'composio')
+    || (kind === 'mcp' && carrierKind === 'mcp')
+    || (kind === 'cli' && carrierKind === 'cli');
+}
+
+function proofKindMatchesProvider(kind: string, providerKind: string): boolean {
+  return (kind === 'composio' && providerKind === 'composio')
+    || (kind === 'mcp' && providerKind === 'native_mcp')
+    || (kind === 'cli' && providerKind === 'reviewed_cli');
+}
+
+function proofEffectMatchesManifest(
+  effectClass: string | undefined,
+  effect: CapabilityManifestV1['effect'],
+): boolean {
+  if (effectClass === 'read') {
+    return effect === 'read' || effect === 'compute' || effect === 'host_only';
+  }
+  if (effectClass === 'write') {
+    return effect === 'local_write' || effect === 'external_write' || effect === 'admin';
+  }
+  return false;
+}
+
+function normalized(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? '';
+}
+
+function currentComposioAccountForProof(proof: CapabilityResolutionEntry): string | null {
+  let connections: ReturnType<typeof peekConnectedToolkits>;
+  try {
+    connections = peekConnectedToolkits();
+  } catch {
+    return null;
+  }
+  if (connections.length === 0) return null;
+  const hint = proof.accountIdentity?.trim() ?? '';
+  if (hint) {
+    // Foreground discovery records the current connection id; learned memory
+    // records a stable mailbox identity. Accept either only through the same
+    // pure current-snapshot selector used at foreground planning.
+    const exactConnection = connections.filter((candidate) => candidate.connectionId === hint);
+    if (exactConnection.length > 0) {
+      const exact = selectToolkitConnection(proof.identifier, exactConnection);
+      if (exact.kind === 'resolved' && exact.connectionId === hint) return hint;
+      return null;
+    }
+  }
+  const selected = selectToolkitConnection(
+    proof.identifier,
+    connections,
+    hint || undefined,
+  );
+  return selected.kind === 'resolved' ? selected.connectionId : null;
+}
+
+function currentAccountForProof(proof: CapabilityResolutionEntry): string | null | undefined {
+  if (proof.kind === 'composio') return currentComposioAccountForProof(proof);
+  const account = proof.accountIdentity?.trim() ?? '';
+  return account && account !== 'runtime' ? account : undefined;
+}
+
+function currentManifestsForProof(
+  store: CapabilityManifestStore,
+  proof: CapabilityResolutionEntry,
+): InstalledCapabilityManifest[] {
+  const base = store.list().filter((installed) => {
+    const manifest = currentCapabilityManifest(installed.manifest);
+    return Boolean(
+      manifest
+      && normalized(manifest.operationId) === normalized(proof.identifier)
+      && proofKindMatchesProvider(proof.kind, manifest.providerKind)
+      && proofEffectMatchesManifest(proof.effectClass, manifest.effect),
+    );
+  });
+  const proofAccount = proof.accountIdentity?.trim() ?? '';
+  // A foreground host resolution may already carry the exact current account
+  // id. That is an identity match, not a memory alias, and needs no second
+  // connection lookup merely to read an already-revalidated catalog row.
+  if (proofAccount) {
+    const exact = base.filter((installed) => installed.manifest.accountId === proofAccount);
+    if (exact.length > 0) return exact;
+  }
+  const currentAccount = currentAccountForProof(proof);
+  if (proof.kind === 'composio' && currentAccount === null) {
+    // Connected-goal proof predates account-aware foreground disclosure. It
+    // may select a single already-installed current account, never choose
+    // among several accounts by store order.
+    return proofAccount ? [] : base;
+  }
+  return currentAccount === undefined
+    ? base
+    : base.filter((installed) => installed.manifest.accountId === currentAccount);
+}
+
+/** A learned mutation identity never gets provider/name heuristics. It may
+ * nominate only an already-installed manifest whose four routing dimensions
+ * and content-addressed capability id are byte-for-byte current. */
+export function currentManifestsForVerifiedWrite(
+  store: CapabilityManifestStore,
+  learned: VerifiedWriteCapabilityRecordV1,
+): InstalledCapabilityManifest[] {
+  if (learned.bindingKind !== 'catalog_manifest') return [];
+  return store.list().filter((installed) => {
+    const manifest = currentCapabilityManifest(installed.manifest);
+    return Boolean(
+      manifest
+      && manifest.manifestId === learned.capabilityRef
+      && manifest.providerKind === learned.providerKind
+      && manifest.operationId === learned.operationId
+      && manifest.effect === learned.effect
+      && manifest.accountId === learned.accountIdentity,
+    );
+  });
+}
+
+function indexDoesNotContradictProof(
+  proof: CapabilityResolutionEntry,
+  hits: readonly CapabilityOperationHit[],
+): boolean {
+  const account = proof.accountIdentity?.trim() ?? '';
+  const exact = hits.filter((hit) => (
+    normalized(hit.identifier) === normalized(proof.identifier)
+    && proofKindMatchesCarrier(proof.kind, hit.carrierKind)
+    && (!hit.accountIdentity || !account || hit.accountIdentity === account)
+  ));
+  // The index is nomination-only, so absence and inferred classifications do
+  // not veto a receipt-backed proof. A provider-declared/host-curated opposite
+  // effect is real drift, however, and must prevent automatic supply.
+  return !exact.some((hit) => (
+    (hit.effectProvenance === 'declared' || hit.effectProvenance === 'curated')
+    && (hit.effectClass === 'read' || hit.effectClass === 'write')
+    && hit.effectClass !== proof.effectClass
+  ));
+}
+
+function canonicalLearnedProofs(input: {
+  sessionId: string;
+  objective: string;
+}): CapabilityResolutionEntry[] {
+  let entries: readonly CapabilityResolutionEntry[] = [];
+  try {
+    entries = resolveTurnCapabilities(input.objective, { sessionId: input.sessionId }).entries;
+  } catch {
+    return [];
+  }
+  return entries.flatMap((proof) => {
+    if (
+      proof.status !== 'proven'
+      || proof.connection === 'missing'
+      || (proof.effectClass !== 'read' && proof.effectClass !== 'unknown')
+      || !proof.verifiedReadOrigin
+    ) return [];
+    const receipt = canonicalVerifiedReadReceipt({
+      origin: proof.verifiedReadOrigin,
+      identifier: proof.identifier,
+      ...(proof.accountIdentity ? { accountIdentity: proof.accountIdentity } : {}),
+    });
+    if (!receipt) return [];
+    const receiptAccount = receipt.scope?.accountIdentity?.trim() ?? '';
+    return [{
+      ...proof,
+      // The canonical receipt—not lexical naming or the connect-time index—
+      // proves this was a settled read. Reviewed CLI inventory intentionally
+      // carries `unknown`, so requiring lexical read classification here would
+      // make a real receipt-backed CLI success impossible to supply.
+      effectClass: 'read' as const,
+      // Some legacy choice rows omitted non-email MCP/CLI account identities.
+      // The canonical receipt is the stronger source and restores that exact
+      // binding for current-manifest matching; it never comes from prose.
+      ...(receiptAccount ? { accountIdentity: receiptAccount } : {}),
+    }];
+  });
+}
+
+function catalogEntryMatchesInstalledManifest(
+  entry: RegisteredHostCapability,
+  installed: InstalledCapabilityManifest,
+): boolean {
+  const manifest = currentCapabilityManifest(installed.manifest);
+  const identity = canonicalCatalogIdentityOf(entry);
+  if (!manifest || !identity) return false;
+  try {
+    return installed.digest === capabilityManifestDigest(manifest)
+      && entry.manifest !== undefined
+      && capabilityManifestDigest(entry.manifest) === installed.digest
+      && identity.capabilityId === manifest.manifestId
+      && identity.manifestId === manifest.manifestId
+      && identity.manifestDigest === installed.digest
+      && identity.operationId === manifest.operationId
+      && identity.schemaVersion === manifest.operationVersion
+      && identity.schemaDigest === manifest.definitionFingerprint
+      && identity.liveFingerprint === manifest.definitionFingerprint
+      && identity.providerKind === manifest.providerKind
+      && identity.providerVersion === manifest.providerVersion
+      && identity.account === manifest.accountId
+      && identity.effect === manifest.effect
+      && identity.invokePortId === manifest.invokePortId
+      && (identity.reconcilePortId ?? '') === (manifest.reconcilePortId ?? '')
+      && identity.argumentCompiler.id === manifest.argumentCompiler.id
+      && identity.argumentCompiler.version === manifest.argumentCompiler.version;
+  } catch {
+    return false;
+  }
+}
+
 export function catalogEntriesForAcceptedSource(input: {
   sessionId: string;
   sourceUserSeq: number;
   objective?: string;
 }): RegisteredHostCapability[] {
   void input.objective;
-  const selectedIds = new Set(
-    provenCapabilityEntriesForTurn(input)
-      .filter((entry) => entry.kind === 'composio' || entry.kind === 'cli' || entry.kind === 'mcp')
-      .map((entry) => capabilityIdOf(entry.identifier)),
-  );
+  const proofs = provenCapabilityEntriesForTurn(input)
+    .filter((entry) => entry.kind === 'composio' || entry.kind === 'cli' || entry.kind === 'mcp');
+  const selectedIds = new Set(proofs.map((entry) => capabilityIdOf(entry.identifier)));
   // PEEK, never persist: this runs from pre-model preparation (deterministic
   // compile, bind enumeration) BEFORE foreground tool_search can disclose
   // anything. Persisting here durably froze an empty snapshot that every
@@ -109,19 +357,135 @@ export function catalogEntriesForAcceptedSource(input: {
   const snapshot = frozen.ok
     ? [...frozen.entries]
     : (peekHostCapabilityCatalogFactory()?.snapshot() ?? []);
+  // Production carrier IDs need not use the legacy cap:resolved convention
+  // (native MCP is content-addressed; reviewed CLI may be versioned). Extend
+  // the current-source selection only when one exact attested live row matches
+  // operation/provider/effect/account. Ambiguity never falls back to order.
+  for (const proof of proofs) {
+    const candidates = snapshot.filter((entry) => {
+      const manifest = entry.manifest;
+      const proofAccount = proof.accountIdentity?.trim() ?? '';
+      return Boolean(
+        manifest
+        && normalized(manifest.operationId) === normalized(proof.identifier)
+        && proofKindMatchesProvider(proof.kind, manifest.providerKind)
+        && proofEffectMatchesManifest(proof.effectClass, manifest.effect)
+        && (!proofAccount || proofAccount === 'runtime' || manifest.accountId === proofAccount),
+      );
+    });
+    if (candidates.length === 1) selectedIds.add(candidates[0]!.capabilityId);
+  }
   return snapshot.filter((entry) => {
     if (entry.effect === 'host_only') return catalogEntryIsAttested(entry);
     return catalogEntryIsAttested(entry) && selectedIds.has(entry.capabilityId);
   });
 }
 
-/** Index retrieval only. Never installs manifests or observations. */
+/**
+ * Rehydrate a request-relevant capability that this host already proved.
+ *
+ * A current request re-resolves durable Tool Memory and accepts only a
+ * canonical verified-read receipt. Neither that receipt nor the optional
+ * connect-time index may create a manifest, port, observation, or catalog row.
+ * The receipt nominates an operation; the provider-neutral production adapter
+ * may then reopen exactly one already-installed current manifest and its
+ * independently observed port. That turns in-memory catalog membership back
+ * into a cache instead of making every new turn rediscover a capability that
+ * already succeeded. Index rows remain ranking/contradiction evidence only.
+ *
+ * Returned `registered` ids are current live catalog identities. They can
+ * enter the planning card, but remain planning supply: selected plan
+ * admission still revalidates account/schema/effect before freezing any
+ * executable authority.
+ */
 export async function registerIndexedCapabilitiesForTurn(input: {
   sessionId: string;
   sourceUserSeq: number;
   objective: string;
-}): Promise<{ registered: string[]; descriptors: HostCapabilityDescriptorV1[] }> {
-  void input.sessionId;
-  void input.sourceUserSeq;
-  return { registered: [], descriptors: hostDescriptorsFromCapabilityIndex(input.objective) };
+}): Promise<{
+  registered: string[];
+  descriptors: HostCapabilityDescriptorV1[];
+  localDefinitions: AuthorizedLocalPlanningDefinitionV1[];
+}> {
+  // Keep unknown-effect rows as nominations (real reviewed-CLI inventory is
+  // intentionally unknown). Only known-effect rows become advisory semantic
+  // descriptors; neither form contributes execution authority.
+  const indexed = searchCapabilityOperations(input.objective, { limit: INDEX_SHORTLIST });
+  const descriptors = indexed
+    .filter((hit) => hit.effectClass === 'read' || hit.effectClass === 'write')
+    .map(descriptorFromHit);
+  const learnedWrites = await verifiedWriteResolver(input.objective);
+  const localByRef = new Map<string, AuthorizedLocalPlanningDefinitionV1>();
+  const ambiguousLocalRefs = new Set<string>();
+  for (const candidate of learnedWrites) {
+    if (candidate.record.bindingKind !== 'local_envelope' || !candidate.currentLocalDefinition) continue;
+    const ref = candidate.currentLocalDefinition.capabilityRef;
+    if (ambiguousLocalRefs.has(ref)) continue;
+    const prior = localByRef.get(ref);
+    if (
+      prior
+      && JSON.stringify(prior) !== JSON.stringify(candidate.currentLocalDefinition)
+    ) {
+      // Two historical rows cannot choose among conflicting current local
+      // identities. This is an abstention, never store-order selection.
+      localByRef.delete(ref);
+      ambiguousLocalRefs.add(ref);
+      continue;
+    }
+    localByRef.set(ref, candidate.currentLocalDefinition);
+  }
+  const localDefinitions = [...localByRef.values()];
+  const store = peekCapabilityManifestStore();
+  const adapter = peekProductionCapabilityAdapter();
+  const factory = peekHostCapabilityCatalogFactory();
+  if (!store || !adapter || !factory) {
+    return { registered: [], descriptors, localDefinitions };
+  }
+
+  const selected = new Map<string, InstalledCapabilityManifest>();
+  for (const proof of canonicalLearnedProofs(input)) {
+    if (!indexDoesNotContradictProof(proof, indexed)) continue;
+    const matches = currentManifestsForProof(store, proof);
+    // One learned operation may have several current versions/accounts. Memory
+    // never chooses by insertion order; explicit lifecycle/account resolution
+    // must reduce it to one exact manifest or the turn falls back to discovery.
+    if (matches.length !== 1) continue;
+    selected.set(matches[0]!.manifest.manifestId, matches[0]!);
+  }
+  for (const learned of learnedWrites) {
+    const matches = currentManifestsForVerifiedWrite(store, learned.record);
+    // Account/effect/provider/version ambiguity can only send the turn back to
+    // foreground discovery. A historical success never picks by row order.
+    if (matches.length !== 1) continue;
+    selected.set(matches[0]!.manifest.manifestId, matches[0]!);
+  }
+  const manifestIds = new Set(selected.keys());
+  if (manifestIds.size === 0) return { registered: [], descriptors, localDefinitions };
+
+  // Scoped refresh is essential: a turn nominated these exact manifests, so
+  // unrelated stale catalog entries cannot be forgotten as collateral work.
+  // Forget the selected cache rows first: the adapter's normal hot path may
+  // reuse a still-callable row after a fresh observation, but cross-turn supply
+  // must prove the catalog identity itself was rebuilt from the installed
+  // manifest rather than accepting stale account/schema/port bytes.
+  for (const manifestId of manifestIds) factory.forget(manifestId);
+  let refreshed: ReturnType<typeof adapter.refresh>;
+  try {
+    refreshed = adapter.refresh(manifestIds);
+  } catch {
+    return { registered: [], descriptors, localDefinitions };
+  }
+  const refused = new Set(refreshed.refused.map((entry) => entry.manifestId));
+  const registered = [...manifestIds].filter((manifestId) => {
+    const current = factory.get(manifestId);
+    const installed = selected.get(manifestId);
+    return Boolean(
+      !refused.has(manifestId)
+      && current
+      && installed
+      && catalogEntryIsAttested(current)
+      && catalogEntryMatchesInstalledManifest(current, installed),
+    );
+  });
+  return { registered, descriptors, localDefinitions };
 }

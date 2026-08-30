@@ -428,7 +428,8 @@ const XAI_BASE_URL = 'https://api.x.ai/v1';
 import { resolveRoleModel, readDurableBindings, pinSessionBrain, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
 import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { connectedModelGroups, connectedModelGroupsForRole, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
+import { modelRoleOptionCatalogSnapshot, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
+import { CodexRescueSettingsError, persistCodexRescueModel } from '../runtime/harness/codex-rescue-settings.js';
 import { modelDiscoveryStatus } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
 import { getClaudeUsageSnapshot } from '../runtime/harness/claude-usage.js';
@@ -7765,6 +7766,10 @@ export function registerConsoleRoutes(
       // metadata + dashboard surfaces it as a connected integration.
       const { autoPromoteInstalledClis } = await import('../integrations/cli-catalog/catalog.js');
       const promotion = autoPromoteInstalledClis();
+      const { reconcileCatalogReviewedCliReads } = await import(
+        '../runtime/harness/catalog-reviewed-cli-reconcile.js'
+      );
+      void reconcileCatalogReviewedCliReads().catch(() => { /* next poll retries */ });
       // Auth health: persisted last-known state only (never a blocking
       // probe in the request path) + a fire-and-forget refresh kick so
       // the pills converge on reality within one poll cycle.
@@ -8087,7 +8092,9 @@ export function registerConsoleRoutes(
   // Role→model registry snapshot for the Models panel: the resolved model +
   // source for each role, the durable bindings, and the available models grouped
   // by CONNECTED provider (so the pickers only offer what you're logged into).
-  const buildModelRolesSnapshot = () => {
+  const buildModelRolesSnapshot = (
+    catalog = modelRoleOptionCatalogSnapshot(),
+  ) => {
     return {
       roles: {
         brain: resolveRoleModel('brain'),
@@ -8095,12 +8102,9 @@ export function registerConsoleRoutes(
         judge: resolveRoleModel('judge'),
       },
       bindings: readDurableBindings(),
-      available: connectedModelGroups(),
-      roleOptions: {
-        worker: connectedModelGroupsForRole('worker'),
-        judge: connectedModelGroupsForRole('judge'),
-      },
-      brainOptions: brainOptions(),
+      available: catalog.available,
+      roleOptions: catalog.roleOptions,
+      brainOptions: catalog.brainOptions,
       effectiveBrain: effectiveBrain(),
       effectiveBrainValue: effectiveBrainValue(),
       activeBrain: getActiveAuthMode(),
@@ -8115,7 +8119,7 @@ export function registerConsoleRoutes(
       const proactivity = getProactivityPolicySnapshot();
       const auth = getAuthStatus();
       const memory = readMemoryIndexStatus();
-      const models = getModelSettingsSnapshot();
+      const models = getModelSettingsSnapshot(resolveProvider);
       const runtimeBudget = getHarnessBudgetSnapshot();
       const byo = getByoBackendConfig();
       const modelBackend = {
@@ -8138,7 +8142,8 @@ export function registerConsoleRoutes(
         active: debateMode() !== 'off' && ((fusionBrains.claude && fusionBrains.codex) || verifyJudgeAvailable()),
         health: getFusionHealthSnapshot(),
       };
-      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: getByoProviderSnapshots(), claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(), judgeMetrics: getJudgeMetricsSnapshot(), developerMode: isDevModeEnabled() });
+      const modelOptionCatalog = modelRoleOptionCatalogSnapshot();
+      res.json({ profile, proactivity, auth, memory, models, runtimeBudget, modelBackend, modelProviders: modelOptionCatalog.providerSnapshots, claudeAuth: getClaudeAuthSnapshot(), activeBrain: getActiveAuthMode(), fusion, modelRoles: buildModelRolesSnapshot(modelOptionCatalog), judgeMetrics: getJudgeMetricsSnapshot(), developerMode: isDevModeEnabled() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -8447,9 +8452,29 @@ export function registerConsoleRoutes(
         updateEnvKey(MODEL_ENV_KEYS[tier], next);
       }
       clearAutonomyAgentCache();
-      res.json({ models: getModelSettingsSnapshot() });
+      res.json({ models: getModelSettingsSnapshot(resolveProvider) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Explicit last-resort Codex lane for all-in BYO brains. This is deliberately
+  // independent of OPENAI_MODEL_PRIMARY: all-in routing may point that tier at
+  // GLM (or the operator may simply want a cheaper rescue model). Clearing the
+  // setting preserves the historical "follow primary" behavior.
+  app.patch('/api/console/settings/models/codex-rescue', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { modelId?: unknown; clear?: unknown };
+      const rawModelId = typeof body.modelId === 'string' ? body.modelId.trim() : '';
+      const clear = body.clear === true || rawModelId === '';
+      persistCodexRescueModel(clear ? null : rawModelId);
+      resetHarnessRuntimeConfig();
+      clearAutonomyAgentCache();
+      res.json({ models: getModelSettingsSnapshot(resolveProvider) });
+    } catch (err) {
+      const status = err instanceof CodexRescueSettingsError ? 400 : 500;
+      res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -8541,7 +8566,7 @@ export function registerConsoleRoutes(
           hasKey: Boolean(byo.apiKey),
           configured: byo.configured,
         },
-        models: getModelSettingsSnapshot(),
+        models: getModelSettingsSnapshot(resolveProvider),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

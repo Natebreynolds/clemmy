@@ -29,6 +29,28 @@ export interface RawResultHandleFacts {
   cursor: string | null;
 }
 
+/**
+ * Read-only value used to verify a workflow's authored evidence paths.
+ *
+ * The raw provider result remains the durable settlement/result-handle value.
+ * This projection only names the one payload owner whose fields the workflow
+ * may cite: an ordinary root result, or one exact MCP result member.
+ */
+export type ProviderResultEvidenceViewV1 =
+  | {
+      version: 1;
+      kind: 'provider_payload';
+      owner: 'root' | 'sealed_invoke_result' | 'mcp_structured_content' | 'mcp_text_json';
+      payload: unknown;
+    }
+  | {
+      version: 1;
+      kind: 'no_evidence';
+      owner: 'mcp' | 'sealed_invoke';
+      reason: 'mcp_result_error' | 'mcp_payload_missing' | 'mcp_envelope_malformed'
+        | 'sealed_invoke_payload_missing' | 'sealed_invoke_envelope_malformed';
+    };
+
 export const LEGACY_ENVELOPE_LOG_ID_MAX_BYTES = 512;
 
 export type StoredEnvelopeMetadataReconciliation =
@@ -206,6 +228,245 @@ function validateMetadataValue(value: unknown, stack = new Set<object>(), depth 
   } finally {
     stack.delete(object);
   }
+}
+
+const EXACT_MCP_RESULT_KEYS = new Set([
+  'content', 'structuredContent', 'isError', '_meta',
+]);
+const MCP_CONTENT_BLOCK_TYPES = new Set([
+  'text', 'image', 'audio', 'resource', 'resource_link',
+]);
+const MCP_TEXT_JSON_MAX_BYTES = 8_000_000;
+
+interface ExactMcpResultPayload {
+  payload: unknown | null;
+  pathPrefix: string | null;
+  isError: boolean;
+  malformed: boolean;
+}
+
+function validMcpContentBlock(value: unknown): boolean {
+  const block = asRecord(value);
+  if (!block || !validateMetadataValue(block)) return false;
+  switch (block.type) {
+    case 'text':
+      return typeof block.text === 'string';
+    case 'image':
+    case 'audio':
+      return typeof block.data === 'string' && typeof block.mimeType === 'string';
+    case 'resource':
+      return asRecord(block.resource) !== null;
+    case 'resource_link':
+      return typeof block.uri === 'string' && typeof block.name === 'string';
+    default:
+      return false;
+  }
+}
+
+function parseMcpTextPayload(value: unknown): unknown | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (
+    Buffer.byteLength(trimmed, 'utf8') > MCP_TEXT_JSON_MAX_BYTES
+    || !((trimmed.startsWith('{') && trimmed.endsWith('}'))
+      || (trimmed.startsWith('[') && trimmed.endsWith(']')))
+  ) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return (asRecord(parsed) || Array.isArray(parsed)) && validateMetadataValue(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactJsonValueMatches(left: unknown, right: unknown): boolean {
+  return canonicalEnvelopeMetadata(left) === canonicalEnvelopeMetadata(right);
+}
+
+/**
+ * Select one business-payload owner from the exact MCP tools/call envelope.
+ *
+ * `structuredContent` is authoritative when present. The text JSON member is
+ * only its compatibility copy (or the fallback when structured content is
+ * absent), never a second result set. A malformed structured member cannot be
+ * laundered through a valid-looking text fallback, and two current members
+ * that disagree yield no provider facts.
+ */
+function exactDirectMcpResultPayload(value: unknown): ExactMcpResultPayload | null {
+  const envelope = asRecord(value);
+  if (
+    !envelope
+    || !Array.isArray(envelope.content)
+    || Object.keys(envelope).some((key) => !EXACT_MCP_RESULT_KEYS.has(key))
+  ) return null;
+
+  const ownsIsError = Object.prototype.hasOwnProperty.call(envelope, 'isError');
+  const contentIsValid = envelope.content.every(validMcpContentBlock);
+  const isErrorIsValid = !ownsIsError || typeof envelope.isError === 'boolean';
+  const textPayloads = envelope.content.flatMap((block, index) => {
+    const record = asRecord(block);
+    if (record?.type !== 'text') return [];
+    const payload = parseMcpTextPayload(record.text);
+    return payload === null ? [] : [{ payload, index }];
+  });
+  const textPayloadsAgree = textPayloads.every((candidate) => (
+    exactJsonValueMatches(candidate.payload, textPayloads[0]?.payload)
+  ));
+  const ownsStructured = Object.prototype.hasOwnProperty.call(envelope, 'structuredContent');
+  if (ownsStructured) {
+    const structured = asRecord(envelope.structuredContent);
+    const structuredIsValid = structured !== null && validateMetadataValue(structured);
+    const textAgrees = textPayloads.every((candidate) => (
+      structured !== null && exactJsonValueMatches(candidate.payload, structured)
+    ));
+    return {
+      payload: structuredIsValid && textPayloadsAgree && textAgrees ? structured : null,
+      pathPrefix: structuredIsValid && textPayloadsAgree && textAgrees
+        ? 'structuredContent'
+        : null,
+      isError: envelope.isError === true,
+      malformed: !contentIsValid || !isErrorIsValid
+        || !structuredIsValid || !textPayloadsAgree || !textAgrees,
+    };
+  }
+
+  const fallback = textPayloadsAgree ? textPayloads[0] : undefined;
+  return {
+    payload: fallback?.payload ?? null,
+    pathPrefix: fallback ? `content.${fallback.index}.text` : null,
+    isError: envelope.isError === true,
+    malformed: !contentIsValid || !isErrorIsValid || !textPayloadsAgree,
+  };
+}
+
+function claimsMcpResultEnvelope(value: unknown): boolean {
+  const envelope = asRecord(value);
+  if (!envelope) return false;
+  if (['structuredContent', 'isError', '_meta'].some((key) => (
+    Object.prototype.hasOwnProperty.call(envelope, key)
+  ))) return true;
+  if (!Object.prototype.hasOwnProperty.call(envelope, 'content')) return false;
+  const keys = Object.keys(envelope);
+  if (keys.every((key) => EXACT_MCP_RESULT_KEYS.has(key))) return true;
+  return Array.isArray(envelope.content) && envelope.content.some((entry) => {
+    const block = asRecord(entry);
+    return block !== null
+      && typeof block.type === 'string'
+      && MCP_CONTENT_BLOCK_TYPES.has(block.type);
+  });
+}
+
+type ExactSealedInvokeResult =
+  | { status: 'absent' }
+  | { status: 'malformed' }
+  | { status: 'valid'; payload: unknown };
+
+function exactSealedInvokeResult(value: unknown): ExactSealedInvokeResult {
+  const envelope = asRecord(value);
+  if (!envelope) return { status: 'absent' };
+  const ownsResult = Object.prototype.hasOwnProperty.call(envelope, 'result');
+  const ownsComplete = Object.prototype.hasOwnProperty.call(envelope, 'complete');
+  if (!ownsResult || !ownsComplete) return { status: 'absent' };
+  if (
+    envelope.complete !== true
+    || Object.keys(envelope).length !== 2
+  ) return { status: 'malformed' };
+  return { status: 'valid', payload: envelope.result };
+}
+
+function exactMcpResultPayload(value: unknown): ExactMcpResultPayload | null {
+  const sealed = exactSealedInvokeResult(value);
+  if (sealed.status === 'malformed') {
+    return { payload: null, pathPrefix: null, isError: false, malformed: true };
+  }
+  const candidate = sealed.status === 'valid' ? sealed.payload : value;
+  const direct = exactDirectMcpResultPayload(candidate);
+  if (direct) {
+    return {
+      ...direct,
+      pathPrefix: direct.pathPrefix && sealed.status === 'valid'
+        ? `result.${direct.pathPrefix}`
+        : direct.pathPrefix,
+    };
+  }
+  if (claimsMcpResultEnvelope(candidate)) {
+    return { payload: null, pathPrefix: null, isError: false, malformed: true };
+  }
+  return null;
+}
+
+/**
+ * Project the provider-neutral value against which workflow evidence paths are
+ * checked. Exact MCP ownership follows the same selector as result handles:
+ * valid structuredContent is authoritative, identical JSON text is only a
+ * compatibility copy/fallback, and malformed or conflicting envelopes cite
+ * no evidence. Ordinary non-MCP results are returned unchanged at the root.
+ */
+export function projectProviderResultEvidenceView(
+  result: unknown,
+): ProviderResultEvidenceViewV1 {
+  const sealed = exactSealedInvokeResult(result);
+  if (sealed.status === 'malformed') {
+    return {
+      version: 1,
+      kind: 'no_evidence',
+      owner: 'sealed_invoke',
+      reason: 'sealed_invoke_envelope_malformed',
+    };
+  }
+  if (sealed.status === 'valid' && sealed.payload === undefined) {
+    return {
+      version: 1,
+      kind: 'no_evidence',
+      owner: 'sealed_invoke',
+      reason: 'sealed_invoke_payload_missing',
+    };
+  }
+  const candidate = sealed.status === 'valid' ? sealed.payload : result;
+  const mcp = exactMcpResultPayload(result);
+  if (mcp) {
+    if (mcp.isError) {
+      return { version: 1, kind: 'no_evidence', owner: 'mcp', reason: 'mcp_result_error' };
+    }
+    if (mcp.malformed) {
+      return { version: 1, kind: 'no_evidence', owner: 'mcp', reason: 'mcp_envelope_malformed' };
+    }
+    if (mcp.payload === null || mcp.pathPrefix === null) {
+      return { version: 1, kind: 'no_evidence', owner: 'mcp', reason: 'mcp_payload_missing' };
+    }
+    return {
+      version: 1,
+      kind: 'provider_payload',
+      owner: mcp.pathPrefix.endsWith('structuredContent')
+        ? 'mcp_structured_content'
+        : 'mcp_text_json',
+      payload: mcp.payload,
+    };
+  }
+  return {
+    version: 1,
+    kind: 'provider_payload',
+    owner: sealed.status === 'valid' ? 'sealed_invoke_result' : 'root',
+    payload: candidate,
+  };
+}
+
+function prefixedRecordPath(prefix: string | null, path: string | null): string | null {
+  if (path === null) return null;
+  if (!prefix) return path;
+  return path === '' ? prefix : `${prefix}.${path}`;
+}
+
+function recordsAtPlainPath(payload: unknown, recordPath: string): unknown[] | null {
+  const value = recordPath === ''
+    ? payload
+    : recordPath.split('.').reduce<unknown>((current, key) => {
+      const record = asRecord(current);
+      return record ? record[key] : undefined;
+    }, payload);
+  return Array.isArray(value) ? value : null;
 }
 
 function normalizedStructuralKey(key: string): string {
@@ -675,7 +936,9 @@ function discoverRecords(envelope: Record<string, unknown>): RecordDiscovery {
  * become provisional dependency authority. */
 export function resultHasMalformedPagination(result: unknown): boolean {
   try {
-    const envelope = asRecord(result);
+    const mcp = exactMcpResultPayload(result);
+    if (mcp?.malformed) return true;
+    const envelope = asRecord(mcp ? mcp.payload : result);
     if (!envelope) return false;
     const discovery = discoverRecords(envelope);
     return inspectPagination(
@@ -803,24 +1066,44 @@ function boundedProjection(records: unknown[]): unknown[] {
  */
 export function recordsAtRecordPath(payload: unknown, recordPath: string | null): unknown[] | null {
   if (recordPath === null) return null;
-  const value = recordPath === ''
-    ? payload
-    : recordPath.split('.').reduce<unknown>((current, key) => {
-      const record = asRecord(current);
-      return record ? record[key] : undefined;
-    }, payload);
-  return Array.isArray(value) ? value : null;
+  const mcp = exactMcpResultPayload(payload);
+  if (mcp) {
+    if (mcp.malformed || mcp.payload === null || mcp.pathPrefix === null) return null;
+    const relativePath = recordPath === mcp.pathPrefix
+      ? ''
+      : recordPath.startsWith(`${mcp.pathPrefix}.`)
+        ? recordPath.slice(mcp.pathPrefix.length + 1)
+        : null;
+    return relativePath === null ? null : recordsAtPlainPath(mcp.payload, relativePath);
+  }
+  return recordsAtPlainPath(payload, recordPath);
 }
 
 /** Pure host interpretation of raw provider result bytes. */
 export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandleFacts {
   try {
-    const envelope = asRecord(result);
-    if (!envelope) {
-      const records = Array.isArray(result) ? result : [];
+    const mcp = exactMcpResultPayload(result);
+    if (mcp?.malformed) {
       return {
-        success: true,
-        recordPath: Array.isArray(result) ? '' : null,
+        success: false,
+        recordPath: null,
+        recordCount: 0,
+        envelopeMeta: null,
+        completeness: 'unknown',
+        projectedRecords: [],
+        statusCode: null,
+        cursor: null,
+      };
+    }
+    const interpreted = mcp ? mcp.payload : result;
+    const envelope = asRecord(interpreted);
+    if (!envelope) {
+      const records = Array.isArray(interpreted) ? interpreted : [];
+      return {
+        success: mcp?.isError !== true,
+        recordPath: Array.isArray(interpreted)
+          ? prefixedRecordPath(mcp?.pathPrefix ?? null, '')
+          : null,
         recordCount: records.length,
         envelopeMeta: null,
         completeness: 'unknown',
@@ -841,7 +1124,11 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
     );
     const status = statusOf(envelope);
     const successful = envelope.successful ?? envelope.success ?? envelope.ok;
-    const isError = typeof envelope.isError === 'boolean' ? envelope.isError : undefined;
+    const isError = mcp?.isError === true
+      ? true
+      : typeof envelope.isError === 'boolean'
+        ? envelope.isError
+        : undefined;
     const inspection = inspectProviderEnvelope(envelope);
     const errorish = inspection.verdict === 'contradicted'
       || (typeof status === 'number' && status >= 400);
@@ -856,7 +1143,7 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
 
     return {
       success,
-      recordPath: found?.path ?? null,
+      recordPath: prefixedRecordPath(mcp?.pathPrefix ?? null, found?.path ?? null),
       recordCount: found?.records.length ?? 0,
       envelopeMeta: meta.value,
       completeness: !success || meta.malformed || pagination.malformed

@@ -24,12 +24,12 @@ const {
   createBackgroundTask,
   getBackgroundTask,
   processBackgroundTasks,
+  _setBackgroundResponseExecutorForTests,
 } = await import('./background-tasks.js');
 const { getRun } = await import('../runtime/run-events.js');
-const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 
 test.after(() => {
-  _setBridgeImplsForTests({});
+  _setBackgroundResponseExecutorForTests(null);
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
@@ -44,9 +44,8 @@ test('Claude unverified terminal parks blocked without minting user-input or app
   let claudeBrainCalls = 0;
   let legacyCalls = 0;
 
-  _setBridgeImplsForTests({
-    configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async (_surface: string, request: { sessionId: string }) => {
+  _setBackgroundResponseExecutorForTests(
+    async (_assistant, request: { sessionId: string }) => {
       claudeBrainCalls += 1;
       return {
         text: terminalText,
@@ -57,8 +56,8 @@ test('Claude unverified terminal parks blocked without minting user-input or app
           model: 'claude-opus-4-8',
         },
       };
-    }) as never,
-  });
+    },
+  );
 
   const processed = await processBackgroundTasks({
     getRuntime() { return {} as never; },

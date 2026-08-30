@@ -34,6 +34,7 @@ const {
 const eventlog = await import('../runtime/harness/eventlog.js');
 const observations = await import('../runtime/harness/independent-capability-observation.js');
 const ports = await import('../runtime/harness/production-capability-ports.js');
+const resultFacts = await import('../runtime/harness/result-facts.js');
 import type { WorkflowNodeReadExecutionIdentityV1 } from './workflow-node-invocation-executor.js';
 import type {
   WorkflowNodeArgumentBindingV1,
@@ -694,6 +695,102 @@ test('one exact read crosses the immutable port once and replays its durable res
   assert.equal(installed.portBodies(), 1, 'restart replay must not cross the immutable port again');
   assert.equal(installed.catalogBodies(), 0);
   assert.equal(eventlog.openEventLog().pragma('foreign_key_check').length, 0);
+});
+
+test('authored evidence paths use one exact MCP payload owner while durable results retain the envelope', async () => {
+  const payload = { records: [{ id: 'record.mcp-evidence' }] };
+  const cases: Array<{
+    label: string;
+    result: unknown;
+    expectedOwner?: 'root' | 'sealed_invoke_result' | 'mcp_structured_content' | 'mcp_text_json';
+    expectedReason?: 'mcp_envelope_malformed';
+    expectedPhase?: 'kernel' | 'evidence';
+  }> = [{
+    label: 'mcp-structured',
+    result: {
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      structuredContent: structuredClone(payload),
+      isError: false,
+    },
+    expectedOwner: 'mcp_structured_content',
+  }, {
+    label: 'mcp-text-compatibility',
+    result: {
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+    },
+    expectedOwner: 'mcp_text_json',
+  }, {
+    label: 'sealed-invoke-mcp-text',
+    result: {
+      result: { content: [{ type: 'text', text: JSON.stringify(payload) }] },
+      complete: true,
+    },
+    expectedOwner: 'mcp_text_json',
+  }, {
+    label: 'sealed-invoke-root',
+    result: { result: structuredClone(payload), complete: true },
+    expectedOwner: 'sealed_invoke_result',
+  }, {
+    label: 'mcp-conflict',
+    result: {
+      content: [{ type: 'text', text: JSON.stringify({ records: [{ id: 'record.other' }] }) }],
+      structuredContent: structuredClone(payload),
+    },
+    expectedReason: 'mcp_envelope_malformed',
+    expectedPhase: 'kernel',
+  }, {
+    label: 'mcp-malformed',
+    result: {
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      structuredContent: 'not-an-object',
+    },
+    expectedReason: 'mcp_envelope_malformed',
+    expectedPhase: 'kernel',
+  }, {
+    label: 'ordinary-root',
+    result: structuredClone(payload),
+    expectedOwner: 'root',
+  }];
+
+  for (const scenario of cases) {
+    const view = resultFacts.projectProviderResultEvidenceView(scenario.result);
+    if (scenario.expectedOwner) {
+      assert.equal(view.kind, 'provider_payload', scenario.label);
+      if (view.kind === 'provider_payload') {
+        assert.equal(view.owner, scenario.expectedOwner, scenario.label);
+        assert.deepEqual(view.payload, payload, scenario.label);
+      }
+    } else {
+      assert.equal(view.kind, 'no_evidence', scenario.label);
+      if (view.kind === 'no_evidence') assert.equal(view.reason, scenario.expectedReason, scenario.label);
+    }
+
+    const installed = installExecutionFixture({
+      label: scenario.label,
+      invoke: async () => structuredClone(scenario.result),
+    });
+    const exactInput = {
+      ...prepareInput({
+        entry: installed.entry,
+        plan: installed.plan,
+        identity: executionIdentity(installed.plan, scenario.label),
+      }),
+      sessionId: workflowSession(scenario.label),
+    };
+    const executed = await executeWorkflowNodeRead(exactInput);
+    assert.equal(executed.ok, Boolean(scenario.expectedOwner), JSON.stringify(executed));
+    if (executed.ok) {
+      assert.equal(executed.status, 'completed', scenario.label);
+      assert.deepEqual(executed.result, scenario.result, scenario.label);
+    } else {
+      assert.equal(executed.phase, scenario.expectedPhase ?? 'evidence', scenario.label);
+      if (executed.phase === 'evidence') {
+        assert.ok(executed.evidenceReasons?.includes('required_path_missing:records'), scenario.label);
+        assert.deepEqual(executed.result, scenario.result, scenario.label);
+      }
+    }
+    assert.equal(installed.portBodies(), 1, scenario.label);
+  }
 });
 
 test('concurrent reentry never redispatches a claimed body and the winning call still settles', async () => {

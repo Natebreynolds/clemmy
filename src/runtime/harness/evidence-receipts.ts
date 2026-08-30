@@ -52,6 +52,13 @@ import { verifyHostSealedArtifactDerivationForWrite } from './artifact-ledger.js
 import { verifyAtomicContentCommit } from './atomic-content-commit-proof.js';
 import { loadSealedNodeBinding } from './host-capability-catalog-factory.js';
 import { reopenTypedPhysicalAuthorityInTransaction } from './typed-physical-authority-proof.js';
+import {
+  proveFrozenMutationVerification,
+  type VerifiedFrozenMutationVerificationV1,
+} from './mutation-verification-proof.js';
+import { mutationVerificationReceiptId } from './mutation-verification-contract.js';
+import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { parseHostLocalWriteCommitFacts } from './host-local-write-commit.js';
 
 export const EVIDENCE_RECEIPT_EVENT = 'evidence_receipt' as const;
 
@@ -112,6 +119,32 @@ export function digestOf(value: unknown): string {
     return `{${keys.map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(',')}}`;
   };
   return createHash('sha256').update(canonical(value)).digest('hex');
+}
+
+/** A compact receipt identity for an exact, adapter-declared mutation proof.
+ * The proof is re-opened from the existing binding, result and settlement
+ * stores on every redemption; this digest merely makes that complete durable
+ * identity immutable in the existing write-receipt row. */
+function frozenMutationVerificationReceiptId(
+  proof: VerifiedFrozenMutationVerificationV1,
+): string {
+  return mutationVerificationReceiptId(proof);
+}
+
+function frozenMutationVerificationContentDigest(
+  proof: VerifiedFrozenMutationVerificationV1,
+): string | null {
+  return proof.recipe.proof === 'exact_content_v1' && proof.expectedContent
+    ? digestOf(proof.expectedContent)
+    : null;
+}
+
+function frozenProofSupportsReceiptKind(
+  proof: VerifiedFrozenMutationVerificationV1,
+  kind: EvidenceReceiptKind,
+): boolean {
+  if (kind === 'commit' || kind === 'readback') return true;
+  return kind === 'content_commit' && proof.recipe.proof === 'exact_content_v1';
 }
 
 function resolveAtomicSealedNodeAuthority(input: {
@@ -1091,6 +1124,7 @@ export function redeemEvidenceReceipt(
         logicalToolCallId: writeRow.logical_tool_call_id,
         kind: writeRow.kind,
         createdId: writeRow.created_id,
+        handle: writeRow.handle,
         providerReceipt: writeRow.provider_receipt,
         intendedDigest: writeRow.intended_digest,
         observedDigest: writeRow.observed_digest,
@@ -1270,6 +1304,7 @@ function redeemHostWriteReceiptFacts(input: {
   logicalToolCallId: string;
   kind: string;
   createdId: string;
+  handle: string;
   providerReceipt: string;
   intendedDigest: string | null;
   observedDigest: string | null;
@@ -1293,6 +1328,36 @@ function redeemHostWriteReceiptFacts(input: {
   const node = manifestState.ok
     ? manifestState.manifest.nodes.find((entry) => entry.nodeId === input.nodeId)
     : undefined;
+  const frozenVerification = proveFrozenMutationVerification({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    ownerLogicalToolCallId: input.logicalToolCallId,
+  });
+  if (frozenVerification.status === 'unverified') {
+    return { ok: false, reason: `frozen mutation verification no longer redeems: ${frozenVerification.reason}` };
+  }
+  if (frozenVerification.status === 'verified') {
+    const contentDigest = frozenMutationVerificationContentDigest(frozenVerification);
+    const receiptDigest = contentDigest ?? frozenVerification.targetDigest;
+    if (
+      !manifestState.ok
+      || node?.operationId !== frozenVerification.recipe.ownerRequirementId
+      || node.resolvedTool !== created.value.toolName
+      || input.acceptedTaskId !== frozenVerification.recipe.acceptedTaskId
+      || input.createdId !== frozenVerification.resourceId
+      || input.providerReceipt !== frozenMutationVerificationReceiptId(frozenVerification)
+      || input.physicalDispatchId !== frozenVerification.ownerPhysicalDispatchId
+      || input.intendedDigest !== receiptDigest
+      || input.observedDigest !== receiptDigest
+      || !frozenProofSupportsReceiptKind(
+        frozenVerification,
+        input.kind as EvidenceReceiptKind,
+      )
+    ) {
+      return { ok: false, reason: 'frozen mutation verification receipt no longer matches its durable proof facts' };
+    }
+    return { ok: true };
+  }
   if (manifestState.ok && node?.contentCommitMode === 'documented_atomic_input') {
     const atomic = verifyAtomicContentCommit({
       db,
@@ -1352,6 +1417,27 @@ function redeemHostWriteReceiptFacts(input: {
         nodeId: input.nodeId,
       });
       if (!sources.ok) return sources;
+    }
+    return { ok: true };
+  }
+  const localCommit = manifestState.ok
+    && node?.effectKind === 'local_write'
+    && node.resolvedTool === created.value.toolName
+    && created.value.executionSite === 'host'
+    && registeredToolSideEffect(created.value.toolName) === 'write'
+    ? parseHostLocalWriteCommitFacts(created.value.rawPayload)
+    : null;
+  if (localCommit) {
+    if (
+      localCommit.createdId !== input.createdId
+      || localCommit.handle !== input.handle
+      || localCommit.receipt !== input.providerReceipt
+      || localCommit.contentDigest !== input.intendedDigest
+      || localCommit.contentDigest !== input.observedDigest
+      || created.value.physicalDispatchId !== input.physicalDispatchId
+      || !['commit', 'readback'].includes(input.kind)
+    ) {
+      return { ok: false, reason: 'local authoring commit receipt no longer matches its durable proof facts' };
     }
     return { ok: true };
   }
@@ -1543,7 +1629,19 @@ export function issueHostWriteEvidenceForManifestNode(input: {
           reason: `manifest write has no authoritative settled result: ${created.reason}`,
         };
       }
-      const atomic = node.contentCommitMode === 'documented_atomic_input'
+      const frozenVerification = proveFrozenMutationVerification({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        ownerLogicalToolCallId: logicalToolCallId,
+      });
+      if (frozenVerification.status === 'unverified') {
+        return {
+          status: 'refused',
+          reason: `frozen mutation verification is incomplete: ${frozenVerification.reason}`,
+        };
+      }
+      const atomic = frozenVerification.status === 'not_applicable'
+        && node.contentCommitMode === 'documented_atomic_input'
         ? verifyAtomicContentCommit({
             db,
             sessionId: input.sessionId,
@@ -1588,32 +1686,75 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         : null;
       if (atomic && !atomic.ok) return { status: 'refused', reason: atomic.reason };
       const genericPayload = createdPayloadOf(created.value.rawPayload);
-      const payload = atomic?.ok
+      const localCommit = node.effectKind === 'local_write'
+        && node.resolvedTool === created.value.toolName
+        && created.value.executionSite === 'host'
+        && registeredToolSideEffect(created.value.toolName) === 'write'
+        ? parseHostLocalWriteCommitFacts(created.value.rawPayload)
+        : null;
+      const exactContentDigest = frozenVerification.status === 'verified'
+        ? frozenMutationVerificationContentDigest(frozenVerification)
+        : null;
+      const exactReceiptDigest = frozenVerification.status === 'verified'
+        ? exactContentDigest ?? frozenVerification.targetDigest
+        : null;
+      const payload = frozenVerification.status === 'verified'
         ? {
+            id: frozenVerification.resourceId,
+            handle: frozenVerification.resourceId,
+            receipt: frozenMutationVerificationReceiptId(frozenVerification),
+            writtenDigest: exactReceiptDigest!,
+          }
+        : atomic?.ok ? {
             id: atomic.facts.createdId,
             handle: atomic.facts.handle,
             receipt: atomic.facts.providerReceipt,
             writtenDigest: atomic.facts.intendedDigest,
           }
+        : localCommit ? {
+            id: localCommit.createdId,
+            handle: localCommit.handle,
+            receipt: localCommit.receipt,
+            writtenDigest: localCommit.contentDigest,
+          }
         : genericPayload;
       if (!payload.id || !payload.handle || !payload.receipt) {
         return { status: 'refused', reason: 'write settlement is missing an exact created id, handle, or receipt' };
       }
-      if (!atomic?.ok && !independentProviderReceipt(payload.receipt, payload.id, created.value.rawPayload)) {
+      if (
+        frozenVerification.status !== 'verified'
+        && !atomic?.ok
+        && !localCommit
+        && !independentProviderReceipt(payload.receipt, payload.id, created.value.rawPayload)
+      ) {
         return { status: 'refused', reason: 'write settlement did not return an independent provider receipt' };
       }
       let intendedDigest = payload.writtenDigest;
-      const readback = findReadbackDigest({
-        sessionId: input.sessionId,
-        sourceUserSeq: input.sourceUserSeq,
-        acceptedTaskId: manifestState.authority.accepted_task_id,
-        createdId: payload.id,
-        ...(intendedDigest ? { intendedDigest } : {}),
-      });
+      const readback = frozenVerification.status === 'verified'
+        ? {
+            digest: exactContentDigest ?? frozenVerification.targetDigest,
+            handle: frozenVerification.resourceId,
+          }
+        : localCommit ? {
+            digest: localCommit.contentDigest,
+            handle: localCommit.handle,
+          }
+        : findReadbackDigest({
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: manifestState.authority.accepted_task_id,
+            createdId: payload.id,
+            ...(intendedDigest ? { intendedDigest } : {}),
+          });
       if (node.obligations.includes('verify_committed_readback') && !readback) {
         return { status: 'refused', reason: 'write has no content-digest-matched readback' };
       }
-      if (node.obligations.includes('verify_committed_content') && !atomic?.ok) {
+      if (
+        node.obligations.includes('verify_committed_content')
+        && !atomic?.ok
+        && !(frozenVerification.status === 'verified'
+          && frozenVerification.recipe.proof === 'exact_content_v1')
+      ) {
         return { status: 'refused', reason: 'write has no exact documented atomic content acknowledgement' };
       }
       if (node.obligations.includes('derivation_from_current_source')) {
@@ -1621,7 +1762,12 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         if (!sources.ok) {
           return { status: 'refused', reason: `write derivation source proof failed: ${sources.reason}` };
         }
-        if (atomic?.ok) {
+        if (frozenVerification.status === 'verified') {
+          return {
+            status: 'refused',
+            reason: 'frozen mutation verification does not by itself prove derivation from source evidence',
+          };
+        } else if (atomic?.ok) {
           intendedDigest = atomic.facts.intendedDigest;
         } else {
           if (!readback) {
@@ -1650,6 +1796,15 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         const kind = OBLIGATION_RECEIPT_KIND[obligation];
         if (!kind || kind === 'observation' || kind === 'collection') {
           return { status: 'refused', reason: `write node declares unissuable obligation ${obligation}` };
+        }
+        if (
+          frozenVerification.status === 'verified'
+          && !frozenProofSupportsReceiptKind(frozenVerification, kind)
+        ) {
+          return {
+            status: 'refused',
+            reason: `frozen ${frozenVerification.recipe.proof} proof cannot satisfy ${obligation}`,
+          };
         }
         const body = {
           sessionId: input.sessionId,

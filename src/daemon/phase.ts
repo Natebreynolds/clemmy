@@ -38,7 +38,8 @@ function cleanDetail(detail: unknown): string | undefined {
 }
 
 function supervisorSend(): ((message: unknown) => boolean) | undefined {
-  return (process as NodeJS.Process & { send?: (message: unknown) => boolean }).send;
+  const owner = process as NodeJS.Process & { send?: (message: unknown) => boolean };
+  return typeof owner.send === 'function' ? owner.send.bind(owner) : undefined;
 }
 
 export function getDaemonRuntimePhase(nowMs: number = Date.now()): DaemonRuntimePhase {

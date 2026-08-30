@@ -174,14 +174,24 @@ export function normalizeZodForDeferredJson(schema: z.ZodTypeAny): z.ZodTypeAny 
     case 'array':
       return withDescription(schema, z.array(normalizeZodForDeferredJson(def.element as z.ZodTypeAny)));
     case 'record': {
+      // A Zod record has already constrained this to a legal JSON-object key
+      // schema. Preserve that exact schema; only record VALUES need deferred
+      // JSON normalization.
+      const keyType = (def.keyType ?? z.string()) as Parameters<typeof z.record>[0];
       const valueType = def.valueType
         ? normalizeZodForDeferredJson(def.valueType as z.ZodTypeAny)
-        : z.string();
-      return withDescription(schema, z.object({}).catchall(valueType));
+        : z.json();
+      // Deferred JSON is not a provider-strict first-class schema, so it may
+      // preserve propertyNames/pattern constraints. Dropping the record key
+      // schema would widen future maps with enum/regex-constrained keys.
+      return withDescription(schema, z.record(keyType, valueType));
     }
     case 'any':
     case 'unknown':
-      return withDescription(schema, z.string());
+      // args_json is an ordinary JSON carrier, not a provider strict-schema
+      // surface. Preserve provider-native numbers, booleans, arrays, objects,
+      // and nulls here; the enclosing record/object still owns its key shape.
+      return withDescription(schema, z.json());
     case 'union': {
       const options = Array.isArray(def.options)
         ? def.options.map((item) => normalizeZodForDeferredJson(item as z.ZodTypeAny))
@@ -225,7 +235,21 @@ export function jsonSchemaAllowsNull(schemaValue: unknown): boolean {
 
 function jsonSchemaTypeMatches(value: unknown, schemaValue: unknown): boolean {
   if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
-  const wrapper = schemaValue as { type?: unknown; anyOf?: unknown; oneOf?: unknown };
+  const wrapper = schemaValue as {
+    type?: unknown;
+    anyOf?: unknown;
+    oneOf?: unknown;
+    const?: unknown;
+    enum?: unknown;
+    properties?: unknown;
+    additionalProperties?: unknown;
+  };
+  if (Object.prototype.hasOwnProperty.call(wrapper, 'const') && !Object.is(value, wrapper.const)) {
+    return false;
+  }
+  if (Array.isArray(wrapper.enum) && !wrapper.enum.some((candidate) => Object.is(value, candidate))) {
+    return false;
+  }
   if (wrapper.type === undefined) {
     for (const alternatives of [wrapper.anyOf, wrapper.oneOf]) {
       if (Array.isArray(alternatives)) {
@@ -237,7 +261,17 @@ function jsonSchemaTypeMatches(value: unknown, schemaValue: unknown): boolean {
   if (value === null) return types.includes('null');
   if (Array.isArray(value)) return types.includes('array');
   if (typeof value === 'object') {
-    return types.includes('object') || Boolean((schemaValue as { properties?: unknown }).properties);
+    if (!(types.includes('object') || Boolean(wrapper.properties))) return false;
+    const properties = wrapper.properties && typeof wrapper.properties === 'object'
+      ? wrapper.properties as Record<string, unknown>
+      : {};
+    if (
+      wrapper.additionalProperties === false
+      && Object.keys(value as Record<string, unknown>).some((key) => !(key in properties))
+    ) return false;
+    return Object.entries(value as Record<string, unknown>).every(([key, nested]) => (
+      !(key in properties) || jsonSchemaTypeMatches(nested, properties[key])
+    ));
   }
   if (typeof value === 'string') return types.includes('string');
   if (typeof value === 'boolean') return types.includes('boolean');
@@ -294,6 +328,14 @@ export function materializeStrictNullableFields(value: unknown, schemaValue: unk
   for (const [key, propertySchema] of Object.entries(properties)) {
     if (!(key in out) || out[key] === undefined) {
       if (required.has(key) && jsonSchemaAllowsNull(propertySchema)) out[key] = null;
+      continue;
+    }
+    // Codex-strict marks optional fields required+nullable. Compatible
+    // models still serialize "omitted" as "" (live 2026-08-29: tool_search
+    // cursor:"" failed minLength and burned the discovery epoch). Empty is
+    // the null the schema already accepts, not a value.
+    if (typeof out[key] === 'string' && out[key].trim() === '' && jsonSchemaAllowsNull(propertySchema)) {
+      out[key] = null;
       continue;
     }
     out[key] = materializeStrictNullableFields(out[key], propertySchema);

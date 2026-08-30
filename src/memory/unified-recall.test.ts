@@ -146,6 +146,18 @@ test('visibleUnifiedPrimerHits force-includes the top hit rather than returning 
   assert.deepEqual(visible.map((h) => h.ref), ['7'], 'roster is force-included, not dropped');
 });
 
+test('a live-world ask cannot be supported from entity mention-counts', () => {
+  const result = {
+    objective: 'How many deals does Tim have set to close this month',
+    answerability: 'supported' as const,
+  };
+  const sheetEntities = [
+    { type: 'entity' as const, ref: '2818', title: 'Google Sheet', snippet: 'thing · mentioned 17×', score: 0.9 },
+    { type: 'entity' as const, ref: '7', title: 'Google Sheets', snippet: 'thing · mentioned 83×', score: 0.8 },
+  ];
+  assert.equal(projectedRecallAnswerability(result, sheetEntities), 'partial');
+});
+
 test('complete-set answerability follows the visible projection, not a clipped stored hit', () => {
   const result = {
     objective: 'list all team members and emails',

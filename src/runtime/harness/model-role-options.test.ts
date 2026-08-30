@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clemmy-model-options-test-'));
 process.env.CLEMENTINE_HOME = home;
@@ -18,10 +19,17 @@ const {
   effectiveBrain,
   effectiveBrainValue,
   falloverBrainModelIds,
+  modelRoleOptionCatalogSnapshot,
   roleModelCapability,
   savedRoleModelIdsForProvider,
+  _setModelOptionSnapshotObserverForTest,
 } = await import('./model-role-options.js');
-const { resolveEffectiveProviderForModel } = await import('./byo-providers.js');
+const {
+  captureByoRoutingSnapshot,
+  resolveEffectiveProviderForModel,
+  resolveEffectiveProviderForModelFromSnapshot,
+} = await import('./byo-providers.js');
+const { _setRuntimeEnvReadObserverForTest } = await import('../../config.js');
 const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
 // Keep this unit file deterministic: provider auth fixtures are fake, so model
 // discovery itself is covered separately with injected discoverers.
@@ -36,6 +44,26 @@ function withEnv(over: Record<string, string | undefined>, fn: () => void): void
   }
   try {
     fn();
+  } finally {
+    for (const k of Object.keys(over)) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  }
+}
+
+async function withEnvAsync(
+  over: Record<string, string | undefined>,
+  fn: () => Promise<void>,
+): Promise<void> {
+  const prev: Record<string, string | undefined> = {};
+  for (const k of Object.keys(over)) {
+    prev[k] = process.env[k];
+    if (over[k] === undefined) delete process.env[k];
+    else process.env[k] = over[k];
+  }
+  try {
+    await fn();
   } finally {
     for (const k of Object.keys(over)) {
       if (prev[k] === undefined) delete process.env[k];
@@ -202,6 +230,112 @@ test('multi-provider: a provider with no saved key is not offered', () => {
     assert.deepEqual(byoGroups.map((g) => g.providerId), ['default'], 'unkeyed provider is hidden');
     assert.equal(validateRoleModelBinding('worker', 'MiniMax-M3').ok, false, 'cannot bind an unkeyed provider model');
     assert.equal(validateRoleModelBinding('worker', 'glm-5.2').ok, true);
+  });
+});
+
+test('200-model settings catalog captures runtime provider state once, preserves output, and yields promptly', async () => {
+  writeAuthFiles();
+  const modelIds = Array.from({ length: 200 }, (_, index) => `together-org/model-${index}`);
+  const firstRegistry = JSON.stringify([
+    {
+      id: 'together',
+      label: 'Together',
+      baseURL: 'https://api.together.test/v1',
+      modelIds,
+    },
+  ]);
+  await withEnvAsync({
+    MODEL_ROUTING_MODE: 'off',
+    BYO_MODEL_BASE_URL: '',
+    BYO_MODEL_API_KEY: '',
+    BYO_MODEL_ID: '',
+    BYO_MODEL_JUDGE_ID: '',
+    BYO_MODEL_PROVIDER: '',
+    OPENAI_MODEL_WORKER: '',
+    BYO_PROVIDERS: firstRegistry,
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
+    BYO_PROVIDER_SECOND_API_KEY: 'second-key',
+  }, async () => {
+    let providerCaptures = 0;
+    let runtimeEnvReads = 0;
+    const runtimeEnvReadsByKey = new Map<string, number>();
+    let observation: { providerCount: number; configuredProviderCount: number; modelCount: number } | undefined;
+    _setModelOptionSnapshotObserverForTest((next) => {
+      providerCaptures += 1;
+      observation = next;
+    });
+    _setRuntimeEnvReadObserverForTest((key) => {
+      runtimeEnvReads += 1;
+      runtimeEnvReadsByKey.set(key, (runtimeEnvReadsByKey.get(key) ?? 0) + 1);
+    });
+
+    const startedAt = performance.now();
+    const immediateLag = new Promise<number>((resolve) => {
+      setImmediate(() => resolve(performance.now() - startedAt));
+    });
+    let catalog: ReturnType<typeof modelRoleOptionCatalogSnapshot>;
+    try {
+      catalog = modelRoleOptionCatalogSnapshot();
+    } finally {
+      _setRuntimeEnvReadObserverForTest(null);
+      _setModelOptionSnapshotObserverForTest(null);
+    }
+    const synchronousMs = performance.now() - startedAt;
+    const yieldedAfterMs = await immediateLag;
+
+    assert.equal(providerCaptures, 1, 'one settings derivation captures provider/env state once');
+    assert.deepEqual(observation, {
+      providerCount: 1,
+      configuredProviderCount: 1,
+      modelCount: 200,
+    });
+    assert.equal(runtimeEnvReadsByKey.get('BYO_PROVIDERS'), 1,
+      'the provider registry is captured exactly once for the whole settings catalog');
+    assert.ok(runtimeEnvReads < 40,
+      `runtime env reads stay bounded by provider count, not 200 models (got ${runtimeEnvReads})`);
+    assert.ok(synchronousMs < 750,
+      `200-model derivation must not monopolize the event loop (took ${synchronousMs.toFixed(1)}ms)`);
+    assert.ok(yieldedAfterMs < 1_000,
+      `a queued immediate must run promptly after settings derivation (lag ${yieldedAfterMs.toFixed(1)}ms)`);
+
+    const availableByo = catalog.available.find((group) => group.providerId === 'together');
+    const workerByo = catalog.roleOptions.worker.find((group) => group.providerId === 'together');
+    const judgeByo = catalog.roleOptions.judge.find((group) => group.providerId === 'together');
+    assert.deepEqual(availableByo?.models.map((model) => model.id), modelIds);
+    assert.deepEqual(workerByo?.models.map((model) => model.id), modelIds);
+    assert.deepEqual(judgeByo?.models.map((model) => model.id), modelIds);
+    assert.deepEqual(
+      catalog.brainOptions.filter((option) => option.providerId === 'together').map((option) => option.modelId),
+      modelIds,
+    );
+    assert.deepEqual(catalog.providerSnapshots, [{
+      id: 'together',
+      label: 'Together',
+      baseURL: 'https://api.together.test/v1',
+      modelIds,
+      hasKey: true,
+      configured: true,
+      isDefault: false,
+    }]);
+
+    // The composite request result stays byte/deep-equivalent to the legacy
+    // public derivations; they now just capture their own one-request context.
+    assert.deepEqual(catalog.available, connectedModelGroups());
+    assert.deepEqual(catalog.roleOptions.worker, connectedModelGroupsForRole('worker'));
+    assert.deepEqual(catalog.roleOptions.judge, connectedModelGroupsForRole('judge'));
+    assert.deepEqual(catalog.brainOptions, brainOptions());
+
+    // No cross-request memo: a live environment flip is visible on the very
+    // next derivation without a daemon restart.
+    process.env.BYO_PROVIDERS = JSON.stringify([{
+      id: 'second',
+      label: 'Second',
+      baseURL: 'https://api.second.test/v1',
+      modelIds: ['second/model'],
+    }]);
+    const refreshed = modelRoleOptionCatalogSnapshot();
+    assert.equal(refreshed.brainOptions.some((option) => option.modelId === modelIds[0]), false);
+    assert.equal(refreshed.brainOptions.some((option) => option.modelId === 'second/model'), true);
   });
 });
 
@@ -426,9 +560,16 @@ test('all_in: claude judge binding validates as claude while the wire classifier
     MODEL_ROUTING_MODE: 'all_in',
     AUTH_MODE: 'api_key',
   }, () => {
+    const routingSnapshot = captureByoRoutingSnapshot();
+    assert.equal(routingSnapshot.claudeAvailable, true, 'fixture exercises the connected OAuth lane');
     const validation = roleModelCapability('judge', 'claude-opus-4-8');
     assert.equal(validation.ok, true);
     if (validation.ok) assert.equal(validation.provider, 'claude');
+    assert.equal(
+      resolveEffectiveProviderForModelFromSnapshot('claude-opus-4-8', routingSnapshot),
+      resolveEffectiveProviderForModel('claude-opus-4-8'),
+      'the request-scoped helper and public canonical wrapper agree for OAuth routing',
+    );
     assert.equal(
       resolveEffectiveProviderForModel('claude-opus-4-8'),
       'claude',

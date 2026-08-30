@@ -20,6 +20,7 @@ const dispatchLease = await import('./dispatch-lease.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const claudeLocalCorrelation = await import('./claude-local-tool-correlation.js');
 const settledReadRepeat = await import('./settled-read-repeat.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
 const { formatAutoResolvedAskUserQuestionOutput } = await import('./terminal-tool.js');
 const {
   CLAUDE_AGENT_SDK_LOCAL_AUTHORING_TOOLS,
@@ -39,7 +40,14 @@ const {
   ClaudeSdkCapacityExhaustedError,
 } = mod;
 const { isAuthRecoverableError } = await import('../../execution/transient-error.js');
-const { withTerminalAuthoringEvidenceReceipt } = await import('../../tools/tool-registry.js');
+const { _withHostLocalWriteCommitFactsForTest } = await import('./host-local-write-commit.js');
+const withLocalWriteCommitFixture = (_tool: string, result: string) =>
+  _withHostLocalWriteCommitFactsForTest({
+    createdId: 'daily-digest',
+    handle: 'vault/00-System/workflows/daily-digest/SKILL.md',
+    contentDigest: 'a'.repeat(64),
+    result,
+  });
 
 // The default posture is now 'yolo' (Autonomous, 2026-07-20) which auto-approves
 // reversible/local + CRM writes. The park-mode / approval-gate tests below verify
@@ -478,7 +486,7 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
         is_error: false,
         num_turns: 1,
         stop_reason: 'end_turn',
-        total_cost_usd: 0,
+        total_cost_usd: 0.004,
         usage: { input_tokens: 1, output_tokens: 1 },
         modelUsage: {},
         permission_denials: [],
@@ -508,6 +516,13 @@ test('runClaudeAgentSdk wires subscription env, MCP, permissions, and aggregates
   assert.equal(result.text, 'ok');
   assert.deepEqual(result.structuredOutput, { ok: true });
   assert.deepEqual(result.toolUses, ['mcp__clementine-local__ping']);
+  assert.deepEqual(result.modelRouteUsage, {
+    inputTokens: 1,
+    cachedTokens: 0,
+    outputTokens: 1,
+    totalTokens: 2,
+    costUsd: 0.004,
+  });
 });
 
 test('byte-identical replayed assistant frames contribute one returned tool use', async () => {
@@ -660,7 +675,7 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
   assert.equal(acquired?.bound.includes('workspace_roots'), true);
 });
 
-test('Claude direct discovery permits one provider body and denies same/distinct replay ids', async () => {
+test('Claude direct discovery denies same-id replay, admits a settled continuation, and denies its unexecuted replay after restart', async () => {
   const { discoveryGovernor } = await import('./discovery-governor.js');
   const session = eventlog.createSession({ kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -771,29 +786,45 @@ test('Claude direct discovery permits one provider body and denies same/distinct
 
   assert.deepEqual(
     verdicts.map((verdict) => verdict.behavior),
-    ['allow', 'deny', 'deny', 'deny', 'deny', 'deny', 'deny', 'deny'],
+    ['allow', 'deny', 'deny', 'allow', 'deny', 'deny', 'deny', 'deny'],
   );
   assert.match(verdicts[1]?.message ?? '', /same_call_replay/);
   assert.match(verdicts[2]?.message ?? '', /same_call_replay/);
-  assert.match(verdicts[3]?.message ?? '', /new_call_requires_retry_epoch/);
-  assert.equal(simulatedProviderBodies, 1, 'neither same-id nor distinct-id replay reaches provider code');
+  assert.match(verdicts[4]?.message ?? '', /new_call_requires_retry_epoch/);
+  assert.match(verdicts[7]?.message ?? '', /same_call_replay/);
+  assert.equal(
+    simulatedProviderBodies,
+    1,
+    'only the permission the fixture actually executes reaches its simulated provider body',
+  );
   const state = discoveryGovernor.getTaskState({
     sessionId: session.id,
     sourceUserSeq: source.seq,
   });
-  assert.equal(state?.claims.broad_discovery?.callId, 'toolu_discovery_first');
-  assert.equal(state?.claims.broad_discovery?.outcome, 'succeeded');
+  assert.equal(state?.claims.broad_discovery?.callId, 'toolu_discovery_second');
+  assert.equal(
+    state?.claims.broad_discovery?.outcome,
+    'failed',
+    'the admitted continuation that never produced a tool result is settled failed at the SDK boundary',
+  );
   assert.equal(
     eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] }).length,
     4,
     'the same-id permission-cache denial does not pretend to be a second governor occurrence',
   );
   const decisions = eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] });
-  assert.equal(decisions.filter((event) => event.data.decision === 'admitted').length, 1);
+  assert.equal(decisions.filter((event) => event.data.decision === 'admitted').length, 2);
   const outcomes = eventlog.listEvents(session.id, { types: ['discovery_governor_outcome'] });
-  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes.length, 2);
   assert.equal(outcomes[0]?.data.callId, 'toolu_discovery_first');
-  assert.equal(outcomes[0]?.data.recorded, true, 'the only admitted provider body settles exactly');
+  assert.equal(outcomes[0]?.data.recorded, true, 'the executed provider body settles exactly');
+  assert.equal(outcomes[1]?.data.callId, 'toolu_discovery_second');
+  assert.equal(outcomes[1]?.data.outcome, 'failed');
+  assert.equal(
+    outcomes[1]?.data.recorded,
+    true,
+    'the admitted continuation with no returned tool result is durably closed as failed',
+  );
 });
 
 test('runClaudeAgentSdk fails before model work when required local MCP tools are absent from SDK init', async () => {
@@ -1464,7 +1495,16 @@ test('runClaudeAgentSdk retains canonical tool results without per-return learni
   setClaudeAgentSdkReflectionForTest(((input: any) => { reflected.push(input); }) as any);
   const sess = eventlog.createSession({ id: 'clem-sess-1', kind: 'chat' });
 
-  await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: sess.id, agentic: true });
+  const previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+    operationId: 'SALESFORCE_QUERY',
+    providerKind: 'composio',
+    effect: 'read',
+  }]);
+  try {
+    await runClaudeAgentSdk({ prompt: 'Look up Acme.', sessionId: sess.id, agentic: true });
+  } finally {
+    currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
+  }
 
   assert.equal(reflected.length, 0, 'terminal-batch intake is the sole learning owner');
 
@@ -1540,7 +1580,7 @@ test('the canonical SDK return emits authoring evidence only for a successful re
     label: 'direct-workflow-create',
     toolName: 'mcp__clementine-local__workflow_create',
     toolInput: { name: 'daily_digest', description: 'Daily digest' },
-    output: withTerminalAuthoringEvidenceReceipt(
+    output: withLocalWriteCommitFixture(
       'workflow_create',
       'Created workflow "daily_digest".',
     ),
@@ -1555,7 +1595,7 @@ test('the canonical SDK return emits authoring evidence only for a successful re
       name: 'workflow_create',
       args_json: JSON.stringify({ name: 'daily_digest', description: 'Daily digest' }),
     },
-    output: withTerminalAuthoringEvidenceReceipt(
+    output: withLocalWriteCommitFixture(
       'workflow_create',
       'Created workflow "daily_digest".',
     ),
@@ -1720,6 +1760,11 @@ test('Claude local settled-read replay reuses the handler-authored outer occurre
     yield successResultMessage('Summarized the proof queue.');
   })())) as any);
 
+  const previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+    operationId: 'PROOF_LIST_TASKS',
+    providerKind: 'composio',
+    effect: 'read',
+  }]);
   try {
     await runClaudeAgentSdk({
       prompt: 'Read the proof queue once and summarize it.',
@@ -1760,6 +1805,7 @@ test('Claude local settled-read replay reuses the handler-authored outer occurre
     assert.equal(eventlog.getToolOutput(session.id, replayCallId), null, 'recovered bytes never mint replay authority');
     assert.deepEqual(reflected, [], 'neither physical nor replayed returns schedule live learning');
   } finally {
+    currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
     if (previousReflection === undefined) delete process.env.CLEMMY_CLAUDE_SDK_REFLECTION;
     else process.env.CLEMMY_CLAUDE_SDK_REFLECTION = previousReflection;
     if (previousGuardrail === undefined) delete process.env.CLEMMY_TOOL_GUARDRAIL;

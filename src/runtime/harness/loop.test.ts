@@ -18,7 +18,7 @@
  * (returns a Node EventEmitter stub) and runRunner (synthesizes a
  * RunOutcome). That keeps the loop test fast and offline.
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash } from 'node:crypto';
@@ -26,6 +26,7 @@ import { spawn } from 'node:child_process';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-harness-loop-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.COMPOSIO_BACKEND = 'sdk';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 mkdirSync(path.join(TMP_HOME, 'vault', '02-Projects'), { recursive: true });
@@ -104,6 +105,9 @@ const fixtureAttempts = await import('./attempt-settlement.js');
 const fixtureExpectedWork = await import('./expected-work-admission.js');
 const fixtureSettlementAudit = await import('./accepted-source-settlement-audit.js');
 const outputGrounding = await import('./output-grounding-gate.js');
+const fixtureGraph = await import('../graph/turn-graph-shadow.js');
+const fixtureCapabilityCatalog = await import('./host-capability-catalog-factory.js');
+const fixtureCapabilityManifest = await import('./capability-manifest.js');
 
 
 /** Wrap runConversation options so each model pass first settles one real
@@ -120,6 +124,53 @@ function withSettledWork<T extends { sessionId: string; runRunner?: any }>(optio
       return rr(...args);
     },
   };
+}
+
+let workflowLoopFixtureSerial = 0;
+function createWorkflowLoopFixture(title: string, fixed?: {
+  id: string;
+  workflowRunId: string;
+  stepId: string;
+}): HarnessSession {
+  const serial = ++workflowLoopFixtureSerial;
+  const workflowRunId = fixed?.workflowRunId ?? `loop-fixture-run-${serial}`;
+  const stepId = fixed?.stepId ?? `step-${serial}`;
+  return HarnessSession.create({
+    id: fixed?.id ?? `workflow:${workflowRunId}:${stepId}`,
+    kind: 'workflow',
+    channel: 'workflow',
+    title,
+    metadata: {
+      source: 'workflow',
+      workflowName: 'Harness Loop Fixture',
+      workflowRunId,
+      stepId,
+      sessionIdSuffix: `${workflowRunId}:${stepId}`,
+    },
+  });
+}
+
+function createAcceptedBackgroundLoopFixture(
+  id: string,
+  text: string,
+  surface: 'background' | 'cron' = 'background',
+): {
+  session: HarnessSession;
+  sourceUserSeq: number;
+  runAttemptId: string;
+} {
+  const session = HarnessSession.create({ id, kind: 'execution' });
+  const attempt = beginRunAttempt(session.id, { runId: `fixture:${id}` });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text },
+  });
+  assert.ok(fixtureGraph.recordTurnGraphShadow({
+    identity: { sessionId: session.id, turn: source.turn, sourceUserSeq: source.seq },
+    surface,
+  }), `fixture precondition: execution owns an accepted ${surface} graph`);
+  return { session, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId };
 }
 
 let fixtureReadSerial = 0;
@@ -294,11 +345,61 @@ function settleExactTerminalInspectionRead(input: {
     physicalDispatchId: `dispatch:terminal-inspection:${input.sourceUserSeq}:${fixtureReadSerial}`,
     ordinal: 0,
   };
-  const begun = fixtureDispatchLedger.beginPhysicalDispatch({
-    identity,
-    tool: input.toolName,
-    args: input.args,
+  const operationId = typeof input.args.tool_slug === 'string'
+    ? input.args.tool_slug.trim()
+    : input.toolName;
+  const fingerprint = createHash('sha256')
+    .update(`terminal-inspection:${operationId}`)
+    .digest('hex');
+  const manifest = fixtureCapabilityManifest.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:test:terminal-inspection:${fingerprint.slice(0, 24)}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'fixture-provider',
+    providerVersion: 'fixture-v1',
+    operationVersion: '1',
+    definitionFingerprint: fingerprint,
+    effect: 'read',
+    accountId: 'fixture-account',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source'],
   });
+  const entry = {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    manifestDigest: fixtureCapabilityManifest.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({}),
+  };
+  const priorCatalog = fixtureCapabilityCatalog.peekHostCapabilityCatalogFactory();
+  fixtureCapabilityCatalog.installHostCapabilityCatalogFactory(
+    fixtureCapabilityCatalog.createHostCapabilityCatalogFactory([
+      ...(priorCatalog?.snapshot() ?? []),
+      entry,
+    ]),
+  );
+  let begun: ReturnType<typeof fixtureDispatchLedger.beginPhysicalDispatch>;
+  try {
+    begun = fixtureDispatchLedger.beginPhysicalDispatch({
+      identity,
+      tool: input.toolName,
+      args: input.args,
+    });
+  } finally {
+    fixtureCapabilityCatalog.installHostCapabilityCatalogFactory(priorCatalog);
+  }
   assert.equal(begun.status, 'inserted', JSON.stringify(begun));
   const carrierSlug = typeof input.args.tool_slug === 'string'
     ? input.args.tool_slug.trim().toLowerCase()
@@ -329,6 +430,65 @@ function settleExactTerminalInspectionRead(input: {
   return logicalToolCallId;
 }
 
+/** Record one exact source/attempt-bound top-level tool lifecycle without
+ * asking the SDK event adapter to infer a provider or effect from a fixture
+ * name. Production learns those fields from the current capability binding;
+ * scripted tests must state the same already-proven facts explicitly. */
+function appendExactTopLevelToolLifecycle(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  attemptId: string;
+  turn: number;
+  callId: string;
+  outerTool: string;
+  effectiveTool: string;
+  args: Record<string, unknown>;
+  output: string;
+  effect: 'read' | 'compute';
+}): void {
+  const common = {
+    sourceUserSeq: input.sourceUserSeq,
+    runScopeId: `${input.sessionId}::source:${input.sourceUserSeq}`,
+    attemptId: input.attemptId,
+    tool: input.outerTool,
+    callId: input.callId,
+    canonicalCallId: input.callId,
+    accounting: 'top_level',
+    topologyRole: 'business',
+    effect: input.effect,
+    effectiveTool: input.effectiveTool,
+    toolSlug: input.effectiveTool,
+  } as const;
+  const called = appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'Orchestrator',
+    type: 'tool_called',
+    data: {
+      ...common,
+      arguments: JSON.stringify(input.args),
+    },
+  });
+  writeToolOutput({
+    sessionId: input.sessionId,
+    callId: input.callId,
+    invocationNonce: `nonce:${input.attemptId}:${input.callId}`,
+    tool: input.outerTool,
+    output: input.output,
+  });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'Orchestrator',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      ...common,
+      result: input.output,
+    },
+  });
+}
+
 const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsLimitExceeded, harnessRunContextStorage, wrapToolForHarness } = await import('./brackets.js');
 const { listEvents: listEventsForConv } = await import('./eventlog.js');
@@ -348,7 +508,11 @@ const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { executeApprovedPendingActionCall } = await import('../../execution/pending-action-executor.js');
 const { toolCallCorrelationFingerprint } = await import('./tool-correlation.js');
 const { runtimeToolAccountingMetadata } = await import('./tool-effect.js');
-const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
+const {
+  checkpointWorkingMemory,
+  loadWorkingMemoryForSession,
+  workingMemoryPathForSession,
+} = await import('../../memory/working-memory.js');
 const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
 const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
 const {
@@ -1180,7 +1344,7 @@ test('W1a: a transient error falls over to the next brain and completes (no ask)
   assert.equal(listEventsForConv(sess.id, { types: ['awaiting_user_input'] }).length, 0, 'no ask when fallover succeeds');
 });
 
-test('runConversation refreshes working memory after the terminal reply is durable', async () => {
+test('runConversation leaves terminal delivery independent and lazy-load rebuilds current working memory', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop', title: 'Terminal WM test' });
   const runRunner: RunRunnerFn = async (_runner, _agent, items) => ({
@@ -1195,15 +1359,21 @@ test('runConversation refreshes working memory after the terminal reply is durab
     },
   } as never);
 
-  const result = await runConversation({
+  const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
     input: 'Remember WM-TERMINAL-USER in this turn.',
     makeRunner: makeRunnerStub,
     runRunner,
-  });
+  }));
 
   assert.equal(result.status, 'completed');
+  assert.equal(
+    existsSync(workingMemoryPathForSession(sess.id)),
+    false,
+    'terminal completion performs no derived working-memory filesystem write',
+  );
+  assert.ok(loadWorkingMemoryForSession(sess.id), 'the first same-session consumer rebuilds before use');
   const snapshot = readFileSync(workingMemoryPathForSession(sess.id), 'utf-8');
   assert.match(snapshot, /WM-TERMINAL-USER/);
   assert.match(snapshot, /WM-TERMINAL-REPLY/, 'writeback includes the current assistant reply, not a one-turn-late snapshot');
@@ -1242,8 +1412,13 @@ test('W1a: when every brain hits the transient error, fall through to the infra-
 // ─── Unattended infra self-heal (workflow/background) ──────────────────────
 test('unattended self-heal: a transient infra error auto-retries and recovers (no awaiting_user_input)', async () => {
   resetEventLog();
-  // A background run session (id prefix is the unattended signal).
-  const sess = HarnessSession.create({ id: 'background:auto-recover-ok', kind: 'execution' });
+  // A background bridge source carries both the unattended id and the
+  // background graph surface before the model loop begins.
+  const accepted = createAcceptedBackgroundLoopFixture(
+    'background:auto-recover-ok',
+    'run the enrichment step',
+  );
+  const sess = accepted.session;
   let calls = 0;
   const runRunner: RunRunnerFn = async (_r, _a, items) => {
     calls += 1;
@@ -1255,6 +1430,8 @@ test('unattended self-heal: a transient infra error auto-retries and recovers (n
   const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
+    sourceUserSeq: accepted.sourceUserSeq,
+    runAttemptId: accepted.runAttemptId,
     input: 'run the enrichment step',
     makeRunner: makeRunnerStub,
     runRunner,
@@ -1288,21 +1465,22 @@ test('infra recovery composes from one exact settled read instead of asking the 
   const runRunner: RunRunnerFn = async (runner, _agent, items, opts) => {
     modelTurns += 1;
     if (modelTurns === 1) {
-      const ee = runner as unknown as EventEmitter;
-      const runContext = { context: opts.context };
-      const tool = { name: 'composio_execute_tool' };
-      const details = {
-        toolCall: {
-          callId: 'settled-before-5xx',
-          arguments: JSON.stringify({
-            tool_slug: 'PROOF_LIST_TASKS',
-            arguments: '{}',
-            connected_account_id: null,
-          }),
+      appendExactTopLevelToolLifecycle({
+        sessionId: sess.id,
+        sourceUserSeq: source.seq,
+        attemptId: attempt.attemptId,
+        turn: 1,
+        callId: 'settled-before-5xx',
+        outerTool: 'composio_execute_tool',
+        effectiveTool: 'PROOF_LIST_TASKS',
+        args: {
+          tool_slug: 'PROOF_LIST_TASKS',
+          arguments: '{}',
+          connected_account_id: null,
         },
-      };
-      ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
-      ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, output, details);
+        output,
+        effect: 'read',
+      });
       throw BoundaryError.from(new Error('backend 503 after the read settled'), {
         kind: 'model.http_5xx',
         retryable: true,
@@ -1355,7 +1533,11 @@ test('infra recovery composes from one exact settled read instead of asking the 
 
 test('unattended self-heal: a persistent infra error auto-retries twice then FAILS honestly (never asks, never fakes success)', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ id: 'workflow:sched-x:enrich_missing_seo_once', kind: 'workflow' });
+  const sess = createWorkflowLoopFixture('enrich missing seo', {
+    id: 'workflow:sched-x:enrich_missing_seo_once',
+    workflowRunId: 'sched-x',
+    stepId: 'enrich_missing_seo_once',
+  });
   const runRunner: RunRunnerFn = async () => {
     throw BoundaryError.from(new Error('backend 529 persistent'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
   };
@@ -1403,13 +1585,19 @@ test('unattended self-heal: CLEMMY_UNATTENDED_AUTO_RECOVER=off restores the ask 
   const prev = process.env.CLEMMY_UNATTENDED_AUTO_RECOVER;
   process.env.CLEMMY_UNATTENDED_AUTO_RECOVER = 'off';
   try {
-    const sess = HarnessSession.create({ id: 'background:killswitch-off', kind: 'execution' });
+    const accepted = createAcceptedBackgroundLoopFixture(
+      'background:killswitch-off',
+      'run the step',
+    );
+    const sess = accepted.session;
     const runRunner: RunRunnerFn = async () => {
       throw BoundaryError.from(new Error('backend 529'), { kind: 'model.overloaded', retryable: true, userMessage: 'transient' });
     };
     const result = await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
+      sourceUserSeq: accepted.sourceUserSeq,
+      runAttemptId: accepted.runAttemptId,
       input: 'run the step',
       makeRunner: makeRunnerStub,
       runRunner,
@@ -1749,6 +1937,23 @@ test('dynamic reasoning effort: real runTurn injects effort per turn (simple→n
   assert.equal(simpleAgent.modelSettings?.text?.verbosity, 'low', 'gpt-5 verbosity default preserved');
   assert.equal(listEvents(s1.id, { types: ['reasoning_effort'] })[0].data.effort, 'none');
 
+  // A scalar detail makes the shared classifier call this moderate, but it is
+  // still one bounded foreground action and should reach execution promptly.
+  const boundedAgent = makeAgentStub() as any;
+  const boundedSession = HarnessSession.create({ kind: 'chat', title: 'effort-bounded-action' });
+  await runTurn({
+    agent: boundedAgent,
+    sessionId: boundedSession.id,
+    input: 'Publish the prepared announcement to my existing website at 9:30 PM with the approved title.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal(boundedAgent.modelSettings?.reasoning?.effort, 'none', 'bounded foreground action → none');
+  const boundedEvent = listEvents(boundedSession.id, { types: ['reasoning_effort'] })[0];
+  assert.equal(boundedEvent.data.complexity, 'moderate');
+  assert.equal(boundedEvent.data.boundedForegroundAction, true);
+  assert.equal(boundedEvent.data.reason, 'moderate/interactive-single-action');
+
   // Complex INTERACTIVE chat turn → capped at medium (a human is waiting)
   const chatAgent = makeAgentStub() as any;
   const s2 = HarnessSession.create({ kind: 'chat', title: 'effort-chat-complex' });
@@ -1765,7 +1970,7 @@ test('dynamic reasoning effort: background (workflow) complex turn → high (no 
     finalOutput: { ok: true },
   });
   const wfAgent = makeAgentStub() as any;
-  const sess = HarnessSession.create({ kind: 'workflow', title: 'effort-wf-complex' });
+  const sess = createWorkflowLoopFixture('effort-wf-complex');
   await runTurn({ agent: wfAgent, sessionId: sess.id, input: COMPLEX_INPUT, makeRunner: makeRunnerStub, runRunner });
   assert.equal(wfAgent.modelSettings?.reasoning?.effort, 'high', 'complex workflow → high');
   assert.equal(listEvents(sess.id, { types: ['reasoning_effort'] })[0].data.effort, 'high');
@@ -1921,7 +2126,7 @@ test('completed workflow run flips session status to completed (one-shot)', asyn
   // task. Marking the row 'completed' here is correct so the dashboard's
   // Live Runs filter doesn't keep showing them.
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'workflow', title: 'workflow-step' });
+  const sess = createWorkflowLoopFixture('workflow-step');
 
   const runRunner: RunRunnerFn = async (_runner, _agent, items, _opts) => ({
     history: [
@@ -1956,7 +2161,7 @@ test('completed workflow run flips session status to completed (one-shot)', asyn
 // `kind !== 'chat' && !approvalRegistry.hasPending(sessionId)`.
 test('workflow run with a pending approval stays active (P0-4 guard)', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'workflow', title: 'paused-workflow' });
+  const sess = createWorkflowLoopFixture('paused-workflow');
 
   // Register a pending approval BEFORE the turn ends, mimicking a
   // tool call that handed off to the approval bus mid-turn.
@@ -2745,6 +2950,126 @@ test('interruption emits approval_requested per interrupted tool call with parse
   assert.deepEqual(approvals[0].data.args, { subject: 'deploy to prod', destructive: true });
 });
 
+test('plan-bound approval unwraps exact frozen work_call details without changing resume authority', async (t) => {
+  resetEventLog();
+  const composioClient = await import('../../integrations/composio/client.js');
+  composioClient.__test__.setConnectedAccountsLoader(async () => [{
+    id: 'ca_scorpion_outlook',
+    status: 'ACTIVE',
+    user_id: 'provider-owner-scorpion',
+    toolkit: { slug: 'outlook' },
+    state: { email: 'calendar@scorpion.example' },
+  }]);
+  t.after(async () => {
+    composioClient.__test__.setConnectedAccountsLoader(async () => []);
+    await composioClient.listConnectedToolkits({ requireFresh: true });
+    composioClient.__test__.setConnectedAccountsLoader(null);
+  });
+  await composioClient.listConnectedToolkits({ requireFresh: true });
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const longSubject = `New AI project ${'scope '.repeat(30)}`.trim();
+  const providerArgs = {
+    subject: longSubject,
+    attendees_info: [{ email: 'james.marshall@example.com' }],
+    start: { dateTime: '2026-08-29T21:00:00-07:00', timeZone: 'America/Los_Angeles' },
+  };
+  const gatewayArgs = {
+    tool_slug: 'OUTLOOK_CALENDAR_CREATE_EVENT',
+    arguments: JSON.stringify(providerArgs),
+    connected_account_id: 'ca_scorpion_outlook',
+  };
+  const workArgs = {
+    requirement_id: 'calendar-invite-once',
+    universe_item_id: null,
+    universe_selector: null,
+    seal_amendment: null,
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify(gatewayArgs),
+  };
+  const rawArgs = JSON.stringify(workArgs);
+  const resumeKey = `host-consent:v1:${'a'.repeat(64)}`;
+
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Schedule the exact meeting invite.',
+    makeRunner: makeRunnerStub,
+    runRunner: async () => ({
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: undefined,
+      hasInterruptions: true,
+      serializedState: '{"$schema":1,"items":[]}',
+      interruptions: [{
+        toolName: 'work_call',
+        rawArgs,
+        args: workArgs,
+        approvalResumeKey: resumeKey,
+      }],
+    }),
+  });
+
+  const approvals = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(approvals.length, 1, 'one exact interruption emits one card');
+  assert.equal(
+    approvals[0].data.subject,
+    `Create Outlook calendar event · subject: ${longSubject.slice(0, 79)}… · to: james.marshall@example.com · when: 2026-08-29T21:00:00-07:00 · account: calendar@scorpion.example (ca_scorpion_outlook)`,
+    'a long subject is clipped independently and cannot erase recipient, time, or account',
+  );
+  assert.equal(approvals[0].data.tool, 'work_call',
+    'presentation unwrapping never replaces the executable outer carrier');
+  assert.equal(approvals[0].data.rawArgs, rawArgs);
+  assert.deepEqual(approvals[0].data.args, workArgs);
+
+  const rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].subject, approvals[0].data.subject);
+  assert.equal(rows[0].tool, 'work_call');
+  assert.equal(rows[0].resumeKey, resumeKey);
+  assert.deepEqual(rows[0].args, workArgs);
+  const { approvalAuthorityMatchesToolCall } = await import('./approval-authority.js');
+  assert.equal(approvalAuthorityMatchesToolCall(rows[0], 'work_call', rawArgs), true,
+    'the approval still resumes only the byte-identical frozen outer payload');
+  assert.equal(approvalAuthorityMatchesToolCall(rows[0], 'work_call', JSON.stringify({
+    ...workArgs,
+    args_json: JSON.stringify({
+      ...gatewayArgs,
+      arguments: JSON.stringify({ ...providerArgs, attendees_info: [{ email: 'other@example.test' }] }),
+    }),
+  })), false, 'changed recipient cannot inherit the card');
+
+  const unknownAccountSession = HarnessSession.create({ kind: 'chat' });
+  const unknownGatewayArgs = { ...gatewayArgs, connected_account_id: 'ca_identity_not_observed' };
+  const unknownWorkArgs = { ...workArgs, args_json: JSON.stringify(unknownGatewayArgs) };
+  const unknownRawArgs = JSON.stringify(unknownWorkArgs);
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: unknownAccountSession.id,
+    input: 'Present an exact account whose identity is not currently observable.',
+    makeRunner: makeRunnerStub,
+    runRunner: async () => ({
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: undefined,
+      hasInterruptions: true,
+      serializedState: '{"$schema":1,"items":[]}',
+      interruptions: [{
+        toolName: 'work_call',
+        rawArgs: unknownRawArgs,
+        args: unknownWorkArgs,
+        approvalResumeKey: `host-consent:v1:${'b'.repeat(64)}`,
+      }],
+    }),
+  });
+  const [unknownEvent] = listEvents(unknownAccountSession.id, { types: ['approval_requested'] });
+  assert.ok(unknownEvent);
+  assert.match(
+    String(unknownEvent.data.subject),
+    /account: ca_identity_not_observed \(current identity unavailable\)$/,
+    'an opaque account id remains visible with an explicit identity gap; source prose is never substituted',
+  );
+});
+
 test('queue-only action → request_approval interruption pins the immutable action; approval executes once and tampering stays inert', async () => {
   resetEventLog();
   const requestCard = async (
@@ -2801,7 +3126,7 @@ test('queue-only action → request_approval interruption pins the immutable act
     return record;
   };
 
-  const executable = await requestCard('sess-loop-exact-card-execute', 'proof@example.com');
+  const executable = await requestCard('sess-loop-exact-card-execute', 'proof@x.co');
   let dispatches = 0;
   const executed = await executeApprovedPendingActionCall(executable.id, {
     sessionId: executable.sessionId!,
@@ -2858,13 +3183,13 @@ test('an identical pending-action interruption reuses its linked card and a re-h
     payload: {
       tool_slug: 'GMAIL_SEND_EMAIL',
       arguments: JSON.stringify({
-        to: 'proof@example.com',
+        to: 'proof@x.co',
         subject: 'Replay proof',
         body: 'Original exact body.',
       }),
       connected_account_id: 'ca_gmail_owner',
     },
-    targetSummary: 'proof@example.com',
+    targetSummary: 'proof@x.co',
     sessionId,
   });
   const interruptionArgs = {
@@ -3267,7 +3592,7 @@ test('an exact approval ID resolves only its matching interruption and leaves a 
   const sess = HarnessSession.create({ kind: 'chat', title: 'exact approval resume' });
   const approvedArgs = {
     tool_slug: 'GMAIL_SEND_EMAIL',
-    arguments: { to: 'approved@example.com', subject: 'Approved', body: 'A' },
+    arguments: { to: 'approved@x.co', subject: 'Approved', body: 'A' },
   };
   const otherArgs = {
     tool_slug: 'GMAIL_SEND_EMAIL',
@@ -3346,7 +3671,7 @@ test('an approval ID that does not match the serialized interruption executes no
   resetEventLog();
   const agent = new Agent({ name: 'MismatchedApprovalResumeTest', instructions: 'test' });
   const sess = HarnessSession.create({ kind: 'chat', title: 'mismatched approval resume' });
-  const cardArgs = { to: 'approved@example.com', body: 'approved payload' };
+  const cardArgs = { to: 'approved@x.co', body: 'approved payload' };
   const interruptedArgs = { to: 'different@example.com', body: 'different payload' };
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'gmail_send_email',
@@ -3744,7 +4069,7 @@ test('resume does not open a scoped plan scope for non-external or single-call a
   resetEventLog();
   const agent = new Agent({ name: 'ResumeSingleApprovalTest', instructions: 'test' });
   const sess = HarnessSession.create({ kind: 'chat', title: 'resume-single-approval' });
-  const args = { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: JSON.stringify({ to: 'a@example.com', subject: 'A' }) };
+  const args = { tool_slug: 'OUTLOOK_CREATE_DRAFT', arguments: JSON.stringify({ to: 'a@x.co', subject: 'A' }) };
   sess.saveInterruptState(makeApprovalRunStateWithInterruptions(agent, [{
     toolName: 'composio_execute_tool',
     callId: 'draft_call_1',
@@ -4855,7 +5180,10 @@ test('self-reconciliation judge unavailability spends the sealed terminal repair
 
   assert.equal(calls, 2);
   assert.equal(repairCalls, 1, 'judge outage must spend the sealed model repair before fallback');
-  assert.equal(result.publicPresentation?.text, repairedText);
+  assert.equal(typeof result.publicPresentation?.text, 'string');
+  assert.ok(result.publicPresentation!.text.startsWith(`${repairedText}\n\n`));
+  assert.match(result.publicPresentation!.text, /Retained work \(durable checkpoint\):/);
+  assert.match(result.publicPresentation!.text, /Source\/tool read_file: 1 record \(complete\) retained as rh_[a-f0-9]+\./);
   const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).at(-1);
   assert.equal(terminal?.data.terminalRepairStatus, 'blocked_repaired');
   assert.equal(terminal?.data.terminalJudgeDisposition, undefined);
@@ -5947,19 +6275,22 @@ test('objective judge: exact-source collection receipt removes only the redundan
     modelTurns += 1;
     const ee = runner as unknown as EventEmitter;
     const runContext = { context: opts.context };
-    const tool = { name: 'composio_execute_tool' };
-    const details = {
-      toolCall: {
-        callId: 'verified-read-business-call',
-        arguments: JSON.stringify({
-          tool_slug: 'PROOF_LIST_TASKS',
-          arguments: '{}',
-          connected_account_id: null,
-        }),
+    appendExactTopLevelToolLifecycle({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      attemptId: attempt.attemptId,
+      turn: 1,
+      callId: 'verified-read-business-call',
+      outerTool: 'composio_execute_tool',
+      effectiveTool: 'PROOF_LIST_TASKS',
+      args: {
+        tool_slug: 'PROOF_LIST_TASKS',
+        arguments: '{}',
+        connected_account_id: null,
       },
-    };
-    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, tool, details);
-    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, tool, output, details);
+      output,
+      effect: 'read',
+    });
     const decision = {
       summary: reply,
       reply,
@@ -6092,19 +6423,22 @@ test('objective judge: exact read-only discovery scaffold counts as meaningful e
         reason: 'outcome_recorded',
       },
     });
-    const businessTool = { name: 'composio_execute_tool' };
-    const businessDetails = {
-      toolCall: {
-        callId: 'verified-read-business-call',
-        arguments: JSON.stringify({
-          tool_slug: 'PROOF_LIST_TASKS',
-          arguments: '{}',
-          connected_account_id: null,
-        }),
+    appendExactTopLevelToolLifecycle({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      attemptId: attempt.attemptId,
+      turn: 1,
+      callId: 'verified-read-business-call',
+      outerTool: 'composio_execute_tool',
+      effectiveTool: 'PROOF_LIST_TASKS',
+      args: {
+        tool_slug: 'PROOF_LIST_TASKS',
+        arguments: '{}',
+        connected_account_id: null,
       },
-    };
-    ee.emit('agent_tool_start', runContext, { name: 'Orchestrator' }, businessTool, businessDetails);
-    ee.emit('agent_tool_end', runContext, { name: 'Orchestrator' }, businessTool, businessOutput, businessDetails);
+      output: businessOutput,
+      effect: 'read',
+    });
     const decision = { summary: reply, reply, done: true, nextAction: 'completed' as const, reason: null };
     ee.emit('agent_end', runContext, { name: 'Orchestrator' }, decision);
     return { history: items, lastResponseId: undefined, finalOutput: decision };
@@ -7078,7 +7412,7 @@ test('request-bound write evidence: exhausted verification never false-greens a 
       terminalDeliveryJudgePort: judge.port,
     });
     assert.equal(runs, 2, 'the terminal judge reopens the live loop once');
-    assert.equal(judge.calls(), 2, 'the exact read is assessed before truthful delivery');
+    assert.equal(judge.calls(), 2, 'the exact current read is assessed before truthful delivery');
     assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, true);
@@ -7150,7 +7484,7 @@ test('request-bound write evidence: a direct communication command requires a cu
       terminalDeliveryJudgePort: judge.port,
     });
     assert.equal(runs, 2);
-    assert.equal(judge.calls(), 2);
+    assert.equal(judge.calls(), 2, 'the judge re-assesses the exact current read before delivery');
     assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, true);
@@ -7214,7 +7548,7 @@ test('request-bound write evidence: a direct invitation response cannot false-co
       terminalDeliveryJudgePort: judge.port,
     });
     assert.equal(runs, 2);
-    assert.equal(judge.calls(), 2);
+    assert.equal(judge.calls(), 2, 'the judge re-assesses the exact current read before delivery');
     assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, true);
@@ -7304,7 +7638,7 @@ test('request-bound write evidence: an overlapping request completion cannot cer
     });
 
     assert.equal(runs, 2);
-    assert.equal(judge.calls(), 2);
+    assert.equal(judge.calls(), 2, 'the judge re-assesses the exact current read before delivery');
     assert.equal(result.status, 'completed', result.error ?? JSON.stringify(result.publicPresentation));
     const terminal = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
     assert.equal(terminal.data.delivered, true);
@@ -7319,7 +7653,7 @@ test('request-bound write evidence: an overlapping request completion cannot cer
 
 test('request-bound write evidence: an accepted execution cannot hide a mixed orphaned write', async () => {
   resetEventLog();
-  const judgeQuestion = 'One of the two email sends has an ambiguous provider outcome. Can you check Sent mail for b@example.com before anything is retried?';
+  const judgeQuestion = 'One of the two email sends has an ambiguous provider outcome. Can you check Sent mail for b@x.co before anything is retried?';
   const prev = process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS;
   process.env.CLEMMY_OBJECTIVE_JUDGE_MAX_CONTINUATIONS = '0';
   try {
@@ -7333,7 +7667,7 @@ test('request-bound write evidence: an accepted execution cannot hide a mixed or
         data: {
           callId: 'send-a',
           shapeKey: 'OUTLOOK_SEND_EMAIL',
-          targets: ['a@example.com'],
+          targets: ['a@x.co'],
         },
       });
       appendEvent({
@@ -7344,7 +7678,7 @@ test('request-bound write evidence: an accepted execution cannot hide a mixed or
         data: {
           callId: 'send-b',
           shapeKey: 'OUTLOOK_SEND_EMAIL',
-          targets: ['b@example.com'],
+          targets: ['b@x.co'],
         },
       });
       appendEvent({
@@ -7355,7 +7689,7 @@ test('request-bound write evidence: an accepted execution cannot hide a mixed or
         data: {
           callId: 'send-b',
           shapeKey: 'OUTLOOK_SEND_EMAIL',
-          targets: ['b@example.com'],
+          targets: ['b@x.co'],
         },
       });
       appendEvent({
@@ -7382,7 +7716,7 @@ test('request-bound write evidence: an accepted execution cannot hide a mixed or
     const result = await runConversation({
       agent: makeAgentStub(),
       sessionId: sess.id,
-      input: 'Send one email to a@example.com and one email to b@example.com.',
+      input: 'Send one email to a@x.co and one email to b@x.co.',
       judgeCompletion: true,
       judgeFn: async () => ({ done: true, reason: 'accepted execution certificate' }),
       makeRunner: makeRunnerStub,
@@ -7457,7 +7791,7 @@ test('honest-completion: a blocked/error-stub final reply does NOT bank as compl
   // The Done? trust-killer: a turn that ends "I can't proceed without your
   // approval" previously returned status=completed (false green). The ungated
   // blocked-text backstop converts it to the honest typed blocked state.
-  const sess = HarnessSession.create({ kind: 'workflow' }); // non-opted-in lane (judge never runs)
+  const sess = HarnessSession.create({ kind: 'chat' }); // judge is not opted in
   const runner = scriptedRunner([
     { finalOutput: { summary: 'blocked', reply: 'I cannot complete this task — I need your approval to send.', done: true, nextAction: 'completed', reason: null } },
   ]);
@@ -7472,7 +7806,7 @@ test('honest-completion: a blocked/error-stub final reply does NOT bank as compl
 });
 
 test('honest-completion: a promise-shaped final reply is judged before banking completion', async () => {
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
     { finalOutput: { summary: 'promised', reply: "I'll prep those contacts and get them over next.", done: true, nextAction: 'completed', reason: null } },
   ]);
@@ -7497,7 +7831,7 @@ test('honest-completion: a promise-shaped final reply is judged before banking c
 });
 
 test('honest-completion: promise-shaped fail-open acceptance is tagged, not silently green', async () => {
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
     { finalOutput: { summary: 'promised', reply: "I'll prep those contacts and get them over next.", done: true, nextAction: 'completed', reason: null } },
   ]);
@@ -7532,7 +7866,7 @@ test('done-invariant: done:true + nextAction:awaiting_user_input does NOT bank c
 });
 
 test('honest-completion: a normal delivered reply still completes (delivered:true)', async () => {
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
     { finalOutput: { summary: 'done', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
   ]);
@@ -8146,7 +8480,7 @@ test('honest-completion: kill-switch off leaves blocked text completing (byte-id
   const prev = process.env.CLEMMY_VERIFY_DELIVERED;
   process.env.CLEMMY_VERIFY_DELIVERED = 'off';
   try {
-    const sess = HarnessSession.create({ kind: 'workflow' });
+    const sess = HarnessSession.create({ kind: 'chat' });
     const runner = scriptedRunner([
       { finalOutput: { summary: 'blocked', reply: 'I cannot complete this task without approval.', done: true, nextAction: 'completed', reason: null } },
     ]);
@@ -8217,7 +8551,7 @@ test('objective judge: continuation budget caps retries, then delivery verifier 
 // production host builder in host-turn-runner.test.ts; this fixture remains a
 // narrow regression for the legacy workflow/controller loop.
 test('runConversation workflow-controller mechanics: recurses through done=false steps until done=true', async () => {
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = createWorkflowLoopFixture('workflow-controller mechanics');
   const runner = scriptedRunner([
     {
       finalOutput: {
@@ -8304,8 +8638,8 @@ test('runConversation: a queued approval-bound question materializes one linked 
         summary: 'Queue one exact external send before approval.',
         kind: 'external_send',
         toolName: 'composio_execute_tool',
-        payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
-        targetSummary: 'proof@example.com',
+        payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@x.co' } },
+        targetSummary: 'proof@x.co',
         sessionId: sess.id,
       });
       pendingActionId = record.id;
@@ -8477,7 +8811,7 @@ test('runConversation: a missing-scope question keeps a prematurely queued paylo
       summary: 'The sending account is not resolved yet.',
       kind: 'external_send',
       toolName: 'composio_execute_tool',
-      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'guessed@example.com' } },
+      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'guessed@x.co' } },
       sessionId: sess.id,
     });
     pendingActionId = record.id;
@@ -8535,8 +8869,8 @@ test('runConversation: a declarative queue-only completion does not mint an appr
       summary: 'Prepare this exact send but do not request approval yet.',
       kind: 'external_send',
       toolName: 'composio_execute_tool',
-      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
-      targetSummary: 'proof@example.com',
+      payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@x.co' } },
+      targetSummary: 'proof@x.co',
       sessionId: sess.id,
     });
     appendEvent({
@@ -8593,7 +8927,7 @@ test('runConversation: a typed queue-only edge stays inert even when closing pro
       toolName: 'composio_execute_tool',
       payload: {
         tool_slug: 'GMAIL_SEND_EMAIL',
-        arguments: JSON.stringify({ to: 'proof@example.com', body: 'Staged only.' }),
+        arguments: JSON.stringify({ to: 'proof@x.co', body: 'Staged only.' }),
         connected_account_id: null,
       },
       sessionId: sess.id,
@@ -8678,8 +9012,8 @@ test('runConversation: a typed propose-to-approval edge auto-materializes withou
       history: items,
       lastResponseId: undefined,
       finalOutput: {
-        summary: 'Queued — nothing was sent. **Should I execute it and send to proof@example.com?**',
-        reply: 'Queued — nothing was sent. **Should I execute it and send to proof@example.com?**',
+        summary: 'Queued — nothing was sent. **Should I execute it and send to proof@x.co?**',
+        reply: 'Queued — nothing was sent. **Should I execute it and send to proof@x.co?**',
         done: true,
         nextAction: 'completed',
         reason: null,
@@ -8969,7 +9303,7 @@ test('runConversation: a non-envelope plain-text final output is a VALID complet
 
 test('runConversation: captured workflow_step_result terminates despite punt-shaped final prose and leaves payload for runner', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = createWorkflowLoopFixture('captured workflow step result');
   clearStepResult(sess.id);
   let calls = 0;
   const runRunner: RunRunnerFn = async (_r, _a, items) => {
@@ -9006,7 +9340,7 @@ test('runConversation: a captured workflow_step_result rides a durable carrier n
   // persist the full captured value as a workflow_step_result_captured event
   // so adoption survives process loss.
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = createWorkflowLoopFixture('durable captured workflow step result');
   clearStepResult(sess.id);
   const payload = { rows: [{ id: 'durable-1' }], total: 1 };
   const runRunner: RunRunnerFn = async (_r, _a, items) => {
@@ -9036,7 +9370,7 @@ test('runConversation: a captured workflow_step_result rides a durable carrier n
 
 test('runConversation: fake workflow_step_result transcript is materialized into the structural result channel', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'workflow' });
+  const sess = createWorkflowLoopFixture('transcript captured workflow step result');
   clearStepResult(sess.id);
   let calls = 0;
   const fakeCall = [
@@ -10689,7 +11023,12 @@ test('runConversation: an explicit decision-only JSON contract completes without
   // this exact contract. The outer autonomy layer still validates every field,
   // delegation id, and result before executing anything.
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'execution' });
+  const accepted = createAcceptedBackgroundLoopFixture(
+    'background:decision-only-json',
+    'Return the strict JSON autonomy decision.',
+    'cron',
+  );
+  const sess = accepted.session;
   const decisionJson = JSON.stringify({
     summary: 'Completed the assigned checklist.',
     commitments: [],
@@ -10717,6 +11056,8 @@ test('runConversation: an explicit decision-only JSON contract completes without
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
+    sourceUserSeq: accepted.sourceUserSeq,
+    runAttemptId: accepted.runAttemptId,
     input: 'Return the strict JSON autonomy decision.',
     acceptStructuredNoToolResult: true,
     makeRunner: makeRunnerStub,
@@ -10780,7 +11121,12 @@ test('decision-only JSON recognition is exact and autonomy-shaped, never repaire
 
 test('runConversation: structured-result recognition is disabled after any tool call', async () => {
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'execution' });
+  const accepted = createAcceptedBackgroundLoopFixture(
+    'background:decision-only-tool-call',
+    'Return the strict JSON autonomy decision.',
+    'cron',
+  );
+  const sess = accepted.session;
   const decisionJson = JSON.stringify({
     summary: 'Returned a decision after unexpected tool work.',
     commitments: [],
@@ -10801,6 +11147,8 @@ test('runConversation: structured-result recognition is disabled after any tool 
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
+    sourceUserSeq: accepted.sourceUserSeq,
+    runAttemptId: accepted.runAttemptId,
     input: 'Return the strict JSON autonomy decision.',
     acceptStructuredNoToolResult: true,
     makeRunner: makeRunnerStub,
@@ -10819,7 +11167,12 @@ test('runConversation: decision-only opt-in never exempts a prose completion cla
   // switch. Only strict JSON is eligible; ordinary action narration keeps the
   // same fail-closed stall behavior.
   resetEventLog();
-  const sess = HarnessSession.create({ kind: 'execution' });
+  const accepted = createAcceptedBackgroundLoopFixture(
+    'background:decision-only-prose',
+    'Return the strict JSON autonomy decision.',
+    'cron',
+  );
+  const sess = accepted.session;
   const runner = scriptedRunner([
     {
       finalOutput: {
@@ -10835,6 +11188,8 @@ test('runConversation: decision-only opt-in never exempts a prose completion cla
   await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
+    sourceUserSeq: accepted.sourceUserSeq,
+    runAttemptId: accepted.runAttemptId,
     input: 'Return the strict JSON autonomy decision.',
     acceptStructuredNoToolResult: true,
     makeRunner: makeRunnerStub,
@@ -11830,8 +12185,8 @@ test('runConversation: a receipt-backed workflow handoff records a nonterminal d
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat', channel: 'desktop' });
   const memoryPath = workingMemoryPathForSession(sess.id);
-  mkdirSync(path.dirname(memoryPath), { recursive: true });
-  writeFileSync(memoryPath, 'DISPATCH-MUST-NOT-REFRESH', 'utf-8');
+  checkpointWorkingMemory(sess.id, { lastText: 'DISPATCH-MUST-NOT-REFRESH' });
+  const memoryBeforeDispatch = readFileSync(memoryPath, 'utf-8');
   const runtimeTerminals: string[] = [];
   const unsubscribe = actionBus.subscribe((event) => {
     if (
@@ -11907,7 +12262,7 @@ test('runConversation: a receipt-backed workflow handoff records a nonterminal d
   assert.match(String(dispatches[0].data.dispatchKey), /^workflow_source_group:/);
   assert.equal(listEventsForConv(sess.id, { types: ['conversation_completed'] }).length, 0);
   assert.deepEqual(runtimeTerminals, [], 'a pending async edge emits no runtime terminal');
-  assert.equal(readFileSync(memoryPath, 'utf-8'), 'DISPATCH-MUST-NOT-REFRESH');
+  assert.equal(readFileSync(memoryPath, 'utf-8'), memoryBeforeDispatch);
   assert.equal('__run_in_flight' in (getSession(sess.id)?.metadata ?? {}), false, 'foreground marker is released');
   assert.equal(listEventsForConv(sess.id, { types: ['stuck_detected'] }).length, 0);
   const calls = listEventsForConv(sess.id, { types: ['tool_called'] });
@@ -13770,7 +14125,11 @@ test('primer recall ceiling covers measured p90 and matches the Claude lane (202
 test('a background (execution-kind) run gets the SELF-RESOLVE continuation too — unattended work settles itself', async () => {
   resetEventLog();
   artifactLedger._resetArtifactLedgerForTests();
-  const sess = HarnessSession.create({ kind: 'execution' });
+  const accepted = createAcceptedBackgroundLoopFixture(
+    'background:self-resolve-continuation',
+    'Create a Google Doc report for the dormant accounts',
+  );
+  const sess = accepted.session;
   const rootScopeId = `${sess.id}::turn:1`;
   const inputs: string[] = [];
   let bgCalls = 0;
@@ -13803,6 +14162,8 @@ test('a background (execution-kind) run gets the SELF-RESOLVE continuation too �
   const result = await runConversation({
     agent: makeAgentStub(),
     sessionId: sess.id,
+    sourceUserSeq: accepted.sourceUserSeq,
+    runAttemptId: accepted.runAttemptId,
     input: 'Create a Google Doc report for the dormant accounts',
     makeRunner: makeRunnerStub,
     runRunner,

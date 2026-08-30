@@ -18,6 +18,15 @@ import type {
   AttestedTransportReconcile,
   AttestedTransportReconcileResult,
 } from './attested-transport.js';
+import {
+  executeReviewedLocalTool,
+  observeReviewedLocalTransport,
+  reconcileReviewedLocalTool,
+} from '../reviewed-local-tool-transport.js';
+import {
+  executeReviewedCliRead,
+  observeReviewedCliReadTransport,
+} from '../reviewed-cli-read-transport.js';
 
 void SHIPPED_TRANSPORT_SUPPORT_MARK;
 
@@ -107,6 +116,12 @@ function loopbackOutboundDenied(): boolean {
 }
 
 export async function executeAttestedTransport(call: AttestedTransportCall): Promise<unknown> {
+  if (call.expected?.providerKind === 'reviewed_cli') {
+    return executeReviewedCliRead(call);
+  }
+  if (call.expected?.providerKind === 'local_registry') {
+    return executeReviewedLocalTool(call);
+  }
   if (loopbackOutboundDenied()) {
     throw new Error(`${call.operationId} transport unavailable`);
   }
@@ -212,6 +227,32 @@ export async function refreshAttestedTransportObservation(input: {
   accountId: string;
 }): Promise<AttestedTransportObservation | null> {
   observed.delete(observationKey(input.operationId, input.accountId));
+  if (input.accountId === 'reviewed_cli:host') {
+    try {
+      const observation = observeReviewedCliReadTransport(
+        input.operationId,
+        input.accountId,
+      );
+      if (!observation) return null;
+      observed.set(observationKey(input.operationId, input.accountId), observation);
+      return observation;
+    } catch {
+      return null;
+    }
+  }
+  if (input.accountId === 'local_registry:host') {
+    try {
+      const observation = observeReviewedLocalTransport(
+        input.operationId,
+        input.accountId,
+      );
+      if (!observation) return null;
+      observed.set(observationKey(input.operationId, input.accountId), observation);
+      return observation;
+    } catch {
+      return null;
+    }
+  }
   if (loopbackOutboundDenied()) return null;
   try {
     if (input.accountId.startsWith('native_mcp:')) {
@@ -268,6 +309,17 @@ export async function reconcileAttestedTransport(
 ): Promise<AttestedTransportReconcileResult> {
   const id = input.artifactId.trim();
   if (!id) return { exists: false };
+  if (input.accountId === 'local_registry:host') {
+    try {
+      return await reconcileReviewedLocalTool({
+        operationId: input.operationId,
+        accountId: input.accountId,
+        artifactId: id,
+      });
+    } catch {
+      return { exists: false };
+    }
+  }
   try {
     const result = await executeAttestedTransport({
       operationId: input.operationId,

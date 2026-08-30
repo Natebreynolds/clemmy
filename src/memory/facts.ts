@@ -13,6 +13,10 @@ import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
 import { captureFactEvidence, getFactEvidence, linkFactEvidence, listMemoryPolicies, syncMemoryPolicyForFact, type FactEvidence } from './temporal-memory.js';
 import { attachGroundedFactResources, resolveEntityIdsForText, setFactEntityLinks } from './relations.js';
+import {
+  requireStandingPolicyDescriptor,
+  type StandingPolicyDescriptor,
+} from './policy-enforcement.js';
 
 // ─── Per-turn semantic recall (reuse the turn's query embedding) ───────────
 // The per-turn fact ranking is SYNCHRONOUS, but embedding the query is async.
@@ -1594,20 +1598,99 @@ export function setFactPinned(id: number, pinned: boolean): boolean {
   return changed;
 }
 
-/** Only policies with a compiled deterministic contract may enter the
- * dispatch guard. `listConstraints()` remains the complete prompt/review set. */
-export function listDispatchConstraints(): ConsolidatedFact[] {
+export interface DispatchStandingPolicy {
+  constraint: ConsolidatedFact;
+  descriptor: StandingPolicyDescriptor;
+  priority: number;
+}
+
+export interface CompiledConstraintStandingPolicy extends DispatchStandingPolicy {
+  policyType: string;
+  enforcement: string;
+}
+
+function parseCompiledConstraintStandingPolicyRows(
+  rows: Array<ConsolidatedFactRow & {
+    applies_to_json: string;
+    priority: number;
+    policy_type: string;
+    enforcement: string;
+  }>,
+  supportedAdapterIds?: readonly string[],
+): CompiledConstraintStandingPolicy[] {
+  const supported = supportedAdapterIds ? new Set(supportedAdapterIds) : null;
+  return rows.map((row) => {
+    const constraint = rowToFact(row);
+    const descriptor = requireStandingPolicyDescriptor(row.applies_to_json, constraint.content);
+    if (supported && !supported.has(descriptor.compiler.adapterId)) {
+      throw new Error(`standing policy #${constraint.id} names unsupported adapter ${descriptor.compiler.adapterId}`);
+    }
+    return {
+      constraint,
+      descriptor,
+      priority: row.priority,
+      policyType: row.policy_type,
+      enforcement: row.enforcement,
+    };
+  });
+}
+
+/** Read every sealed constraint policy, including prompt-only adapter bindings. */
+export function listCompiledConstraintStandingPolicies(
+  options: { supportedAdapterIds?: readonly string[] } = {},
+): CompiledConstraintStandingPolicy[] {
   const rows = openMemoryDb().prepare(`
-    SELECT cf.* FROM consolidated_facts cf
+    SELECT cf.*, mp.applies_to_json, mp.priority, mp.policy_type, mp.enforcement
+    FROM consolidated_facts cf
+    JOIN memory_policies mp ON mp.fact_id = cf.id
+    WHERE cf.active = 1 AND cf.kind = 'constraint'
+    ORDER BY mp.priority DESC, cf.updated_at DESC
+  `).all() as Array<ConsolidatedFactRow & {
+    applies_to_json: string;
+    priority: number;
+    policy_type: string;
+    enforcement: string;
+  }>;
+  return parseCompiledConstraintStandingPolicyRows(rows, options.supportedAdapterIds);
+}
+
+/**
+ * Read the exact compiled contracts that own dispatch behavior.
+ *
+ * A hard/dispatch row with stale prose, an unknown adapter, malformed JSON, or
+ * a bad seal is a registry failure—not an omitted rule. Callers intentionally
+ * fail closed around this function.
+ */
+export function listDispatchStandingPolicies(
+  options: { supportedAdapterIds?: readonly string[] } = {},
+): DispatchStandingPolicy[] {
+  const rows = openMemoryDb().prepare(`
+    SELECT cf.*, mp.applies_to_json, mp.priority, mp.policy_type, mp.enforcement
+    FROM consolidated_facts cf
     JOIN memory_policies mp ON mp.fact_id = cf.id
     WHERE cf.active = 1 AND cf.kind = 'constraint'
       AND mp.policy_type = 'hard_constraint' AND mp.enforcement = 'dispatch'
-      AND CASE WHEN json_valid(mp.applies_to_json) = 1
-        THEN COALESCE(json_extract(mp.applies_to_json, '$.deterministic'), 0)
-        ELSE 0 END = 1
     ORDER BY mp.priority DESC, cf.updated_at DESC
-  `).all() as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  `).all() as Array<ConsolidatedFactRow & {
+    applies_to_json: string;
+    priority: number;
+    policy_type: string;
+    enforcement: string;
+  }>;
+  return parseCompiledConstraintStandingPolicyRows(rows, options.supportedAdapterIds).map((policy) => {
+    const { constraint, descriptor, priority } = policy;
+    if (!descriptor.deterministic || descriptor.directives.length === 0) {
+      throw new Error(`standing policy #${constraint.id} is dispatch-enforced without an executable directive`);
+    }
+    return { constraint, descriptor, priority };
+  });
+}
+
+/** Compatibility read for review surfaces. It still validates every dispatch
+ * descriptor before returning facts, so it cannot recreate the old fail-open
+ * JSON-admission path. New execution code must use listDispatchStandingPolicies. */
+export function listDispatchConstraints(): ConsolidatedFact[] {
+  return listDispatchStandingPolicies().map((policy) => policy.constraint);
 }
 
 /** Active pinned facts (standing instructions), newest-first. Capped so
@@ -1680,6 +1763,52 @@ export function stableFactCandidateRefs(
     }
   } catch { /* scored unavailable → pinned-only refs */ }
   return [...refs.entries()].map(([id, snippet]) => ({ type: 'fact' as const, id: String(id), snippet }));
+}
+
+
+/**
+ * How long a remembered observation stays "just read" before its age is worth
+ * saying out loud. Below this it is noise on every line; above it, silence is
+ * what makes a five-week-old figure read as a live one.
+ */
+export const OBSERVATION_AGE_DISCLOSURE_DAYS = 7;
+
+/**
+ * The age and origin of a remembered OBSERVATION, rendered for the model.
+ *
+ * A fact derived from looking at an external system describes a world that
+ * keeps moving after the look. A fact the user simply told her ("always use
+ * the sf CLI") does not decay, so provenance — not the fact's kind and not its
+ * wording — decides which one this is.
+ *
+ * This exists because the prompt used to render every fact as a bare
+ * assertion. Live 2026-08-27: asked a CRM question, the model was handed a
+ * remembered head-count for a named rep's account portfolio with no date
+ * attached — an observation five weeks stale, via a tool that had since been
+ * deleted — and answered "I can confirm <n> accounts". Nothing in what it
+ * received distinguished that from something read a second ago, so confident
+ * restatement was the only available reading.
+ *
+ * The point is NOT to suppress the answer. Withholding what she knows is its
+ * own failure. The point is that she can only offer "I have this from July —
+ * it has probably moved, want me to re-check?" if the harness tells her which
+ * July it came from.
+ */
+export function observationProvenanceSuffix(
+  fact: Pick<ConsolidatedFact, 'derivedFrom' | 'sourceApp' | 'extractedAt' | 'createdAt'>,
+  nowMs: number = Date.now(),
+): string {
+  const tool = fact.derivedFrom?.tool?.trim() ?? '';
+  const app = fact.sourceApp?.trim() ?? '';
+  // No external origin means nobody observed it — it was stated, not read.
+  if (!tool && !app) return '';
+  const observedAt = fact.extractedAt ?? fact.createdAt;
+  const parsed = Date.parse(observedAt ?? '');
+  if (!Number.isFinite(parsed)) return '';
+  const days = Math.floor((nowMs - parsed) / 86_400_000);
+  if (days < OBSERVATION_AGE_DISCLOSURE_DAYS) return '';
+  const source = app || tool;
+  return ` _(remembered from ${observedAt!.slice(0, 10)}, ${days}d ago, via ${source})_`;
 }
 
 export function renderFactsForInstructions(
@@ -1860,10 +1989,18 @@ export function renderFactsForInstructions(
   };
 
   const scoredSections: string[] = [];
+  const renderNowMs = Date.now();
+  let datedObservationRendered = false;
   for (const kind of FACT_KINDS) {
     const group = byKind[kind];
     if (group.length === 0) continue;
-    const lines = group.map((fact) => `- ${fact.content}`).join('\n');
+    const lines = group
+      .map((fact) => {
+        const provenance = observationProvenanceSuffix(fact, renderNowMs);
+        if (provenance) datedObservationRendered = true;
+        return `- ${fact.content}${provenance}`;
+      })
+      .join('\n');
     scoredSections.push(`**${titles[kind]}**\n${lines}`);
   }
   let scoredBlock = scoredSections.join('\n\n');
@@ -1882,6 +2019,21 @@ export function renderFactsForInstructions(
   if (scoredBlock.length > scoredBudget) {
     scoredBlock = clipToLineBoundary(scoredBlock, scoredBudget);
     if (scoredBlock) scoredBlock += '\n_… more facts elided to fit; call memory_search_facts to widen._';
+  }
+
+  // Say once what the dates mean — AFTER the clip, never inside the budget.
+  // This line sat at the end of the block and was therefore the FIRST thing
+  // the char cap removed: the model kept the ages and lost the only sentence
+  // telling it that offering to re-read was available. Facts compete for the
+  // budget; the instruction for reading them does not compete with them.
+  //
+  // It is a nudge, not a rule. Whether to answer from memory or check live is
+  // the model's call in conversation — the harness's job is to make sure it
+  // knows both are on the table.
+  if (datedObservationRendered && scoredBlock) {
+    scoredBlock += '\n\n_Dated items above are remembered observations, not live readings._'
+      + ' _If one is load-bearing for the answer and may have moved, say when you learned it'
+      + ' and offer to re-check — rather than asserting it as current, or withholding it._';
   }
 
   // Count only facts that actually survived policy/scored clipping and were
@@ -2125,4 +2277,53 @@ export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
     }
   }
   return result;
+}
+
+/**
+ * Correct remembered facts that name a connection id the provider has retired.
+ *
+ * A connection id is an opaque machine identifier. Providers re-issue them on
+ * reconnect, re-auth, or account migration — but a fact that recorded one goes
+ * on asserting it forever, and the model dutifully restates it. Live
+ * 2026-08-28: four active facts named a re-issued Outlook connection, and a
+ * correctly admitted plan for a correctly resolved capability died one call
+ * short because the host had long since bound a different account.
+ *
+ * Repairing that by hand is not a general answer. Most people cannot edit a
+ * SQLite row, and every user of every provider reaches this state eventually,
+ * so the harness has to heal it where it is observed.
+ *
+ * The id is REPLACED rather than the fact retired, because the id was never
+ * the point: "use the Scorpion calendar connection" is the durable intent and
+ * only its machine spelling went stale. supersedeFact carries the pin across,
+ * so a user's pinned preference survives the correction instead of being
+ * silently dropped.
+ *
+ * Returns the number of facts corrected. Never throws: this runs beside live
+ * provider work and must not be able to fail a call.
+ */
+export function correctFactsNamingSupersededAccount(input: {
+  supersededAccountId: string;
+  currentAccountId: string;
+}): number {
+  const stale = input.supersededAccountId.trim();
+  const current = input.currentAccountId.trim();
+  // A blank or identical id would rewrite every fact to itself; a very short
+  // token would match as a substring of unrelated text.
+  if (stale.length < 8 || !current || stale === current) return 0;
+  try {
+    const db = openMemoryDb();
+    const rows = db.prepare(
+      'SELECT id, content FROM consolidated_facts WHERE active = 1 AND instr(content, ?) > 0',
+    ).all(stale) as { id: number; content: string }[];
+    let corrected = 0;
+    for (const row of rows) {
+      const content = row.content.split(stale).join(current);
+      if (content === row.content) continue;
+      if (supersedeFact(row.id, { content })) corrected += 1;
+    }
+    return corrected;
+  } catch {
+    return 0;
+  }
 }

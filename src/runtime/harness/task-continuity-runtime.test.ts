@@ -345,7 +345,7 @@ test('clarification answer classification is conversational but question-shaped 
 
   const liveConfirmation = {
     kind: 'clarification' as const,
-    question: 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "nathan@scorpion..co"; I\'ll send to your Scorpion mailbox nathan.reynolds@scorpion.co unless you want a different one.',
+    question: 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "blake@scorpion..co"; I\'ll send to your Scorpion mailbox blake@scorpion.co unless you want a different one.',
     options: [] as string[],
   };
   for (const answer of [
@@ -1025,33 +1025,119 @@ test('a materially different source answer cannot inherit the pending binding', 
   assert.ok(enriched.taskContinuation, 'the conversational A/Q/B capsule remains available');
   assert.equal(enriched.turnCandidates?.sourceStrategyBinding, undefined,
     'an alternate named source cannot inherit or retain A’s exact Apify binding');
-  await recordAcceptedSourceGraph({
-    identity: { sessionId, turn: answer.turn, sourceUserSeq: answer.seq },
-    surface: 'direct',
-    acceptedText: answerText,
-    verifiedTaskContinuation: enriched.taskContinuation,
-  });
-  const graphFacts = turnControl.compiledGraphPreflightFacts(sessionId, answer.seq);
-  assert.equal(graphFacts?.construct, 'collect_then_construct', JSON.stringify(graphFacts));
-  const decision = turnControl.classifyTurnPreflight({
-    message: answerText,
+  const inspection = runtime.inspectDurableMaterialSourceContinuation({
     sessionId,
-    sessionKind: 'chat',
     sourceUserSeq: answer.seq,
   });
+  assert.equal(inspection.status, 'variant', JSON.stringify(inspection));
+  assert.equal(continuity.readConsumedTaskContinuityPacket({
+    sessionId,
+    consumingSourceUserSeq: answer.seq,
+  }).status, 'consumed');
+  if (inspection.status !== 'variant') return;
+
+  const replacementSlug = 'DATAFORSEO_MAPS_SEARCH';
+  schemaCache.rememberToolSchema(replacementSlug, {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }, Date.now());
+  const replacementFingerprint = schemaCache.liveComposioSchemaFingerprint(replacementSlug);
+  assert.ok(replacementFingerprint);
+  const replacementDraft = {
+    version: 1,
+    primary: {
+      capabilityId: `capability:composio:${replacementSlug}`,
+      schemaFingerprint: replacementFingerprint!,
+    },
+    equivalentFallbacks: [sourceStrategyBinding.primary],
+    topology: 'single_aggregate_read_then_single_artifact_write',
+    topologyDigest: '0'.repeat(64),
+    destination: { family: 'workbook', posture: 'create_new' },
+    effect: 'external_write',
+  } as const;
+  const replacementBinding = {
+    ...replacementDraft,
+    topologyDigest: turnControl.sourceStrategyTopologyDigestFor(replacementDraft)!,
+  };
+  const replacementCandidate = {
+    identifier: replacementSlug,
+    kind: 'composio',
+    intent: 'collect restaurant records from the selected replacement source',
+    klass: 'capability_only',
+    via: 'exact' as const,
+    score: 1,
+    effectClass: 'read' as const,
+    schemaFingerprint: replacementFingerprint!,
+    schemaAuthority: 'live' as const,
+    roleKey: 'clause-0:read',
+    resolutionRoleKeys: ['clause-0:read'],
+    verifiedReadOrigin: {
+      version: 1 as const,
+      sessionId: 'verified-source-origin',
+      sourceUserSeq: 1,
+      receiptId: `rr_${'a'.repeat(32)}`,
+      evidenceDigest: 'b'.repeat(24),
+    },
+    verifiedReadAliasSpecific: true as const,
+    verifiedReadSchemaFingerprint: replacementFingerprint!,
+    sourceStructurallyEligible: true as const,
+  };
+  const prepared = runtime.prepareMaterialSourceVariantRecovery({
+    inspection,
+    resolved: {
+      candidates: [replacementCandidate],
+      requirements: [{
+        roleKey: 'clause-0:read',
+        clauseIndex: 0,
+        text: 'collect restaurant records',
+        effect: 'read',
+        resolved: true,
+        resolvedCapabilities: [replacementCandidate],
+      }],
+      matches: [],
+      pinnedTools: ['composio_execute_tool'],
+      semanticApplied: true,
+      sourceStrategyBinding: replacementBinding,
+    },
+  });
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  if (prepared.status !== 'ready') return;
+  const decision = prepared.decision;
   assert.equal(decision.phase, 'align');
   assert.equal(decision.reason, 'collect_then_construct');
   assert.notEqual(decision.reason, 'continuation_approved');
   assert.equal(decision.sourceStrategyPosture, 'materially_variant');
-  assert.equal(decision.sourceStrategyBinding, undefined);
+  assert.equal(decision.confirmationDisposition, 'material_source_strategy');
+  assert.equal(decision.sourceStrategyBinding?.primary.capabilityId,
+    `capability:composio:${replacementSlug}`);
+  assert.deepEqual(decision.sourceStrategyBinding?.equivalentFallbacks, [],
+    'the fresh selector cannot carry A back into Q2 as a fallback');
+  assert.equal(prepared.turnCandidates.candidates.some((candidate) => candidate.identifier === slug), false,
+    'all authority/candidate state from the rejected source is absent');
+  const ambiguousReplacement = runtime.prepareMaterialSourceVariantRecovery({
+    inspection,
+    resolved: {
+      candidates: [replacementCandidate, { ...replacementCandidate }],
+      requirements: [],
+      matches: [],
+      pinnedTools: ['composio_execute_tool'],
+      semanticApplied: true,
+      sourceStrategyBinding: replacementBinding,
+    },
+  });
+  assert.deepEqual(ambiguousReplacement, {
+    status: 'refused',
+    reason: 'replacement_not_uniquely_current',
+  }, 'two live rows for the same replacement identity are ambiguous');
   const admission = sourceAdmission.evaluateSourceStrategyPhysicalAdmission({
     requirementEffect: 'read',
     requirementRole: 'collection',
     decision,
     requireDurableDecision: true,
-    capability: { capabilityId: 'capability:composio:DATAFORSEO_MAPS_SEARCH' },
+    capability: { capabilityId: `capability:composio:${replacementSlug}` },
   });
-  assert.equal(admission.status, 'refused', 'the alternate provider has zero physical dispatch authority');
+  assert.equal(admission.status, 'refused', 'the replacement remains zero-dispatch until Q2 is confirmed');
 });
 
 test('an ordinal matching only hidden awaiting options cannot consume the parent action', async () => {
@@ -1285,8 +1371,8 @@ test('send-consent controls cannot also consume a generic clarification packet',
 
 test('the exact live A/Q/B confirmation closes one question and rehydrates its lineage across restart', async () => {
   const sessionId = 'continuity-live-compound-confirmation';
-  const parent = 'Pull the top five restaurants in Ventura, California using amplify put them in a new Google sheet with their name rating address and the most recent review if possible and then go ahead and email me a link nathan@scorpion..co';
-  const question = 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "nathan@scorpion..co"; I\'ll send to your Scorpion mailbox nathan.reynolds@scorpion.co unless you want a different one.';
+  const parent = 'Pull the top five restaurants in Ventura, California using amplify put them in a new Google sheet with their name rating address and the most recent review if possible and then go ahead and email me a link blake@scorpion..co';
+  const question = 'Two quick confirmations before I run it: (1) "amplify" = Apify (the Google Maps scraper you\'ve used before) — yes? (2) The address came through as "blake@scorpion..co"; I\'ll send to your Scorpion mailbox blake@scorpion.co unless you want a different one.';
   const source = accepted(sessionId, parent);
   commitClarification({
     sessionId,
@@ -1305,7 +1391,7 @@ test('the exact live A/Q/B confirmation closes one question and rehydrates its l
   assert.equal(enriched.taskContinuation?.parentInput, parent);
   assert.equal(enriched.taskContinuation?.question, question);
   assert.match(enriched.semanticTaskInput ?? '', /Apify/);
-  assert.match(enriched.semanticTaskInput ?? '', /nathan\.reynolds@scorpion\.co/);
+  assert.match(enriched.semanticTaskInput ?? '', /blake@scorpion\.co/);
   assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), { status: 'none' });
 
   eventlog.closeEventLog();

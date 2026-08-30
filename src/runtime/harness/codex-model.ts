@@ -1032,7 +1032,7 @@ export function splitCodexInstructions(raw: string | undefined | null): { instru
   if (idx < 0) return { instructions: stripCacheBreakSentinel(s), trailingContext: '' };
   return {
     instructions: s.slice(0, idx),
-    trailingContext: s.slice(idx + INSTRUCTION_CACHE_DELIM.length),
+    trailingContext: stripCacheBreakSentinel(s.slice(idx + INSTRUCTION_CACHE_DELIM.length)),
   };
 }
 

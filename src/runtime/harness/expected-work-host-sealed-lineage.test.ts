@@ -117,6 +117,9 @@ function persistNodeBinding(input: {
     })),
     account: 'account:host-sealed-lineage',
     effect: input.effect,
+    ...(input.effect === 'external_write' || input.effect === 'local_write'
+      ? { destination: { family: 'fixture-report', posture: 'create_new' } }
+      : {}),
   };
   const binding: SealedNodeBinding = {
     ...unsealed,

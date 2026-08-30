@@ -16,10 +16,11 @@ import { getStoredClaudeTokens } from '../claude-oauth.js';
 import { defaultForRole, type ModelRole } from './model-roles.js';
 import { resolveProvider, type ModelProviderClass } from './model-wire-registry.js';
 import {
-  getByoProviders,
-  providerToBackendConfig,
-  configuredByoProvidersForModel,
-  resolveEffectiveProviderForModel,
+  captureByoRoutingSnapshot,
+  getByoProviderSnapshotsFromRoutingSnapshot,
+  resolveEffectiveProviderForModelFromSnapshot,
+  type ByoProviderSnapshot,
+  type ByoRoutingSnapshot,
 } from './byo-providers.js';
 import { discoveredModels, labelForModelId, modelDiscoveryStatus, type ModelDiscoveryPhase } from './model-discovery.js';
 
@@ -32,16 +33,57 @@ export interface AvailableModelGroup {
   models: Array<{ id: string; label: string }>;
 }
 
-/** Union of model ids served by every CONFIGURED (keyed) BYO provider — the
- *  allow-set for binding any non-brain role. For a migrated single-BYO user this
- *  is exactly {primaryId, judgeId, worker}, so existing bindings never demote. */
-function connectedByoModelIds(): Set<string> {
-  const ids = new Set<string>();
-  for (const p of getByoProviders()) {
-    if (!providerToBackendConfig(p).configured) continue;
-    for (const id of p.modelIds) ids.add(id);
-  }
-  return ids;
+interface ModelOptionDerivationContext {
+  readonly byo: ByoRoutingSnapshot;
+  readonly connected: Readonly<{ codex: boolean; claude: boolean }>;
+  readonly roleAvailable: Readonly<{ codex: boolean; claude: boolean }>;
+}
+
+export interface ModelOptionSnapshotObservation {
+  providerCount: number;
+  configuredProviderCount: number;
+  modelCount: number;
+}
+
+let modelOptionSnapshotObserverForTest:
+  | ((observation: ModelOptionSnapshotObservation) => void)
+  | undefined;
+
+/** Test-only observation seam. It measures environment-backed snapshot
+ * CAPTURES, not pure per-model lookups, so a large catalog can prove the former
+ * remains O(provider count) instead of regressing to O(model count). */
+export function _setModelOptionSnapshotObserverForTest(
+  observer: ((observation: ModelOptionSnapshotObservation) => void) | null,
+): void {
+  modelOptionSnapshotObserverForTest = observer ?? undefined;
+}
+
+/**
+ * Capture mutable runtime/provider state exactly once for one settings
+ * derivation. Every model lookup after this point is pure and indexed.
+ *
+ * Do not promote this to a cross-request cache: Settings writes intentionally
+ * change process.env/.env at runtime, and the next request must observe them.
+ */
+function captureModelOptionContext(): ModelOptionDerivationContext {
+  const byo = captureByoRoutingSnapshot();
+  const connected = Object.freeze({
+    codex: codexModelsAvailable(),
+    claude: claudeModelsAvailable(),
+  });
+  const roleAvailable = Object.freeze(debateBrainsAvailable());
+
+  modelOptionSnapshotObserverForTest?.({
+    providerCount: byo.providers.length,
+    configuredProviderCount: byo.providers.filter(({ backend }) => backend.configured).length,
+    modelCount: byo.providers.reduce((sum, { provider }) => sum + provider.modelIds.length, 0),
+  });
+
+  return Object.freeze({
+    byo,
+    connected,
+    roleAvailable,
+  });
 }
 
 export type RoleModelCapability =
@@ -202,95 +244,63 @@ export function claudeModelsAvailable(): boolean {
   }
 }
 
-export function connectedModelGroups(): AvailableModelGroup[] {
+function connectedModelGroupsFromContext(context: ModelOptionDerivationContext): AvailableModelGroup[] {
   const groups: AvailableModelGroup[] = [];
 
   // Presets + configured slots + LIVE-DISCOVERED models (providers' /v1/models):
   // a newly released Codex/Anthropic model shows up as a choice on the next
   // settings poll, no Clementine release needed.
-  if (codexModelsAvailable()) {
+  if (context.connected.codex) {
     groups.push({ provider: 'codex', label: 'Codex', models: codexBrainModelChoices() });
   }
-
-  if (claudeModelsAvailable()) {
+  if (context.connected.claude) {
     groups.push({ provider: 'claude', label: 'Claude', models: claudeBrainModelChoices() });
   }
 
   // One group per CONNECTED BYO provider, so the picker lists every model the
   // user has added across providers (GLM + DeepSeek + MiniMax …).
-  for (const provider of getByoProviders()) {
-    if (!providerToBackendConfig(provider).configured) continue;
+  for (const { provider, backend } of context.byo.providers) {
+    if (!backend.configured) continue;
+    const seen = new Set<string>();
     const models: Array<{ id: string; label: string }> = [];
-    for (const id of provider.modelIds) pushUnique(models, id);
+    for (const raw of provider.modelIds) {
+      const id = raw.trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      models.push({ id, label: id });
+    }
     if (models.length === 0) continue;
     groups.push({ provider: 'byo', providerId: provider.id, label: provider.label || 'Custom', models });
   }
-
   return groups;
 }
 
-export function connectedModelGroupsForRole(role: ModelRole): AvailableModelGroup[] {
-  if (role === 'brain') return [];
-  return connectedModelGroups()
-    .map((group) => {
-      const models = group.models.filter((model) => {
-        const capability = roleModelCapability(role, model.id);
-        return capability.ok && capability.provider === group.provider;
-      });
-      return { ...group, models };
-    })
-    .filter((group) => group.models.length > 0);
+export function connectedModelGroups(): AvailableModelGroup[] {
+  return connectedModelGroupsFromContext(captureModelOptionContext());
 }
 
-export function modelIdsAvailableForRole(role: ModelRole): Set<string> {
-  const ids = new Set<string>();
-  for (const group of connectedModelGroupsForRole(role)) {
-    for (const model of group.models) ids.add(model.id);
-  }
-  return ids;
-}
-
-export function roleModelCapability(role: ModelRole, modelId: string): RoleModelCapability {
+function roleModelCapabilityFromContext(
+  role: ModelRole,
+  modelId: string,
+  context: ModelOptionDerivationContext,
+): RoleModelCapability {
   if (role === 'brain') {
     return { ok: false, reason: 'The brain is set through the active-brain provider switch for now.' };
   }
   const clean = modelId.trim();
   if (!clean) return { ok: false, reason: 'modelId is required.' };
+
   let provider: ModelProviderClass;
   try {
-    // Hybrid stacks (owner ask, 2026-07-24): in all-in, a claude-shaped id
-    // with a CONNECTED Claude login validates as 'claude' — VALIDATION ONLY.
-    // The wire classifier keeps the full all-in collapse so tool-bearing
-    // dispatch paths (workers, space runners) never route onto the text-only
-    // headless transport; the judge (tools: []) and the agent runner's native
-    // claude mapping dispatch the bound model correctly.
-    let shape: ModelProviderClass | null = null;
-    try { shape = resolveProvider(clean); } catch { shape = null; }
-    if (
-      shape === 'claude'
-      && getModelRoutingMode() === 'all_in'
-      && getByoBackendConfig().configured
-      && configuredByoProvidersForModel(clean).length === 0
-      && debateBrainsAvailable().claude
-    ) {
-      provider = 'claude';
-    } else {
-      provider = resolveEffectiveProviderForModel(clean);
-    }
+    provider = resolveEffectiveProviderForModelFromSnapshot(clean, context.byo);
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
 
-  if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured && provider !== 'byo') {
-    // Hybrid stacks (owner ask, 2026-07-24: cheap BYO brain + frontier judge —
-    // "kimi with cheap workers but a really good judge"): all-in collapses
-    // DEFAULTS to the BYO backend, but an EXPLICIT binding to a CONNECTED
-    // OAuth family is honored — the judge/worker runners resolve their own
-    // provider per model, independent of the brain. This also restores the
-    // never-self-grade property all-in was silently breaking (BYO judging
-    // BYO). Only genuinely disconnected families are refused.
-    const oauth = debateBrainsAvailable();
-    const connected = provider === 'claude' ? oauth.claude : provider === 'codex' ? oauth.codex : false;
+  if (context.byo.mode === 'all_in' && context.byo.defaultBackend.configured && provider !== 'byo') {
+    const connected = provider === 'claude'
+      ? context.roleAvailable.claude
+      : provider === 'codex' ? context.roleAvailable.codex : false;
     if (!connected) {
       return {
         ok: false,
@@ -299,45 +309,81 @@ export function roleModelCapability(role: ModelRole, modelId: string): RoleModel
     }
   }
 
-  if (provider === 'byo') {
-    // Any model offered by any connected provider can serve any non-brain role
-    // (the user declares a provider's models at connect time; worker vs judge is
-    // their pick, not a per-env distinction). Union across all configured providers.
-    const allowed = connectedByoModelIds();
-    if (allowed.size === 0) return { ok: false, reason: 'No BYO backend is configured.' };
-    if (!allowed.has(clean)) {
-      // A claude/codex-shaped id landing in the BYO branch means the all-in
-      // collapse claimed it because that family's login is NOT connected —
-      // say so, instead of sending the user to a BYO model list.
-      let family: ModelProviderClass | null = null;
-      try { family = resolveProvider(clean); } catch { family = null; }
-      if (family === 'claude') {
-        return {
-          ok: false,
-          reason: `${clean} needs a connected Claude login — sign in under Models & routing, or pick a BYO model.`,
-        };
-      }
-      if (family === 'codex') {
-        return {
-          ok: false,
-          reason: `${clean} is unavailable while all-in mode is on — Codex-family ids stay on the BYO backend in all-in. Use a Claude model for this role, or turn all-in off.`,
-        };
-      }
+  if (provider === 'byo' && !context.byo.hasConnectedModel(clean)) {
+    let family: ModelProviderClass | null = null;
+    try { family = resolveProvider(clean); } catch { family = null; }
+    if (family === 'claude') {
       return {
         ok: false,
-        reason: `BYO model ${clean} is not offered by any connected provider. Add it to a provider's model list in Settings → Models.`,
+        reason: `${clean} needs a connected Claude login — sign in under Models & routing, or pick a BYO model.`,
       };
     }
+    if (family === 'codex') {
+      return {
+        ok: false,
+        reason: `${clean} is unavailable while all-in mode is on — Codex-family ids stay on the BYO backend in all-in. Use a Claude model for this role, or turn all-in off.`,
+      };
+    }
+    if (!context.byo.providers.some(({ provider: candidate, backend }) =>
+      backend.configured && candidate.modelIds.length > 0)) {
+      return { ok: false, reason: 'No BYO backend is configured.' };
+    }
+    return {
+      ok: false,
+      reason: `BYO model ${clean} is not offered by any connected provider. Add it to a provider's model list in Settings → Models.`,
+    };
   }
 
   return { ok: true, provider };
 }
 
+function connectedModelGroupsForRoleFromContext(
+  role: ModelRole,
+  context: ModelOptionDerivationContext,
+  groups = connectedModelGroupsFromContext(context),
+): AvailableModelGroup[] {
+  if (role === 'brain') return [];
+  return groups
+    .map((group) => {
+      const models = group.models.filter((model) => {
+        const capability = roleModelCapabilityFromContext(role, model.id, context);
+        return capability.ok && capability.provider === group.provider;
+      });
+      return { ...group, models };
+    })
+    .filter((group) => group.models.length > 0);
+}
+
+export function connectedModelGroupsForRole(role: ModelRole): AvailableModelGroup[] {
+  const context = captureModelOptionContext();
+  return connectedModelGroupsForRoleFromContext(role, context);
+}
+
+function modelIdsAvailableForRoleFromContext(
+  role: ModelRole,
+  context: ModelOptionDerivationContext,
+): Set<string> {
+  const ids = new Set<string>();
+  for (const group of connectedModelGroupsForRoleFromContext(role, context)) {
+    for (const model of group.models) ids.add(model.id);
+  }
+  return ids;
+}
+
+export function modelIdsAvailableForRole(role: ModelRole): Set<string> {
+  return modelIdsAvailableForRoleFromContext(role, captureModelOptionContext());
+}
+
+export function roleModelCapability(role: ModelRole, modelId: string): RoleModelCapability {
+  return roleModelCapabilityFromContext(role, modelId, captureModelOptionContext());
+}
+
 export function validateRoleModelBinding(role: ModelRole, modelId: string): RoleModelCapability {
-  const capability = roleModelCapability(role, modelId);
+  const context = captureModelOptionContext();
+  const capability = roleModelCapabilityFromContext(role, modelId, context);
   if (!capability.ok) return capability;
 
-  const allowed = modelIdsAvailableForRole(role);
+  const allowed = modelIdsAvailableForRoleFromContext(role, context);
   const clean = modelId.trim();
   if (!allowed.has(clean)) {
     const available = [...allowed].sort();
@@ -348,7 +394,6 @@ export function validateRoleModelBinding(role: ModelRole, modelId: string): Role
         : `No connected models are available for ${role}. Connect Codex, Claude, or a BYO backend first.`,
     };
   }
-
   return capability;
 }
 
@@ -375,14 +420,17 @@ export interface BrainOption {
  *  connected model can be the brain: the router resolves a chosen model id to its
  *  OWNING provider's baseURL+key via resolveByoProviderForModel, so selecting an
  *  extra-provider model (e.g. a Together AI model) just works — no slot reshuffle. */
-export function brainOptions(): BrainOption[] {
+function brainOptionsFromContext(
+  context: ModelOptionDerivationContext,
+  groups = connectedModelGroupsFromContext(context),
+): BrainOption[] {
   const opts: BrainOption[] = [];
   // Codex brain: offer the SPECIFIC gpt-5.x model (like the worker picker) so the
   // brain can be pinned to gpt-5.5 vs gpt-5.4 — not just "Codex". Sourced from the
   // same connected-Codex model list the worker uses; value `codex_oauth:<id>` so
   // the active-brain route persists the exact model. Falls back to unavailable
   // model-specific rows when Codex isn't connected so effectiveBrainValue remains in-list.
-  const codexGroup = connectedModelGroups().find((g) => g.provider === 'codex');
+  const codexGroup = groups.find((g) => g.provider === 'codex');
   const codexModels = codexGroup?.models?.length ? codexGroup.models : codexBrainModelChoices();
   for (const m of codexModels) {
     opts.push({
@@ -398,7 +446,7 @@ export function brainOptions(): BrainOption[] {
   // value `claude_oauth:<id>` so the active-brain route persists the exact model
   // (→ CLAUDE_MODEL). Falls back to unavailable model-specific rows when Claude
   // isn't connected so effectiveBrainValue remains in-list.
-  const claudeGroup = connectedModelGroups().find((g) => g.provider === 'claude');
+  const claudeGroup = groups.find((g) => g.provider === 'claude');
   const claudeModels = claudeGroup?.models?.length ? claudeGroup.models : claudeBrainModelChoices();
   for (const m of claudeModels) {
     opts.push({
@@ -410,11 +458,11 @@ export function brainOptions(): BrainOption[] {
     });
   }
   const seen = new Set<string>();
-  for (const provider of getByoProviders()) {
-    if (!providerToBackendConfig(provider).configured) continue;
+  for (const { provider, backend } of context.byo.providers) {
+    if (!backend.configured) continue;
     for (const raw of provider.modelIds) {
       const modelId = raw.trim();
-      if (configuredByoProvidersForModel(modelId).length > 1) continue;
+      if (context.byo.configuredOwnersForModel(modelId).length > 1) continue;
       if (!modelId || seen.has(modelId)) continue;
       seen.add(modelId);
       opts.push({
@@ -428,6 +476,37 @@ export function brainOptions(): BrainOption[] {
     }
   }
   return opts;
+}
+
+export function brainOptions(): BrainOption[] {
+  const context = captureModelOptionContext();
+  return brainOptionsFromContext(context);
+}
+
+export interface ModelRoleOptionCatalogSnapshot {
+  available: AvailableModelGroup[];
+  roleOptions: {
+    worker: AvailableModelGroup[];
+    judge: AvailableModelGroup[];
+  };
+  brainOptions: BrainOption[];
+  providerSnapshots: ByoProviderSnapshot[];
+}
+
+/** One coherent settings-catalog derivation. Provider configuration is read
+ * once, then worker/judge/brain choices share the same immutable indexed view. */
+export function modelRoleOptionCatalogSnapshot(): ModelRoleOptionCatalogSnapshot {
+  const context = captureModelOptionContext();
+  const available = connectedModelGroupsFromContext(context);
+  return {
+    available,
+    roleOptions: {
+      worker: connectedModelGroupsForRoleFromContext('worker', context, available),
+      judge: connectedModelGroupsForRoleFromContext('judge', context, available),
+    },
+    brainOptions: brainOptionsFromContext(context, available),
+    providerSnapshots: getByoProviderSnapshotsFromRoutingSnapshot(context.byo),
+  };
 }
 
 /** The selector VALUE for the brain the wire actually uses — matches one of

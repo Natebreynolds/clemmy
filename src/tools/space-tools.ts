@@ -1,17 +1,18 @@
 /**
  * Workspaces ("Spaces") authoring tools — Clem's surface for standing up a
- * persistent, interactive surface for the user. She writes the view code with
- * the existing `write_file` tool; these tools do only the bookkeeping wiring
- * (install the view as the canonical/versioned copy, persist the manifest,
- * record the data sources + re-engage contract). Daily scheduling of a data
- * source is wired in a later phase; the manifest already records it.
+ * persistent, interactive surface for the user. Ordinary views travel inline
+ * with the authoritative `space_save` commit; `view_path` remains as legacy /
+ * oversized-file compatibility. The tool installs the canonical/versioned
+ * copy, persists the manifest, and records data sources + re-engage contract.
+ * Daily scheduling of a data source is wired in a later phase; the manifest
+ * already records it.
  *
  * Registered in BOTH local-runtime-tools.ts (the harness's in-process tool
  * surface) and mcp-server.ts (the standalone MCP server) — mirrors
  * registerWorkflowScheduleTools.
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -47,7 +48,12 @@ import {
   spaceActionNeedsApproval,
   standingSpaceActionAuthority,
 } from '../spaces/space-action-gate.js';
+import {
+  acquireAutoSpaceActionV3Authority,
+  evaluateSpaceActionV3AutoConsent,
+} from '../spaces/space-action-v3-authority.js';
 import { redactSensitiveText } from '../runtime/security.js';
+import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
 
 // Re-exported for back-compat (space-tools.test.ts imports it from here); the
 // canonical definition now lives in the shared leaf so workflow_get can reuse it.
@@ -320,6 +326,10 @@ const VIEW_READ_CHAR_CAP = 48_000;
  *  ceiling so a whole typical view reads in one call (the 12000 default would cut
  *  most views and our grep note). */
 const VIEW_READ_RESULT_MAX_CHARS = 50_000;
+/** Keep ordinary inline authoring below the same per-call byte budget as the
+ * former write_file staging hop. The HTML bytes now ride the exact space_save
+ * argument digest, so no mutable path can change between consent and commit. */
+export const SPACE_INLINE_VIEW_MAX_BYTES = 24_000;
 
 /**
  * Render a view's HTML for space_get_view: cat -n style line numbers so the model
@@ -399,7 +409,8 @@ export function registerSpaceTools(server: McpServer): void {
     'space_save',
     [
       'Create or update a Workspace — a persistent, interactive HTML surface you build for the user (a live report, a CRM mini-app, a daily planner, a tracker). Idempotent: pass an existing slug to UPDATE it.',
-      `FIRST write the self-contained view with write_file (inline CSS/JS only — external CDNs are blocked by CSP). It may live at ANY path inside ${BASE_DIR}; pass that path as view_path and space_save installs it.`,
+      `For an ordinary view, pass the complete self-contained HTML directly as view_html (maximum ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes; inline CSS/JS only — external CDNs are blocked by CSP). This keeps creation to one authoritative, versioned space_save commit.`,
+      `view_path is legacy / oversized-file compatibility for an already-authored file inside ${BASE_DIR}; pass exactly one of view_html or view_path when replacing the view.`,
       'The view calls same-origin data routes the user opens in the desktop: GET /api/console/spaces/<slug>/data, POST /api/console/spaces/<slug>/notes. It can call any /api endpoint (it inherits the session).',
       'A helper `clem` is auto-injected into every served view. For declared data, PREFER `const data = await clem.data()` and read the exact declared id as `data["<sourceId>"]`; `await clem.refresh(sourceId?)` also returns `{ results, data }`. Legacy placeholders such as `{{tasks}}` are NOT expanded and embedded seeds are static. Existing absolute `/api/console/spaces/<slug>/data` views remain supported through the same scoped RPC bridge. Also available: `await clem.compose(instructions, context)` → a grounded draft; `await clem.action(actionId, args)`; `await clem.note(text, kind?, meta?)`.',
       'APPROVAL CONTRACT: an action that SENDS or writes to an external system takes ONE user approval before it fires — for those `clem.action()` returns {pending:true, approvalId} (it surfaces in the user\'s inbox/board and runs when approved); a read-only action returns {ok:true, result} immediately. Build the view to show a "waiting for approval" state on a pending result — never tell the user it sent until it actually ran.',
@@ -418,7 +429,8 @@ export function registerSpaceTools(server: McpServer): void {
       objective: z.string().min(4).max(1200).nullish().describe('Durable user outcome this Workspace exists to advance. Set from the agreed request; omit on later saves to preserve it.'),
       success_criteria: z.array(z.string().min(1).max(500)).max(12).nullish().describe('Optional observable definition of good/done (counts, freshness, required views/actions, quality checks). An explicit [] clears the list; omit to preserve it.'),
       invariants: z.array(z.string().min(1).max(500)).max(12).nullish().describe('Optional user/product rules that later edits must never violate, e.g. "Salesforce remains read-only" or "Never publish without approval". An explicit [] clears; omit to preserve.'),
-      view_path: z.string().max(1000).nullish().describe(`Path to the HTML file you wrote with write_file (inside ${BASE_DIR}). Required when first creating; omit to update only metadata.`),
+      view_html: z.string().min(1).max(SPACE_INLINE_VIEW_MAX_BYTES).nullish().describe(`Preferred for ordinary views: complete self-contained HTML, at most ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes. Mutually exclusive with view_path; omit both to update only metadata on an existing Workspace.`),
+      view_path: z.string().max(1000).nullish().describe(`Legacy / oversized compatibility: path to an already-authored HTML file inside ${BASE_DIR}. Mutually exclusive with view_html; omit both to update only metadata on an existing Workspace.`),
       data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh.'),
       actions: z.array(actionShape).nullish().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
       reengage_triggers: z.array(z.enum(['note', 'ask', 'threshold'])).nullish().describe('Which in-workspace events should wake you to reason: "note" (user left a note), "ask" (user asked in the workspace chat), "threshold" (data crossed a limit).'),
@@ -426,15 +438,33 @@ export function registerSpaceTools(server: McpServer): void {
       origin_session_id: z.string().max(200).nullish().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
     },
     async ({
-      slug, title, objective, success_criteria, invariants, view_path, data_sources, actions,
+      slug, title, objective, success_criteria, invariants, view_html, view_path, data_sources, actions,
       reengage_triggers, reengage_guidance, origin_session_id,
     }) => {
       if (!isValidSpaceSlug(slug)) {
         return textResult(`Error: "${slug}" is not a valid workspace slug. Use lowercase kebab-case, 2-63 chars (e.g. "sf-daily-report").`);
       }
       const existing = spaceStore.get(slug);
-      if (!existing && (!view_path || !view_path.trim())) {
-        return textResult('Error: view_path is required when creating a new workspace. Write the HTML with write_file first, then pass its path.');
+      const inlineView = typeof view_html === 'string' && view_html.trim().length > 0
+        ? view_html
+        : null;
+      const viewPath = typeof view_path === 'string' && view_path.trim().length > 0
+        ? view_path.trim()
+        : null;
+      if (inlineView !== null && viewPath !== null) {
+        return textResult('Error: pass exactly one of view_html or view_path, never both. No Workspace changes were saved.');
+      }
+      if (typeof view_html === 'string' && inlineView === null) {
+        return textResult('Error: view_html must contain non-blank HTML. No Workspace changes were saved.');
+      }
+      if (inlineView !== null && Buffer.byteLength(inlineView, 'utf8') > SPACE_INLINE_VIEW_MAX_BYTES) {
+        return textResult(
+          `Error: view_html is over the ${SPACE_INLINE_VIEW_MAX_BYTES}-byte inline limit. No Workspace changes were saved. `
+          + 'Use view_path only for an already-authored oversized compatibility file.',
+        );
+      }
+      if (!existing && inlineView === null && viewPath === null) {
+        return textResult('Error: view_html or view_path is required when creating a new Workspace. No Workspace was saved.');
       }
       if (existing?.manifestErrors && existing.manifestErrors.length > 0) {
         const needsSources = existing.manifestErrors.some((e) => /^Data source /.test(e));
@@ -453,10 +483,13 @@ export function registerSpaceTools(server: McpServer): void {
       // Authoring-reliability gate (mirror of prepareWorkflowForWrite): auto-repair
       // + validate the declared data sources/actions BEFORE installing the view or
       // persisting. Refuse a Workspace set up to fail; repairs surface as advisories.
-      let authoredView: ReturnType<typeof readAgentOwnedFile> | null = null;
-      if (view_path && view_path.trim()) {
-        authoredView = readAgentOwnedFile(view_path.trim());
-        if (!authoredView.ok) return textResult(`Error: ${authoredView.error}`);
+      let authoredView: { ok: true; content: string; resolved: string | null } | null = null;
+      if (inlineView !== null) {
+        authoredView = { ok: true, content: inlineView, resolved: null };
+      } else if (viewPath !== null) {
+        const read = readAgentOwnedFile(viewPath);
+        if (!read.ok) return textResult(`Error: ${read.error}`);
+        authoredView = read;
       }
 
       const parseErrors: string[] = [];
@@ -562,20 +595,6 @@ export function registerSpaceTools(server: McpServer): void {
         }
       }
 
-      // Install the view (snapshot the prior canonical first, for revert).
-      if (authoredView?.ok) {
-        const read = authoredView;
-        const canonical = resolveInSpace(slug, existing?.viewEntry ?? 'view/index.html');
-        const prior = existsSync(canonical) ? readFileSync(canonical, 'utf-8') : null;
-        if (prior !== null && prior !== read.content) {
-          spaceStore.recordRevision(slug); // snapshot the prior view + bump version
-        }
-        if (read.resolved !== canonical) {
-          mkdirSync(path.dirname(canonical), { recursive: true });
-          writeFileSync(canonical, read.content, 'utf-8');
-        }
-      }
-
       const ambientSession = getToolOutputContext()?.sessionId;
       const reengage = (reengage_triggers && reengage_triggers.length > 0)
         ? { triggers: reengage_triggers, guidance: reengage_guidance?.trim() || undefined }
@@ -589,6 +608,7 @@ export function registerSpaceTools(server: McpServer): void {
         status: existing?.status === 'archived' ? 'archived' : 'active',
         ...(contract ? { contract } : {}),
         viewEntry: 'view/index.html',
+        ...(authoredView?.ok ? { viewContent: authoredView.content } : {}),
         dataSources: prep.dataSources,
         actions: prep.actions,
         reengage: reengage ?? existing?.reengage,
@@ -664,6 +684,16 @@ export function registerSpaceTools(server: McpServer): void {
         kind: 'gap',
         meta: { gaps: gaps.map((g) => ({ resolution: g.resolution, question: g.question, why: g.why })) },
       });
+      // spaceStore.save indexed the manifest/view before the durable gap note
+      // existed. Reindex the exact final filesystem state before stamping
+      // authoring success so view + notes digests cannot lag the returned
+      // Workspace revision.
+      indexWorkspaceRecord(record, {
+        actor: 'space-save-final-state',
+        emitOperational: false,
+        appendStateEvent: false,
+        strict: true,
+      });
       const gapQuestions = renderSpaceGapQuestions(gaps);
       const contractListsDropped =
         !record.contract && ((success_criteria?.length ?? 0) > 0 || (invariants?.length ?? 0) > 0);
@@ -672,20 +702,23 @@ export function registerSpaceTools(server: McpServer): void {
         : contractListsDropped
           ? ' Operating contract NOT saved: success criteria/invariants need an objective — re-save with objective to pin them.'
           : ' Operating contract is not pinned yet; preserve the user\'s stated purpose on the next substantive save.';
-      return textResult(
-        `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
-        + `${contractNote} The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`,
-      );
+      const result = `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
+        + `${contractNote} The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`;
+      return textResult(withHostLocalWriteCommitFromFile({
+        createdId: slug,
+        committedPath: resolveInSpace(slug, record.viewEntry),
+        result,
+      }));
     },
   );
 
   server.tool(
     'space_action_prepare',
     [
-      'Prepare ONE action already declared in a Workspace for the user to approve, or execute it when exact standing approval already covers this invocation.',
-      'With no standing approval, this tool only creates/reuses the same exact approval card used by the Workspace button and does not dispatch. With standing approval, it executes only the exact declared action, caller arguments, and current runner bytes covered by that authority through the existing Workspace receipt path.',
+      'Run ONE exact action already declared in a Workspace under canonical Auto, asking the user only when the exact current effect is irreversible, destructive, administrative, ambiguous, or otherwise genuinely user-owned.',
+      'An ordinary current Composio create/update executes through the durable workflow_v3_call receipt path without a card. Sends/deletes/admin work still create one exact approval. Ambiguous accounts ask one account choice and never create a blind approval.',
       'The approval is bound to the exact Workspace, declared action manifest, runner digest when applicable, and caller arguments. You cannot supply or override a Composio slug, runner, or wildcard authority here.',
-      'Use only after Workspace evidence supports the proposed action and the user asked you to take or prepare it. Report exactly the returned status: waiting when an approval was staged, or executed only when the result says standing authority ran it.',
+      'Use only after Workspace evidence supports the proposed action and the user asked you to take it. Report exactly the returned status: waiting when an approval was staged, a choice when account/target identity is ambiguous, or executed only when the durable kernel says it ran.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('Exact existing Workspace slug.'),
@@ -754,6 +787,85 @@ export function registerSpaceTools(server: McpServer): void {
             + '(the user already approved this exact runner version; no new approval was needed).'
           : `"${action.label ?? action.id}" was covered by standing approval ${standing.approvalId} but failed: ${result.error}`);
       }
+
+      if (action.composioSlug?.trim()) {
+        const ambient = getToolOutputContext();
+        const sourceUserSeq = ambient?.sourceUserSeq;
+        const outerCallId = ambient?.callId?.trim();
+        if (
+          !ambient?.sessionId?.trim()
+          || !Number.isSafeInteger(sourceUserSeq)
+          || sourceUserSeq! <= 0
+          || !outerCallId
+        ) {
+          return textResult(
+            `Action "${action_id}" was not run because its one-shot request identity is unavailable. `
+            + 'Retry it from the active conversation so the exact action can be bound once.',
+          );
+        }
+        const runOccurrenceId = `space-auto:${createHash('sha256').update(JSON.stringify({
+          version: 1,
+          sessionId: ambient.sessionId,
+          sourceUserSeq,
+          outerCallId,
+          slug,
+          actionId: action_id,
+          callerArgs,
+        }), 'utf8').digest('hex')}`;
+        const evaluated = evaluateSpaceActionV3AutoConsent({
+          slug,
+          action,
+          callerArgs,
+          runOccurrenceId,
+        });
+        if (evaluated.status === 'needs_user') {
+          return textResult(evaluated.need === 'choice'
+            ? `The account for "${action.label ?? action.id}" is ambiguous. Choose which connected account should own this action, then retry. ${evaluated.message}`
+            : `Connect the account required for "${action.label ?? action.id}", then retry. ${evaluated.message}`);
+        }
+        if (evaluated.status === 'conflict') {
+          return textResult(
+            `Action "${action_id}" was not run because its current capability binding could not be verified: `
+            + redactSensitiveText(evaluated.reason),
+          );
+        }
+        if (evaluated.decision.kind === 'proceed') {
+          if (!evaluated.authorization) {
+            return textResult(
+              `Action "${action_id}" was not run because its exact Auto authorization was unavailable.`,
+            );
+          }
+          const acquired = acquireAutoSpaceActionV3Authority({
+            slug,
+            preparation: evaluated.preparation,
+            authorization: evaluated.authorization,
+          });
+          if (!acquired.ok) {
+            return textResult(
+              `Action "${action_id}" was not run: ${redactSensitiveText(acquired.error)}`,
+            );
+          }
+          const { runSpaceAction } = await import('../spaces/runner.js');
+          const result = await runSpaceAction(rec.id, action, callerArgs, {
+            composioAuthority: acquired.authority,
+          });
+          return textResult(result.ok
+            ? `Ran "${action.label ?? action.id}" in workspace "${rec.title}".`
+            : `"${action.label ?? action.id}" failed: ${redactSensitiveText(result.error)}`);
+        }
+        if (evaluated.decision.kind === 'needs_user') {
+          if (evaluated.decision.need !== 'approval') {
+            return textResult(
+              `"${action.label ?? action.id}" needs ${evaluated.decision.need.replace('_', ' ')} before it can run.`,
+            );
+          }
+          // High-consequence work retains the existing one exact visible card.
+        } else {
+          return textResult(
+            `Action "${action_id}" was not run because its exact effect authority needs internal repair.`,
+          );
+        }
+      }
       try {
         const prepared = enqueueSpaceActionApproval(rec, action, callerArgs);
         return textResult(
@@ -775,9 +887,9 @@ export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_edit_view',
     [
-      'Make a TARGETED edit to an existing Workspace view — FAST, for small tweaks (a button, label, color, a bit of logic). Use this instead of rewriting the whole file with write_file + space_save: it sends only the changed snippet, so it is far cheaper and quicker.',
+      'Make a TARGETED edit to an existing Workspace view — FAST, for small tweaks (a button, label, color, a bit of logic). Use this instead of resending the whole view through space_save: it sends only the changed snippet, so it is far cheaper and quicker.',
       'Provide one or more {find, replace} pairs; each `find` must appear VERBATIM in the current view — call space_get_view first (optionally grep for the spot) to read the exact current text. It snapshots the prior version (revertible) and bumps the version — the open Workspace auto-refreshes, so you do NOT need to call space_save after.',
-      'Use write_file + space_save instead only for a large rewrite, or when changing data sources / actions.',
+      'Use space_save with inline view_html instead for an ordinary full rewrite, or when changing data sources / actions; view_path remains oversized-file compatibility.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
@@ -797,7 +909,7 @@ export function registerSpaceTools(server: McpServer): void {
         );
       }
       const viewFile = resolveInSpace(slug, rec.viewEntry);
-      if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with a view_path.`);
+      if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with view_html (or legacy view_path).`);
       let html = readFileSync(viewFile, 'utf-8');
       const detailLines: string[] = [];
       let applied = 0;
@@ -823,9 +935,10 @@ export function registerSpaceTools(server: McpServer): void {
       if (applied === 0) {
         return textResult(`No edits applied — none of the find strings were in the view. Call space_get_view('${slug}', '<nearby text>') to read the exact current view lines, then match a find string EXACTLY (whitespace included).${detail}`);
       }
-      spaceStore.recordRevision(slug); // snapshot the prior view + bump version (revertible)
-      writeFileSync(viewFile, html, 'utf-8');
-      const after = spaceStore.get(slug);
+      // One locked store operation snapshots V1, commits V2 + its manifest,
+      // and only then indexes V2. recordRevision()+writeFileSync() previously
+      // indexed the V1 digest under the incremented version before V2 existed.
+      const after = spaceStore.commitViewRevision(slug, html);
       // Re-run the gap test on EVERY edit and record the fresh verdict — the
       // gap note is what the desktop banner renders, and before this it was
       // only ever re-evaluated by space_save. A model that fixed the view with
@@ -835,7 +948,7 @@ export function registerSpaceTools(server: McpServer): void {
       // failure never fails the edit.
       let gapNote = '';
       try {
-        const gaps = analyzeSpaceGaps(after ?? rec, html, []);
+        const gaps = analyzeSpaceGaps(after, html, []);
         appendNote(slug, {
           text: gaps.length > 0 ? `Gap test flagged ${gaps.length} item${gaps.length === 1 ? '' : 's'} to confirm.` : 'Gap test: clean.',
           kind: 'gap',
@@ -843,7 +956,20 @@ export function registerSpaceTools(server: McpServer): void {
         });
         gapNote = gaps.length > 0 ? renderSpaceGapQuestions(gaps) : '\n\nGap test: clean — the confirm banner clears on next load.';
       } catch { /* the verdict is best-effort; the edit already landed */ }
-      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" view (now v${after?.version}). The open Workspace auto-refreshes — no need to space_save.${detail}${gapNote}`);
+      // Include the note appended above in the same final file index. This
+      // strict pass happens after V2 is durable and never associates V1 bytes
+      // with the new version.
+      indexWorkspaceRecord(after, {
+        actor: 'space-edit-view-final-state',
+        emitOperational: false,
+        appendStateEvent: false,
+        strict: true,
+      });
+      return textResult(withHostLocalWriteCommitFromFile({
+        createdId: slug,
+        committedPath: viewFile,
+        result: `Applied ${applied} edit${applied === 1 ? '' : 's'} to the "${slug}" view (now v${after.version}). The open Workspace auto-refreshes — no need to space_save.${detail}${gapNote}`,
+      }));
     },
   );
 
@@ -1066,7 +1192,7 @@ export function registerSpaceTools(server: McpServer): void {
       const rec = spaceStore.get(slug);
       if (!rec) return textResult(`No workspace named "${slug}".`);
       const viewFile = resolveInSpace(slug, rec.viewEntry);
-      if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with a view_path.`);
+      if (!existsSync(viewFile)) return textResult(`Workspace "${slug}" has no view yet — use space_save with view_html (or legacy view_path).`);
       let html: string;
       try { html = readFileSync(viewFile, 'utf-8'); }
       catch (err) { return textResult(`Error reading the "${slug}" view: ${(err as Error).message}`); }
@@ -1144,7 +1270,7 @@ export function registerSpaceTools(server: McpServer): void {
     [
       "Make a TARGETED, reversible edit to a Workspace runner's SOURCE — FAST, for changing what/how a runner pulls (a query, a field, a filter, a data source). Use this instead of rewriting the whole file.",
       'Provide runner_path + one or more {find, replace}; each `find` must appear VERBATIM in the current runner — call space_get_runner first to read the exact text. It snapshots the prior source (revert with space_revert_runner) before writing.',
-      'If the runner backs an installed DATA SOURCE, editing its entrypoint invalidates the prior pinned-entrypoint grant; space_refresh will request one fresh time-bounded approval before the new bytes can run. Helpers, packages, CLIs, local files, auth, and network remain live outside that digest. New data sources must use a provably read-only Composio source. If it backs an ACTION, test it only through the normal Workspace action + approval path. Reserve write_file + space_save for a full rewrite.',
+      'If the runner backs an installed DATA SOURCE, editing its entrypoint invalidates the prior pinned-entrypoint grant; space_refresh will request one fresh time-bounded approval before the new bytes can run. Helpers, packages, CLIs, local files, auth, and network remain live outside that digest. New data sources must use a provably read-only Composio source. If it backs an ACTION, test it only through the normal Workspace action + approval path. For an ordinary full view rewrite, use one space_save call with inline view_html.',
     ].join('\n'),
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
@@ -1218,7 +1344,11 @@ export function registerSpaceTools(server: McpServer): void {
         refreshNote = `\nThis runner backs action "${backedActions[0].label ?? backedActions[0].id}" — not auto-run. Invoke the Workspace action normally so its human approval and durable receipt stay intact.`;
       }
       const revertNote = backedUp ? ` Revert with space_revert_runner('${slug}', '${runner}').` : ' (backup unavailable — not reversible.)';
-      return textResult(`Applied ${applied} edit${applied === 1 ? '' : 's'} to "data/${runner}".${revertNote}${refreshNote}${detail}`);
+      return textResult(withHostLocalWriteCommitFromFile({
+        createdId: slug,
+        committedPath: file,
+        result: `Applied ${applied} edit${applied === 1 ? '' : 's'} to "data/${runner}".${revertNote}${refreshNote}${detail}`,
+      }));
     },
   );
 

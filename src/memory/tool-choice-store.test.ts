@@ -1397,7 +1397,7 @@ test('a remembered call renders SHAPE-first — the callable template is never t
     // `arguments={"subject":"…` and invented `body_content`, which failed
     // pre-dispatch schema validation twice.
     const template = 'composio_execute_tool OUTLOOK_CREATE_DRAFT connected_account_id=ca_T9pDCuTalAI3 '
-      + 'arguments={"subject":"...","body":"<plain string>","to_recipients":["a@b.com"],"user_id":"nathan.reynolds@scorpion.co"}';
+      + 'arguments={"subject":"...","body":"<plain string>","to_recipients":["a@b.com"],"user_id":"blake@scorpion.co"}';
     rememberToolChoice({
       intent: 'shapefirst.outlook.create_draft',
       choice: {

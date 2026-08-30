@@ -50,6 +50,21 @@ test('query-driven recall: no query ⇒ no per-request recall section (byte-iden
   assert.doesNotMatch(renderHarnessMemoryContext({ sessionId: 's' }), /## Relevant To Your Request/);
 });
 
+test('persistent context distinguishes explicit authority from derived memory instead of calling everything ground truth', () => {
+  resetMemoryDb();
+  rememberFact({
+    kind: 'project',
+    content: 'A derived project observation may need live-source verification.',
+    trustLevel: 0.6,
+    derivedFromTool: 'fixture_read',
+  });
+  const context = renderHarnessMemoryContext({ partition: 'stable' });
+  assert.match(context, /persistent context, not uniform ground truth/i);
+  assert.match(context, /provenance and freshness/i);
+  assert.match(context, /verify stale or conflicting claims/i);
+  assert.doesNotMatch(context, /Treat it as ground truth/i);
+});
+
 test('one accepted-turn instruction function freezes its memory snapshot across model cycles', () => {
   resetMemoryDb();
   rememberFact({ kind: 'project', content: 'Snapshot fact present before this accepted turn begins.' });
@@ -70,6 +85,46 @@ test('one accepted-turn instruction function freezes its memory snapshot across 
   })();
   assert.match(nextTurn, /Fact learned during a later model cycle in the same turn/,
     'a newly constructed turn receives the latest consolidated memory');
+});
+
+test('stable rubric, turn authority, and externally-rendered Tool Memory occupy distinct cache layers', async () => {
+  resetMemoryDb();
+  const {
+    CACHE_BREAK_SENTINEL,
+    CACHE_MEMORY_APPEND_SENTINEL,
+    CACHE_MEMORY_CONTEXT_SENTINEL,
+    splitCacheDynamicContext,
+  } = await import('../runtime/harness/model-wire-registry.js');
+  const rendered = harnessInstructions('STABLE RUBRIC', {
+    volatileInstructions: 'CURRENT TURN AUTHORITY',
+    volatileMemoryInstructions: 'LEARNED TOOL MEMORY',
+  })();
+  const at = rendered.indexOf(CACHE_BREAK_SENTINEL);
+  assert.ok(at > 0);
+  assert.equal(rendered.slice(0, at).trim(), 'STABLE RUBRIC');
+  const dynamic = rendered.slice(at + CACHE_BREAK_SENTINEL.length).trim();
+  const split = splitCacheDynamicContext(dynamic);
+  assert.equal(split.turnContext, 'CURRENT TURN AUTHORITY');
+  assert.match(split.memoryContext, /LEARNED TOOL MEMORY/);
+  assert.equal(rendered.indexOf(CACHE_MEMORY_CONTEXT_SENTINEL) > rendered.indexOf('CURRENT TURN AUTHORITY'), true);
+  assert.equal(rendered.indexOf(CACHE_MEMORY_APPEND_SENTINEL) > rendered.indexOf(CACHE_MEMORY_CONTEXT_SENTINEL), true);
+});
+
+test('parity-off appends externally-rendered Tool Memory once after role and turn', () => {
+  resetMemoryDb();
+  const previous = process.env.CLEMMY_MODEL_PARITY;
+  process.env.CLEMMY_MODEL_PARITY = 'off';
+  try {
+    const rendered = harnessInstructions('STABLE RUBRIC', {
+      volatileInstructions: 'CURRENT TURN AUTHORITY',
+      volatileMemoryInstructions: 'LEARNED TOOL MEMORY',
+    })();
+    assert.equal(rendered.split('LEARNED TOOL MEMORY').length - 1, 1);
+    assert.ok(rendered.indexOf('LEARNED TOOL MEMORY') > rendered.indexOf('CURRENT TURN AUTHORITY'));
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_MODEL_PARITY;
+    else process.env.CLEMMY_MODEL_PARITY = previous;
+  }
 });
 
 test('same-session completed external actions are visible in shared harness context', () => {

@@ -21,17 +21,20 @@ import {
   parseWorkflowCanonicalEntityResultProjection,
   type WorkflowCanonicalEntityFieldProjectionV1,
   type WorkflowCanonicalEntityNormalizerV1,
-  type WorkflowCanonicalEntityResultProjectionV1,
+  type WorkflowCanonicalEntityResultProjection,
 } from '../memory/workflow-result-projection-contract.js';
 import {
   redeemVerifiedClosedWorkflowReadResult,
+  redeemVerifiedFailedWorkflowReadResult,
   type VerifiedClosedWorkflowReadResultV1,
+  type VerifiedFailedWorkflowReadResultV1,
   type VerifiedWorkflowReadPageV1,
   type WorkflowReadResultLineageV1,
 } from './workflow-read-result-redemption.js';
 import {
   listWorkflowSurfaceBindingsForWorkflow,
 } from '../spaces/workflow-surface-binding-store.js';
+import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 import {
   canonicalEntityWorkspaceSelectionDigest,
   parseCanonicalEntityWorkspaceBindingApproval,
@@ -43,9 +46,11 @@ import {
   putCanonicalEntityWorkflowLineageReceipt,
 } from '../spaces/canonical-entity-workflow-lineage-store.js';
 import type {
-  CanonicalEntityWorkflowProjectionClaimV1,
+  CanonicalEntityWorkflowFailedPartitionAuthorityV1,
+  CanonicalEntityWorkflowProjectionClaim,
   CanonicalEntityWorkflowProjectionRequestV1,
 } from '../spaces/canonical-entity-workflow-finalizer.js';
+import { canonicalEntityWorkflowFailedPartitionAuthorityDigest } from '../spaces/canonical-entity-workflow-finalizer.js';
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -69,7 +74,7 @@ export type ProduceCanonicalEntityWorkflowLineageResultV1 =
   | { status: 'not_applicable' }
   | {
       status: 'ready' | 'replayed';
-      claim: CanonicalEntityWorkflowProjectionClaimV1;
+      claim: CanonicalEntityWorkflowProjectionClaim;
       finishedAt: string;
       datasetId: string;
       observationCount: number;
@@ -184,7 +189,7 @@ function shapeCovered(value: unknown, node: PathNode): boolean {
   return node.children.size === 0;
 }
 
-function recordShape(projection: WorkflowCanonicalEntityResultProjectionV1): PathNode {
+function recordShape(projection: WorkflowCanonicalEntityResultProjection): PathNode {
   const root: PathNode = { terminal: false, children: new Map() };
   for (const mapping of projection.fields) addPath(root, mapping.recordPath);
   addPath(root, projection.sourceRecord.idPath);
@@ -242,7 +247,7 @@ function normalizeIdentityValue(
 }
 
 function prepareObservation(input: {
-  projection: WorkflowCanonicalEntityResultProjectionV1;
+  projection: WorkflowCanonicalEntityResultProjection;
   record: Record<string, unknown>;
   page: VerifiedWorkflowReadPageV1;
   activationDigest: string;
@@ -282,6 +287,7 @@ function prepareObservation(input: {
     };
   }
   const exactIdentifiers: Array<{ namespace: string; value: string }> = [];
+  const compoundSignals: NonNullable<EntityObservationInput['compoundSignals']>[number][] = [];
   for (const rule of input.projection.identityRules) {
     const normalized: string[] = [];
     for (const field of rule.fields) {
@@ -294,25 +300,41 @@ function prepareObservation(input: {
       normalized.push(value);
     }
     if (normalized.length === rule.fields.length) {
-      exactIdentifiers.push({
-        namespace: rule.exactIdentifierNamespace,
-        value: canonicalEntitySha256({ version: 1, ruleId: rule.ruleId, values: normalized }),
-      });
+      if (!('kind' in rule)) {
+        exactIdentifiers.push({
+          namespace: rule.exactIdentifierNamespace,
+          value: canonicalEntitySha256({ version: 1, ruleId: rule.ruleId, values: normalized }),
+        });
+      } else if (rule.kind === 'exact_identifier') {
+        exactIdentifiers.push({
+          namespace: rule.namespace,
+          value: canonicalEntitySha256({ version: 2, ruleId: rule.ruleId, values: normalized }),
+        });
+      } else {
+        compoundSignals.push({
+          name: rule.signalName,
+          components: Object.fromEntries(rule.fields.map((field, index) => [
+            field,
+            normalized[index]!,
+          ])),
+        });
+      }
     }
   }
-  if (exactIdentifiers.length === 0) return null;
+  if (exactIdentifiers.length === 0 && compoundSignals.length === 0) return null;
   return {
     entityKind: input.projection.entityKind,
     origin: { sourceId, recordId, ...(revision ? { revision } : {}) },
     observedAt,
     fields,
     exactIdentifiers,
+    compoundSignals,
   };
 }
 
 function preparePages(input: {
-  redeemed: VerifiedClosedWorkflowReadResultV1;
-  projection: WorkflowCanonicalEntityResultProjectionV1;
+  redeemed: VerifiedClosedWorkflowReadResultV1 | VerifiedFailedWorkflowReadResultV1;
+  projection: WorkflowCanonicalEntityResultProjection;
 }): PreparedPage[] | null {
   const shape = recordShape(input.projection);
   let totalBytes = 0;
@@ -322,7 +344,9 @@ function preparePages(input: {
     totalBytes += page.rawByteCount;
     if (page.rawByteCount > input.projection.bounds.maxPageBytes
       || totalBytes > input.projection.bounds.maxTotalBytes) return null;
-    const records = valueAtPath(page.rawPayload, input.projection.recordsPath);
+    const evidenceView = projectProviderResultEvidenceView(page.rawPayload);
+    if (evidenceView.kind !== 'provider_payload') return null;
+    const records = valueAtPath(evidenceView.payload, input.projection.recordsPath);
     if (!Array.isArray(records)
       || records.length !== page.itemCount
       || records.length > input.projection.bounds.maxRecordsPerPage) return null;
@@ -360,14 +384,28 @@ function preparePages(input: {
 function claimFrom(input: {
   receiptId: string;
   receiptDigest: string;
-  identity: CanonicalEntityWorkflowProjectionClaimV1['identity'];
+  identity: CanonicalEntityWorkflowProjectionClaim['identity'];
   bindingDigest: string;
-}): CanonicalEntityWorkflowProjectionClaimV1 {
-  return { version: 1, ...input };
+  terminalOutcomeAuthority?: CanonicalEntityWorkflowFailedPartitionAuthorityV1;
+}): CanonicalEntityWorkflowProjectionClaim {
+  return input.terminalOutcomeAuthority
+    ? {
+        version: 2,
+        receiptId: input.receiptId,
+        receiptDigest: input.receiptDigest,
+        identity: input.identity,
+        bindingDigest: input.bindingDigest,
+        terminalOutcomeAuthorityDigest: canonicalEntityWorkflowFailedPartitionAuthorityDigest(
+          input.terminalOutcomeAuthority,
+        ),
+      }
+    : { version: 1, ...input };
 }
 
-function completedAt(request: CanonicalEntityWorkflowProjectionRequestV1): string | null {
-  const receipt = request.runReceipts.find((candidate) => candidate.status === 'completed');
+function terminalAt(request: CanonicalEntityWorkflowProjectionRequestV1): string | null {
+  const receipt = request.runReceipts.find((candidate) => (
+    candidate.status === 'completed' || candidate.status === 'failed'
+  ));
   return receipt && exactIso(receipt.at) ? receipt.at : null;
 }
 
@@ -416,39 +454,73 @@ export function produceCanonicalEntityWorkflowLineage(input: {
     || canonicalEntityWorkspaceSelectionDigest(workspace)
       !== reviewedWorkspaceBinding.selection.expectedWorkspaceDigest
   ) return block('workspace_binding_drifted', 'current Workspace or binding bytes drifted from the reviewed approval');
-  const redeemed = redeemVerifiedClosedWorkflowReadResult({
+  const closed = redeemVerifiedClosedWorkflowReadResult({
     executionKind: input.root.executionKind,
     activationId: input.root.activationId,
     lineage: input.root.lineage,
   });
-  if (!redeemed.ok) return block('workflow_result_authority_unavailable', redeemed.reason);
+  let redeemed: VerifiedClosedWorkflowReadResultV1 | VerifiedFailedWorkflowReadResultV1;
+  if (closed.ok) {
+    redeemed = closed.value;
+  } else if (projection.version === 2
+    && projection.partition.outcomeAuthority.acceptedTerminalStates.some((state) => state === 'failed')) {
+    const failed = redeemVerifiedFailedWorkflowReadResult({
+      executionKind: input.root.executionKind,
+      activationId: input.root.activationId,
+      lineage: input.root.lineage,
+    });
+    if (!failed.ok) return block('workflow_result_authority_unavailable', failed.reason);
+    redeemed = failed.value;
+  } else {
+    return block('workflow_result_authority_unavailable', closed.reason);
+  }
+  const failedOutcome = redeemed.complete === false;
   if (
-    redeemed.value.pages.length < 1
-    || redeemed.value.pages.length > projection.bounds.maxPages
-    || redeemed.value.pages.at(-1)?.exhausted !== true
-    || redeemed.value.pages.slice(0, -1).some((page) => page.exhausted)
+    redeemed.pages.length < 1
+    || redeemed.pages.length > projection.bounds.maxPages
+    || (failedOutcome
+      ? redeemed.pages.some((page) => page.exhausted)
+      : redeemed.pages.at(-1)?.exhausted !== true
+        || redeemed.pages.slice(0, -1).some((page) => page.exhausted))
   ) return block('result_projection_bounds_exceeded', 'closed read page count or exhaustion contradicts the reviewed projection');
-  const pages = preparePages({ redeemed: redeemed.value, projection });
+  const pages = preparePages({ redeemed, projection });
   if (!pages) return block('result_records_invalid', 'retained page records violate the reviewed path, closed shape, type, identity, or byte bounds');
   const observationCount = pages.reduce((total, page) => total + page.observations.length, 0);
   const datasetId = `canonical-dataset:${canonicalEntitySha256({
     version: 1,
     workflowId: input.root.lineage.workflowId,
     runId: input.root.lineage.runId,
-    activationDigest: redeemed.value.activationDigest,
+    activationDigest: redeemed.activationDigest,
     projectionDigest: projection.projectionDigest,
   })}`;
   const partitionId = `workflow-run:${canonicalEntitySha256({
     version: 1,
     workflowId: input.root.lineage.workflowId,
     runId: input.root.lineage.runId,
-    activationDigest: redeemed.value.activationDigest,
+    activationDigest: redeemed.activationDigest,
   })}`;
+  const terminalOutcomeAuthority: CanonicalEntityWorkflowFailedPartitionAuthorityV1 | undefined = redeemed.complete === false
+    ? {
+        version: 1,
+        kind: 'failed_paginated_read',
+        projectionDigest: projection.projectionDigest,
+        executionKind: 'paginated_read',
+        activationId: redeemed.activationId,
+        lineage: { ...input.root.lineage },
+        aggregateReceiptId: redeemed.failure.aggregateReceiptId,
+        aggregateReceiptDigest: redeemed.failure.aggregateReceiptDigest,
+        failureReason: redeemed.failure.kind,
+        partitionId,
+        failureRef: `workflow-read-failure:${redeemed.failure.aggregateReceiptDigest}`,
+      }
+    : undefined;
   const created = createCanonicalDataset({
     datasetId,
     universe: { kind: 'closed', partitionIds: [partitionId] },
-    denominator: { kind: 'exact', total: observationCount },
-    createdAt: redeemed.value.pages[0]!.settledAt,
+    denominator: projection.partition.denominator === 'unknown'
+      ? { kind: 'unknown' }
+      : { kind: 'exact', total: observationCount },
+    createdAt: redeemed.pages[0]!.settledAt,
   });
   if (!created.ok) return block('canonical_dataset_conflict', created.message);
   input.hooks?.afterDataset?.();
@@ -487,11 +559,13 @@ export function produceCanonicalEntityWorkflowLineage(input: {
         inputCursor: prepared.page.inputCursorDigest
           ? `cursor:${prepared.page.inputCursorDigest}`
           : null,
-        outputCursor: last ? null : prepared.page.nextCursorDigest
+        outputCursor: !failedOutcome && last ? null : prepared.page.nextCursorDigest
           ? `cursor:${prepared.page.nextCursorDigest}`
           : null,
-        exhaustion: last ? 'exhausted' : 'more',
-        denominator: { kind: 'exact', total: observationCount },
+        exhaustion: !failedOutcome && last ? 'exhausted' : 'more',
+        denominator: projection.partition.denominator === 'unknown'
+          ? { kind: 'unknown' }
+          : { kind: 'exact', total: observationCount },
         itemIds: prepared.coverageItemIds,
       },
       committedAt: prepared.page.settledAt,
@@ -507,11 +581,13 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   const dataset = getCanonicalDataset(datasetId);
   const coverage = summarizeStoredDatasetCoverage(datasetId);
   if (!dataset || !coverage
-    || coverage.status !== 'complete'
-    || coverage.exhaustion !== 'exhausted'
     || coverage.cursorCycleDetected
-    || coverage.observed !== observationCount) {
-    return block('canonical_coverage_incomplete', 'canonical coverage lacks exact exhausted complete truth');
+    || coverage.observed !== observationCount
+    || (projection.partition.denominator === 'settled_record_count'
+      && (coverage.status !== 'complete' || coverage.exhaustion !== 'exhausted'))
+    || (projection.partition.denominator === 'unknown'
+      && (coverage.status === 'complete' || coverage.denominator.kind !== 'unknown'))) {
+    return block('canonical_coverage_incomplete', 'canonical coverage contradicts the reviewed denominator or settled result truth');
   }
   const identity = {
     version: 1 as const,
@@ -526,8 +602,9 @@ export function produceCanonicalEntityWorkflowLineage(input: {
     identity,
     bindingDigest: binding.digest,
     projectionDigest: projection.projectionDigest,
-    activationDigest: redeemed.value.activationDigest,
-    aggregateReceiptDigest: redeemed.value.aggregateReceiptDigest ?? null,
+    activationDigest: redeemed.activationDigest,
+    aggregateReceiptDigest: redeemed.aggregateReceiptDigest ?? null,
+    terminalOutcome: failedOutcome ? 'failed' : 'completed',
     datasetAuthority: {
       contractDigest: dataset.contractDigest,
       resolutionRevision: dataset.resolutionRevision,
@@ -538,9 +615,11 @@ export function produceCanonicalEntityWorkflowLineage(input: {
   })}`;
   const retained = loadCanonicalEntityWorkflowLineageReceipt(receiptId);
   if (retained) {
-    const retainedFinishedAt = completedAt(retained.request);
+    const retainedFinishedAt = terminalAt(retained.request);
     if (!retainedFinishedAt
       || retained.request.expectedBindingDigest !== binding.digest
+      || canonicalEntityJson(retained.request.terminalOutcomeAuthority ?? null)
+        !== canonicalEntityJson(terminalOutcomeAuthority ?? null)
       || canonicalEntityJson(retained.request.identity) !== canonicalEntityJson(identity)
       || canonicalEntityJson(retained.request.expectedDatasetAuthority) !== canonicalEntityJson({
         version: 1,
@@ -557,6 +636,9 @@ export function produceCanonicalEntityWorkflowLineage(input: {
         receiptDigest: retained.receiptDigest,
         identity,
         bindingDigest: binding.digest,
+        ...(retained.request.terminalOutcomeAuthority
+          ? { terminalOutcomeAuthority: retained.request.terminalOutcomeAuthority }
+          : {}),
       }),
       finishedAt: retainedFinishedAt,
       datasetId,
@@ -577,6 +659,8 @@ export function produceCanonicalEntityWorkflowLineage(input: {
     sequence: index + 2,
     ordinal: 0,
   }));
+  const terminalRunStatus = failedOutcome ? 'failed' as const : 'completed' as const;
+  const terminalPartitionState = failedOutcome ? 'failed' as const : 'completed' as const;
   const request: CanonicalEntityWorkflowProjectionRequestV1 = {
     version: 1,
     identity,
@@ -597,12 +681,12 @@ export function produceCanonicalEntityWorkflowLineage(input: {
       identity,
       status: 'running',
     }, {
-      receiptId: `workflow-run-receipt:${canonicalEntitySha256({ version: 1, identity, status: 'completed', at: input.proposedFinishedAt })}`,
+      receiptId: `workflow-run-receipt:${canonicalEntitySha256({ version: 1, identity, status: terminalRunStatus, at: input.proposedFinishedAt })}`,
       sequence: batchReceipts.length + 3,
       ordinal: 0,
       at: input.proposedFinishedAt,
       identity,
-      status: 'completed',
+      status: terminalRunStatus,
     }],
     partitionReceipts: [{
       receiptId: `workflow-partition-receipt:${canonicalEntitySha256({ version: 1, identity, partitionId, kind: 'declared' })}`,
@@ -623,15 +707,22 @@ export function produceCanonicalEntityWorkflowLineage(input: {
       state: 'running',
       attempt: 1,
     }, {
-      receiptId: `workflow-partition-receipt:${canonicalEntitySha256({ version: 1, identity, partitionId, state: 'completed' })}`,
+      receiptId: `workflow-partition-receipt:${canonicalEntitySha256({
+        version: 1,
+        identity,
+        partitionId,
+        state: terminalPartitionState,
+        failureRef: terminalOutcomeAuthority?.failureRef ?? null,
+      })}`,
       sequence: batchReceipts.length + 2,
       ordinal: 1,
       at: input.proposedFinishedAt,
       identity,
       kind: 'status',
       partitionId,
-      state: 'completed',
+      state: terminalPartitionState,
       attempt: 1,
+      ...(terminalOutcomeAuthority ? { failureRef: terminalOutcomeAuthority.failureRef } : {}),
     }],
     batchLineage,
     coveragePosition: {
@@ -639,6 +730,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
       sequence: batchReceipts.length + 2,
       ordinal: 2,
     },
+    ...(terminalOutcomeAuthority ? { terminalOutcomeAuthority } : {}),
   };
   input.hooks?.beforeReceipt?.();
   const stored = putCanonicalEntityWorkflowLineageReceipt({ receiptId, request });
@@ -651,6 +743,7 @@ export function produceCanonicalEntityWorkflowLineage(input: {
       receiptDigest: stored.receipt.receiptDigest,
       identity,
       bindingDigest: binding.digest,
+      ...(terminalOutcomeAuthority ? { terminalOutcomeAuthority } : {}),
     }),
     finishedAt: input.proposedFinishedAt,
     datasetId,

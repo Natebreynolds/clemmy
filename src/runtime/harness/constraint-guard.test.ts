@@ -32,7 +32,7 @@ import { formatConstraintEscalation, type ConstraintViolation } from './constrai
 // off non-email sends (live 2026-07-22: the Scorpion-Outlook email constraint
 // blocked SLACK_SEND_MESSAGE and broke the user's team-activity workflow).
 {
-  const { isEmailFamilySend } = await import('./constraint-guard.js');
+  const { isComposioEmailFamilySend: isEmailFamilySend } = await import('../../integrations/composio/standing-policy-adapter.js');
   // Email family: slug says so…
   if (!isEmailFamilySend('OUTLOOK_SEND_EMAIL', {})) throw new Error('OUTLOOK send is email-family');
   if (!isEmailFamilySend('GMAIL_SEND_EMAIL', {})) throw new Error('GMAIL send is email-family');

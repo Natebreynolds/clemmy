@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -65,11 +65,16 @@ const {
 } = await import('./claude-agent-sdk.js');
 const capabilityHealth = await import('./capability-health.js');
 const artifactLedger = await import('./artifact-ledger.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const composioOperationSemantics = await import('../../integrations/composio/operation-semantics.js');
 const { closeMemoryDb, openMemoryDb } = await import('../../memory/db.js');
 const { rememberFact } = await import('../../memory/facts.js');
 const { clearFocus, createFocus, patchFocusWorkstate } = await import('../../memory/focus.js');
 const { createGoalContract } = await import('../../agents/plan-proposals.js');
-const { workingMemoryPathForSession } = await import('../../memory/working-memory.js');
+const {
+  loadWorkingMemoryForSession,
+  workingMemoryPathForSession,
+} = await import('../../memory/working-memory.js');
 const {
   cancelProspectiveIntention,
   closeProspectiveIntentionsDbForTest,
@@ -91,6 +96,37 @@ const { beginPhysicalDispatch, settlePhysicalDispatch } = await import('./dispat
 const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
 const { commitLogicalCallSettlement } = await import('./logical-call-settlement-store.js');
 const { redeemSuccessfulSettlementResultForHost } = await import('./result-handle.js');
+
+function installClaudeArtifactManifestFixtures(): void {
+  const sheetFromJson = composioOperationSemantics.documentedComposioManifestOperationSemantics(
+    'GOOGLESHEETS_SHEET_FROM_JSON',
+  );
+  assert.ok(sheetFromJson?.atomicInputContent);
+  currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+    {
+      operationId: 'GOOGLEDOCS_CREATE_DOCUMENT',
+      providerKind: 'composio',
+      effect: 'external_write',
+      destination: { family: 'googledocs', posture: 'create_new' },
+      verification: {
+        mutation: {
+          version: 1,
+          resourceFamily: 'googledocs',
+          producedHandleKind: 'created_resource',
+          proof: 'resource_identity_v1',
+          target: { source: 'authoritative_result', pointers: ['/document_id'] },
+        },
+      },
+    },
+    {
+      operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+      providerKind: 'composio',
+      effect: 'external_write',
+      destination: { family: 'googlesheets', posture: 'create_new' },
+      operationSemantics: sheetFromJson,
+    },
+  ]);
+}
 
 /**
  * Settlement anchor for stubbed retrieve turns (authority spine, ffae7dbd).
@@ -205,6 +241,7 @@ function installPreparedClaudeWorkflowDispatch(input: {
 }
 
 beforeEach(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(null);
   resetEventLog();
   artifactLedger._resetArtifactLedgerForTests();
   capabilityHealth._resetHarnessCapabilityHealthForTest();
@@ -238,6 +275,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(null);
   setClaudeAgentSdkBrainRunForTest(null);
   setClaudeAgentSdkBrainPostTurnHooksForTest(null);
   setClaudeAgentSdkBrainJudgeForTest(null);
@@ -2733,11 +2771,16 @@ test('Claude brain honors request-local recall opt-out while retaining pinned po
 test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors excludes, and commits final text', async () => {
   const chunks: string[] = [];
   let captured: any;
+  let projectionBeforeTerminal: string | null = null;
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
   process.env.CLEMMY_TOOL_JIT = 'off'; // pin off: this test guards the unfiltered read-only surface
   setClaudeAgentSdkBrainRunForTest(async (options) => {
     captured = options;
     settleAdmittedRead({ sessionId: 'brain-run', sourceUserSeq: options.sourceUserSeq! });
+    const projectionPath = workingMemoryPathForSession('brain-run');
+    projectionBeforeTerminal = existsSync(projectionPath)
+      ? readFileSync(projectionPath, 'utf-8')
+      : null;
     return {
       text: 'Claude brain reply',
       sessionId: 'sdk-session',
@@ -2782,9 +2825,19 @@ test('respondViaClaudeAgentSdkBrain read_only mode uses read-only tools, honors 
   const effort = listEvents('brain-run', { types: ['reasoning_effort'] })[0]?.data as { transport?: string; effort?: string } | undefined;
   assert.equal(effort?.transport, 'claude_agent_sdk_brain');
   assert.equal(effort?.effort, 'provider_default');
+  const projectionPath = workingMemoryPathForSession('brain-run');
+  const projectionAfterTerminal = existsSync(projectionPath)
+    ? readFileSync(projectionPath, 'utf-8')
+    : null;
+  assert.equal(
+    projectionAfterTerminal,
+    projectionBeforeTerminal,
+    'terminal delivery performs no derived working-memory filesystem write',
+  );
+  assert.ok(loadWorkingMemoryForSession('brain-run'), 'same-session demand read rebuilds the stale projection');
   const workingMemory = readFileSync(workingMemoryPathForSession('brain-run'), 'utf-8');
   assert.match(workingMemory, /search memory/);
-  assert.match(workingMemory, /Claude brain reply/, 'Claude-lane writeback runs after the terminal assistant reply is durable');
+  assert.match(workingMemory, /Claude brain reply/, 'lazy rebuild includes the durable Claude terminal reply');
 });
 
 test('Claude SDK transport window stays flat across objective shapes', () => {
@@ -3512,6 +3565,7 @@ test('full mode: an accepted execution cannot hide a mixed orphaned write', asyn
 });
 
 test('artifact completion stays pending without a second SDK read-back query', async () => {
+  installClaudeArtifactManifestFixtures();
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -3602,6 +3656,7 @@ test('artifact completion stays pending without a second SDK read-back query', a
 });
 
 test('Google Sheet completion stays unverified without a second SDK read-back query', async () => {
+  installClaudeArtifactManifestFixtures();
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -3688,6 +3743,7 @@ test('Google Sheet completion stays unverified without a second SDK read-back qu
 });
 
 test('artifact completion stays honest when exact read-back cannot verify the binding', async () => {
+  installClaudeArtifactManifestFixtures();
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   process.env.CLEMMY_CLAUDE_SDK_COMPLETION_JUDGE = 'off';
@@ -4495,6 +4551,7 @@ test('frameTrustedMemory labels non-empty memory as trusted, passes empty throug
 });
 
 test('respondViaClaudeAgentSdkBrain preserves ask_user_question as awaiting-input and skips continuations', async () => {
+  installClaudeArtifactManifestFixtures();
   process.env.AUTH_MODE = 'claude_oauth';
   process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'full';
   let runCalls = 0;

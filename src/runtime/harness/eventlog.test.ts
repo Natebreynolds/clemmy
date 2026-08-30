@@ -17,6 +17,7 @@ import Database from 'better-sqlite3';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-eventlog-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 import { test } from 'node:test';
@@ -68,10 +69,19 @@ const {
   reapStaleToolOutputs,
   openEventLog,
   HARNESS_DB_PATH,
+  applyHarnessMigrationsThroughVersionForTests,
 } = await import('./eventlog.js');
 const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 type EventType = import('./eventlog.js').EventType;
+
+function insertHistoricalSession(db: Database.Database, id: string, at: string): void {
+  db.prepare(`
+    INSERT INTO sessions
+      (id, kind, created_at, updated_at, status, metadata_json)
+    VALUES (?, 'chat', ?, ?, 'active', '{}')
+  `).run(id, at, at);
+}
 
 test.after(() => {
   try {
@@ -85,24 +95,9 @@ test('latest schema upgrades an existing v4 approval table without losing rows',
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  applyHarnessMigrationsThroughVersionForTests(raw, 4);
+  insertHistoricalSession(raw, 'workflow:old', '2026-07-01T00:00:00.000Z');
   raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (4, '2026-07-01T00:00:00.000Z');
-    CREATE TABLE pending_approvals (
-      approval_id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      channel TEXT,
-      channel_id TEXT,
-      requested_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      tool TEXT,
-      args_json TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      resolution TEXT,
-      resolver TEXT,
-      resolved_at TEXT
-    );
     INSERT INTO pending_approvals
       (approval_id, session_id, requested_at, expires_at, subject, status)
     VALUES
@@ -130,17 +125,10 @@ test('schema v6 migrates scoped guardrail rows and skips legacy orphans', () => 
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  raw.pragma('foreign_keys = OFF');
+  applyHarnessMigrationsThroughVersionForTests(raw, 5);
+  insertHistoricalSession(raw, 'sess-valid', '2026-07-01T00:00:00.000Z');
   raw.exec(`
-    PRAGMA foreign_keys = OFF;
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (5, '2026-07-01T00:00:00.000Z');
-    CREATE TABLE sessions (id TEXT PRIMARY KEY);
-    INSERT INTO sessions (id) VALUES ('sess-valid');
-    CREATE TABLE tool_guardrail_state (
-      session_id TEXT PRIMARY KEY,
-      recent_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
     INSERT INTO tool_guardrail_state (session_id, recent_json, updated_at) VALUES
       ('sess-valid', '[{"toolName":"plain"}]', '2026-07-01T00:00:00.000Z'),
       ('sess-valid::codeMode', '[{"toolName":"scoped"}]', '2026-07-01T00:00:01.000Z'),
@@ -174,54 +162,30 @@ test('schema v11 preserves a legacy targeted stop without widening its compatibi
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  raw.pragma('foreign_keys = OFF');
+  applyHarnessMigrationsThroughVersionForTests(raw, 10);
+  insertHistoricalSession(raw, 'sess-v10-kill', '2026-07-16T00:00:00.000Z');
   raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (10, '2026-07-16T00:00:00.000Z');
-    CREATE TABLE sessions (id TEXT PRIMARY KEY);
-    INSERT INTO sessions (id) VALUES ('sess-v10-kill');
-    CREATE TABLE run_attempts (
-      attempt_id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      run_id TEXT,
-      started_at TEXT NOT NULL,
-      finished_at TEXT,
-      status TEXT NOT NULL,
-      lease_owner TEXT,
-      lease_expires_at TEXT,
-      source_user_seq INTEGER
-    );
     INSERT INTO run_attempts
       (attempt_id, session_id, run_id, started_at, finished_at, status)
     VALUES
       ('attempt-v10-a', 'sess-v10-kill', 'run-v10-a', '2026-07-16T00:00:00.000Z', NULL, 'active'),
       ('attempt-v10-b', 'sess-v10-kill', 'run-v10-b', '2026-07-16T00:00:01.000Z', NULL, 'active');
-    CREATE TABLE run_kill_requests (
-      session_id TEXT PRIMARY KEY,
-      attempt_id TEXT,
-      run_id TEXT,
-      requested_at TEXT NOT NULL,
-      reason TEXT
-    );
     INSERT INTO run_kill_requests
       (session_id, attempt_id, run_id, requested_at, reason)
     VALUES
       ('sess-v10-kill', 'attempt-v10-a', 'run-v10-a', '2026-07-16T00:00:02.000Z', 'stop A');
-    CREATE TABLE kill_switches (
-      session_id TEXT PRIMARY KEY,
-      requested_at TEXT NOT NULL,
-      reason TEXT
-    );
     INSERT INTO kill_switches
       (session_id, requested_at, reason)
     VALUES
       ('sess-v10-kill', '2026-07-16T00:00:02.000Z', 'legacy mirror of stop A');
-    CREATE TABLE pending_approvals (
-      approval_id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
-    );
-    INSERT INTO pending_approvals (approval_id, session_id) VALUES
-      ('apr-valid-v10', 'sess-v10-kill'),
-      ('apr-orphan-v10', 'sess-deleted');
+    INSERT INTO pending_approvals
+      (approval_id, session_id, requested_at, expires_at, subject)
+    VALUES
+      ('apr-valid-v10', 'sess-v10-kill', '2026-07-16T00:00:00.000Z',
+       '2026-07-16T01:00:00.000Z', 'valid historical approval'),
+      ('apr-orphan-v10', 'sess-deleted', '2026-07-16T00:00:00.000Z',
+       '2026-07-16T01:00:00.000Z', 'orphan historical approval');
   `);
   raw.close();
 
@@ -311,11 +275,9 @@ test('schema v12 upgrades a lazy artifact ledger in place and preserves its earl
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  applyHarnessMigrationsThroughVersionForTests(raw, 11);
+  insertHistoricalSession(raw, 'sess-v11-artifact', '2026-07-16T00:00:00.000Z');
   raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (11, '2026-07-16T00:00:00.000Z');
-    CREATE TABLE sessions (id TEXT PRIMARY KEY);
-    INSERT INTO sessions (id) VALUES ('sess-v11-artifact');
     CREATE TABLE run_artifacts (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -378,23 +340,9 @@ test('schema v19 upgrades a live-like v18 database with invocation-scoped output
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
-  raw.exec(`
-    PRAGMA foreign_keys = OFF;
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (18, '2026-08-02T00:00:00.000Z');
-    CREATE TABLE sessions (id TEXT PRIMARY KEY);
-    INSERT INTO sessions (id) VALUES ('sess-live-v18');
-    CREATE TABLE tool_outputs (
-      session_id TEXT NOT NULL,
-      call_id TEXT NOT NULL,
-      tool TEXT,
-      output_full TEXT NOT NULL,
-      content_bytes INTEGER NOT NULL,
-      truncated_at_write INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (session_id, call_id)
-    );
-  `);
+  raw.pragma('foreign_keys = OFF');
+  applyHarnessMigrationsThroughVersionForTests(raw, 18);
+  insertHistoricalSession(raw, 'sess-live-v18', '2026-08-02T00:00:00.000Z');
   raw.close();
 
   const migrated = openEventLog();
@@ -425,12 +373,8 @@ test('schema v21 upgrades a v20 database with durable discovery claims and casca
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
-  raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (20, '2026-08-08T00:00:00.000Z');
-    CREATE TABLE sessions (id TEXT PRIMARY KEY);
-    INSERT INTO sessions (id) VALUES ('sess-v20-discovery');
-  `);
+  applyHarnessMigrationsThroughVersionForTests(raw, 20);
+  insertHistoricalSession(raw, 'sess-v20-discovery', '2026-08-08T00:00:00.000Z');
   raw.close();
 
   const migrated = openEventLog();
@@ -491,9 +435,8 @@ test('schema v22 preserves complete legacy obligation evidence without inventing
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  applyHarnessMigrationsThroughVersionForTests(raw, 21);
   raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (21, '2026-08-09T00:00:00.000Z');
     CREATE TABLE obligation_transitions (
       obligation_key      TEXT PRIMARY KEY,
       session_id          TEXT NOT NULL,
@@ -559,9 +502,8 @@ test('schema v22 quarantines an incomplete obligation table instead of promoting
   resetEventLog();
   closeEventLog();
   const raw = new Database(HARNESS_DB_PATH);
+  applyHarnessMigrationsThroughVersionForTests(raw, 21);
   raw.exec(`
-    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    INSERT INTO schema_version (version, applied_at) VALUES (21, '2026-08-09T00:00:00.000Z');
     CREATE TABLE obligation_transitions (
       obligation_key TEXT PRIMARY KEY,
       session_id     TEXT NOT NULL
@@ -611,10 +553,8 @@ test('schema v22 keeps sparse migration rehearsals sparse while installing stand
     CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
     INSERT INTO schema_version (version, applied_at) VALUES (21, '2026-08-09T00:00:00.000Z');
   `);
-  raw.close();
-
-  const migrated = openEventLog();
-  const rows = migrated.prepare(`
+  applyHarnessMigrationsThroughVersionForTests(raw, 22);
+  const rows = raw.prepare(`
     SELECT name FROM sqlite_master
      WHERE type = 'table'
        AND name IN (
@@ -628,9 +568,10 @@ test('schema v22 keeps sparse migration rehearsals sparse while installing stand
     { name: 'settlement_claims' },
   ]);
   assert.equal(
-    (migrated.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
-    HARNESS_SCHEMA_VERSION,
+    (raw.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version,
+    22,
   );
+  raw.close();
   resetEventLog();
 });
 
@@ -1038,18 +979,40 @@ test('reapStaleSessions deletes old terminal sessions (+cascade), keeps active +
 test('reapStaleSessions never reaps a pinned or archived terminal session', () => {
   resetEventLog();
   const db = openEventLog();
+  const old = '2020-01-01T00:00:00.000Z';
   const backdate = (id: string) =>
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', id);
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(old, id);
+  const seedReplayAuthority = (sessionId: string, suffix: string, digit: string): void => {
+    const continuity = digit.repeat(64);
+    db.prepare(`
+      INSERT INTO harness_chat_requests
+        (request_id, session_id, run_id, input_hash, since_seq, created_at)
+      VALUES (?, ?, ?, ?, 0, ?)
+    `).run(`request-${suffix}`, sessionId, `run-${suffix}`, `input-${suffix}`, old);
+    db.prepare(`
+      INSERT INTO accepted_source_session_pointers
+        (root_session_id, continuity_digest, head_session_id, revision, updated_at)
+      VALUES (?, ?, ?, 0, ?)
+    `).run(`root-${suffix}`, continuity, sessionId, old);
+    db.prepare(`
+      INSERT INTO accepted_source_session_bindings
+        (durable_source_digest, root_session_id, continuity_digest, session_id,
+         disposition, selected_after_seq, created_at)
+      VALUES (?, ?, ?, ?, 'reused', 0, ?)
+    `).run(digit.toUpperCase().repeat(64).toLowerCase(), `root-${suffix}`, continuity, sessionId, old);
+  };
 
   // Pinned + old + completed → must be kept (explicit "hold onto this").
   const pinned = createSession({ kind: 'chat', channel: 'discord', title: 'pinned-done' });
   updateSession(pinned.id, { status: 'completed', metadata: { source: 'discord', pinned: true } });
   backdate(pinned.id);
+  seedReplayAuthority(pinned.id, 'pinned', 'a');
 
   // Archived + old + completed → must be kept.
   const archived = createSession({ kind: 'workflow', channel: 'cli', title: 'archived-done' });
   updateSession(archived.id, { status: 'completed', metadata: { archived: true } });
   backdate(archived.id);
+  seedReplayAuthority(archived.id, 'archived', 'b');
 
   // Plain old completed → reaped.
   const plain = createSession({ kind: 'chat', channel: 'cli', title: 'plain-done' });
@@ -1061,6 +1024,93 @@ test('reapStaleSessions never reaps a pinned or archived terminal session', () =
   assert.ok(getSession(pinned.id), 'pinned terminal session kept');
   assert.ok(getSession(archived.id), 'archived terminal session kept');
   assert.equal(getSession(plain.id), null, 'plain old terminal session reaped');
+  for (const retained of [pinned.id, archived.id]) {
+    assert.equal(
+      (db.prepare(`
+        SELECT (
+          (SELECT COUNT(*) FROM harness_chat_requests WHERE session_id = ?)
+          + (SELECT COUNT(*) FROM accepted_source_session_bindings WHERE session_id = ?)
+          + (SELECT COUNT(*) FROM accepted_source_session_pointers WHERE head_session_id = ?)
+        ) AS n
+      `).get(retained, retained, retained) as { n: number }).n,
+      3,
+      'a retained session keeps every byte of its replay authority',
+    );
+  }
+});
+
+test('reapStaleSessions keeps a fresh replay receipt and removes old receipts only with their exact doomed session', () => {
+  resetEventLog();
+  const db = openEventLog();
+  const old = '2020-01-01T00:00:00.000Z';
+  const backdate = (id: string) =>
+    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(old, id);
+  const receipt = (sessionId: string, suffix: string): void => {
+    claimHarnessChatRequest({
+      requestId: `request-${suffix}`,
+      sessionId,
+      runId: `run-${suffix}`,
+      inputHash: `input-${suffix}`,
+      sinceSeq: 0,
+    });
+  };
+
+  const fresh = createSession({ kind: 'chat', channel: 'cli', title: 'fresh-replay' });
+  updateSession(fresh.id, { status: 'completed' });
+  backdate(fresh.id);
+  receipt(fresh.id, 'fresh');
+
+  const doomed = createSession({ kind: 'chat', channel: 'cli', title: 'old-replay' });
+  updateSession(doomed.id, { status: 'completed' });
+  backdate(doomed.id);
+  receipt(doomed.id, 'old');
+  db.prepare('UPDATE harness_chat_requests SET created_at = ? WHERE request_id = ?')
+    .run(old, 'request-old');
+
+  const active = createSession({ kind: 'chat', channel: 'cli', title: 'active-old-replay' });
+  backdate(active.id);
+  receipt(active.id, 'active');
+  db.prepare('UPDATE harness_chat_requests SET created_at = ? WHERE request_id = ?')
+    .run(old, 'request-active');
+
+  assert.equal(reapStaleSessions(14), 1, 'only the exact old terminal receipt owner is doomed');
+  assert.ok(getSession(fresh.id), 'a fresh replay receipt retains its stale terminal session');
+  assert.ok(getHarnessChatRequestReceipt('request-fresh'), 'the fresh receipt remains replayable');
+  assert.equal(getSession(doomed.id), null, 'the old terminal receipt owner is reaped');
+  assert.equal(getHarnessChatRequestReceipt('request-old'), null, 'only its old receipt is removed');
+  assert.ok(getSession(active.id), 'an active session is never in the doomed set');
+  assert.ok(getHarnessChatRequestReceipt('request-active'), 'an old receipt outside the doomed set remains');
+});
+
+test('reapStaleSessions rolls preparatory cleanup back when the final cascade is blocked', () => {
+  resetEventLog();
+  const db = openEventLog();
+  const session = createSession({ kind: 'chat', channel: 'cli', title: 'blocked-reap' });
+  updateSession(session.id, { status: 'completed' });
+  db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
+    .run('2020-01-01T00:00:00.000Z', session.id);
+  db.prepare(`
+    INSERT INTO harness_chat_requests
+      (request_id, session_id, run_id, input_hash, since_seq, created_at)
+    VALUES ('blocked-request', ?, 'blocked-run', 'blocked-input', 0, '2020-01-01T00:00:00.000Z')
+  `).run(session.id);
+  db.exec(`
+    CREATE TABLE reaper_fault_blocker (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE RESTRICT
+    );
+  `);
+  db.prepare('INSERT INTO reaper_fault_blocker (session_id) VALUES (?)').run(session.id);
+
+  assert.throws(() => reapStaleSessions(14), /FOREIGN KEY/);
+  assert.ok(getSession(session.id), 'the blocked session remains');
+  assert.equal(
+    (db.prepare('SELECT COUNT(*) AS n FROM harness_chat_requests WHERE session_id = ?')
+      .get(session.id) as { n: number }).n,
+    1,
+    'the earlier replay-receipt delete rolled back with the failed session delete',
+  );
+  db.prepare('DELETE FROM reaper_fault_blocker WHERE session_id = ?').run(session.id);
+  db.exec('DROP TABLE reaper_fault_blocker');
 });
 
 test('rejects unknown event type', () => {

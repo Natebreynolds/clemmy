@@ -51,8 +51,12 @@ import {
 } from './turn-outcome.js';
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import {
+  materiallyVariantSourceStrategyDecision,
+  materialSourceReplacementBindingIsCompatible,
   PREFLIGHT_ALIGNMENT_SOURCE,
   sourceStrategyBindingAffirmedByAnswer,
+  sourceStrategyBindingsEqual,
+  sourceStrategyTopologyDigestFor,
   validatedTurnSourceStrategyBinding,
   type TurnPreflightDecision,
   type TurnSourceCapabilityBindingV1,
@@ -68,6 +72,11 @@ const ANSWER_MAX_WORDS = 24;
 export const MAX_CLARIFICATION_PARENT_CHARS = 64_000;
 const MAX_CONTINUITY_CANDIDATES = 10;
 export const CLARIFICATION_RESOLVER_VERSION = 'clarification-resolver-v2' as const;
+/** Durable proof that the disposition came from the checked semantic slot
+ * projection, not the legacy eval phrase classifier. The existing continuity
+ * columns already freeze resolverVersion, so this needs no schema widening. */
+export const SEMANTIC_CLARIFICATION_RESOLVER_VERSION =
+  'clarification-resolver-v3-semantic-projection' as const;
 
 const NON_CLARIFICATION_SOURCES = new Set([
   'offer_background',
@@ -194,16 +203,25 @@ function clarificationAwaitingEvent(input: {
       ? event.data.sourceUserSeq === input.sourceUserSeq
       : event.turn === input.terminalTurn;
   });
-  const distinctQuestions = new Set(candidates.map((event) => JSON.stringify({
-    question: normalizedKey(normalized(event.data.question)),
-    options: (Array.isArray(event.data.options) ? event.data.options : [])
-      .map((option) => normalizedKey(normalized(option)))
-      .filter(Boolean),
-  })));
+  const distinctQuestions: Array<{ question: string; options: string[] }> = [];
+  for (const event of candidates) {
+    const candidate = {
+      question: normalizedKey(normalized(event.data.question)),
+      options: (Array.isArray(event.data.options) ? event.data.options : [])
+        .map((option) => normalizedKey(normalized(option)))
+        .filter(Boolean),
+    };
+    if (!distinctQuestions.some((current) =>
+      current.question === candidate.question
+      && current.options.length === candidate.options.length
+      && current.options.every((option, index) => option === candidate.options[index]))) {
+      distinctQuestions.push(candidate);
+    }
+  }
   // Several distinct open asks cannot be resolved by one short reply. The
   // packet store normally has one row, so detect ambiguity while the typed
   // awaiting events are still visible instead of silently selecting the last.
-  if (distinctQuestions.size > 1) return null;
+  if (distinctQuestions.length > 1) return null;
   const event = candidates.at(-1);
   if (!event) return null;
   const eventSourceUserSeq = event.data.sourceUserSeq;
@@ -659,6 +677,8 @@ function frozenResolutionFor(input: {
   question: string;
   answer: string;
   classification: ClarificationAnswerClassification;
+  resolverVersion?: typeof CLARIFICATION_RESOLVER_VERSION
+    | typeof SEMANTIC_CLARIFICATION_RESOLVER_VERSION;
 }): TaskContinuityFrozenResolution | null {
   const semanticInput = retrievalQueryForClassification(
     input.parentInput,
@@ -668,7 +688,7 @@ function frozenResolutionFor(input: {
   );
   if (!semanticInput) return null;
   return {
-    resolverVersion: CLARIFICATION_RESOLVER_VERSION,
+    resolverVersion: input.resolverVersion ?? CLARIFICATION_RESOLVER_VERSION,
     disposition: input.classification.disposition,
     ...(input.classification.selectedOption
       ? { selectedOption: input.classification.selectedOption }
@@ -708,13 +728,19 @@ function clarificationContextFromPacket(input: {
     question: input.packet.pause.question,
     answer: input.answer,
     classification,
+    resolverVersion: input.frozenResolution.resolverVersion === SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+      ? SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+      : CLARIFICATION_RESOLVER_VERSION,
   });
   if (
     !frozenResolution
     || input.frozenResolution.disposition !== frozenResolution.disposition
     || input.frozenResolution.selectedOption !== frozenResolution.selectedOption
     || input.frozenResolution.activeTaskInput !== frozenResolution.activeTaskInput
-    || input.frozenResolution.resolverVersion !== CLARIFICATION_RESOLVER_VERSION
+    || (
+      input.frozenResolution.resolverVersion !== CLARIFICATION_RESOLVER_VERSION
+      && input.frozenResolution.resolverVersion !== SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+    )
     || input.frozenResolution.semanticInputHash !== frozenResolution.semanticInputHash
   ) return null;
   const retrievalQuery = retrievalQueryForClassification(
@@ -837,7 +863,7 @@ function consumeContinuationContext(input: {
   // selector's durable decision+awaiting binding. The phrase is therefore a
   // selector over existing authority, never a fresh source inference.
   const durableSourceSelection = !input.typedClassification
-    ? selectedDurableSourceStrategyBindingForEdge({
+    ? structurallySelectedDurableSourceStrategyBindingForEdge({
         sessionId: input.sessionId,
         parentSourceUserSeq: packet.originatingSourceUserSeq,
         question: packet.pause.question,
@@ -867,6 +893,9 @@ function consumeContinuationContext(input: {
     question: packet.pause.question,
     answer: input.answer,
     classification,
+    ...(input.typedClassification
+      ? { resolverVersion: SEMANTIC_CLARIFICATION_RESOLVER_VERSION }
+      : {}),
   });
   if (!resolution) return null;
   const consumed = consumeTaskContinuityPacket({
@@ -951,7 +980,7 @@ function durableSourceStrategyBindingForEdge(input: {
     if (
       !awaitingBinding
       || !decisionBinding
-      || JSON.stringify(awaitingBinding) !== JSON.stringify(decisionBinding)
+      || !sourceStrategyBindingsEqual(awaitingBinding, decisionBinding)
     ) return undefined;
     return awaitingBinding;
   } catch {
@@ -964,19 +993,28 @@ function durableSourceStrategyBindingForEdge(input: {
  * otherwise-live primary fail replay. Missing process-local schema authority
  * is not treated as drift; the physical gateway still requires and verifies a
  * live exact schema before provider I/O. */
-function selectedDurableSourceStrategyBindingForEdge(input: {
+function structurallySelectedDurableSourceStrategyBindingForEdge(input: {
   sessionId: string;
   parentSourceUserSeq: number;
   question: string;
   answer: string;
 }): TurnSourceStrategyBindingV1 | undefined {
   const binding = durableSourceStrategyBindingForEdge(input);
-  const selected = sourceStrategyBindingAffirmedByAnswer(input.answer, binding);
+  return sourceStrategyBindingAffirmedByAnswer(input.answer, binding) ?? undefined;
+}
+
+function selectedDurableSourceStrategyBindingForEdge(input: {
+  sessionId: string;
+  parentSourceUserSeq: number;
+  question: string;
+  answer: string;
+}): TurnSourceStrategyBindingV1 | undefined {
+  const selected = structurallySelectedDurableSourceStrategyBindingForEdge(input);
   if (!selected) return undefined;
   for (const identity of [selected.primary, ...selected.equivalentFallbacks]) {
-    const match = identity.capabilityId.match(/^capability:composio:(.+)$/i);
-    if (!match?.[1] || !identity.schemaFingerprint) continue;
-    const live = liveComposioSchemaFingerprint(match[1]);
+    const parsed = parsedCapabilityIdentity(identity.capabilityId);
+    if (parsed?.kind !== 'composio' || !identity.schemaFingerprint) continue;
+    const live = liveComposioSchemaFingerprint(parsed.identifier);
     if (live && live !== identity.schemaFingerprint) return undefined;
   }
   return selected;
@@ -998,6 +1036,15 @@ export type DurableMaterialSourceContinuationInspection =
         | 'parent_terminal_ambiguous'
         | 'parent_binding_mismatch'
         | 'answer_not_bound_or_schema_stale';
+    }
+  | {
+      /** B names/provides a materially different source through the checked
+       * semantic slot projection. This is deliberately non-authorizing: the
+       * fresh selector and a second confirmation still have to succeed. */
+      status: 'variant';
+      context: TaskContinuationContext;
+      parentBinding: TurnSourceStrategyBindingV1;
+      parentDecision: TurnPreflightDecision;
     }
   | {
       status: 'verified';
@@ -1136,7 +1183,7 @@ export function inspectDurableMaterialSourceContinuation(input: {
   if (
     !decisionBinding
     || !awaitingBinding
-    || JSON.stringify(decisionBinding) !== JSON.stringify(awaitingBinding)
+    || !sourceStrategyBindingsEqual(decisionBinding, awaitingBinding)
   ) {
     return { status: 'refused', reason: 'parent_binding_mismatch' };
   }
@@ -1164,15 +1211,36 @@ export function inspectDurableMaterialSourceContinuation(input: {
     return { status: 'refused', reason: 'parent_terminal_ambiguous' };
   }
 
-  const binding = selectedDurableSourceStrategyBindingForEdge({
-    sessionId: input.sessionId,
-    parentSourceUserSeq,
-    question: context.question,
+  const structurallySelectedBinding = sourceStrategyBindingAffirmedByAnswer(
     answer,
-  });
-  if (!binding) {
+    decisionBinding,
+  );
+  if (!structurallySelectedBinding) {
+    if (
+      consumed.resolution.resolverVersion === SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+      && context.disposition === 'provided'
+    ) {
+      return {
+        status: 'variant',
+        context,
+        parentBinding: decisionBinding,
+        parentDecision,
+      };
+    }
     return { status: 'refused', reason: 'answer_not_bound_or_schema_stale' };
   }
+  for (const identity of [
+    structurallySelectedBinding.primary,
+    ...structurallySelectedBinding.equivalentFallbacks,
+  ]) {
+    const parsed = parsedCapabilityIdentity(identity.capabilityId);
+    if (parsed?.kind !== 'composio' || !identity.schemaFingerprint) continue;
+    const live = liveComposioSchemaFingerprint(parsed.identifier);
+    if (live && live !== identity.schemaFingerprint) {
+      return { status: 'refused', reason: 'answer_not_bound_or_schema_stale' };
+    }
+  }
+  const binding = structurallySelectedBinding;
   return {
     status: 'verified',
     context,
@@ -1197,6 +1265,176 @@ export function inspectDurableMaterialSourceContinuation(input: {
       sourceStrategyBinding: binding,
       reason: 'continuation_approved',
     },
+  };
+}
+
+function parsedCapabilityIdentity(capabilityId: string): { kind: string; identifier: string } | null {
+  const prefix = 'capability:';
+  if (!capabilityId.startsWith(prefix)) return null;
+  const separator = capabilityId.indexOf(':', prefix.length);
+  if (separator <= prefix.length || separator >= capabilityId.length - 1) return null;
+  return {
+    kind: capabilityId.slice(prefix.length, separator),
+    identifier: capabilityId.slice(separator + 1),
+  };
+}
+
+function candidateMatchesBoundIdentity(
+  candidate: Pick<CapabilityCandidate, 'kind' | 'identifier' | 'accountIdentity' | 'schemaFingerprint'>,
+  identity: TurnSourceCapabilityBindingV1,
+): boolean {
+  const parsed = parsedCapabilityIdentity(identity.capabilityId);
+  return Boolean(parsed
+    && candidate.kind === parsed.kind
+    && candidate.identifier === parsed.identifier
+    && candidate.accountIdentity === identity.accountIdentity
+    && candidate.schemaFingerprint === identity.schemaFingerprint);
+}
+
+function currentSelectorCandidateMatches(
+  candidate: CapabilityCandidate,
+  identity: TurnSourceCapabilityBindingV1,
+): boolean {
+  if (!candidateMatchesBoundIdentity(candidate, identity)) return false;
+  if (
+    candidate.effectClass !== 'read'
+    || !candidate.verifiedReadOrigin
+    || candidate.verifiedReadAliasSpecific !== true
+    || candidate.sourceStructurallyEligible !== true
+    || !(candidate.resolutionRoleKeys ?? []).some((roleKey) => roleKey.endsWith(':read'))
+  ) return false;
+  const parsed = parsedCapabilityIdentity(identity.capabilityId);
+  if (parsed?.kind !== 'composio') return true;
+  return candidate.schemaAuthority === 'live'
+    && Boolean(identity.schemaFingerprint)
+    && candidate.verifiedReadSchemaFingerprint === identity.schemaFingerprint
+    && liveComposioSchemaFingerprint(parsed.identifier) === identity.schemaFingerprint;
+}
+
+function bindingIdentityPresent(
+  binding: TurnSourceStrategyBindingV1,
+  candidate: Pick<CapabilityCandidate, 'kind' | 'identifier' | 'accountIdentity' | 'schemaFingerprint'>,
+): boolean {
+  return [binding.primary, ...binding.equivalentFallbacks]
+    .some((identity) => candidateMatchesBoundIdentity(candidate, identity));
+}
+
+export type MaterialSourceVariantRecoveryPreparation =
+  | {
+      status: 'ready';
+      context: TaskContinuationContext;
+      parentBinding: TurnSourceStrategyBindingV1;
+      binding: TurnSourceStrategyBindingV1;
+      decision: TurnPreflightDecision;
+      turnCandidates: TurnCapabilityCandidates;
+    }
+  | {
+      status: 'refused';
+      reason:
+        | 'replacement_binding_missing_or_incompatible'
+        | 'replacement_not_uniquely_current'
+        | 'replacement_decision_invalid';
+    };
+
+/** Validate one result from the existing fresh selector. The result remains a
+ * proposal: this prepares an align decision and never promotes it to
+ * `confirmed_exact`. Every old source identity is removed from both the
+ * returned binding and advisory surface, even if the fresh selector surfaced
+ * it again as a fallback. */
+export function prepareMaterialSourceVariantRecovery(input: {
+  inspection: Extract<DurableMaterialSourceContinuationInspection, { status: 'variant' }>;
+  resolved: TurnCapabilityCandidates;
+}): MaterialSourceVariantRecoveryPreparation {
+  const selectedReplacement = validatedTurnSourceStrategyBinding(input.resolved.sourceStrategyBinding);
+  if (!selectedReplacement || !materialSourceReplacementBindingIsCompatible({
+    parent: input.inspection.parentBinding,
+    replacement: selectedReplacement,
+  })) {
+    return { status: 'refused', reason: 'replacement_binding_missing_or_incompatible' };
+  }
+  const parentIdentities = [
+    input.inspection.parentBinding.primary,
+    ...input.inspection.parentBinding.equivalentFallbacks,
+  ];
+  const sameIdentity = (
+    left: TurnSourceCapabilityBindingV1,
+    right: TurnSourceCapabilityBindingV1,
+  ): boolean => left.capabilityId === right.capabilityId
+    && left.accountIdentity === right.accountIdentity
+    && left.schemaFingerprint === right.schemaFingerprint;
+  // The fresh selector may surface A's path as a bounded fallback. B expressly
+  // replaced A, so carrying that old identity into Q2 would preserve authority
+  // the user just revoked. Monotonically narrow the selector result and digest
+  // the narrowed binding; never add an identity the selector did not produce.
+  const replacementDraft: TurnSourceStrategyBindingV1 = {
+    ...selectedReplacement,
+    equivalentFallbacks: selectedReplacement.equivalentFallbacks.filter((identity) =>
+      !parentIdentities.some((parentIdentity) => sameIdentity(parentIdentity, identity))),
+    topologyDigest: '0'.repeat(64),
+  };
+  const narrowedDigest = sourceStrategyTopologyDigestFor(replacementDraft);
+  if (!narrowedDigest) {
+    return { status: 'refused', reason: 'replacement_binding_missing_or_incompatible' };
+  }
+  const replacement: TurnSourceStrategyBindingV1 = {
+    ...replacementDraft,
+    topologyDigest: narrowedDigest,
+  };
+  if (!materialSourceReplacementBindingIsCompatible({
+    parent: input.inspection.parentBinding,
+    replacement,
+  })) {
+    return { status: 'refused', reason: 'replacement_binding_missing_or_incompatible' };
+  }
+  const replacementIdentities = [replacement.primary, ...replacement.equivalentFallbacks];
+  if (!replacementIdentities.every((identity) =>
+    input.resolved.candidates.filter((candidate) =>
+      currentSelectorCandidateMatches(candidate, identity)).length === 1)) {
+    return { status: 'refused', reason: 'replacement_not_uniquely_current' };
+  }
+  const decision = materiallyVariantSourceStrategyDecision({
+    parentDecision: input.inspection.parentDecision,
+    parentBinding: input.inspection.parentBinding,
+    replacementBinding: replacement,
+    acceptedAnswer: input.inspection.context.answer,
+  });
+  if (!decision) return { status: 'refused', reason: 'replacement_decision_invalid' };
+
+  const parent = input.inspection.parentBinding;
+  const revokedCandidate = (candidate: CapabilityCandidate): boolean =>
+    bindingIdentityPresent(parent, candidate);
+  const revokedNames = new Set([parent.primary, ...parent.equivalentFallbacks]
+    .map((identity) => parsedCapabilityIdentity(identity.capabilityId)?.identifier)
+    .filter((identifier): identifier is string => Boolean(identifier)));
+  const retainedNames = new Set(replacementIdentities
+    .map((identity) => parsedCapabilityIdentity(identity.capabilityId)?.identifier)
+    .filter((identifier): identifier is string => Boolean(identifier)));
+  const turnCandidates: TurnCapabilityCandidates = {
+    ...input.resolved,
+    candidates: input.resolved.candidates.filter((candidate) => !revokedCandidate(candidate)),
+    requirements: input.resolved.requirements.map((requirement) => {
+      const resolvedCapabilities = requirement.resolvedCapabilities
+        .filter((candidate) => !revokedCandidate(candidate));
+      return resolvedCapabilities.length === requirement.resolvedCapabilities.length
+        ? requirement
+        : {
+            ...requirement,
+            resolved: resolvedCapabilities.length > 0,
+            resolvedCapabilities,
+          };
+    }),
+    matches: input.resolved.matches.filter((match) => !revokedNames.has(match.identifier)),
+    pinnedTools: input.resolved.pinnedTools.filter((tool) =>
+      !revokedNames.has(tool) || retainedNames.has(tool)),
+    sourceStrategyBinding: replacement,
+  };
+  return {
+    status: 'ready',
+    context: { ...input.inspection.context, capabilities: [] },
+    parentBinding: input.inspection.parentBinding,
+    binding: replacement,
+    decision,
+    turnCandidates,
   };
 }
 
@@ -1257,11 +1495,12 @@ function candidateCapabilityId(candidate: Pick<CapabilityCandidate, 'kind' | 'id
 }
 
 function sourceIdentityKey(identity: TurnSourceCapabilityBindingV1): string {
-  return JSON.stringify([
-    identity.capabilityId,
-    identity.accountIdentity ?? null,
-    identity.schemaFingerprint ?? null,
-  ]);
+  const field = (value: string | undefined): string => value === undefined
+    ? 'u;'
+    : `s${Buffer.byteLength(value, 'utf8')}:${value};`;
+  return field(identity.capabilityId)
+    + field(identity.accountIdentity)
+    + field(identity.schemaFingerprint);
 }
 
 function candidateMatchesSourceIdentity(
@@ -1294,12 +1533,12 @@ function withoutRevokedSourceFallbacks(
   const revokedCapabilityIds = new Set(revoked.map((identity) => identity.capabilityId));
   const retainedCapabilityIds = new Set(retained.map((identity) => identity.capabilityId));
   const revokedIdentifiers = new Set([...revokedCapabilityIds].flatMap((capabilityId) => {
-    const parsed = capabilityId.match(/^capability:[^:]+:(.+)$/);
-    return parsed?.[1] ? [parsed[1]] : [];
+    const parsed = parsedCapabilityIdentity(capabilityId);
+    return parsed ? [parsed.identifier] : [];
   }));
   const retainedIdentifiers = new Set([...retainedCapabilityIds].flatMap((capabilityId) => {
-    const parsed = capabilityId.match(/^capability:[^:]+:(.+)$/);
-    return parsed?.[1] ? [parsed[1]] : [];
+    const parsed = parsedCapabilityIdentity(capabilityId);
+    return parsed ? [parsed.identifier] : [];
   }));
   const keepCandidate = (candidate: SourceSurfaceCandidate) => {
     const capabilityId = candidateCapabilityId(candidate);
@@ -1346,7 +1585,7 @@ export function mergeTurnCapabilityCandidates(
 ): TurnCapabilityCandidates {
   const sourceStrategyBinding: TurnSourceStrategyBindingV1 | undefined =
     first.sourceStrategyBinding && second.sourceStrategyBinding
-      ? JSON.stringify(first.sourceStrategyBinding) === JSON.stringify(second.sourceStrategyBinding)
+      ? sourceStrategyBindingsEqual(first.sourceStrategyBinding, second.sourceStrategyBinding)
         ? first.sourceStrategyBinding
         : undefined
       : first.sourceStrategyBinding ?? second.sourceStrategyBinding;
@@ -1366,13 +1605,13 @@ export function mergeTurnCapabilityCandidates(
     ? [sourceStrategyBinding.primary, ...sourceStrategyBinding.equivalentFallbacks]
       .map((identity) => ({
         identity,
-        parsed: identity.capabilityId.match(/^capability:([^:]+):(.+)$/),
+        parsed: parsedCapabilityIdentity(identity.capabilityId),
       }))
-      .filter((row): row is typeof row & { parsed: RegExpMatchArray } => Boolean(row.parsed))
+      .filter((row): row is typeof row & { parsed: { kind: string; identifier: string } } => Boolean(row.parsed))
     : [];
   const promotedCandidates: CapabilityCandidate[] = [];
   for (const { identity, parsed } of boundCapabilities) {
-    const [, kind, identifier] = parsed;
+    const { kind, identifier } = parsed;
     const exactIndex = mergedCandidates.findIndex((candidate) =>
       candidate.kind === kind
       && candidate.identifier === identifier
@@ -1449,7 +1688,7 @@ export function mergeTurnCapabilityCandidates(
     requirements: [...requirements.values()],
     matches: [...first.matches, ...second.matches].slice(0, MAX_CONTINUITY_CANDIDATES),
     pinnedTools: [...new Set([
-      ...(boundCapabilities.some(({ parsed }) => parsed[1] === 'composio') ? ['composio_execute_tool'] : []),
+      ...(boundCapabilities.some(({ parsed }) => parsed.kind === 'composio') ? ['composio_execute_tool'] : []),
       ...first.pinnedTools,
       ...second.pinnedTools,
     ])],
@@ -1471,6 +1710,10 @@ export async function enrichAcceptedRequestWithTaskContinuity(
   options: {
     continuationOnly?: boolean;
     typedClassification?: ClarificationAnswerClassification | { keepOpen: true };
+    /** The bridge uses this only for the pre-resolution A/Q/B inspection. It
+     * consumes/rehydrates the exact packet but performs no candidate/schema
+     * lookup, so corrupt material-source lineage can stop at zero selector I/O. */
+    resolveCandidates?: boolean;
   } = {},
 ): Promise<AssistantRequest> {
   const accepted = realAcceptedSource(request.sessionId, sourceUserSeq);
@@ -1509,6 +1752,18 @@ export async function enrichAcceptedRequestWithTaskContinuity(
     : context?.disposition === 'declined_with_new_task'
       ? context.activeTaskInput ?? context.retrievalQuery
       : context?.retrievalQuery ?? request.message;
+  if (context && options.resolveCandidates === false) {
+    const turnCandidates = request.turnCandidates
+      ? (({ sourceStrategyBinding: _untrustedBinding, ...safe }) => safe)(request.turnCandidates)
+      : undefined;
+    return {
+      ...request,
+      semanticTaskInput: query,
+      taskContinuation: context,
+      taskContinuationResolved: true,
+      ...(turnCandidates ? { turnCandidates } : {}),
+    };
+  }
   let resolved: TurnCapabilityCandidates = {
     candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
   };
@@ -1517,7 +1772,7 @@ export async function enrichAcceptedRequestWithTaskContinuity(
   // a literal "No" lookup is wasted work and can match generic historical
   // aliases, so leave the candidate surface empty rather than merely changing
   // the query from A/Q/B to B.
-  if (context?.disposition !== 'declined') {
+  if (context?.disposition !== 'declined' && options.resolveCandidates !== false) {
     try { resolved = await resolveTurnCapabilityCandidates({ userInput: query }); } catch { /* advisory only */ }
   }
   if (!context) {

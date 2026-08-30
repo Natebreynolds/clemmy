@@ -7,9 +7,18 @@ import type { StreamEvent } from '@openai/agents-core/types';
 import { BASE_DIR } from '../config.js';
 import { recordOperationalEvent } from './operational-telemetry.js';
 import {
+  FallbackModel,
   fallbackRouteResolution,
+  type FallbackTarget,
   type FallbackRouteResolution,
 } from './harness/fallback-model.js';
+import {
+  observePromptCacheRequest,
+  parseProviderPromptCacheUsage,
+  type PromptCacheRequestObservationV1,
+  type ProviderPromptCacheUsageV1,
+} from './harness/prompt-cache-observation.js';
+import { harnessRunContextStorage } from './harness/brackets.js';
 
 export const MODEL_ROUTE_METRICS_SCHEMA_VERSION = 1;
 
@@ -196,6 +205,20 @@ export interface RecordModelRouteOutcomeInput {
   now?: Date;
 }
 
+/**
+ * Content-free accounting projected from one provider adapter response.
+ * `costUsd` is present only when the adapter returned an explicit billed cost;
+ * callers must never synthesize it from model names or token counts.
+ */
+export interface ModelRouteCallUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  totalTokens?: number;
+  costUsd?: number;
+  promptCacheUsage?: ProviderPromptCacheUsageV1;
+}
+
 export interface ModelRouteMetricsContext extends Omit<RecordModelRouteDecisionInput, 'id' | 'now'> {
   modelCallIdPrefix?: string;
 }
@@ -238,7 +261,7 @@ export function recordModelRouteDecision(
   const createdAt = (input.now ?? new Date()).toISOString();
   try {
     (db ?? openModelRouteMetricsDb()).prepare(`
-      INSERT OR REPLACE INTO model_route_decisions (
+      INSERT OR IGNORE INTO model_route_decisions (
         id, created_at, session_id, workflow_run_id, workflow_node_id,
         workspace_id, role, intent, requested_model, resolved_model, provider,
         source, reason_json, policy_version
@@ -296,11 +319,11 @@ export function recordModelRouteDecision(
 export function recordModelRouteOutcome(
   input: RecordModelRouteOutcomeInput,
   db?: Database.Database,
-): void {
+): boolean {
   const completedAt = (input.now ?? new Date()).toISOString();
   try {
-    (db ?? openModelRouteMetricsDb()).prepare(`
-      INSERT OR REPLACE INTO model_route_outcomes (
+    const result = (db ?? openModelRouteMetricsDb()).prepare(`
+      INSERT OR IGNORE INTO model_route_outcomes (
         decision_id, completed_at, status, latency_ms, input_tokens,
         output_tokens, cached_tokens, total_tokens, cost_usd, error_class,
         fallover_to_model, tool_calls, tool_success, objective_met, metadata_json
@@ -326,8 +349,10 @@ export function recordModelRouteOutcome(
       objectiveMet: boolToInt(input.objectiveMet),
       metadataJson: JSON.stringify(input.metadata ?? {}),
     });
+    return result.changes === 1;
   } catch {
     // Metrics must never fail a model call.
+    return false;
   }
 }
 
@@ -347,8 +372,51 @@ export function reapStaleModelRouteMetrics(maxAgeDays = 30): number {
   }
 }
 
-export function withModelRouteMetrics(model: Model, context: ModelRouteMetricsContext): Model {
-  return new ModelRouteMetricsModel(model, context);
+export function withModelRouteMetrics(
+  model: Model,
+  context: ModelRouteMetricsContext,
+  db?: Database.Database,
+): Model {
+  if (model instanceof FallbackModel) {
+    const mapped = model.mapAttemptTargets((target, index) => instrumentFallbackTarget(target, index, context, db));
+    // Keep the pre-existing context introspection surface while deliberately
+    // avoiding an aggregate recording wrapper around the fallback graph.
+    Object.defineProperty(mapped, 'context', {
+      value: context,
+      enumerable: false,
+      configurable: true,
+    });
+    return mapped;
+  }
+  return new ModelRouteMetricsModel(model, context, db);
+}
+
+function instrumentFallbackTarget(
+  target: FallbackTarget,
+  index: number,
+  context: ModelRouteMetricsContext,
+  db?: Database.Database,
+): FallbackTarget {
+  return {
+    ...target,
+    getModel: () => withModelRouteMetrics(target.getModel(), {
+      ...context,
+      resolvedModel: target.model ?? target.label,
+      provider: modelRouteProvider(target.provider) ?? context.provider,
+      source: index === 0 ? context.source : 'fallback',
+      reason: {
+        ...(context.reason ?? {}),
+        routeTargetIndex: index,
+        initialResolvedModel: context.resolvedModel,
+      },
+    }, db),
+  };
+}
+
+function modelRouteProvider(value: string | undefined): ModelRouteProvider | undefined {
+  return value === 'codex' || value === 'claude' || value === 'byo' || value === 'openai' || value === 'unknown'
+    ? value
+    : undefined;
 }
 
 export function successfulRouteOutcome(
@@ -377,14 +445,19 @@ export function successfulRouteOutcome(
 }
 
 class ModelRouteMetricsModel implements Model {
-  constructor(private readonly inner: Model, private readonly context: ModelRouteMetricsContext) {}
+  constructor(
+    private readonly inner: Model,
+    private readonly context: ModelRouteMetricsContext,
+    private readonly db?: Database.Database,
+  ) {}
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     const startedAt = Date.now();
-    const decisionId = this.startCall('getResponse');
+    const promptCacheRequest = observePromptCacheRequest(request);
+    const decisionId = this.startCall('getResponse', promptCacheRequest);
     try {
       const response = await this.inner.getResponse(request);
-      const usage = usageFromResponse(response);
+      const usage = modelRouteUsageFromResponse(response);
       const resolution = fallbackRouteResolution(response);
       const outcome = successfulRouteOutcome(resolution, { path: 'getResponse' });
       this.finishCall(
@@ -400,7 +473,6 @@ class ModelRouteMetricsModel implements Model {
     } catch (err) {
       this.finishCall(decisionId, 'failed', startedAt, {}, {
         path: 'getResponse',
-        error: errorMessage(err),
       }, errorClass(err));
       throw err;
     }
@@ -408,8 +480,9 @@ class ModelRouteMetricsModel implements Model {
 
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     const startedAt = Date.now();
-    const decisionId = this.startCall('getStreamedResponse');
-    let usage: UsageFields = {};
+    const promptCacheRequest = observePromptCacheRequest(request);
+    const decisionId = this.startCall('getStreamedResponse', promptCacheRequest);
+    let usage: ModelRouteCallUsage = {};
     let completed = false;
     let failed = false;
     let resolution: FallbackRouteResolution | undefined;
@@ -435,7 +508,6 @@ class ModelRouteMetricsModel implements Model {
       failed = true;
       this.finishCall(decisionId, 'failed', startedAt, usage, {
         path: 'getStreamedResponse',
-        error: errorMessage(err),
       }, errorClass(err));
       throw err;
     } finally {
@@ -445,23 +517,28 @@ class ModelRouteMetricsModel implements Model {
     }
   }
 
-  private startCall(pathName: 'getResponse' | 'getStreamedResponse'): string {
+  private startCall(
+    pathName: 'getResponse' | 'getStreamedResponse',
+    promptCacheRequest: PromptCacheRequestObservationV1,
+  ): string {
+    const activeContext = harnessMetricsContext(this.context);
     const decisionId = recordModelRouteDecision({
-      ...this.context,
+      ...activeContext,
       id: this.context.modelCallIdPrefix ? `${this.context.modelCallIdPrefix}:${randomUUID()}` : undefined,
       reason: {
         ...(this.context.reason ?? {}),
         path: pathName,
+        promptCacheRequest,
       },
-    });
-    recordOperationalEvent({
+    }, this.db);
+    if (!this.db) recordOperationalEvent({
       source: 'model',
       type: 'model_call_started',
       severity: 'info',
-      sessionId: this.context.sessionId,
-      workflowRunId: this.context.workflowRunId,
-      workflowNodeRunId: this.context.workflowNodeId,
-      workspaceId: this.context.workspaceId,
+      sessionId: activeContext.sessionId,
+      workflowRunId: activeContext.workflowRunId,
+      workflowNodeRunId: activeContext.workflowNodeId,
+      workspaceId: activeContext.workspaceId,
       modelCallId: decisionId,
       actor: 'model-route-metrics',
       payload: {
@@ -481,7 +558,7 @@ class ModelRouteMetricsModel implements Model {
     decisionId: string,
     status: ModelRouteOutcomeStatus,
     startedAt: number,
-    usage: UsageFields,
+    usage: ModelRouteCallUsage,
     metadata: Record<string, unknown>,
     errorClassName?: string,
     falloverToModel?: string,
@@ -494,11 +571,15 @@ class ModelRouteMetricsModel implements Model {
       outputTokens: usage.outputTokens,
       cachedTokens: usage.cachedTokens,
       totalTokens: usage.totalTokens,
+      costUsd: usage.costUsd,
       errorClass: errorClassName,
       falloverToModel,
-      metadata,
-    });
-    if (status === 'failed') {
+      metadata: {
+        ...metadata,
+        ...(usage.promptCacheUsage ? { promptCacheUsage: usage.promptCacheUsage } : {}),
+      },
+    }, this.db);
+    if (status === 'failed' && !this.db) {
       recordOperationalEvent({
         source: 'model',
         type: 'model_call_failed',
@@ -614,13 +695,6 @@ function roundScore(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000;
 }
 
-interface UsageFields {
-  inputTokens?: number;
-  outputTokens?: number;
-  cachedTokens?: number;
-  totalTokens?: number;
-}
-
 function ensureStateDir(): void {
   if (!existsSync(MODEL_ROUTE_METRICS_STATE_DIR)) mkdirSync(MODEL_ROUTE_METRICS_STATE_DIR, { recursive: true });
 }
@@ -630,27 +704,62 @@ function boolToInt(value: boolean | undefined): 0 | 1 | null {
   return value ? 1 : 0;
 }
 
-function usageFromResponse(response: ModelResponse): UsageFields {
+export function modelRouteUsageFromResponse(response: ModelResponse): ModelRouteCallUsage {
   const usage = (response as { usage?: unknown }).usage;
-  return usageFromUnknown(usage);
+  const fields = usageFromUnknown(usage);
+  const costUsd = explicitProviderCostUsd(
+    (response as { providerData?: unknown }).providerData,
+  );
+  const receipt = parseProviderPromptCacheUsage(
+    (response as { providerData?: { promptCacheUsage?: unknown } }).providerData?.promptCacheUsage,
+  );
+  return bindProviderPromptCacheUsage(
+    costUsd === undefined ? fields : { ...fields, costUsd },
+    receipt,
+  );
 }
 
-function usageFromStreamEvent(event: StreamEvent): UsageFields | null {
-  const candidate = event as { type?: string; response?: { usage?: unknown } };
+function usageFromStreamEvent(event: StreamEvent): ModelRouteCallUsage | null {
+  const candidate = event as {
+    type?: string;
+    response?: { usage?: unknown; providerData?: { promptCacheUsage?: unknown } };
+  };
   if (candidate.type !== 'response_done') return null;
-  return usageFromUnknown(candidate.response?.usage);
+  return modelRouteUsageFromResponse((candidate.response ?? {}) as ModelResponse);
 }
 
-function usageFromUnknown(value: unknown): UsageFields {
+function bindProviderPromptCacheUsage(
+  fields: ModelRouteCallUsage,
+  receipt: ProviderPromptCacheUsageV1 | null,
+): ModelRouteCallUsage {
+  if (!receipt) return fields;
+  // The adapter-owned receipt and the generic Agents response must describe the
+  // same call. A detached/mismatched receipt is discarded rather than allowed
+  // to manufacture a favorable cache number.
+  if (fields.inputTokens !== undefined && fields.inputTokens !== receipt.inputTokens) return fields;
+  if (fields.cachedTokens !== undefined && fields.cachedTokens !== receipt.cachedInputTokens) return fields;
+  return {
+    ...fields,
+    inputTokens: receipt.inputTokens,
+    cachedTokens: receipt.cachedInputTokens,
+    promptCacheUsage: receipt,
+  };
+}
+
+function usageFromUnknown(value: unknown): ModelRouteCallUsage {
   if (!value || typeof value !== 'object') return {};
   const usage = value as Record<string, unknown>;
   const inputTokens = readNumber(usage, 'inputTokens', 'input_tokens', 'prompt_tokens');
   const outputTokens = readNumber(usage, 'outputTokens', 'output_tokens', 'completion_tokens');
   const totalTokens = readNumber(usage, 'totalTokens', 'total_tokens')
     ?? (inputTokens !== undefined || outputTokens !== undefined ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined);
-  const inputDetails = readObject(usage, 'inputTokensDetails', 'input_tokens_details', 'prompt_tokens_details');
+  const inputDetails = readObjects(usage, 'inputTokensDetails', 'input_tokens_details', 'prompt_tokens_details');
   const cachedTokens = readNumber(usage, 'cachedInputTokens', 'cached_input_tokens', 'cache_read_input_tokens')
-    ?? (inputDetails ? readNumber(inputDetails, 'cachedTokens', 'cached_tokens', 'cache_read_input_tokens') : undefined);
+    ?? (inputDetails.length > 0
+      ? inputDetails.reduce((sum, detail) => sum + (
+          readNumber(detail, 'cachedTokens', 'cached_tokens', 'cacheReadInputTokens', 'cache_read_input_tokens') ?? 0
+        ), 0)
+      : undefined);
   return {
     inputTokens,
     outputTokens,
@@ -659,12 +768,43 @@ function usageFromUnknown(value: unknown): UsageFields {
   };
 }
 
-function readObject(record: Record<string, unknown>, ...keys: string[]): Record<string, unknown> | undefined {
+/** Only adapter-owned explicit billed cost is accepted. Token-derived estimates
+ * and provider/model price tables deliberately do not exist in this ledger. */
+function explicitProviderCostUsd(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const providerData = value as Record<string, unknown>;
+  const raw = providerData.totalCostUsd ?? providerData.total_cost_usd;
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
+function harnessMetricsContext(context: ModelRouteMetricsContext): ModelRouteMetricsContext {
+  if (context.sessionId && context.workflowRunId) return context;
+  const active = harnessRunContextStorage.getStore();
+  const sessionId = context.sessionId ?? active?.sessionId;
+  const workflowRunId = context.workflowRunId ?? workflowRunIdFromSessionId(sessionId);
+  return {
+    ...context,
+    ...(sessionId ? { sessionId } : {}),
+    ...(workflowRunId ? { workflowRunId } : {}),
+  };
+}
+
+function workflowRunIdFromSessionId(sessionId: string | undefined): string | undefined {
+  if (!sessionId?.startsWith('workflow:')) return undefined;
+  const [, runId] = sessionId.split(':');
+  return runId || undefined;
+}
+
+function readObjects(record: Record<string, unknown>, ...keys: string[]): Array<Record<string, unknown>> {
   for (const key of keys) {
     const value = record[key];
-    if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+    if (Array.isArray(value)) {
+      return value.filter((entry): entry is Record<string, unknown> =>
+        Boolean(entry) && typeof entry === 'object' && !Array.isArray(entry));
+    }
+    if (value && typeof value === 'object') return [value as Record<string, unknown>];
   }
-  return undefined;
+  return [];
 }
 
 function readNumber(record: Record<string, unknown>, ...keys: string[]): number | undefined {
@@ -686,9 +826,4 @@ function errorClass(err: unknown): string {
     if (typeof named.constructor?.name === 'string' && named.constructor.name.length > 0) return named.constructor.name;
   }
   return typeof err;
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }

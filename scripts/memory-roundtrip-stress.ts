@@ -27,7 +27,10 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 const { rememberFact, setFactPinned, listConstraints, listPinnedFacts, searchFactsByText } = await import('../src/memory/facts.js');
 const { openMemoryDb } = await import('../src/memory/db.js');
 const { renderHarnessMemoryContext } = await import('../src/agents/harness-context.js');
-const { findEmailSendConstraint, constraintsForToolkit } = await import('../src/runtime/harness/constraint-guard.js');
+const {
+  findComposioEmailSendConstraint: findEmailSendConstraint,
+  constraintsForComposioToolkit: constraintsForToolkit,
+} = await import('../src/integrations/composio/standing-policy-adapter.js');
 const { extractAutoMemoryCandidates } = await import('../src/memory/auto-capture.js');
 
 function clearFacts(): void {

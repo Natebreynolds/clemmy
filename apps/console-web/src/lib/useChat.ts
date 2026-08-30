@@ -836,7 +836,7 @@ export function progressLabel(ev: HarnessEvent): string | null {
         const key = typeof g.key === 'string' && g.key ? g.key : 'results';
         return `Got ${g.count} ${key}`;
       }
-      if (isDiscoveryToolName(tool)) return 'Finding the right tool…';
+      if (isDiscoveryToolName(tool)) return 'Working on it…';
       return pretty ? `Got results from ${pretty}` : 'Got results';
     }
     case 'handoff': return 'Handing off…';
@@ -1295,6 +1295,13 @@ export function useChat(options?: UseChatOptions) {
       patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined });
     } else if (ev.type === 'approval_requested') {
       setMessages((prev) => appendLiveApprovalCard(prev, ev));
+    } else if (ev.type === 'conversation_preamble') {
+      const text = typeof d.text === 'string' ? d.text.trim() : '';
+      if (text) {
+        setMessages((prev) => prev.map((m) => (
+          m.id === assistantId && !m.text.trim() ? { ...m, text } : m
+        )));
+      }
     } else {
       const label = progressLabel(ev);
       setMessages((prev) => prev.map((m) => {

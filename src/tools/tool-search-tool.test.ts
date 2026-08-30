@@ -3,10 +3,16 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync } from 'node:fs';
-import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 
+// NOTHING that reaches config.js may be imported statically above this line:
+// a hoisted import captures BASE_DIR from the REAL home before the assignment
+// runs, and the suite then reads and writes the user's live store while
+// believing it is isolated. openEventLog now refuses that outright.
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-toolsearch-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+
+const { DEFAULT_TOOL_RESULT_MAX_CHARS } = await import('../runtime/harness/tool-output-format.js');
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ToolSearchCandidateSource } from './tool-search-tool.js';
@@ -68,6 +74,31 @@ async function runSearch(handler: Handler, query: string, sessionId?: string, ro
   };
 }
 
+test('JSON-null cursor sentinels are omitted, not treated as continuations', async () => {
+  const { normalizeToolSearchCursor } = await import('./tool-search-tool.js');
+  for (const cursor of ['null', 'NULL', ' undefined ', 'none', 'nil', 'n/a', '', '  ']) {
+    assert.equal(normalizeToolSearchCursor(cursor), null, cursor);
+  }
+  assert.equal(normalizeToolSearchCursor(null), null);
+  assert.equal(normalizeToolSearchCursor(undefined), null);
+  assert.match(
+    normalizeToolSearchCursor(`tool_search_page:v1:${'a'.repeat(64)}`) ?? '',
+    /^tool_search_page:v1:/,
+  );
+
+  const t = captureToolSearch();
+  const cursorField = t.schema.cursor as { parse?: (value: unknown) => unknown; safeParse?: (value: unknown) => { success: boolean } };
+  assert.equal(typeof cursorField?.parse, 'function', 'cursor is a zod field the host validates');
+  assert.equal(cursorField.safeParse?.('')?.success, true, 'empty cursor is omitted, not minLength-invalid');
+  assert.equal(cursorField.safeParse?.(null)?.success, true);
+  for (const cursor of ['null', 'undefined', 'none', '']) {
+    const raw = await t.handler({ query: 'calendar', cursor });
+    const body = JSON.parse(raw.content[0]!.text) as { error?: string; results?: unknown[] };
+    assert.notEqual(body.error, 'invalid_or_expired_tool_search_cursor', cursor);
+    assert.ok(Array.isArray(body.results), `${cursor} must run discovery, not a continuation read`);
+  }
+});
+
 test('registers as read-only tool_search with a query param', () => {
   const t = captureToolSearch();
   assert.equal(t.name, 'tool_search');
@@ -120,6 +151,51 @@ test('incident replay: scoped reminder discovery ranks the firing timer above a 
   } finally {
     if (previousDisabled === undefined) delete process.env.EMBEDDINGS_DISABLED;
     else process.env.EMBEDDINGS_DISABLED = previousDisabled;
+  }
+});
+
+test('a uniquely named saved-workflow run is an exact workflow_run hit, not a provider hunt', async () => {
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+  const { rmSync } = await import('node:fs');
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  let providerSearches = 0;
+  try {
+    const t = captureToolSearch(
+      new Set(['workflow_run', 'workflow_get', 'workflow_schedule']),
+      false,
+      [{
+        kind: 'authorized_composio',
+        async search() {
+          providerSearches += 1;
+          return [{
+            name: 'APIFY_RUN_ACTOR',
+            summary: 'Run an Apify actor',
+            carrier: 'work_call',
+            score: 1,
+          }];
+        },
+      }],
+    );
+    const raw = await t.handler({
+      query: 'Can you run my platform 49 workflow',
+      limit: 8,
+    });
+    const out = JSON.parse(raw.content[0]!.text) as {
+      results: Array<{ name: string }>;
+      schemas: Record<string, unknown>;
+    };
+    assert.deepEqual(out.results.map((result) => result.name), ['workflow_run']);
+    assert.ok(out.schemas.workflow_run, 'workflow_run must include its callable schema');
+    assert.equal(providerSearches, 0, 'unique workflow identity must not consult provider discovery');
+  } finally {
+    rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
   }
 });
 
@@ -602,6 +678,123 @@ for (const renderChars of [20_000, 20_001, 100_000]) {
   });
 }
 
+test('compact oversized schema keeps real properties whose names match annotation keywords', async () => {
+  const name = 'ANNOTATION_NAMED_FIELDS';
+  const schema = {
+    type: 'object',
+    description: 'root annotation '.repeat(4_000),
+    required: ['description', 'title', 'default', 'payload'],
+    additionalProperties: false,
+    properties: {
+      description: { type: 'string', description: 'field annotation '.repeat(500) },
+      title: { type: 'string', title: 'field title annotation'.repeat(500) },
+      default: { type: 'string', default: 'field default annotation'.repeat(500) },
+      payload: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['description'],
+        const: {
+          description: 'instance description',
+          title: 'instance title',
+          default: 'instance default',
+        },
+        enum: [{
+          description: 'enum description',
+          title: 'enum title',
+          default: 'enum default',
+        }],
+        properties: {
+          description: { type: 'string', description: 'nested annotation '.repeat(500) },
+        },
+      },
+    },
+  };
+  const t = captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio',
+    async search() {
+      return [{ name, summary: 'Annotation-name preservation proof', schema, carrier: 'work_call', score: 1 }];
+    },
+  }]);
+
+  const raw = await t.handler({ query: name, limit: 1 });
+  const body = JSON.parse(raw.content[0].text) as {
+    schemas: Record<string, any>;
+    schema_handles?: Record<string, unknown>;
+  };
+  const compact = body.schemas[name];
+  assert.ok(body.schema_handles?.[name], 'the lossless original remains content-addressable');
+  assert.ok(compact, 'annotation stripping should leave a bounded structural preview inline');
+  assert.deepEqual(Object.keys(compact.properties).sort(), ['default', 'description', 'payload', 'title']);
+  assert.ok(compact.properties.payload.properties.description);
+  assert.equal(compact.description, undefined, 'the schema-node annotation is removed');
+  assert.equal(compact.properties.description.description, undefined, 'nested schema-node annotations are removed');
+  assert.equal(compact.properties.title.title, undefined, 'title annotations are removed without deleting the title field');
+  assert.equal(compact.properties.default.default, undefined, 'default annotations are removed without deleting the default field');
+  assert.deepEqual(compact.properties.payload.const, {
+    description: 'instance description',
+    title: 'instance title',
+    default: 'instance default',
+  }, 'const instance JSON is never traversed as a schema');
+  assert.deepEqual(compact.properties.payload.enum, [{
+    description: 'enum description',
+    title: 'enum title',
+    default: 'enum default',
+  }], 'enum instance JSON is never traversed as a schema');
+});
+
+test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership on the same planning query', async () => {
+  const { registerToolSearchTool } = await import('./tool-search-tool.js');
+  const { AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE } = await import(
+    '../runtime/harness/live-read-planning-authority.js'
+  );
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'live-read-rank-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      {
+        kind: AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
+        search: async () => [{
+          name: 'acquired_live_read',
+          summary: 'Current attested read capability acquired_live_read',
+          schema: { type: 'object', properties: { query: { type: 'string' } } },
+          carrier: 'work_call',
+          score: 1,
+        }],
+      },
+      {
+        kind: 'authorized_composio',
+        search: async () => [{
+          name: 'UNRELATED_BROKER_QUERY_TABLE',
+          summary: 'Fuzzy connected-app membership that does not answer this query.',
+          schema: { type: 'object', properties: { spreadsheet_id: { type: 'string' } } },
+          carrier: 'work_call',
+          score: 1.05,
+        }],
+      },
+    ],
+    discloseForPlanning: async (candidates) => Object.fromEntries(
+      candidates
+        .filter((candidate) => candidate.sourceKind === AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE)
+        .map((candidate) => [candidate.name, `cap:live:v1:test:${candidate.name}`]),
+    ),
+  });
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({
+    query: 'query Salesforce open opportunities via sf CLI data query',
+    role_key: 'clause-0:write',
+    limit: 8,
+  });
+  const body = JSON.parse(result.content[0].text) as { results: Array<{ name: string }> };
+  const names = body.results.map((hit) => hit.name);
+  assert.equal(
+    names[0],
+    'acquired_live_read',
+    `exact live-read acquisition must lead the card, got: ${names.join(', ')}`,
+  );
+  const broker = names.indexOf('UNRELATED_BROKER_QUERY_TABLE');
+  assert.ok(broker > 0, 'fuzzy broker membership may still appear, but not as rank one');
+});
+
 test('TIERED RANKING: her own workflow_schedule outranks a third-party scheduler for the live query', async () => {
   const { registerToolSearchTool } = await import('./tool-search-tool.js');
   const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
@@ -678,6 +871,229 @@ test('a wedged planning-disclosure stage is dropped at its deadline and the sear
   assert.ok(body.results.length > 0, 'candidates still answer without materialized refs');
 });
 
+test('first discovery preserves a proven ref when Composio fuzzy search and staging both wedge', async () => {
+  const {
+    registerToolSearchTool,
+    CANDIDATE_SOURCE_SEARCH_DEADLINE_MS,
+    PLANNING_DISCLOSURE_DEADLINE_MS,
+  } = await import('./tool-search-tool.js');
+  const { timeoutForTool } = await import('../runtime/harness/brackets.js');
+  const outerHostBudgetMs = timeoutForTool('tool_search');
+  const firstDiscoveryWallCeilingMs = 30_000;
+  assert.ok(
+    CANDIDATE_SOURCE_SEARCH_DEADLINE_MS + PLANNING_DISCLOSURE_DEADLINE_MS < outerHostBudgetMs,
+    'internal discovery deadlines must leave room inside the outer host budget',
+  );
+  assert.ok(firstDiscoveryWallCeilingMs < outerHostBudgetMs,
+    'the broker reserves at least half the host window for wrapper/model recovery overhead');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'first-discovery-combined-stall-pin', version: '1.0.0' });
+  const independentlyProvenRefs = Object.freeze({
+    LIVE_MCP_SEARCH: 'cap:resolved:live_mcp_search',
+  });
+  registerToolSearchTool(server as never, {
+    candidateSources: [
+      {
+        kind: 'authorized_composio',
+        search: () => new Promise(() => { /* provider fuzzy search never resolves */ }),
+      },
+      {
+        kind: 'authorized_external_mcp',
+        search: async () => [{
+          name: 'LIVE_MCP_SEARCH',
+          summary: 'A separately proven provider capability.',
+          schema: { type: 'object', properties: { query: { type: 'string' } } },
+          carrier: 'work_call',
+          score: 1000,
+        }],
+      },
+    ],
+    // Production can disclose the native-MCP row independently; only the
+    // Composio group needs the fresh account/staging read. A broker that hands
+    // every adapter to one monolithic callback still wedges here and erases
+    // the healthy ref, while per-source disclosure retains it.
+    discloseForPlanning: async (candidates) => {
+      if (candidates.some((candidate) => candidate.sourceKind === 'authorized_composio')) {
+        await new Promise(() => { /* provider staging never resolves */ });
+      }
+      return Object.fromEntries(candidates
+        .filter((candidate) => candidate.name === 'LIVE_MCP_SEARCH')
+        .map((candidate) => [candidate.name, independentlyProvenRefs.LIVE_MCP_SEARCH]));
+    },
+  });
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+
+  const startedAt = Date.now();
+  const result = await handler({ query: 'read the live provider records', limit: 20 });
+  const elapsedMs = Date.now() - startedAt;
+  const body = JSON.parse(result.content[0].text) as {
+    results: Array<{ name: string; capabilityRef?: string }>;
+    unavailable?: Array<{ source: string; code: string; reason: string }>;
+    next_cursor?: string;
+  };
+  assert.deepEqual({
+    returnedWithinFirstDiscoveryBudget: elapsedMs < firstDiscoveryWallCeilingMs,
+    capabilityRef: body.results.find((row) => row.name === 'LIVE_MCP_SEARCH')?.capabilityRef,
+    composioTimeoutReported: body.unavailable?.some((entry) => (
+      entry.source === 'authorized_composio' && /did not answer within/i.test(entry.reason)
+    )) ?? false,
+    nextCursor: body.next_cursor,
+  }, {
+    returnedWithinFirstDiscoveryBudget: true,
+    capabilityRef: independentlyProvenRefs.LIVE_MCP_SEARCH,
+    composioTimeoutReported: true,
+    nextCursor: undefined,
+  }, `first discovery took ${elapsedMs}ms; a wedged provider must neither consume the host window nor erase another candidate's usable exact ref`);
+});
+
+test('multi-account planning disclosure asks for the exact account instead of inviting a guessed ref', async () => {
+  const { registerToolSearchTool } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'account-choice-pin', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [{
+      kind: 'authorized_composio',
+      search: async () => [{
+        name: 'OUTLOOK_SEARCH_MESSAGES',
+        summary: 'Read Outlook messages.',
+        schema: { type: 'object', properties: { query: { type: 'string' } } },
+        carrier: 'work_call',
+        score: 1,
+      }],
+    }],
+    discloseForPlanning: async () => ({
+      version: 1,
+      refs: {},
+      blockers: {
+        OUTLOOK_SEARCH_MESSAGES: {
+          code: 'account_selection_required',
+          choices: ['work@corp.example', 'personal@example.net'],
+        },
+      },
+    }),
+  });
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'read my latest Outlook message', role_key: 'clause-0:read', limit: 8 });
+  const body = JSON.parse(result.content[0].text) as {
+    results: Array<{
+      name: string;
+      capabilityRef?: string;
+      planningRefStatus?: string;
+      accountChoices?: string[];
+    }>;
+    hint: string;
+  };
+  const outlook = body.results.find((entry) => entry.name === 'OUTLOOK_SEARCH_MESSAGES');
+  assert.ok(outlook);
+  assert.equal(outlook?.capabilityRef, undefined);
+  assert.equal(outlook?.planningRefStatus, 'account_selection_required');
+  assert.deepEqual(outlook?.accountChoices, ['work@corp.example', 'personal@example.net']);
+  assert.match(body.hint, /Ask the user which exact connected account/i);
+  assert.match(body.hint, /Do not call plan_task or invent a capabilityRef/i);
+});
+
+test('catalog-only account question shows the exact selected account on the resolved row and no unrelated identity', async () => {
+  const {
+    registerToolSearchTool,
+    attachToolSearchSelectedAccountEvidence,
+  } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'selected-account-evidence', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [{
+      kind: 'authorized_composio',
+      search: async () => [{
+        name: 'OUTLOOK_SEARCH_MESSAGES',
+        summary: 'Read Outlook messages.',
+        schema: { type: 'object', properties: { query: { type: 'string' } } },
+        carrier: 'work_call',
+        score: 1,
+      }],
+    }],
+    discloseForPlanning: async (candidates) => {
+      const selected = candidates.find((candidate) => candidate.name === 'OUTLOOK_SEARCH_MESSAGES');
+      assert.ok(selected);
+      attachToolSearchSelectedAccountEvidence(selected!, {
+        toolkit: 'outlook',
+        label: 'Scorpion',
+        email: 'Calendar@Scorpion.Example',
+        connectionId: 'ca_scorpion_private_transport_id',
+      });
+      return { OUTLOOK_SEARCH_MESSAGES: 'cap:resolved:outlook_search_messages:fixture-scorpion' };
+    },
+  });
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({
+    query: 'Identify which connected Outlook account you would use when I say my Scorpion Outlook account.',
+    role_key: 'clause-0:read',
+    limit: 8,
+  });
+  const raw = result.content[0].text;
+  const body = JSON.parse(raw) as {
+    results: Array<{
+      name: string;
+      capabilityRef?: string;
+      selectedAccount?: {
+        toolkit: string;
+        accountIdentity: string;
+        accountIdentityKind: string;
+        email?: string;
+        label?: string;
+      };
+    }>;
+  };
+  const outlook = body.results.find((row) => row.name === 'OUTLOOK_SEARCH_MESSAGES');
+  assert.deepEqual(outlook?.selectedAccount, {
+    toolkit: 'outlook',
+    accountIdentity: 'calendar@scorpion.example',
+    accountIdentityKind: 'email',
+    email: 'calendar@scorpion.example',
+    label: 'Scorpion',
+  });
+  assert.equal(typeof outlook?.capabilityRef, 'string');
+  assert.doesNotMatch(raw, /breakthrough/i, 'an unrelated connected account must not leak');
+  assert.doesNotMatch(raw, /ca_scorpion_private_transport_id/i,
+    'a raw connection id is omitted when a stable email identity is known');
+});
+
+test('selected-account evidence is non-authoritative and stays hidden when no capabilityRef was disclosed', async () => {
+  const {
+    registerToolSearchTool,
+    attachToolSearchSelectedAccountEvidence,
+  } = await import('./tool-search-tool.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const server = new McpServer({ name: 'selected-account-no-ref', version: '1.0.0' });
+  registerToolSearchTool(server as never, {
+    candidateSources: [{
+      kind: 'authorized_composio',
+      search: async () => [{
+        name: 'OUTLOOK_SEARCH_MESSAGES',
+        summary: 'Read Outlook messages.',
+        schema: { type: 'object', properties: {} },
+        carrier: 'work_call',
+        score: 1,
+      }],
+    }],
+    discloseForPlanning: async (candidates) => {
+      attachToolSearchSelectedAccountEvidence(candidates[0]!, {
+        toolkit: 'outlook',
+        label: 'Breakthrough',
+        email: 'personal.calendar@example.invalid',
+      });
+      return {};
+    },
+  });
+  const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
+  const result = await handler({ query: 'inspect Outlook capability readiness', role_key: 'clause-0:read', limit: 8 });
+  const body = JSON.parse(result.content[0].text) as {
+    results: Array<{ name: string; capabilityRef?: string; selectedAccount?: unknown }>;
+  };
+  const outlook = body.results.find((row) => row.name === 'OUTLOOK_SEARCH_MESSAGES');
+  assert.equal(outlook?.capabilityRef, undefined);
+  assert.equal(outlook?.selectedAccount, undefined,
+    'identity evidence cannot make an undisclosed row look resolved');
+});
+
 test('a named candidate-source unavailability reaches the model, never as silent emptiness', async () => {
   // Regression pin (2026-08-26): "the provider did not answer" and "no such
   // capability exists" were the same empty array to every caller. A live
@@ -704,7 +1120,11 @@ test('a named candidate-source unavailability reaches the model, never as silent
     hint: string;
   };
   assert.deepEqual(body.unavailable, [
-    { source: 'authorized_composio', reason: 'No Composio toolkits are connected.' },
+    {
+      source: 'authorized_composio',
+      code: 'no_connections',
+      reason: 'No Composio toolkits are connected.',
+    },
   ]);
   assert.match(body.hint, /Could not reach/);
   assert.doesNotMatch(body.hint, /not disclosed/i);

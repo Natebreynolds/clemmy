@@ -20,6 +20,7 @@
  */
 
 import { classifyExternalEffectRequest } from './external-effect-taxonomy.js';
+import { hasDurableOrStandingProjectShape } from './project-shape.js';
 import {
   isResultActionSemanticSegment,
   requestSemanticSegments,
@@ -181,6 +182,7 @@ function isReplyLocalConstruction(text: string, externalEffectRequested: boolean
   if (externalEffectRequested) return false;
   const direct = text.replace(ACKNOWLEDGEMENT_PREFIX_RE, '').trim();
   if (!REPLY_LOCAL_CONSTRUCTION_START_RE.test(direct)) return false;
+  if (hasDurableOrStandingProjectShape(direct)) return false;
   if (requestSemanticSegments(direct).length !== 1) return false;
   if (hasExplicitActionContinuation(direct, true)) return false;
   if (refersToUserOrHostedWorld(direct)) return false;
@@ -274,6 +276,13 @@ function hasActionAfterAcknowledgement(text: string): boolean {
   return remainder !== text && DIRECT_ACTION_AFTER_ACK_RE.test(remainder);
 }
 
+const GREETING_OPENER_RE =
+  /^(?:hey|hi|hello|yo|sup|howdy|good\s+(?:morning|afternoon|evening|night))\b[\s,;:.!?—–-]*/i;
+
+function remainderAfterGreetingOpener(text: string): string {
+  return text.replace(GREETING_OPENER_RE, '').trim();
+}
+
 function isShort(text: string): boolean {
   return text.trim().length <= 40;
 }
@@ -321,6 +330,20 @@ export function hasDiscourseReferent(text: string): boolean {
   return DISCOURSE_REFERENT_RE.test(text.trim());
 }
 
+/**
+ * A greeting prefix on a short message is not itself a closed social turn when
+ * the remainder still names the user's world or a retrieval. Live 2026-08-28:
+ * "Hey what's on my calendar today" is 30 characters, matches /^(hey)\b/, and
+ * compiled as casual — tools stripped, zero crossings, published as `done`.
+ */
+function greetingOpensHostedOrLookupAsk(text: string): boolean {
+  const remainder = remainderAfterGreetingOpener(text);
+  if (!remainder) return false;
+  if (refersToUserOrHostedWorld(remainder)) return true;
+  const lookup = matchCount(remainder, LOOKUP_CUES);
+  return lookup.matched.some((cue) => !GENERIC_QUESTION_FRAMES.has(cue));
+}
+
 export function classifyMessageIntent(
   message: string,
   opts: ClassifyMessageIntentOptions = {},
@@ -341,6 +364,7 @@ export function classifyMessageIntent(
       && isShort(trimmed)
       && !hasExplicitActionContinuation(trimmed, true)
       && !hasActionAfterAcknowledgement(trimmed)
+      && !greetingOpensHostedOrLookupAsk(trimmed)
       && !externalEffect.requested
     ) {
       return { intent: 'casual', confidence: 0.9, reasons: ['matches casual greeting/acknowledgement pattern'] };

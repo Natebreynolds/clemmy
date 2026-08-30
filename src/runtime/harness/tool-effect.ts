@@ -6,10 +6,15 @@ import {
   type ToolSideEffect,
 } from '../../tools/tool-registry.js';
 import { classifyShellCommand, classifyShellNetworkMutation, expandLiteralShellCommands } from './destination-gate.js';
-import { peekHostCapabilityCatalogFactory } from './host-capability-catalog-factory.js';
+import {
+  isCurrentCallableCatalogEntry,
+  peekHostCapabilityCatalogFactory,
+  type RegisteredHostCapability,
+} from './host-capability-catalog-factory.js';
 import { isMutatingExternalWrite } from './execution-gate.js';
 import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
 import {
+  catalogOperationIdentityKey,
   isClementineLocalToolNamespace as isClementineLocalNamespace,
   isPlainOrClementineLocalTool,
   isTrustedComposioGateway,
@@ -34,7 +39,7 @@ export interface RuntimeToolEffectDecision {
   mutating: boolean;
   /** A mutation outside Clementine's local workspace/state boundary. */
   dangerousWrite: boolean;
-  source: 'shell' | 'composio' | 'native_mcp' | 'registry' | 'unknown';
+  source: 'shell' | 'composio' | 'native_mcp' | 'reviewed_cli' | 'registry' | 'unknown';
 }
 
 /** Provider-neutral authority class consumed by shared execution owners. */
@@ -57,6 +62,7 @@ export function runtimeToolAuthorityBinding(
         : 'local_envelope';
     case 'composio':
     case 'native_mcp':
+    case 'reviewed_cli':
       return 'catalog_manifest';
     default:
       return 'unknown';
@@ -410,7 +416,94 @@ function externalWriteDecision(source: RuntimeToolEffectDecision['source']): Run
   return { effect: 'external_write', mutating: true, dangerousWrite: true, source };
 }
 
+function unknownDecision(): RuntimeToolEffectDecision {
+  return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+}
+
+/**
+ * Reopen effect authority from one exact callable catalog row. No operation
+ * spelling participates: the manifest effect and adapter provenance were
+ * sealed before registration, while `isCurrentCallableCatalogEntry` proves
+ * the row still matches those registration-time bytes and invoke identity.
+ */
+function currentCatalogEffectDecision(
+  entry: RegisteredHostCapability,
+): RuntimeToolEffectDecision {
+  if (!isCurrentCallableCatalogEntry(entry)) return unknownDecision();
+  const source: RuntimeToolEffectDecision['source'] = entry.manifest.providerKind === 'local_registry'
+    ? 'registry'
+    : entry.manifest.providerKind;
+  switch (entry.manifest.effect) {
+    case 'read': return readDecision(source);
+    case 'compute': return { effect: 'compute', mutating: false, dangerousWrite: false, source };
+    case 'host_only': return { effect: 'host_only', mutating: true, dangerousWrite: false, source };
+    case 'local_write': return { effect: 'local_write', mutating: true, dangerousWrite: false, source };
+    case 'external_write': return externalWriteDecision(source);
+    case 'admin': return { effect: 'admin', mutating: true, dangerousWrite: true, source };
+    case 'none':
+    case 'unknown':
+      return unknownDecision();
+  }
+}
+
+/**
+ * Identity-before-spelling lookup for bare tools. Presence is reported
+ * separately from the decision so a stale, unattested, or ambiguous catalog
+ * residue fails closed instead of falling through to a provider-name heuristic.
+ */
+function catalogEntriesNamedFor(toolName: string): RegisteredHostCapability[] {
+  const identity = toolName.trim().toLowerCase();
+  if (!identity) return [];
+  const snapshot = peekHostCapabilityCatalogFactory()?.snapshot() ?? [];
+  const exact = snapshot.filter((entry) => (
+    entry.toolName.trim().toLowerCase() === identity
+    || (entry.manifest?.operationId.trim().toLowerCase() === identity)
+  ));
+  if (exact.length > 0) return exact;
+  const key = catalogOperationIdentityKey(toolName);
+  if (!key) return [];
+  return snapshot.filter((entry) => (
+    catalogOperationIdentityKey(entry.toolName) === key
+    || catalogOperationIdentityKey(entry.manifest?.operationId ?? '') === key
+  ));
+}
+
+function uniqueCurrentCallableCatalogEntry(toolName: string): RegisteredHostCapability | null {
+  const current = catalogEntriesNamedFor(toolName).filter(isCurrentCallableCatalogEntry);
+  return current.length === 1 ? current[0]! : null;
+}
+
+function classifyBareCurrentCatalogCapability(toolName: string): {
+  matched: boolean;
+  decision: RuntimeToolEffectDecision;
+} {
+  const named = catalogEntriesNamedFor(toolName);
+  if (named.length === 0) return { matched: false, decision: unknownDecision() };
+  const current = named.filter(isCurrentCallableCatalogEntry);
+  if (current.length === 0) return { matched: true, decision: unknownDecision() };
+  const effects = new Set(current.map((entry) => entry.manifest.effect));
+  // Same operation on two transports is still that effect. Live 2026-08-29
+  // workflow:1788024507349: GOOGLESHEETS_BATCH_GET / SLACK_FETCH occupancy
+  // failed closed as write, then the worker missed at proven=none.
+  if (effects.size === 1) {
+    return { matched: true, decision: currentCatalogEffectDecision(current[0]!) };
+  }
+  return { matched: true, decision: unknownDecision() };
+}
+
 function classifyComposio(args: unknown): RuntimeToolEffectDecision {
+  const decoded = decodedToolArgs(args);
+  const slug = decoded && typeof decoded === 'object' && !Array.isArray(decoded)
+    ? String(
+      (decoded as Record<string, unknown>).tool_slug
+      ?? (decoded as Record<string, unknown>).slug
+      ?? '',
+    ).trim()
+    : '';
+  if (slug) {
+    const registered = classifyBareCurrentCatalogCapability(slug);
+    if (registered.matched) return registered.decision;
+  }
   // Use the same canonical carrier-aware classifier as dispatch admission.
   // Missing and unfamiliar external actions therefore fail closed here too.
   return isMutatingExternalWrite('composio_execute_tool', args)
@@ -567,18 +660,18 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   ) {
     const outer = decodedToolArgs(args);
     if (!outer || typeof outer !== 'object' || Array.isArray(outer)) {
-      return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+      return unknownDecision();
     }
     const input = outer as Record<string, unknown>;
     const target = typeof input.name === 'string' ? input.name.trim() : '';
     if (!target || target === 'call_tool' || target === 'work_call') {
-      return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+      return unknownDecision();
     }
     const innerArgs = decodedToolArgs(input.args_json ?? {});
     const alias = resolveCallToolAlias(target, innerArgs);
     if (alias?.ok) return classifyRuntimeToolEffect(alias.targetName, alias.targetArgs);
     if (alias && !alias.ok) {
-      return { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+      return unknownDecision();
     }
     return classifyRuntimeToolEffect(target, innerArgs);
   }
@@ -625,7 +718,6 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
 
   const isNamespaced = normalized.includes('__');
   const isClementineLocal = isClementineLocalNamespace(normalized);
-  if (isNamespaced && !isClementineLocal) return classifyNativeMcp(toolName, args);
 
   // IDENTITY BEFORE SPELLING. If this exact name is a capability the host has
   // already registered, its effect is a KNOWN, provisioned fact — the registry
@@ -640,14 +732,16 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   // `effect: external_write` for that exact toolName. Casing is not a safety
   // property, and a capability the host itself provisioned should never be
   // unclassifiable.
-  if (!isNamespaced) {
-    const registered = peekHostCapabilityCatalogFactory()?.snapshot()
-      .find((entry) => entry.toolName.trim().toLowerCase() === normalized.trim().toLowerCase());
-    if (registered && String(registered.providerKind ?? '') === 'composio') {
-      // Same classifier the spelled-correctly path uses; only the way we found
-      // it differs. Every downstream gate still runs on the result.
-      return classifyComposio({ tool_slug: registered.toolName, arguments: args });
-    }
+  //
+  // Live 2026-08-29 (OPEN-THE-GATES, sess-mob-416706): namespaced MCP spelling
+  // `google_sheets__batch_get` skipped this lookup, classified fail-closed as
+  // write, and the live-read seam then refused a same-turn proven Sheets read.
+  const registered = classifyBareCurrentCatalogCapability(normalized);
+  if (registered.matched) return registered.decision;
+  if (isNamespaced && !isClementineLocal) {
+    const tailRegistered = classifyBareCurrentCatalogCapability(localToolTail(normalized));
+    if (tailRegistered.matched) return tailRegistered.decision;
+    return classifyNativeMcp(toolName, args);
   }
 
   // A bare SCREAMING_SNAKE name is a Composio slug: tool_search hands the
@@ -660,7 +754,7 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   }
 
   return classifyRegistered(normalized)
-    ?? { effect: 'unknown', mutating: false, dangerousWrite: false, source: 'unknown' };
+    ?? unknownDecision();
 }
 
 /** Canonical fields attached to top-level tool accounting events. Tool hooks

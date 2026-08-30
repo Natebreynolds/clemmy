@@ -156,6 +156,18 @@ test('board feed uses durable terminal events and fails closed without one', () 
     assert.equal(narrated[0]!.tone, 'live');
   }
 
+  // Live: lookup finished, next step not yet visible — do not keep claiming
+  // we are still finding a tool (live 2026-08-28 Grok/Salesforce).
+  {
+    const narrated = narrateActivity([
+      row({ label: 'tool_search', status: 'done', startedAt: 1 }),
+    ], { live: true });
+    assert.equal(narrated.length, 1);
+    assert.equal(narrated[0]!.label, 'Working on it…');
+    assert.equal(narrated[0]!.status, 'running');
+    assert.equal(narrated[0]!.tone, 'live');
+  }
+
   // Live: once real work exists, the stand-in yields to it.
   {
     const narrated = narrateActivity([

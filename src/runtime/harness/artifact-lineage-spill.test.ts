@@ -24,6 +24,8 @@ const ledger = await import('./artifact-ledger.js');
 const payloadStorage = await import('./result-payload-storage.js');
 const resultHandles = await import('./result-handle.js');
 const admittedConstruct = await import('./admitted-construct-run.js');
+const logicalContracts = await import('./logical-call-contract.js');
+const sealedBindings = await import('./host-capability-catalog-factory.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -48,17 +50,23 @@ function binding(input: {
   const capabilityId = `fixture:${input.nodeId}`;
   const schemaVersion = 'fixture-v1';
   const schemaDigest = digest(`schema:${input.nodeId}`);
-  const bindingDigest = digest(`binding:${input.nodeId}`);
-  return {
+  const logicalToolName = logicalContracts.canonicalLogicalToolName(input.toolName);
+  assert.ok(logicalToolName, `fixture tool ${input.toolName} must have one canonical identity`);
+  const unsealed = {
     nodeId: input.nodeId,
     capabilityId,
     toolName: input.toolName,
     providerOperationId: input.toolName,
-    logicalToolName: input.toolName,
+    logicalToolName: logicalToolName!,
     schemaVersion,
     schemaDigest,
+    argumentDigest: digest(`arguments:${input.nodeId}`),
+    account: 'account:artifact-lineage-spill',
     effect: input.effect,
-    bindingDigest,
+  };
+  return {
+    ...unsealed,
+    bindingDigest: sealedBindings.bindingDigestOf(unsealed),
   };
 }
 
@@ -141,11 +149,16 @@ test('oversized settled lineage authorizes exact artifact binding and fails clos
   };
   const db = eventlog.openEventLog();
   for (const sealed of Object.values(bindings)) {
-    db.prepare(`
-      INSERT INTO graph_node_bindings
-        (session_id, source_user_seq, node_id, binding_json, binding_digest)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(session.id, source.seq, sealed.nodeId, JSON.stringify(sealed), sealed.bindingDigest);
+    assert.equal(sealedBindings.persistSealedNodeBinding({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      binding: sealed,
+    }), true);
+    assert.deepEqual(
+      sealedBindings.loadSealedNodeBinding(session.id, source.seq, sealed.nodeId),
+      sealed,
+      'fixture binding must survive the production canonical loader',
+    );
   }
 
   const acceptedTaskId = identities.acceptedTaskIdFor(session.id, source.seq);

@@ -43,6 +43,8 @@ import {
   createProductionMcpReadCarrier,
   type ProductionMcpRuntime,
 } from './production-mcp-read-carrier.js';
+import { createProductionReviewedCliReadCarrier } from './production-reviewed-cli-read-carrier.js';
+import { listReviewedCliReadDescriptors } from './reviewed-cli-read-config.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 
 export const PRODUCTION_LIVE_READ_ACQUISITION_VERSION = 1 as const;
@@ -109,11 +111,24 @@ export interface ProductionLiveReadCarrierAdapterV1 {
   materialize(input: {
     requirement: Readonly<ProductionLiveReadRequirementV1>;
     nomination: Readonly<ProductionLiveReadNominationV1>;
+    /** The registry owns this guard. A carrier may finish already-started I/O
+     * after it becomes false, but the shared materializer must not publish or
+     * retire authority. */
+    publicationGuard?: () => boolean;
   }): Promise<MaterializeLiveReadCapabilityResult>;
 }
 
+export interface ProductionLiveReadAcquisitionControlV1 {
+  signal?: AbortSignal;
+  /** Absolute wall deadline shared with the foreground discovery broker. */
+  deadlineAt?: number;
+}
+
 export interface ProductionLiveReadAcquisitionPortV1 {
-  acquire(input: ProductionLiveReadRequirementV1): Promise<MaterializeLiveReadCapabilityResult>;
+  acquire(
+    input: ProductionLiveReadRequirementV1,
+    control?: ProductionLiveReadAcquisitionControlV1,
+  ): Promise<MaterializeLiveReadCapabilityResult>;
 }
 
 export type ProductionLiveReadAcquisitionRegistryV1 = ProductionLiveReadAcquisitionPortV1;
@@ -129,6 +144,16 @@ export interface ProductionLiveReadAcquisitionRegistryOptions {
   /** Additional real carrier ports. No CLI or gateway authority is invented
    * when this provider is absent. */
   additionalAdapters?: () => MaybePromise<readonly ProductionLiveReadCarrierAdapterV1[]>;
+  /** Host policy can remove a carrier before any enumeration. This is used by
+   * the foreground MCP scope, while unrelated carrier kinds remain untouched. */
+  adapterAllowed?: (
+    adapter: Readonly<Pick<ProductionLiveReadCarrierAdapterV1, 'adapterId' | 'carrier'>>,
+  ) => boolean;
+  /** Final exact-identity policy. It runs only after a carrier returned a
+   * closed current nomination and cannot promote a missing nomination. */
+  nominationAllowed?: (
+    nomination: Readonly<ProductionLiveReadNominationV1>,
+  ) => boolean;
   store?: CapabilityManifestStore;
   factory?: HostCapabilityCatalogFactory;
   now?: () => number;
@@ -177,14 +202,29 @@ function objectiveTerms(value: string): readonly string[] {
 }
 
 /**
+ * Identity tokens that appear in almost every CLI read operationId. They are
+ * not enough, alone, to nominate a reviewed CLI from a tool_search query.
+ */
+const CLI_IDENTITY_GENERIC_TERMS = new Set([
+  'data', 'query', 'list', 'get', 'read', 'info', 'status', 'show', 'cli',
+]);
+
+/**
  * Advisory nomination only. Token overlap can put a live definition forward;
  * it cannot choose by catalog order, attest an effect/account/schema, install
  * a manifest, or authorize invocation. Every one of those facts is re-read by
  * the carrier and shared materializer after global exact-one selection.
+ *
+ * MCP/Composio-style rows keep the historical all-terms haystack. Reviewed CLI
+ * rows also nominate when a tool_search query names the closed operation
+ * identity (at least two identifier tokens, or one distinctive token). That is
+ * how "query Salesforce … via sf CLI" can cite `salesforce_sf_soql_query`
+ * without stuffing the user question into the descriptor.
  */
-function rowIsAdvisoryObjectiveNomination(
+export function rowIsAdvisoryObjectiveNomination(
   row: CapabilityOperationRow,
   objective: string,
+  carrierKind?: CapabilityCarrierKind,
 ): boolean {
   const terms = objectiveTerms(objective);
   if (terms.length === 0) return false;
@@ -195,7 +235,14 @@ function rowIsAdvisoryObjectiveNomination(
     row.parentIdentifier ?? '',
     row.selector ?? '',
   ].join(' ')));
-  return terms.every((term) => haystack.has(term));
+  if (terms.every((term) => haystack.has(term))) return true;
+  if (carrierKind !== 'cli') return false;
+  const identityTerms = objectiveTerms(row.identifier);
+  if (identityTerms.length < 2) return false;
+  const termSet = new Set(terms);
+  const overlap = identityTerms.filter((term) => termSet.has(term));
+  return overlap.length >= 2
+    || overlap.some((term) => !CLI_IDENTITY_GENERIC_TERMS.has(term));
 }
 
 function closeRequirement(value: unknown): ProductionLiveReadRequirementV1 | null {
@@ -437,6 +484,7 @@ export function createAttestedLiveReadCarrierAdapter(input: {
   materialize(
     objective: string,
     expectedIdentity: AttestedLiveReadCapabilityIdentity,
+    publicationGuard?: () => boolean,
   ): Promise<MaterializeLiveReadCapabilityResult>;
   now?: () => number;
 }): ProductionLiveReadCarrierAdapterV1 {
@@ -463,13 +511,25 @@ export function createAttestedLiveReadCarrierAdapter(input: {
         return { status: 'unavailable', detail: 'the carrier enumeration is not closed data' };
       }
       if (!closed.ok) return { status: 'unavailable', detail: closed.detail };
-      const rows = closed.rows
-        .filter((row) => (
-          row.effectClass === 'read'
-          && (row.effectProvenance === 'declared' || row.effectProvenance === 'curated')
-          && boundedText(row.accountIdentity)
-          && rowIsAdvisoryObjectiveNomination(row, requirement.objective)
-        ))
+      const eligible = closed.rows.filter((row) => (
+        row.effectClass === 'read'
+        && (row.effectProvenance === 'declared' || row.effectProvenance === 'curated')
+        && boundedText(row.accountIdentity)
+      ));
+      // An exact operation identifier is stronger than advisory token overlap.
+      // Keep every exact account row so genuine account ambiguity still fails
+      // closed; use fuzzy nomination only when the carrier has no exact row.
+      const normalizedObjective = normalizeText(requirement.objective);
+      const exact = eligible.filter((row) => (
+        normalizeText(row.identifier) === normalizedObjective
+      ));
+      const rows = (exact.length > 0 ? exact : eligible.filter((row) => (
+        rowIsAdvisoryObjectiveNomination(
+          row,
+          requirement.objective,
+          input.carrier.identity.kind,
+        )
+      )))
         .sort((left, right) => (
           `${left.identifier}\0${left.accountIdentity}`
             .localeCompare(`${right.identifier}\0${right.accountIdentity}`)
@@ -505,8 +565,12 @@ export function createAttestedLiveReadCarrierAdapter(input: {
       }
       return { status: 'nominated', nominations };
     },
-    materialize({ requirement, nomination }) {
-      return input.materialize(requirement.objective, nomination.identity);
+    materialize({ requirement, nomination, publicationGuard }) {
+      return input.materialize(
+        requirement.objective,
+        nomination.identity,
+        publicationGuard,
+      );
     },
   };
   return Object.freeze(adapter);
@@ -521,7 +585,22 @@ export function createProductionMcpLiveReadAcquisitionAdapter(input: {
   return createAttestedLiveReadCarrierAdapter({
     adapterId: `native_mcp:${mcp.carrier.identity.name}`,
     carrier: mcp.carrier,
-    materialize: (objective, expectedIdentity) => mcp.materialize(objective, expectedIdentity),
+    materialize: (objective, expectedIdentity, publicationGuard) => (
+      mcp.materialize(objective, expectedIdentity, publicationGuard)
+    ),
+  });
+}
+
+/** Real reviewed-CLI adapter. Its sole inventory is the durable closed
+ * descriptor registry; PATH discovery and saved CLI names never call this. */
+export function createProductionReviewedCliLiveReadAcquisitionAdapter(): ProductionLiveReadCarrierAdapterV1 {
+  const cli = createProductionReviewedCliReadCarrier();
+  return createAttestedLiveReadCarrierAdapter({
+    adapterId: `reviewed_cli:${cli.carrier.identity.name}`,
+    carrier: cli.carrier,
+    materialize: (objective, expectedIdentity, publicationGuard) => (
+      cli.materialize(objective, expectedIdentity, publicationGuard)
+    ),
   });
 }
 
@@ -540,6 +619,22 @@ function defaultConfiguredMcpAdapters(
         : {}),
     })
   ));
+}
+
+function defaultConfiguredAdapters(
+  options: Pick<
+    ProductionLiveReadAcquisitionRegistryOptions,
+    'configuredMcpServers' | 'mcpRuntimeForServer'
+  >,
+): readonly ProductionLiveReadCarrierAdapterV1[] {
+  const mcp = defaultConfiguredMcpAdapters(options);
+  // Absence is ordinary blank state. A present malformed registry throws and
+  // makes the complete configured inventory unavailable rather than silently
+  // ignoring reviewed authority whose bytes cannot be closed.
+  const reviewedCli = listReviewedCliReadDescriptors().length > 0
+    ? [createProductionReviewedCliLiveReadAcquisitionAdapter()]
+    : [];
+  return [...mcp, ...reviewedCli];
 }
 
 function manifestMatchesNomination(
@@ -578,6 +673,58 @@ async function mapBounded<T, R>(
   return results;
 }
 
+type ControlledAwaitResult<T> =
+  | { status: 'settled'; value: T }
+  | { status: 'failed'; error: unknown }
+  | { status: 'expired' };
+
+function acquisitionControlActive(
+  control: ProductionLiveReadAcquisitionControlV1 | undefined,
+): boolean {
+  return !control?.signal?.aborted
+    && (control?.deadlineAt === undefined || Date.now() < control.deadlineAt);
+}
+
+/** Consume both late fulfillment and late rejection. Expiry stops the registry
+ * continuation; the materializer's publication guard separately prevents the
+ * already-started carrier promise from changing authority later. */
+async function awaitControlled<T>(input: {
+  start: () => Promise<T> | T;
+  control?: ProductionLiveReadAcquisitionControlV1;
+}): Promise<ControlledAwaitResult<T>> {
+  if (!acquisitionControlActive(input.control)) return { status: 'expired' };
+  let work: Promise<T>;
+  try {
+    work = Promise.resolve(input.start());
+  } catch (error) {
+    return { status: 'failed', error };
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (result: ControlledAwaitResult<T>): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      input.control?.signal?.removeEventListener('abort', onAbort);
+      resolve(result);
+    };
+    const onAbort = (): void => finish({ status: 'expired' });
+    work.then(
+      (value) => finish({ status: 'settled', value }),
+      (error) => finish({ status: 'failed', error }),
+    );
+    input.control?.signal?.addEventListener('abort', onAbort, { once: true });
+    if (input.control?.signal?.aborted) onAbort();
+    if (!settled && input.control?.deadlineAt !== undefined) {
+      timer = setTimeout(
+        () => finish({ status: 'expired' }),
+        Math.max(0, input.control.deadlineAt - Date.now()),
+      );
+    }
+  });
+}
+
 /**
  * Enumerates all currently configured adapters, admits exactly one live
  * nomination, and delegates installation to that adapter's shared materializer.
@@ -587,10 +734,13 @@ export function createProductionLiveReadAcquisitionRegistry(
 ): ProductionLiveReadAcquisitionRegistryV1 {
   let queue: Promise<void> = Promise.resolve();
 
-  const configured = async (): Promise<readonly ProductionLiveReadCarrierAdapterV1[]> => {
+  const configured = async (): Promise<{
+    adapters: readonly ProductionLiveReadCarrierAdapterV1[];
+    policyExcluded: number;
+  }> => {
     const primary = options.configuredAdapters
       ? await options.configuredAdapters()
-      : defaultConfiguredMcpAdapters(options);
+      : defaultConfiguredAdapters(options);
     const additional = options.additionalAdapters ? await options.additionalAdapters() : [];
     const combined = [...primary, ...additional];
     const closed = closeAdapterInventory(combined);
@@ -599,7 +749,16 @@ export function createProductionLiveReadAcquisitionRegistry(
         ? 'configured carrier adapter inventory is unbounded'
         : 'configured carrier adapter inventory is invalid');
     }
-    return closed.adapters;
+    const adapters = closed.adapters.filter((adapter) => (
+      options.adapterAllowed?.(Object.freeze({
+        adapterId: adapter.adapterId,
+        carrier: Object.freeze({ ...adapter.carrier }),
+      })) ?? true
+    ));
+    return {
+      adapters,
+      policyExcluded: closed.adapters.length - adapters.length,
+    };
   };
 
   const surfaces = (): {
@@ -649,7 +808,26 @@ export function createProductionLiveReadAcquisitionRegistry(
     retired: retire(requirement, extra),
   });
 
-  const acquireOnce = async (raw: ProductionLiveReadRequirementV1): Promise<MaterializeLiveReadCapabilityResult> => {
+  const refuseWithoutRetiring = (
+    reason: Extract<MaterializeLiveReadCapabilityResult, { status: 'blocked' }>['reason'],
+    detail: string,
+  ): MaterializeLiveReadCapabilityResult => ({
+    status: 'blocked',
+    reason,
+    detail,
+    retired: [],
+  });
+
+  const expired = (): MaterializeLiveReadCapabilityResult => refuseWithoutRetiring(
+    'publication_expired',
+    'the bounded acquisition caller stopped awaiting live-read discovery',
+  );
+
+  const acquireOnce = async (
+    raw: ProductionLiveReadRequirementV1,
+    control?: ProductionLiveReadAcquisitionControlV1,
+  ): Promise<MaterializeLiveReadCapabilityResult> => {
+    if (!acquisitionControlActive(control)) return expired();
     const requirement = closeRequirement(raw);
     if (!requirement) {
       return {
@@ -659,13 +837,19 @@ export function createProductionLiveReadAcquisitionRegistry(
         retired: [],
       };
     }
-    let adapters: readonly ProductionLiveReadCarrierAdapterV1[];
-    try {
-      adapters = await configured();
-    } catch {
+    const configuredResult = await awaitControlled({ start: configured, control });
+    if (configuredResult.status === 'expired') return expired();
+    if (configuredResult.status === 'failed') {
       return block(requirement, 'carrier_unavailable', 'configured carrier adapters are unavailable');
     }
+    const { adapters, policyExcluded } = configuredResult.value;
     if (adapters.length === 0) {
+      if (policyExcluded > 0) {
+        return refuseWithoutRetiring(
+          'missing',
+          'all otherwise configured live-read carriers are outside this request scope',
+        );
+      }
       return block(requirement, 'missing', 'no live-read carrier adapters are configured');
     }
     const duplicateIds = adapters
@@ -680,10 +864,14 @@ export function createProductionLiveReadAcquisitionRegistry(
     }
 
     const observed = await mapBounded(adapters, async (adapter) => {
-      try {
-        const rawResult = await adapter.nominate(Object.freeze({ ...requirement }));
+      const nominated = await awaitControlled({
+        start: () => adapter.nominate(Object.freeze({ ...requirement })),
+        control,
+      });
+      if (nominated.status === 'expired') return { status: 'expired' as const };
+      if (nominated.status === 'settled') {
         const result = closeNominationResult({
-          value: rawResult,
+          value: nominated.value,
           adapter,
           now: (options.now ?? Date.now)(),
         });
@@ -691,13 +879,14 @@ export function createProductionLiveReadAcquisitionRegistry(
           status: 'unavailable' as const,
           detail: 'the carrier returned an invalid nomination envelope',
         };
-      } catch {
-        return {
-          status: 'unavailable' as const,
-          detail: 'the carrier nomination failed',
-        };
       }
+      return {
+        status: 'unavailable' as const,
+        detail: 'the carrier nomination failed',
+      };
     });
+    if (observed.some((result) => result.status === 'expired')) return expired();
+    if (!acquisitionControlActive(control)) return expired();
     const unavailable = observed.flatMap((result, index) => (
       result.status === 'unavailable' ? [adapters[index]!.adapterId] : []
     )).sort();
@@ -708,10 +897,39 @@ export function createProductionLiveReadAcquisitionRegistry(
         `configured carrier adapters could not be fully observed: ${unavailable.join(', ')}`,
       );
     }
-    const nominations = observed.flatMap((result) => (
+    const allNominated = observed.flatMap((result) => (
       result.status === 'nominated' ? [...result.nominations] : []
     )).sort((left, right) => nominationKey(left).localeCompare(nominationKey(right)));
+    // Exact identity precedence is global across the configured carrier set.
+    // A sibling carrier's fuzzy hit cannot dilute an exact operation exposed
+    // by another carrier. Preserve every exact account/provider nomination so
+    // genuine cross-carrier or multi-account ambiguity remains closed.
+    const normalizedObjective = normalizeText(requirement.objective);
+    const exactNominated = allNominated.filter((nomination) => (
+      normalizeText(nomination.identity.reference.identifier) === normalizedObjective
+    ));
+    const nominated = exactNominated.length > 0 ? exactNominated : allNominated;
+    let nominationPolicyExcluded = 0;
+    let nominations: ProductionLiveReadNominationV1[];
+    try {
+      nominations = nominated.filter((nomination) => {
+        const allowed = options.nominationAllowed?.(Object.freeze(nomination)) ?? true;
+        if (!allowed) nominationPolicyExcluded += 1;
+        return allowed;
+      });
+    } catch {
+      return refuseWithoutRetiring(
+        'carrier_unavailable',
+        'the live-read nomination policy could not be evaluated',
+      );
+    }
     if (nominations.length === 0) {
+      if (policyExcluded > 0 || nominationPolicyExcluded > 0) {
+        return refuseWithoutRetiring(
+          'missing',
+          'current matching live-read capabilities are outside this request scope',
+        );
+      }
       return block(requirement, 'missing', 'no current attested read capability matched the objective');
     }
     if (nominations.length !== 1) {
@@ -723,16 +941,24 @@ export function createProductionLiveReadAcquisitionRegistry(
     }
     const nomination = nominations[0]!;
     const adapter = adapters.find((candidate) => candidate.adapterId === nomination.adapterId)!;
-    let materialized: MaterializeLiveReadCapabilityResult;
-    try {
-      materialized = await adapter.materialize({
+    const materializedResult = await awaitControlled({
+      start: () => adapter.materialize({
         requirement: Object.freeze({ ...requirement }),
         nomination: Object.freeze(nomination),
-      });
-    } catch {
+        publicationGuard: () => acquisitionControlActive(control),
+      }),
+      control,
+    });
+    if (materializedResult.status === 'expired') return expired();
+    if (materializedResult.status === 'failed') {
       return block(requirement, 'live_unavailable', 'the nominated carrier could not materialize');
     }
+    const materialized = materializedResult.value;
     if (materialized.status === 'blocked') {
+      if (
+        materialized.reason === 'publication_expired'
+        || !acquisitionControlActive(control)
+      ) return expired();
       return block(
         requirement,
         materialized.reason,
@@ -740,6 +966,7 @@ export function createProductionLiveReadAcquisitionRegistry(
         materialized.retired,
       );
     }
+    if (!acquisitionControlActive(control)) return expired();
     const { store, factory } = surfaces();
     const stored = store.get(materialized.manifest.manifestId);
     const catalog = factory.get(materialized.manifest.manifestId);
@@ -764,6 +991,7 @@ export function createProductionLiveReadAcquisitionRegistry(
         [materialized.manifest.manifestId],
       );
     }
+    if (!acquisitionControlActive(control)) return expired();
     const registryReplaced = retire(requirement, [], current.manifestId);
     return {
       ...materialized,
@@ -772,8 +1000,8 @@ export function createProductionLiveReadAcquisitionRegistry(
   };
 
   const registry: ProductionLiveReadAcquisitionRegistryV1 = {
-    acquire(raw) {
-      const run = queue.then(() => acquireOnce(raw));
+    acquire(raw, control) {
+      const run = queue.then(() => acquireOnce(raw, control));
       queue = run.then(() => undefined, () => undefined);
       return run;
     },

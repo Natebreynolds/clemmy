@@ -7,6 +7,7 @@ import {
 } from '../execution/background-task-status.js';
 import { enqueueDurableChatTask } from '../execution/background-promote.js';
 import {
+  getBackgroundTask,
   reviseBackgroundTaskContract,
   type BackgroundTaskRecord,
 } from '../execution/background-tasks.js';
@@ -20,8 +21,12 @@ import {
   listFanoutActivations,
   listFanoutSettlements,
   loadFanoutPlan,
+  readFanoutSettlementDataPage,
+  redeemFanoutSettlementData,
+  resolveUnboundFanoutDataResultByLogicalCall,
   scheduleDurableFanout,
   settleFanoutActivationAs,
+  unboundFanoutDataResults,
   windowAuthorityFor,
 } from '../execution/durable-fanout.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -36,6 +41,33 @@ function planToNextActions(plan: string): string[] {
     .map((line) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s*/, '').trim())
     .filter((line) => line.length > 0)
     .slice(0, 12);
+}
+
+const FANOUT_READ_AUTHORITY_DENIED = 'Fan-out data is not available to this run.';
+
+type FanoutToolReadAuthority =
+  | { kind: 'worker'; itemIds: ReadonlySet<string> }
+  | { kind: 'reducer' };
+
+/** Model-facing fan-out reads are capabilities of the exact live task, not
+ * bearer access conferred by knowing a plan id. A currently claimed worker may
+ * inspect only its own window. Only the exact reducer task currently admitted
+ * or running for the plan may inspect the whole settled journal. */
+function fanoutToolReadAuthority(
+  planId: string,
+  callerRunSessionId: string,
+): FanoutToolReadAuthority | null {
+  if (!callerRunSessionId) return null;
+  const window = windowAuthorityFor(planId, callerRunSessionId);
+  if (window) return { kind: 'worker', itemIds: new Set(window.itemIds) };
+
+  const plan = loadFanoutPlan(planId);
+  if (
+    !plan?.reducerTaskId
+    || (plan.reducerState !== 'admitted' && plan.reducerState !== 'running')
+  ) return null;
+  const reducer = getBackgroundTask(plan.reducerTaskId);
+  return reducer?.runSessionId === callerRunSessionId ? { kind: 'reducer' } : null;
 }
 
 export function backgroundRouteForOriginSession(sessionId: string): Pick<BackgroundTaskRecord, 'source' | 'channel' | 'userId'> {
@@ -195,8 +227,14 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       manifest: z.object({
         items: z.array(z.string().min(1)).min(1).max(2000)
           .describe('CANONICAL item identities (real ids/names you enumerated — never "item 1..N" placeholders). Every item is durably tracked and settled individually.'),
-        phases: z.array(z.string().min(1)).min(1).max(6).nullable()
-          .describe('Phase names each item passes through, in order (default: ["execute"]).'),
+        phases: z.array(z.union([
+          z.string().min(1),
+          z.object({
+            id: z.string().min(1),
+            result_kind: z.enum(['data', 'action']),
+          }),
+        ])).min(1).max(6).nullable()
+          .describe('Phases each item passes through, in order. Every new fan-out plan must use {id,result_kind} for every phase: data for a non-mutating payload needed downstream, action for an effect/receipt. Nullable/string wire forms exist only so the host can return one typed same-turn repair; do not use them.'),
         missing_required_inputs: z.array(z.string()).nullable()
           .describe('Load-bearing inputs you do NOT have. Naming any pauses admission with ONE typed clarification instead of guessing unattended.'),
         worker_model: z.string().min(1).nullable().optional()
@@ -212,6 +250,26 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         return textResult('I can only dispatch a background task from a live chat session (no session context here) — run the task directly instead.');
       }
       void handoff_note; // consumed by the terminal reply renderer via output marker below
+
+      // Boundary-tolerant wire, strict new admission. This tool creates only
+      // NEW plans, so even one phase must state the model's data/action
+      // judgment. Persisted historical plans remain readable elsewhere.
+      // Returning typed `ok:false` keeps repair inside the model loop: no
+      // plan/task row and no user question.
+      if (
+        manifest
+        && (
+          manifest.phases === null
+          || manifest.phases.some((phase) => typeof phase === 'string')
+        )
+      ) {
+        return textResult(JSON.stringify({
+          ok: false,
+          code: 'fanout_manifest_result_kind_required',
+          detail: 'A new durable fan-out cannot admit an untyped phase because a prose receipt cannot prove whether successful source bytes must be retained.',
+          repair: 'Call dispatch_background_task again in this same turn with every phase encoded as {id,result_kind}. Use result_kind:"data" for each non-mutating payload consumed later and result_kind:"action" for an effect or receipt. Do not ask the user about this internal repair.',
+        }));
+      }
 
       // STRUCTURAL opening floor. A bare consequential ALIGN row is not enough
       // to dispatch: older runtimes could enter the tool-capable model before
@@ -283,7 +341,8 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       // second classifier call, no phrase heuristics. Admission validates the
       // contract; missing inputs come back as ONE typed clarification.
       if (manifest) {
-        const phases = manifest.phases?.length ? manifest.phases : ['execute'];
+        const proposedPhases = manifest.phases?.length ? manifest.phases : ['execute'];
+        const phases = proposedPhases.map((phase) => typeof phase === 'string' ? phase : phase.id);
         const originRoute = backgroundRouteForOriginSession(sessionId);
         const runContext = harnessRunContextStorage.getStore();
         const admitted = admitDurableFanoutPlan({
@@ -301,6 +360,9 @@ export function registerBackgroundTaskTools(server: McpServer): void {
               id,
               dependsOn: index === 0 ? [] : [phases[index - 1]!],
               runnerClass: 'worker',
+              ...(typeof proposedPhases[index] === 'object'
+                ? { resultKind: proposedPhases[index].result_kind }
+                : {}),
             })),
             reducer: { id: 'reduce', requiredPhases: phases, outputContract: 'report@1' },
             ...(manifest.worker_model?.trim() ? { workerModel: manifest.worker_model.trim() } : {}),
@@ -489,15 +551,55 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       phase_id: z.string().min(1),
       status: z.enum(['done', 'failed']),
       receipt: z.string().nullable().describe('One line of evidence for HOW the item settled (an id, a count, an error). Stored on the durable journal row.'),
+      source_call_id: z.string().min(1).nullable().optional()
+        .describe('For a data-producing phase: the exact logical call id of the successful source/read whose retained payload this item owns. The host resolves its opaque durable result handle. Omit only when exactly one unclaimed successful data result exists in this accepted worker source.'),
     },
-    async ({ plan_id, item_id, phase_id, status, receipt }) => {
-      const callerRunSessionId = getToolOutputContext()?.sessionId ?? '';
+    async ({ plan_id, item_id, phase_id, status, receipt, source_call_id }) => {
+      const outputContext = getToolOutputContext();
+      const callerRunSessionId = outputContext?.sessionId ?? '';
+      const plan = loadFanoutPlan(plan_id);
+      const phase = plan?.manifest.manifest?.phases.find((candidate) => candidate.id === phase_id);
+      let dataResult: import('../execution/durable-fanout.js').FanoutDataResultReference | undefined;
+      if (status === 'done' && phase?.resultKind === 'data') {
+        const sourceUserSeq = outputContext?.sourceUserSeq;
+        if (!Number.isSafeInteger(sourceUserSeq) || Number(sourceUserSeq) <= 0) {
+          return textResult('Not settled: this worker call has no exact accepted-source identity for the data result.');
+        }
+        if (source_call_id) {
+          const resolved = resolveUnboundFanoutDataResultByLogicalCall({
+            planId: plan_id,
+            callerRunSessionId,
+            sourceUserSeq: Number(sourceUserSeq),
+            logicalToolCallId: source_call_id,
+          });
+          if (!resolved.ok) return textResult(`Not settled: ${resolved.reason}.`);
+          dataResult = resolved.reference;
+        } else {
+          const candidates = unboundFanoutDataResults({
+            planId: plan_id,
+            callerRunSessionId,
+            sourceUserSeq: Number(sourceUserSeq),
+          });
+          if (candidates.length !== 1) {
+            return textResult(
+              `Not settled: data auto-binding found ${candidates.length} unclaimed successful source results; `
+              + 'name the exact source_call_id so the host can bind its immutable retained result without swapping payloads.'
+              + (candidates.length > 0
+                ? ` Candidates: ${candidates.slice(0, 20).map((candidate) =>
+                    candidate.logicalToolCallId).join('; ')}`
+                : ''),
+            );
+          }
+          dataResult = candidates[0];
+        }
+      }
       // Settlement carries the CALLER's window authority: this worker's run
       // session must own a claimed window containing the item. Another
       // window's items, a stale generation, or a non-worker caller refuse.
       const settled = settleFanoutActivationAs({
         planId: plan_id, itemId: item_id, phaseId: phase_id, status,
         receiptRef: receipt ?? undefined,
+        ...(dataResult ? { dataResult } : {}),
         callerRunSessionId,
       });
       if (!settled.settled) return textResult(`Not settled: ${settled.reason}`);
@@ -522,17 +624,17 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       limit: z.number().int().min(1).max(200).nullable(),
     },
     async ({ plan_id, limit }) => {
-      const plan = loadFanoutPlan(plan_id);
-      if (!plan) return textResult(`No durable fan-out plan ${plan_id}.`);
       const callerRunSessionId = getToolOutputContext()?.sessionId ?? '';
       const authority = windowAuthorityFor(plan_id, callerRunSessionId);
-      const open = listFanoutActivations(plan_id).filter((a) => a.status !== 'done'
-        && (!authority || authority.itemIds.includes(a.itemId)));
+      if (!authority) return textResult(FANOUT_READ_AUTHORITY_DENIED);
+      const plan = loadFanoutPlan(plan_id);
+      if (!plan) return textResult(FANOUT_READ_AUTHORITY_DENIED);
+      const ownedItemIds = new Set(authority.itemIds);
+      const open = listFanoutActivations(plan_id).filter((a) =>
+        a.status !== 'done' && ownedItemIds.has(a.itemId));
       const page = open.slice(0, limit ?? 100);
       return textResult([
-        authority
-          ? `Plan ${plan_id} (${plan.status}), YOUR window ${authority.windowIndex + 1}: ${open.length} open activation(s).`
-          : `Plan ${plan_id} (${plan.status}): ${open.length} open activation(s).`,
+        `Plan ${plan_id} (${plan.status}), YOUR window ${authority.windowIndex + 1}: ${open.length} open activation(s).`,
         ...page.map((a) => `- ${a.itemId} × ${a.phaseId} [${a.status}]`),
         ...(open.length > page.length ? [`…and ${open.length - page.length} more.`] : []),
       ].join('\n'));
@@ -541,21 +643,99 @@ export function registerBackgroundTaskTools(server: McpServer): void {
 
   server.tool(
     'fanout_list_settlements',
-    'Page through the DURABLE settlements of a fan-out plan (reducer use): every settled item×phase with its receipt. The journal is the complete record — page until an empty page.',
+    'Page through the DURABLE settlements of a fan-out plan (reducer use): every settled item×phase with its receipt or retained-data pointer. The journal is complete; use fanout_read_settlement_data to page an exact data payload without re-running its source.',
     {
       plan_id: z.string().min(1),
       offset: z.number().int().min(0).nullable(),
       limit: z.number().int().min(1).max(500).nullable(),
     },
     async ({ plan_id, offset, limit }) => {
-      const plan = loadFanoutPlan(plan_id);
-      if (!plan) return textResult(`No durable fan-out plan ${plan_id}.`);
-      const page = listFanoutSettlements(plan_id, { offset: offset ?? 0, limit: limit ?? 200 });
+      const callerRunSessionId = getToolOutputContext()?.sessionId ?? '';
+      const authority = fanoutToolReadAuthority(plan_id, callerRunSessionId);
+      if (!authority) return textResult(FANOUT_READ_AUTHORITY_DENIED);
+      const pageOffset = offset ?? 0;
+      const pageLimit = limit ?? 200;
+      const page = authority.kind === 'reducer'
+        ? listFanoutSettlements(plan_id, { offset: pageOffset, limit: pageLimit })
+        : listFanoutActivations(plan_id)
+          .filter((activation) => activation.status === 'done' && authority.itemIds.has(activation.itemId))
+          .sort((left, right) => left.itemId < right.itemId
+            ? -1
+            : left.itemId > right.itemId
+              ? 1
+              : left.phaseId < right.phaseId
+                ? -1
+                : left.phaseId > right.phaseId ? 1 : 0)
+          .slice(pageOffset, pageOffset + pageLimit)
+          .map((activation) => ({
+            itemId: activation.itemId,
+            phaseId: activation.phaseId,
+            receiptRef: activation.receiptRef,
+            dataResult: activation.dataResult,
+            updatedAt: activation.updatedAt,
+          }));
+      const rendered = page.flatMap((settlement) => {
+        if (!settlement.dataResult) {
+          return [`- ${settlement.itemId} × ${settlement.phaseId}${settlement.receiptRef ? `: ${settlement.receiptRef}` : ''}`];
+        }
+        const redeemed = redeemFanoutSettlementData({
+          planId: plan_id,
+          itemId: settlement.itemId,
+          phaseId: settlement.phaseId,
+        });
+        if (redeemed.status !== 'ok') {
+          return [`- ${settlement.itemId} × ${settlement.phaseId}: DATA ARTIFACT ${redeemed.status} — ${redeemed.reason}`];
+        }
+        return [
+          `- ${settlement.itemId} × ${settlement.phaseId}: retained data `
+            + `${redeemed.binding.resultHandleId} (${redeemed.binding.rawByteCount} bytes, sha256 ${redeemed.binding.rawPayloadSha256}); `
+            + 'read with fanout_read_settlement_data',
+        ];
+      });
       return textResult([
-        `Plan ${plan_id}: ${page.length} settlement(s) at offset ${offset ?? 0}.`,
-        ...page.map((s) => `- ${s.itemId} × ${s.phaseId}${s.receiptRef ? `: ${s.receiptRef}` : ''}`),
+        `Plan ${plan_id}: ${page.length} settlement(s) at offset ${pageOffset}.`,
+        ...rendered,
         ...(page.length === 0 ? ['(end of journal)'] : []),
       ].join('\n'));
+    },
+  );
+
+  server.tool(
+    'fanout_read_settlement_data',
+    [
+      'Read one successful data-producing fan-out activation from its exact retained source result.',
+      'This reads local durable bytes only; it NEVER re-runs the source/provider. Page with next_offset until null, then concatenate page text in order.',
+    ].join(' '),
+    {
+      plan_id: z.string().min(1),
+      item_id: z.string().min(1),
+      phase_id: z.string().min(1),
+      offset: z.number().int().min(0).nullable().optional(),
+      limit: z.number().int().min(1).max(16_000).nullable().optional(),
+    },
+    async ({ plan_id, item_id, phase_id, offset, limit }) => {
+      const callerRunSessionId = getToolOutputContext()?.sessionId ?? '';
+      const authority = fanoutToolReadAuthority(plan_id, callerRunSessionId);
+      if (
+        !authority
+        || (authority.kind === 'worker' && !authority.itemIds.has(item_id))
+      ) return textResult(FANOUT_READ_AUTHORITY_DENIED);
+      const page = readFanoutSettlementDataPage({
+        planId: plan_id,
+        itemId: item_id,
+        phaseId: phase_id,
+        offset: offset ?? 0,
+        limit: limit ?? 16_000,
+      });
+      if (page.status !== 'ok') {
+        return textResult(`Data artifact ${page.status}: ${page.reason}`);
+      }
+      return textResult([
+        `Data ${item_id} × ${phase_id}; handle=${page.binding.resultHandleId}; `
+          + `sha256=${page.binding.rawPayloadSha256}; bytes=${page.binding.rawByteCount}; `
+          + `offset=${page.offset}; next_offset=${page.nextOffset ?? 'null'}; total_chars=${page.totalChars}`,
+        page.text,
+      ].join('\n'), { maxChars: 20_000 });
     },
   );
 }

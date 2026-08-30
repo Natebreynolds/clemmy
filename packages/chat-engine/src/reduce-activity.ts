@@ -39,6 +39,51 @@ function providerFor(d: Record<string, unknown>, model: string): ActivityItem['p
 
 export const REUSED_RESULT_LABEL = 'Reused earlier result';
 
+/** One transient row owns the model-side phase between concrete tool calls.
+ * Keeping one stable id prevents a long tool loop from growing a page of
+ * "thinking" rows while still letting each new route/heartbeat move the live
+ * headline forward. The presenter hides this row once the turn settles. */
+export const MODEL_PHASE_ACTIVITY_ID = 'model-phase-live';
+
+function boundedPhaseIdentity(value: unknown): string {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/.test(raw)) return '';
+  return raw.slice(0, 48)
+    .replace(/[_:-]+/g, ' ')
+    .replace(/\b(?:gpt|grok|claude|codex|sonnet|opus|haiku|sol)\b/gi, (part) => (
+      part.toLowerCase() === 'gpt'
+        ? 'GPT'
+        : part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+    ));
+}
+
+function modelIdentity(d: Record<string, unknown>): string {
+  return boundedPhaseIdentity(d.model) || boundedPhaseIdentity(d.provider);
+}
+
+function upsertModelPhase(
+  prev: ActivityItem[],
+  label: string,
+  now: () => number,
+  detail?: string,
+): ActivityItem[] {
+  const prior = prev.find((row) => row.id === MODEL_PHASE_ACTIVITY_ID);
+  const row: ActivityItem = {
+    id: MODEL_PHASE_ACTIVITY_ID,
+    kind: 'event',
+    variant: 'lifecycle',
+    tone: 'live',
+    label: label.slice(0, 120),
+    status: 'running',
+    startedAt: prior?.startedAt ?? now(),
+    ...(detail ? { detail: detail.slice(0, 64) } : prior?.detail ? { detail: prior.detail } : {}),
+  };
+  // Re-append instead of replacing in place: the final running row is the
+  // current phase, so a rescue route or heartbeat cannot sit behind an older
+  // completed tool merely because the model row was first created at turn start.
+  return [...prev.filter((item) => item.id !== MODEL_PHASE_ACTIVITY_ID), row];
+}
+
 /** Fold one harness event into the turn's activity list. Returns the SAME array
  *  reference when nothing changed (so the caller can skip a re-render). Tools are
  *  correlated called→returned by callId when available, falling back to name for
@@ -52,6 +97,23 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
   const model = typeof d.model === 'string' ? d.model : '';
   const toolLabel = humanToolLabel(tool, d.args, d.publicSlug, d.innerTool);
   switch (ev.type) {
+    case 'turn_started': {
+      // A route event normally arrives first and carries the bounded brain
+      // identity. Do not let a duplicate turn_started erase that better phase.
+      if (prev.some((row) => row.id === MODEL_PHASE_ACTIVITY_ID && row.status === 'running')) return prev;
+      return upsertModelPhase(prev, 'Thinking through your request…', now);
+    }
+    case 'turn_model_routed': {
+      const identity = modelIdentity(d);
+      const fallover = d.fallover === true;
+      const preselected = d.preselected === true;
+      const label = fallover
+        ? preselected
+          ? `Continuing with ${identity || 'a backup brain'}…`
+          : `Switching to ${identity || 'a backup brain'}…`
+        : `Thinking with ${identity || 'your selected brain'}…`;
+      return upsertModelPhase(prev, label, now, identity || undefined);
+    }
     // The compiled graph is internal topology. Pinning "Planned: plan · N
     // steps" is generic noise, not work.
     case 'turn_graph_compiled':
@@ -238,18 +300,28 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
               : {}),
         };
       };
+      let next = prev;
       if (callId) {
         const id = `t-${callId}`;
         if (prev.some((a) => a.kind === 'tool' && a.id === id)) {
-          return prev.map((a) => (a.kind === 'tool' && a.id === id ? settle(a) : a));
+          next = prev.map((a) => (a.kind === 'tool' && a.id === id ? settle(a) : a));
         }
       }
-      for (let i = prev.length - 1; i >= 0; i--) {
-        if (prev[i].kind === 'tool' && prev[i].status === 'running' && prev[i].label === toolLabel) {
-          return prev.map((a, j) => (j === i ? settle(a) : a));
+      if (next === prev) {
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i].kind === 'tool' && prev[i].status === 'running' && prev[i].label === toolLabel) {
+            next = prev.map((a, j) => (j === i ? settle(a) : a));
+            break;
+          }
         }
       }
-      return prev;
+      if (next === prev) return prev;
+      // The concrete call is over. The truthful next beat is model-side work,
+      // not the last completed call. This is the exact transition the stale
+      // mobile bundle lost after memory_recall_all returned.
+      return next.some((row) => row.id === MODEL_PHASE_ACTIVITY_ID)
+        ? upsertModelPhase(next, 'Working on it…', now)
+        : next;
     }
     case 'worker_started': {
       if (!item) return prev;
@@ -300,6 +372,19 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       }];
     }
     case 'heartbeat': {
+      if (d.kind === 'active_turn_check_in' || d.kind === 'progress_check_in') {
+        // Heartbeats fill model-side silence. They must not jump ahead of a
+        // concrete tool, worker, or batch that is provably still running.
+        if (prev.some((row) => row.status === 'running' && row.id !== MODEL_PHASE_ACTIVITY_ID)) return prev;
+        const prior = prev.find((row) => row.id === MODEL_PHASE_ACTIVITY_ID);
+        const identity = prior?.detail?.trim() ?? '';
+        const hostMessage = d.kind === 'progress_check_in' && typeof d.message === 'string'
+          ? d.message.trim().replace(/\s+/g, ' ').slice(0, 120)
+          : '';
+        const label = hostMessage
+          || (identity ? `Still thinking with ${identity}…` : 'Still working through this…');
+        return upsertModelPhase(prev, label, now, identity || undefined);
+      }
       if (d.kind !== 'watcher_steer') return prev;
       const miss = typeof d.miss === 'string' ? d.miss : '';
       const steer = typeof d.steer === 'string' ? d.steer : '';

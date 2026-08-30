@@ -28,24 +28,26 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 delete process.env.CLEMENTINE_CRON_CATCHUP_PER_TICK; // independent default budget: 1
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
-// Route runCronJob to the stub brain: disable the cron harness lane AND
-// explicitly opt into the legacy respond fallback (without the second flag the
-// bridge blocks pre-run instead of falling back — by design).
-process.env.CLEMMY_HARNESS_CRON = 'off';
-process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
 
 const {
   _testOnly_processCronSchedules: processCron,
   _testOnly_processCronTriggers: processTriggers,
   _testOnly_waitForCronScheduleIdle: waitForCronScheduleIdle,
   _testOnly_loadDaemonState: loadDaemonState,
+  _testOnly_setCronResponseExecutor: setCronResponseExecutor,
 } = await import('./runner.js') as unknown as {
   _testOnly_processCronSchedules: (assistant: unknown, state: CronState, now?: Date) => Promise<void>;
   _testOnly_processCronTriggers: (assistant: unknown) => Promise<void>;
   _testOnly_waitForCronScheduleIdle: () => Promise<void>;
   _testOnly_loadDaemonState: () => CronState;
+  _testOnly_setCronResponseExecutor: (executor: ((
+    assistant: { respond: (request: { sessionId?: string }) => Promise<{ text: string; sessionId?: string }> },
+    request: { sessionId?: string },
+  ) => Promise<{ text: string; sessionId?: string }>) | null) => void;
 };
 const { CRON_FILE: cronFile } = await import('../memory/vault.js');
+
+setCronResponseExecutor((assistant, request) => assistant.respond(request));
 
 type CronState = {
   lastCronRunByMinute: Record<string, string>;
@@ -74,6 +76,12 @@ test.beforeEach(async () => {
   rmSync(path.join(TMP_HOME, 'state', 'daemon-state.json'), { force: true });
   delete process.env.CLEMENTINE_CRON_CATCHUP_PER_TICK;
   delete process.env.CLEMENTINE_WORKFLOW_CATCHUP_PER_TICK;
+});
+
+test.after(async () => {
+  await waitForCronScheduleIdle();
+  setCronResponseExecutor(null);
+  rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
 function seedCronFile(jobs: Array<{ name: string; schedule: string }>): void {

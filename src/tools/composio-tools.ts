@@ -73,7 +73,12 @@ import {
   updateToolChoiceOutcomeForIdentifier,
   recallComposioForSearch,
 } from '../memory/tool-choice-store.js';
-import { harnessRunContextStorage, workerThrashGuardEnabled } from '../runtime/harness/brackets.js';
+import {
+  attestToolLocalInputInvalidity,
+  harnessRunContextStorage,
+  workerThrashGuardEnabled,
+  type ToolLocalInputInvalidityValidator,
+} from '../runtime/harness/brackets.js';
 import { appendFanoutAdvisory } from '../runtime/harness/fanout-advisory.js';
 import { maybeDiscoveryAdvisory, isDescribeSlug, describeSignature } from '../runtime/harness/discovery-advisory.js';
 import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
@@ -97,14 +102,14 @@ import { classifyDiscoveryCall } from '../runtime/harness/discovery-boundary.js'
 import { isTransientStepError } from '../execution/transient-error.js';
 import { asyncJobTimeoutCorrective } from '../runtime/harness/tool-error-corrective.js';
 import {
-  checkConstraintViolation,
+  checkComposioConstraintViolation,
   formatConstraintEscalation,
-  findEmailDraftAuthoringPreference,
-  findEmailSendConstraint,
-  findOutlookCalendarReadConstraint,
-  renderToolkitConstraintBanner,
-} from '../runtime/harness/constraint-guard.js';
-import { resolveCompliantSenderConnection, extractMailboxEmails } from '../runtime/harness/sender-verify.js';
+  findComposioEmailDraftAuthoringPreference,
+  findComposioEmailSendConstraint,
+  findComposioConnectionReadConstraint,
+  renderComposioToolkitConstraintBanner,
+} from '../integrations/composio/standing-policy-adapter.js';
+import { resolveCompliantSenderConnection, extractMailboxEmails } from '../integrations/composio/outlook-sender-verifier.js';
 import { rememberAccountAlias, resolveAccountAlias, aliasLabelFor } from '../memory/account-alias-store.js';
 import { cachedIdentityEmail, identityProbeAttempted, recordIdentityProbe } from '../integrations/composio/identity-cache.js';
 import { validateComposioArgs, formatBatchValidationError, applyEmailRecipientAliases, repairUnambiguousFieldRename } from './composio-batch-validator.js';
@@ -129,10 +134,6 @@ import {
   classifyComposioSlugEffect,
   composioSlugIsReadOnly,
 } from '../integrations/composio/slug-effect.js';
-import {
-  documentedAtomicInputContentCommit,
-  documentedComposioOperationSemantic,
-} from '../integrations/composio/operation-semantics.js';
 import { currentHostCallAttestation } from '../runtime/harness/accepted-turn-call-authority.js';
 import {
   capabilityManifestDigest,
@@ -151,9 +152,9 @@ import {
   type DocumentedCreateResultAdmission,
 } from '../runtime/harness/documented-create-result-evidence.js';
 import {
-  compileGoogleSheetsSheetFromJsonContract,
-  parseGoogleSheetsSheetFromJsonContract,
-} from '../runtime/harness/sheet-from-json-content-contract.js';
+  compileAtomicInputContentContract,
+  parseAtomicTabularRecordSetContentContract,
+} from '../runtime/harness/atomic-input-content-contract.js';
 import { suggestNextSteps, type FailureType as FallbackFailureType } from '../runtime/fallback-chain-store.js';
 import { getCapabilitiesForIntent } from '../runtime/capability-registry.js';
 import { recordExecution } from '../runtime/graceful-degradation-engine.js';
@@ -231,6 +232,29 @@ export const COMPOSIO_EXECUTE_TOOL_PARAMS = {
   arguments: z.string().nullable(),
   connected_account_id: z.string().nullable(),
 } satisfies z.ZodRawShape;
+
+const COMPOSIO_EXECUTE_TOOL_INPUT_SCHEMA = z.object(COMPOSIO_EXECUTE_TOOL_PARAMS);
+
+/** Exact mirror of the SDK JSON-schema tool parser. It proves only malformed
+ * JSON syntax; a parsed value remains unproven and keeps every effect gate. */
+const sdkJsonSyntaxInvalidity: ToolLocalInputInvalidityValidator = ({ rawInput }) => {
+  try {
+    JSON.parse(rawInput as string);
+    return 'unproven';
+  } catch {
+    return 'invalid';
+  }
+};
+
+/** Pure mirror of both local carrier validators. A valid outer envelope or
+ * inner object never conveys effect/read/dispatch authority. */
+const directComposioCarrierInvalidity: ToolLocalInputInvalidityValidator = ({ parsedInput }) => {
+  const outer = COMPOSIO_EXECUTE_TOOL_INPUT_SCHEMA.safeParse(parsedInput);
+  if (!outer.success) return 'invalid';
+  return normalizeComposioArgsPayload(outer.data.arguments ?? null).ok
+    ? 'unproven'
+    : 'invalid';
+};
 
 export interface ComposioCliSearchMatch {
   toolkit: string;
@@ -1155,7 +1179,7 @@ function settleComposioPreDispatchRefusal(
       turn: run?.turn,
       lane: 'composio',
       toolName: toolSlug,
-      ...(invocation?.settlementNonce ? { callId: invocation.settlementNonce } : {}),
+      ...(invocation?.callId ? { callId: invocation.callId } : {}),
       args,
       // Nothing dispatched, so nothing is uncertain — even for a write.
       mutating: false,
@@ -1204,7 +1228,7 @@ function settleComposioReturned(
       lane: 'composio',
       toolName: toolSlug,
       args,
-      ...(invocation?.settlementNonce ? { callId: invocation.settlementNonce } : {}),
+      ...(invocation?.callId ? { callId: invocation.callId } : {}),
       mutating: classifyComposioSlugEffect(toolSlug) !== 'read',
       businessCall: classifyDiscoveryCall(toolSlug, args) === null,
       result,
@@ -1241,11 +1265,13 @@ function currentDocumentedCreateProjection(input: {
   providerSchemaLeaseFingerprint: string | undefined;
   providerInputSchemaDigest: string | undefined;
 }): RuntimeDocumentedCreateProjection {
-  if (!documentedAtomicInputContentCommit(input.toolSlug)) return { status: 'not_applicable' };
-
   const attestation = currentHostCallAttestation();
   const work = currentExpectedWorkBinding();
   const logical = currentLogicalCall();
+  const frozenSubmitted = parseAtomicTabularRecordSetContentContract(
+    work?.generatedArtifactContentContract,
+  );
+  if (!frozenSubmitted) return { status: 'not_applicable' };
   // Preserve every historical provider lane.  Projection is available only
   // to a current host-owned planned call, never inferred from a slug alone.
   if (!attestation && !work) return { status: 'not_applicable' };
@@ -1288,8 +1314,15 @@ function currentDocumentedCreateProjection(input: {
     status: 'refused',
     reason: 'resolved provider schema conflicts with planned work',
   };
-  const submitted = compileGoogleSheetsSheetFromJsonContract(input.toolSlug, input.args);
-  const frozenSubmitted = parseGoogleSheetsSheetFromJsonContract(work.generatedArtifactContentContract);
+  const submitted = compileAtomicInputContentContract({
+    declaration: {
+      version: 1,
+      compiler: frozenSubmitted.compiler,
+      resultIdentity: frozenSubmitted.resultIdentity,
+      evidence: ['receipt', 'content_commit'],
+    },
+    providerArguments: input.args,
+  });
   if (
     !submitted
     || !frozenSubmitted
@@ -1311,6 +1344,7 @@ function currentDocumentedCreateProjection(input: {
       providerInputSchemaDigest: attestation.providerInputSchemaDigest,
       argumentDigest: attestation.argumentDigest,
       submittedContentDigest: submitted.submittedContentDigest,
+      resultIdentity: submitted.resultIdentity,
       effect: 'external_write',
     },
     actual: {
@@ -1321,6 +1355,7 @@ function currentDocumentedCreateProjection(input: {
       providerInputSchemaDigest: input.providerInputSchemaDigest,
       argumentDigest: contract.argumentDigest,
       submittedContentDigest: submitted.submittedContentDigest,
+      resultIdentity: submitted.resultIdentity,
       effect: 'external_write',
     },
   });
@@ -1346,8 +1381,8 @@ function settleComposioThrown(
       lane: 'composio',
       toolName: toolSlug,
       args,
-      ...(toolOutputContextStorage.getStore()?.settlementNonce
-        ? { callId: toolOutputContextStorage.getStore()!.settlementNonce }
+      ...(toolOutputContextStorage.getStore()?.callId
+        ? { callId: toolOutputContextStorage.getStore()!.callId }
         : {}),
       mutating: classifyComposioSlugEffect(toolSlug) !== 'read',
       businessCall: classifyDiscoveryCall(toolSlug, args) === null,
@@ -1628,10 +1663,12 @@ function routeConstraintBlock(
   // `emailHandledExternally` stays true: the mailbox rule is resolved by
   // findEmailSendConstraint during sender resolution, exactly as before. This
   // call is only the pattern-based ROUTE prohibition.
-  const violation = checkConstraintViolation('composio_execute_tool', {
-    ...args,
-    action: toolSlug,
-  }, { emailHandledExternally: true });
+  const violation = checkComposioConstraintViolation(
+    'composio_execute_tool',
+    toolSlug,
+    args,
+    { senderIdentityHandledExternally: true },
+  );
   return violation ? formatConstraintEscalation(violation) : null;
 }
 
@@ -1651,7 +1688,7 @@ async function enforceStandingConstraints(
   delete args.sender_override_confirmed; // meta-arg — never reaches the provider API
 
   let routeConnectedAccountId: string | undefined;
-  const emailRule = findEmailSendConstraint(toolSlug, args);
+  const emailRule = findComposioEmailSendConstraint(toolSlug, args);
   if (emailRule) {
     if (senderOverride) {
       console.error(`[sender-verify] OVERRIDE used for ${toolSlug} — user-directed alternate sender (constraint #${emailRule.constraint.id})`);
@@ -2633,7 +2670,9 @@ export async function resolveComposioDispatch(
   const toolkit = registeredToolkitOfSlug(toolSlug);
   const normalized = normalizeInlineConnectedAccountId(rawArgs, connectedAccountId);
   let args = normalized.args;
-  const pinned = normalized.connectedAccountId;
+  let pinned = normalized.connectedAccountId;
+  /** A caller-supplied account id the host binding superseded, for disclosure. */
+  let supersededCallerAccountId: string | undefined;
   const notes: string[] = [];
   const credentials = getComposioCredentialStatus();
   const cliOnlyLane = composioExecutionUsesCliOnlyLane(credentials);
@@ -2678,7 +2717,7 @@ export async function resolveComposioDispatch(
   // Standard SDK and AUTO-with-key routing does not enter this branch.
   const recalledIdentity = recallComposioAccountIdentity(toolSlug);
   const preferredIdentity = opts.preferredIdentity?.trim();
-  const draftPreference = findEmailDraftAuthoringPreference(toolSlug);
+  const draftPreference = findComposioEmailDraftAuthoringPreference(toolSlug);
   const draftPreferredIdentity = draftPreference?.preferredAccount;
   const cliAccountRoute = pinned
     ? {
@@ -2773,6 +2812,102 @@ export async function resolveComposioDispatch(
     ? /^(active|enabled)$/i.test((c.status ?? '').trim())
     : /active|enabled|initiat/i.test(c.status ?? ''));
   let emptySnapshotRuntime: Awaited<ReturnType<typeof getComposioRuntimeStatus>> | null = null;
+
+  // A host-planned call already froze one exact provider manifest, including
+  // its connected account. Reopen that process-local authority here, before
+  // generic multi-account selection, so the model is never asked to restate a
+  // copyable connection id that the host already selected. The current
+  // prepared account snapshot below still has to prove the account is live,
+  // and the terminal definition gate later revalidates the full schema/version
+  // identity. Caller-supplied account bytes may agree with the host binding;
+  // they can never replace it.
+  const attestedRawDefinition = opts.preparedExecution
+    ? exactRegisteredComposioIdentityForCurrentHostCall(toolSlug)
+    : { status: 'not_attested' as const };
+  if (attestedRawDefinition.status === 'exact') {
+    const attestedAccountId = attestedRawDefinition.identity.accountId;
+    // A stale connection id SUPERSEDES, it does not kill the turn.
+    //
+    // `pinned` is overwritten with attestedAccountId a few lines below, so a
+    // conflicting caller-supplied id never reaches the provider either way —
+    // refusing here only denied service over bytes already destined for the
+    // bin. And these bytes go stale as a matter of course: a connection id is
+    // an opaque machine identifier that a provider re-issues on reconnect,
+    // while any memory of it lives on. Live 2026-08-28: four active facts
+    // named a re-issued Outlook connection, the model dutifully restated it,
+    // and an admitted plan with a correct capability died one call from done.
+    // No user can be expected to hand-edit a remembered account id, so this
+    // must be survivable by construction, for everyone, not repaired per user.
+    //
+    // The property the guard exists to protect is unaffected — in fact it is
+    // strengthened. Caller bytes could never redirect the call; now they
+    // cannot deny it either. The account used is always the one the host
+    // froze and attested.
+    //
+    // Human-meaningful selectors are deliberately NOT covered by this: an
+    // `account_alias` or a preferred identity expresses which mailbox the USER
+    // asked for, so a conflict there is a real disagreement and still refuses
+    // below rather than silently reading the wrong account.
+    if (pinned && pinned !== attestedAccountId) {
+      notes.push(
+        `[account-route] Ignoring stale connected account ${pinned}; the accepted host plan `
+        + `froze ${attestedAccountId} for ${toolSlug}. The remembered id is no longer current.`,
+      );
+      supersededCallerAccountId = pinned;
+    }
+    if (preferredIdentity) {
+      const preferred = selectToolkitConnection(toolSlug, conns, preferredIdentity);
+      if (preferred.kind !== 'resolved' || preferred.connectionId !== attestedAccountId) {
+        const message =
+          `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because preferred account `
+          + `"${preferredIdentity}" does not match the host-selected account ${attestedAccountId}. `
+          + 'Refresh and select one exact provider definition, then retry. No provider dispatch was started.';
+        emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+          guard: 'host-attested-preferred-account-conflict',
+        });
+        return { ok: false, reason: 'invalid-args', message, toolkit };
+      }
+    }
+    if (aliasArg) {
+      const savedAlias = aliasArg.includes('@') ? undefined : resolveAccountAlias(aliasArg, toolkit);
+      const aliasIdentity = aliasArg.includes('@') ? aliasArg : savedAlias?.email;
+      const aliasConnectionId = aliasIdentity
+        ? (() => {
+            const selected = selectToolkitConnection(toolSlug, conns, aliasIdentity);
+            return selected.kind === 'resolved' ? selected.connectionId : undefined;
+          })()
+        : savedAlias?.connectionId && usable.some((connection) =>
+            connection.connectionId === savedAlias.connectionId)
+          ? savedAlias.connectionId
+          : undefined;
+      // A new name may be bound to the already-attested account by the legacy
+      // pin+alias gesture. An existing name/email, however, is a selector and
+      // may agree with that account only; it can never be silently repointed.
+      if ((aliasArg.includes('@') || savedAlias) && aliasConnectionId !== attestedAccountId) {
+        const message =
+          `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because account alias `
+          + `"${aliasArg}" does not match the host-selected account ${attestedAccountId}. `
+          + 'Refresh and select one exact provider definition, then retry. No provider dispatch was started.';
+        emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+          guard: 'host-attested-account-alias-conflict',
+        });
+        return { ok: false, reason: 'invalid-args', message, toolkit };
+      }
+    }
+    pinned = attestedAccountId;
+    notes.push(`[account-route] Using the exact account frozen by the accepted host plan (${attestedAccountId}).`);
+    // Heal the memory that produced the stale id, so the next turn does not
+    // restate it. Observed here because this is the only place both the dead
+    // and the live id are known at once. Best-effort by construction.
+    if (supersededCallerAccountId) {
+      void import('../memory/facts.js')
+        .then(({ correctFactsNamingSupersededAccount }) => correctFactsNamingSupersededAccount({
+          supersededAccountId: supersededCallerAccountId!,
+          currentAccountId: attestedAccountId,
+        }))
+        .catch(() => 0);
+    }
+  }
 
   if (opts.preparedExecution && !cliOnlyLane && pinned) {
     if (preparedConnectionSnapshot === null) {
@@ -2977,7 +3112,7 @@ export async function resolveComposioDispatch(
   }
 
   if (!owner) {
-    const calendarRoute = findOutlookCalendarReadConstraint(toolSlug, args, opts.userInput);
+    const calendarRoute = findComposioConnectionReadConstraint(toolSlug, args, opts.userInput);
     if (calendarRoute) {
       owner = calendarRoute.routeConnectionId;
       notes.push(`[account-route] Routed Outlook calendar read to connection ${calendarRoute.routeConnectionId} from standing rule #${calendarRoute.constraint.id}.`);
@@ -2998,7 +3133,7 @@ export async function resolveComposioDispatch(
   // stage below resolves it probe-verified (snapshot emails can be stale/absent,
   // the profile probe is authoritative) — so identity resolution must not
   // pre-block it. Everything else resolves by identity here.
-  const ruleOwnedSend = !owner && isIrreversibleSendSlug(toolSlug) && Boolean(findEmailSendConstraint(toolSlug, args));
+  const ruleOwnedSend = !owner && isIrreversibleSendSlug(toolSlug) && Boolean(findComposioEmailSendConstraint(toolSlug, args));
   if (cliOnlyLane && ruleOwnedSend && args.sender_override_confirmed !== true) {
     const message =
       `⚠️ NEEDS-YOUR-CHOICE: ${toolkit} was not started. A standing sender rule requires a specific verified ` +
@@ -3285,9 +3420,6 @@ export async function resolveComposioDispatch(
     });
     return { ok: false, reason: 'invalid-args', message, toolkit };
   }
-  const attestedRawDefinition = opts.preparedExecution
-    ? exactRegisteredComposioIdentityForCurrentHostCall(toolSlug)
-    : { status: 'not_attested' as const };
   // A preparation instrument degrades a REFUSAL to unattested instead of
   // dying on it — the identity this gate demands is what the instrument
   // exists to build. A warm manifest still resolves 'exact', so instruments
@@ -3368,7 +3500,11 @@ export async function resolveComposioDispatch(
     const finalConnection = usable.find((connection) => connection.connectionId === owner);
     let snapshotIdentity = '';
     let routedIdentity = '';
-    try { snapshotIdentity = normalizeProcedureAccountIdentity(finalConnection?.accountEmail); } catch { /* unbound */ }
+    try {
+      snapshotIdentity = normalizeProcedureAccountIdentity(
+        finalConnection?.accountEmail ?? cachedIdentityEmail(owner),
+      );
+    } catch { /* unbound */ }
     try { routedIdentity = normalizeProcedureAccountIdentity(identity); } catch { /* unbound */ }
     if (finalConnection && snapshotIdentity
       && (!routedIdentity || routedIdentity === snapshotIdentity)) {
@@ -3878,7 +4014,7 @@ async function runComposioExecuteInner(
   // Tool-bound standing rules ride with EVERY call's output — the model
   // re-reads them at the moment it acts on this toolkit, independent of
   // whether memory recall surfaced them this turn.
-  const constraintBanner = renderToolkitConstraintBanner(registeredToolkitOfSlug(toolSlug));
+  const constraintBanner = renderComposioToolkitConstraintBanner(registeredToolkitOfSlug(toolSlug));
 
   const recentErrors: string[] = [];
   let lastError: unknown;
@@ -4568,7 +4704,7 @@ function describeDynamicTool(toolkitSlug: string, toolSlug: string, description?
     : `${tag} Composio action ${toolSlug}. Call this directly when the fields are clear. If its exact schema is missing or validation rejects the call, inspect this exact action once and repair the arguments; do not run broad discovery.`;
   // Tool-bound standing rules live IN the tool description: the model cannot
   // form a call to this tool without the rule in view, every single turn.
-  const banner = renderToolkitConstraintBanner(toolkitSlug);
+  const banner = renderComposioToolkitConstraintBanner(toolkitSlug);
   return banner ? `${base}\n${banner}` : base;
 }
 
@@ -4748,7 +4884,7 @@ export async function getDynamicComposioRuntimeTools(options: {
           ? [toolkitTool.outputParameters]
           : []),
       );
-      out.push(attestTerminalPhysicalDispatchOwner(tool({
+      out.push(attestTerminalPhysicalDispatchOwner(attestToolLocalInputInvalidity(tool({
         name,
         description: describeDynamicTool(toolkitSlug, toolSlug, toolkitTool.description),
         parameters: normalizeJsonSchemaObject(toolkitTool.inputParameters) as any,
@@ -4772,7 +4908,7 @@ export async function getDynamicComposioRuntimeTools(options: {
           defaultConnectionId,
           { context, details, toolName: name },
         ),
-      })));
+      }), sdkJsonSyntaxInvalidity)));
     }
   }
 
@@ -5154,7 +5290,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
       );
       let constraintBanners = '';
       for (const toolkit of matchedToolkits) {
-        const banner = renderToolkitConstraintBanner(toolkit);
+        const banner = renderComposioToolkitConstraintBanner(toolkit);
         if (banner) constraintBanners += `\n${banner}`;
       }
       if (constraintBanners) output += constraintBanners;
@@ -5170,10 +5306,10 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     },
   });
 
-  const composio_execute_tool = attestTerminalPhysicalDispatchOwner(tool({
+  const composio_execute_tool = attestTerminalPhysicalDispatchOwner(attestToolLocalInputInvalidity(tool({
     name: 'composio_execute_tool',
     description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search, Salesforce query, etc.). Use an exact slug already supplied by the runtime or a proven capability directly. Never invent a slug: when this requirement is unresolved, use the single discovery broker once, then pass its exact result here. If the slug is known but its arguments fail validation, inspect that exact action once and repair the call instead of broad-searching again. Arguments must be a JSON object string. Uses the connected OAuth account and approval policy. FILES: actions that return files (attachment/export downloads) save them locally and include the local `filePath` in the result — pass that exact path onward; file-input params (uploads, attachments) accept a local file path string, so download→upload flows (e.g. Outlook attachment → Drive) chain the returned filePath directly.',
-    parameters: z.object(COMPOSIO_EXECUTE_TOOL_PARAMS),
+    parameters: COMPOSIO_EXECUTE_TOOL_INPUT_SCHEMA,
     // Taxonomy reads `tool_slug` from args to decide read-vs-send, so
     // GOOGLESHEETS_BATCH_GET autos through while GMAIL_SEND_EMAIL pauses
     // (or autos in YOLO).
@@ -5214,7 +5350,7 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
         toolName: 'composio_execute_tool',
       });
     },
-  }));
+  }), directComposioCarrierInvalidity));
 
   return [composio_status, composio_search_tools, composio_list_tools, composio_execute_tool];
 }

@@ -2217,6 +2217,12 @@ export interface RememberedComposioMatch {
   accountIdentity?: string;
   /** Exact canonical procedure selected by memory. */
   procedureId?: string;
+  /** Provider contract attached to the exact receipt-backed choice. */
+  schemaFingerprint?: string;
+  /** Private pointer to the verified read that taught this exact choice.
+   * Consumers must re-resolve it against the durable receipt before using it
+   * as nomination evidence. */
+  verifiedReadOrigin?: VerifiedReadCapabilityOrigin;
 }
 
 type ComposioSearchOperation = 'create' | 'write' | 'read' | 'search' | 'list' | 'delete' | 'send';
@@ -2361,6 +2367,8 @@ export function recallComposioForSearch(
       successCount,
       matched,
       procedureId: rec.procedureId,
+      schemaFingerprint: c.schemaFingerprint,
+      verifiedReadOrigin: c.verifiedReadOrigin,
     };
     const prev = bySlug.get(c.identifier);
     if (!prev) {

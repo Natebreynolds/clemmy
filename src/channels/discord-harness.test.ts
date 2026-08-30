@@ -412,12 +412,12 @@ test('autonomous single email projects an ordinary exact-action question with re
       approvalPresentation: 'conversation',
       question: [
         'I’ve got what you needed — here’s the result: https://docs.google.com/spreadsheets/d/sheet-proof/edit',
-        'The exact email is ready for **nathan.reynolds@scorpion.co** with subject **Top 5 restaurants in Ventura, CA**. Do you want me to send it?',
+        'The exact email is ready for **blake@scorpion.co** with subject **Top 5 restaurants in Ventura, CA**. Do you want me to send it?',
       ].join('\n\n'),
       args: {
         tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
         arguments: JSON.stringify({
-          to_email: 'nathan.reynolds@scorpion.co',
+          to_email: 'blake@scorpion.co',
           subject: 'Top 5 restaurants in Ventura, CA',
           body: 'Here is the finished sheet: https://docs.google.com/spreadsheets/d/sheet-proof/edit',
         }),
@@ -433,7 +433,7 @@ test('autonomous single email projects an ordinary exact-action question with re
   assert.equal(s.pendingApprovalId, undefined, 'hidden durable authority must not become card chrome');
   assert.equal(__test__.approvalComponentsForState(s), null);
   assert.match(s.summary, /https:\/\/docs\.google\.com\/spreadsheets\/d\/sheet-proof\/edit/);
-  assert.match(s.summary, /nathan\.reynolds@scorpion\.co/);
+  assert.match(s.summary, /blake@scorpion\.co/);
   assert.match(s.summary, /Top 5 restaurants in Ventura, CA/);
   assert.match(s.summary, /Do you want me to send it\?/);
 });
@@ -447,7 +447,7 @@ test('autonomous consent stays fail-closed for qualified changes and missing exa
   assert.equal(parseAutonomousSendConsentReply('send it to Alex instead'), null);
   assert.equal(autonomousSendConsent('composio_execute_tool', {
     tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL',
-    arguments: JSON.stringify({ to_email: 'nathan.reynolds@scorpion.co', body: 'No subject supplied.' }),
+    arguments: JSON.stringify({ to_email: 'blake@scorpion.co', body: 'No subject supplied.' }),
   }), null, 'an unreviewable email keeps the formal approval surface');
 });
 
@@ -462,14 +462,14 @@ test('autonomous email recipient extraction is nested, order-independent, and ex
       body: 'Exact preview and a body-only address nobody@body.example',
     },
   );
-  assert.equal(nested({ name: 'Nathan', address: 'nathan@example.ai' })?.target, 'nathan@example.ai');
-  assert.equal(nested({ address: 'nathan@example.ai', name: 'Nathan' })?.target, 'nathan@example.ai');
+  assert.equal(nested({ name: 'Nathan', address: 'avery@example.ai' })?.target, 'avery@example.ai');
+  assert.equal(nested({ address: 'avery@example.ai', name: 'Nathan' })?.target, 'avery@example.ai');
   assert.equal(nested({ name: 'Nathan' }), null, 'display name alone is never a destination');
   assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
-    to_recipients: [{ name: 'Nathan', email: 'nathan@example.ai' }],
+    to_recipients: [{ name: 'Nathan', email: 'avery@example.ai' }],
     subject: 'Exact subject',
     body: 'Exact preview',
-  })?.target, 'nathan@example.ai', 'snake_case recipient objects retain their exact email target');
+  })?.target, 'avery@example.ai', 'snake_case recipient objects retain their exact email target');
   assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
     from: { name: 'Nathan', email: 'from@example.ai' },
     reply_to: [{ email: 'reply@example.ai' }],
@@ -488,7 +488,7 @@ test('autonomous email recipient extraction is nested, order-independent, and ex
 
 test('autonomous email consent rejects conflicting nested subject or body decoys', () => {
   const recipient = {
-    toRecipients: [{ emailAddress: { address: 'nathan@example.ai', name: 'Nathan' } }],
+    toRecipients: [{ emailAddress: { address: 'avery@example.ai', name: 'Nathan' } }],
   };
   assert.equal(autonomousSendConsent('mcp__outlook__OUTLOOK_SEND_EMAIL', {
     ...recipient,

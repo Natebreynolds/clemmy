@@ -7,13 +7,30 @@
  * finding: 8 serial bare-name DataForSEO reads sailed past every other mount.
  */
 process.env.CLEMMY_GUARDRAIL_PERSIST = 'off';
-import { test } from 'node:test';
+import { after, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { withReadFanoutGuard } from './claude-agent-sdk.js';
 import { _resetAllTrackersForTests } from './tool-guardrail.js';
+import {
+  installCurrentCapabilityManifestFixtures,
+  restoreCurrentCapabilityManifestFixtures,
+} from './current-capability-manifest.fixture.js';
 
 type Result = { behavior: string; message?: string };
 const allowBase = (async () => ({ behavior: 'allow' })) as never;
+
+beforeEach(() => {
+  restoreCurrentCapabilityManifestFixtures(null);
+  installCurrentCapabilityManifestFixtures([{
+    operationId: 'dataforseo__serp_organic_live_advanced',
+    providerKind: 'native_mcp',
+    effect: 'read',
+  }]);
+});
+
+after(() => {
+  restoreCurrentCapabilityManifestFixtures(null);
+});
 
 test('SDK read-fanout guard: serial native-MCP reads are DENIED with parallel-call recovery', async () => {
   _resetAllTrackersForTests();

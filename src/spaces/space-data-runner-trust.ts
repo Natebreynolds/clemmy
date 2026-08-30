@@ -36,6 +36,10 @@ import { deliverOutcome } from '../runtime/outcome.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendNote, listNotes } from './data-store.js';
 import {
+  projectWorkspaceApprovalDecision,
+  type WorkspaceApprovalTerminalResolution,
+} from './workspace-db.js';
+import {
   cliArgvError,
   resolveInSpace,
   runnerFilenameError,
@@ -82,12 +86,17 @@ interface CliSourceTrustSnapshot {
 export type RunnerTrustDecision =
   | { state: 'approved'; runnerSha256: string; approvalId: string }
   | { state: 'pending'; approvalId: string; error: string }
-  | { state: 'rejected' | 'blocked'; error: string };
+  | { state: 'rejected' | 'expired' | 'cancelled' | 'blocked'; error: string };
 
 export type CliSourceTrustDecision =
   | { state: 'approved'; cliArgv: string[]; approvalId: string }
   | { state: 'pending'; approvalId: string; error: string }
-  | { state: 'rejected' | 'blocked'; error: string };
+  | { state: 'rejected' | 'expired' | 'cancelled' | 'blocked'; error: string };
+
+export interface RunnerTrustAuthorizationOptions {
+  /** Only an explicit foreground refresh may ask again after a terminal no. */
+  requestFreshApproval?: boolean;
+}
 
 export interface RunnerTrustRefreshRequest {
   spaceSlug: string;
@@ -120,21 +129,30 @@ export function registerRunnerTrustRefreshHandler(handler: RunnerTrustRefreshHan
  * after its synchronous event-log boot fence has completed. */
 export function recoverResolvedRunnerTrustApprovals(): number {
   let recovered = 0;
-  for (const row of listPending({ status: 'resolved' })) {
-    if (row.resolution !== 'approved' || row.consumedAt !== null) continue;
-    if (
+  for (const row of listPending({ status: 'any' })) {
+    const runnerDecision = (
       row.tool === SPACE_DATA_RUNNER_TRUST_TOOL
       && row.args?.spaceDataRunnerTrustVersion === SPACE_DATA_RUNNER_TRUST_VERSION
-    ) {
-      recovered += 1;
-      recordRunnerTrustDecision(row);
-    } else if (
+    );
+    const cliDecision = (
       row.tool === SPACE_CLI_SOURCE_TRUST_TOOL
       && row.args?.spaceCliSourceTrustVersion === SPACE_CLI_SOURCE_TRUST_VERSION
-    ) {
+    );
+    if (!runnerDecision && !cliDecision) continue;
+
+    if (row.resolution === 'approved') {
+      if (row.consumedAt !== null) continue;
       recovered += 1;
-      recordCliSourceTrustDecision(row);
+      if (runnerDecision) recordRunnerTrustDecision(row);
+      else recordCliSourceTrustDecision(row);
+      continue;
     }
+
+    if (!terminalApprovalResolution(row)) continue;
+    const changed = runnerDecision
+      ? recordRunnerTrustDecision(row)
+      : recordCliSourceTrustDecision(row);
+    if (changed) recovered += 1;
   }
   return recovered;
 }
@@ -224,20 +242,130 @@ function ensureSpaceSession(rec: SpaceRecord): string {
   return sessionId;
 }
 
-function recordRunnerTrustDecision(row: PendingApprovalRow): void {
-  if (row.tool !== SPACE_DATA_RUNNER_TRUST_TOOL || !row.resolution) return;
+function terminalApprovalResolution(
+  row: PendingApprovalRow,
+): WorkspaceApprovalTerminalResolution | null {
+  switch (row.resolution) {
+    case 'rejected':
+    case 'expired':
+    case 'cancelled_by_user':
+    case 'cancelled_by_system':
+      return row.resolution;
+    default:
+      return null;
+  }
+}
+
+function approvalDecisionTimestamp(row: PendingApprovalRow): string {
+  const candidate = row.resolvedAt ?? (
+    row.resolution === 'expired' ? row.expiresAt : row.requestedAt
+  );
+  const parsed = Date.parse(candidate);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString();
+}
+
+function approvalDecisionDateLabel(iso: string): string {
+  return `${iso.slice(0, 10)} at ${iso.slice(11, 16)} UTC`;
+}
+
+function terminalApprovalExplanation(input: {
+  row: PendingApprovalRow;
+  sourceId: string;
+  executionLabel: string;
+}): { resolution: WorkspaceApprovalTerminalResolution; resolvedAt: string; text: string } | null {
+  const resolution = terminalApprovalResolution(input.row);
+  if (!resolution) return null;
+  const resolvedAt = approvalDecisionTimestamp(input.row);
+  const when = approvalDecisionDateLabel(resolvedAt);
+  const subject = `approval ${input.row.approvalId} for data source “${input.sourceId}”`;
+  const decision = resolution === 'rejected'
+    ? `You declined ${subject} on ${when}`
+    : resolution === 'expired'
+      ? `${subject[0]!.toUpperCase()}${subject.slice(1)} expired on ${when} without a decision`
+      : resolution === 'cancelled_by_user'
+        ? `You cancelled ${subject} on ${when}`
+        : `Clementine cancelled ${subject} on ${when}`;
+  return {
+    resolution,
+    resolvedAt,
+    text: `${decision}. ${input.executionLabel} remained blocked and was not executed. Ask Clementine to refresh this source again if you want a new approval.`,
+  };
+}
+
+function terminalAuthorizationRefusal(input: {
+  row: PendingApprovalRow;
+  sourceId: string;
+  executionLabel: string;
+  now: number;
+}): { state: 'rejected' | 'expired' | 'cancelled'; error: string } | null {
+  const terminal = terminalApprovalExplanation(input);
+  if (terminal) {
+    return {
+      state: terminal.resolution === 'rejected'
+        ? 'rejected'
+        : terminal.resolution === 'expired'
+          ? 'expired'
+          : 'cancelled',
+      error: terminal.text,
+    };
+  }
+  if (
+    input.row.resolution === 'approved'
+    && Date.parse(input.row.expiresAt) <= input.now
+  ) {
+    const expiredAt = approvalDecisionTimestamp({
+      ...input.row,
+      resolution: 'expired',
+      resolvedAt: input.row.expiresAt,
+    });
+    return {
+      state: 'expired',
+      error: `The grant from approval ${input.row.approvalId} for data source “${input.sourceId}” expired on ${approvalDecisionDateLabel(expiredAt)}. ${input.executionLabel} remained blocked and was not executed. Ask Clementine to refresh this source again if you want a new approval.`,
+    };
+  }
+  return null;
+}
+
+function projectTerminalTrustDecision(input: {
+  row: PendingApprovalRow;
+  slug: string;
+  sourceId: string;
+  executionLabel: string;
+}): { changed: boolean; explanation: ReturnType<typeof terminalApprovalExplanation> } {
+  const explanation = terminalApprovalExplanation(input);
+  if (!explanation) return { changed: false, explanation: null };
+  const result = projectWorkspaceApprovalDecision({
+    workspaceId: input.slug,
+    sourceKey: input.sourceId,
+    approvalId: input.row.approvalId,
+    resolution: explanation.resolution,
+    resolvedAt: explanation.resolvedAt,
+    explanation: explanation.text,
+  });
+  return { changed: result.transitioned > 0, explanation };
+}
+
+function recordRunnerTrustDecision(row: PendingApprovalRow): boolean {
+  if (row.tool !== SPACE_DATA_RUNNER_TRUST_TOOL || !row.resolution) return false;
   const args = row.args ?? {};
-  if (args.spaceDataRunnerTrustVersion !== SPACE_DATA_RUNNER_TRUST_VERSION) return;
+  if (args.spaceDataRunnerTrustVersion !== SPACE_DATA_RUNNER_TRUST_VERSION) return false;
   const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
   const sourceId = typeof args.sourceId === 'string' ? args.sourceId : '';
   const runner = typeof args.runner === 'string' ? args.runner : '';
   const runnerSha256 = typeof args.runnerSha256 === 'string' ? args.runnerSha256 : '';
   const trustKey = typeof args.trustKey === 'string' ? args.trustKey : '';
-  if (!slug || !sourceId || !runner || !/^[a-f0-9]{64}$/.test(runnerSha256) || !trustKey) return;
+  if (!slug || !sourceId || !runner || !/^[a-f0-9]{64}$/.test(runnerSha256) || !trustKey) return false;
 
   const rec = spaceStore.get(slug);
+  if (!rec) return false;
   const installed = rec?.dataSources.find((source) => source.id === sourceId);
-  if (!rec || installed?.runner?.trim() !== runner.trim()) return;
+  const terminal = projectTerminalTrustDecision({
+    row,
+    slug,
+    sourceId,
+    executionLabel: `The pinned runner entrypoint “data/${runner}”`,
+  });
+  if (!terminal.explanation && installed?.runner?.trim() !== runner.trim()) return false;
   const decisionAlreadyProjected = listNotes(slug, Number.MAX_SAFE_INTEGER).some((note) => (
     note.meta?.approvalId === row.approvalId
     && note.meta?.kind === SPACE_DATA_RUNNER_TRUST_TOOL
@@ -245,11 +373,13 @@ function recordRunnerTrustDecision(row: PendingApprovalRow): void {
   ));
 
   const status = row.resolution;
+  let noteAdded = false;
   if (!decisionAlreadyProjected) {
     appendNote(slug, {
       text: status === 'approved'
         ? `Runner trust was approved for data source “${sourceId}” (${row.approvalId}). The blocked refresh is resuming automatically; its observation will report the real outcome.`
-        : `Runner trust was ${status} for data source “${sourceId}” (${row.approvalId}). The runner remains blocked and was not executed.`,
+        : terminal.explanation?.text
+          ?? `Runner trust was ${status} for data source “${sourceId}” (${row.approvalId}). The runner remains blocked and was not executed.`,
       kind: 'data-source',
       meta: {
         kind: SPACE_DATA_RUNNER_TRUST_TOOL,
@@ -259,12 +389,17 @@ function recordRunnerTrustDecision(row: PendingApprovalRow): void {
         approvalId: row.approvalId,
         status,
         staleDataStatus: status !== 'approved',
+        ...(terminal.explanation
+          ? { resolvedAt: terminal.explanation.resolvedAt }
+          : {}),
       },
     });
+    noteAdded = true;
   }
 
-  if (status !== 'approved') return;
+  if (status !== 'approved') return terminal.changed || noteAdded;
   resumeApprovedSourceRefresh(row, rec, sourceId);
+  return noteAdded;
 }
 
 /** Approved trust card → replay the blocked refresh exactly once (claim the
@@ -368,19 +503,30 @@ function parseCliArgvArg(v: unknown): string[] | null {
   return v as string[];
 }
 
-function recordCliSourceTrustDecision(row: PendingApprovalRow): void {
-  if (row.tool !== SPACE_CLI_SOURCE_TRUST_TOOL || !row.resolution) return;
+function recordCliSourceTrustDecision(row: PendingApprovalRow): boolean {
+  if (row.tool !== SPACE_CLI_SOURCE_TRUST_TOOL || !row.resolution) return false;
   const args = row.args ?? {};
-  if (args.spaceCliSourceTrustVersion !== SPACE_CLI_SOURCE_TRUST_VERSION) return;
+  if (args.spaceCliSourceTrustVersion !== SPACE_CLI_SOURCE_TRUST_VERSION) return false;
   const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
   const sourceId = typeof args.sourceId === 'string' ? args.sourceId : '';
   const cliArgv = parseCliArgvArg(args.cliArgv);
   const trustKey = typeof args.trustKey === 'string' ? args.trustKey : '';
-  if (!slug || !sourceId || !cliArgv || !trustKey) return;
+  if (!slug || !sourceId || !cliArgv || !trustKey) return false;
 
   const rec = spaceStore.get(slug);
+  if (!rec) return false;
   const installed = rec?.dataSources.find((source) => source.id === sourceId);
-  if (!rec || JSON.stringify(installed?.cliArgv ?? null) !== JSON.stringify(cliArgv)) return;
+  const commandLabel = cliArgv.join(' ');
+  const terminal = projectTerminalTrustDecision({
+    row,
+    slug,
+    sourceId,
+    executionLabel: `The frozen CLI refresh “${commandLabel}”`,
+  });
+  if (
+    !terminal.explanation
+    && JSON.stringify(installed?.cliArgv ?? null) !== JSON.stringify(cliArgv)
+  ) return false;
   const decisionAlreadyProjected = listNotes(slug, Number.MAX_SAFE_INTEGER).some((note) => (
     note.meta?.approvalId === row.approvalId
     && note.meta?.kind === SPACE_CLI_SOURCE_TRUST_TOOL
@@ -388,12 +534,13 @@ function recordCliSourceTrustDecision(row: PendingApprovalRow): void {
   ));
 
   const status = row.resolution;
-  const commandLabel = cliArgv.join(' ');
+  let noteAdded = false;
   if (!decisionAlreadyProjected) {
     appendNote(slug, {
       text: status === 'approved'
         ? `The frozen CLI refresh “${commandLabel}” was approved for data source “${sourceId}” (${row.approvalId}). The blocked refresh is resuming automatically; its observation will report the real outcome.`
-        : `The frozen CLI refresh “${commandLabel}” was ${status} for data source “${sourceId}” (${row.approvalId}). The command remains blocked and was not executed.`,
+        : terminal.explanation?.text
+          ?? `The frozen CLI refresh “${commandLabel}” was ${status} for data source “${sourceId}” (${row.approvalId}). The command remains blocked and was not executed.`,
       kind: 'data-source',
       meta: {
         kind: SPACE_CLI_SOURCE_TRUST_TOOL,
@@ -402,12 +549,17 @@ function recordCliSourceTrustDecision(row: PendingApprovalRow): void {
         approvalId: row.approvalId,
         status,
         staleDataStatus: status !== 'approved',
+        ...(terminal.explanation
+          ? { resolvedAt: terminal.explanation.resolvedAt }
+          : {}),
       },
     });
+    noteAdded = true;
   }
 
-  if (status !== 'approved') return;
+  if (status !== 'approved') return terminal.changed || noteAdded;
   resumeApprovedSourceRefresh(row, rec, sourceId);
+  return noteAdded;
 }
 
 onApprovalResolved(recordRunnerTrustDecision);
@@ -463,6 +615,7 @@ function cliSnapshot(
 export function authorizeCliDataSource(
   slug: string,
   source: SpaceDataSource,
+  options: RunnerTrustAuthorizationOptions = {},
 ): CliSourceTrustDecision {
   const resolved = cliSnapshot(slug, source);
   if (!resolved.ok) return { state: 'blocked', error: resolved.error };
@@ -503,11 +656,14 @@ export function authorizeCliDataSource(
       error: `Frozen CLI refresh "${commandLabel}" is awaiting one-time approval (${latest.approvalId}); it was not executed.`,
     };
   }
-  if (latest?.resolution === 'rejected') {
-    return {
-      state: 'rejected',
-      error: `Trust for frozen CLI refresh "${commandLabel}" was rejected (${latest.approvalId}); it was not executed. Migrate this source to a provably read-only Composio action or change the declared command to request a new review.`,
-    };
+  const terminal = latest ? terminalAuthorizationRefusal({
+    row: latest,
+    sourceId: snapshot.sourceId,
+    executionLabel: `The frozen CLI refresh “${commandLabel}”`,
+    now,
+  }) : null;
+  if (terminal && !options.requestFreshApproval) {
+    return terminal;
   }
 
   const subject = `Allow “${commandLabel}” to refresh “${rec.title}” automatically`;
@@ -570,6 +726,7 @@ export function authorizeCliDataSource(
 export function authorizeInstalledDataRunner(
   slug: string,
   source: SpaceDataSource,
+  options: RunnerTrustAuthorizationOptions = {},
 ): RunnerTrustDecision {
   const resolved = runnerSnapshot(slug, source);
   if (!resolved.ok) return { state: 'blocked', error: resolved.error };
@@ -610,11 +767,14 @@ export function authorizeInstalledDataRunner(
       error: `Legacy data runner "data/${snapshot.runner}" is awaiting one-time approval (${latest.approvalId}); it was not executed.`,
     };
   }
-  if (latest?.resolution === 'rejected') {
-    return {
-      state: 'rejected',
-      error: `Trust for legacy data runner "data/${snapshot.runner}" was rejected (${latest.approvalId}); it was not executed. Migrate this source to a provably read-only Composio action or change the runner to request a new entrypoint review.`,
-    };
+  const terminal = latest ? terminalAuthorizationRefusal({
+    row: latest,
+    sourceId: snapshot.sourceId,
+    executionLabel: `The pinned runner entrypoint “data/${snapshot.runner}”`,
+    now,
+  }) : null;
+  if (terminal && !options.requestFreshApproval) {
+    return terminal;
   }
 
   const subject = `Allow pinned entrypoint “${snapshot.runner}” to refresh “${rec.title}” automatically`;

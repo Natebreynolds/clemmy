@@ -3,9 +3,9 @@
  * LIVE (2026-08-24, weekly-review): a workflow step sat in capability
  * resolution for 20+ minutes — the phase's registry awaits have no timeout of
  * their own — and the watchdog could only notify at 10 minutes. The phase now
- * races one shared deadline across its three legs; a miss degrades to the
- * local capability index, the turn proceeds, and the typed reason rides the
- * planning_catalog_disclosed event instead of silence.
+ * races one shared deadline across its current proof and indexed-catalog legs;
+ * a miss degrades to the local capability index, the turn proceeds, and the
+ * typed reason rides the planning_catalog_disclosed event instead of silence.
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -26,8 +26,9 @@ const {
   recordCapabilityOperations,
   deactivateCapabilityCarrier,
 } = await import('../../memory/capability-index.js');
+const indexedCapabilityCatalog = await import('../harness/indexed-capability-catalog.js');
 
-test('the independent index leg completes while connected-account resolution is wedged and survives the deadline', async () => {
+test('the retired connected-account selector cannot wedge pre-model resolution or hide the local index', async () => {
   process.env.CAPABILITY_RESOLUTION_DEADLINE_MS = '300';
   recordCapabilityOperations([{
     identifier: 'LOCALINDEX_WIDGET_SEARCH',
@@ -38,10 +39,9 @@ test('the independent index leg completes while connected-account resolution is 
     effectClass: 'read',
     effectProvenance: 'declared',
   }]);
-  let connectedLoaderStarted!: () => void;
-  const loaderStarted = new Promise<void>((resolve) => { connectedLoaderStarted = resolve; });
+  let connectedLoaderCalls = 0;
   __test__.setConnectedAccountsLoader(() => {
-    connectedLoaderStarted();
+    connectedLoaderCalls += 1;
     return new Promise(() => { /* the production account leg can wedge */ });
   });
   try {
@@ -53,49 +53,31 @@ test('the independent index leg completes while connected-account resolution is 
       type: 'user_input_received',
       data: { text: 'find latency widgets' },
     });
-    const admittedPromise = admitAndCompileAcceptedSource({
+    const startedAt = Date.now();
+    const admitted = await admitAndCompileAcceptedSource({
       identity: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq },
       surface: 'direct',
     });
-    let loaderStartTimer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        loaderStarted,
-        new Promise<never>((_resolve, reject) => {
-          loaderStartTimer = setTimeout(
-            () => reject(new Error('connected-account leg did not start')),
-            2_000,
-          );
-        }),
-      ]);
-    } finally {
-      if (loaderStartTimer) clearTimeout(loaderStartTimer);
-    }
-    // If index retrieval was started independently, its immutable result is
-    // already captured. Remove the live row so a post-deadline fallback query
-    // cannot make a serial implementation accidentally pass this assertion.
-    deactivateCapabilityCarrier('composio', 'localindex-latency-fixture');
-
-    const startedAt = Date.now();
-    const admitted = await admittedPromise;
-    const elapsedAfterWedgeObservedMs = Date.now() - startedAt;
-    assert.equal(admitted.ok, true, 'the connected-account miss degrades instead of blocking the turn');
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(admitted.ok, true);
     assert.ok(
-      elapsedAfterWedgeObservedMs < 2_500,
-      `the one phase deadline must yield promptly, took ${elapsedAfterWedgeObservedMs}ms after the wedge was observed`,
+      elapsedMs < 2_500,
+      `retired account selection must add no provider wait, took ${elapsedMs}ms`,
     );
+    assert.equal(connectedLoaderCalls, 0, 'pre-model admission must not call the retired account selector');
     const disclosure = listEvents(session.id, { types: ['planning_catalog_disclosed'] })
       .find((event) => (event.data as { sourceUserSeq?: number }).sourceUserSeq === source.seq);
     assert.equal((disclosure?.data as { resolution?: string } | undefined)?.resolution,
-      'capability_resolution_deadline_exceeded');
+      'completed');
     assert.ok(
       ((disclosure?.data as {
         capabilities?: Array<{ id?: string; source?: string }>;
       } | undefined)?.capabilities ?? []).some((entry) =>
         entry.id === 'cap:resolved:localindex_widget_search' && entry.source === 'index'),
-      'the completed concurrent index result must be disclosed even though the connected leg missed the phase deadline',
+      'the local index result must remain available without hidden account selection',
     );
   } finally {
+    deactivateCapabilityCarrier('composio', 'localindex-latency-fixture');
     __test__.setConnectedAccountsLoader(null);
     delete process.env.CAPABILITY_RESOLUTION_DEADLINE_MS;
   }
@@ -103,7 +85,9 @@ test('the independent index leg completes while connected-account resolution is 
 
 test('a wedged registry cannot hold the turn: the phase misses its deadline, records the reason, and proceeds', async () => {
   process.env.CAPABILITY_RESOLUTION_DEADLINE_MS = '250';
-  __test__.setConnectedAccountsLoader(() => new Promise(() => { /* never resolves */ }));
+  indexedCapabilityCatalog._setVerifiedWriteResolverForTests(
+    () => new Promise(() => { /* an indexed durable-memory leg can wedge */ }),
+  );
   try {
     const session = createSession({ id: 'cap-deadline-wedged', kind: 'chat', userId: 'user-1' });
     const source = appendEvent({
@@ -125,7 +109,7 @@ test('a wedged registry cannot hold the turn: the phase misses its deadline, rec
       'the miss is a typed, durable reason — never silence',
     );
   } finally {
-    __test__.setConnectedAccountsLoader(null);
+    indexedCapabilityCatalog._setVerifiedWriteResolverForTests(null);
     delete process.env.CAPABILITY_RESOLUTION_DEADLINE_MS;
   }
 });

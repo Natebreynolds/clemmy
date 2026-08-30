@@ -55,3 +55,19 @@ export function isTrustedDynamicComposioTool(toolName: string): boolean {
   return tail.toLowerCase().startsWith('cx_')
     && isPlainOrClementineLocalTool(toolName, tail);
 }
+
+/**
+ * Transport-neutral operation identity. Native MCP `google_sheets__batch_get`,
+ * Composio `GOOGLESHEETS_BATCH_GET`, and catalog `googlesheets_batch_get` are
+ * one operation. Casing, underscores, and MCP `__` separators are not safety
+ * properties. Ambiguous collisions still fail closed at the caller.
+ */
+export function catalogOperationIdentityKey(operationId: string): string {
+  return operationId.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+export function catalogOperationIdentitiesEqual(left: string, right: string): boolean {
+  const a = catalogOperationIdentityKey(left);
+  const b = catalogOperationIdentityKey(right);
+  return Boolean(a) && a === b;
+}

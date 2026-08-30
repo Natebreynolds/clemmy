@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { globSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -28,6 +28,13 @@ function nestedRunnerEnv() {
   return env;
 }
 
+function expandTestTargets(targets) {
+  return targets.flatMap((target) => (
+    globSync(target, { cwd: repoRoot })
+      .map((file) => file.split(path.sep).join('/'))
+  ));
+}
+
 test('isolated test runner retains source-only defaults when only reporter options are forwarded', () => {
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter=dot']),
@@ -36,6 +43,43 @@ test('isolated test runner retains source-only defaults when only reporter optio
   assert.deepEqual(
     isolatedTestArgs(['--test-reporter', 'dot']),
     ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter', 'dot', ...DEFAULT_TEST_TARGETS],
+  );
+  assert.equal(
+    DEFAULT_TEST_TARGETS.some((target) => target.includes('/journeys/')),
+    false,
+    'the broad concurrent unit suite must not duplicate the serialized journey gate',
+  );
+});
+
+test('broad and serialized journey targets partition every src/apps TypeScript test exactly once', () => {
+  const allTests = expandTestTargets(['src/**/*.test.ts', 'apps/**/*.test.ts']).sort();
+  const allJourneys = expandTestTargets(['src/journeys/**/*.test.ts']).sort();
+  const expectedBroad = allTests.filter((file) => !file.startsWith('src/journeys/'));
+  const expandedBroad = expandTestTargets(DEFAULT_TEST_TARGETS);
+
+  assert.equal(
+    new Set(expandedBroad).size,
+    expandedBroad.length,
+    'no broad target patterns may select the same test file twice',
+  );
+  assert.deepEqual([...expandedBroad].sort(), expectedBroad);
+
+  const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const journeyTargets = String(packageJson.scripts?.journeys ?? '')
+    .split(/\s+/)
+    .filter((argument) => argument.startsWith('src/journeys/') && argument.endsWith('.test.ts'));
+  const expandedJourneys = expandTestTargets(journeyTargets);
+
+  assert.equal(
+    new Set(expandedJourneys).size,
+    expandedJourneys.length,
+    'journey target patterns may select each journey exactly once',
+  );
+  assert.deepEqual([...expandedJourneys].sort(), allJourneys);
+  assert.deepEqual(
+    [...new Set([...expandedBroad, ...expandedJourneys])].sort(),
+    allTests,
+    'the two gates must cover the full src/apps TypeScript test set without a hole',
   );
 });
 
@@ -49,7 +93,7 @@ test('isolated test runner preserves an explicit targeted test without adding th
 test('repository test scripts route through the isolated runner', () => {
   const packageJson = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
   const scripts = packageJson.scripts ?? {};
-  for (const name of ['test', 'test:prospective', 'test:public-hygiene', 'test:release-assets', 'test:release-closure', 'proof:selftest', 'journeys', 'test:measurement']) {
+  for (const name of ['test', 'test:prospective', 'test:public-hygiene', 'test:release-assets', 'test:release-closure', 'test:packaged-upgrade', 'proof:selftest', 'journeys', 'test:measurement']) {
     assert.match(
       String(scripts[name] ?? ''),
       /run-tests-isolated\.mjs/,
@@ -61,6 +105,11 @@ test('repository test scripts route through the isolated runner', () => {
       `${name} must not invoke node/tsx --test directly`,
     );
   }
+  assert.match(
+    String(scripts.journeys ?? ''),
+    /(?:^|\s)--test-concurrency(?:=|\s+)1(?:\s|$)/,
+    'journeys must serialize test files so the canonical latency gate is not contending with sibling journey processes',
+  );
 });
 
 test('concurrently executed test files never share a home', () => {

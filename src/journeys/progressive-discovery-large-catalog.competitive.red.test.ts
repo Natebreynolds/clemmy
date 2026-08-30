@@ -293,6 +293,7 @@ interface HostInvocationSession {
 function createHostInvocationSession(
   allTools: readonly Invokable[],
   identity: { sessionId: string; sourceUserSeq: number; turn: number },
+  acceptedInput: string,
   deliveredPreambles: string[],
 ): HostInvocationSession {
   type QueuedInstruction = {
@@ -443,17 +444,29 @@ function createHostInvocationSession(
         },
       };
     },
-  }, () => hostRunner.hostRunRunner(
-    runner as never,
-    agent as never,
-    [{ type: 'message', role: 'user', content: 'Complete the requested task using the configured controls.' }] as never,
-    {
-      maxTurns: 8,
-      hostTurnEngine: 'host_v1',
-      context: { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq },
-      toolExecution: { maxFunctionToolConcurrency: 1 },
-    } as never,
-  ));
+  }, async () => {
+    let itemsOrState: unknown = [{ type: 'message', role: 'user', content: acceptedInput }];
+    for (let recoveryCount = 0; ; recoveryCount += 1) {
+      const outcome = await hostRunner.hostRunRunner(
+        runner as never,
+        agent as never,
+        itemsOrState as never,
+        {
+          maxTurns: 8,
+          hostTurnEngine: 'host_v1',
+          context: { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq },
+          toolExecution: { maxFunctionToolConcurrency: 1 },
+        } as never,
+      );
+      if (
+        outcome.hold?.owner !== 'host'
+        || outcome.hold.wake !== 'recovery'
+        || !outcome.serializedRecoveryState
+      ) return outcome;
+      assert.ok(recoveryCount < 3, 'host checkpoint recovery did not converge');
+      itemsOrState = hostRunner.HostRecoveryState.fromString(outcome.serializedRecoveryState);
+    }
+  });
   const observedOutcome = outcomePromise.then((outcome) => {
     const authorityDiagnostic = (): unknown => {
       try {
@@ -708,7 +721,12 @@ async function preparePermutation(
   const deliveredPreambles: string[] = [];
   const modelRequestBytes: number[] = [];
   const configuredTools = [searchTool, planTool] as const;
-  const invocation = createHostInvocationSession(configuredTools, identity, deliveredPreambles);
+  const invocation = createHostInvocationSession(
+    configuredTools,
+    identity,
+    String(source.data.text),
+    deliveredPreambles,
+  );
   const sourceText = returnedText(await invocation.invoke(searchTool, {
     query: 'source role search restaurant records by city',
     role_key: catalog.sourceRole,
@@ -751,8 +769,15 @@ async function preparePermutation(
   const destinationRef = `cap:resolved:${catalog.destinationSlug.toLowerCase()}`;
   assert.ok(sourceRefs.length <= MAX_RETURNED_REFS_PER_ROLE);
   assert.ok(destinationRefs.length <= MAX_RETURNED_REFS_PER_ROLE);
-  assert.ok(sourceRefs.includes(sourceRef), `source ref missing for seed ${catalog.seed}`);
-  assert.ok(destinationRefs.includes(destinationRef), `destination ref missing for seed ${catalog.seed}`);
+  if (mutation === 'missing-version') {
+    assert.equal(sourceRefs.includes(sourceRef), false,
+      'the selected unversioned source definition cannot mint a capability ref');
+    assert.ok(destinationRefs.includes(destinationRef),
+      'the staged write keeps its planning ref until plan-time exact revalidation');
+  } else {
+    assert.ok(sourceRefs.includes(sourceRef), `source ref missing for seed ${catalog.seed}`);
+    assert.ok(destinationRefs.includes(destinationRef), `destination ref missing for seed ${catalog.seed}`);
+  }
   assert.ok(sourceBody.schemas[catalog.sourceSlug], 'the selected source includes its exact input schema');
   assert.ok(destinationBody.schemas[catalog.destinationSlug], 'the selected destination includes its exact input schema');
   const discoverySchemaBytes = Buffer.byteLength(sourceText, 'utf8')
@@ -795,10 +820,23 @@ async function preparePermutation(
     assert.ok(durable?.descriptor && typeof durable.descriptor === 'object');
   }
 
-  assert.deepEqual(factory.snapshot(), [],
-    'tool_search disclosure is metadata/staging and publishes no executable catalog entry');
-  assert.deepEqual(ports.listProductionCapabilityPorts(), [],
-    'search/ref disclosure cannot install an invoke port');
+  assert.deepEqual(
+    factory.snapshot().map((entry) => entry.capabilityId).sort(),
+    (mutation === 'missing-version'
+      ? []
+      : [sourceRef, 'cap:resolved:host_transform']).sort(),
+    'tool_search publishes only its independently proven read and the host transform; the write stays staged',
+  );
+  assert.deepEqual(
+    ports.listProductionCapabilityPorts()
+      .map((entry) => entry.identity.manifestId)
+      .filter((manifestId) => manifestId.startsWith('cap:resolved:'))
+      .sort(),
+    (mutation === 'missing-version'
+      ? []
+      : [sourceRef, 'cap:resolved:host_transform']).sort(),
+    'only the independently proven read path may become executable during discovery',
+  );
   assert.equal(eventlog.getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq), null,
     'search/ref disclosure cannot admit a plan');
 
@@ -896,8 +934,19 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
     });
     assert.match(String(poisonBody.detail ?? ''), /not disclosed/i);
     assert.equal(eventlog.getTurnGraphEventForSource(run.identity.sessionId, run.identity.sourceUserSeq), null);
-    assert.deepEqual(catalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [], []);
-    assert.deepEqual(ports.listProductionCapabilityPorts(), []);
+    assert.deepEqual(
+      (catalogs.peekHostCapabilityCatalogFactory()?.snapshot() ?? [])
+        .map((entry) => entry.capabilityId)
+        .sort(),
+      [run.sourceRef, 'cap:resolved:host_transform'].sort(),
+    );
+    assert.deepEqual(
+      ports.listProductionCapabilityPorts()
+        .map((entry) => entry.identity.manifestId)
+        .filter((manifestId) => manifestId.startsWith('cap:resolved:'))
+        .sort(),
+      [run.sourceRef, 'cap:resolved:host_transform'].sort(),
+    );
     assert.deepEqual(run.deliveredPreambles, []);
     assert.equal(businessCrossings, 0);
 
@@ -923,8 +972,8 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
     assert.equal(businessCrossings, 0,
       'metadata discovery and plan admission perform zero business/provider execution');
     run.metrics.exactDefinitionReads = run.readExactDefinitionCount();
-    assert.equal(run.metrics.exactDefinitionReads, 2,
-      'plan freeze re-reads only the two selected exact live definitions');
+    assert.equal(run.metrics.exactDefinitionReads, 3,
+      'read publication validates the source once, then plan freeze revalidates both selected definitions');
     run.metrics.businessCrossings = businessCrossings;
     allMetrics.push(run.metrics);
   }
@@ -947,7 +996,7 @@ test('GATE: 100 cold 10K-catalog permutations stay bounded and freeze only live 
     maxReturnedRefsPerRole: 8,
     totalProviderSearches: 200,
     maxProviderMetadataRowsPerTask: 16,
-    exactDefinitionReadsPerTask: [2],
+    exactDefinitionReadsPerTask: [3],
     businessCrossings: 0,
     successRate: 1,
   });
@@ -1021,14 +1070,19 @@ test('GATE: a legacy input-digest disclosure rebuilds full staged identity after
   if (!primed.ok) throw new Error(primed.reason);
   assert.deepEqual(
     primed.planning.capabilities.map((entry) => entry.id).sort(),
-    [staged.sourceRef, staged.destinationRef].sort(),
+    [staged.sourceRef, staged.destinationRef, 'cap:resolved:host_transform'].sort(),
   );
 
   const rawPlan = buildPlanTaskTool({ planning: primed.planning }) as unknown as Invokable;
   const planTool = brackets.wrapToolForHarness(rawPlan as never) as unknown as Invokable;
   const deliveredPreambles: string[] = [];
   const callId = 'plan-legacy-disclosure-after-restart';
-  const invocation = createHostInvocationSession([planTool], identity, deliveredPreambles);
+  const invocation = createHostInvocationSession(
+    [planTool],
+    identity,
+    String(source.data.text),
+    deliveredPreambles,
+  );
   const output = returnedText(await invocation.invoke(planTool, {
     preamble: 'I’ll collect the restaurant rows and create the new spreadsheet.',
     draft: planDraft(catalog, staged.sourceRef, staged.destinationRef),
@@ -1064,7 +1118,12 @@ test('GATE: removal, rename, schema drift, and missing operation version fail ty
       ok: false,
       code: 'plan_not_admitted',
     }, `${mutation} did not fail through the typed plan boundary: ${output}`);
-    assert.match(String(body.detail ?? ''), /changed|frozen host catalog|selected provider capability|published|selected_definition_/i);
+    assert.match(
+      String(body.detail ?? ''),
+      mutation === 'missing-version'
+        ? /not disclosed/i
+        : /changed|frozen host catalog|selected provider capability|published|selected_definition_/i,
+    );
     assert.equal(eventlog.getTurnGraphEventForSource(run.identity.sessionId, run.identity.sourceUserSeq), null);
     assert.deepEqual(run.deliveredPreambles, []);
     assert.equal(businessCrossings, 0);

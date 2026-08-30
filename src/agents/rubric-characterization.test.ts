@@ -5,7 +5,12 @@ import crypto from 'node:crypto';
 // importer uses — so this also guards that the Phase-3 re-export stays intact).
 import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE } from './orchestrator.js';
 // The shared rubric module (Phase 3): the single source both flagship lanes consume.
-import { CLAUDE_BRAIN_RUBRIC, ORCHESTRATOR_INSTRUCTIONS_LEAN, renderClemRubric } from './clem-rubric.js';
+import {
+  CLAUDE_BRAIN_RUBRIC,
+  ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN,
+  ORCHESTRATOR_INSTRUCTIONS_LEAN,
+  renderClemRubric,
+} from './clem-rubric.js';
 import { RUBRIC_INSTRUCTIONS_BY_VARIANT } from './orchestrator.js';
 
 /**
@@ -144,10 +149,14 @@ const GOLDEN = {
   // 2026-08-22: a clean pilot can stage only a disabled recurrence preview and
   // separate formal recurrence-consent card; neither configuration nor the
   // staging tool is activation or execution authority.
-  instructions: { len: 31717, sha16: '65e2d7dd7db7d72e' },
-  native: { len: 30820, sha16: 'def13e1425bf7da4' },
-  claudeBrain: { len: 8269, sha16: 'a659203342decd00' },
-  lean: { len: 10279, sha16: '0a7eb6e3732295bd' },
+  // 2026-08-29: Auto consent has one carrier/owner. Accepted plan-bound work
+  // enters work_call directly; pending_action_queue is explicit staging only.
+  // 2026-08-30: persistent context is provenance-sensitive context, not one
+  // uniform ground-truth authority; explicit memory remains authoritative.
+  instructions: { len: 31831, sha16: '13ff97f515bd048d' },
+  native: { len: 30934, sha16: '2d1badb0e242e443' },
+  claudeBrain: { len: 8277, sha16: '47581f47e4781bea' },
+  lean: { len: 10287, sha16: 'cf1a82a0a0805347' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -176,6 +185,24 @@ test('characterization: CLAUDE_BRAIN_RUBRIC (lean) is byte-stable (reviewable-di
 
 test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewable-diff guard)', () => {
   snapshotGuard('lean', ORCHESTRATOR_INSTRUCTIONS_LEAN, GOLDEN.lean);
+});
+
+test('fresh accepted actions keep model judgment while omitting unreachable policy', () => {
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, 'utf8') <= 5_500,
+    'fresh-action stable policy must leave room for the exact turn snapshot and tool schemas');
+  for (const required of [
+    'CONVERSE FIRST',
+    'CALL TOOLS',
+    'run_worker',
+    'AUTO CONSENT',
+    'ACCEPTED WORK AUTHORITY',
+    'END YOUR TURN WITH PLAIN TEXT',
+    'CLOSE THE LOOP',
+  ]) {
+    assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, new RegExp(required, 'i'), required);
+  }
+  assert.doesNotMatch(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /BACKGROUND STATUS|DURABLE OPPORTUNITIES/,
+    'fresh foreground action policy must not repeat unreachable background/workflow guidance');
 });
 
 test('lean variant: production default with a legacy rollback, materially leaner, keeps load-bearing rules', () => {

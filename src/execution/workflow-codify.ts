@@ -81,19 +81,30 @@ export interface CodifyResult {
  * original executor in `codifiedFrom` for reversibility. Returns which steps
  * were codified + operator-facing notes.
  *
- * Currently a no-op (2026-08-26): the workflow definition validator and
- * runner now require ANY `call` step to carry a paired, exact
- * `invocationPlan` (workflow-validator.ts "structured call is missing its
- * exact invocationPlan"; workflow-runner.ts `workflow_exact_call_plan_missing`,
- * landed in the durable-activation wave, commit 60db67d8). Compiling that
- * plan needs the live capability/schema catalog — machinery this
- * deterministic, sync, no-LLM pass has no access to (and shouldn't reach for;
- * see the module doc). Emitting the old bare `call` shape here would save an
- * un-writable-when-enabled (and un-runnable-when-disabled) workflow instead of
- * the working model step it replaced, so the pass stands down until a plan
- * compiler exists for this seam. `proposeCodifiedStep`/`proposeCodifiedSteps`
- * are untouched — they only report candidates for display.
+ * The pass deliberately emits the authoring-time bare `call` shape. Runtime
+ * compiles that shape from the exact live catalog and executes it through the
+ * same workflow-v3 prepare/consent/activate/settle kernel as an authored
+ * invocationPlan. Keeping the live plan out of this synchronous compiler is a
+ * feature: a saved workflow describes intent and arguments, while each run
+ * binds the current provider/account/schema rather than persisting a stale
+ * catalog snapshot.
  */
-export function codifyMechanicalSteps(_steps: WorkflowStepInput[]): CodifyResult {
-  return { codified: [], notes: [] };
+export function codifyMechanicalSteps(steps: WorkflowStepInput[]): CodifyResult {
+  const codified: string[] = [];
+  const notes: string[] = [];
+  for (const step of steps) {
+    const proposal = proposeCodifiedStep(step);
+    if (!proposal) continue;
+    step.codifiedFrom = {
+      prompt: step.prompt,
+      ...(step.allowedTools ? { allowedTools: [...step.allowedTools] } : {}),
+    };
+    step.call = { tool: proposal.tool, args: proposal.args };
+    codified.push(step.id);
+    notes.push(
+      `Codified step \`${step.id}\` into a direct ${proposal.tool} call — `
+      + 'runtime binds it to the exact live capability and executes it without an AI turn.',
+    );
+  }
+  return { codified, notes };
 }

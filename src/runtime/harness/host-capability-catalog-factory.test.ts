@@ -16,8 +16,17 @@ const {
   createHostCapabilityCatalogFactory,
   freezeCatalogSnapshotForSource,
   installHostCapabilityCatalogFactory,
+  isCurrentCallableCatalogEntry,
+  resolveProvenLiveReadCatalogEntry,
 } = await import('./host-capability-catalog-factory.js');
 const { attachSemanticContract, capabilityManifestDigest } = await import('./capability-manifest.js');
+const {
+  createCapabilityManifestStore,
+  installCapabilityManifestStore,
+} = await import('./capability-manifest-store.js');
+const {
+  createProductionCapabilityAdapter,
+} = await import('./production-capability-adapter.js');
 const { resetEventLog, createSession, appendEvent, openEventLog } = await import('./eventlog.js');
 import type { CapabilityManifestV1 } from './capability-manifest.js';
 import type { RegisteredHostCapability } from './host-capability-catalog-factory.js';
@@ -70,6 +79,35 @@ function asRegistered(
     invoke: async () => ({}),
   };
 }
+
+test('current-callable attestation refuses post-registration provider, port, and compiler drift', () => {
+  for (const drift of [
+    (manifest: CapabilityManifestV1): CapabilityManifestV1 => ({
+      ...manifest,
+      providerVersion: 'tool-registry-v2',
+    }),
+    (manifest: CapabilityManifestV1): CapabilityManifestV1 => ({
+      ...manifest,
+      invokePortId: 'invoke:stale-port:v2',
+    }),
+    (manifest: CapabilityManifestV1): CapabilityManifestV1 => ({
+      ...manifest,
+      argumentCompiler: { id: 'compile:stale:v2', version: '2' },
+    }),
+  ]) {
+    const entry = asRegistered(sheetManifest());
+    const factory = createHostCapabilityCatalogFactory([entry]);
+    assert.equal(isCurrentCallableCatalogEntry(factory.get(entry.capabilityId)!), true);
+    const driftedManifest = drift(entry.manifest!);
+    entry.manifest = driftedManifest;
+    entry.manifestDigest = capabilityManifestDigest(driftedManifest);
+    assert.equal(
+      isCurrentCallableCatalogEntry(entry),
+      false,
+      'a callable row cannot restamp manifest-only call-surface bytes after registration',
+    );
+  }
+});
 
 test('catalog snapshot persists canonical identities and refuses same-ID drift', () => {
   resetEventLog();
@@ -193,4 +231,194 @@ test('durable hydration refuses digest mismatch and untrusted rows', async () =>
   assert.equal(hydrated.get(current.manifestId), undefined);
   assert.equal(hydrated.get('cap-untrusted'), undefined);
   assert.equal(hydrated.install(current).reason, 'identity_mismatch');
+});
+
+function batchGetRead(
+  manifestId: string,
+  operationId: string,
+  accountId = 'acct-google-1',
+): RegisteredHostCapability {
+  const fingerprint = sha256(`read:${manifestId}:${operationId}`);
+  const manifest = attachSemanticContract({
+    version: 1,
+    manifestId,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'composio:googlesheets',
+    providerVersion: sha256('composio'),
+    operationVersion: sha256(operationId),
+    definitionFingerprint: fingerprint,
+    effect: 'read',
+    accountId,
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: 'collect_records',
+    acceptedInputKinds: ['query'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-29T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source'],
+  });
+  return asRegistered(manifest);
+}
+
+test('NEGATIVE: a proven Sheets read still resolves when two current spellings share an account', () => {
+  const successor = batchGetRead(
+    'cap:resolved:googlesheets_batch_get:definition:aaaaaaaaaaaaaaaaaaaaaaaa',
+    'GOOGLESHEETS_BATCH_GET',
+  );
+  const native = batchGetRead('cap:resolved:google_sheets_batch_get', 'google_sheets__batch_get');
+  const factory = createHostCapabilityCatalogFactory();
+  factory.register(successor);
+  factory.register(native);
+  installHostCapabilityCatalogFactory(factory);
+  const resolved = resolveProvenLiveReadCatalogEntry({
+    capabilityId: 'cap:resolved:googlesheets_batch_get',
+    effectiveName: 'GOOGLESHEETS_BATCH_GET',
+    accountIdentity: 'acct-google-1',
+  });
+  assert.ok(resolved, 'duplicate transports of one account must not hide the proven read');
+  assert.equal(resolved?.effect, 'read');
+  assert.ok(
+    resolved!.capabilityId === successor.capabilityId
+    || resolved!.capabilityId === native.capabilityId,
+  );
+  installHostCapabilityCatalogFactory(null);
+});
+
+test('account-bound direct read resolution never transplants a legacy base from A to B', () => {
+  const operationId = 'FIXTURE_LIST_RESOURCES';
+  const baseId = 'cap:resolved:fixture_list_resources';
+  const a = batchGetRead(baseId, operationId, 'acct-a');
+  const b = batchGetRead(`${baseId}:definition:account-b`, operationId, 'acct-b');
+  const factory = createHostCapabilityCatalogFactory([a, b]);
+  installHostCapabilityCatalogFactory(factory);
+  const resolved = resolveProvenLiveReadCatalogEntry({
+    capabilityId: baseId,
+    effectiveName: operationId,
+    accountIdentity: 'acct-b',
+  });
+  assert.equal(resolved?.capabilityId, b.capabilityId);
+  assert.equal(resolved?.account, 'acct-b');
+  installHostCapabilityCatalogFactory(null);
+});
+
+test('duplicate current identities in one exact account lineage fail closed', () => {
+  const operationId = 'FIXTURE_LIST_DUPLICATES';
+  const baseId = 'cap:resolved:fixture_list_duplicates';
+  const first = batchGetRead(baseId, operationId, 'acct-one');
+  const duplicate = batchGetRead(`${baseId}:definition:duplicate`, operationId, 'acct-one');
+  const factory = createHostCapabilityCatalogFactory([first, duplicate]);
+  installHostCapabilityCatalogFactory(factory);
+  assert.equal(resolveProvenLiveReadCatalogEntry({
+    capabilityId: baseId,
+    effectiveName: operationId,
+    accountIdentity: 'acct-one',
+  }), null);
+  installHostCapabilityCatalogFactory(null);
+});
+
+test('a superseded base with an uncallable successor cannot resolve or bind through its stale copy', () => {
+  const operationId = 'FIXTURE_LIST_STALE';
+  const baseId = 'cap:resolved:fixture_list_stale';
+  const base = batchGetRead(baseId, operationId, 'acct-stale');
+  const successor = batchGetRead(`${baseId}:definition:current`, operationId, 'acct-stale');
+  const store = createCapabilityManifestStore([base.manifest!]);
+  assert.equal(store.supersede(baseId, successor.manifest!).ok, true);
+  const factory = createHostCapabilityCatalogFactory([base]);
+  installCapabilityManifestStore(store);
+  installHostCapabilityCatalogFactory(factory);
+  assert.equal(resolveProvenLiveReadCatalogEntry({
+    capabilityId: baseId,
+    effectiveName: operationId,
+    accountIdentity: 'acct-stale',
+  }), null);
+  assert.equal(factory.catalog().bind({
+    node: {
+      id: 'read-stale',
+      kind: 'retrieve',
+      capabilityRole: 'source',
+      effect: { kind: 'read' },
+      capabilities: [{ kind: 'tool', resolution: 'explicit', names: [baseId] }],
+    },
+    graph: { effectCeiling: 'read' } as never,
+    acceptedText: 'read the fixture',
+  }), null);
+  installHostCapabilityCatalogFactory(null);
+  installCapabilityManifestStore(null);
+});
+
+test('adapter refresh evicts revoked read and write rows before frozen replay or binding', () => {
+  resetEventLog();
+  const read = batchGetRead('cap:fixture:revoked-read', 'FIXTURE_REVOKED_READ', 'acct-revoked');
+  const writeManifest = attachSemanticContract({
+    ...read.manifest!,
+    manifestId: 'cap:fixture:revoked-write',
+    operationId: 'FIXTURE_REVOKED_WRITE',
+    effect: 'external_write',
+    destination: { family: 'fixture', posture: 'create_new' },
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: true, policy: 'exact_artifact' },
+  });
+  const write = asRegistered(writeManifest);
+  const store = createCapabilityManifestStore([read.manifest!, writeManifest]);
+  const factory = createHostCapabilityCatalogFactory();
+  const adapter = createProductionCapabilityAdapter({
+    store,
+    factory,
+    observe: {
+      composio: (manifest) => ({
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion,
+        operationVersion: manifest.operationVersion,
+        accountId: manifest.accountId,
+        observedAt: Date.now(),
+      }),
+    },
+    invokePorts: () => ({
+      invoke: async () => ({}),
+      reconcile: async () => ({ exists: false }),
+    }),
+  });
+  assert.equal(adapter.refresh().registered, 2);
+  installCapabilityManifestStore(store);
+  installHostCapabilityCatalogFactory(factory);
+  const session = createSession({ kind: 'chat', userId: 'revoked-fixture' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'read the fixture' },
+  });
+  assert.equal(freezeCatalogSnapshotForSource({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  }).ok, true);
+  assert.equal(store.revoke(read.capabilityId), true);
+  assert.equal(store.revoke(write.capabilityId), true);
+  const refreshed = adapter.refresh();
+  assert.ok(refreshed.refused.some((entry) => entry.reason === 'revoked'));
+  assert.equal(factory.get(read.capabilityId), undefined);
+  assert.equal(factory.get(write.capabilityId), undefined);
+  assert.deepEqual(freezeCatalogSnapshotForSource({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  }), { ok: false, reason: 'identity_mismatch' });
+  assert.equal(factory.catalog().bind({
+    node: {
+      id: 'read-revoked',
+      kind: 'retrieve',
+      capabilityRole: 'source',
+      effect: { kind: 'read' },
+      capabilities: [{ kind: 'tool', resolution: 'explicit', names: [read.capabilityId] }],
+    },
+    graph: { effectCeiling: 'read' } as never,
+    acceptedText: 'read the fixture',
+  }), null);
+  installHostCapabilityCatalogFactory(null);
+  installCapabilityManifestStore(null);
 });

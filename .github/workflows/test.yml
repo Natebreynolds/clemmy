@@ -43,6 +43,36 @@ jobs:
           const probe = JSON.parse(execFileSync(helper, ["--probe"], { encoding: "utf8" }));
           if (probe.type !== "probe" || probe.protocol !== 1) throw new Error(`Unexpected helper probe: ${JSON.stringify(probe)}`);'
 
+  ios-tests:
+    name: iOS unit tests
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: apps/ios
+        run: xcodegen generate
+
+      - name: Run Clem iOS tests
+        working-directory: apps/ios
+        run: |
+          simulator_id="$(
+            xcrun simctl list devices available |
+              awk '/iPhone/ && ($NF == "(Shutdown)" || $NF == "(Booted)") { print $(NF - 1); exit }' |
+              tr -d '()'
+          )"
+          test -n "$simulator_id"
+          xcodebuild \
+            -project Clem.xcodeproj \
+            -scheme Clem \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -only-testing:ClemTests \
+            test
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -67,6 +97,10 @@ jobs:
       - name: Test public repository hygiene gate
         run: npm run test:public-hygiene
 
+      - name: Install mobile-web test dependencies
+        working-directory: apps/mobile-web
+        run: npm ci
+
       - name: Install console-web test dependencies
         working-directory: apps/console-web
         run: npm ci
@@ -87,6 +121,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Run canonical journeys sequentially
+        run: npm run journeys
+
       # Measurement/benchmark layer (scripts/**) sits outside the npm-test
       # globs; explicit hermetic file list so a future daemon-spawning
       # selftest can never silently enter CI.
@@ -104,6 +141,14 @@ jobs:
           command -v sqlite3
           sqlite3 --version
           npm run test:release-closure
+
+      - name: Build complete packaged candidate
+        run: npm run prepack
+
+      - name: Run post-build package and upgrade gates
+        run: |
+          npm run test:packed-candidate
+          npm run test:packaged-upgrade
 
   gate-benchmark:
     name: Harness gate benchmark (violations prevented)

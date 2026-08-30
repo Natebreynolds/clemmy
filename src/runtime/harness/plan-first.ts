@@ -8,12 +8,12 @@ import {
 import { recallHybrid } from '../../memory/recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
 import { runPostTurnHooks } from './post-turn.js';
-import { extractNamedResource } from '../../memory/focus.js';
 import type { AutoApproveScope } from '../../agents/proactivity-policy.js';
 import { appendEvent, listEvents, type EventRow } from './eventlog.js';
 import { deliverableContextBlock } from '../../memory/deliverable-index.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity, type TurnOutcome } from './turn-outcome.js';
+import { modelVisibleTextSha256 } from './model-visible-text-digest.js';
 
 export interface PlanFirstInput {
   input: string;
@@ -63,86 +63,10 @@ export interface PlanFirstResult {
 const CONTROL_RE = /^(?:\/)?(?:continue|cancel|new|sessions?|approve|approved|reject|rejected)\b/i;
 const EXECUTION_CONTINUATION_RE =
   /\b(?:go ahead|proceed|do it|send those|create those|make those|yes|approved?|continue)\b/i;
-const SEQUENCE_RE = /\b(?:then|after that|afterward|for each|each one|before .* then|once .* then|first .* then)\b/i;
-const BATCH_RE = /\b(?:\d+|top\s+\d+|several|many|multiple|batch|bulk|list of|all of them)\b/i;
-const WRITE_RE =
-  /\b(?:create|draft|send|write|update|append|post|publish|host|deploy|file|sheet|email|proposal|report)\b/i;
-
-const DOMAIN_PATTERNS: RegExp[] = [
-  /\bsalesforce|sf cli|soql|accounts?|leads?|contacts?|opportunit(?:y|ies)\b/i,
-  /\bseo|ranking|rankings|serp|keyword|keywords|backlink|organic traffic|search visibility|dataforseo\b/i,
-  /\boutlook|email|emails|drafts?|calendar|meeting invite\b/i,
-  /\bgoogle sheets?|googlesheets?|spreadsheet|sheet row|worksheet\b/i,
-  /\bwebsite|web page|webpage|scrape|crawl|browser|article|web search|look up online\b/i,
-  /\blocal file|markdown|report|proposal|docx?|deck|pdf|workspace\b/i,
-  /\bgithub|repo|repository|branch|commit|pull request|pr\b/i,
-  /\bnetlify|vercel|railway|deploy|host\b/i,
-];
 
 function planFirstDisabled(): boolean {
   const raw = process.env.CLEMMY_PLAN_FIRST;
   return typeof raw === 'string' && /^(0|false|off|no)$/i.test(raw.trim());
-}
-
-function domainCount(input: string): number {
-  return DOMAIN_PATTERNS.reduce((count, pattern) => count + (pattern.test(input) ? 1 : 0), 0);
-}
-
-const DATA_FETCH_VERB_RE = /\b(?:get|pull|list|grab|fetch|compile|put together)\b/i;
-const DATA_NOUN_RE =
-  /\b(?:deals?|accounts?|leads?|contacts?|opportunit(?:y|ies)|emails?|customers?|prospects?|rows?|records?|report|list|sheet|data)\b/i;
-const VAGUE_RECENCY_RE = /\b(?:recent|recently|lately|some|a few|the latest|current)\b/i;
-const CONCRETE_SCOPE_RE =
-  /(?:\d|\blast\s+\w+\b|\bmy\b|\bour\b|\bowner\b|"[^"]+"|'[^']+'|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b|\b(?:january|february|march|april|june|july|august|september|october|november|december)\b|\b(?:today|yesterday|week|month|quarter|year)\b)/i;
-const DEST_IMPLIED_RE =
-  /\b(?:somewhere|put it|place to look|where i can|save|store)\b/i;
-const CONCRETE_DEST_RE =
-  /\b(?:sheet|spreadsheet|docs?|document|email|file|notion|slack|message)\b/i;
-const QUESTION_LEAD_RE = /^(?:what|when|where|who|why|how)\b/i;
-
-/**
- * Conservative ambiguity detector for the conversation side. Returns which
- * required slots (source / scope / destination) a request leaves unfilled.
- * MUST NOT fire on simple clear asks ("what's on my calendar today") or
- * pure questions — those should execute or answer directly.
- */
-export function detectAmbiguousAction(
-  input: string,
-): { ambiguous: boolean; missing: Array<'source' | 'scope' | 'destination'> } {
-  const text = (input ?? '').trim();
-  const lower = text.toLowerCase();
-
-  // Pure questions never count as ambiguous actions.
-  if (QUESTION_LEAD_RE.test(text) && text.endsWith('?')) {
-    return { ambiguous: false, missing: [] };
-  }
-
-  // Must look like an ACTION on data / a deliverable.
-  const isWrite = WRITE_RE.test(text);
-  const isDataFetch = DATA_FETCH_VERB_RE.test(text) && DATA_NOUN_RE.test(text);
-  if (!isWrite && !isDataFetch) {
-    return { ambiguous: false, missing: [] };
-  }
-
-  const missing: Array<'source' | 'scope' | 'destination'> = [];
-
-  // source: no system/tool family named yet it's asking for data.
-  const asksForData = DATA_NOUN_RE.test(text);
-  if (domainCount(lower) === 0 && asksForData) {
-    missing.push('source');
-  }
-
-  // scope: vague recency/quantity word with no concrete window/filter.
-  if (VAGUE_RECENCY_RE.test(text) && !CONCRETE_SCOPE_RE.test(text)) {
-    missing.push('scope');
-  }
-
-  // destination: implies an output but names no concrete target.
-  if (DEST_IMPLIED_RE.test(text) && !CONCRETE_DEST_RE.test(text)) {
-    missing.push('destination');
-  }
-
-  return { ambiguous: missing.length >= 1, missing };
 }
 
 const EXPLICIT_PLAN_FIRST_RE =
@@ -203,19 +127,8 @@ export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryC
     'Name the likely tool families or systems in the step text when they are obvious from the request.',
   ];
   if (priorAnswers && priorAnswers.trim().length > 0) {
-    // Only offer the "NEW Google Sheet" default when the user has NOT named a
-    // specific destination. When they named one (a sheet/doc id or URL, "the
-    // existing X", "update the …", or a quoted name), substituting a default
-    // would override their explicit resource — the cross-session drift we guard.
-    const combined = `${input} ${priorAnswers}`;
-    const namesResource = Boolean(extractNamedResource(combined))
-      || /\b(?:existing|the same|that)\s+(?:sheet|spreadsheet|doc|document|file|list|folder)\b/i.test(combined)
-      || /\bupdate\s+(?:the|my|our|that|this)\b/i.test(combined)
-      || /["'][^"']{3,}["']/.test(combined);
     lines.push(
-      namesResource
-        ? `The user has answered the open questions: ${priorAnswers.trim()}. Produce a now-COMPLETE plan with needsUserInput EMPTY. Use the resource the user named; do NOT substitute a new default.`
-        : `The user has answered the open questions: ${priorAnswers.trim()}. Produce a now-COMPLETE plan with needsUserInput EMPTY; apply safe defaults (e.g. create a NEW Google Sheet unless told to update an existing one) rather than re-asking.`,
+      `The user answered the prior open questions: ${priorAnswers.trim()}. Fold those exact answers into the plan. Do not substitute a provider, resource, destination, account, or other default that the accepted request, these answers, or verified memory did not supply. If a material slot is still unresolved, keep only its shortest question in needsUserInput; otherwise return a complete plan with needsUserInput empty.`,
     );
   }
   lines.push('', `User request:\n${input}`);
@@ -225,36 +138,20 @@ export function buildPlannerPrompt(input: string, priorAnswers?: string, memoryC
   return lines.join('\n\n');
 }
 
-const EXTERNAL_WRITE_RE =
-  /\b(?:send|sent|post|publish|deploy|host|netlify|vercel|railway|notify(?:\s+externally|\s+prospects?)?|salesforce|crm|airtable|google\s+sheets?|googlesheets?|spreadsheet|outlook|email|emails|draft\s+emails?|create\s+drafts?|slack|github|pull\s+request|commit|delete|remove|mutate\s+external)\b/i;
-const LOCAL_ONLY_SAFE_RE =
-  /\b(?:local(?:ly)?|markdown|file|report|brief)\b[\s\S]{0,140}\b(?:only|review|reviewable|save|saved|no\s+external|do\s+not\s+send|stop\s+before|without\s+sending)\b/i;
-const EXTERNAL_WRITE_NEGATED_RE =
-  /\b(?:no\s+external|do\s+not\s+(?:send|post|publish|deploy|host|notify|update|mutate)|stop\s+before\s+(?:any\s+)?external|without\s+(?:sending|posting|publishing|deploying|updating|notifying))\b/i;
-
 function compact(value: string, max = 220): string {
   const text = value.replace(/\s+/g, ' ').trim();
   if (text.length <= max) return text;
   return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}...`;
 }
 
-function planText(plan: Plan, input: string): string {
-  return [
-    input,
-    plan.objective,
-    ...plan.steps.map((step) => step.action),
-    ...(plan.successCriteria ?? []),
-    ...(plan.risks ?? []),
-  ].join('\n');
-}
-
 export function planRequiresUserApproval(plan: Plan, input: string): boolean {
-  const text = planText(plan, input);
-  if (plan.estimatedComplexity === 'significant' || plan.estimatedComplexity === 'large') return true;
-  if (plan.recommendsTrackedExecution) return true;
-  if (LOCAL_ONLY_SAFE_RE.test(text) && EXTERNAL_WRITE_NEGATED_RE.test(text)) return false;
-  if (LOCAL_ONLY_SAFE_RE.test(text) && !EXTERNAL_WRITE_RE.test(text)) return false;
-  return EXTERNAL_WRITE_RE.test(text);
+  void plan;
+  void input;
+  // This lane is entered only when the user explicitly asks to see a plan (or
+  // is completing that plan's questions). Surface the requested plan. Effect
+  // consent belongs to the exact downstream call contract, never to a regex
+  // over provider names or planner prose.
+  return true;
 }
 
 function planHighlights(plan: Plan): string[] {
@@ -512,6 +409,7 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         candidateCount: memoryCandidateCount,
         injected: Boolean(memoryContext),
         injectedBytes: Buffer.byteLength(memoryContext, 'utf8'),
+        visibleTextSha256: modelVisibleTextSha256(memoryContext),
         source: memorySource,
         recallId: memoryRecallId,
         answerability: memoryAnswerability,
@@ -618,25 +516,6 @@ export async function runPlanFirstPreflight(input: PlanFirstRunInput): Promise<P
         metadata: askingProposalId ? { planProposalId: askingProposalId } : undefined,
       });
       return { surfaced: true, ...(askingProposalId ? { proposalId: askingProposalId } : {}) };
-    }
-
-    if (!planRequiresUserApproval(plan, input.input)) {
-      appendEvent({
-        sessionId: input.sessionId,
-        turn: 0,
-        role: 'system',
-        type: 'conversation_step',
-        data: {
-          decision: {
-            summary: `Prepared a safe local plan and continued without an approval gate: ${plan.objective}`,
-            reply: null,
-            done: false,
-            nextAction: 'continue_to_execution',
-            reason: 'plan_first_safe_local',
-          },
-        },
-      });
-      return { surfaced: false };
     }
 
     const proposal = surfacePlan({

@@ -24,28 +24,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="$HOME/.clementine-next"
 PORT="$(grep -E '^WEBHOOK_PORT=' "$HOME_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"'"'"' ' || true)"; PORT="${PORT:-8420}"
-EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
-if [[ ! "$EXPECTED_GIT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-  echo "✗ could not resolve the candidate's full git SHA"; exit 2
-fi
-EXPECTED_GIT_DIRTY=false
-[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all 2>/dev/null)" ] && EXPECTED_GIT_DIRTY=true
-EXPECTED_RUNTIME_JSON="$(cd "$ROOT" && NODE_OPTIONS= node --import tsx --input-type=module --eval '
-  import { fingerprintRuntimeSourceFromGit } from "./src/runtime/source-fingerprint.ts";
-  import { HARNESS_SCHEMA_VERSION } from "./src/runtime/harness/schema-version.ts";
-  console.log(JSON.stringify({
-    sourceFingerprint: fingerprintRuntimeSourceFromGit({ repoRoot: process.cwd() }),
-    schemaVersion: HARNESS_SCHEMA_VERSION,
-  }));
-')"
-EXPECTED_SOURCE_FINGERPRINT="$(node -e 'console.log(JSON.parse(process.argv[1]).sourceFingerprint)' "$EXPECTED_RUNTIME_JSON")"
-EXPECTED_SCHEMA_VERSION="$(node -e 'console.log(JSON.parse(process.argv[1]).schemaVersion)' "$EXPECTED_RUNTIME_JSON")"
-if [[ ! "$EXPECTED_SOURCE_FINGERPRINT" =~ ^[a-f0-9]{64}$ ]]; then
-  echo "✗ could not fingerprint the exact candidate source"; exit 2
-fi
-if [[ ! "$EXPECTED_SCHEMA_VERSION" =~ ^[1-9][0-9]*$ ]]; then
-  echo "✗ invalid expected harness schema: $EXPECTED_SCHEMA_VERSION"; exit 2
-fi
+IMPLEMENTATION_ARTIFACT_ROOT="$ROOT/src/runtime/harness/implementation-artifacts/emitted"
 DEV_PRIMARY_MODEL="${DEV_PRIMARY_MODEL:-}"
 DEV_FUSION_MODE="${DEV_FUSION_MODE:-}"
 DEV_FUSION_STRATEGY="${DEV_FUSION_STRATEGY:-}"
@@ -144,6 +123,66 @@ if lsof -iTCP:"$PORT" -sTCP:LISTEN -n >/dev/null 2>&1; then
   exit 1
 fi
 
+# Source launches execute these digest-addressed bundles, not the TypeScript
+# implementation files directly. The prior owner must be stopped before the
+# emitter prunes old digest files. Emit before capturing candidate identity so
+# the dirty flag/fingerprint describe the exact generation we will launch.
+echo "→ emitting implementation artifacts from current source"
+if ! (cd "$ROOT" && NODE_OPTIONS= node scripts/emit-implementation-artifacts.mjs "$IMPLEMENTATION_ARTIFACT_ROOT"); then
+  echo "✗ implementation artifact emission failed; refusing to launch"
+  exit 1
+fi
+EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+if [[ ! "$EXPECTED_GIT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "✗ could not resolve the candidate's full git SHA"; exit 2
+fi
+EXPECTED_GIT_DIRTY=false
+[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all 2>/dev/null)" ] && EXPECTED_GIT_DIRTY=true
+EXPECTED_RUNTIME_JSON="$(cd "$ROOT" && NODE_OPTIONS= node --import tsx --input-type=module --eval '
+  import { fingerprintRuntimeSourceFromGit } from "./src/runtime/source-fingerprint.ts";
+  import { HARNESS_SCHEMA_VERSION } from "./src/runtime/harness/schema-version.ts";
+  console.log(JSON.stringify({
+    sourceFingerprint: fingerprintRuntimeSourceFromGit({ repoRoot: process.cwd() }),
+    schemaVersion: HARNESS_SCHEMA_VERSION,
+  }));
+')"
+EXPECTED_SOURCE_FINGERPRINT="$(node -e 'console.log(JSON.parse(process.argv[1]).sourceFingerprint)' "$EXPECTED_RUNTIME_JSON")"
+EXPECTED_SCHEMA_VERSION="$(node -e 'console.log(JSON.parse(process.argv[1]).schemaVersion)' "$EXPECTED_RUNTIME_JSON")"
+if [[ ! "$EXPECTED_SOURCE_FINGERPRINT" =~ ^[a-f0-9]{64}$ ]]; then
+  echo "✗ could not fingerprint the exact candidate source"; exit 2
+fi
+if [[ ! "$EXPECTED_SCHEMA_VERSION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "✗ invalid expected harness schema: $EXPECTED_SCHEMA_VERSION"; exit 2
+fi
+if ! (cd "$ROOT" && NODE_OPTIONS= node scripts/emit-implementation-artifacts.mjs --verify-current "$IMPLEMENTATION_ARTIFACT_ROOT"); then
+  echo "✗ implementation artifacts changed or source moved during emission; refusing to launch"
+  exit 1
+fi
+echo "✓ implementation artifacts match current source"
+
+# The source daemon serves apps/mobile-web/dist verbatim. A source-only patch
+# otherwise leaves the phone on yesterday's ignored bundle, even though the
+# daemon build attestation is current. Rebuild after the old owner is stopped,
+# and require index.html to have been emitted during THIS invocation before any
+# new daemon is allowed to serve it.
+echo "→ rebuilding mobile web from the exact source candidate"
+MOBILE_BUILD_STARTED_AT="$(date +%s)"
+if ! (cd "$ROOT" && NODE_OPTIONS= npm run build:mobile-web); then
+  echo "✗ mobile web build failed; refusing to launch a stale PWA"
+  exit 1
+fi
+MOBILE_WEB_INDEX="$ROOT/apps/mobile-web/dist/index.html"
+if [ ! -s "$MOBILE_WEB_INDEX" ]; then
+  echo "✗ mobile web build emitted no dist/index.html; refusing to launch"
+  exit 1
+fi
+MOBILE_WEB_INDEX_MTIME="$(stat -f '%m' "$MOBILE_WEB_INDEX" 2>/dev/null || echo 0)"
+if [ "$MOBILE_WEB_INDEX_MTIME" -lt "$MOBILE_BUILD_STARTED_AT" ]; then
+  echo "✗ mobile web dist was not refreshed by this launch; refusing to serve it"
+  exit 1
+fi
+echo "✓ mobile web rebuilt from current source"
+
 # Disable proactivity for the build (reversible; dev-down.sh restores it) WITHOUT
 # wiping the user's real autonomy settings. The old version overwrote the WHOLE
 # policy with a minimal object, which dropped autoApproveScope — so a user in
@@ -185,6 +224,9 @@ if ! (
   export CLEMMY_HARNESS_DASHBOARD=on CLEMMY_HARNESS_HOME=on CLEMMY_HARNESS_WORKFLOW=on
   export CLEMMY_BRAIN_FALLOVER="$DEV_BRAIN_FALLOVER"
   export CLEMMY_AUTH_FALLOVER="$DEV_AUTH_FALLOVER"
+  # The generation verified above is the only implementation root this source
+  # launch may inherit; a shell-level override must not substitute stale bytes.
+  export CLEMMY_IMPLEMENTATION_ARTIFACT_ROOT="$IMPLEMENTATION_ARTIFACT_ROOT"
   # Always overwrite a caller's inherited selector. An old shell-level
   # CLEMMY_TURN_ENGINE=legacy_sdk must not silently turn a host-labelled dev
   # launch into a blocked or legacy-owned fresh chat.

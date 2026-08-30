@@ -147,6 +147,8 @@ test('a mobile session cannot self-elevate to PIN rotation or session enumeratio
   assert.equal(realmFor('POST', '/m/api/chat/send'), 'mobile-session');
   assert.equal(realmFor('GET', '/m/api/whoami'), 'mobile-session');
   assert.equal(realmFor('POST', '/m/auth/origin-handoff'), 'mobile-session');
+  assert.equal(realmFor('POST', '/m/auth/origin-handoff/activate'), 'mobile-session');
+  assert.equal(realmFor('POST', '/m/auth/origin-handoff/finalize'), 'mobile-session');
   assert.equal(realmFor('POST', '/m/auth/origin-adopt'), 'mobile-anon');
 });
 
@@ -184,16 +186,38 @@ test('LIVE: the global gate delegates origin handoff and adoption to their mobil
 
     const mint = await post('/m/auth/origin-handoff', {}, cookie);
     assert.equal(mint.status, 200);
-    const handoff = await mint.json() as { token?: string };
+    const handoff = await mint.json() as {
+      token?: string;
+      handoffId?: string;
+      generation?: number;
+    };
     assert.ok(handoff.token, 'the mobile-session route must mint a one-time handoff');
 
-    const adopt = await post('/m/auth/origin-adopt', { token: handoff.token });
+    const activate = await post('/m/auth/origin-handoff/activate', {
+      handoffId: handoff.handoffId,
+      generation: handoff.generation,
+    }, cookie);
+    assert.equal(activate.status, 200, 'activation must reach mobile-session auth, not admin auth');
+
+    const adopt = await post('/m/auth/origin-adopt', {
+      version: 2,
+      token: handoff.token,
+      handoffId: handoff.handoffId,
+      generation: handoff.generation,
+    });
     assert.equal(adopt.status, 200, 'adoption must reach its token handler without admin auth');
-    assert.ok(adopt.headers.get('set-cookie'), 'adoption must establish the relay-origin session');
+    const adoptedCookie = adopt.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(adoptedCookie, 'adoption must establish the relay-origin session');
+
+    const finalize = await post('/m/auth/origin-handoff/finalize', {
+      handoffId: handoff.handoffId,
+      generation: handoff.generation,
+    }, adoptedCookie);
+    assert.equal(finalize.status, 200, 'finalize must reach the exact adopted mobile session');
 
     const replay = await post('/m/auth/origin-adopt', { token: handoff.token });
     assert.equal(replay.status, 401);
-    assert.deepEqual(await replay.json(), { error: 'INVALID_HANDOFF' }, 'the handoff remains single use');
+    assert.deepEqual(await replay.json(), { error: 'INVALID_HANDOFF' }, 'finalized handoff cannot reopen');
   } finally {
     await new Promise<void>((resolve) => { server.close(() => resolve()); });
   }

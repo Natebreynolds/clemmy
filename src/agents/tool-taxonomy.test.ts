@@ -44,15 +44,31 @@ let needsApprovalFromTaxonomy: typeof import('./tool-taxonomy.js').needsApproval
 let openPlanScope: typeof import('./plan-scope.js').openPlanScope;
 let withHarnessRunContext: typeof import('../runtime/harness/brackets.js').withHarnessRunContext;
 let ToolCallsCounter: typeof import('../runtime/harness/brackets.js').ToolCallsCounter;
+const currentCapabilityFixtures = await import('../runtime/harness/current-capability-manifest.fixture.js');
+let previousCapabilityCatalog: ReturnType<
+  typeof currentCapabilityFixtures.installCurrentCapabilityManifestFixtures
+> | undefined;
 
 before(async () => {
   setScope('strict');
+  previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+    { operationId: 'GOOGLESHEETS_CREATE_SPREADSHEET', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'GOOGLESHEETS_SHEET_FROM_JSON', providerKind: 'composio', effect: 'external_write' },
+    { operationId: 'GOOGLESHEETS_BATCH_GET', providerKind: 'composio', effect: 'read' },
+    { operationId: 'OUTLOOK_CREATE_DRAFT', providerKind: 'composio', effect: 'external_write' },
+  ]);
   const mod = await import('./tool-taxonomy.js');
   classifyTool = mod.classifyTool;
   decideToolApproval = mod.decideToolApproval;
   needsApprovalFromTaxonomy = mod.needsApprovalFromTaxonomy;
   ({ openPlanScope } = await import('./plan-scope.js'));
   ({ withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js'));
+});
+
+test.after(() => {
+  if (previousCapabilityCatalog !== undefined) {
+    currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
+  }
 });
 
 // ---------- classifyTool ----------
@@ -84,7 +100,14 @@ test('classifyTool: local-side-effect tools never gate on approval', () => {
   assert.equal(classifyTool('share_plan'), 'read');
   assert.equal(classifyTool('surface_plan'), 'read');
   assert.equal(classifyTool('propose_check_in_template'), 'read');
-  assert.equal(classifyTool('workflow_run'), 'read');
+  assert.equal(classifyTool('space_try_runner'), 'read');
+});
+
+test('workflow dispatch is an honest local write without duplicate approval', () => {
+  assert.equal(classifyTool('workflow_run'), 'write');
+  assert.equal(classifyTool('workflow_rerun_failed_items'), 'write');
+  assert.equal(decideToolApproval({ toolName: 'workflow_run' }).needsApproval, false);
+  assert.equal(decideToolApproval({ toolName: 'workflow_rerun_failed_items' }).needsApproval, false);
 });
 
 test('execution_create classifies as a write and still never asks', () => {
@@ -489,7 +512,7 @@ test('decideToolApproval: the connected Ventura Sheet uses request authority; un
     args: {
       tool_slug: 'OUTLOOK_SEND_EMAIL',
       arguments: JSON.stringify({
-        to_recipients: [{ emailAddress: { address: 'nathan@example.ai' } }],
+        to_recipients: [{ emailAddress: { address: 'avery@example.ai' } }],
         subject: 'Ventura restaurants',
         body: 'Here is the Sheet link.',
       }),

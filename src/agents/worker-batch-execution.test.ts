@@ -77,7 +77,7 @@ test('existing dispatch ledger CAS never steals by time and boot reconciliation 
     () => batchExecution.claimWorkerBatchDurableOwnership('batch-cas', successorOwner),
     batchExecution.WorkerBatchOwnershipConflictError,
   );
-  assert.equal(batchExecution.reconcileWorkerBatchDurableOwnershipAtBoot(25_001), 1);
+  assert.equal(dispatch.reconcileTerminalRunAttemptDispatchLeasesAtBoot(25_001), 2);
   const recovered = batchExecution.claimWorkerBatchDurableOwnership('batch-cas', successorOwner);
   assert.equal(dispatch.isDispatchLeaseCurrent(first), false);
   assert.equal(dispatch.isDispatchLeaseCurrent(recovered), true);

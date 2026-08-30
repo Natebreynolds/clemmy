@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { protocol, withTrace } from '@openai/agents-core';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
-import { relaxRequestForCompatBackend, wrapCompletionsCreate, liftReasoning, applyGlmThinking, repairToolCallArguments } from './byo-model.js';
+import { relaxRequestForCompatBackend, wrapCompletionsCreate, byoBackendStreamsChatCompletions, liftReasoning, liftReasoningChunk, applyGlmThinking, repairToolCallArguments } from './byo-model.js';
 
 // --- test helpers for the wrapped-create repair layer ---------------------
 type AnyObj = Record<string, unknown>;
@@ -866,4 +866,110 @@ test('kimi final-in-reasoning: a stop-final whose prose rode the reasoning chann
   const chunks3 = await collect(stream3);
   const delta3 = (chunks3[0].choices as AnyObj[])[0].delta as AnyObj;
   assert.equal(delta3.content, undefined, 'tool-call finals never promote reasoning into content');
+});
+
+test('xAI and GLM stream natively; MiniMax stays buffered', () => {
+  assert.equal(byoBackendStreamsChatCompletions({ baseURL: 'https://api.x.ai/v1' }), true);
+  assert.equal(byoBackendStreamsChatCompletions({ baseURL: 'https://api.x.ai/v1/' }), true);
+  assert.equal(byoBackendStreamsChatCompletions({ providerLabel: 'xAI (Grok)' }), true);
+  assert.equal(byoBackendStreamsChatCompletions({ baseURL: 'https://api.z.ai/api/coding/paas/v4' }), true);
+  assert.equal(byoBackendStreamsChatCompletions({ providerLabel: 'GLM (Z.ai)' }), true);
+  assert.equal(byoBackendStreamsChatCompletions({ baseURL: 'https://api.minimax.chat/v1' }), false);
+  assert.equal(byoBackendStreamsChatCompletions({}), false);
+});
+
+test('liftReasoningChunk copies GLM reasoning_content deltas onto the SDK reasoning field', () => {
+  const chunk = liftReasoningChunk({
+    choices: [{ delta: { reasoning_content: 'checking the connected CLI' } }],
+  }) as AnyObj;
+  assert.equal(
+    ((chunk.choices as AnyObj[])[0].delta as AnyObj).reasoning,
+    'checking the connected CLI',
+  );
+});
+
+test('native xAI stream keeps stream:true on the wire and does not buffer a completion', async () => {
+  async function* realStream() {
+    yield {
+      id: 's1',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'grok-4.6',
+      choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }],
+    };
+  }
+  const fake = makeFake([(p) => {
+    assert.equal(p.stream, true, 'xAI interactive turns must not be rewritten to stream:false');
+    return realStream();
+  }]);
+  const stream = await wrapCompletionsCreate(fake.fn, { nativeChatCompletionsStream: true })({
+    model: 'grok-4.6',
+    messages: [{ role: 'user', content: "What's on my calendar" }],
+    stream: true,
+    tools: [{ type: 'function', function: { name: 'work_call', parameters: { type: 'object' } } }],
+  });
+  const chunks = await collect(stream);
+  assert.equal(chunks.length, 1);
+  assert.equal((((chunks[0].choices as AnyObj[])[0].delta) as AnyObj).content, 'hi');
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls[0]?.stream, true);
+});
+
+test('native GLM stream keeps stream:true and lifts reasoning_content on the wire chunks', async () => {
+  async function* realStream() {
+    yield {
+      id: 's1',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'glm-5.3-flash',
+      choices: [{ index: 0, delta: { reasoning_content: 'look up the reviewed read' }, finish_reason: null }],
+    };
+  }
+  const fake = makeFake([(p) => {
+    assert.equal(p.stream, true, 'GLM interactive turns must not be rewritten to stream:false');
+    return realStream();
+  }]);
+  const stream = await wrapCompletionsCreate(fake.fn, { nativeChatCompletionsStream: true })({
+    model: 'glm-5.3-flash',
+    messages: [{ role: 'user', content: 'How many deals does Tim have' }],
+    stream: true,
+    tools: [{ type: 'function', function: { name: 'tool_search', parameters: { type: 'object' } } }],
+  });
+  const chunks = await collect(stream);
+  assert.equal((((chunks[0].choices as AnyObj[])[0].delta) as AnyObj).reasoning, 'look up the reviewed read');
+  assert.equal(fake.calls[0]?.stream, true);
+});
+
+test('native stream still buffers structured JSON so repair can run on a finished object', async () => {
+  const fake = makeFake([() => completionWith('```json\n{"done": true}\n```')]);
+  const stream = await wrapCompletionsCreate(fake.fn, { nativeChatCompletionsStream: true })(
+    structuredParams({ stream: true }),
+  );
+  const chunks = await collect(stream);
+  assert.equal(chunks.length, 1);
+  assert.equal(fake.calls[0]?.stream, false, 'json_schema turns stay buffered even on xAI');
+  assert.deepEqual(JSON.parse((((chunks[0].choices as AnyObj[])[0].delta) as AnyObj).content as string), { done: true });
+});
+
+test('native stream does not buffer a tool-bearing turn even if a json_schema was folded into the prompt', async () => {
+  async function* realStream() {
+    yield {
+      id: 's2',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'grok-4.6',
+      choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'work_call', arguments: '{' } }] }, finish_reason: null }],
+    };
+  }
+  const fake = makeFake([(p) => {
+    assert.equal(p.stream, true);
+    return realStream();
+  }]);
+  await collect(await wrapCompletionsCreate(fake.fn, { nativeChatCompletionsStream: true })(
+    structuredParams({
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'work_call', parameters: { type: 'object' } } }],
+    }),
+  ));
+  assert.equal(fake.calls[0]?.stream, true, 'calendar/tool turns on xAI must stream');
 });

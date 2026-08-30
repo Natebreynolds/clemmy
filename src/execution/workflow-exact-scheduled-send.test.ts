@@ -49,8 +49,11 @@ const workflow = {
     {
       id: 'render_message',
       prompt: '',
-      deterministic: { runner: 'render-message.mjs' },
-      sideEffect: 'write',
+      call: {
+        tool: 'CHATCO_GET_SCHEDULED_MESSAGE',
+        args: { templateId: 'weekday-status' },
+      },
+      sideEffect: 'read',
       output: {
         type: 'object',
         required_keys: ['summary'],
@@ -260,11 +263,12 @@ test('exact scheduled send: source output renders to one fixed provider crossing
 
 test('committed exact-send replay remains available during a schema metadata outage', async () => {
   const tool = workflow.steps[1].call.tool;
-  rememberToolSchema(tool, {
+  const schema = {
     type: 'object',
     required: ['destination', 'body'],
     properties: { destination: { type: 'string' }, body: { type: 'string' } },
-  }, Date.now());
+  } as const;
+  rememberToolSchema(tool, schema, Date.now());
   const args = { destination: 'fixed-destination', body: 'outage replay payload' };
   const mutation = {
     workflowSlug: workflow.name,
@@ -298,18 +302,11 @@ test('committed exact-send replay remains available during a schema metadata out
     assert.equal(validation.ok, true, validation.errors.join('\n'));
   } finally {
     Date.now = realDateNow;
+    // Keep later receipt cases independent even when an assertion above fails:
+    // this test deliberately clears the process lease, while the following
+    // cases require a provider-observed schema fingerprint.
+    rememberToolSchema(tool, schema, Date.now());
   }
-
-  // Restore the live lease for independent cases below; the replay proof above
-  // specifically exercised the process-cache outage.
-  rememberToolSchema(tool, {
-    type: 'object',
-    required: ['destination', 'body'],
-    properties: {
-      destination: { type: 'string' },
-      body: { type: 'string' },
-    },
-  }, Date.now());
 });
 
 test('exact scheduled send evidence is keyed by the catalog slug, never the display name', async () => {

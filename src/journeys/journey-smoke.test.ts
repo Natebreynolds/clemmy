@@ -49,6 +49,7 @@ const {
   markBackgroundTaskAwaitingInput,
   getBackgroundTask,
   processBackgroundTasks,
+  _setBackgroundResponseExecutorForTests,
 } = await import('../execution/background-tasks.js');
 const reg = await import('../runtime/harness/approval-registry.js');
 const {
@@ -84,6 +85,7 @@ function anchorAcceptedTask(sessionId: string, text: string): {
   });
   assert.ok(recordTurnGraphShadow({
     identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+    surface: 'background',
   }), 'fixture persisted the turn graph for the accepted task');
   return { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
 }
@@ -96,6 +98,7 @@ after(async () => {
   // their dynamic-import boundary, then remove the isolated temp home.
   await new Promise<void>((resolve) => setTimeout(resolve, 400));
   setProactiveReportFireForTest(null);
+  _setBackgroundResponseExecutorForTests(null);
   _setBridgeImplsForTests({});
   resetHarnessRuntimeConfig();
   resetEventLog();
@@ -128,16 +131,16 @@ test('J1: parked task → answered in the conversation → resumes → completes
   resetEventLog();
   resetHarnessRuntimeConfig();
   const brainReplies: string[] = [];
+  _setBackgroundResponseExecutorForTests(async (_assistant, request) => {
+    brainReplies.push(JSON.stringify(request ?? {}));
+    return {
+      text: 'All five firms compiled into the base. Task complete.',
+      sessionId: request.sessionId,
+      stoppedReason: 'success',
+    };
+  });
   _setBridgeImplsForTests({
     configure: (async () => ({ ok: true })) as never,
-    claudeAgentBrain: (async (_surface: unknown, request: unknown) => {
-      brainReplies.push(JSON.stringify(request ?? {}));
-      return {
-        text: 'All five firms compiled into the base. Task complete.',
-        sessionId: 'ignored',
-        stoppedReason: 'success',
-      };
-    }) as never,
   });
   const harness = await boot();
   try {
@@ -184,6 +187,7 @@ test('J1: parked task → answered in the conversation → resumes → completes
     );
   } finally {
     await harness.close();
+    _setBackgroundResponseExecutorForTests(null);
     _setBridgeImplsForTests({});
   }
 });

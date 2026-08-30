@@ -468,7 +468,7 @@ function hasCompletePostConstructCommunicationTopology(
     && hasOnlyDataSource(terminal, verification.id);
 }
 
-function validateActionProposalForGraph(
+export function validateActionProposalForGraph(
   proposal: ExpectedWorkProposalV1,
   graph: TurnGraphIR,
 ): string[] {
@@ -503,6 +503,7 @@ function validateActionProposalForGraph(
   }
   if (
     graph.classification.externalEffectRequested
+    && graph.effectCeiling === 'external_write'
     && !proposal.operations.some((operation) => operation.effect === 'external_write')
   ) errors.push('the accepted external effect requires an external-write outcome');
   for (const requiredEffect of ['local_write', 'external_write', 'admin'] as const) {

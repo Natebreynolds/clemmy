@@ -32,10 +32,55 @@ const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const admission = await import('./expected-work-admission.js');
+const currentCapabilities = await import('./current-capability-manifest.fixture.js');
+const composioSemantics = await import('../../integrations/composio/operation-semantics.js');
 // (arming handled through activateActionExpectedWork)
 // const authority = await import('./accepted-task-authority.js');
 
+const sheetFromJsonSemantics = composioSemantics.documentedComposioManifestOperationSemantics(
+  'GOOGLESHEETS_SHEET_FROM_JSON',
+);
+const googleDocCreateSemantics = composioSemantics.documentedComposioManifestOperationSemantics(
+  'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+);
+assert.ok(sheetFromJsonSemantics, 'fixture requires the reviewed atomic Sheet operation');
+assert.ok(googleDocCreateSemantics, 'fixture requires the reviewed Google Docs create operation');
+const priorCapabilityCatalog = currentCapabilities.installCurrentCapabilityManifestFixtures([
+  {
+    operationId: 'FIRECRAWL_SEARCH',
+    providerKind: 'composio',
+    effect: 'read',
+  },
+  {
+    operationId: 'GOOGLESHEETS_SHEET_FROM_JSON',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'googlesheets', posture: 'create_new' },
+    operationSemantics: sheetFromJsonSemantics,
+  },
+  {
+    operationId: 'GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN',
+    providerKind: 'composio',
+    effect: 'external_write',
+    destination: { family: 'google_doc', posture: 'create_new' },
+    operationSemantics: googleDocCreateSemantics,
+  },
+  {
+    operationId: 'GMAIL_SEND_EMAIL',
+    providerKind: 'composio',
+    effect: 'external_write',
+    operationSemantics: { version: 1, reversibility: 'irreversible' },
+  },
+  {
+    operationId: 'OUTLOOK_SEND_EMAIL',
+    providerKind: 'composio',
+    effect: 'external_write',
+    operationSemantics: { version: 1, reversibility: 'irreversible' },
+  },
+]);
+
 test.after(() => {
+  currentCapabilities.restoreCurrentCapabilityManifestFixtures(priorCapabilityCatalog);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });

@@ -203,15 +203,16 @@ export function registerPendingActionTools(server: McpServer): void {
   server.tool(
     'pending_action_queue',
     [
-      'Queue a fully prepared action payload before an irreversible external write/send/deploy or other approval-bound execution.',
+      'Queue a fully prepared exact action only after the work boundary says one formal approval is required, such as an irreversible send, destructive change, high-impact deploy, or other approval-bound execution.',
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
+      'Do not queue an exact ordinary reversible write merely because it changes external state; execute that through the normal work boundary without a separate approval ceremony.',
       'State the graph edge with approvalIntent: request_now opens the one exact formal card this turn; queue_only stores it without a card. Use queue_only when the user explicitly asked to stage only, and do not queue at all while required scope is unresolved.',
       'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
     ].join(' '),
     {
       title: z.string().min(3).max(160),
       summary: z.string().min(8).max(2000).describe('Plain-language summary of what is queued and why.'),
-      kind: kindEnum.describe('The action class. external_send/external_write/deployment are approval-bound in normal operation.'),
+      kind: kindEnum.describe('Descriptive action class only; the host derives approval from the exact tool and payload. external_write alone does not imply approval.'),
       toolName: z.string().min(1).max(160).describe('The exact tool to call after approval, e.g. composio_execute_tool or run_shell_command.'),
       payloadJson: z.string().min(2).max(100000).describe('Exact JSON payload for the execution tool. Use the tool schema shape, not prose.'),
       approvalIntent: approvalIntentEnum.optional().describe('request_now = exact payload is complete and the graph should open its one formal card now; queue_only = store it without opening a card this turn. Optional only for pre-3.0 callers, which retain the narrow legacy prose bridge.'),
@@ -249,6 +250,11 @@ export function registerPendingActionTools(server: McpServer): void {
         toolName,
         payload,
       }, { sessionId });
+      if (approvalIntent === 'request_now' && !needsFormalApproval) {
+        return textResult(
+          'pending_action_queue refused: PENDING_ACTION_APPROVAL_NOT_REQUIRED. This exact action is not approval-bound. Execute it through the ordinary work boundary without asking for or creating a separate approval; use queue_only only when the user explicitly requested staging without execution.',
+        );
+      }
       if (needsFormalApproval && !sessionId) {
         return textResult('pending_action_queue refused: an approval-bound action requires an authoritative harness session.');
       }

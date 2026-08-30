@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { recordDeclaredMcpToolEffect } from './mcp-declared-effects.js';
 import type { MCPServer } from '@openai/agents';
 import pino from 'pino';
@@ -572,6 +573,43 @@ function mcpResultText(result: unknown): string {
 const logger = pino({ name: 'clementine-next.mcp-namespace' });
 
 const SEPARATOR = '__';
+
+interface AcceptedExactMcpTransportHandoff {
+  toolName: string;
+  args: Record<string, unknown> | null;
+  used: boolean;
+}
+
+const acceptedExactTransportStorage = new AsyncLocalStorage<AcceptedExactMcpTransportHandoff>();
+
+/**
+ * Process-opaque hand-off from the exact manifest-backed native-MCP carrier to
+ * the namespace shim's already-connected raw server route. The carrier owns
+ * physical accounting and logical settlement; re-entering this shim's legacy
+ * work/approval/settlement wrapper would create a second business attempt for
+ * the same provider body. Only the exact object identity supplied here can be
+ * consumed, once, by the matching namespaced call below.
+ */
+export async function withAcceptedExactMcpTransportHandoff<T>(
+  input: { toolName: string; args: Record<string, unknown> | null },
+  work: () => Promise<T>,
+): Promise<T> {
+  if (acceptedExactTransportStorage.getStore()) {
+    throw new Error('accepted exact MCP transport hand-off is already active');
+  }
+  const state: AcceptedExactMcpTransportHandoff = {
+    toolName: input.toolName,
+    args: input.args,
+    used: false,
+  };
+  return acceptedExactTransportStorage.run(state, async () => {
+    const result = await work();
+    if (!state.used) {
+      throw new Error('accepted exact MCP transport hand-off did not reach its namespace route');
+    }
+    return result;
+  });
+}
 
 export interface MCPNamespaceShimOptions {
   /** Servers to wrap. Order doesn't matter for behaviour. */
@@ -1252,6 +1290,24 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
     },
 
     async callTool(toolName: string, args: Record<string, unknown> | null): Promise<CallToolResultContent> {
+      const exactHandoff = acceptedExactTransportStorage.getStore();
+      if (exactHandoff) {
+        if (
+          exactHandoff.used
+          || exactHandoff.toolName !== toolName
+          || exactHandoff.args !== args
+          || !cachedToolToServer
+        ) {
+          throw new Error('accepted exact MCP transport hand-off is absent, consumed, or mismatched');
+        }
+        const parsed = parseNamespacedTool(toolName);
+        const server = parsed ? cachedToolToServer.get(toolName) : undefined;
+        if (!parsed || !server) {
+          throw new Error('accepted exact MCP transport route is no longer present');
+        }
+        exactHandoff.used = true;
+        return server.callTool(parsed.toolName, args);
+      }
       // Open the physical attempt here, before lease and routing checks, so an
       // unknown tool or an unavailable server is still a correlated attempt
       // rather than an event nothing can be reconciled against.

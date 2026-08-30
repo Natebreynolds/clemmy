@@ -19,14 +19,20 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
-import { catalogEntries, rankCatalog, type RankedCatalogEntry } from '../agents/tool-catalog.js';
+import { catalogEntries, rankCatalogLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
+import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 import { relaxJsonSchemaForDeferred } from '../runtime/schema-normalizer.js';
 import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   issueAuthorizedLocalPlanningDisclosureCandidate,
+  type LocalPlanningRefusalReason,
 } from '../runtime/harness/local-planning-capability.js';
+import {
+  AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
+  type AuthorizedLiveReadPlanningAuthorityV1,
+} from '../runtime/harness/live-read-planning-authority.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   readToolSearchContinuation,
@@ -35,6 +41,30 @@ import {
   TOOL_SEARCH_CONTINUATION_MAX_SESSION_BYTES,
   writeToolSearchContinuation,
 } from '../runtime/harness/eventlog.js';
+
+/**
+ * Models often serialize JSON null as the string `"null"` because the wire
+ * schema advertises `cursor` as a required nullable string. That string is
+ * not a host-issued continuation; treating it as one burned the one physical
+ * discovery epoch and then refused the retry (live 2026-08-29 GLM: Salesforce
+ * read never ran). Sentinels are omitted. Forged host-shaped cursors still fail.
+ */
+const TOOL_SEARCH_CURSOR_SENTINELS = new Set([
+  'null',
+  'undefined',
+  'none',
+  'nil',
+  'n/a',
+  'na',
+]);
+
+export function normalizeToolSearchCursor(cursor: string | null | undefined): string | null {
+  if (cursor == null) return null;
+  const trimmed = cursor.trim();
+  if (!trimmed) return null;
+  if (TOOL_SEARCH_CURSOR_SENTINELS.has(trimmed.toLowerCase())) return null;
+  return trimmed;
+}
 
 function connectedToolkitSlugs(): Set<string> {
   try {
@@ -56,6 +86,64 @@ function candidateToolkitConnected(name: string, connected: Set<string>): boolea
   } catch {
     return false;
   }
+}
+
+/** Exact live-read acquisition for this query is not a peer of fuzzy broker
+ * membership. A 0.05 memory nudge on a connected Composio row previously
+ * outranked an acquired reviewed CLI (live 2026-08-28: GOOGLESHEETS_QUERY_TABLE
+ * ranked above salesforce_sf_soql_query on "query Salesforce ... sf CLI"). */
+const ACQUIRED_LIVE_READ_RANK_BOOST = 1;
+const PLANNING_PROVIDER_RANK_BOOST = 2;
+const CONNECTED_TOOLKIT_RANK_BOOST = 0.5;
+/**
+ * Her own catalog ranks in the SAME band as a provider row, so relevance
+ * decides between them.
+ *
+ * Both rankers bound their base score to [0,1]. While this was 1 and the
+ * planning provider boost was 2, providers occupied [2,3] and built-ins [1,2]
+ * — so no built-in could outrank any provider at any relevance, which is the
+ * defect the tiering comment below says was fixed on 2026-08-19
+ * (APIFY_SCHEDULE_PUT over her own workflow_schedule). It regressed.
+ *
+ * Measured live 2026-08-28: "I need this to update please and refresh" against
+ * a workspace returned twenty SALESFORCE_/ASANA_/SLACK_/APIFY_ rows and ZERO
+ * space_* tools. Her workspace tools were not mis-ranked; they never entered
+ * the window to be ranked at all.
+ *
+ * The value is 1.5, not 2, and the half matters: at 2 a maximally relevant
+ * built-in TIES an acquired live read, collapsing the tier above it. At 1.5 the
+ * bands are built-in [1.5,2.5], connected provider [2,3], acquired [3,4] — they
+ * overlap enough for relevance to decide, and the acquired tier stays strictly
+ * on top.
+ *
+ * Equal footing, not precedence: a provider row that is genuinely more relevant to
+ * the query still wins. What can no longer happen is losing by construction.
+ */
+const OWN_CATALOG_RANK_BOOST = 1.5;
+
+function isAcquiredLiveReadCandidate(
+  candidate: Pick<ToolSearchBrokerCandidate, 'planningAuthority'> & {
+    sourceKind?: ToolSearchCandidateSourceKind;
+  },
+): boolean {
+  return candidate.sourceKind === AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE
+    || candidate.planningAuthority != null;
+}
+
+function scoreDiscoveredSourceCandidate(
+  candidate: ToolSearchBrokerCandidate & { sourceKind: ToolSearchCandidateSourceKind },
+  index: number,
+  count: number,
+  input: { discloseForPlanning: boolean; connectedToolkitSlugs: Set<string> },
+): number {
+  const base = candidate.score ?? Math.max(0, 1 - (index / Math.max(1, count)));
+  const planningOrConnected = input.discloseForPlanning
+    ? PLANNING_PROVIDER_RANK_BOOST
+    : candidateToolkitConnected(candidate.name, input.connectedToolkitSlugs)
+      ? CONNECTED_TOOLKIT_RANK_BOOST
+      : 0;
+  const acquired = isAcquiredLiveReadCandidate(candidate) ? ACQUIRED_LIVE_READ_RANK_BOOST : 0;
+  return base + planningOrConnected + acquired;
 }
 
 const TOP_RESULTS = 8;
@@ -83,6 +171,12 @@ export const CANDIDATE_SOURCE_SEARCH_DEADLINE_MS = 10_000;
  *  generous against one slow candidate, fatal to a full-list walk of a slow
  *  provider (~3.3s/fetch measured live × 20 candidates = the 60s stalls). */
 export const PLANNING_DISCLOSURE_DEADLINE_MS = 15_000;
+/** Absolute broker budget. Per-source search and per-adapter disclosure remain
+ * separately bounded below, but they also consume this one wall clock so a
+ * future phase cannot silently stack another full allowance behind a slow
+ * predecessor. Kept at half the 60s host-tool window to reserve settlement,
+ * cancellation, and model-recovery time. */
+export const TOOL_SEARCH_TOTAL_DEADLINE_MS = 30_000;
 
 interface ToolSearchSchemaHandle {
   schema_ref: string;
@@ -307,6 +401,7 @@ export type ToolSearchDispatchCarrier = 'call_tool' | 'work_call';
 export type ToolSearchCandidateSourceKind =
   | 'authorized_external_mcp'
   | 'authorized_composio'
+  | typeof AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE
   | typeof AUTHORIZED_LOCAL_REGISTRY_PROVENANCE;
 
 /** Provider adapters stay behind the one visible broker. A candidate is
@@ -327,11 +422,23 @@ export interface ToolSearchBrokerCandidate {
     fixedArgs?: Record<string, unknown>;
     payloadField?: string;
   };
+  /** Process-only nomination issued by a live-read source. The broker carries
+   * it to the planning callback but never serializes it into model-visible
+   * result JSON. */
+  planningAuthority?: AuthorizedLiveReadPlanningAuthorityV1;
 }
 
 export interface ToolSearchCandidateSource {
   kind: ToolSearchCandidateSourceKind;
-  search(input: { query: string; limit: number }): Promise<ToolSearchBrokerCandidate[]>;
+  search(input: {
+    query: string;
+    limit: number;
+    signal?: AbortSignal;
+    /** Absolute wall deadline owned by the broker. Adapters with multiple
+     * internal reads should settle slightly before it so partial progress can
+     * be returned instead of being discarded by the outer abort. */
+    deadlineAt?: number;
+  }): Promise<ToolSearchBrokerCandidate[]>;
 }
 
 /** A stable, repair-relevant reason a candidate source could not answer.
@@ -375,6 +482,108 @@ export interface ToolSearchPlanningDisclosureCandidate {
    * manufacture this value; the broker attaches it while flattening the
    * configured host sources. */
   sourceKind: ToolSearchCandidateSourceKind;
+  planningAuthority?: AuthorizedLiveReadPlanningAuthorityV1;
+  /** Provider-neutral argument variants minted by the local registry. The
+   * disclosure callback reopens their opaque host seal before any ref is made
+   * visible; these public fields never grant authority by themselves. */
+  capabilityVariants?: readonly {
+    variantId: string;
+    capabilityRef: string;
+    reversibility: string;
+    destructive: boolean;
+    destinationPosture: 'create_new' | 'named_existing' | null;
+  }[];
+}
+
+/** Model-visible identity evidence for the one current account that backed a
+ * resolved provider row. This is descriptive only: it is deliberately absent
+ * from every planning/execution input and cannot grant or widen authority. */
+export interface ToolSearchSelectedAccountEvidence {
+  toolkit: string;
+  accountIdentity: string;
+  accountIdentityKind: 'email' | 'connection_id';
+  email?: string;
+  label?: string;
+}
+
+// The provider staging boundary is the only place that has both the exact
+// disclosure candidate object and a freshly resolved current connection. Keep
+// that association process-private: candidate prose cannot manufacture it,
+// callback return values cannot copy it onto a different row, and the public
+// serializer below emits it only alongside the capabilityRef minted for this
+// same object.
+const selectedAccountEvidenceByCandidate = new WeakMap<
+  ToolSearchPlanningDisclosureCandidate,
+  ToolSearchSelectedAccountEvidence
+>();
+
+function boundedEvidenceText(value: string | null | undefined, maxChars: number): string | undefined {
+  const normalized = value?.replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length > maxChars || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    return undefined;
+  }
+  return normalized;
+}
+
+/** Provider-staging seam. Attaching evidence does not affect ref disclosure,
+ * account selection, planning admission, or dispatch. */
+export function attachToolSearchSelectedAccountEvidence(
+  candidate: ToolSearchPlanningDisclosureCandidate,
+  input: {
+    toolkit: string;
+    email?: string;
+    label?: string;
+    connectionId?: string;
+  },
+): void {
+  if (candidate.sourceKind !== 'authorized_composio' || candidate.carrier !== 'work_call') return;
+  const toolkit = boundedEvidenceText(input.toolkit.toLowerCase(), 80);
+  const possibleEmail = boundedEvidenceText(input.email?.toLowerCase().replace(/^smtp:/, ''), 320);
+  const email = possibleEmail?.includes('@') ? possibleEmail : undefined;
+  // An opaque connection id is useful only when the provider exposes no
+  // stable mailbox identity. Never leak it in addition to a known email.
+  const fallbackConnectionId = email
+    ? undefined
+    : boundedEvidenceText(input.connectionId, 256);
+  const accountIdentity = email ?? fallbackConnectionId;
+  if (!toolkit || !accountIdentity) return;
+  const label = boundedEvidenceText(input.label, 160);
+  selectedAccountEvidenceByCandidate.set(candidate, Object.freeze({
+    toolkit,
+    accountIdentity,
+    accountIdentityKind: email ? 'email' : 'connection_id',
+    ...(email ? { email } : {}),
+    ...(label ? { label } : {}),
+  }));
+}
+
+export interface ToolSearchPlanningBlocker {
+  code: 'account_selection_required';
+  /** Stable current identities the user can name on the next accepted turn.
+   * Emails are preferred; an opaque connection id is used only when the
+   * provider exposes no mailbox identity. */
+  choices: readonly string[];
+}
+
+export interface ToolSearchPlanningDisclosureOutcome {
+  version: 1;
+  refs: Readonly<Record<string, string>>;
+  blockers: Readonly<Record<string, ToolSearchPlanningBlocker>>;
+}
+
+function isPlanningDisclosureOutcome(
+  value: unknown,
+): value is ToolSearchPlanningDisclosureOutcome {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as { version?: unknown }).version === 1
+    && (value as { refs?: unknown }).refs
+    && typeof (value as { refs?: unknown }).refs === 'object'
+    && (value as { blockers?: unknown }).blockers
+    && typeof (value as { blockers?: unknown }).blockers === 'object',
+  );
 }
 
 export type ToolSearchBrokerCoverage = 'builtins_only' | 'authorized_external_v1';
@@ -386,7 +595,10 @@ export function toolSearchBrokerCoverage(
   sources: readonly ToolSearchCandidateSource[] | undefined,
 ): ToolSearchBrokerCoverage {
   const kinds = new Set((sources ?? []).map((source) => source.kind));
-  return kinds.has('authorized_external_mcp') && kinds.has('authorized_composio')
+  return (
+    kinds.has(AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE)
+    || kinds.has('authorized_external_mcp')
+  ) && kinds.has('authorized_composio')
     ? 'authorized_external_v1'
     : 'builtins_only';
 }
@@ -402,21 +614,55 @@ function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
   return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(query);
 }
 
+const JSON_SCHEMA_ANNOTATION_KEYS = new Set([
+  '$schema',
+  'description',
+  'title',
+  'examples',
+  'default',
+  'deprecated',
+  'readOnly',
+  'writeOnly',
+]);
+
+// Values of these keywords are maps keyed by user-authored property/schema
+// names. A map entry named "description" is data, not an annotation keyword.
+const JSON_SCHEMA_NAMED_MAP_KEYS = new Set([
+  '$defs',
+  'definitions',
+  'dependentRequired',
+  'dependentSchemas',
+  'patternProperties',
+  'properties',
+]);
+
+// These keywords contain instance JSON, not nested schema nodes. Recursing as
+// though they were schemas would corrupt legitimate values whose object keys
+// happen to be named "description", "title", "default", and so on.
+const JSON_SCHEMA_INSTANCE_VALUE_KEYS = new Set(['const', 'enum']);
+
 function stripSchemaAnnotations(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripSchemaAnnotations);
+  if (Array.isArray(value)) return value.map((item) => stripSchemaAnnotations(item));
   if (!value || typeof value !== 'object') return value;
   const out: Record<string, unknown> = {};
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    if ([
-      '$schema',
-      'description',
-      'title',
-      'examples',
-      'default',
-      'deprecated',
-      'readOnly',
-      'writeOnly',
-    ].includes(key)) continue;
+    if (JSON_SCHEMA_ANNOTATION_KEYS.has(key)) continue;
+    if (JSON_SCHEMA_INSTANCE_VALUE_KEYS.has(key)) {
+      out[key] = nested;
+      continue;
+    }
+    if (
+      JSON_SCHEMA_NAMED_MAP_KEYS.has(key)
+      && nested
+      && typeof nested === 'object'
+      && !Array.isArray(nested)
+    ) {
+      out[key] = Object.fromEntries(
+        Object.entries(nested as Record<string, unknown>)
+          .map(([name, schema]) => [name, stripSchemaAnnotations(schema)]),
+      );
+      continue;
+    }
     out[key] = stripSchemaAnnotations(nested);
   }
   return out;
@@ -471,7 +717,10 @@ export function registerToolSearchTool(
      * the current host catalog. Candidate prose itself grants nothing. */
     discloseForPlanning?: (
       candidates: readonly ToolSearchPlanningDisclosureCandidate[],
-    ) => Promise<Readonly<Record<string, string>>> | Readonly<Record<string, string>>;
+      control?: Readonly<{ signal: AbortSignal; deadlineAt: number }>,
+    ) => Promise<Readonly<Record<string, string>> | ToolSearchPlanningDisclosureOutcome>
+      | Readonly<Record<string, string>>
+      | ToolSearchPlanningDisclosureOutcome;
   } = {},
 ): void {
   const continuations = new ToolSearchContinuationStore();
@@ -501,13 +750,14 @@ export function registerToolSearchTool(
         .describe(`How many ranked results to return (default ${TOP_RESULTS}).`),
       cursor: z
         .string()
-        .min(1)
         .max(160)
         .nullable()
         // Default keeps serialized pre-cursor calls/replays valid while the
         // Codex-strict schema still advertises a required nullable field.
+        // Empty string is omitted — models emit "" for "no continuation"
+        // (live 2026-08-29 GLM/Grok: min(1) 400'd the first discovery call).
         .default(null)
-        .describe('Opaque local next_cursor or schema_handles[*].cursor from a prior result in this durable session. Cursor reads survive broker restarts and never re-run provider discovery or mint new planning authority.'),
+        .describe('Opaque local next_cursor or schema_handles[*].cursor from a prior result in this durable session. Empty or JSON-null means the first page. Cursor reads survive broker restarts and never re-run provider discovery or mint new planning authority.'),
     },
     async ({ query, role_key, limit, cursor }: {
       query: string;
@@ -519,10 +769,13 @@ export function registerToolSearchTool(
       // A continuation is a read of bytes retained by an earlier admitted
       // search, never another discovery attempt. Invalid/expired cursors fail
       // locally and cannot fall through into a candidate source.
-      if (cursor) {
-        const continued = continuations.read(cursor, continuationSessionId);
+      const continuation = normalizeToolSearchCursor(cursor);
+      if (continuation) {
+        const continued = continuations.read(continuation, continuationSessionId);
         return textResult(continued.text, { isError: continued.isError });
       }
+      const brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
+      const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
       // An exact tool name is an explicit selection, not another fuzzy search
       // term. Resolve it against the policy-filtered catalog BEFORE semantic
       // ranking so a selected name never pays a cold embedding/model detour.
@@ -530,17 +783,30 @@ export function registerToolSearchTool(
       // capability and its schema. Natural-language discovery still ranks the
       // whole allowed catalog below.
       const requestedLimit = Math.min(limit ?? TOP_RESULTS, TOOL_SEARCH_WINDOW_RESULTS);
-      const exactEntry = catalogEntries({ allowedNames: opts.allowedNames })
+      const scopedCatalog = catalogEntries({ allowedNames: opts.allowedNames });
+      const exactEntry = scopedCatalog
         .find((entry) => queryExplicitlyNamesTool(query, entry.name));
       const exactKnownButDenied = !exactEntry && catalogEntries()
         .some((entry) => queryExplicitlyNamesTool(query, entry.name));
+      // A uniquely named saved workflow plus execution text is an exact
+      // selection of workflow_run — not a fuzzy hunt across Composio actors
+      // (live 2026-08-29: "run my platform 49 workflow" ranked APIFY_RUN_ACTOR).
+      const uniqueWorkflowRun = !exactEntry && uniqueWorkflowRunRequest(query)
+        ? scopedCatalog.find((entry) => entry.name === 'workflow_run')
+        : undefined;
       const exactNamedHit: RankedCatalogEntry | undefined = exactEntry
         ? { ...exactEntry, score: 1 }
-        : undefined;
+        : uniqueWorkflowRun
+          ? { ...uniqueWorkflowRun, score: 1 }
+          : undefined;
       // Sources the provider itself could not answer, so the model is told
       // "could not reach X" and can retry — never silence that reads as "X
       // does not exist" (see CandidateSourceUnavailableError).
-      const unavailable: Array<{ source: ToolSearchCandidateSourceKind; reason: string }> = [];
+      const unavailable: Array<{
+        source: ToolSearchCandidateSourceKind;
+        code: CandidateSourceUnavailableCode;
+        reason: string;
+      }> = [];
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
       // name/role, preserving the fast path and avoiding broad discovery after
@@ -557,22 +823,52 @@ export function registerToolSearchTool(
             // "contributes nothing" must not be laundered into "found
             // nothing"; both are recorded below instead of discarded.
             let deadline: ReturnType<typeof setTimeout> | undefined;
+            const controller = new AbortController();
             try {
+              const sourceBudgetMs = Math.min(
+                CANDIDATE_SOURCE_SEARCH_DEADLINE_MS,
+                remainingBrokerMs(),
+              );
+              if (sourceBudgetMs <= 0) {
+                throw new CandidateSourceUnavailableError(
+                  'timed_out',
+                  `${source.kind} did not answer before the tool_search deadline.`,
+                );
+              }
+              const sourceDeadlineAt = Date.now() + sourceBudgetMs;
               const candidates = await Promise.race([
                 // A source may retain a larger bounded provider snapshot than
                 // the visible limit (the Composio adapter does); whatever it
                 // returns is paged locally and never fetched a second time.
-                source.search({ query, limit: requestedLimit }),
+                source.search({
+                  query,
+                  limit: requestedLimit,
+                  signal: controller.signal,
+                  deadlineAt: sourceDeadlineAt,
+                }),
                 new Promise<never>((_, reject) => {
                   deadline = setTimeout(
-                    () => reject(new CandidateSourceUnavailableError(
-                      'timed_out',
-                      `${source.kind} did not answer within ${CANDIDATE_SOURCE_SEARCH_DEADLINE_MS / 1000}s.`,
-                    )),
-                    CANDIDATE_SOURCE_SEARCH_DEADLINE_MS,
+                    () => {
+                      controller.abort();
+                      reject(new CandidateSourceUnavailableError(
+                        'timed_out',
+                        `${source.kind} did not answer within ${sourceBudgetMs / 1000}s.`,
+                      ));
+                    },
+                    sourceBudgetMs,
                   );
                 }),
               ]);
+              if (
+                controller.signal.aborted
+                || Date.now() >= sourceDeadlineAt
+                || remainingBrokerMs() <= 0
+              ) {
+                throw new CandidateSourceUnavailableError(
+                  'timed_out',
+                  `${source.kind} answered after the tool_search deadline.`,
+                );
+              }
               return candidates
                 .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
                 .slice(0, TOOL_SEARCH_WINDOW_RESULTS)
@@ -584,6 +880,9 @@ export function registerToolSearchTool(
             } catch (error) {
               unavailable.push({
                 source: source.kind,
+                code: error instanceof CandidateSourceUnavailableError
+                  ? error.code
+                  : 'search_failed',
                 reason: error instanceof CandidateSourceUnavailableError
                   ? error.message
                   : `${source.kind} raised an unexpected error during discovery.`,
@@ -593,37 +892,47 @@ export function registerToolSearchTool(
               if (deadline) clearTimeout(deadline);
             }
           }))).flat();
-      const exactSourceHit = sourceCandidates.find((candidate) =>
+      const exactSourceMatches = sourceCandidates.filter((candidate) =>
         queryExplicitlyNamesTool(query, candidate.name));
+      const exactSourceHit = exactSourceMatches.length === 1
+        ? exactSourceMatches[0]
+        : undefined;
       const selectedExactly = exactSourceHit ?? exactNamedHit;
-      const rankedBuiltins = exactNamedHit
-        ? [exactNamedHit]
-        : await rankCatalog(query, { allowedNames: opts.allowedNames });
+      const rankedBuiltins = selectedExactly
+        ? []
+        // Provider membership/schema acquisition already owns this control
+        // call's bounded network budget. Embeddings are only an advisory
+        // ordering signal, so the execution-critical broker uses the same
+        // deterministic lexical fallback directly instead of stacking a cold
+        // 2x10s embedding retry behind provider search (live 2026-08-27: that
+        // stack turned the nominal 10s source bound into a 66s host timeout).
+        : rankCatalogLexically(query, { allowedNames: opts.allowedNames });
       // TIERED RANKING (live 2026-08-19: APIFY_SCHEDULE_PUT outranked her own
-      // workflow_schedule for "update workflow schedule cron interval"). Her
-      // own catalog outranks connected-app operations, which outrank
-      // everything else — she finds what SHE has before the world's noise.
+      // workflow_schedule; live 2026-08-28: GOOGLESHEETS_QUERY_TABLE outranked
+      // an acquired Salesforce CLI read). Exact live-read acquisition for this
+      // query outranks fuzzy broker membership, which outranks her own catalog,
+      // which outranks the rest — she cites the acquired how before the world's
+      // noise.
       const connectedSlugs = connectedToolkitSlugs();
       const combined = selectedExactly
         ? [selectedExactly]
         : [
             ...sourceCandidates.map((candidate, index) => ({
               ...candidate,
-              score: (candidate.score ?? Math.max(0, 1 - (index / Math.max(1, sourceCandidates.length))))
-                + (opts.discloseForPlanning
-                  // The fresh planning broker is resolving missing executable
-                  // roles. Exact live provider candidates must survive the
-                  // bounded result card ahead of unrelated built-in controls;
-                  // otherwise a dependent source can be the ninth item and
-                  // plan_task can never cite it. This ranks disclosure only —
-                  // stage/freeze still owns authority.
-                  ? 2
-                  : candidateToolkitConnected(candidate.name, connectedSlugs) ? 0.5 : 0),
+              score: scoreDiscoveredSourceCandidate(
+                candidate,
+                index,
+                sourceCandidates.length,
+                {
+                  discloseForPlanning: Boolean(opts.discloseForPlanning),
+                  connectedToolkitSlugs: connectedSlugs,
+                },
+              ),
             })),
             ...rankedBuiltins.map((entry) => ({
               name: entry.name,
               summary: entry.oneLiner,
-              score: (entry.score ?? 0) + 1,
+              score: (entry.score ?? 0) + OWN_CATALOG_RANK_BOOST,
             })),
           ].sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
       const seen = new Set<string>();
@@ -634,15 +943,19 @@ export function registerToolSearchTool(
         return true;
       }).slice(0, TOOL_SEARCH_WINDOW_RESULTS);
       const metadataMap = await toolMetadataMap();
-      const planningCandidates: ToolSearchPlanningDisclosureCandidate[] = opts.discloseForPlanning
+      const planningOutcomes: (ToolSearchPlanningDisclosureCandidate | { name: string; refused: LocalPlanningRefusalReason } | null)[] = opts.discloseForPlanning
         ? (await Promise.all(rankedWindow.map(async (candidate) => {
-            const sourced = sourceCandidates.find((entry) => entry.name === candidate.name);
+            const sourcedMatches = sourceCandidates.filter((entry) => entry.name === candidate.name);
+            const sourced = sourcedMatches.length === 1 ? sourcedMatches[0] : undefined;
             if (sourced) {
               return {
                 name: sourced.name,
                 carrier: sourced.carrier,
                 sourceKind: sourced.sourceKind,
                 ...(sourced.schema !== undefined ? { schema: sourced.schema } : {}),
+                ...(sourced.planningAuthority
+                  ? { planningAuthority: sourced.planningAuthority }
+                  : {}),
               } satisfies ToolSearchPlanningDisclosureCandidate;
             }
             // Local authority is issued only for an exact row on this scoped
@@ -658,10 +971,58 @@ export function registerToolSearchTool(
               name: candidate.name,
               carrier,
               configuredNames: opts.allowedNames,
-            });
-          }))).filter((candidate): candidate is ToolSearchPlanningDisclosureCandidate => candidate !== null)
+            }).then((outcome) => (
+              outcome && 'refused' in outcome
+                ? { name: candidate.name, refused: outcome.refused }
+                : outcome
+            ));
+          })))
         : [];
+      // A refusal is KEPT, not dropped. It says the row cannot be CITED in a
+      // plan; the row's own carrier still says whether it can be CALLED now.
+      const planningRefusalByName = new Map(
+        planningOutcomes
+          .filter((outcome): outcome is { name: string; refused: LocalPlanningRefusalReason } => (
+            outcome !== null && 'refused' in outcome
+          ))
+          .map((outcome) => [outcome.name, outcome.refused] as const),
+      );
+      const planningCandidates = planningOutcomes
+        .filter((outcome): outcome is ToolSearchPlanningDisclosureCandidate => (
+          outcome !== null && !('refused' in outcome)
+        ));
       const planningCandidateByName = new Map(planningCandidates.map((candidate) => [candidate.name, candidate]));
+
+      /**
+       * Say what a ref-less row actually IS.
+       *
+       * Not citable is not not usable. The orchestrator routes exactly the
+       * names that fail the planning gate to the call_tool dispatcher, so a
+       * row whose carrier resolves to call_tool is dispatchable on THIS turn.
+       * Stamping one flat `unsupported_unmaterialized` across every ref-less
+       * row told the model the opposite, and it believed the label over the
+       * carrier sitting beside it — live 2026-08-27 seq 90427.
+       *
+       * A destructive row is named as such and gets NO invitation: the reason
+       * a plan will not carry it is the same reason a page must not nudge the
+       * model to fire it. Everything else keeps the original status, because a
+       * work_call-carrier row with no ref genuinely has no door on this turn.
+       */
+      const localPlanningRowStatus = (name: string): Record<string, unknown> => {
+        const refused = planningRefusalByName.get(name);
+        if (!refused) return { planningRefStatus: 'unsupported_unmaterialized' as const };
+        if (refused === 'destructive' || refused === 'irreversible_or_unknown') {
+          return { planningRefStatus: 'not_plannable_destructive' as const, planningRefusalReason: refused };
+        }
+        const carrier = opts.dispatchCarrierForName?.(name)
+          ?? opts.dispatchCarrier
+          ?? (opts.dispatchViaCallTool ? 'call_tool' : undefined);
+        if (carrier === 'call_tool') {
+          return { planningRefStatus: 'dispatch_now' as const, planningRefusalReason: refused };
+        }
+        return { planningRefStatus: 'unsupported_unmaterialized' as const, planningRefusalReason: refused };
+      };
+
       // Planning disclosure materializes exact host refs, which can mean one
       // LIVE schema fetch per candidate — measured ~3.3s each against the
       // provider today, and five consecutive 60-second tool_search calls in
@@ -669,19 +1030,84 @@ export function registerToolSearchTool(
       // stage walking a candidate list with no budget. Discovery is a READ:
       // it answers with what materialized inside the budget, and the
       // existing no-materialized-ref copy stays honest about the rest.
-      let disclosureTimer: ReturnType<typeof setTimeout> | undefined;
-      const disclosureExpired = Symbol('planning-disclosure-deadline');
-      const planningRefs = opts.discloseForPlanning
-        ? await Promise.race([
-            opts.discloseForPlanning(planningCandidates),
-            new Promise<typeof disclosureExpired>((resolve) => {
-              disclosureTimer = setTimeout(() => resolve(disclosureExpired), PLANNING_DISCLOSURE_DEADLINE_MS);
-            }),
-          ]).then((outcome) => {
-            if (disclosureTimer) clearTimeout(disclosureTimer);
-            return outcome === disclosureExpired ? {} : outcome;
-          })
-        : {};
+      const planningDisclosure = opts.discloseForPlanning
+        ? await (async (): Promise<ToolSearchPlanningDisclosureOutcome> => {
+            // Materialize already-independent MCP/reviewed-local rows first,
+            // then Composio's account-bound rows. The catalog mutation owner is
+            // intentionally sequential: concurrent callbacks could each read
+            // the same catalog snapshot and let the last writer erase the
+            // other's newly disclosed descriptor. Every group consumes the
+            // same absolute broker clock, so this does not stack unbounded
+            // provider allowances.
+            const independent = planningCandidates.filter((candidate) => (
+              candidate.sourceKind !== 'authorized_composio'
+            ));
+            const composio = planningCandidates.filter((candidate) => (
+              candidate.sourceKind === 'authorized_composio'
+            ));
+            const groups = [independent, composio].filter((group) => group.length > 0);
+            const disclose = opts.discloseForPlanning!;
+            const outcomes: Array<
+              Readonly<Record<string, string>>
+              | ToolSearchPlanningDisclosureOutcome
+              | null
+            > = [];
+            for (const group of groups) {
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              const controller = new AbortController();
+              const groupBudgetMs = Math.min(
+                PLANNING_DISCLOSURE_DEADLINE_MS,
+                remainingBrokerMs(),
+              );
+              if (groupBudgetMs <= 0) {
+                outcomes.push(null);
+                continue;
+              }
+              const groupDeadlineAt = Date.now() + groupBudgetMs;
+              try {
+                const outcome = await Promise.race([
+                  Promise.resolve(disclose(group, {
+                    signal: controller.signal,
+                    deadlineAt: groupDeadlineAt,
+                  })).catch(() => null),
+                  new Promise<null>((resolve) => {
+                    timer = setTimeout(() => {
+                      controller.abort();
+                      resolve(null);
+                    }, groupBudgetMs);
+                  }),
+                ]);
+                outcomes.push(
+                  controller.signal.aborted
+                  || Date.now() >= groupDeadlineAt
+                  || remainingBrokerMs() <= 0
+                  ? null
+                  : outcome,
+                );
+              } finally {
+                if (timer) clearTimeout(timer);
+              }
+            }
+            const refs: Record<string, string> = {};
+            const blockers: Record<string, ToolSearchPlanningBlocker> = {};
+            for (const outcome of outcomes) {
+              if (outcome === null) continue;
+              if (isPlanningDisclosureOutcome(outcome)) {
+                Object.assign(refs, outcome.refs);
+                Object.assign(blockers, outcome.blockers);
+              } else {
+                Object.assign(refs, outcome);
+              }
+            }
+            return Object.freeze({
+              version: 1,
+              refs: Object.freeze({ ...refs }),
+              blockers: Object.freeze({ ...blockers }),
+            });
+          })()
+        : Object.freeze({ version: 1, refs: Object.freeze({}), blockers: Object.freeze({}) });
+      const planningRefs: Readonly<Record<string, string>> = planningDisclosure.refs;
+      const planningBlockers: Readonly<Record<string, ToolSearchPlanningBlocker>> = planningDisclosure.blockers;
 
       const schemaForName = (name: string): unknown => {
         const localPlanning = planningCandidateByName.get(name);
@@ -724,7 +1150,27 @@ export function registerToolSearchTool(
           const causes = unavailable.map((entry) => `${entry.source}: ${entry.reason}`).join(' | ');
           return `Could not reach: ${causes}. This is a provider/connection problem, not evidence the capability is missing — do not conclude it does not exist or invent a reference for it. Retry this search once, or tell the user the connection could not be reached if it keeps failing.`;
         }
+        if (Object.keys(planningBlockers).length > 0) {
+          const choices = [...new Set(Object.values(planningBlockers).flatMap((blocker) => blocker.choices))];
+          return `Account selection is required before these provider results can receive a capabilityRef. Ask the user which exact connected account to use${choices.length ? ` (${choices.join(', ')})` : ''}; then repeat one search that names that account. Do not call plan_task or invent a capabilityRef before that search returns one.`;
+        }
         if (opts.discloseForPlanning && Object.keys(planningRefs).length === 0) {
+          // "No plan ref" is not "no door". The names below fail the plan-citation
+          // gate, which is exactly what routes them to the call_tool dispatcher,
+          // so they are invocable on this turn. Telling the model to refine
+          // discovery here sent it back to search five times while it was
+          // holding the tool with a full schema (live 2026-08-27, seq 90427).
+          // Destructive rows are deliberately never named here — a page that
+          // cannot plan them must not nudge the model to fire them either.
+          const callableNow = rankedWindow
+            .map((row) => row.name)
+            .filter((name) => {
+              const status = localPlanningRowStatus(name);
+              return status.planningRefStatus === 'dispatch_now';
+            });
+          if (callableNow.length > 0) {
+            return `None of these can be CITED in plan_task, but ${callableNow.length === 1 ? 'this one is' : 'these are'} directly invocable on this turn with call_tool(name, args_json): ${callableNow.join(', ')}. Each result carries its schema. Call what you need instead of re-searching; only refine discovery if none of them does the job.`;
+          }
           return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
         }
         if (exactCarrier) return dispatchHint(exactCarrier);
@@ -740,16 +1186,40 @@ export function registerToolSearchTool(
       })();
 
       type RankedWindowRow = (typeof rankedWindow)[number];
+
+      const selectedAccountForName = (name: string): ToolSearchSelectedAccountEvidence | undefined => {
+        const candidate = planningCandidateByName.get(name);
+        return candidate ? selectedAccountEvidenceByCandidate.get(candidate) : undefined;
+      };
+
       const publicResult = (r: RankedWindowRow) => ({
           name: r.name,
           summary: ('summary' in r ? r.summary : r.oneLiner).slice(0, 600),
-          ...(planningRefs[r.name] ? { capabilityRef: planningRefs[r.name] } : {}),
+          ...(planningRefs[r.name]
+            && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
+            ? { capabilityRef: planningRefs[r.name] }
+            : {}),
+          ...(planningRefs[r.name]
+            && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) > 1
+            ? {
+                capabilityVariants: planningCandidateByName.get(r.name)!.capabilityVariants,
+                capabilitySelection: 'Choose exactly one variant before plan_task; work_call arguments must match that frozen variant.',
+              }
+            : {}),
           ...(planningRefs[r.name] && planningCandidateByName.get(r.name)
             ? { planningProvenance: planningCandidateByName.get(r.name)!.sourceKind }
             : {}),
-          ...(opts.discloseForPlanning && !planningRefs[r.name]
-            ? { planningRefStatus: 'unsupported_unmaterialized' as const }
+          ...(planningRefs[r.name] && selectedAccountForName(r.name)
+            ? { selectedAccount: selectedAccountForName(r.name)! }
             : {}),
+          ...(planningBlockers[r.name]
+            ? {
+                planningRefStatus: 'account_selection_required' as const,
+                accountChoices: planningBlockers[r.name]!.choices,
+              }
+            : opts.discloseForPlanning && !planningRefs[r.name]
+              ? localPlanningRowStatus(r.name)
+              : {}),
           ...('carrier' in r && r.carrier
             ? { carrier: r.carrier }
             : opts.dispatchCarrierForName

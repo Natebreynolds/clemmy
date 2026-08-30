@@ -122,7 +122,7 @@ test('tool_search ranks from the index but requires one bounded live provider se
   const composioClient = await import('./client.js');
   await indexComposioToolkit({
     slug: 'acmehelpdesk',
-    accountIdentity: 'support@example.com',
+    accountIdentity: 'support@composio.dev',
     listOperations: async () => [
       { slug: 'ACMEHELPDESK_LIST_TICKETS', name: 'List tickets', description: 'List support tickets by status and assignee.' },
       { slug: 'ACMEHELPDESK_CREATE_TICKET', name: 'Create ticket', description: 'Open a new support ticket.' },
@@ -136,16 +136,30 @@ test('tool_search ranks from the index but requires one bounded live provider se
     user_id: 'capability-enumeration-user',
     toolkit: { slug: 'acmehelpdesk' },
   }]);
-  let liveSearchCalls = 0;
+  const liveSearchInputs: Record<string, unknown>[] = [];
   composioClient.__test__.setComposioClient({
     tools: {
       async getRawComposioTools(input: Record<string, unknown>) {
-        liveSearchCalls += 1;
-        assert.deepEqual(input, {
-          toolkits: ['acmehelpdesk'],
-          search: 'support tickets by assignee',
-          limit: 16,
-        });
+        liveSearchInputs.push(structuredClone(input));
+        if (Array.isArray(input.tools)) {
+          return (input.tools as string[]).map((slug) => ({
+            slug,
+            name: 'Create ticket',
+            description: 'Open a new support ticket.',
+            toolkit: { slug: 'acmehelpdesk' },
+            inputParameters: {
+              type: 'object',
+              required: ['subject'],
+              properties: { subject: { type: 'string' } },
+            },
+            outputParameters: {
+              type: 'object',
+              required: ['ticketId'],
+              properties: { ticketId: { type: 'string' } },
+            },
+            version: 'fixture-acmehelpdesk-create-v1',
+          }));
+        }
         return [{
           slug: 'ACMEHELPDESK_LIST_TICKETS',
           name: 'List tickets',
@@ -171,13 +185,27 @@ test('tool_search ranks from the index but requires one bounded live provider se
     assert.ok(composio, 'the composio broker source exists');
 
     const found = await composio!.search({ query: 'support tickets by assignee', limit: 5 });
-    assert.equal(liveSearchCalls, 1, 'the advisory index cannot suppress bounded live proof');
-    assert.equal(found.length, 1);
+    assert.deepEqual(liveSearchInputs, [{
+      toolkits: ['acmehelpdesk'],
+      search: 'support tickets by assignee',
+      limit: 16,
+    }, {
+      tools: ['ACMEHELPDESK_LIST_TICKETS', 'ACMEHELPDESK_CREATE_TICKET'],
+      limit: 2,
+    }], 'discovery deliberately performs one fuzzy proof plus one bounded exact nomination batch');
+    assert.equal(found.length, 2);
     const ticketRead = found.find((candidate) => candidate.name === 'ACMEHELPDESK_LIST_TICKETS');
     assert.ok(ticketRead, 'the exact live operation is offered');
     assert.equal(ticketRead?.carrier, 'work_call');
     assert.equal(ticketRead?.invocation?.fixedArgs?.tool_slug, 'ACMEHELPDESK_LIST_TICKETS');
     assert.match(String(ticketRead?.guidance ?? ''), /work_call/);
+    const ticketCreate = found.find((candidate) => candidate.name === 'ACMEHELPDESK_CREATE_TICKET');
+    assert.ok(ticketCreate, 'the exact provider row nominated by the index is also offered');
+    assert.deepEqual(ticketCreate?.schema, {
+      type: 'object',
+      required: ['subject'],
+      properties: { subject: { type: 'string' } },
+    });
   } finally {
     composioClient.__test__.setConnectedAccountsLoader(null);
     composioClient.__test__.setComposioApiKeyOverride(null);

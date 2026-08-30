@@ -10,13 +10,74 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-tools-test-'));
 
-const { registerSpaceTools, deriveRunnerProvenance } = await import('./space-tools.js');
+const {
+  registerSpaceTools,
+  deriveRunnerProvenance,
+  SPACE_INLINE_VIEW_MAX_BYTES,
+} = await import('./space-tools.js');
 const store = await import('../spaces/store.js');
 const { spaceActionNeedsApproval } = await import('../spaces/space-action-gate.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
+const capabilityCatalog = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifest = await import('../runtime/harness/capability-manifest.js');
+const { parseHostLocalWriteCommitFacts } = await import('../runtime/harness/host-local-write-commit.js');
+
+async function withCurrentReadOperations<T>(
+  operationIds: readonly string[],
+  run: () => Promise<T> | T,
+): Promise<T> {
+  const prior = capabilityCatalog.peekHostCapabilityCatalogFactory();
+  const entries = operationIds.map((operationId) => {
+    const fingerprint = createHash('sha256').update(`space-test:${operationId}`).digest('hex');
+    const manifest = capabilityManifest.attachSemanticContract({
+      version: 1,
+      manifestId: `cap:test:space-read:${fingerprint.slice(0, 24)}`,
+      providerKind: 'composio' as const,
+      operationId,
+      providerIdentity: 'fixture-provider',
+      providerVersion: 'fixture-v1',
+      operationVersion: '1',
+      definitionFingerprint: fingerprint,
+      effect: 'read' as const,
+      accountId: 'fixture-account',
+      idempotency: { required: false, policy: 'none' as const },
+      reconciliation: { supported: false, policy: 'none' as const },
+      outputContract: { kind: 'records' as const },
+      evidenceContract: { kinds: ['payload'] as const, readbackRequired: false },
+      provenance: { issuer: 'host:test', issuedAt: '2026-08-27T00:00:00.000Z', trusted: true },
+      lifecycle: { state: 'current' as const },
+      advisoryRoles: ['source'],
+    });
+    return {
+      capabilityId: manifest.manifestId,
+      toolName: manifest.operationId,
+      schemaVersion: manifest.operationVersion,
+      schemaDigest: manifest.definitionFingerprint,
+      effect: manifest.effect,
+      account: manifest.accountId,
+      manifestDigest: capabilityManifest.capabilityManifestDigest(manifest),
+      providerKind: manifest.providerKind,
+      liveFingerprint: manifest.definitionFingerprint,
+      manifest,
+      invoke: async () => ({}),
+    };
+  });
+  capabilityCatalog.installHostCapabilityCatalogFactory(
+    capabilityCatalog.createHostCapabilityCatalogFactory([
+      ...(prior?.snapshot() ?? []),
+      ...entries,
+    ]),
+  );
+  try {
+    return await run();
+  } finally {
+    capabilityCatalog.installHostCapabilityCatalogFactory(prior);
+  }
+}
 
 type Handler = (input: Record<string, unknown>) => Promise<unknown> | unknown;
 function captureTools(): Record<string, Handler> {
@@ -43,7 +104,7 @@ test('registerSpaceTools exposes Workspace authoring and deferred temporal reads
 });
 
 test('space_save creates a workspace, installs the view, returns the URL', async () => {
-  // Clem "writes" the view with write_file first → emulate by writing into BASE_DIR.
+  // Legacy/oversized compatibility: an already-authored path still installs.
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'spaces', 'crm', 'view', 'index.html');
   mkdirSync(path.dirname(draft), { recursive: true });
   writeFileSync(draft, '<html><body>CRM v1</body></html>', 'utf-8');
@@ -74,7 +135,80 @@ test('space_save creates a workspace, installs the view, returns the URL', async
 
 test('space_save rejects an invalid slug and a missing view on create', async () => {
   assert.match(text(await tools.space_save({ slug: 'Bad Slug', title: 'x', view_path: null })), /not a valid workspace slug/);
-  assert.match(text(await tools.space_save({ slug: 'newone', title: 'x', view_path: null })), /view_path is required/);
+  assert.match(text(await tools.space_save({ slug: 'newone', title: 'x', view_path: null })), /view_html or view_path is required/);
+  assert.equal(store.spaceStore.get('newone'), undefined);
+});
+
+test('space_save inline create is one authoritative commit and later inline save is versioned', async () => {
+  const firstView = '<html><body><h1>Inline v1</h1></body></html>';
+  const created = text(await tools.space_save({
+    slug: 'inline-view',
+    title: 'Inline View',
+    view_html: firstView,
+    view_path: null,
+  }));
+  assert.match(created, /Created workspace "Inline View"/);
+  assert.equal(store.spaceStore.get('inline-view')?.version, 1);
+  assert.equal(readFileSync(store.resolveInSpace('inline-view', 'view/index.html'), 'utf-8'), firstView);
+
+  const secondView = '<html><body><h1>Inline v2</h1></body></html>';
+  const updated = text(await tools.space_save({
+    slug: 'inline-view',
+    title: 'Inline View',
+    view_html: secondView,
+    view_path: null,
+  }));
+  assert.match(updated, /Updated workspace/);
+  const rec = store.spaceStore.get('inline-view');
+  assert.equal(rec?.version, 2);
+  assert.equal(rec?.revisions.length, 1);
+  assert.equal(readFileSync(store.resolveInSpace('inline-view', 'view/index.html'), 'utf-8'), secondView);
+  assert.equal(readFileSync(store.resolveInSpace('inline-view', rec!.revisions[0].file), 'utf-8'), firstView);
+});
+
+test('space_save refuses conflicting, blank, and oversized inline view inputs before commit', async () => {
+  const conflict = text(await tools.space_save({
+    slug: 'inline-conflict',
+    title: 'Inline Conflict',
+    view_html: '<html><body>inline</body></html>',
+    view_path: path.join(process.env.CLEMENTINE_HOME!, 'does-not-need-to-exist.html'),
+  }));
+  assert.match(conflict, /exactly one of view_html or view_path/);
+  assert.equal(store.spaceStore.get('inline-conflict'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('inline-conflict', 'view/index.html')), false);
+
+  const blank = text(await tools.space_save({
+    slug: 'inline-blank',
+    title: 'Inline Blank',
+    view_html: '   ',
+    view_path: null,
+  }));
+  assert.match(blank, /view_html must contain non-blank HTML/);
+  assert.equal(store.spaceStore.get('inline-blank'), undefined);
+
+  const oversized = text(await tools.space_save({
+    slug: 'inline-oversized',
+    title: 'Inline Oversized',
+    // Multibyte input proves the bound is authoritative UTF-8 bytes, not JS characters.
+    view_html: '€'.repeat(Math.floor(SPACE_INLINE_VIEW_MAX_BYTES / 3) + 1),
+    view_path: null,
+  }));
+  assert.match(oversized, /over the 24000-byte inline limit/);
+  assert.equal(store.spaceStore.get('inline-oversized'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('inline-oversized', 'view/index.html')), false);
+});
+
+test('space_save refuses invalid inline HTML before writing a canonical view or manifest', async () => {
+  const out = text(await tools.space_save({
+    slug: 'inline-invalid',
+    title: 'Inline Invalid',
+    view_html: '<html><script>const broken = {;</script><body>Never committed</body></html>',
+    view_path: null,
+  }));
+  assert.match(out, /was NOT saved/);
+  assert.match(out, /JavaScript syntax error/);
+  assert.equal(store.spaceStore.get('inline-invalid'), undefined);
+  assert.equal(existsSync(store.resolveInSpace('inline-invalid', 'view/index.html')), false);
 });
 
 test('space_save updates in place + snapshots the prior view (revert path)', async () => {
@@ -98,14 +232,14 @@ test('space_save updates in place + snapshots the prior view (revert path)', asy
 test('space_save records declared data sources + re-engage contract', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-planner.html');
   writeFileSync(draft, '<html><script>clem.data().then(data => render(data.cal))</script></html>', 'utf-8');
-  await tools.space_save({
+  await withCurrentReadOperations(['GOOGLECALENDAR_LIST_EVENTS'], () => tools.space_save({
     slug: 'planner',
     title: 'Daily Planner',
     view_path: draft,
     data_sources: [{ id: 'cal', composio_slug: 'GOOGLECALENDAR_LIST_EVENTS', composio_args_json: '{"max":10}', schedule: '0 7 * * *', timezone: 'America/Los_Angeles', runner: null }],
     reengage_triggers: ['note', 'ask'],
     reengage_guidance: 'reschedule anything that slips',
-  });
+  }));
   const rec = store.spaceStore.get('planner');
   assert.equal(rec?.dataSources.length, 1);
   assert.equal(rec?.dataSources[0].composioSlug, 'GOOGLECALENDAR_LIST_EVENTS');
@@ -117,12 +251,12 @@ test('space_save refuses a data-backed view that only reads an imaginary window 
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-imaginary-seed.html');
   writeFileSync(draft, '<html><script>const data=window.__SPACE_DATA__||{}; render(data.tasks)</script></html>', 'utf-8');
 
-  const out = text(await tools.space_save({
+  const out = text(await withCurrentReadOperations(['SALESFORCE_GET_TASKS'], () => tools.space_save({
     slug: 'imaginary-seed',
     title: 'Imaginary Seed',
     view_path: draft,
     data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS' }],
-  }));
+  })));
 
   assert.match(out, /was NOT saved/);
   assert.match(out, /fix these implementation issues now/);
@@ -143,12 +277,12 @@ test('space_save refuses legacy {{source}} binding before activating a dynamic W
     </html>`,
     'utf-8',
   );
-  const out = text(await tools.space_save({
+  const out = text(await withCurrentReadOperations(['SALESFORCE_GET_TASKS'], () => tools.space_save({
     slug: 'legacy-binding',
     title: 'Legacy Binding',
     view_path: draft,
     data_sources: [{ id: 'tasks', composio_slug: 'SALESFORCE_GET_TASKS', allow_empty: true }],
-  }));
+  })));
 
   assert.match(out, /was NOT saved/);
   assert.match(out, /clem\.data\(\)/);
@@ -578,12 +712,14 @@ test('space_try_runner never spawns arbitrary runner code', async () => {
   await tools.space_save({ slug: 'tryrunner', title: 'TryRunner', view_path: draft });
   const runnerDir = store.resolveInSpace('tryrunner', 'data');
   mkdirSync(runnerDir, { recursive: true });
-  writeFileSync(path.join(runnerDir, 'pull.mjs'),
-    'import { writeFileSync } from "node:fs"; writeFileSync(new URL("./spawned.txt", import.meta.url), "yes"); process.stdout.write("[]")', 'utf-8');
+  const runnerPath = path.join(runnerDir, 'pull.mjs');
+  const runnerSource = 'import { writeFileSync } from "node:fs"; writeFileSync(new URL("./spawned.txt", import.meta.url), "yes"); process.stdout.write("[]")';
+  writeFileSync(runnerPath, runnerSource, 'utf-8');
 
   const res = text(await tools.space_try_runner({ slug: 'tryrunner', runner_path: 'pull.mjs', payload_json: null }));
   assert.match(res, /did not execute|static/i);
   assert.match(res, /arbitrary runner|external/i);
+  assert.equal(readFileSync(runnerPath, 'utf-8'), runnerSource);
   assert.equal(existsSync(path.join(runnerDir, 'spawned.txt')), false);
   assert.equal(existsSync(store.resolveInSpace('tryrunner', 'data.json')), false);
 });
@@ -875,7 +1011,24 @@ test('space_edit_runner applies a verbatim find/replace on a runner and is rever
   assert.match(res, /space_revert_runner/);
   // action runner → NOT auto-run (no side effect)
   assert.match(res, /action "Refresh Why.*not auto-run/);
-  const after = readFileSync(store.resolveInSpace(slug, 'data/deepwhy.mjs'), 'utf-8');
+  const runnerFile = store.resolveInSpace(slug, 'data/deepwhy.mjs');
+  const after = readFileSync(runnerFile, 'utf-8');
+  const commit = parseHostLocalWriteCommitFacts(res);
+  assert.ok(commit, 'the successful runner edit carries the canonical host-local commit marker');
+  assert.equal(
+    parseHostLocalWriteCommitFacts(res.slice(res.indexOf('\n') + 1)),
+    null,
+    'the success prose alone cannot masquerade as an exact local commit',
+  );
+  assert.deepEqual({
+    createdId: commit.createdId,
+    handle: commit.handle,
+    contentDigest: commit.contentDigest,
+  }, {
+    createdId: slug,
+    handle: `spaces/${slug}/data/deepwhy.mjs`,
+    contentDigest: createHash('sha256').update(readFileSync(runnerFile)).digest('hex'),
+  });
   assert.match(after, /AccountId IN \('FIXTURE_ACCOUNT_ID'\)/);
   assert.equal(after.includes("RelatedToId IN ('FIXTURE_OPPORTUNITY_ID')"), false);
 
@@ -891,6 +1044,7 @@ test('space_edit_runner on a non-matching find returns a precise hint and does N
     edits: [{ find: 'RelatedToXd IN', replace: 'x' }],
   }));
   assert.match(res, /No edits applied/);
+  assert.equal(parseHostLocalWriteCommitFacts(res), null, 'a no-op never advertises a local commit');
   assert.match(res, /matched the first \d+ char/);
   assert.match(res, /space_get_runner/);
   // unchanged

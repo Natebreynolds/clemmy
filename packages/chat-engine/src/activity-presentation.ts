@@ -1,4 +1,5 @@
 import type { ActivityItem, MessageStatus } from './types.js';
+import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
 import { isWorkPlanRow, workPlanStepLabel } from './work-plan-presentation.js';
 
 export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted';
@@ -17,9 +18,13 @@ export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted';
  *
  *   1. DISCOVERY IS NOT WORK. Looking up which tool to use is overhead, like
  *      narrating a walk to the filing cabinet. After the turn it is hidden.
- *      While live and nothing else has happened yet, it collapses to one
- *      human row ("Finding the right tool…") so the strip is not a blank
- *      pause. Failed lookups stay visible — they explain the silence.
+ *      While live and lookup is still in flight, it collapses to one human
+ *      row ("Finding the right tool…") so the strip is not a blank pause.
+ *      Once lookup has settled and no work row exists yet, the stand-in is
+ *      the wait on the next step ("Working on it…") — keeping the lookup
+ *      label after search finished is a lie (live 2026-08-28: Grok had
+ *      already searched and planned; the phone still said it was finding a
+ *      tool). Failed lookups stay visible — they explain the silence.
  *   2. REPETITION IS ONE THING HAPPENING, NOT MANY. Three identical lookups are
  *      one line with a count. This also stops a retry storm from burying the
  *      one row that matters.
@@ -60,6 +65,7 @@ export interface NarrateOptions {
 
 const DISCOVERY_LIVE_ID = 'discovery-live';
 const DISCOVERY_LIVE_LABEL = 'Finding the right tool…';
+const WORKING_LIVE_LABEL = 'Working on it…';
 const CAPABILITY_INVENTORY_RE = /^Grounded in what's proven:/i;
 const COMPILER_NODE_LABEL_RE = /^N\d+\s+/i;
 const BLOCKED_PLAN_LABEL_RE = /— blocked$/i;
@@ -98,6 +104,11 @@ export function narrateActivity(
   let discoveryRunning = false;
   let discoveryStartedAt: number | undefined;
   for (const raw of items) {
+    // Model-side phase is live affordance, not completed work. Keeping it out
+    // of settled receipts also prevents "Thinking with X" from inflating the
+    // user's step count after the answer lands.
+    if (raw.id === MODEL_PHASE_ACTIVITY_ID && options.live !== true) continue;
+
     // Inventory and compiler sequencing are not work. A leftover Outlook pin
     // or "N6 execute — blocked" is the mechanism, not the job.
     if (isCapabilityInventoryRow(raw)) continue;
@@ -107,7 +118,8 @@ export function narrateActivity(
 
     // 1 — discovery is overhead, unless it FAILED, in which case it is the
     // reason nothing else happened and must stay visible. While live and
-    // nothing else is on screen yet, one human stand-in replaces the blank.
+    // nothing else is on screen yet, one phase-honest stand-in replaces the
+    // blank: lookup in flight vs wait after lookup.
     if (isDiscoveryRow(item) && item.status !== 'failed') {
       discoverySeen = true;
       if (item.status === 'running') discoveryRunning = true;
@@ -133,18 +145,36 @@ export function narrateActivity(
     }
     out.push({ ...item });
   }
-  if (options.live && discoverySeen && out.length === 0) {
-    return [{
+  if (options.live && discoverySeen) {
+    const modelPhasePresent = out.some((row) => row.id === MODEL_PHASE_ACTIVITY_ID);
+    const concreteWorkRunning = out.some((row) => (
+      row.status === 'running' && row.id !== MODEL_PHASE_ACTIVITY_ID
+    ));
+    if (!concreteWorkRunning && (discoveryRunning || !modelPhasePresent)) out.push({
       id: DISCOVERY_LIVE_ID,
       kind: 'event',
       variant: 'lifecycle',
-      label: DISCOVERY_LIVE_LABEL,
-      status: discoveryRunning ? 'running' : 'done',
-      tone: discoveryRunning ? 'live' : 'muted',
+      label: discoveryRunning ? DISCOVERY_LIVE_LABEL : WORKING_LIVE_LABEL,
+      status: 'running',
+      tone: 'live',
       ...(discoveryStartedAt !== undefined ? { startedAt: discoveryStartedAt } : {}),
-    }];
+    });
   }
   return out;
+}
+
+/** The one live headline rule shared by phone surfaces and pure regressions.
+ * A settled row is historical evidence, never a description of what is
+ * happening now. If no running row exists, retain an honest generic wait. */
+export function liveActivityHeadline(items: readonly ActivityItem[]): string {
+  let modelPhase: ActivityItem | undefined;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.status !== 'running') continue;
+    if (item.id !== MODEL_PHASE_ACTIVITY_ID) return item.label;
+    modelPhase ??= item;
+  }
+  return modelPhase?.label ?? WORKING_LIVE_LABEL;
 }
 
 /** How many rows the narration hid, so a diagnostics affordance can offer them

@@ -120,6 +120,89 @@ test('runClaudeAgentSdkWorker builds a worker packet prompt with read-only tools
   assert.equal(captured.workerScope, true, 'worker identity reaches the SDK independently of the optional thrash guard');
 });
 
+test('Claude SDK worker threads provider total cost and cache usage into one canonical route row', async () => {
+  setClaudeAgentSdkWorkerRunForTest(async () => ({
+    text: 'worker cost receipt',
+    sessionId: 'sdk-cost-session',
+    model: 'claude-sonnet-4-6',
+    toolUses: [],
+    modelRouteUsage: {
+      inputTokens: 120,
+      cachedTokens: 90,
+      outputTokens: 8,
+      totalTokens: 128,
+      costUsd: 0.031,
+    },
+  }));
+
+  await runClaudeAgentSdkWorker(packet, 'claude-sonnet-4-6', 'sess-sdk-cost-ledger');
+  const { openModelRouteMetricsDb } = await import('../model-route-metrics.js');
+  const rows = openModelRouteMetricsDb().prepare(`
+    SELECT d.role, d.provider, d.resolved_model, o.status, o.input_tokens,
+           o.cached_tokens, o.output_tokens, o.total_tokens, o.cost_usd
+    FROM model_route_decisions d
+    JOIN model_route_outcomes o ON o.decision_id = d.id
+    WHERE d.session_id = ?
+  `).all('sess-sdk-cost-ledger');
+  assert.deepEqual(rows, [{
+    role: 'worker',
+    provider: 'claude',
+    resolved_model: 'claude-sonnet-4-6',
+    status: 'success',
+    input_tokens: 120,
+    cached_tokens: 90,
+    output_tokens: 8,
+    total_tokens: 128,
+    cost_usd: 0.031,
+  }]);
+});
+
+test('a safe Claude SDK replay records each physical query once without collapsing or mirroring cost', async () => {
+  let attempt = 0;
+  setClaudeAgentSdkWorkerRunForTest(async () => {
+    attempt += 1;
+    if (attempt === 1) {
+      const error = new Error('provider attempt failed');
+      Object.defineProperty(error, 'modelRouteUsage', {
+        value: { inputTokens: 10, cachedTokens: 4, outputTokens: 1, totalTokens: 11, costUsd: 0.01 },
+      });
+      throw error;
+    }
+    return {
+      text: 'replayed worker completed',
+      sessionId: 'sdk-replay-session',
+      model: 'claude-sonnet-4-6',
+      toolUses: [],
+      modelRouteUsage: {
+        inputTokens: 12,
+        cachedTokens: 8,
+        outputTokens: 2,
+        totalTokens: 14,
+        costUsd: 0.02,
+      },
+    };
+  });
+
+  await assert.rejects(
+    runClaudeAgentSdkWorker(packet, 'claude-sonnet-4-6', 'sess-sdk-route-replay'),
+    /provider attempt failed/,
+  );
+  await runClaudeAgentSdkWorker(packet, 'claude-sonnet-4-6', 'sess-sdk-route-replay');
+
+  const { openModelRouteMetricsDb } = await import('../model-route-metrics.js');
+  const rows = openModelRouteMetricsDb().prepare(`
+    SELECT o.status, o.input_tokens, o.cached_tokens, o.total_tokens, o.cost_usd
+    FROM model_route_decisions d
+    JOIN model_route_outcomes o ON o.decision_id = d.id
+    WHERE d.session_id = ?
+    ORDER BY d.rowid ASC
+  `).all('sess-sdk-route-replay');
+  assert.deepEqual(rows, [
+    { status: 'failed', input_tokens: 10, cached_tokens: 4, total_tokens: 11, cost_usd: 0.01 },
+    { status: 'success', input_tokens: 12, cached_tokens: 8, total_tokens: 14, cost_usd: 0.02 },
+  ]);
+});
+
 // ── 2026-06-22 fan-out fix: SDK-lane cap visibility + intent-aware cap ─────────
 // This is the lane Alexander's claude_oauth workers take. Both behaviors gated under
 // CLEMMY_WORKER_THRASH_GUARD (default on). Asserted via the injected-run seam.

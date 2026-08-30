@@ -8,6 +8,7 @@ import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
  * names no provider, tool, catalog row, schedule, or recurrence.
  */
 export const WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION = 1 as const;
+export const WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION = 2 as const;
 
 export type WorkflowCanonicalEntityFieldTypeV1 =
   | 'string'
@@ -38,6 +39,27 @@ export interface WorkflowCanonicalEntityIdentityRuleProjectionV1 {
   normalizers: WorkflowCanonicalEntityNormalizerV1[];
   exactIdentifierNamespace: string;
 }
+
+/**
+ * Version 2 stops treating every normalized identity rule as an exact
+ * identifier. The reviewed bytes explicitly name the evidence class that the
+ * canonical resolver will receive; field count and field names never infer it.
+ */
+export type WorkflowCanonicalEntityIdentityRuleProjectionV2 =
+  | {
+      kind: 'exact_identifier';
+      ruleId: string;
+      fields: string[];
+      normalizers: WorkflowCanonicalEntityNormalizerV1[];
+      namespace: string;
+    }
+  | {
+      kind: 'compound_signal';
+      ruleId: string;
+      fields: string[];
+      normalizers: WorkflowCanonicalEntityNormalizerV1[];
+      signalName: string;
+    };
 
 export interface WorkflowCanonicalEntityResolutionPolicyV1 {
   policyId: string;
@@ -96,8 +118,33 @@ export interface WorkflowCanonicalEntityResultProjectionV1 {
   projectionDigest: string;
 }
 
+export interface WorkflowCanonicalEntityResultProjectionV2 extends Omit<
+  WorkflowCanonicalEntityResultProjectionV1,
+  'version' | 'identityRules' | 'partition'
+> {
+  version: typeof WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION;
+  identityRules: WorkflowCanonicalEntityIdentityRuleProjectionV2[];
+  partition: {
+    kind: 'workflow_run';
+    coverageItems: 'source_record_occurrences';
+    denominator: 'settled_record_count' | 'unknown';
+    completion: 'closed_authority_exhaustion';
+    /** Reviewed interpretation of the exact durable workflow-read aggregate.
+     * Failure projection is opt-in and never inferred from terminal prose. */
+    outcomeAuthority: {
+      version: 1;
+      kind: 'workflow_read_aggregate';
+      acceptedTerminalStates: ['completed'] | ['completed', 'failed'];
+    };
+  };
+}
+
+export type WorkflowCanonicalEntityResultProjection =
+  | WorkflowCanonicalEntityResultProjectionV1
+  | WorkflowCanonicalEntityResultProjectionV2;
+
 export type WorkflowCanonicalEntityResultProjectionParseResult =
-  | { ok: true; contract: WorkflowCanonicalEntityResultProjectionV1 }
+  | { ok: true; contract: WorkflowCanonicalEntityResultProjection }
   | { ok: false; errors: string[] };
 
 const DIGEST_RE = /^[a-f0-9]{64}$/;
@@ -168,23 +215,32 @@ function positiveBound(value: unknown, maximum: number): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0 && Number(value) <= maximum;
 }
 
-function withoutDigest(
-  contract: WorkflowCanonicalEntityResultProjectionV1,
-): Omit<WorkflowCanonicalEntityResultProjectionV1, 'projectionDigest'> {
+function acceptedTerminalStates(value: unknown): value is ['completed'] | ['completed', 'failed'] {
+  return Array.isArray(value) && (
+    (value.length === 1 && value[0] === 'completed')
+    || (value.length === 2 && value[0] === 'completed' && value[1] === 'failed')
+  );
+}
+
+function withoutDigest<T extends WorkflowCanonicalEntityResultProjection>(
+  contract: T,
+): Omit<T, 'projectionDigest'> {
   const { projectionDigest: _ignored, ...rest } = contract;
-  return rest;
+  return rest as Omit<T, 'projectionDigest'>;
 }
 
 export function workflowCanonicalEntityResultProjectionDigest(
   contract: Omit<WorkflowCanonicalEntityResultProjectionV1, 'projectionDigest'>
-    | WorkflowCanonicalEntityResultProjectionV1,
+    | WorkflowCanonicalEntityResultProjectionV1
+    | Omit<WorkflowCanonicalEntityResultProjectionV2, 'projectionDigest'>
+    | WorkflowCanonicalEntityResultProjectionV2,
 ): string {
   const value = 'projectionDigest' in contract
-    ? withoutDigest(contract as WorkflowCanonicalEntityResultProjectionV1)
+    ? withoutDigest(contract as WorkflowCanonicalEntityResultProjection)
     : contract;
   return sha256(canonicalJson({
     domain: 'workflow-canonical-entity-result-projection',
-    version: WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION,
+    version: value.version,
     contract: value,
   }));
 }
@@ -192,9 +248,9 @@ export function workflowCanonicalEntityResultProjectionDigest(
 export function parseWorkflowCanonicalEntityResultProjection(
   value: unknown,
 ): WorkflowCanonicalEntityResultProjectionParseResult {
-  let canonical: WorkflowCanonicalEntityResultProjectionV1;
+  let canonical: WorkflowCanonicalEntityResultProjection;
   try {
-    canonical = JSON.parse(canonicalJson(value)) as WorkflowCanonicalEntityResultProjectionV1;
+    canonical = JSON.parse(canonicalJson(value)) as WorkflowCanonicalEntityResultProjection;
   } catch (error) {
     return { ok: false, errors: [error instanceof Error ? error.message : 'Result projection is not bounded plain JSON.'] };
   }
@@ -205,8 +261,9 @@ export function parseWorkflowCanonicalEntityResultProjection(
     'identityRules', 'resolutionPolicy', 'fieldResolution', 'provenance',
     'partition', 'bounds', 'projectionDigest',
   ])) return { ok: false, errors: ['Result projection must be a closed versioned object.'] };
-  if (canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION) {
-    errors.push(`Result projection version must be ${WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION}.`);
+  if (canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION
+    && canonical.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION) {
+    errors.push('Result projection version must be 1 or 2.');
   }
   if (!path(canonical.recordsPath)) errors.push('recordsPath must be an exact bounded record path.');
   if (!id(canonical.entityKind)) errors.push('entityKind must be an exact bounded identity.');
@@ -249,7 +306,8 @@ export function parseWorkflowCanonicalEntityResultProjection(
   )) errors.push('sourceRecord.observedAt must be an exact record path or page settlement source.');
 
   const ruleIds = new Set<string>();
-  const namespaces = new Set<string>();
+  const exactNamespaces = new Set<string>();
+  const compoundSignalNames = new Set<string>();
   if (!Array.isArray(canonical.identityRules)
     || canonical.identityRules.length < 1
     || canonical.identityRules.length > MAX_RULES) {
@@ -257,19 +315,48 @@ export function parseWorkflowCanonicalEntityResultProjection(
   } else {
     for (const [index, rule] of canonical.identityRules.entries()) {
       const item = record(rule);
-      if (!item || !exactKeys(item, ['ruleId', 'fields', 'normalizers', 'exactIdentifierNamespace'])) {
+      if (!item) {
         errors.push(`identityRules[${index}] must be closed.`);
         continue;
       }
       if (!id(rule.ruleId) || ruleIds.has(rule.ruleId)) errors.push(`identityRules[${index}].ruleId is invalid or duplicated.`);
       else ruleIds.add(rule.ruleId);
-      if (!id(rule.exactIdentifierNamespace) || namespaces.has(rule.exactIdentifierNamespace)) {
-        errors.push(`identityRules[${index}].exactIdentifierNamespace is invalid or duplicated.`);
-      } else namespaces.add(rule.exactIdentifierNamespace);
+      if (canonical.version === 1) {
+        const legacyRule = rule as WorkflowCanonicalEntityIdentityRuleProjectionV1;
+        if (!exactKeys(item, ['ruleId', 'fields', 'normalizers', 'exactIdentifierNamespace'])) {
+          errors.push(`identityRules[${index}] must be a closed version-1 exact identifier rule.`);
+        } else if (!id(legacyRule.exactIdentifierNamespace)
+          || exactNamespaces.has(legacyRule.exactIdentifierNamespace)) {
+          errors.push(`identityRules[${index}].exactIdentifierNamespace is invalid or duplicated.`);
+        } else exactNamespaces.add(legacyRule.exactIdentifierNamespace);
+      } else {
+        const currentRule = rule as WorkflowCanonicalEntityIdentityRuleProjectionV2;
+        if (currentRule.kind === 'exact_identifier') {
+          if (!exactKeys(item, ['kind', 'ruleId', 'fields', 'normalizers', 'namespace'])) {
+            errors.push(`identityRules[${index}] must be a closed exact_identifier rule.`);
+          } else if (!id(currentRule.namespace) || exactNamespaces.has(currentRule.namespace)) {
+            errors.push(`identityRules[${index}].namespace is invalid or duplicated.`);
+          } else exactNamespaces.add(currentRule.namespace);
+        } else if (currentRule.kind === 'compound_signal') {
+          if (!exactKeys(item, ['kind', 'ruleId', 'fields', 'normalizers', 'signalName'])) {
+            errors.push(`identityRules[${index}] must be a closed compound_signal rule.`);
+          } else if (!id(currentRule.signalName)
+            || compoundSignalNames.has(currentRule.signalName)) {
+            errors.push(`identityRules[${index}].signalName is invalid or duplicated.`);
+          } else compoundSignalNames.add(currentRule.signalName);
+        } else {
+          errors.push(`identityRules[${index}].kind must be exact_identifier or compound_signal.`);
+        }
+      }
       if (!Array.isArray(rule.fields) || rule.fields.length < 1 || rule.fields.length > 32
         || new Set(rule.fields).size !== rule.fields.length
         || rule.fields.some((name) => !field(name) || !names.has(name))) {
         errors.push(`identityRules[${index}].fields do not exactly reference projected fields.`);
+      }
+      if (canonical.version === 2
+        && (rule as WorkflowCanonicalEntityIdentityRuleProjectionV2).kind === 'compound_signal'
+        && rule.fields.length < 2) {
+        errors.push(`identityRules[${index}].fields requires at least two components for compound_signal.`);
       }
       if (!Array.isArray(rule.normalizers) || rule.normalizers.length < 1 || rule.normalizers.length > 8
         || new Set(rule.normalizers).size !== rule.normalizers.length
@@ -315,7 +402,7 @@ export function parseWorkflowCanonicalEntityResultProjection(
     const exclusive = canonical.resolutionPolicy.exclusiveIdentifierNamespaces;
     if (exclusive !== undefined && (!Array.isArray(exclusive)
       || new Set(exclusive).size !== exclusive.length
-      || exclusive.some((namespace) => !namespaces.has(namespace)))) {
+      || exclusive.some((namespace) => !exactNamespaces.has(namespace)))) {
       errors.push('resolutionPolicy.exclusiveIdentifierNamespaces must reference projected namespaces exactly.');
     }
   }
@@ -331,13 +418,29 @@ export function parseWorkflowCanonicalEntityResultProjection(
     || !exactKeys(record(canonical.provenance) ?? {}, ['kind', 'retainSourceSnapshots'])) {
     errors.push('provenance does not name exact workflow/page/record lineage.');
   }
+  const partition = record(canonical.partition);
+  const outcomeAuthority = canonical.version === 2
+    ? record((canonical.partition as WorkflowCanonicalEntityResultProjectionV2['partition'])?.outcomeAuthority)
+    : null;
   if (canonical.partition?.kind !== 'workflow_run'
     || canonical.partition?.coverageItems !== 'source_record_occurrences'
-    || canonical.partition?.denominator !== 'settled_record_count'
+    || (canonical.version === 1
+      ? canonical.partition?.denominator !== 'settled_record_count'
+      : !['settled_record_count', 'unknown'].includes(String(canonical.partition?.denominator)))
     || canonical.partition?.completion !== 'closed_authority_exhaustion'
-    || !exactKeys(record(canonical.partition) ?? {}, [
-      'kind', 'coverageItems', 'denominator', 'completion',
-    ])) errors.push('partition/coverage mapping is unsupported or incomplete.');
+    || !partition
+    || !exactKeys(partition, canonical.version === 1
+      ? ['kind', 'coverageItems', 'denominator', 'completion']
+      : ['kind', 'coverageItems', 'denominator', 'completion', 'outcomeAuthority'])
+    || (canonical.version === 2 && (
+      !outcomeAuthority
+      || !exactKeys(outcomeAuthority, ['version', 'kind', 'acceptedTerminalStates'])
+      || outcomeAuthority.version !== 1
+      || outcomeAuthority.kind !== 'workflow_read_aggregate'
+      || !acceptedTerminalStates(outcomeAuthority.acceptedTerminalStates)
+      || (outcomeAuthority.acceptedTerminalStates.some((state) => state === 'failed')
+        && canonical.partition.denominator !== 'unknown')
+    ))) errors.push('partition/coverage mapping is unsupported or incomplete.');
 
   const bounds = record(canonical.bounds);
   if (!bounds || !exactKeys(bounds, [
@@ -390,5 +493,27 @@ export function createWorkflowCanonicalEntityResultProjection(
   };
   const parsed = parseWorkflowCanonicalEntityResultProjection(candidate);
   if (!parsed.ok) throw new Error(parsed.errors.join(' '));
+  if (parsed.contract.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_VERSION) {
+    throw new Error('Created version-1 result projection parsed as a different version.');
+  }
+  return parsed.contract;
+}
+
+export function createWorkflowCanonicalEntityResultProjectionV2(
+  input: Omit<WorkflowCanonicalEntityResultProjectionV2, 'version' | 'projectionDigest'>,
+): WorkflowCanonicalEntityResultProjectionV2 {
+  const withoutProjectionDigest = JSON.parse(canonicalJson({
+    version: WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION,
+    ...input,
+  })) as Omit<WorkflowCanonicalEntityResultProjectionV2, 'projectionDigest'>;
+  const candidate: WorkflowCanonicalEntityResultProjectionV2 = {
+    ...withoutProjectionDigest,
+    projectionDigest: workflowCanonicalEntityResultProjectionDigest(withoutProjectionDigest),
+  };
+  const parsed = parseWorkflowCanonicalEntityResultProjection(candidate);
+  if (!parsed.ok) throw new Error(parsed.errors.join(' '));
+  if (parsed.contract.version !== WORKFLOW_CANONICAL_ENTITY_RESULT_PROJECTION_V2_VERSION) {
+    throw new Error('Created version-2 result projection parsed as a different version.');
+  }
   return parsed.contract;
 }

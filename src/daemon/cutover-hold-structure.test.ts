@@ -135,6 +135,7 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/runtime/build-info.ts',
       'src/runtime/cutover-hold.ts',
       'src/runtime/harness/eventlog-schema.ts',
+      'src/runtime/harness/host-planned-resolution-coexistence.ts',
       'src/runtime/harness/schema-version.ts',
       'src/runtime/security.ts',
       'src/runtime/source-fingerprint.ts',
@@ -144,6 +145,7 @@ test('held parent and migration child have exact minimal runtime import closures
   assert.deepEqual(runtimeImportClosure('src/runtime/harness/eventlog-schema.ts'), {
     modules: [
       'src/runtime/harness/eventlog-schema.ts',
+      'src/runtime/harness/host-planned-resolution-coexistence.ts',
       'src/runtime/harness/schema-version.ts',
     ],
     packages: ['better-sqlite3'],

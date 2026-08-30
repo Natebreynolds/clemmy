@@ -29,6 +29,8 @@ declare global {
       refresh?(): void;
       /** Called by the shell when the door or reachability changes. */
       setConnection?(door: ConnectionDoor): void;
+      /** Native durably parked this exact relay lease in Keychain. */
+      originHandoffStored?(value: { handoffId: string; generation: number }): void;
     };
     webkit?: {
       messageHandlers?: Record<string, { postMessage(body: unknown): void } | undefined>;
@@ -63,11 +65,39 @@ export function inNativeShell(): boolean {
  * it as `?adopt=` when it loads the relay origin. Absent shell = no-op, and
  * the token simply expires unused.
  */
-export function parkOriginHandoff(token: string, expiresAt: number): boolean {
+export interface OriginHandoffLeaseMessage {
+  version: 2;
+  token: string;
+  expiresAt: number;
+  handoffId: string;
+  generation: number;
+  deviceId: string;
+}
+
+export function parkOriginHandoff(lease: OriginHandoffLeaseMessage): boolean {
   try {
     const handler = window.webkit?.messageHandlers?.clemHandoff;
     if (!handler) return false;
-    handler.postMessage({ token, expiresAt });
+    handler.postMessage(lease);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Confirm the exact leased token was consumed or explicitly rejected.
+ * Transport failures never call this: the Keychain copy remains retryable.
+ */
+export function reportOriginHandoffResult(
+  handoffId: string,
+  generation: number,
+  outcome: 'consumed' | 'invalid',
+): boolean {
+  try {
+    const handler = window.webkit?.messageHandlers?.clemHandoffResult;
+    if (!handler) return false;
+    handler.postMessage({ handoffId, generation, outcome });
     return true;
   } catch {
     return false;
@@ -97,6 +127,7 @@ export function requestNativeRepair(): boolean {
 
 /** Fires when the shell reports a new connection door. */
 export const CONNECTION_EVENT = 'clem:connection';
+export const ORIGIN_HANDOFF_STORED_EVENT = 'clem:origin-handoff-stored';
 /** Fires when the shell's pull-to-refresh asks the page for fresh data. */
 export const REFRESH_EVENT = 'clem:refresh';
 
@@ -151,6 +182,15 @@ export function installNativeBridge(): void {
     },
     setConnection(door: ConnectionDoor): void {
       setConnectionDoor(door);
+    },
+    originHandoffStored(value): void {
+      if (
+        !value
+        || typeof value.handoffId !== 'string'
+        || !Number.isSafeInteger(value.generation)
+        || value.generation <= 0
+      ) return;
+      window.dispatchEvent(new CustomEvent(ORIGIN_HANDOFF_STORED_EVENT, { detail: value }));
     },
   };
   let pending: string | null = null;

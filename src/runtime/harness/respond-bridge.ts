@@ -14,7 +14,7 @@
  * out). Routing rules, in order:
  *
  *   1. Per-surface kill-switch (`CLEMMY_HARNESS_<SURFACE>`, default ON) —
- *      blocks that surface unless the explicit legacy escape hatch is enabled.
+ *      blocks that surface. It never transfers the turn to another executor.
  *   2. `excludeToolNames` the harness CANNOT enforce (a non-local/external MCP
  *      tool) → blocks pre-run. buildOrchestratorAgent filters HARNESS-surface
  *      tools, so callers excluding only local tools (architect: workflow_*;
@@ -26,11 +26,6 @@
  *   4. Once the harness run STARTS, errors propagate — there is deliberately
  *      no run-failed→legacy retry (a retry after a partial run is the
  *      double-send class the gates exist to prevent).
- *
- * Legacy fallback remains an explicit operator break-glass for non-chat
- * execution owners only: `CLEMMY_LEGACY_RESPOND_FALLBACK=on`. Fresh interactive
- * chat always blocks instead of handing effect authority back to the old
- * ApprovalStore / assistant.respond path.
  *
  * Known, accepted contract differences from the legacy loop (same trade the
  * workflow runner accepted when it converged):
@@ -49,9 +44,13 @@ import {
   enrichAcceptedRequestWithTaskContinuity,
   inspectDurableMaterialSourceContinuation,
   mergeTurnCapabilityCandidates,
+  prepareMaterialSourceVariantRecovery,
 } from './task-continuity-runtime.js';
 import {
+  materiallyVariantSourceStrategyDecision,
   recordTurnPreflightDecision,
+  sourceStrategyBindingsEqual,
+  turnPreflightDecisionsEqual,
   validatedTurnSourceStrategyBinding,
   type TurnPreflightDecision,
   type TurnSourceStrategyBindingV1,
@@ -90,7 +89,11 @@ import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkU
 import { buildContinueInput } from './continue-directive.js';
 import { ClaudeSdkCapacityExhaustedError, ClaudeSdkProviderOverloadError } from './claude-agent-sdk.js';
 import { AgentRuntimeCancelledError } from '../provider.js';
-import { getModelRoutingMode, getRuntimeEnv } from '../../config.js';
+import {
+  getModelRoutingMode,
+  getRuntimeEnv,
+  withRuntimeConfigSnapshot,
+} from '../../config.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import { falloverBrainModelIds, type BrainProviderClass } from './model-role-options.js';
 import { resolveRoleModel } from './model-roles.js';
@@ -147,11 +150,6 @@ export interface RespondHarnessLimits {
 const MATERIAL_SOURCE_AUTHORITY_BLOCKED_TEXT =
   'I stopped before contacting a source because the confirmed source choice could not be reconstructed exactly. No source provider call was started. Please confirm the source again.';
 
-function decisionBytes(value: TurnPreflightDecision & { sourceUserSeq?: number }): string {
-  const { sourceUserSeq: _sourceUserSeq, ...decision } = value;
-  return JSON.stringify(decision);
-}
-
 /** Persist/read back one exact consuming decision. The optional caller binding
  * may veto a forged disagreement, but can never supply authority: all bytes
  * written here come from the durable A/Q/B inspection. */
@@ -168,8 +166,8 @@ function persistVerifiedMaterialSourceDecision(input: {
     if (
       !caller
       || (
-        JSON.stringify(caller) !== JSON.stringify(input.parentBinding)
-        && JSON.stringify(caller) !== JSON.stringify(input.binding)
+        !sourceStrategyBindingsEqual(caller, input.parentBinding)
+        && !sourceStrategyBindingsEqual(caller, input.binding)
       )
     ) return false;
   }
@@ -179,21 +177,93 @@ function persistVerifiedMaterialSourceDecision(input: {
     if (before.length === 0) {
       recordTurnPreflightDecision(input.sessionId, input.decision, input.sourceUserSeq);
     } else if (
-      decisionBytes(before[0]!.data as unknown as TurnPreflightDecision & { sourceUserSeq?: number })
-      !== decisionBytes(input.decision)
+      !turnPreflightDecisionsEqual(
+        before[0]!.data as unknown as TurnPreflightDecision,
+        input.decision,
+      )
     ) {
       return false;
     }
     const after = exactSourceStrategyDecisionRowsForSource(input.sessionId, input.sourceUserSeq);
     return after.length === 1
-      && decisionBytes(after[0]!.data as unknown as TurnPreflightDecision & { sourceUserSeq?: number })
-        === decisionBytes(input.decision)
-      && JSON.stringify(confirmedSourceStrategyBindingForSource(
+      && turnPreflightDecisionsEqual(
+        after[0]!.data as unknown as TurnPreflightDecision,
+        input.decision,
+      )
+      && sourceStrategyBindingsEqual(confirmedSourceStrategyBindingForSource(
         input.sessionId,
         input.sourceUserSeq,
-      )) === JSON.stringify(input.binding);
+      ), input.binding);
   } catch {
     return false;
+  }
+}
+
+/** Persist/read back one non-authorizing replacement checkpoint. The exact
+ * selector result is durable before runConversation is allowed to render Q2. */
+function persistMaterialSourceVariantDecision(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  decision: TurnPreflightDecision;
+}): boolean {
+  try {
+    const before = exactSourceStrategyDecisionRowsForSource(input.sessionId, input.sourceUserSeq);
+    if (before.length > 1) return false;
+    if (before.length === 0) {
+      recordTurnPreflightDecision(input.sessionId, input.decision, input.sourceUserSeq);
+    } else if (!turnPreflightDecisionsEqual(
+      before[0]!.data as unknown as TurnPreflightDecision,
+      input.decision,
+    )) {
+      return false;
+    }
+    const after = exactSourceStrategyDecisionRowsForSource(input.sessionId, input.sourceUserSeq);
+    return after.length === 1
+      && after[0]!.role === 'system'
+      && after[0]!.turn === 0
+      && turnPreflightDecisionsEqual(
+        after[0]!.data as unknown as TurnPreflightDecision,
+        input.decision,
+      )
+      && input.decision.phase === 'align'
+      && input.decision.sourceStrategyPosture === 'materially_variant'
+      && confirmedSourceStrategyBindingForSource(input.sessionId, input.sourceUserSeq) === undefined;
+  } catch {
+    return false;
+  }
+}
+
+function persistedMaterialSourceVariantDecision(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  parentDecision: TurnPreflightDecision;
+  parentBinding: TurnSourceStrategyBindingV1;
+  acceptedAnswer: string;
+}): { status: 'absent' } | { status: 'invalid' } | {
+  status: 'ok';
+  decision: TurnPreflightDecision;
+  binding: TurnSourceStrategyBindingV1;
+} {
+  try {
+    const rows = exactSourceStrategyDecisionRowsForSource(input.sessionId, input.sourceUserSeq);
+    if (rows.length === 0) return { status: 'absent' };
+    if (rows.length !== 1 || rows[0]!.role !== 'system' || rows[0]!.turn !== 0) {
+      return { status: 'invalid' };
+    }
+    const decision = rows[0]!.data as unknown as TurnPreflightDecision;
+    const binding = validatedTurnSourceStrategyBinding(decision.sourceStrategyBinding);
+    if (!binding) return { status: 'invalid' };
+    const expected = materiallyVariantSourceStrategyDecision({
+      parentDecision: input.parentDecision,
+      parentBinding: input.parentBinding,
+      replacementBinding: binding,
+      acceptedAnswer: input.acceptedAnswer,
+    });
+    return expected && turnPreflightDecisionsEqual(expected, decision)
+      ? { status: 'ok', decision: expected, binding }
+      : { status: 'invalid' };
+  } catch {
+    return { status: 'invalid' };
   }
 }
 
@@ -284,58 +354,6 @@ function readRawString(value: unknown, key: string): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const got = (value as Record<string, unknown>)[key];
   return typeof got === 'string' && got.trim() ? got.trim() : undefined;
-}
-
-function routeForLegacyFallback(surface: HarnessSurface, request: AssistantRequest): AssistantRouteDiagnostics {
-  return {
-    routeKind: 'legacy',
-    surface,
-    requestedModel: request.model,
-    effectiveModel: request.model,
-    provider: providerFor(request.model),
-    transport: 'legacy_assistant',
-  };
-}
-
-function legacyRespondFallbackEnabled(surface: HarnessSurface): boolean {
-  // Rolling-upgrade compatibility belongs to persisted interruption state.
-  // This operator fallback is retained only for the existing non-chat owners;
-  // it can never admit a new effect-capable interactive turn.
-  if (SURFACE_CONFIG[surface].kind === 'chat') return false;
-  const raw = (getRuntimeEnv('CLEMMY_LEGACY_RESPOND_FALLBACK', 'off') ?? 'off').trim().toLowerCase();
-  return raw === 'on' || raw === '1' || raw === 'true' || raw === 'yes';
-}
-
-async function runLegacyBreakGlass(
-  surface: HarnessSurface,
-  request: AssistantRequest,
-  legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
-): Promise<AssistantResponse> {
-  const {
-    onChunk: _rawChunk,
-    onReasoning: _rawReasoning,
-    onToolActivity,
-    ...baseRequest
-  } = request;
-  const safeRequest: AssistantRequest = {
-    ...baseRequest,
-    ...(onToolActivity
-      ? {
-          onToolActivity: (activity: ToolActivity) => onToolActivity({
-            toolName: activity.toolName,
-            input: {},
-          }),
-        }
-      : {}),
-  };
-  const response = await legacyRespond(safeRequest);
-  return withRouteDiagnostics({
-    ...response,
-    text: publicReplyText(
-      response.text,
-      'I could not produce a safe final answer for that turn. Please ask me to try again.',
-    ),
-  }, routeForLegacyFallback(surface, request));
 }
 
 async function blockedPreRunResponse(
@@ -495,11 +513,10 @@ let runConversationImpl: RunConversationFn = runConversation;
 let buildAgentImpl: BuildAgentFn = buildOrchestratorAgent;
 let configureImpl: ConfigureFn = configureHarnessRuntime;
 let claudeAgentBrainImpl: ClaudeAgentBrainFn = respondViaClaudeAgentSdkBrain;
-// The standalone Claude brain remains an execution-lane transport for cron and
-// background work. Interactive chat is converged on respondViaHarness in
-// production. This test-only override keeps the standalone failure reducer
-// directly exercisable without reopening a production chat fork. Legacy tests
-// must opt in explicitly; injecting a transport stub never changes route policy.
+// The standalone Claude brain is a retired execution owner. This test-only
+// override keeps its rolling-upgrade failure reducer directly exercisable
+// without reopening a production fork on chat, cron, or background. Injecting
+// a transport stub never changes route policy.
 let allowStandaloneClaudeInteractiveBrainForTests = false;
 let recoveryListEventsImpl: RecoveryListEventsFn = listEvents;
 let commitTurnOutcomeImpl: CommitTurnOutcomeFn = commitTurnOutcome;
@@ -650,14 +667,14 @@ function commitRecoveryCandidateTerminal(input: {
     });
   }
   const text = input.completedReason === 'no_structured_output'
-    ? 'I could not produce a safe final answer for that turn. Please ask me to try again.'
-    : 'I could not complete that run safely. Please ask me to continue from the recorded state.';
+    ? 'I could not produce a safe final answer for that turn. The turn is closed; the activity log has the technical details.'
+    : 'The run stopped before it produced a safe final answer. The run is closed; the activity log has the technical details.';
   const committed = commitTurnOutcomeImpl({
     version: 2,
     id: turnOutcomeId(identity),
     identity,
     status: 'blocked',
-    resumable: true,
+    resumable: false,
     presentation: { kind: 'blocked', text },
   }, {
     legacyReason: input.completedReason,
@@ -1285,6 +1302,7 @@ function commitBridgeBlockedTerminal(input: {
   text: string;
   reason: string;
   metadata?: Record<string, unknown>;
+  resumable?: boolean;
 }): EventRow {
   const identity = logicalTurnIdentity({
     sessionId: input.request.sessionId,
@@ -1296,7 +1314,7 @@ function commitBridgeBlockedTerminal(input: {
     id: turnOutcomeId(identity),
     identity,
     status: 'blocked',
-    resumable: true,
+    resumable: input.resumable ?? true,
     presentation: { kind: 'blocked', text: input.text },
   }, {
     legacyReason: input.reason,
@@ -1389,8 +1407,9 @@ export async function respondViaHarness(
   const typedClassification = semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
     ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
     : undefined;
+  const requestBeforeContinuity = request;
   request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
-    ...(hostOwnsTurn ? { continuationOnly: true } : {}),
+    ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
     typedClassification,
   });
   if (hostOwnsTurn) {
@@ -1400,6 +1419,14 @@ export async function respondViaHarness(
     });
     let materialSourceAuthorityValid = materialSource.status !== 'refused';
     if (materialSource.status === 'verified') {
+      // The exact lineage and retained schema were proved before candidate
+      // resolution. Resolution may now run as advisory context; it cannot
+      // author or alter the consuming decision below.
+      request = await enrichAcceptedRequestWithTaskContinuity(
+        requestBeforeContinuity,
+        sourceUserEvent.seq,
+        { continuationOnly: true, typedClassification },
+      );
       materialSourceAuthorityValid = persistVerifiedMaterialSourceDecision({
         sessionId,
         sourceUserSeq: sourceUserEvent.seq,
@@ -1410,6 +1437,86 @@ export async function respondViaHarness(
           ? { callerBinding: callerSourceStrategyBinding }
           : {}),
       });
+    } else if (materialSource.status === 'variant') {
+      // A checked semantic slot answer can reject A and name B, but it cannot
+      // approve B. Reuse a previously persisted Q2 checkpoint on replay;
+      // otherwise run the existing fresh selector once and persist its exact
+      // non-authorizing result before runConversation is entered.
+      const persisted = persistedMaterialSourceVariantDecision({
+        sessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        parentDecision: materialSource.parentDecision,
+        parentBinding: materialSource.parentBinding,
+        acceptedAnswer: materialSource.context.answer,
+      });
+      if (persisted.status === 'invalid') {
+        materialSourceAuthorityValid = false;
+      } else if (persisted.status === 'ok') {
+        request = {
+          ...request,
+          semanticTaskInput: materialSource.context.retrievalQuery,
+          taskContinuation: { ...materialSource.context, capabilities: [] },
+          taskContinuationResolved: true,
+          turnCandidates: {
+            candidates: [],
+            requirements: [],
+            matches: [],
+            pinnedTools: [],
+            semanticApplied: false,
+            sourceStrategyBinding: persisted.binding,
+          },
+        };
+      } else {
+        let resolved: TurnCapabilityCandidates = {
+          candidates: [],
+          requirements: [],
+          matches: [],
+          pinnedTools: [],
+          semanticApplied: false,
+        };
+        try {
+          resolved = await resolveTurnCandidatesImpl({
+            userInput: materialSource.context.retrievalQuery,
+          });
+        } catch {
+          // A selector failure cannot widen authority. The typed correction is
+          // retained, but no Q2 or provider work starts without one unique live
+          // replacement.
+        }
+        const prepared = prepareMaterialSourceVariantRecovery({
+          inspection: materialSource,
+          resolved,
+        });
+        if (prepared.status !== 'ready') {
+          materialSourceAuthorityValid = false;
+        } else {
+          materialSourceAuthorityValid = persistMaterialSourceVariantDecision({
+            sessionId,
+            sourceUserSeq: sourceUserEvent.seq,
+            decision: prepared.decision,
+          });
+          if (materialSourceAuthorityValid) {
+            request = {
+              ...request,
+              semanticTaskInput: prepared.context.retrievalQuery,
+              taskContinuation: prepared.context,
+              taskContinuationResolved: true,
+              turnCandidates: prepared.turnCandidates,
+            };
+          }
+        }
+      }
+      // This source is intentionally still unconfirmed. The align decision is
+      // consumed by runConversation's preflight publisher, which returns Q2
+      // before the business model or host runner can run.
+    } else if (materialSource.status === 'not_applicable' && request.taskContinuation) {
+      // Ordinary clarification continuations retain their existing one-resolve
+      // behavior, but only after the durable A/Q/B edge has been inspected.
+      request = await enrichAcceptedRequestWithTaskContinuity(
+        requestBeforeContinuity,
+        sourceUserEvent.seq,
+        { continuationOnly: true, typedClassification },
+      );
     }
     if (!materialSourceAuthorityValid) {
       const terminal = commitBridgeBlockedTerminal({
@@ -1524,7 +1631,14 @@ export async function respondViaHarness(
     let acceptedBuildIdentity: Parameters<NonNullable<RunConversationOptions['buildAgent']>>[0] | undefined;
     const buildAgent: NonNullable<RunConversationOptions['buildAgent']> = async (identity) => {
       acceptedBuildIdentity = identity;
-      const turnCandidates = await candidatesForAcceptedBuild();
+      // The loop's closed-world proof has already sealed this accepted source
+      // to a zero-tool conversation surface. Live capability recall cannot
+      // affect that build, so do not read action-only learning/catalog stores.
+      // Caller-supplied advisory context remains intact; every non-plain build
+      // retains the existing one-resolution promise.
+      const turnCandidates = identity.hostPlainConversation
+        ? request.turnCandidates
+        : await candidatesForAcceptedBuild();
       return buildAgentImpl({
         userInput: request.message,
         sessionId,
@@ -1955,13 +2069,14 @@ export async function respondViaHarness(
 /**
  * Drop-in router for legacy call sites:
  *   `assistant.respond(req)` → `respondPreferHarness('cron', req, (r) => assistant.respond(r))`
- * Falls back to legacy ONLY pre-run (flag off, per-call tool excludes, auth
- * unavailable) — never after the harness run has started.
+ * The legacy callback remains in the public signature while callers migrate,
+ * but it is never invoked. A disabled surface, unsupported tool boundary, or
+ * missing model runtime produces one typed pre-run block under the same owner.
  */
 async function respondPreferHarnessOnce(
   surface: HarnessSurface,
   request: AssistantRequest,
-  legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
+  _legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
   limits: RespondHarnessLimits = {},
 ): Promise<AssistantResponse> {
   // Idempotent transport replay is resolved before runtime availability or
@@ -2000,10 +2115,6 @@ async function respondPreferHarnessOnce(
     if (completedAnswerReplay) return completedAnswerReplay;
   }
   if (!harnessSurfaceEnabled(surface)) {
-    if (legacyRespondFallbackEnabled(surface) && request.allowedToolNames === undefined) {
-      bridgeLogger.warn({ surface, reason: 'surface_disabled' }, 'explicit legacy respond fallback engaged');
-      return runLegacyBreakGlass(surface, request, legacyRespond);
-    }
     return await blockedPreRunResponse(
       surface,
       request,
@@ -2017,10 +2128,6 @@ async function respondPreferHarnessOnce(
   // caller's tool surface or bypass the harness. buildOrchestratorAgent does the
   // actual filtering for enforceable names.
   if (!harnessCanEnforceExcludes(request.excludeToolNames)) {
-    if (legacyRespondFallbackEnabled(surface) && request.allowedToolNames === undefined) {
-      bridgeLogger.warn({ surface, excludeToolNames: request.excludeToolNames, reason: 'non_filterable_excludes' }, 'explicit legacy respond fallback engaged');
-      return runLegacyBreakGlass(surface, request, legacyRespond);
-    }
     const unsafe = nonFilterableToolExcludes(request.excludeToolNames, HARNESS_FILTERABLE_TOOLS);
     return await blockedPreRunResponse(
       surface,
@@ -2036,10 +2143,6 @@ async function respondPreferHarnessOnce(
     auth = { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
   if (!auth.ok) {
-    if (legacyRespondFallbackEnabled(surface) && request.allowedToolNames === undefined) {
-      bridgeLogger.warn({ surface, reason: 'harness_auth_unavailable', authReason: auth.reason }, 'explicit legacy respond fallback engaged');
-      return runLegacyBreakGlass(surface, request, legacyRespond);
-    }
     return await blockedPreRunResponse(
       surface,
       request,
@@ -2048,9 +2151,9 @@ async function respondPreferHarnessOnce(
     );
   }
   // Freeze the fresh-turn owner before any eager resolver can consume the
-  // accepted request. Host chat deliberately starts with the model; memory and
-  // live catalog are context/capability ports inside that loop, not a second
-  // executor in front of it. Non-chat surfaces remain on the legacy owner.
+  // accepted request. Every surface starts with the host-owned model loop;
+  // memory and live catalog are context/capability ports inside it, not a
+  // second executor in front of it.
   let turnEngine: TurnEngineMode;
   try {
     turnEngine = selectTurnEngine({
@@ -2061,22 +2164,20 @@ async function respondPreferHarnessOnce(
     return await blockedPreRunResponse(
       surface,
       request,
-      'This interactive runtime is configured for an unsupported turn engine, so I did not start the turn. Use host_v1 or host_v1_read_only.',
+      'This runtime is configured for an unsupported turn engine, so I did not start the turn. Use host_v1 or host_v1_read_only.',
       { reason: 'invalid_turn_engine' },
     );
   }
   // Deliberately no pre-brain provider read runs at this boundary. The typed
   // resolver components remain dormant until they can enter through the same
   // durable carrier and physical-authority kernel as every other provider I/O.
-  const useStandaloneClaudeExecutionBrain = claudeAgentSdkBrainEnabled(surface)
-    && (SURFACE_CONFIG[surface].kind === 'execution' || allowStandaloneClaudeInteractiveBrainForTests);
+  const useStandaloneClaudeExecutionBrain = allowStandaloneClaudeInteractiveBrainForTests
+    && claudeAgentSdkBrainEnabled(surface);
   if (useStandaloneClaudeExecutionBrain) {
-    // Cron/background keep their existing subscription-backed execution
-    // transport. Interactive Claude turns never enter this branch: they fall
-    // through to respondViaHarness below and therefore share Codex's host-owned
-    // model -> tool-intent -> host-execution loop. RouterModelProvider still
-    // resolves the selected claude-* model to ClaudeModelProvider, preserving
-    // the OAuth Bearer billing envelope.
+    // Production never enters this branch. Tests can still exercise the
+    // retired subscription-backed reducer in isolation; ordinary Claude turns
+    // fall through to respondViaHarness and RouterModelProvider preserves the
+    // OAuth Bearer billing envelope inside the shared host loop.
     if (Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0) {
       request = await enrichAcceptedRequestWithTaskContinuity(
         request,
@@ -2188,12 +2289,10 @@ async function respondPreferHarnessOnce(
             : commitBridgeBlockedTerminal({
                 request,
                 turn,
-                text: publicReplyText(
-                  err.message,
-                  'I could not complete that turn safely. Please ask me to try again.',
-                ),
+                text: 'The turn stopped before it produced a safe final answer. The turn is closed; the activity log has the technical details.',
                 reason: 'narration_giveup',
                 metadata: { transport: 'claude_agent_sdk_brain' },
+                resumable: false,
               });
           const response = responseForCommittedTerminal(terminal, {
             failure: 'narration_giveup',
@@ -2243,6 +2342,20 @@ export async function respondPreferHarness(
   request: AssistantRequest,
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
   limits: RespondHarnessLimits = {},
+): Promise<AssistantResponse> {
+  return withRuntimeConfigSnapshot(() => respondPreferHarnessWithinRuntimeConfig(
+    surface,
+    request,
+    legacyRespond,
+    limits,
+  ));
+}
+
+async function respondPreferHarnessWithinRuntimeConfig(
+  surface: HarnessSurface,
+  request: AssistantRequest,
+  legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
+  limits: RespondHarnessLimits,
 ): Promise<AssistantResponse> {
   let key: string | null = null;
   try {

@@ -4,6 +4,8 @@ import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import {
   defaultClaudeAgentSdkAllowedLocalTools,
   runClaudeAgentSdk,
+  runClaudeAgentSdkRouteAttempt,
+  type ClaudeAgentSdkRouteUsage,
   type ClaudeAgentSdkRunOptions,
   type ClaudeAgentSdkRunResult,
 } from './claude-agent-sdk.js';
@@ -91,6 +93,7 @@ export interface ClaudeAgentSdkWorkerResult {
   toolUses: string[];
   usage?: unknown;
   modelUsage?: unknown;
+  modelRouteUsage?: ClaudeAgentSdkRouteUsage;
 }
 
 export async function runClaudeAgentSdkWorker(
@@ -124,56 +127,75 @@ export async function runClaudeAgentSdkWorker(
     resolvedTools: input.resolvedTools,
     externalMcpToolNames: input.externalMcpToolNames,
   });
-  const result = await runClaudeAgentSdkImpl({
-    prompt: buildWorkerJobPrompt(input),
-    sessionId: sid,
-    modelId,
-    systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic),
-    allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(agentic ? 'worker' : 'read_only'),
-    // Scope the worker's NATIVE external MCP surface to exact parent-resolved
-    // external MCP slugs only. "none needed", skill_read, read_file, and Composio
-    // slugs remain local/core — never fail-open to every external MCP child.
-    nativeMcpScopeInput: input.externalMcpToolNames !== undefined
-      ? (input.externalMcpToolNames ?? []).join('\n')
-      : input.resolvedTools,
-    nativeMcpScopeMode: 'resolved_tools',
-    nativeMcpToolScope,
-    agentic,
-    workerScope: true,
-    maxTurns: resolvedMaxTurns,
-    // Isolation and authority are separate: this packet-stable scope enforces
-    // the full grind ladder per worker (and survives resume), while sessionId
-    // continues to own kill, approval, execution, and event records.
-    trackerScopeId,
-    ...(dispatchLease ? { dispatchLease } : {}),
-    ...(abortSignal ? {
-      abortSignal,
-      shouldCancel: () => abortSignal.aborted,
-      // Cancellation must interrupt a quiet worker stream promptly enough to
-      // drain before run_worker's unchanged outer deadline.
-      livenessHeartbeatMs: 50,
-    } : {}),
-    ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
-  });
-  // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say
-  // continue" text. Returning that verbatim made the fan-out ledger record the
-  // capped worker as ok=true (hooks.ts:362) and worker_capped never fired
-  // (hooks.ts:380 regex) — so the model saw "success" with no real output and
-  // re-spawned forever. Surface the cap as an ERROR: envelope CONTAINING "hit
-  // its turn cap" so the ledger marks it failed AND worker_capped fires, bringing
-  // this lane to parity with the nested lane and letting the respawn-guard SEE it.
-  // (Gated: =off restores the prior friendly text verbatim for clean rollback.)
-  const cappedText = guard && result.limitHit === true
-    ? `ERROR: worker hit its turn cap before finishing this item (turn budget exhausted). Treat as failed / needs-attention; do not blindly re-spawn the same item.${
-        result.text.trim() ? ` Partial: ${result.text.trim()}` : ''
-      }`
-    : (result.text.trim() || 'ERROR: Claude SDK worker produced no output.');
-  return {
-    text: cappedText,
-    sdkSessionId: result.sessionId,
-    model: result.model,
-    toolUses: result.toolUses,
-    usage: result.usage,
-    modelUsage: result.modelUsage,
-  };
+  try {
+    const sdkOptions: ClaudeAgentSdkRunOptions = {
+      prompt: buildWorkerJobPrompt(input),
+      sessionId: sid,
+      modelId,
+      systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic),
+      allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(agentic ? 'worker' : 'read_only'),
+      // Scope the worker's NATIVE external MCP surface to exact parent-resolved
+      // external MCP slugs only. "none needed", skill_read, read_file, and Composio
+      // slugs remain local/core — never fail-open to every external MCP child.
+      nativeMcpScopeInput: input.externalMcpToolNames !== undefined
+        ? (input.externalMcpToolNames ?? []).join('\n')
+        : input.resolvedTools,
+      nativeMcpScopeMode: 'resolved_tools',
+      nativeMcpToolScope,
+      agentic,
+      workerScope: true,
+      maxTurns: resolvedMaxTurns,
+      // Isolation and authority are separate: this packet-stable scope enforces
+      // the full grind ladder per worker (and survives resume), while sessionId
+      // continues to own kill, approval, execution, and event records.
+      trackerScopeId,
+      ...(dispatchLease ? { dispatchLease } : {}),
+      ...(abortSignal ? {
+        abortSignal,
+        shouldCancel: () => abortSignal.aborted,
+        // Cancellation must interrupt a quiet worker stream promptly enough to
+        // drain before run_worker's unchanged outer deadline.
+        livenessHeartbeatMs: 50,
+      } : {}),
+      ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
+    };
+    const result = await runClaudeAgentSdkRouteAttempt(
+      runClaudeAgentSdkImpl,
+      sdkOptions,
+      {
+        sessionId: sid,
+        workflowRunId: sid?.startsWith('workflow:') ? sid.split(':')[1] : undefined,
+        role: 'worker',
+        requestedModel: modelId,
+        resolvedModel: modelId,
+        provider: 'claude',
+        source: 'explicit',
+        reason: { lane: 'claude_agent_sdk_worker' },
+      },
+    );
+    // Cap-visibility: on a turn-cap the SDK returns limitHit:true + FRIENDLY "say
+    // continue" text. Returning that verbatim made the fan-out ledger record the
+    // capped worker as ok=true (hooks.ts:362) and worker_capped never fired
+    // (hooks.ts:380 regex) — so the model saw "success" with no real output and
+    // re-spawned forever. Surface the cap as an ERROR: envelope CONTAINING "hit
+    // its turn cap" so the ledger marks it failed AND worker_capped fires, bringing
+    // this lane to parity with the nested lane and letting the respawn-guard SEE it.
+    // (Gated: =off restores the prior friendly text verbatim for clean rollback.)
+    const cappedText = guard && result.limitHit === true
+      ? `ERROR: worker hit its turn cap before finishing this item (turn budget exhausted). Treat as failed / needs-attention; do not blindly re-spawn the same item.${
+          result.text.trim() ? ` Partial: ${result.text.trim()}` : ''
+        }`
+      : (result.text.trim() || 'ERROR: Claude SDK worker produced no output.');
+    return {
+      text: cappedText,
+      sdkSessionId: result.sessionId,
+      model: result.model,
+      toolUses: result.toolUses,
+      usage: result.usage,
+      modelUsage: result.modelUsage,
+      modelRouteUsage: result.modelRouteUsage,
+    };
+  } catch (error) {
+    throw error;
+  }
 }

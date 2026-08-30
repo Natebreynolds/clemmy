@@ -11,7 +11,7 @@
  * clean cartridge installs and materializes onto the real shelf, and each
  * unsafe shape is rejected AT THE SLOT — before consent, not after.
  */
-import { test } from 'node:test';
+import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
@@ -21,6 +21,23 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-plugin-ws
 
 const { previewPlugin, installPlugin, uninstallPlugin } = await import('./plugin-store.js');
 const { spaceStore, resolveSpaceDir } = await import('../spaces/store.js');
+const currentCapabilityFixtures = await import('../runtime/harness/current-capability-manifest.fixture.js');
+
+let previousCapabilityCatalog: ReturnType<
+  typeof currentCapabilityFixtures.installCurrentCapabilityManifestFixtures
+> = null;
+
+before(() => {
+  previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+    operationId: 'GOOGLESHEETS_BATCH_GET',
+    providerKind: 'composio',
+    effect: 'read',
+  }]);
+});
+
+after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
+});
 
 let serial = 0;
 

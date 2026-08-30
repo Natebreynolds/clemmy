@@ -28,19 +28,25 @@ import {
   type TurnOutcome,
   type TurnOutcomeStatus,
 } from './turn-outcome.js';
+import { exactPartialMutationPresentation } from './mutation-verification-presentation.js';
 import { persistCommittedClarificationContinuity } from './task-continuity-runtime.js';
 import { assertNoPendingWorkflowChatDispatchOwnership } from '../../tools/workflow-run-queue.js';
 import { fenceAndReleaseHandoffAtTerminal } from '../../execution/continuation-capsule.js';
 import type { ExactVerifiedReadCompletionCertificate } from './verified-read-completion.js';
 import { loadManifestState } from './obligation-store.js';
 import { adjudicateTerminalForTaskSync } from './terminal-truth.js';
-import { prepareAcceptedTaskTerminal } from './accepted-task-terminal-preparation.js';
+import {
+  pendingAcceptedReadPlan,
+  prepareAcceptedTaskTerminal,
+} from './accepted-task-terminal-preparation.js';
 import {
   auditAcceptedSourceSettlementTruth,
   type AcceptedSourceSettlementAudit,
 } from './accepted-source-settlement-audit.js';
 import { workEvidenceForAcceptedSource, type WorkEvidenceRef } from './work-manifest.js';
 import { constrainNeedsInputPresentationForRecovery } from './recovery-presentation-truth.js';
+import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-capability-learning.js';
+import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -392,6 +398,18 @@ function disclosedCompletionOutcome(
   };
 }
 
+function withExactMutationPartialTruth(
+  outcome: Extract<TurnOutcome, { status: 'done' }>,
+): Extract<TurnOutcome, { status: 'done' }> {
+  const text = exactPartialMutationPresentation({
+    sessionId: outcome.identity.sessionId,
+    sourceUserSeq: outcome.identity.sourceUserSeq,
+  });
+  return text
+    ? { ...outcome, presentation: { kind: 'answer', text } }
+    : outcome;
+}
+
 function disclosedCompletionOptions(
   options: DeliveryCommitOptions,
   detail?: { reason?: string; missing?: readonly string[] },
@@ -464,7 +482,11 @@ function unverifiedCompletionOptions(
   }
   return {
     metadata,
-    legacyReason: options.legacyReason ?? 'verification_required',
+    // This projection changed the typed terminal from done to blocked.  The
+    // compatibility reason must change with it: preserving an upstream
+    // `success` here creates the internally impossible row
+    // `{ status: blocked, reason: success }` at the one durable gateway.
+    legacyReason: 'verification_required',
   };
 }
 
@@ -767,7 +789,7 @@ function repairArgumentsNeedsInputOutcome(
 /** Honest terminal for a host-side failure with a provably effect-free ledger.
  * Value-opaque like every host constant: no tool names, no model prose. */
 export const HOST_LOCAL_FAILURE_BLOCKED_TEXT =
-  'A host-side step failed after running locally. Nothing external was executed or changed — no call left this machine for this request — so there is nothing to reconcile. Ask me to continue and I will retry from the durable checkpoint.';
+  'I hit a bounded internal host error. Any completed work and retained results remain preserved, and no uncertain external change is pending.';
 
 /**
  * Ledger effect-truth for one accepted source: true only when the write ledger
@@ -799,6 +821,70 @@ function acceptedSourceHasZeroExternalEffectSurface(
       && row.reconciliation_owed === 0;
   } catch {
     return false;
+  }
+}
+
+function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
+  switch (outcome.status) {
+    case 'needs_input': {
+      const text = renderFailureWithRetainedWork({
+        sessionId: outcome.identity.sessionId,
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        fallbackText: outcome.presentation.text,
+      });
+      if (text === outcome.presentation.text) return outcome;
+      if (outcome.presentation.kind === 'approval') {
+        return {
+          ...outcome,
+          needs: { kind: 'approval' },
+          presentation: { ...outcome.presentation, text },
+        };
+      }
+      if (outcome.presentation.kind === 'continue') {
+        return {
+          ...outcome,
+          needs: { kind: 'continue' },
+          presentation: { ...outcome.presentation, text },
+        };
+      }
+      return {
+        ...outcome,
+        needs: { kind: 'input' },
+        presentation: { ...outcome.presentation, text },
+      };
+    }
+    case 'blocked': {
+      const text = renderFailureWithRetainedWork({
+        sessionId: outcome.identity.sessionId,
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        fallbackText: outcome.presentation.text,
+      });
+      return text === outcome.presentation.text
+        ? outcome
+        : { ...outcome, presentation: { kind: 'blocked', text } };
+    }
+    case 'uncertain': {
+      const text = renderFailureWithRetainedWork({
+        sessionId: outcome.identity.sessionId,
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        fallbackText: outcome.presentation.text,
+      });
+      return text === outcome.presentation.text
+        ? outcome
+        : { ...outcome, presentation: { kind: 'blocked', text } };
+    }
+    case 'failed': {
+      const text = renderFailureWithRetainedWork({
+        sessionId: outcome.identity.sessionId,
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        fallbackText: outcome.presentation.text,
+      });
+      return text === outcome.presentation.text
+        ? outcome
+        : { ...outcome, presentation: { kind: 'error', text } };
+    }
+    default:
+      return outcome;
   }
 }
 
@@ -836,26 +922,41 @@ export function commitTurnOutcome(
   // exact settled calls. Historical/action-deferred sources retain their
   // existing behavior; they never borrow staged authority by accident.
   if (outcome.status === 'done') {
+    // The asynchronous terminal judge/repair is advisory prose. Re-project an
+    // exact partial mutation at the single public write boundary as well, so a
+    // judge that repeats a stale full-completion claim cannot leak it through
+    // the terminal row or transport edit.
+    const mutationTruthOutcome = withExactMutationPartialTruth(outcome);
+    effectiveOutcome = mutationTruthOutcome;
     const assessment = assessAcceptedSourceDelivery({
       sessionId: requested.identity.sessionId,
       sourceUserSeq: requested.identity.sourceUserSeq,
-      proposedReply: requested.text,
+      proposedReply: mutationTruthOutcome.presentation.text,
       deliveryConcern: options.deliveryConcern,
     });
     const { settlementAudit, deliveryGap } = assessment;
     if (deliveryGap) {
-      const mustHold = options.terminalJudgeDisposition === 'deliver'
-        ? deliveryMustHoldForHuman(settlementAudit)
-        : deliveryMustHoldWhenJudgeUnavailable(settlementAudit);
+      // A judge may author the best public explanation, but it cannot erase a
+      // frozen read plan that has not executed even one accepted operation.
+      // This is the source-91257 floor: plan_task succeeded, the model stopped,
+      // and a truthful-sounding explanation was otherwise stamped success.
+      const acceptedReadPlanStillPending = pendingAcceptedReadPlan({
+        sessionId: requested.identity.sessionId,
+        sourceUserSeq: requested.identity.sourceUserSeq,
+      }) !== null;
+      const mustHold = acceptedReadPlanStillPending
+        || (options.terminalJudgeDisposition === 'deliver'
+          ? deliveryMustHoldForHuman(settlementAudit)
+          : deliveryMustHoldWhenJudgeUnavailable(settlementAudit));
       if (mustHold) {
         effectiveOutcome = unverifiedCompletionOutcome(
-          outcome,
+          mutationTruthOutcome,
           options.presentationAlreadyDiscloses === true,
         );
         effectiveOptions = unverifiedCompletionOptions(options, deliveryGap);
       } else {
         effectiveOutcome = disclosedCompletionOutcome(
-          outcome,
+          mutationTruthOutcome,
           options.presentationAlreadyDiscloses === true,
         );
         effectiveOptions = disclosedCompletionOptions(options, deliveryGap);
@@ -894,6 +995,7 @@ export function commitTurnOutcome(
       },
     };
   }
+  effectiveOutcome = withRetainedWorkTerminal(effectiveOutcome);
   const proposed = presentationEventForOutcome(effectiveOutcome);
   // A prepared/held workflow admission is durable accepted work, not an error
   // or needs-input terminal. Until immutable group activation transfers that
@@ -920,9 +1022,11 @@ export function commitTurnOutcome(
     // this module re-deriving the condition and drifting from it. A turn that
     // cannot legally complete is genuinely incomplete: fall back to the hold.
     if (!disclosedInsteadOfHeld || !(error instanceof AcceptedTaskTerminalPublicationError)) throw error;
-    effectiveOutcome = unverifiedCompletionOutcome(
-      outcome as Extract<TurnOutcome, { status: 'done' }>,
-      options.presentationAlreadyDiscloses === true,
+    effectiveOutcome = withRetainedWorkTerminal(
+      unverifiedCompletionOutcome(
+        withExactMutationPartialTruth(outcome as Extract<TurnOutcome, { status: 'done' }>),
+        options.presentationAlreadyDiscloses === true,
+      ),
     );
     effectiveOptions = unverifiedCompletionOptions(options, disclosureDetail);
     effectiveOptions = {
@@ -978,6 +1082,16 @@ export function commitTurnOutcome(
       presentation: persisted,
     });
   } catch { /* next turn safely falls back to ordinary discovery */ }
+  // Capability learning is a separate, identity-only projection of already
+  // durable success. It carries no invocation/approval authority and cannot
+  // affect this terminal. A crash in this narrow gap is repaired lazily from
+  // the same receipts on a later planning turn.
+  if (persisted.status === 'done') {
+    void learnVerifiedWriteCapabilitiesForAcceptedTask({
+      sessionId: persisted.identity.sessionId,
+      sourceUserSeq: persisted.identity.sourceUserSeq,
+    }).catch(() => {});
+  }
   return {
     event: terminal.event,
     inserted: terminal.inserted,

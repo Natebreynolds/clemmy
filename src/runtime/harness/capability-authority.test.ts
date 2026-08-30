@@ -69,6 +69,31 @@ function writeManifest(overrides: Partial<CapabilityManifestV1> = {}): Capabilit
   });
 }
 
+const PROVIDER_NEUTRAL_ATOMIC_CONTENT = {
+  version: 1 as const,
+  compiler: {
+    version: 1 as const,
+    kind: 'tabular_record_set_v1' as const,
+    namePointer: '/container',
+    recordsPointer: '/items',
+    recordsEncoding: 'json_or_value' as const,
+    selector: 'a1_grid_v1' as const,
+  },
+  resultIdentity: {
+    version: 1 as const,
+    kind: 'pointer_resource_identity_v1' as const,
+    idPointers: ['/result/id'],
+    handlePointers: ['/result/handle'],
+    handleTemplate: {
+      version: 1 as const,
+      kind: 'prefix_suffix_v1' as const,
+      prefix: 'https://opaque.invalid/resources/',
+      suffix: '',
+    },
+  },
+  evidence: ['receipt', 'content_commit'] as const,
+};
+
 const identity = {
   acceptedSource: { sessionId: 'sess-auth', sourceUserSeq: 1 },
   acceptedTaskId: 'task-1',
@@ -124,6 +149,47 @@ test('incomplete, untrusted, revoked, and superseded manifests never become curr
     operationId: 'git_status',
   })).reason, 'multiplexer_is_not_an_operation');
   assert.ok(currentCapabilityManifest(manifest()));
+});
+
+test('sealed operation semantics cannot contradict effect, destructive hints, or destination posture', () => {
+  assert.equal(validateCapabilityManifestV1(manifest({
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+  })).reason, 'incomplete', 'a read effect cannot carry write reversibility');
+
+  assert.equal(validateCapabilityManifestV1(writeManifest({
+    providerKind: 'composio',
+    providerIdentity: 'provider:opaque',
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: 'b'.repeat(64),
+      semanticName: 'Opaque operation',
+      behaviorHints: {
+        readOnly: false,
+        destructive: true,
+        idempotent: true,
+        openWorld: false,
+      },
+    },
+    operationSemantics: { version: 1, reversibility: 'ordinary_non_destructive' },
+  })).reason, 'incomplete', 'destructive true contradicts ordinary non-destructive');
+
+  const atomic = writeManifest({
+    operationSemantics: {
+      version: 1,
+      reversibility: 'reversible',
+      atomicInputContent: PROVIDER_NEUTRAL_ATOMIC_CONTENT,
+    },
+    evidenceContract: { kinds: ['receipt', 'content_commit'], readbackRequired: false },
+  });
+  assert.equal(validateCapabilityManifestV1(atomic).ok, true);
+  for (const drifted of [
+    { ...atomic, effect: 'read' as const },
+    { ...atomic, destination: { family: 'opaque-resource', posture: 'named_existing' } },
+    { ...atomic, idempotency: { required: false, policy: 'none' as const } },
+    { ...atomic, reconciliation: { supported: false, policy: 'none' as const } },
+    { ...atomic, evidenceContract: { kinds: ['receipt'], readbackRequired: false } },
+    { ...atomic, evidenceContract: { kinds: ['receipt', 'content_commit'], readbackRequired: true } },
+  ]) assert.equal(validateCapabilityManifestV1(drifted).reason, 'incomplete');
 });
 
 test('trusted store refuses untrusted writes and preserves revoke/supersede', () => {

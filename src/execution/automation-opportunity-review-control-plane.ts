@@ -293,6 +293,7 @@ export function loadAutomationOpportunityReviewProjection(
 export function listAutomationOpportunityReviewProjections(input: {
   status?: AutomationOpportunityReviewProjectionStatus;
   approvalId?: string;
+  proposalId?: string;
   limit?: number;
 } = {}): AutomationOpportunityReviewProjectionV1[] {
   const limit = input.limit ?? 100;
@@ -308,6 +309,11 @@ export function listAutomationOpportunityReviewProjections(input: {
   if (input.approvalId) {
     conditions.push('approval_id = ?');
     values.push(input.approvalId);
+  }
+  if (input.proposalId) {
+    if (!exactId(input.proposalId)) return [];
+    conditions.push('proposal_id = ?');
+    values.push(input.proposalId);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = database().prepare(`

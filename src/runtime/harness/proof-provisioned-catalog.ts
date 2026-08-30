@@ -23,13 +23,22 @@
  *    provider schema. A slug with no cached schema is skipped (fail closed).
  */
 import { createHash } from 'node:crypto';
-import { documentedAtomicInputContentCommit } from '../../integrations/composio/operation-semantics.js';
+import {
+  validateDocumentedComposioManifestOperationSemantics,
+} from '../../integrations/composio/operation-semantics.js';
+import type {
+  MutationVerificationContractV1,
+  OperationVerificationContractV1,
+  ReadbackVerificationContractV1,
+} from './mutation-verification-contract.js';
+import { readbackContractMatchesMutation } from './mutation-verification-contract.js';
 import {
   attachSemanticContract,
   capabilityManifestDigest,
   type CapabilityManifestV1,
 } from './capability-manifest.js';
 import {
+  canonicalResolvedCapabilityId,
   createHostCapabilityCatalogFactory,
   installHostCapabilityCatalogFactory,
   peekHostCapabilityCatalogFactory,
@@ -37,9 +46,14 @@ import {
 import {
   peekCapabilityManifestStore,
   resolveCapabilityManifestStore,
-  resolveCurrentSuccessorManifest,
+  type CapabilityManifestStore,
+  type InstalledCapabilityManifest,
 } from './capability-manifest-store.js';
-import { registerIndependentCapabilityObservation } from './independent-capability-observation.js';
+import {
+  compareAndSetIndependentCapabilityObservation,
+  peekIndependentCapabilityObservation,
+  registerIndependentCapabilityObservation,
+} from './independent-capability-observation.js';
 import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
 import {
   ensureToolSchema,
@@ -82,6 +96,51 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function toolkitOf(slug: string): string {
   return slug.split('_')[0]?.toLowerCase() ?? '';
+}
+
+function currentProofManifestLineage(input: {
+  store: CapabilityManifestStore;
+  baseCapabilityId: string;
+  operationId: string;
+  accountId: string;
+}): readonly InstalledCapabilityManifest[] {
+  const operationId = input.operationId.trim().toLowerCase();
+  return input.store.list().filter((installed) => {
+    const manifest = installed.manifest;
+    const verified = input.store.get(manifest.manifestId);
+    return Boolean(verified && verified.digest === installed.digest)
+      && manifest.lifecycle.state === 'current'
+      && manifest.providerKind === 'composio'
+      && manifest.providerIdentity === 'composio'
+      && manifest.operationId.trim().toLowerCase() === operationId
+      && manifest.accountId === input.accountId
+      && (
+        manifest.manifestId === input.baseCapabilityId
+        || manifest.manifestId.startsWith(`${input.baseCapabilityId}:definition:`)
+      );
+  });
+}
+
+function proofDefinitionSuccessorId(input: {
+  baseCapabilityId: string;
+  predecessorId: string;
+  operationId: string;
+  accountId: string;
+  semanticDefinitionFingerprint: string;
+}): string {
+  // Include the predecessor as well as the new definition. A provider can
+  // legitimately move v1 -> v2 -> v1; reusing the first manifest id after it
+  // was superseded would make the durable store reject the restamp as an
+  // identity mismatch.
+  const revision = sha256(JSON.stringify({
+    version: 1,
+    provider: 'composio',
+    operation: input.operationId.trim().toLowerCase(),
+    account: input.accountId,
+    predecessor: input.predecessorId,
+    definition: input.semanticDefinitionFingerprint,
+  })).slice(0, 24);
+  return `${input.baseCapabilityId}:definition:${revision}`;
 }
 
 function schemaKeys(schema: Record<string, unknown>): { required: string[]; properties: string[] } {
@@ -157,9 +216,19 @@ export async function registerProofProvisionedCapabilities(identity: {
    * foreground disclosures. Only allowedIdentifiers are newly published, but
    * every row here pays the same final provider proof before freeze. */
   selectedDefinitions?: readonly SelectedComposioDefinition[];
+  /** Exact host-derived verifier definitions selected from adapter-authored
+   * contracts. These identifiers may be absent from the model-facing
+   * capability-resolution proof, but only when exactly one selected/proven
+   * mutation on the same account requires the declared readback contract. */
+  hostDerivedVerificationIdentifiers?: readonly string[];
+  /** Optional caller-owned liveness fence for bounded foreground discovery.
+   * Provider refresh may finish after its deadline, but no manifest, catalog
+   * entry, port, or compiler may publish after this predicate turns false. */
+  publicationGuard?: () => boolean;
 } = {}): Promise<ProofProvisionResult> {
   const registered: string[] = [];
   try {
+    if (options.publicationGuard && !options.publicationGuard()) return { registered };
     if (!productionProviderCrossingAllowed()) {
       const selected = options.selectedDefinitions?.[0]?.identifier.trim()
         || options.allowedIdentifiers?.[0]?.trim();
@@ -179,10 +248,70 @@ export async function registerProofProvisionedCapabilities(identity: {
         entry.schemaDigest.trim().toLowerCase(),
       ]),
     );
-    const entries = provenCapabilityEntriesForTurn(identity)
+    const proofEntries = provenCapabilityEntriesForTurn(identity)
       .filter((entry) => entry.kind === 'composio'
         && (entry.effectClass === 'read' || entry.effectClass === 'write')
         && (!allowed || allowed.has(entry.identifier.trim().toLowerCase())));
+    const selectedDefinitionByIdentifier = new Map(
+      (options.selectedDefinitions ?? []).map((entry) => [
+        entry.identifier.trim().toLowerCase(),
+        entry,
+      ]),
+    );
+    const derivedVerificationIdentifiers = new Set(
+      (options.hostDerivedVerificationIdentifiers ?? [])
+        .map((identifier) => identifier.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    const derivedEntries: typeof proofEntries = [];
+    for (const identifier of derivedVerificationIdentifiers) {
+      if (!allowed?.has(identifier)) {
+        return {
+          registered,
+          refusal: { code: 'selected_definition_not_proven', identifier },
+        };
+      }
+      const selectedVerifier = selectedDefinitionByIdentifier.get(identifier);
+      const verifierDeclaration = selectedVerifier?.verificationContract;
+      if (!selectedVerifier || !verifierDeclaration || !('readback' in verifierDeclaration)) {
+        return {
+          registered,
+          refusal: { code: 'selected_definition_not_proven', identifier },
+        };
+      }
+      const owners = proofEntries.filter((entry) => {
+        if (entry.effectClass !== 'write') return false;
+        const selectedOwner = selectedDefinitionByIdentifier.get(entry.identifier.trim().toLowerCase());
+        const ownerDeclaration = selectedOwner?.verificationContract;
+        return Boolean(
+          selectedOwner
+          && ownerDeclaration
+          && 'mutation' in ownerDeclaration
+          && selectedOwner.accountIdentity.trim() === selectedVerifier.accountIdentity.trim()
+          && readbackContractMatchesMutation(ownerDeclaration.mutation, verifierDeclaration.readback),
+        );
+      });
+      if (owners.length === 0) {
+        return {
+          registered,
+          refusal: { code: 'selected_definition_not_proven', identifier },
+        };
+      }
+      derivedEntries.push({
+        intent: `host-derived verification for ${owners.map((owner) => owner.identifier).sort().join(',')}`,
+        kind: 'composio',
+        identifier: selectedVerifier.identifier,
+        status: 'proven',
+        connection: 'active',
+        accountIdentity: selectedVerifier.accountIdentity,
+        effectClass: 'read',
+      });
+    }
+    const entries = [...proofEntries];
+    const proofEntryIdentifiers = new Set(entries.map((entry) => entry.identifier.trim().toLowerCase()));
+    for (const entry of derivedEntries) {
+      if (!proofEntryIdentifiers.has(entry.identifier.trim().toLowerCase())) entries.push(entry);
+    }
     if (allowed) {
       const entryByIdentifier = new Map(
         entries.map((entry) => [entry.identifier.trim().toLowerCase(), entry]),
@@ -237,6 +366,7 @@ export async function registerProofProvisionedCapabilities(identity: {
     // Composio set (initial card plus staged disclosures): verify everything,
     // then publish only the staged/proven subset.
     const revalidated = await revalidateSelectedComposioDefinitions(selectedDefinitions);
+    if (options.publicationGuard && !options.publicationGuard()) return { registered };
     if (!revalidated.ok) {
       return { registered, refusal: revalidated.refusal };
     }
@@ -258,6 +388,7 @@ export async function registerProofProvisionedCapabilities(identity: {
     const store = peekCapabilityManifestStore() ?? resolveCapabilityManifestStore();
 
     for (const entry of entries) {
+      if (options.publicationGuard && !options.publicationGuard()) return { registered };
       const slug = entry.identifier.trim();
       const baseCapabilityId = `cap:resolved:${slug.toLowerCase()}`;
       // First-touch daemon: the schema cache is empty until something lists
@@ -295,7 +426,24 @@ export async function registerProofProvisionedCapabilities(identity: {
       const effect: BoundNodeCapability['effect'] = entry.effectClass === 'write' ? 'external_write' : 'read';
       const family = toolkitOf(slug);
       const write = effect === 'external_write';
-      const atomicContentCommit = documentedAtomicInputContentCommit(slug);
+      const operationSemantics = selectedSchema
+        && Object.prototype.hasOwnProperty.call(selectedSchema, 'operationSemantics')
+        ? selectedSchema.operationSemantics ?? null
+        : selectedSchema
+          ? null
+          : validateDocumentedComposioManifestOperationSemantics({
+              operationId: slug,
+              inputSchema: schema,
+            });
+      const atomicContentCommit = operationSemantics?.atomicInputContent;
+      const verification: OperationVerificationContractV1 | null = selectedSchema
+        && Object.prototype.hasOwnProperty.call(selectedSchema, 'verificationContract')
+        ? selectedSchema.verificationContract ?? null
+        : null;
+      const mutationVerification: MutationVerificationContractV1 | null = verification
+        && 'mutation' in verification ? verification.mutation : null;
+      const readbackVerification: ReadbackVerificationContractV1 | null = verification
+        && 'readback' in verification ? verification.readback : null;
       const advisoryRoles = advisoryRolesForProofEntry({
         effect: write ? 'external_write' : 'read',
         schema,
@@ -314,7 +462,22 @@ export async function registerProofProvisionedCapabilities(identity: {
           outputSchema,
         });
       if (!definitionFingerprint) continue;
-      const currentInstalled = resolveCurrentSuccessorManifest(store, baseCapabilityId);
+      const currentLineage = currentProofManifestLineage({
+        store,
+        baseCapabilityId,
+        operationId: slug,
+        accountId,
+      });
+      if (currentLineage.length > 1) {
+        return {
+          registered,
+          refusal: {
+            code: 'selected_definition_identity_conflict',
+            identifier: slug,
+          },
+        };
+      }
+      const currentInstalled = currentLineage[0];
       const outputSchemaDigest = outputSchema ? digestSchema(outputSchema) : undefined;
       const currentDefinition = currentInstalled?.manifest;
       const currentMatches = Boolean(
@@ -329,12 +492,27 @@ export async function registerProofProvisionedCapabilities(identity: {
         && currentDefinition.externalDefinition?.providerOutputSchemaObserved === true
         && (currentDefinition.externalDefinition?.providerOutputSchemaDigest ?? null)
           === (outputSchemaDigest ?? null)
+        && JSON.stringify(currentDefinition.externalDefinition?.verification ?? null)
+          === JSON.stringify(verification)
+        && JSON.stringify(currentDefinition.operationSemantics ?? null)
+          === JSON.stringify(operationSemantics)
       );
+      const semanticDefinitionFingerprint = sha256(JSON.stringify({
+        definitionFingerprint,
+        verification,
+        operationSemantics,
+      }));
       const capabilityId = currentMatches
         ? currentDefinition!.manifestId
         : currentInstalled
-          ? `${baseCapabilityId}:definition:${definitionFingerprint.slice(0, 24)}`
-          : baseCapabilityId;
+          ? proofDefinitionSuccessorId({
+              baseCapabilityId,
+              predecessorId: currentInstalled.manifest.manifestId,
+              operationId: slug,
+              accountId,
+              semanticDefinitionFingerprint,
+            })
+          : canonicalResolvedCapabilityId(slug.toLowerCase(), accountId, 'composio');
       const manifest: CapabilityManifestV1 = attachSemanticContract({
         version: 1,
         manifestId: capabilityId,
@@ -352,19 +530,53 @@ export async function registerProofProvisionedCapabilities(identity: {
             ? { providerOutputSchemaDigest: outputSchemaDigest }
             : {}),
           semanticName: slug,
+          ...(verification ? { verification } : {}),
           behaviorHints: {
-            readOnly: null,
-            destructive: null,
+            readOnly: !write,
+            destructive: !write
+              || atomicContentCommit
+              || operationSemantics?.reversibility === 'ordinary_non_destructive'
+              ? false
+              : null,
             idempotent: null,
             openWorld: null,
           },
         },
         effect,
-        ...(write ? { destination: { family, posture: 'create_new' as const } } : {}),
+        ...(operationSemantics ? { operationSemantics } : {}),
+        ...(write
+          ? {
+              destination: {
+                family: mutationVerification?.resourceFamily ?? family,
+                posture: mutationVerification?.target.source === 'provider_arguments'
+                  ? 'named_existing' as const
+                  : 'create_new' as const,
+              },
+            }
+          : readbackVerification
+            ? {
+                destination: {
+                  family: readbackVerification.resourceFamily,
+                  posture: 'named_existing' as const,
+                },
+              }
+            : {}),
         accountId,
         idempotency: { required: write, policy: write ? 'key_before_dispatch' : 'none' },
         reconciliation: { supported: write, policy: write ? 'exact_artifact' : 'none' },
-        outputContract: { kind: write ? 'created_resource' : 'records' },
+        outputContract: {
+          kind: mutationVerification?.producedHandleKind
+            ?? (write ? 'created_resource' : 'records'),
+        },
+        ...(readbackVerification ? { purpose: 'verify_created_resource' } : {}),
+        ...(mutationVerification
+          ? {
+              readbackContract: {
+                required: true,
+                contentDigestRequired: mutationVerification.proof === 'exact_content_v1',
+              },
+            }
+          : {}),
         evidenceContract: {
           kinds: atomicContentCommit
             ? [...atomicContentCommit.evidence]
@@ -386,7 +598,9 @@ export async function registerProofProvisionedCapabilities(identity: {
         // records, a readback is a point read of the created resource, and the
         // write produces that resource. The write also carries its concrete
         // destination family so a family-named deliverable stays admissible.
-        acceptedInputKinds: write
+        acceptedInputKinds: readbackVerification
+          ? ['evidence', readbackVerification.acceptedHandleKind]
+          : write
           ? ['evidence', 'records']
           : (advisoryRoles.includes('collection') || advisoryRoles.includes('source') || advisoryRoles.includes('lookup'))
             ? ['evidence']
@@ -400,15 +614,25 @@ export async function registerProofProvisionedCapabilities(identity: {
             : advisoryRoles.includes('readback')
               ? ['evidence', 'locator']
               : ['evidence', 'records'],
-        applicableDeliverableKinds: write ? ['evidence', family] : ['evidence'],
+        applicableDeliverableKinds: write
+          ? ['evidence', mutationVerification?.resourceFamily ?? family]
+          : readbackVerification
+            ? ['evidence', readbackVerification.resourceFamily]
+            : ['evidence'],
       });
-      const installed = !currentInstalled || currentMatches
-        ? store.install(manifest)
-        : store.supersede(currentInstalled.manifest.manifestId, manifest);
+      const installed = currentInstalled && !currentMatches
+        ? store.supersede(currentInstalled.manifest.manifestId, manifest)
+        : store.install(manifest);
       if (!installed.ok) continue;
-      if (capabilityId !== baseCapabilityId) factory.forget(baseCapabilityId);
+      if (options.publicationGuard && !options.publicationGuard()) return { registered };
+      if (currentInstalled && currentInstalled.manifest.manifestId !== capabilityId) {
+        // Retire only the exact predecessor in this account lineage. Forgetting
+        // the lexical base globally removed another account's still-current
+        // callable and caused the live A -> B -> A publication failure.
+        factory.forget(currentInstalled.manifest.manifestId);
+      }
       const observedAt = Date.now();
-      registerIndependentCapabilityObservation({
+      const observation = {
         operationId: manifest.operationId,
         accountId: manifest.accountId,
         definitionFingerprint: manifest.definitionFingerprint,
@@ -429,7 +653,28 @@ export async function registerProofProvisionedCapabilities(identity: {
           operationVersion: manifest.operationVersion,
           observedAt: Date.now(),
         }),
-      });
+      } as const;
+      const registeredObservation = registerIndependentCapabilityObservation(observation);
+      let observationReady = registeredObservation.ok;
+      if (!registeredObservation.ok && registeredObservation.reason === 'identity_exists') {
+        const expected = peekIndependentCapabilityObservation(
+          manifest.operationId,
+          manifest.accountId,
+        );
+        observationReady = Boolean(
+          expected
+          && compareAndSetIndependentCapabilityObservation({ expected, next: observation }).ok,
+        );
+      }
+      if (!observationReady) {
+        return {
+          registered,
+          refusal: {
+            code: 'selected_definition_identity_conflict',
+            identifier: slug,
+          },
+        };
+      }
       const primaryRole = advisoryRoles[0]!;
       factory.register({
         capabilityId,
@@ -445,7 +690,7 @@ export async function registerProofProvisionedCapabilities(identity: {
         liveFingerprint: definitionFingerprint,
         manifest,
         account: accountId,
-        ...(write ? { destination: { family, posture: 'create_new' } } : {}),
+        ...(manifest.destination ? { destination: manifest.destination } : {}),
         ...(write
           ? {
               reconcile: async (input) => {
@@ -497,6 +742,7 @@ export async function registerProofProvisionedCapabilities(identity: {
     }
 
     if (registered.length > 0) {
+      if (options.publicationGuard && !options.publicationGuard()) return { registered };
       // The collect→construct shortlist needs a host projection between the
       // collection and the create. This is host-owned compute (no provider,
       // no account) — identity projection of the collected records.

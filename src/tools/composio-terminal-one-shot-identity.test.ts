@@ -21,6 +21,8 @@ const providerIdentity = await import('../integrations/composio/provider-definit
 const contracts = await import('./tool-contract-store.js');
 const attestedComposio = await import('../runtime/harness/composio-attested-transport.js');
 const abortContext = await import('../runtime/tool-abort-context.js');
+const accountAliases = await import('../memory/account-alias-store.js');
+const identityCache = await import('../integrations/composio/identity-cache.js');
 
 const previousBackend = process.env.COMPOSIO_BACKEND;
 process.env.COMPOSIO_BACKEND = 'sdk';
@@ -135,6 +137,7 @@ async function prepareFixture(input: {
   slug: string;
   manifestAccount?: string;
   currentAccount?: string;
+  currentAccounts?: Array<{ id: string; email?: string }>;
   inputSchema?: Record<string, unknown>;
   observedInputSchema?: Record<string, unknown>;
   observedOutput?: Record<string, unknown> | null;
@@ -178,12 +181,13 @@ async function prepareFixture(input: {
   client.__test__.setComposioApiKeyOverride('terminal-one-shot-test-key');
   client.__test__.setConnectedAccountsLoader(async () => {
     accountLoads += 1;
-    return [{
-      id: currentAccount,
+    return (input.currentAccounts ?? [{ id: currentAccount }]).map((account) => ({
+      id: account.id,
       status: 'ACTIVE',
-      user_id: `owner:${currentAccount}`,
+      user_id: `owner:${account.id}`,
       toolkit: { slug: input.slug.split('_')[0]!.toLowerCase() },
-    }];
+      ...(account.email ? { account_email: account.email } : {}),
+    }));
   });
   await client.listConnectedToolkits({ requireFresh: true });
   if (input.rememberSchema !== false) {
@@ -242,6 +246,10 @@ afterEach(() => {
   client.resetComposioClient();
   schemas.resetToolSchemaCache();
   stores.installCapabilityManifestStore(null);
+  rmSync(path.join(TEST_HOME, 'memory', 'account-aliases.json'), { force: true });
+  accountAliases.resetAccountAliasesForTest();
+  rmSync(path.join(TEST_HOME, 'state', 'composio-account-identities.json'), { force: true });
+  identityCache.resetIdentityCacheForTest();
 });
 
 after(() => {
@@ -276,6 +284,209 @@ test('prepared platform read uses one SDK raw no-retry body and cannot reuse its
   await assert.rejects(tools.executePreparedComposioGatewayTool(result.preparedDispatch!));
   assert.equal(fixture.rawBodies(), 1, 'one opaque token owns exactly one raw provider body');
   assert.equal(fixture.accountLoads(), 1, 'execution preparation performs no hidden account refresh');
+});
+
+test('prepared host call routes through its exact attested account without model-restated account bytes', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-scorpion', email: 'owner@example.com' },
+      { id: 'ca-personal', email: 'nathan@example.com' },
+    ],
+  });
+  const result = await authority.withHostCallAttestation(
+    hostAttestation(fixture.manifest),
+    () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId,
+      { query: 'received>today-3650' },
+      undefined,
+      { preparedExecution: true },
+    ),
+  );
+  assert.equal(result.ok, true, result.ok ? '' : result.message);
+  if (!result.ok) return;
+  assert.equal(result.connectionId, 'ca-scorpion');
+  await tools.executePreparedComposioGatewayTool(result.preparedDispatch!);
+  assert.equal(fixture.rawBodies(), 1);
+  assert.equal(fixture.legacyBodies(), 0);
+});
+
+test('prepared host call proves its stable mailbox from a probe learned after the live account snapshot', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-scorpion' },
+      { id: 'ca-personal' },
+    ],
+  });
+  // Microsoft account listings can omit the mailbox. Model the live ordering:
+  // the current account snapshot is already frozen, then a pinned profile probe
+  // teaches the stable connection→mailbox identity used by closeout learning.
+  identityCache.recordIdentityProbe('ca-scorpion', 'owner@example.com');
+
+  const result = await authority.withHostCallAttestation(
+    hostAttestation(fixture.manifest),
+    () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId,
+      { query: 'received>today-3650' },
+      undefined,
+      { preparedExecution: true },
+    ),
+  );
+
+  assert.equal(result.ok, true, result.ok ? '' : result.message);
+  if (!result.ok) return;
+  assert.equal(result.connectionId, 'ca-scorpion');
+  assert.deepEqual(result.accountIdentityProof, {
+    connectionId: 'ca-scorpion',
+    identity: 'owner@example.com',
+  });
+  assert.equal(fixture.accountLoads(), 1,
+    'proof consumes the already-learned cache without refreshing provider state');
+  assert.equal(fixture.rawBodies(), 0, 'resolution and proof preparation do not execute the business call');
+});
+
+test('prepared host call supersedes a stale opaque caller account with its attested account', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-scorpion', email: 'owner@example.com' },
+      { id: 'ca-personal', email: 'nathan@example.com' },
+    ],
+  });
+  const result = await authority.withHostCallAttestation(
+    hostAttestation(fixture.manifest),
+    () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId,
+      { query: 'received>today-3650' },
+      'ca-personal',
+      { preparedExecution: true },
+    ),
+  );
+  assert.equal(result.ok, true, result.ok ? '' : result.message);
+  if (!result.ok) return;
+  assert.equal(result.connectionId, 'ca-scorpion');
+  assert.ok(result.notes.some((note) => (
+    /ignoring stale connected account ca-personal/i.test(note)
+    && /froze ca-scorpion/i.test(note)
+  )));
+  assert.equal(fixture.rawBodies(), 0);
+  assert.equal(fixture.legacyBodies(), 0);
+});
+
+test('prepared host call refuses a conflicting saved alias without repointing it', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-scorpion', email: 'owner@example.com' },
+      { id: 'ca-personal', email: 'nathan@example.com' },
+    ],
+  });
+  accountAliases.rememberAccountAlias({
+    toolkit: 'outlook',
+    label: 'personal',
+    email: 'nathan@example.com',
+    connectionId: 'ca-personal',
+  });
+  const before = accountAliases.resolveAccountAlias('personal', 'outlook');
+  const result = await authority.withHostCallAttestation(
+    hostAttestation(fixture.manifest),
+    () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId,
+      { query: 'received>today-3650', account_alias: 'personal' },
+      undefined,
+      { preparedExecution: true },
+    ),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.reason, 'invalid-args');
+    assert.match(result.message, /alias "personal" does not match the host-selected account/i);
+  }
+  assert.deepEqual(accountAliases.resolveAccountAlias('personal', 'outlook'), before);
+  assert.equal(fixture.rawBodies(), 0);
+  assert.equal(fixture.legacyBodies(), 0);
+});
+
+test('prepared host call refuses a preferred identity that conflicts with its attested account', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-scorpion', email: 'owner@example.com' },
+      { id: 'ca-personal', email: 'nathan@example.com' },
+    ],
+  });
+  const result = await authority.withHostCallAttestation(
+    hostAttestation(fixture.manifest),
+    () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId,
+      { query: 'received>today-3650' },
+      undefined,
+      {
+        preparedExecution: true,
+        preferredIdentity: 'nathan@example.com',
+      },
+    ),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.reason, 'invalid-args');
+    assert.match(result.message, /preferred account .* does not match the host-selected account/i);
+  }
+  assert.equal(fixture.rawBodies(), 0);
+  assert.equal(fixture.legacyBodies(), 0);
+});
+
+test('prepared host call refuses when its attested account is no longer current', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-personal', email: 'nathan@example.com' },
+    ],
+  });
+  const result = await authority.withHostCallAttestation(
+    hostAttestation(fixture.manifest),
+    () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId,
+      { query: 'received>today-3650' },
+      undefined,
+      { preparedExecution: true },
+    ),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.reason, 'identity-absent');
+    assert.match(result.message, /not present as a current usable outlook account/i);
+  }
+  assert.equal(fixture.rawBodies(), 0);
+  assert.equal(fixture.legacyBodies(), 0);
+});
+
+test('unattested prepared call with two accounts remains ambiguous and zero-body', async () => {
+  const fixture = await prepareFixture({
+    slug: 'OUTLOOK_SEARCH_MESSAGES',
+    manifestAccount: 'ca-scorpion',
+    currentAccounts: [
+      { id: 'ca-scorpion', email: 'owner@example.com' },
+      { id: 'ca-personal', email: 'nathan@example.com' },
+    ],
+  });
+  const result = await tools.resolveComposioDispatch(
+    fixture.manifest.operationId,
+    { query: 'received>today-3650' },
+    undefined,
+    { preparedExecution: true },
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'ambiguous-account');
+  assert.equal(fixture.rawBodies(), 0);
+  assert.equal(fixture.legacyBodies(), 0);
 });
 
 test('cold platform mutation refuses with zero SDK, CLI, legacy, or provider body', async () => {

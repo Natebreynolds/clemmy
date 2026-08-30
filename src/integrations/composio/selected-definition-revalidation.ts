@@ -2,6 +2,16 @@ import { digestSchema } from '../../tools/tool-contract-store.js';
 import { refreshExactComposioSchemaFromProvider } from '../../tools/composio-schema-cache.js';
 import { revalidateSelectedComposioConnections } from './client.js';
 import { fingerprintComposioProviderDefinition } from './provider-definition-identity.js';
+import {
+  parseOperationVerificationContract,
+  validateOperationVerificationContractForSchemas,
+  type OperationVerificationContractV1,
+} from '../../runtime/harness/mutation-verification-contract.js';
+import {
+  parseCapabilityManifestOperationSemantics,
+  validateCapabilityManifestOperationSemanticsForInputSchema,
+  type CapabilityManifestOperationSemanticsV1,
+} from '../../runtime/harness/capability-manifest.js';
 
 export interface SelectedComposioDefinition {
   identifier: string;
@@ -14,6 +24,11 @@ export interface SelectedComposioDefinition {
   outputSchemaDigest?: string | null;
   providerOperationVersion?: string;
   invokePortId?: string;
+  /** Presence is significant. Omitted legacy rows never acquire verifier
+   * authority from current code; null explicitly declares no authority. */
+  verificationContract?: OperationVerificationContractV1 | null;
+  /** Presence is significant for the same reason as verificationContract. */
+  operationSemantics?: CapabilityManifestOperationSemanticsV1 | null;
 }
 
 export interface RevalidatedComposioDefinition extends SelectedComposioDefinition {
@@ -38,7 +53,8 @@ export type SelectedComposioRevalidationRefusalCode =
   | 'selected_definition_output_schema_drift'
   | 'selected_definition_operation_version_unavailable'
   | 'selected_definition_operation_version_drift'
-  | 'selected_definition_fingerprint_drift';
+  | 'selected_definition_fingerprint_drift'
+  | 'selected_definition_semantic_contract_drift';
 
 export type SelectedComposioRevalidationResult =
   | {
@@ -82,9 +98,21 @@ export async function revalidateSelectedComposioDefinitions(
     const providerOperationVersion = raw.providerOperationVersion?.trim();
     const invokePortId = raw.invokePortId?.trim();
     const outputSchemaWasBound = Object.prototype.hasOwnProperty.call(raw, 'outputSchemaDigest');
+    const verificationWasBound = Object.prototype.hasOwnProperty.call(raw, 'verificationContract');
+    const operationSemanticsWasBound = Object.prototype.hasOwnProperty.call(raw, 'operationSemantics');
     const outputSchemaDigest = raw.outputSchemaDigest === null
       ? null
       : raw.outputSchemaDigest?.trim().toLowerCase();
+    const verificationContract = raw.verificationContract === null
+      ? null
+      : raw.verificationContract === undefined
+        ? undefined
+        : parseOperationVerificationContract(raw.verificationContract);
+    const operationSemantics = raw.operationSemantics === null
+      ? null
+      : raw.operationSemantics === undefined
+        ? undefined
+        : parseCapabilityManifestOperationSemantics(raw.operationSemantics);
     if (!identifier || !/^[a-f0-9]{64}$/.test(schemaDigest) || !accountIdentity) {
       return {
         ok: false,
@@ -98,6 +126,12 @@ export async function revalidateSelectedComposioDefinitions(
         && !/^[a-f0-9]{64}$/.test(outputSchemaDigest ?? ''))
       || (providerOperationVersion !== undefined && !providerOperationVersion)
       || (invokePortId !== undefined && !invokePortId)
+      || (verificationWasBound
+        && raw.verificationContract !== null
+        && !verificationContract)
+      || (operationSemanticsWasBound
+        && raw.operationSemantics !== null
+        && !operationSemantics)
     ) {
       return {
         ok: false,
@@ -112,6 +146,12 @@ export async function revalidateSelectedComposioDefinitions(
       ...(outputSchemaWasBound ? { outputSchemaDigest: outputSchemaDigest ?? null } : {}),
       ...(providerOperationVersion ? { providerOperationVersion } : {}),
       ...(invokePortId ? { invokePortId } : {}),
+      ...(verificationWasBound
+        ? { verificationContract: verificationContract ?? null }
+        : {}),
+      ...(operationSemanticsWasBound
+        ? { operationSemantics: operationSemantics ?? null }
+        : {}),
     };
     const prior = selected.get(key);
     if (prior && (
@@ -122,6 +162,14 @@ export async function revalidateSelectedComposioDefinitions(
       || (prior.outputSchemaDigest ?? null) !== (normalized.outputSchemaDigest ?? null)
       || (prior.providerOperationVersion ?? null) !== (normalized.providerOperationVersion ?? null)
       || (prior.invokePortId ?? null) !== (normalized.invokePortId ?? null)
+      || JSON.stringify(prior.verificationContract ?? null)
+        !== JSON.stringify(normalized.verificationContract ?? null)
+      || Object.prototype.hasOwnProperty.call(prior, 'verificationContract')
+        !== Object.prototype.hasOwnProperty.call(normalized, 'verificationContract')
+      || JSON.stringify(prior.operationSemantics ?? null)
+        !== JSON.stringify(normalized.operationSemantics ?? null)
+      || Object.prototype.hasOwnProperty.call(prior, 'operationSemantics')
+        !== Object.prototype.hasOwnProperty.call(normalized, 'operationSemantics')
     )) {
       return {
         ok: false,
@@ -236,6 +284,63 @@ export async function revalidateSelectedComposioDefinitions(
         },
       };
     }
+    const semanticAuthorityFullyBound = Boolean(
+      selection.definitionFingerprint
+      && selection.providerOperationVersion
+      && selection.invokePortId
+      && Object.prototype.hasOwnProperty.call(selection, 'outputSchemaDigest'),
+    );
+    if (
+      (selection.verificationContract || selection.operationSemantics)
+      && !semanticAuthorityFullyBound
+    ) {
+      return {
+        ok: false as const,
+        refusal: {
+          code: 'selected_definition_semantic_contract_drift' as const,
+          identifier: selection.identifier,
+        },
+      };
+    }
+    const currentVerification = selection.verificationContract
+      ? validateOperationVerificationContractForSchemas({
+          contract: selection.verificationContract,
+          inputSchema: exact.schema,
+          outputSchema,
+        })
+      : null;
+    const currentOperationSemantics = selection.operationSemantics
+      ? validateCapabilityManifestOperationSemanticsForInputSchema({
+          semantics: selection.operationSemantics,
+          inputSchema: exact.schema,
+        })
+      : null;
+    if (
+      Object.prototype.hasOwnProperty.call(selection, 'verificationContract')
+      && JSON.stringify(selection.verificationContract ?? null)
+        !== JSON.stringify(currentVerification ?? null)
+    ) {
+      return {
+        ok: false as const,
+        refusal: {
+          code: 'selected_definition_semantic_contract_drift' as const,
+          identifier: selection.identifier,
+        },
+      };
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(selection, 'operationSemantics')
+      && JSON.stringify(selection.operationSemantics ?? null)
+        !== JSON.stringify(currentOperationSemantics ?? null)
+    ) {
+      return {
+        ok: false as const,
+        refusal: {
+          code: 'selected_definition_semantic_contract_drift' as const,
+          identifier: selection.identifier,
+        },
+      };
+    }
     const invokePortId = selection.invokePortId
       ?? `port:cap:resolved:${selection.identifier.toLowerCase()}:${selection.identifier}`;
     const definitionFingerprint = fingerprintComposioProviderDefinition({
@@ -279,6 +384,12 @@ export async function revalidateSelectedComposioDefinitions(
         providerOperationVersion: operationVersion,
         invokePortId,
         definitionFingerprint,
+        ...(Object.prototype.hasOwnProperty.call(selection, 'verificationContract')
+          ? { verificationContract: currentVerification ?? null }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(selection, 'operationSemantics')
+          ? { operationSemantics: currentOperationSemantics ?? null }
+          : {}),
       } satisfies RevalidatedComposioDefinition,
     };
     }));

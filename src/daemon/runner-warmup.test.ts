@@ -21,6 +21,7 @@ const {
   bootAuthSetupSatisfied,
   bootModelWarmupEnabled,
   cliDiscoveryWarmupEnabled,
+  daemonRecursiveReflectionEnabled,
   resolveBootModelWarmupGate,
 } = await import('./runner.js');
 
@@ -95,6 +96,23 @@ function isInsideOnReady(node: ts.Node): boolean {
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('recursive-reflection kill switch disables the entire daemon tick owner', () => {
+  const prior = process.env.CLEMMY_REFLECTION;
+  try {
+    for (const value of ['off', 'false', '0']) {
+      process.env.CLEMMY_REFLECTION = value;
+      assert.equal(daemonRecursiveReflectionEnabled(), false);
+    }
+    process.env.CLEMMY_REFLECTION = 'on';
+    assert.equal(daemonRecursiveReflectionEnabled(), true);
+    delete process.env.CLEMMY_REFLECTION;
+    assert.equal(daemonRecursiveReflectionEnabled(), true);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_REFLECTION;
+    else process.env.CLEMMY_REFLECTION = prior;
+  }
 });
 
 test('boot model warmup is explicit opt-in', () => {
@@ -243,7 +261,10 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
 
   const canonicalToolMigration = callsNamed(startDaemon, 'migrateToolChoicesToCanonicalProcedures');
   const orphanFence = callsNamed(startDaemon, 'interruptOrphanedRunAttemptsAtBoot');
-  const workerBatchFence = callsNamed(startDaemon, 'reconcileWorkerBatchDurableOwnershipAtBoot');
+  const dispatchLeaseQuarantine = callsNamed(
+    startDaemon,
+    'reconcileTerminalRunAttemptDispatchLeasesAtBoot',
+  );
   const runnerTrustRecovery = callsNamed(startDaemon, 'recoverResolvedRunnerTrustApprovals');
   const approvalDrain = callsNamed(startDaemon, 'startChatApprovalResume');
   const closedDispatchRecovery = callsNamed(startDaemon, 'reconcileClosedWorkflowDispatchBatches')
@@ -255,7 +276,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   for (const [label, calls] of [
     ['canonical tool-memory migration', canonicalToolMigration],
     ['orphan fencing', orphanFence],
-    ['worker-batch ownership fencing', workerBatchFence],
+    ['terminal-attempt dispatch quarantine', dispatchLeaseQuarantine],
     ['runner-trust approval recovery', runnerTrustRecovery],
     ['approval drain', approvalDrain],
     ['closed workflow dispatch recovery', closedDispatchRecovery],
@@ -281,7 +302,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   const orderedBootNodes = [
     canonicalToolMigration[0],
     orphanFence[0],
-    workerBatchFence[0],
+    dispatchLeaseQuarantine[0],
     runnerTrustRecovery[0],
     approvalDrain[0],
     closedDispatchRecovery[0],
@@ -294,7 +315,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
   assert.deepEqual(
     [...orderedBootNodes].sort((left, right) => left.getStart() - right.getStart()),
     orderedBootNodes,
-    'boot must migrate, terminalize orphan attempts, fence their worker batches, drain approvals, settle workflow dispatch, recover generic chats, arm report-back, register lanes, then release ingress',
+    'boot must migrate, terminalize orphan attempts, quarantine their dispatch generations, drain approvals, settle workflow dispatch, recover generic chats, arm report-back, register lanes, then release ingress',
   );
 
   const cliWarmCalls = callsNamed(startDaemon, 'warmCliScan');

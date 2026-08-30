@@ -13,7 +13,11 @@ import assert from 'node:assert/strict';
 import { applyClaudeEnvelope } from './claude-model.js';
 import { relaxRequestForCompatBackend } from './byo-model.js';
 import { ORCHESTRATOR_INSTRUCTIONS } from '../../agents/orchestrator.js';
-import { CACHE_BREAK_SENTINEL, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
+import {
+  CACHE_BREAK_SENTINEL,
+  CACHE_MEMORY_CONTEXT_SENTINEL,
+  INSTRUCTION_CACHE_DELIM,
+} from './model-wire-registry.js';
 
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const TOKEN = 'sk-ant-oat01-x';
@@ -31,7 +35,7 @@ const DYNAMIC_CTX = [
 
 // What harnessInstructions(ORCHESTRATOR_INSTRUCTIONS)() emits with parity ON:
 // STABLE role first, sentinel delimiter, DYNAMIC context last.
-const ASSEMBLED_PARITY = `${ORCHESTRATOR_INSTRUCTIONS}${INSTRUCTION_CACHE_DELIM}${DYNAMIC_CTX}`;
+const ASSEMBLED_PARITY = `${ORCHESTRATOR_INSTRUCTIONS}${INSTRUCTION_CACHE_DELIM}${CACHE_MEMORY_CONTEXT_SENTINEL}\n\n${DYNAMIC_CTX}`;
 // What it emitted BEFORE this change (parity off / legacy): dynamic first.
 const ASSEMBLED_LEGACY = `${DYNAMIC_CTX}\n\n---\n\n${ORCHESTRATOR_INSTRUCTIONS}`;
 

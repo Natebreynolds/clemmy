@@ -109,7 +109,16 @@ export function RunningTasksSheet({
         aria-expanded={open}
         onClick={() => { haptic('light'); setOpen(true); }}
       >
-        <span class="running-tasks-spark" aria-hidden="true">✳</span>
+        {/* An inline glyph, never a text emoji. `✳` (U+2733) has emoji
+            presentation on iOS, so it rendered as a bright green tile that
+            ignored `color:` entirely and fought the warm palette beside it.
+            An SVG inherits currentColor and stays on-brand. */}
+        <span class="running-tasks-spark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="8.5" opacity="0.28" />
+            <path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5" />
+          </svg>
+        </span>
         <span aria-hidden="true">{compact}</span>
         <span class="sr-only">{pillLabel}</span>
       </button>

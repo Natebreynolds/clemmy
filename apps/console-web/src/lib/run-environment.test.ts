@@ -77,14 +77,15 @@ test('Tasks handoff carries exact canonical attempt and scope identity', () => {
   assert.equal(runEnvironmentTasksHref({ id: 'legacy-run' }), '/tasks?select=legacy-run');
 });
 
-// The old Run environment panel was replaced by the Live agents panel
-// (2026-07-30 — the owner's call: simple who-is-working rows in a pop-in
-// side panel; deep inspection lives on the Tasks board). The viewport
-// containment pin moves with it.
-test('mobile Live agents dialog is viewport-contained', () => {
-  const source = readFileSync(new URL('../components/LiveAgentsPanel.tsx', import.meta.url), 'utf8');
-  assert.match(source, /fixed inset-x-3 inset-y-3[^'\n]*min-w-0[^'\n]*max-w-\[calc\(100vw-24px\)\][^'\n]*overflow-hidden/);
-  assert.match(source, /min-h-0 flex-1 overflow-y-auto/);
+// Working Now now has one chat-adjacent drawer instead of a second Live Agents
+// panel. Deep inspection still lives on the Tasks board; the drawer owns the
+// mobile viewport and safe-area containment.
+test('mobile running-tasks dialog is viewport-contained', () => {
+  const source = readFileSync(new URL('../components/chat/RunningTasksDrawer.tsx', import.meta.url), 'utf8');
+  assert.match(source, /fixed inset-0[^'\n]*items-end/);
+  assert.match(source, /max-h-\[86dvh\][^'\n]*w-full[^'\n]*flex-col/);
+  assert.match(source, /min-h-0 flex-1[^'\n]*overflow-y-auto/);
+  assert.match(source, /safe-area-inset-bottom/);
 });
 
 test('counts only canonical top-level calls and reports transport mirrors separately', () => {

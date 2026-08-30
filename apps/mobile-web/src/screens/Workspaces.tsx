@@ -12,6 +12,7 @@
  * deterministic and testable rather than guessed in a component.
  */
 import { useState } from 'preact/hooks';
+import { useBackGesture } from '../lib/back-gesture';
 import {
   getWorkspace,
   listWorkspaces,
@@ -29,6 +30,7 @@ import { Chat } from './Chat';
 
 export function Workspaces() {
   const [openId, setOpenId] = useState<string | null>(null);
+  useBackGesture(openId !== null, () => setOpenId(null));
   const { data, loading, error, offline, refresh } = useScreenData(
     listWorkspaces,
     { intervalMs: 15_000, disabled: openId !== null },

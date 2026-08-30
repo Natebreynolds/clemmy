@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 
 import {
   MODEL_ROUTE_METRICS_SCHEMA_SQL,
@@ -12,7 +13,45 @@ import {
   scoreModelRouteCandidate,
   selectBestRouteCandidate,
   summarizeRouteOutcomes,
+  withModelRouteMetrics,
 } from './model-route-metrics.js';
+import { withModelFallback } from './harness/fallback-model.js';
+
+function metricsDb(): Database.Database {
+  const db = new Database(':memory:');
+  db.exec('PRAGMA foreign_keys = ON;');
+  db.exec(MODEL_ROUTE_METRICS_SCHEMA_SQL);
+  return db;
+}
+
+function requestWithSentinel(): ModelRequest {
+  return {
+    input: 'PRIVATE_PROMPT_SENTINEL',
+    modelSettings: {},
+    tools: [],
+    handoffs: [],
+  } as unknown as ModelRequest;
+}
+
+function responseModel(response: ModelResponse): Model {
+  return {
+    getResponse: async () => response,
+    getStreamedResponse: async function* () {
+      yield { type: 'response_done', response } as never;
+    },
+  } as Model;
+}
+
+function responseWith(
+  usage: Record<string, unknown>,
+  providerData: Record<string, unknown> = {},
+): ModelResponse {
+  return {
+    output: [{ type: 'message', role: 'assistant', content: 'PRIVATE_RESPONSE_SENTINEL' }],
+    usage,
+    providerData,
+  } as unknown as ModelResponse;
+}
 
 test('successful fallback is attributed to the brain that actually served it', () => {
   assert.deepEqual(successfulRouteOutcome({
@@ -155,6 +194,237 @@ test('recordModelRouteOutcome tolerates missing decisions without throwing', () 
       }, db);
     });
     assert.equal((db.prepare('SELECT COUNT(*) AS n FROM model_route_outcomes').get() as { n: number }).n, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test('provider recording adapters persist explicit cost only and preserve token/cache fields', async () => {
+  const db = metricsDb();
+  try {
+    const cases: Array<{
+      id: string;
+      provider: 'codex' | 'claude' | 'byo';
+      response: ModelResponse;
+      expected: { input: number; output: number; cached: number; total: number; cost: number | null };
+    }> = [
+      {
+        id: 'codex-shaped',
+        provider: 'codex',
+        response: responseWith({
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+          inputTokensDetails: { cachedTokens: 40 },
+        }),
+        expected: { input: 100, output: 20, cached: 40, total: 120, cost: null },
+      },
+      {
+        id: 'claude-cost',
+        provider: 'claude',
+        response: responseWith({
+          input_tokens: 80,
+          output_tokens: 12,
+          total_tokens: 92,
+          input_tokens_details: { cache_read_input_tokens: 30 },
+        }, { totalCostUsd: 0.125 }),
+        expected: { input: 80, output: 12, cached: 30, total: 92, cost: 0.125 },
+      },
+      {
+        id: 'claude-zero-cost',
+        provider: 'claude',
+        response: responseWith({ inputTokens: 5, outputTokens: 1, totalTokens: 6 }, { totalCostUsd: 0 }),
+        expected: { input: 5, output: 1, cached: 0, total: 6, cost: 0 },
+      },
+      {
+        id: 'byo-no-cost',
+        provider: 'byo',
+        response: responseWith({
+          prompt_tokens: 70,
+          completion_tokens: 9,
+          total_tokens: 79,
+          prompt_tokens_details: { cached_tokens: 25 },
+        }),
+        expected: { input: 70, output: 9, cached: 25, total: 79, cost: null },
+      },
+    ];
+
+    for (const fixture of cases) {
+      const recorded = withModelRouteMetrics(responseModel(fixture.response), {
+        modelCallIdPrefix: fixture.id,
+        sessionId: 'metrics-adapter-test',
+        role: 'brain',
+        resolvedModel: fixture.id,
+        provider: fixture.provider,
+        source: 'explicit',
+        reason: { fixture: fixture.id },
+      }, db);
+      await recorded.getResponse(requestWithSentinel());
+    }
+
+    const rows = db.prepare(`
+      SELECT d.resolved_model, d.reason_json, o.input_tokens, o.output_tokens,
+             o.cached_tokens, o.total_tokens, o.cost_usd, o.metadata_json
+      FROM model_route_decisions d
+      JOIN model_route_outcomes o ON o.decision_id = d.id
+      ORDER BY d.rowid ASC
+    `).all() as Array<{
+      resolved_model: string;
+      reason_json: string;
+      input_tokens: number;
+      output_tokens: number;
+      cached_tokens: number | null;
+      total_tokens: number;
+      cost_usd: number | null;
+      metadata_json: string;
+    }>;
+    assert.equal(rows.length, cases.length);
+    for (const [index, row] of rows.entries()) {
+      const expected = cases[index]!.expected;
+      assert.equal(row.input_tokens, expected.input);
+      assert.equal(row.output_tokens, expected.output);
+      assert.equal(row.cached_tokens ?? 0, expected.cached);
+      assert.equal(row.total_tokens, expected.total);
+      assert.equal(row.input_tokens - (row.cached_tokens ?? 0), expected.input - expected.cached,
+        'uncached prompt tokens remain derivable without folding cached tokens twice');
+      assert.equal(row.cost_usd, expected.cost);
+      assert.doesNotMatch(`${row.reason_json}${row.metadata_json}`, /PRIVATE_(?:PROMPT|RESPONSE)_SENTINEL/);
+    }
+
+    const aggregate = db.prepare(`
+      SELECT COUNT(*) AS attempts, COUNT(cost_usd) AS priced_attempts, SUM(cost_usd) AS actual_cost_usd
+      FROM model_route_outcomes
+    `).get() as { attempts: number; priced_attempts: number; actual_cost_usd: number };
+    assert.deepEqual(aggregate, { attempts: 4, priced_attempts: 2, actual_cost_usd: 0.125 },
+      'actual zero is available/priced while unavailable provider cost remains NULL');
+  } finally {
+    db.close();
+  }
+});
+
+test('fallover records exactly one row for each provider attempt and no aggregate mirror row', async () => {
+  const db = metricsDb();
+  try {
+    const primary = {
+      getResponse: async () => { throw { statusCode: 529, message: 'overloaded' }; },
+      getStreamedResponse: async function* () { throw { statusCode: 529, message: 'overloaded' }; },
+    } as Model;
+    const rescue = responseModel(responseWith(
+      { inputTokens: 11, outputTokens: 3, totalTokens: 14 },
+      { totalCostUsd: 0.02 },
+    ));
+
+    const recordedFallback = withModelRouteMetrics(withModelFallback([
+      { label: 'primary', provider: 'codex', model: 'codex-primary', getModel: () => primary },
+      { label: 'rescue', provider: 'claude', model: 'claude-rescue', getModel: () => rescue },
+    ]), {
+      sessionId: 'fallover-attempt-test',
+      role: 'brain',
+      resolvedModel: 'codex-primary',
+      provider: 'codex',
+      source: 'explicit',
+    }, db);
+    await recordedFallback.getResponse(requestWithSentinel());
+
+    const rows = db.prepare(`
+      SELECT d.resolved_model, o.status, o.total_tokens, o.cost_usd
+      FROM model_route_decisions d
+      JOIN model_route_outcomes o ON o.decision_id = d.id
+      ORDER BY d.rowid ASC
+    `).all();
+    assert.deepEqual(rows, [
+      { resolved_model: 'codex-primary', status: 'failed', total_tokens: null, cost_usd: null },
+      { resolved_model: 'claude-rescue', status: 'success', total_tokens: 14, cost_usd: 0.02 },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
+test('duplicate retry/mirror finalization cannot overwrite or double-count an actual attempt', () => {
+  const db = metricsDb();
+  try {
+    const decisionId = recordModelRouteDecision({
+      id: 'immutable-attempt',
+      role: 'brain',
+      resolvedModel: 'claude-zero-cost',
+      provider: 'claude',
+      source: 'explicit',
+    }, db);
+    assert.equal(recordModelRouteOutcome({
+      decisionId,
+      status: 'success',
+      inputTokens: 3,
+      cachedTokens: 1,
+      totalTokens: 4,
+      costUsd: 0,
+    }, db), true);
+    assert.equal(recordModelRouteOutcome({
+      decisionId,
+      status: 'failed',
+      totalTokens: 999,
+      costUsd: 999,
+      metadata: { accounting: 'transport_mirror' },
+    }, db), false);
+    recordModelRouteDecision({
+      id: decisionId,
+      role: 'brain',
+      resolvedModel: 'mirror-must-not-replace-original',
+      provider: 'unknown',
+      source: 'fallback',
+    }, db);
+    assert.deepEqual(db.prepare(`
+      SELECT d.resolved_model, o.status, o.input_tokens, o.cached_tokens, o.total_tokens, o.cost_usd
+      FROM model_route_decisions d
+      JOIN model_route_outcomes o ON o.decision_id = d.id
+    `).all(), [{
+      resolved_model: 'claude-zero-cost',
+      status: 'success',
+      input_tokens: 3,
+      cached_tokens: 1,
+      total_tokens: 4,
+      cost_usd: 0,
+    }]);
+  } finally {
+    db.close();
+  }
+});
+
+test('an adapter-owned transport retry produces one canonical model-call row', async () => {
+  const db = metricsDb();
+  try {
+    let transportAttempts = 0;
+    const retryingAdapter: Model = {
+      async getResponse() {
+        for (;;) {
+          transportAttempts += 1;
+          try {
+            if (transportAttempts === 1) throw new Error('retryable transport reset');
+            return responseWith({ inputTokens: 9, outputTokens: 2, totalTokens: 11 });
+          } catch (error) {
+            // Simulate the adapter's bounded wire retry below the model-call
+            // boundary. Only its terminal provider response owns accounting.
+            if (transportAttempts >= 2) throw error;
+          }
+        }
+      },
+      async *getStreamedResponse() {
+        throw new Error('unused');
+      },
+    };
+    await withModelRouteMetrics(retryingAdapter, {
+      sessionId: 'adapter-retry-test',
+      role: 'brain',
+      resolvedModel: 'codex-retrying-adapter',
+      provider: 'codex',
+      source: 'explicit',
+    }, db).getResponse(requestWithSentinel());
+
+    assert.equal(transportAttempts, 2);
+    assert.deepEqual(db.prepare(`
+      SELECT COUNT(*) AS attempts, SUM(total_tokens) AS total_tokens, COUNT(cost_usd) AS priced_attempts
+      FROM model_route_outcomes
+    `).get(), { attempts: 1, total_tokens: 11, priced_attempts: 0 });
   } finally {
     db.close();
   }

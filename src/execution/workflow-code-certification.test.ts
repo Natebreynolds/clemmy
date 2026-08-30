@@ -10,6 +10,7 @@ process.env.HOME = TMP_HOME;
 
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 const { certifyWorkflowCode } = await import('./workflow-code-certification.js');
+const { validateWorkflowDefinition } = await import('./workflow-validator.js');
 
 beforeEach(() => {
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
@@ -39,7 +40,7 @@ function script(slug: string, name: string, source: string): void {
   writeFileSync(path.join(dir, name), source, 'utf-8');
 }
 
-test('certifies JavaScript syntax and emits an exact content bundle hash', () => {
+test('preserves an exact legacy bundle for migration without granting execution authority', () => {
   script('code-cert', 'transform.mjs', 'const input = await new Promise((resolve) => resolve({ ok: true }));\nconsole.log(JSON.stringify(input));\n');
   const first = certifyWorkflowCode(workflow('transform.mjs'), 'code-cert');
 
@@ -49,6 +50,11 @@ test('certifies JavaScript syntax and emits an exact content bundle hash', () =>
   assert.equal(first.artifacts[0].status, 'ready');
   assert.match(first.artifacts[0].sha256 ?? '', /^[a-f0-9]{64}$/);
   assert.match(first.bundleHash ?? '', /^[a-f0-9]{64}$/);
+  const validation = validateWorkflowDefinition(workflow('transform.mjs'));
+  assert.equal(validation.ok, false, 'byte certification is not execution admission');
+  assert.ok(validation.errors.some((error) => (
+    /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i.test(error)
+  )));
 
   script('code-cert', 'transform.mjs', 'console.log("changed");\n');
   const changed = certifyWorkflowCode(workflow('transform.mjs'), 'code-cert');

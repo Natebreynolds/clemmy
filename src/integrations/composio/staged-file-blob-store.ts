@@ -27,6 +27,9 @@ const MD5_RE = /^[a-f0-9]{32}$/;
 const TEMP_BASENAME_RE = /^\.staged-[a-f0-9-]+\.part$/;
 const MATERIALIZE_TEMP_BASENAME_RE = /^\.materialize-[a-f0-9-]+\.part$/;
 const READ_BUFFER_BYTES = 128 * 1024;
+const PUBLICATION_LINK_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
+const PUBLICATION_LINK_RETRY_ATTEMPTS = 400;
+const PUBLICATION_LINK_RETRY_INTERVAL_MS = 5;
 
 export const DEFAULT_STAGED_FILE_MAX_BYTES = 512 * 1024 * 1024;
 
@@ -381,6 +384,41 @@ function verifyPublishedBlob(input: PublishedStagedFileBlob, maxBytes: number): 
   }
 }
 
+/** Hard-link publication briefly exposes the winning inode under both its
+ * temp and final names. Ordinary consumers keep requiring exactly one link;
+ * only a competing publisher may wait for that exact 0600 regular-file
+ * transition to finish, after which the full size and digest verification
+ * still runs. A crashed or hostile extra link remains invalid after the
+ * bounded wait. */
+function verifyPublishedBlobForPublisher(
+  input: PublishedStagedFileBlob,
+  maxBytes: number,
+): void {
+  for (let attempt = 0; attempt <= PUBLICATION_LINK_RETRY_ATTEMPTS; attempt += 1) {
+    let transitional = false;
+    try {
+      const entry = lstatSync(input.blobPath);
+      transitional = !entry.isSymbolicLink()
+        && entry.isFile()
+        && entry.nlink === 2
+        && (entry.mode & 0o777) === FILE_MODE
+        && entry.size === input.byteCount;
+    } catch {
+      // Missing/unreadable winners flow through strict verification below.
+    }
+    if (!transitional) return verifyPublishedBlob(input, maxBytes);
+    if (attempt === PUBLICATION_LINK_RETRY_ATTEMPTS) {
+      return verifyPublishedBlob(input, maxBytes);
+    }
+    Atomics.wait(
+      PUBLICATION_LINK_RETRY_WAIT,
+      0,
+      0,
+      PUBLICATION_LINK_RETRY_INTERVAL_MS,
+    );
+  }
+}
+
 /**
  * Incremental, network-agnostic writer. `seal()` fsyncs and closes the hidden
  * temp file; the returned metadata can be checkpointed before `publish()`.
@@ -555,7 +593,7 @@ export function publishStagedFileBlob(input: {
     try {
       const existing = lstatSync(finalPath);
       if (existing) {
-        verifyPublishedBlob(published, maxBytes);
+        verifyPublishedBlobForPublisher(published, maxBytes);
         closeSync(fd);
         fd = null;
         unlinkSync(temporaryPath);
@@ -571,6 +609,10 @@ export function publishStagedFileBlob(input: {
     // different random-IV file bytes after both observed ENOENT. A hard-link
     // publish is atomic/no-replace; EEXIST adopts only an exactly verified
     // winner, and unlinking the temp restores the required single-link inode.
+    // The temp was already descriptor/path-validated as 0600 above, and the
+    // hard link preserves that same inode and mode. Do not chmod after the
+    // final name becomes visible: even a same-mode chmod advances ctime while
+    // a competing publisher may be hashing the canonical inode.
     if (fd === null) {
       throw new StagedFileBlobError('invalid_staged_blob', 'verified staged-file descriptor was lost');
     }
@@ -579,7 +621,7 @@ export function publishStagedFileBlob(input: {
       linkSync(temporaryPath, finalPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      verifyPublishedBlob(published, maxBytes);
+      verifyPublishedBlobForPublisher(published, maxBytes);
       closeSync(verifiedFd);
       fd = null;
       unlinkSync(temporaryPath);
@@ -587,7 +629,6 @@ export function publishStagedFileBlob(input: {
       return published;
     }
     unlinkSync(temporaryPath);
-    fchmodSync(verifiedFd, FILE_MODE);
     fsyncDirectory(storeDirectory);
     closeSync(verifiedFd);
     fd = null;

@@ -8,7 +8,16 @@ import Database from 'better-sqlite3';
 
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-durable-auth-'));
 
-const { appendEvent, closeEventLog, createSession, listEvents, openEventLog, resetEventLog, HARNESS_DB_PATH } = await import('./eventlog.js');
+const {
+  appendEvent,
+  applyHarnessMigrationsThroughVersionForTests,
+  closeEventLog,
+  createSession,
+  listEvents,
+  openEventLog,
+  resetEventLog,
+  HARNESS_DB_PATH,
+} = await import('./eventlog.js');
 const { mintResolvedCallAuthority, callAuthorityDigestOf } = await import('./resolved-call-authority.js');
 const { attachSemanticContract, capabilityManifestDigest } = await import('./capability-manifest.js');
 const { beginPhysicalDispatch, beginTypedPhysicalDispatch } = await import('./dispatch-ledger.js');
@@ -569,32 +578,8 @@ test('interrupted v46 mid-ALTER completes on reopen', () => {
   closeEventLog();
   try { unlinkSync(HARNESS_DB_PATH); } catch { /* missing is fine */ }
   const raw = new Database(HARNESS_DB_PATH);
-  raw.exec(`
-    CREATE TABLE schema_version (
-      version INTEGER PRIMARY KEY,
-      applied_at TEXT NOT NULL
-    );
-    INSERT INTO schema_version (version, applied_at) VALUES (45, '2026-08-16T00:00:00.000Z');
-    CREATE TABLE physical_dispatches (
-      session_id TEXT NOT NULL,
-      source_user_seq INTEGER NOT NULL,
-      accepted_task_id TEXT NOT NULL,
-      logical_tool_call_id TEXT NOT NULL,
-      physical_dispatch_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL,
-      relation TEXT NOT NULL,
-      retry_of TEXT,
-      tool_name TEXT NOT NULL,
-      argument_digest TEXT NOT NULL,
-      state TEXT NOT NULL DEFAULT 'started',
-      started_at TEXT NOT NULL,
-      settled_at TEXT,
-      start_event_id TEXT,
-      settle_event_id TEXT,
-      authority_digest TEXT,
-      PRIMARY KEY (session_id, source_user_seq, physical_dispatch_id)
-    );
-  `);
+  applyHarnessMigrationsThroughVersionForTests(raw, 45);
+  raw.exec('ALTER TABLE physical_dispatches ADD COLUMN authority_digest TEXT');
   raw.close();
 
   const migrated = openEventLog();

@@ -1416,36 +1416,170 @@ export function hasMeaningfulSuccessfulToolNames(
 }
 
 /**
- * B3 — destination truth from what the turn actually TOUCHED.
+ * B3 — destination truth from the accepted work and what the turn touched.
  *
  * `objectiveRequiresFreshExternalWrite` classifies REQUEST TEXT through ~45
  * regexes, and the class has already produced two live false-incompletions
  * ("save them in the workflow" matched nothing local → the finished turn was
  * rewritten to "no receipt of it landing"; the 2026-08-05 fix was one regex
- * wider and the class recurred in four days). The settlement-aware form asks
- * the ledger first: when the turn demonstrably touched destinations and every
- * one of them resolved LOCAL (read / compute / local_write — no external_write
- * event, no external-effect dispatch), no external receipt is required, and
- * no phrasing can change that fact.
+ * wider and the class recurred in four days). The authority-aware form first
+ * reads the exact source's frozen work effect and validated graph. Provider
+ * names never decide those facts. Only in their absence may observed local
+ * activity disprove the text classifier's destination guess.
  *
- * PRECISION THAT KEEPS THE HOLE CLOSED: the inversion fires ONLY on observed
- * local-only activity. A turn that was supposed to send and did NOTHING
- * touched no destination, so it falls through to the text classifier and
- * behaves exactly as today.
- *
- * Callsites (loop/claude-agent-brain/controller) flip to this at integration
- * time; the text regexes the settlement path subsumes get DELETED in that same
- * change (subtraction pin), never before — deleting them while live callsites
- * still pass only text would widen the gate blind.
+ * PRECISION THAT KEEPS BOTH HOLES CLOSED: positive structural authority wins
+ * over local side work. A negative work topology is trusted only when it is
+ * graph-bound under a known non-external ceiling. With no structural fact and
+ * no touched destination, zero-call failures retain the conservative request-
+ * text floor.
  */
-import { listEvents as listEventsForEvidence } from './eventlog.js';
+import {
+  getTurnGraphEventForSource,
+  listEvents as listEventsForEvidence,
+  openEventLog,
+} from './eventlog.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
+import { validateTurnGraph } from '../graph/turn-graph-compiler.js';
+import type { TurnGraphIR } from '../graph/turn-graph-ir.js';
 
 export interface FreshExternalWriteRequirement {
   required: boolean;
-  basis: 'observed_local_only' | 'objective_text';
+  basis: 'expected_work' | 'accepted_graph' | 'observed_local_only' | 'objective_text';
   touchedTotal: number;
   touchedExternal: number;
+}
+
+function isExternalMutationEffect(effect: unknown): boolean {
+  return effect === 'external_write' || effect === 'admin';
+}
+
+function graphHasExternalMutation(
+  graph: TurnGraphIR,
+): boolean {
+  if (isExternalMutationEffect(graph.effectCeiling)) return true;
+  if (graph.nodes.some((node) => isExternalMutationEffect(node.effect.kind))) return true;
+  if (graph.workTopology?.topology.operations.some((operation) => (
+    isExternalMutationEffect(operation.effect)
+  ))) return true;
+  const destinations = graph.classification.goalConstraints?.destinations
+    ?? (graph.classification.goalConstraints?.destination
+      ? [graph.classification.goalConstraints.destination]
+      : []);
+  return destinations.some((destination) => (
+    isExternalMutationEffect(destination.binding?.effect)
+  ));
+}
+
+function graphHasKnownNonExternalCeiling(
+  graph: TurnGraphIR,
+): boolean {
+  return graph.effectCeiling === 'none'
+    || graph.effectCeiling === 'read'
+    || graph.effectCeiling === 'compute'
+    || graph.effectCeiling === 'host_only'
+    || graph.effectCeiling === 'local_write';
+}
+
+function validatedGraphForExternalWriteRequirement(
+  sessionId: string,
+  sourceUserSeq: number,
+): TurnGraphIR | null {
+  const event = getTurnGraphEventForSource(sessionId, sourceUserSeq);
+  if (!event || event.type !== 'turn_graph_compiled') return null;
+  const graph = event.data.graph as TurnGraphIR | undefined;
+  if (
+    !graph
+    || graph.identity.sessionId !== sessionId
+    || graph.identity.sourceUserSeq !== sourceUserSeq
+    || graph.identity.turn !== event.turn
+    || event.data.sourceUserSeq !== sourceUserSeq
+    || event.data.graphId !== graph.graphId
+    || event.data.graphHash !== graph.compiler.graphHash
+    || !validateTurnGraph(graph).ok
+  ) return null;
+  return graph;
+}
+
+/**
+ * Positive-only fail-safe for a separately frozen expected-work contract.
+ *
+ * The heavy contract loader imports the event log and cannot be pulled back
+ * through this module (eventlog itself consumes tool-result evidence). This
+ * exact-key join projects only the monotonic fact needed here: an immutable
+ * authority row and its identically-bound contract both name an external
+ * mutation. Corruption, parse failure, missing identity, or disagreement
+ * returns false and grants no negative authority; the validated graph and
+ * request-text floor still run.
+ */
+function exactExpectedWorkHasExternalMutation(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  graph: TurnGraphIR | null;
+}): boolean {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT c.accepted_task_id, c.contract_id, c.graph_event_id,
+             c.graph_id, c.graph_hash, c.contract_json, c.operation_count,
+             a.work_contract_id, a.state
+        FROM accepted_task_work_contracts c
+        JOIN accepted_task_authority a
+          ON a.session_id = c.session_id
+         AND a.source_user_seq = c.source_user_seq
+         AND a.accepted_task_id = c.accepted_task_id
+         AND a.graph_event_id = c.graph_event_id
+         AND a.graph_id = c.graph_id
+         AND a.graph_hash = c.graph_hash
+       WHERE c.session_id = ? AND c.source_user_seq = ?
+         AND a.work_contract_id = c.contract_id
+         AND a.state <> 'conflict'
+    `).get(input.sessionId, input.sourceUserSeq) as {
+      accepted_task_id: string;
+      contract_id: string;
+      graph_event_id: string;
+      graph_id: string;
+      graph_hash: string;
+      contract_json: string;
+      operation_count: number;
+      work_contract_id: string;
+      state: string;
+    } | undefined;
+    if (!row || row.work_contract_id !== row.contract_id) return false;
+    if (input.graph && (
+      row.graph_id !== input.graph.graphId
+      || row.graph_hash !== input.graph.compiler.graphHash
+    )) return false;
+    const parsed = JSON.parse(row.contract_json) as Record<string, unknown>;
+    const identity = parsed.identity as Record<string, unknown> | undefined;
+    const operations = Array.isArray(parsed.operations) ? parsed.operations : null;
+    if (
+      !identity
+      || identity.sessionId !== input.sessionId
+      || identity.sourceUserSeq !== input.sourceUserSeq
+      || parsed.acceptedTaskId !== row.accepted_task_id
+      || parsed.contractId !== row.contract_id
+      || parsed.graphEventId !== row.graph_event_id
+      || parsed.graphId !== row.graph_id
+      || parsed.graphHash !== row.graph_hash
+      || !operations
+      || operations.length !== row.operation_count
+    ) return false;
+    return operations.some((operation) => (
+      operation !== null
+      && typeof operation === 'object'
+      && !Array.isArray(operation)
+      && isExternalMutationEffect((operation as Record<string, unknown>).effect)
+    ));
+  } catch {
+    return false;
+  }
+}
+
+function graphHasAgreedKnownNonExternalTopology(graph: TurnGraphIR): boolean {
+  return graphHasKnownNonExternalCeiling(graph)
+    && Boolean(graph.workTopology)
+    && graph.workTopology!.topology.operations.every((operation) => (
+      !isExternalMutationEffect(operation.effect)
+    ));
 }
 
 export function freshExternalWriteRequirement(input: {
@@ -1455,7 +1589,17 @@ export function freshExternalWriteRequirement(input: {
 }): FreshExternalWriteRequirement {
   let touchedTotal = 0;
   let touchedExternal = 0;
+  let graph: TurnGraphIR | null = null;
   if (input.sessionId && typeof input.sourceUserSeq === 'number') {
+    try {
+      graph = validatedGraphForExternalWriteRequirement(
+        input.sessionId,
+        input.sourceUserSeq,
+      );
+    } catch {
+      // An unreadable graph cannot weaken the requirement. Keep evaluating
+      // the remaining positive evidence and the text fallback.
+    }
     try {
       const events = listEventsForEvidence(input.sessionId);
       for (const event of events) {
@@ -1488,6 +1632,33 @@ export function freshExternalWriteRequirement(input: {
       // turn's answer on a DB hiccup).
     }
   }
+
+  // Positive structural authority dominates every observed side effect. A
+  // turn may write a local staging file before its admitted provider write;
+  // seeing that local child must never erase the still-open external outcome.
+  if (
+    input.sessionId
+    && typeof input.sourceUserSeq === 'number'
+    && exactExpectedWorkHasExternalMutation({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      graph,
+    })
+  ) {
+    return { required: true, basis: 'expected_work', touchedTotal, touchedExternal };
+  }
+  if (graph && graphHasExternalMutation(graph)) {
+    return { required: true, basis: 'accepted_graph', touchedTotal, touchedExternal };
+  }
+
+  // A non-external topology is negative authority only when it is embedded in
+  // the exact content-addressed graph under a known non-external ceiling. A
+  // separately stored proposal, missing topology, or unknown graph may be
+  // under-scoped, so zero-call failures retain the request-text safety floor.
+  if (graph && graphHasAgreedKnownNonExternalTopology(graph)) {
+    return { required: false, basis: 'expected_work', touchedTotal, touchedExternal };
+  }
+
   if (touchedTotal > 0 && touchedExternal === 0) {
     return { required: false, basis: 'observed_local_only', touchedTotal, touchedExternal };
   }

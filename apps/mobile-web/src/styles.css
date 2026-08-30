@@ -18,11 +18,11 @@
   /* Warm paper surfaces: cream undertone, never clinical gray-white.
      Elevation DARKENS a step toward parchment — cards sit on the page the
      way paper sits on a desk. */
-  --bg-0: #fcf9f4;
+  --bg-0: #ffffff;
   --bg-1: #ffffff;
-  --bg-2: #f7f1e7;
-  --bg-3: #f0e7d8;
-  --bg-4: #e8dcc8;
+  --bg-2: #f7f5f2;
+  --bg-3: #efece7;
+  --bg-4: #e4e0d9;
 
   --line: rgba(63, 42, 22, 0.10);
   --line-strong: rgba(63, 42, 22, 0.18);
@@ -94,11 +94,12 @@ body {
   font-family: var(--font-body);
   /* Two warm lights: a citrus dawn at the top, an ember low and left. The
      page is never a flat black rectangle. */
-  background:
-    radial-gradient(130% 46% at 50% -12%, rgba(255, 138, 61, 0.12), transparent 62%),
-    radial-gradient(90% 40% at 8% 108%, rgba(240, 101, 17, 0.06), transparent 70%),
-    var(--bg-0);
-  background-attachment: fixed;
+  /* The page is plain white. The two orange radial washes that used to sit
+     here tinted every screen and, with background-attachment: fixed, kept
+     painting through the over-scroll bounce — so the app never looked white
+     even where the surfaces were. Warmth now comes only from the accent and
+     the type, which keeps the identity without colouring the paper. */
+  background: var(--bg-0);
   color: var(--fg);
   font-size: var(--t-body);
   line-height: 1.5;
@@ -1487,6 +1488,16 @@ input, textarea { font: inherit; }
 .chat-send:active { transform: scale(0.92); }
 .chat-send:disabled { opacity: 0.3; }
 
+/* Stop reads as a halt, not a second send: the accent is what you press to
+   ADD, so taking it away is what tells you this one takes something back. */
+.chat-stop {
+  background: var(--surface-2, #eceae6);
+  color: var(--text, #1b1b1b);
+  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.14));
+  font-size: 13px;
+  line-height: 1;
+}
+
 /* ── foreground running-task affordance ────────────────────────── */
 /* The screen remains the page. At zero this entire region is absent; at
    nonzero it is one compact header chip, opening the durable work projection
@@ -1500,13 +1511,13 @@ input, textarea { font: inherit; }
   font-variant-numeric: tabular-nums;
   margin: 0;
   padding: 5px 11px;
-  border: 1px solid var(--line-hot);
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent-deep);
+  background: var(--bg-2);
+  color: var(--fg-2);
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.04em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1526,7 +1537,14 @@ input, textarea { font: inherit; }
   white-space: nowrap;
   border: 0;
 }
-.running-tasks-spark { color: var(--accent); font-size: 17px; line-height: 1; }
+/* Sized like the connection dot beside it, spinning only while work runs so
+   the header reads as one calm cluster instead of two competing chips. */
+.running-tasks-spark { display: inline-flex; color: var(--accent); }
+.running-tasks-spark svg { width: 13px; height: 13px; animation: running-spark-turn 1.9s linear infinite; }
+@keyframes running-spark-turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .running-tasks-spark svg { animation: none; }
+}
 .running-tasks-layer { position: fixed; inset: 0; z-index: 90; display: flex; align-items: flex-end; justify-content: center; }
 .running-tasks-scrim {
   position: absolute;
@@ -2220,6 +2238,23 @@ input, textarea { font: inherit; }
 .settings-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
 .settings-row-label { font-size: var(--t-body); font-weight: 650; }
 .settings-row-note { font-size: var(--t-xs); color: var(--fg-3); }
+.settings-rescue {
+  border-top: 1px solid var(--line);
+  margin-top: var(--sp-1);
+}
+.settings-select {
+  flex: 0 1 min(48%, 210px);
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 28px 0 var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--t-sm);
+}
+.settings-select:disabled { color: var(--fg-3); }
 .settings-row-action {
   flex: 0 0 auto;
   font-size: var(--t-sm);
@@ -2436,3 +2471,159 @@ input, textarea { font: inherit; }
 .brain-dot.off { background: var(--bg-4); }
 .brain-note { margin: var(--sp-3) 0 0; font-size: var(--t-sm); }
 .brain-note.switched { color: var(--accent-2); font-weight: 650; }
+
+
+/* ── Named agents ───────────────────────────────────────────────────────────
+   Agents are the user's own standing helpers, so the surface stays quiet and
+   card-shaped like the rest of the app. Pins read as chosen/unchosen chips
+   rather than form controls: picking what an agent leans on should feel like
+   tapping, not filling in a form. */
+.agent-new {
+  width: 100%;
+  min-height: 48px;
+  margin-bottom: var(--sp-3);
+  border: 1px dashed var(--line-hot);
+  border-radius: var(--r-3);
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 15px;
+  font-weight: 700;
+}
+.agent-new:active { transform: scale(0.995); }
+
+.agent-empty {
+  margin: 0 0 var(--sp-3);
+  color: var(--fg-2);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.agent-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-2); }
+.agent-card {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  background: var(--bg-1);
+  overflow: hidden;
+}
+.agent-card-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: var(--sp-3);
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.agent-card-main:active { background: var(--bg-2); }
+.agent-name { font-size: 15px; font-weight: 700; color: var(--fg-1); }
+.agent-desc {
+  font-size: 13px;
+  color: var(--fg-2);
+  line-height: 1.45;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.agent-pins { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.agent-pins span {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--fg-2);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.agent-edit {
+  flex: 0 0 auto;
+  min-width: 64px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+.agent-edit:active { background: var(--bg-2); }
+
+.agent-editor { display: grid; gap: var(--sp-3); }
+.agent-field { display: grid; gap: 6px; }
+.agent-field > span {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+.agent-field input,
+.agent-field textarea {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  background: var(--bg-1);
+  color: var(--fg-1);
+  font: inherit;
+  font-size: 15px;
+}
+.agent-field textarea { resize: vertical; line-height: 1.5; }
+.agent-field input:focus-visible,
+.agent-field textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.agent-pin-group { display: grid; gap: 8px; }
+.agent-pin-group h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+.agent-pin-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.agent-pin {
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-1);
+  color: var(--fg-2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.agent-pin.on {
+  border-color: var(--line-hot);
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+}
+.agent-pin:active { transform: scale(0.97); }
+
+.agent-failure {
+  margin: 0;
+  color: var(--accent-deep);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.agent-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.agent-save,
+.agent-cancel,
+.agent-delete {
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: var(--r-2);
+  font-size: 15px;
+  font-weight: 700;
+}
+.agent-save { flex: 1 1 auto; border: 0; background: var(--accent); color: #fff; }
+.agent-save:disabled { opacity: 0.5; }
+.agent-cancel { border: 1px solid var(--line); background: var(--bg-1); color: var(--fg-2); }
+.agent-delete { border: 1px solid var(--line); background: var(--bg-1); color: var(--accent-deep); }

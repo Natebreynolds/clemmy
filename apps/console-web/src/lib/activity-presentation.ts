@@ -18,9 +18,13 @@ export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted';
  *
  *   1. DISCOVERY IS NOT WORK. Looking up which tool to use is overhead, like
  *      narrating a walk to the filing cabinet. After the turn it is hidden.
- *      While live and nothing else has happened yet, it collapses to one
- *      human row ("Finding the right tool…") so the strip is not a blank
- *      pause. Failed lookups stay visible — they explain the silence.
+ *      While live and lookup is still in flight, it collapses to one human
+ *      row ("Finding the right tool…") so the strip is not a blank pause.
+ *      Once lookup has settled and no work row exists yet, the stand-in is
+ *      the wait on the next step ("Working on it…") — keeping the lookup
+ *      label after search finished is a lie (live 2026-08-28: Grok had
+ *      already searched and planned; the phone still said it was finding a
+ *      tool). Failed lookups stay visible — they explain the silence.
  *   2. REPETITION IS ONE THING HAPPENING, NOT MANY. Three identical lookups are
  *      one line with a count. This also stops a retry storm from burying the
  *      one row that matters.
@@ -62,6 +66,7 @@ export interface NarrateOptions {
 
 const DISCOVERY_LIVE_ID = 'discovery-live';
 const DISCOVERY_LIVE_LABEL = 'Finding the right tool…';
+const WORKING_LIVE_LABEL = 'Working on it…';
 const CAPABILITY_INVENTORY_RE = /^Grounded in what's proven:/i;
 const COMPILER_NODE_LABEL_RE = /^N\d+\s+/i;
 const BLOCKED_PLAN_LABEL_RE = /— blocked$/i;
@@ -109,7 +114,8 @@ export function narrateActivity(
 
     // 1 — discovery is overhead, unless it FAILED, in which case it is the
     // reason nothing else happened and must stay visible. While live and
-    // nothing else is on screen yet, one human stand-in replaces the blank.
+    // nothing else is on screen yet, one phase-honest stand-in replaces the
+    // blank: lookup in flight vs wait after lookup.
     if (isDiscoveryRow(item) && item.status !== 'failed') {
       discoverySeen = true;
       if (item.status === 'running') discoveryRunning = true;
@@ -140,9 +146,9 @@ export function narrateActivity(
       id: DISCOVERY_LIVE_ID,
       kind: 'event',
       variant: 'lifecycle',
-      label: DISCOVERY_LIVE_LABEL,
-      status: discoveryRunning ? 'running' : 'done',
-      tone: discoveryRunning ? 'live' : 'muted',
+      label: discoveryRunning ? DISCOVERY_LIVE_LABEL : WORKING_LIVE_LABEL,
+      status: 'running',
+      tone: 'live',
       ...(discoveryStartedAt !== undefined ? { startedAt: discoveryStartedAt } : {}),
     }];
   }

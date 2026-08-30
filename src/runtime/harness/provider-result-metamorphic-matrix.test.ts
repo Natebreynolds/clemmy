@@ -21,8 +21,28 @@ const providerEvidence = await import('./provider-read-evidence.js');
 const resultFacts = await import('./result-facts.js');
 const resultHandles = await import('./result-handle.js');
 const settlements = await import('./logical-call-settlement-store.js');
+const currentCapabilityFixtures = await import('./current-capability-manifest.fixture.js');
+const priorCapabilityFactory = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([
+  'apify_act_run_sync_get_dataset_items_get',
+  'salesforce_query',
+  'airtable_list_records',
+  'account_search',
+  'airtable_get_record',
+  'googlesheets_get_values',
+].map((operationId) => ({
+  operationId,
+  providerKind: 'composio' as const,
+  effect: 'read' as const,
+})).concat([{
+  operationId: 'googlesheets_create_google_sheet1',
+  providerKind: 'composio' as const,
+  effect: 'external_write' as const,
+  destination: { family: 'googlesheets', posture: 'create_new' },
+  operationSemantics: { version: 1 as const, reversibility: 'reversible' as const },
+}]));
 
 test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(priorCapabilityFactory);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -106,6 +126,7 @@ function commitReturnedResult(input: {
   logicalToolCallId: string;
   tool: string;
   args: unknown;
+  inputSchema?: unknown;
   payload: unknown;
   mutating: boolean;
   requirementId?: string;
@@ -175,6 +196,8 @@ function runReadDependency(input: {
   coverage: ReadCoverage;
 }): {
   downstreamStatus: string;
+  downstreamDetail: string;
+  evidenceBasis: string | null;
   settlementResultHandleId: string | undefined;
   redeemed: ReturnType<typeof resultHandles.redeemSuccessfulSettlementResultForHost>;
 } {
@@ -224,7 +247,7 @@ function runReadDependency(input: {
     requirementId: 'read_source',
     tool: input.logicalTool,
     args: input.args,
-    inputSchema: { type: 'object' },
+    inputSchema: input.inputSchema ?? { type: 'object' },
   });
   assert.equal(boundRead.status, 'bound', `${input.label}: ${JSON.stringify(boundRead)}`);
 
@@ -261,8 +284,8 @@ function runReadDependency(input: {
     logicalToolCallId: readLogicalId,
   });
 
-  const sheetTool = 'cx_googlesheets_sheet_from_json';
-  const sheetArgs = { title: input.label, sheet_json: [{ source: input.label }] };
+  const sheetTool = 'cx_googlesheets_create_google_sheet1';
+  const sheetArgs = { title: input.label };
   const sheetLogicalId = `logical:sheet:${input.label}:${serial}`;
   assert.equal(dispatch.admitLogicalCall({
     identity: { ...task, logicalToolCallId: sheetLogicalId },
@@ -279,8 +302,16 @@ function runReadDependency(input: {
     args: sheetArgs,
     inputSchema: { type: 'object' },
   });
+  const evidenceRow = eventlog.openEventLog().prepare(`
+    SELECT evidence_basis FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, readLogicalId) as {
+    evidence_basis: string | null;
+  } | undefined;
   return {
     downstreamStatus: downstream.status,
+    downstreamDetail: JSON.stringify(downstream),
+    evidenceBasis: evidenceRow?.evidence_basis ?? null,
     settlementResultHandleId: committed.settled.resultHandleId,
     redeemed,
   };
@@ -438,6 +469,10 @@ test('expected-work discharge follows evidence semantics across read carriers an
       logicalTool: 'cx_apify_act_run_sync_get_dataset_items_get',
       physicalTool: 'apify_act_run_sync_get_dataset_items_get',
       args: apifyArgs,
+      inputSchema: {
+        type: 'object',
+        properties: { limit: { type: 'integer' } },
+      },
       payload: {
         successful: true,
         error: null,
@@ -644,7 +679,8 @@ test('expected-work discharge follows evidence semantics across read carriers an
 
   for (const fixture of fixtures) {
     const result = runReadDependency(fixture);
-    assert.equal(result.downstreamStatus, fixture.expectedDownstream, fixture.label);
+    assert.equal(result.downstreamStatus, fixture.expectedDownstream,
+      `${fixture.label}: ${result.downstreamDetail}; evidence=${result.evidenceBasis}`);
     if (fixture.expectedDownstream === 'bound') {
       assert.equal(typeof result.settlementResultHandleId, 'string', fixture.label);
       assert.equal(result.redeemed.status, 'ok', fixture.label);

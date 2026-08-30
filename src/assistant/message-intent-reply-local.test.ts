@@ -39,6 +39,9 @@ test('durable, current-world, named-system, and compound construction remains ac
     'Rewrite the existing Project Note.',
     'Make a calendar event for tomorrow.',
     'Produce a PDF and email it to Alex.',
+    'Build a status page and keep it updated every week.',
+    'Prepare a client portal.',
+    'Write a book.',
   ];
   for (const prompt of prompts) {
     assert.notEqual(classifyMessageIntent(prompt).intent, 'conversation', prompt);

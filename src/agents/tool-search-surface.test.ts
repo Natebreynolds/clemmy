@@ -25,6 +25,8 @@ const {
   localMemoryBuiltinScope,
 } = await import('./orchestrator.js');
 const { appendEvent, createSession, listEvents, resetEventLog } = await import('../runtime/harness/eventlog.js');
+const { writeWorkflow } = await import('../memory/workflow-store.js');
+const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 
 // A discovery tool that is NOT in the hot set for a benign query (not in the
 // tiny acquisition/recovery kernel,
@@ -258,6 +260,71 @@ test('explicit remember and recent-conversation recall use the bounded memory su
     null,
     'ordinary memory-ish product work keeps the general tool surface',
   );
+});
+
+test('ON: uniquely named workflow execution keeps workflow_run first-class on a planning turn', async () => {
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Can you run my platform 49 workflow' },
+  });
+  try {
+    const runAgent = await withFlag('on', () => buildOrchestratorAgent({
+      sessionId: sess.id,
+      sourceUserSeq: source.seq,
+      userInput: 'Can you run my platform 49 workflow',
+      allowToolJit: true,
+      hostFreshPlanning: {
+        authority: { scope: 'primary_model_planning_catalog_v1' },
+        identity: { sessionId: sess.id, sourceUserSeq: source.seq },
+        capabilities: [],
+        digest: '0'.repeat(64),
+      } as never,
+    }));
+    assert.ok(
+      namesOf(runAgent).has('workflow_run'),
+      'planning must not strip the hot-set run control of a uniquely named saved workflow',
+    );
+
+    const helloSess = createSession({ kind: 'chat' });
+    const hello = appendEvent({
+      sessionId: helloSess.id,
+      turn: 1,
+      role: 'user',
+      type: 'user_input_received',
+      data: { text: USER_INPUT },
+    });
+    const helloAgent = await withFlag('on', () => buildOrchestratorAgent({
+      sessionId: helloSess.id,
+      sourceUserSeq: hello.seq,
+      userInput: USER_INPUT,
+      allowToolJit: true,
+      hostFreshPlanning: {
+        authority: { scope: 'primary_model_planning_catalog_v1' },
+        identity: { sessionId: helloSess.id, sourceUserSeq: hello.seq },
+        capabilities: [],
+        digest: '0'.repeat(64),
+      } as never,
+    }));
+    assert.equal(
+      namesOf(helloAgent).has('workflow_run'),
+      false,
+      'an unrelated planning turn must not pin workflow_run',
+    );
+  } finally {
+    rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
+  }
 });
 
 test('schema-on-demand defers broad MCP fail-open but preserves concrete provider scopes', () => {

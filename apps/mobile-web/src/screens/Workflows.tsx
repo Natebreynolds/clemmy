@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks';
+import { useBackGesture } from '../lib/back-gesture';
 import { renderMarkdown } from '@clem/chat-engine';
 import {
   getWorkflowDetail,
@@ -23,6 +24,7 @@ const TERMINAL_RUN_STATUSES = new Set([
 
 export function Workflows() {
   const [selected, setSelected] = useState<MobileWorkflow | null>(null);
+  useBackGesture(selected !== null, () => setSelected(null));
   const { data, loading, error, offline, refresh } = useScreenData(
     listWorkflows,
     { intervalMs: 10_000, disabled: selected !== null },

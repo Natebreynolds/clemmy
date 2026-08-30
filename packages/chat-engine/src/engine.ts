@@ -19,12 +19,19 @@ import { runChatStream, type ChatStreamHandle, type StreamTransport } from './st
 export interface SendResult {
   sessionId: string;
   accepted: boolean;
+  steered?: boolean;
 }
 
 export interface ChatApi {
   /** Async-accepted send: resolves as soon as the turn is durably claimed.
-   *  Retries with the SAME idempotency key must be safe. */
-  send(input: { message: string; sessionId: string | null; idempotencyKey: string }): Promise<SendResult>;
+   *  Retries with the SAME idempotency key must be safe. A mid-run steer
+   *  (steerOnly) must never claim a competing attempt. */
+  send(input: {
+    message: string;
+    sessionId: string | null;
+    idempotencyKey: string;
+    steerOnly?: boolean;
+  }): Promise<SendResult>;
   /** Full transcript load for opening an existing session. */
   loadSession(sessionId: string): Promise<{ events: HarnessEvent[]; latestSeq: number; title?: string }>;
 }
@@ -56,6 +63,8 @@ export class ChatEngine {
   private sessionId: string | null;
   private messages: ChatMessage[] = [];
   private busy = false;
+  /** Key of the turn in flight; see EngineSnapshot.cancelKey. */
+  private inFlightKey: string | null = null;
   private connection: ConnectionState = 'idle';
   private stream: ChatStreamHandle | null = null;
   private activeAssistantId: string | null = null;
@@ -84,6 +93,9 @@ export class ChatEngine {
       messages: this.messages,
       busy: this.busy,
       connection: this.connection,
+      // Derived rather than cleared at each of the several places busy drops,
+      // so a stale key can never outlive the turn it belonged to.
+      cancelKey: this.busy ? this.inFlightKey : null,
     };
   }
 
@@ -125,7 +137,46 @@ export class ChatEngine {
 
   async send(text: string): Promise<void> {
     const message = text.trim();
-    if (!message || this.busy) return;
+    if (!message) return;
+    if (this.busy) {
+      // Mid-run steering (OPEN-THE-GATES 4.2). The composer stays open; the
+      // text is delivered into the live turn. Never claim a competing attempt.
+      if (!this.sessionId) return;
+      const steerId = nextLocalId();
+      const steerMessage: ChatMessage = {
+        id: steerId,
+        role: 'user',
+        text: message,
+        pending: 'sending',
+        steer: 'pending',
+        idempotencyKey: this.newKey(),
+      };
+      this.messages = [...this.messages, steerMessage];
+      this.emit();
+      try {
+        const result = await this.api.send({
+          message,
+          sessionId: this.sessionId,
+          idempotencyKey: steerMessage.idempotencyKey!,
+          steerOnly: true,
+        });
+        this.messages = this.messages.map((entry) => (
+          entry.id === steerId
+            ? {
+                ...entry,
+                pending: result.steered ? undefined : 'failed',
+                steer: result.steered ? 'delivered' : 'failed',
+              }
+            : entry
+        ));
+      } catch {
+        this.messages = this.messages.map((entry) => (
+          entry.id === steerId ? { ...entry, pending: 'failed', steer: 'failed' } : entry
+        ));
+      }
+      this.emit();
+      return;
+    }
     const idempotencyKey = this.newKey();
     const userMessage: ChatMessage = {
       id: nextLocalId(),
@@ -144,6 +195,7 @@ export class ChatEngine {
     this.messages = [...this.messages, userMessage, assistant];
     this.activeAssistantId = assistant.id;
     this.busy = true;
+    this.inFlightKey = idempotencyKey;
     this.emit();
     await this.postWithRetry(userMessage, message, idempotencyKey);
   }
@@ -153,6 +205,7 @@ export class ChatEngine {
     if (!failed || !failed.idempotencyKey || this.busy) return;
     this.messages = this.messages.map((m) => (m.id === messageId ? { ...m, pending: 'sending', pendingError: undefined } : m));
     this.busy = true;
+    this.inFlightKey = failed.idempotencyKey;
     this.ensureActiveAssistant();
     this.emit();
     await this.postWithRetry(failed, failed.text, failed.idempotencyKey);
@@ -261,6 +314,15 @@ export class ChatEngine {
         this.updateActive((m) => ({ ...m, text: m.text + delta }));
         break;
       }
+      case 'conversation_preamble': {
+        // Host-owned opening is the start of the user-visible reply. Discord
+        // already projects it; dropping it here left mobile on a discovery
+        // stand-in after the plan had already spoken (live 2026-08-28).
+        const text = typeof d.text === 'string' ? d.text.trim() : '';
+        if (!text || !this.busy) return;
+        this.updateActive((m) => (m.text.trim() ? m : { ...m, text }));
+        break;
+      }
       case 'user_input_received': {
         const text = typeof d.text === 'string' ? d.text.trim() : '';
         if (!text) return;
@@ -330,7 +392,27 @@ export class ChatEngine {
         break;
       }
       case 'awaiting_user_input': {
-        this.updateActive((m) => ({ ...m, status: 'awaiting-reply' }));
+        // This event is itself a public terminal for the live stream. The
+        // stream closes immediately after delivering it, so waiting for the
+        // later conversation_completed projection leaves mobile permanently
+        // busy with an empty bubble and a Stop button (live source 100077).
+        // Render and settle the question at this exact boundary; the durable
+        // completion remains the replay/cross-surface terminal authority.
+        const question = typeof d.question === 'string' && d.question.trim()
+          ? d.question.trim()
+          : 'I have a question for you.';
+        this.updateActive((m) => ({
+          ...m,
+          text: question,
+          status: 'awaiting-reply',
+          progress: undefined,
+          activity: settleTerminalActivity(
+            m.activity ?? [],
+            activityTerminalOutcomeForMessageStatus('awaiting-reply'),
+          ),
+        }));
+        this.busy = false;
+        this.activeAssistantId = null;
         break;
       }
       default: {
@@ -384,6 +466,12 @@ export function inFlightTurnSince(events: readonly HarnessEvent[]): number | nul
 export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let activity: ChatMessage['activity'] = [];
+  let opening = '';
+  // awaiting_user_input is independently deliverable, while the canonical
+  // conversation_completed row normally follows it. Retain the raw question
+  // when it is the only row, but replace it with the canonical projection on
+  // full replay so one logical pause never renders as two assistant bubbles.
+  let pendingAwaitingMessageIndex: number | null = null;
   for (const event of events) {
     const d = (event.data ?? {}) as Record<string, unknown>;
     switch (event.type) {
@@ -391,13 +479,20 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
         const text = typeof d.text === 'string' ? d.text.trim() : '';
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text });
         activity = [];
+        opening = '';
+        pendingAwaitingMessageIndex = null;
+        break;
+      }
+      case 'conversation_preamble': {
+        const text = typeof d.text === 'string' ? d.text.trim() : '';
+        if (text) opening = text;
         break;
       }
       case 'conversation_completed': {
-        const presentation = terminalCompletionPresentation(d, '', undefined);
+        const presentation = terminalCompletionPresentation(d, opening, undefined);
         const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : undefined;
         const statusRaw = typeof d.planProposalStatus === 'string' ? d.planProposalStatus : 'pending';
-        messages.push({
+        const terminalMessage: ChatMessage = {
           id: `a-${event.seq}`,
           role: 'assistant',
           text: presentation.text,
@@ -408,8 +503,15 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
             planProposalNeedsUserInput: d.planProposalNeedsUserInput === true,
           } : {}),
           activity: settleTerminalActivity(activity ?? [], activityTerminalOutcomeForMessageStatus(presentation.status)),
-        });
+        };
+        if (pendingAwaitingMessageIndex !== null) {
+          messages[pendingAwaitingMessageIndex] = terminalMessage;
+        } else {
+          messages.push(terminalMessage);
+        }
         activity = [];
+        opening = '';
+        pendingAwaitingMessageIndex = null;
         break;
       }
       case 'run_failed': {
@@ -422,6 +524,29 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
           activity: settleTerminalActivity(activity ?? [], 'failed'),
         });
         activity = [];
+        opening = '';
+        pendingAwaitingMessageIndex = null;
+        break;
+      }
+      case 'awaiting_user_input': {
+        const question = typeof d.question === 'string' && d.question.trim()
+          ? d.question.trim()
+          : 'I have a question for you.';
+        const message: ChatMessage = {
+          id: `a-awaiting-${event.seq}`,
+          role: 'assistant',
+          text: question,
+          status: 'awaiting-reply',
+          activity: settleTerminalActivity(activity ?? [], 'interrupted'),
+        };
+        if (pendingAwaitingMessageIndex !== null) {
+          messages[pendingAwaitingMessageIndex] = message;
+        } else {
+          messages.push(message);
+          pendingAwaitingMessageIndex = messages.length - 1;
+        }
+        activity = [];
+        opening = '';
         break;
       }
       case 'approval_requested': {

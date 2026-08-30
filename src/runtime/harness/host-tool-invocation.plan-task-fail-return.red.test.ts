@@ -38,6 +38,8 @@ const invocation = await import('./host-tool-invocation.js');
 const callAuthority = await import('./accepted-turn-call-authority.js');
 const logicalContracts = await import('./logical-call-contract.js');
 const hostBindings = await import('./host-call-capability-binding.js');
+const settlements = await import('./logical-call-settlement-store.js');
+const guardrail = await import('./tool-guardrail.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -231,5 +233,65 @@ test('a payload that settled SUCCESS but is not the typed union still fails clos
       && /not an exact typed success or refusal/.test(error.message),
     'success-shaped prose masquerading as a plan_task result remains the invariant breach',
   );
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('post-result semantic loop control preserves the exact host-only refusal settlement', async () => {
+  // Live 2026-08-29: GLM repaired the proposal wording four times while the
+  // host returned this same local plan_not_admitted consequence. On the third
+  // result, semantic loop control threw *after* the exact bytes were observed.
+  // The host paired effect_unknown, checkpointed reconciliation_required, and
+  // publicly asked the user to continue despite zero external crossings.
+  guardrail._resetAllTrackersForTests();
+  const task = fixture('Schedule the requested meeting using the connected Outlook account.');
+  const refusal = JSON.stringify({
+    ok: false,
+    code: 'plan_not_admitted',
+    detail: 'write_not_aligned:work.requestedEffect',
+    repair: 'Correct the requested effect against the exact planning catalog.',
+  });
+  let bodies = 0;
+  const configured = {
+    name: 'plan_task',
+    invoke: async () => {
+      bodies += 1;
+      return refusal;
+    },
+  } as unknown as brackets.WrappableTool & {
+    invoke: (runContext: unknown, input: unknown, details?: unknown) => Promise<unknown>;
+  };
+  const wrapped = brackets.wrapToolForHarness(configured);
+  const args = { preamble: 'I’ll prepare this now.', draft: { criteria: ['one row lands'] } };
+
+  for (let index = 1; index <= 3; index += 1) {
+    const callId = `model:plan-semantic-refusal-${index}`;
+    const returned = await runPlanTask<string>(task, {
+      callId,
+      invoke: ({ signal }) => wrapped.invoke(
+        null,
+        JSON.stringify(args),
+        { signal, toolCall: { callId } },
+      ) as Promise<string>,
+    });
+    assert.equal(returned.value, refusal,
+      'post-result control returns the same exact bytes to the host/model loop');
+    const durable = settlements.redeemDurableLogicalCallSettlementForHost({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      acceptedTaskId: task.acceptedTaskId,
+      logicalToolCallId: callId,
+    });
+    assert.equal(durable.status, 'ok');
+    if (durable.status !== 'ok') throw new Error(durable.reason);
+    assert.equal(durable.settlement.executionKind, 'local_execution');
+    assert.equal(durable.settlement.physicalCrossingCount, 0,
+      'no result-preservation path invents traffic leaving the machine');
+    assert.equal(durable.settlement.hostCrossingCount, 1,
+      'the exact host-local execution remains recorded');
+    assert.equal(durable.settlement.outcome.directive.requiresReconciliation, false,
+      'the local typed refusal cannot become reconciliation_required');
+  }
+
+  assert.equal(bodies, 3, 'each distinct model call executes once; no hidden retry is introduced');
   leases.revokeDispatchLease(task.parentLease);
 });

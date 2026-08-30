@@ -15,10 +15,19 @@ import path from 'node:path';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-yolo-guard-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 
+const currentCapabilityFixtures = await import('../runtime/harness/current-capability-manifest.fixture.js');
+const previousCapabilityCatalog = currentCapabilityFixtures.installCurrentCapabilityManifestFixtures([{
+  operationId: 'GOOGLESHEETS_VALUES_UPDATE',
+  providerKind: 'composio',
+  effect: 'external_write',
+}]);
 const { _requestApprovalRequiresHumanForTests: guard } = await import('./orchestrator.js');
 const { queuePendingAction } = await import('../runtime/harness/pending-actions.js');
 
-test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
+test.after(() => {
+  currentCapabilityFixtures.restoreCurrentCapabilityManifestFixtures(previousCapabilityCatalog);
+  try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 function queueSendBatch(items: number, kind: 'external_send' | 'external_write' = 'external_send') {
   return queuePendingAction({

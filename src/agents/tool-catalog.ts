@@ -18,7 +18,10 @@ import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
-import { uniqueEnabledWorkflowMatch } from '../tools/named-workflow-match.js';
+import {
+  requestsWorkflowExecution,
+  uniqueEnabledWorkflowMatch,
+} from '../tools/named-workflow-match.js';
 
 export interface CatalogEntry {
   name: string;
@@ -103,17 +106,6 @@ export function allRegistryNames(): Set<string> {
 
 function passesPolicy(name: string, allowedNames?: ReadonlySet<string>): boolean {
   return allowedNames ? allowedNames.has(name) : true;
-}
-
-/** A matched workflow is a resource identity, not permission to execute it.
- * Promote the immediate run control only from affirmative execution text;
- * explicit prohibitions are constraints and must never become positive intent. */
-function requestsWorkflowExecution(input: string): boolean {
-  const positive = input.replace(
-    /\b(?:do\s+not|don'?t|dont|never|without)\b[^.!?;\n]{0,180}/gi,
-    ' prohibited_workflow_action ',
-  );
-  return /\b(?:run|start|execute|launch|trigger|kick\s+off)\b/i.test(positive);
 }
 
 /**
@@ -258,10 +250,26 @@ export async function rankCatalog(
       .sort((a, b) => b.score - a.score);
   }
 
+  return rankCatalogLexically(q, opts);
+}
+
+/** Deterministic, network-free catalog ranking for latency-bounded control
+ * paths. `tool_search` already spends its bounded network budget on the live
+ * provider sources that can prove current capability membership; a second
+ * embedding request is only an advisory rerank and must not consume the host
+ * tool's remaining deadline. Other callers retain semantic ranking through
+ * `rankCatalog()` above. */
+export function rankCatalogLexically(
+  query: string,
+  opts: { allowedNames?: ReadonlySet<string> } = {},
+): RankedCatalogEntry[] {
+  const entries = catalogEntries(opts);
+  const q = (query ?? '').trim();
+  if (!q) return entries.map((entry) => ({ ...entry, score: 0 }));
   const queryTokens = q.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   return entries
-    .map((e) => ({ ...e, score: lexicalScore(queryTokens, e) }))
-    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+    .map((entry) => ({ ...entry, score: lexicalScore(queryTokens, entry) }))
+    .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
 }
 
 async function semanticScores(query: string, entries: CatalogEntry[]): Promise<Map<string, number> | null> {

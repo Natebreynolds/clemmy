@@ -2,8 +2,9 @@
 
 The mobile command center. A signed native app that pairs with the Clementine
 daemon by scanning the same QR the desktop Mobile panel already shows — and
-connects **directly** to the Mac over pinned TLS. No Cloudflare, no tunnel, no
-third party in the path.
+reaches the same Mac identity over certificate-pinned TLS. On the same LAN it
+connects directly; off-LAN it can use the paired relay as a byte tunnel without
+changing the TLS peer it trusts.
 
 ## How the security model works
 
@@ -11,19 +12,19 @@ third party in the path.
    (`src/runtime/mobile-tls.ts`) and opens a LAN HTTPS listener that serves
    only the `/m/*` mobile surface (`direct-app` ingress class — socket-enforced,
    same mechanism that keeps the admin API off the tunnel).
-2. The pairing QR encodes `https://<lan-ip>:8421/m/?pair=<one-time>&fp=<sha256>`.
-   `fp` is the certificate fingerprint; `pair` is the one-time pairing token
-   the mobile surface already uses.
-3. The app stores `{origin, fp}` in the Keychain and accepts exactly that
-   certificate — nothing else, not even a valid public CA chain. End-to-end
-   encryption terminates on your Mac, unlike the tunnel path where a third
-   party held the TLS keys.
-4. Everything after the TLS layer is the existing hardened mobile stack:
+2. The pairing QR encodes
+   `https://<lan-ip>:8421/m/?pair=<one-time>&fp=<sha256>[&relay=<origin>]`.
+   `fp` is the certificate fingerprint; `pair` is the one-time pairing token,
+   and `relay` is an optional off-LAN door for the same daemon.
+3. The app stores the pairing in the Keychain and accepts exactly that
+   certificate — nothing else, not even a valid public CA chain. A pairing with
+   no fingerprint is refused and must be repaired by scanning a current QR.
+4. Direct and relay requests use the same certificate pin. The relay forwards
+   the TLS byte stream but does not terminate the app-to-Mac TLS session or hold
+   the Mac's certificate key; it can still observe ordinary network metadata.
+5. Everything after the TLS layer is the existing hardened mobile stack:
    one-time pairing consumption, device-bound sessions (P-256 proof per
    request), scoped rate limits, default-deny routes.
-
-If the QR has no `fp` (a tunnel-mode QR), the app falls back to normal system
-trust — so the same app keeps working if a tunnel ever comes back.
 
 ## Build & install (first time)
 
@@ -92,8 +93,13 @@ Environment defaults to `sandbox`, which matches Xcode-installed builds
 
 ## Current scope / known gaps
 
-- Reachability is whatever network path exists between phone and Mac (same
-  Wi-Fi today, plus anything Bonjour can see). A remote path is a deliberate
-  fast-follow decision, not an accident of this design.
+- On Wi-Fi, Clem tries the paired Mac directly before its relay. On cellular
+  or another off-LAN path, it probes the paired relay first. The relay is only
+  a byte tunnel: the native shell still pins the Mac's TLS identity, and the
+  adopted mobile session remains bound to the paired device key.
+- After upgrading an older pairing to the relay-capable shell, open Clem once
+  while it can still reach the Mac directly so it can persist its first relay
+  handoff. A binary downgrade after a v2 handoff has been minted requires the
+  documented handoff-state quarantine; it is not an automatic rollback path.
 - Cert rotation (`rotateMobileTlsIdentity`) invalidates every paired app by
   design; recovery is re-scanning a QR.

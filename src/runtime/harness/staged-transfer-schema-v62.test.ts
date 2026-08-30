@@ -470,6 +470,8 @@ function tableParents(db: Database.Database, table: string): Set<string> {
 }
 
 function snapshotUnrelatedRows(db: Database.Database, seed: SeededV61Authority): unknown {
+  const lease = db.prepare(`SELECT * FROM run_dispatch_leases WHERE scope_id = ?`)
+    .get(seed.unrelatedLeaseScopeId) as Record<string, unknown> | undefined;
   return {
     root: db.prepare(`
       SELECT * FROM accepted_turn_call_authorities
@@ -479,8 +481,9 @@ function snapshotUnrelatedRows(db: Database.Database, seed: SeededV61Authority):
       SELECT * FROM logical_tool_calls
        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
     `).get(seed.sessionId, seed.sourceUserSeq, seed.unrelatedLogicalCallId),
-    lease: db.prepare(`SELECT * FROM run_dispatch_leases WHERE scope_id = ?`)
-      .get(seed.unrelatedLeaseScopeId),
+    // v68 adds one nullable revocation-reason column. Normalize the historical
+    // v61 row to the current shape while still comparing every durable value.
+    lease: lease ? { revocation_reason: null, ...lease } : lease,
     physical: db.prepare(`
       SELECT session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
              physical_dispatch_id, ordinal, relation, retry_of, tool_name,

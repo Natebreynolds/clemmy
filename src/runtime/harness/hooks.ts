@@ -11,7 +11,8 @@ import {
   unwrapRuntimeEffectiveToolIdentity,
   type RuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
-import { terminalAuthoringResultIsProven } from '../../tools/tool-registry.js';
+import { registeredToolSideEffect } from '../../tools/tool-registry.js';
+import { hostLocalWriteCommitResultIsProven } from './host-local-write-commit.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { isDispatchLeaseCurrent, type DispatchLeaseRef } from './dispatch-lease.js';
@@ -606,7 +607,9 @@ export function attachEventLogHooks(
           ...(pairedAdmittedStart
             && topologyRole === 'control'
             && accounting.effectiveTool
-            && terminalAuthoringResultIsProven(accounting.effectiveTool, resultStr)
+            && accounting.effect === 'local_write'
+            && registeredToolSideEffect(accounting.effectiveTool) === 'write'
+            && hostLocalWriteCommitResultIsProven(resultStr)
             && terminalAuthoringReceiptBodyLooksSuccessful(resultStr)
             ? { successfulAuthoringResult: true }
             : {}),
