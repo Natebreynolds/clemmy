@@ -7,9 +7,13 @@ import {
   AUTOMATION_OPPORTUNITY_PROPOSAL_DB,
   WORK_TABLES,
   classifyPackagedFirstBootAddedFile,
+  isExactApprovalResolutionAuditAppend,
   isPackagedCapabilityAcquisitionMissingDetail,
   isExactDaemonLeaseOwnerRecord,
   isExactLegacyApprovalRetirement,
+  isExactRecoveredWorkflowRunProjection,
+  isExactStarterWorkspaceOfferSeed,
+  isExactV314WorkspaceAuditCarrier,
   isExactV314FixtureMachineIdCandidate,
   isExactV314TriggerRegistry,
   normalizePackagedLogicalJson,
@@ -76,6 +80,37 @@ function desktopDeliveredNotification(input: {
       boundAt: '2026-08-30T12:00:00.000Z',
     },
     deliveryPlanCompletedAt: '2026-08-30T12:00:01.000Z',
+  };
+}
+
+function recoveredWorkflowActivity(runId: string, workflowName: string, ordinal: number) {
+  const createdAt = `2026-08-30T12:00:0${ordinal}.000Z`;
+  const completedAt = `2026-08-30T12:00:1${ordinal}.000Z`;
+  const error = `Workflow "${workflowName}" is disabled — approve/enable it before it can run.`;
+  return {
+    id: runId,
+    sessionId: `workflow:${runId}`,
+    channel: 'workflow',
+    source: 'workflow',
+    title: `Workflow: ${workflowName}`,
+    input: `Starting workflow "${workflowName}"`,
+    status: 'failed',
+    createdAt,
+    updatedAt: completedAt,
+    completedAt,
+    error,
+    events: [{
+      id: `10000000-0000-4000-8000-00000000000${ordinal}`,
+      type: 'received',
+      message: 'Run received.',
+      createdAt,
+    }, {
+      id: `20000000-0000-4000-8000-00000000000${ordinal}`,
+      type: 'failed',
+      message: `Workflow failed before start: ${error}`,
+      createdAt: completedAt,
+      data: {},
+    }],
   };
 }
 
@@ -205,6 +240,18 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
   for (const [file, category] of cases) {
     assert.equal(classifyPackagedFirstBootAddedFile(file, recovery), category, file);
   }
+  assert.equal(classifyPackagedFirstBootAddedFile('state/runs.json', recovery), 'unexpected');
+  assert.equal(classifyPackagedFirstBootAddedFile(
+    'state/runs.json',
+    recovery,
+    { recoveredWorkflowRuns: true },
+  ), 'recovery_projection');
+  assert.equal(classifyPackagedFirstBootAddedFile('state/starter-workspace-offer.json', recovery), 'unexpected');
+  assert.equal(classifyPackagedFirstBootAddedFile(
+    'state/starter-workspace-offer.json',
+    recovery,
+    { starterWorkspaceOffer: true },
+  ), 'deterministic_boot_seed');
   for (const file of [
     'state/reviewed-cli-scan.json',
     'state/capability-catalog.json',
@@ -222,6 +269,287 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
   assert.equal(isExactDaemonLeaseOwnerRecord(lease, 123, lease.token), true);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, pid: 124 }, 123, lease.token), false);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, extra: true }, 123, lease.token), false);
+});
+
+test('recovered workflow activity projection accepts exactly two failed recoveries, one exercise, and a stable boot two', () => {
+  const workflowName = 'upgrade-rehearsal-workflow';
+  const scheduleId = 'trigger-schedule';
+  const eventId = 'trigger-event';
+  const exerciseId = 'trigger-exercise';
+  const first = [
+    recoveredWorkflowActivity(scheduleId, workflowName, 1),
+    recoveredWorkflowActivity(eventId, workflowName, 2),
+  ];
+  const exercise = {
+    id: exerciseId,
+    sessionId: `workflow:${exerciseId}`,
+    channel: 'workflow',
+    source: 'workflow',
+    title: `Workflow: ${workflowName}`,
+    input: `Running workflow "${workflowName}"`,
+    status: 'completed',
+    createdAt: '2026-08-30T12:00:20.000Z',
+    updatedAt: '2026-08-30T12:00:21.000Z',
+    completedAt: '2026-08-30T12:00:21.000Z',
+    outputPreview: 'completed',
+    events: [{
+      id: '30000000-0000-4000-8000-000000000001',
+      type: 'received',
+      message: 'Run received.',
+      createdAt: '2026-08-30T12:00:20.000Z',
+    }, {
+      id: '40000000-0000-4000-8000-000000000001',
+      type: 'completed',
+      message: 'Completed',
+      createdAt: '2026-08-30T12:00:21.000Z',
+      data: {},
+    }],
+  };
+  const postExercise = [...structuredClone(first), exercise];
+  const expected = {
+    workflowName,
+    recoveredRunIds: [scheduleId, eventId],
+    exerciseRunId: exerciseId,
+    exerciseOutputPreview: 'completed',
+  };
+  assert.equal(isExactRecoveredWorkflowRunProjection(
+    first,
+    postExercise,
+    structuredClone(postExercise),
+    expected,
+  ), true);
+  assert.equal(isExactRecoveredWorkflowRunProjection(
+    first.slice(0, 1),
+    postExercise,
+    structuredClone(postExercise),
+    expected,
+  ), false, 'missing recovered row');
+  assert.equal(isExactRecoveredWorkflowRunProjection(
+    [...first, recoveredWorkflowActivity('extra', workflowName, 3)],
+    postExercise,
+    structuredClone(postExercise),
+    expected,
+  ), false, 'extra recovered row');
+  const wrong = structuredClone(first);
+  wrong[0]!.status = 'completed';
+  assert.equal(isExactRecoveredWorkflowRunProjection(
+    wrong,
+    postExercise,
+    structuredClone(postExercise),
+    expected,
+  ), false, 'wrong recovered terminal state');
+  assert.equal(isExactRecoveredWorkflowRunProjection(
+    first,
+    postExercise,
+    [...structuredClone(postExercise), { ...exercise, id: 'boot-two-extra' }],
+    expected,
+  ), false, 'boot two extra execution');
+  for (const [label, mutate] of [
+    ['extra exercise field', (row: Record<string, unknown>) => { row.error = 'should not exist'; }],
+    ['wrong exercise input', (row: Record<string, unknown>) => { row.input = 'wrong'; }],
+    ['wrong exercise output', (row: Record<string, unknown>) => { row.outputPreview = 'wrong'; }],
+    ['extra exercise event', (row: Record<string, unknown>) => {
+      (row.events as unknown[]).push({ type: 'status' });
+    }],
+    ['wrong exercise event message', (row: Record<string, unknown>) => {
+      ((row.events as Array<Record<string, unknown>>)[1]!).message = 'Done-ish';
+    }],
+  ] as const) {
+    const wrongPost = structuredClone(postExercise) as Array<Record<string, unknown>>;
+    mutate(wrongPost.find((row) => row.id === exerciseId)!);
+    assert.equal(isExactRecoveredWorkflowRunProjection(
+      first,
+      wrongPost,
+      structuredClone(wrongPost),
+      expected,
+    ), false, label);
+  }
+});
+
+test('starter workspace one-shot seed rejects missing, extra, wrong, and boot-two-drifting rows', () => {
+  const valid = {
+    offeredAt: null,
+    reason: 'already-has-workspaces',
+    at: '2026-08-30T12:00:00.000Z',
+  };
+  assert.equal(isExactStarterWorkspaceOfferSeed(valid, structuredClone(valid), structuredClone(valid)), true);
+  assert.equal(isExactStarterWorkspaceOfferSeed(null, valid, valid), false, 'missing row');
+  assert.equal(isExactStarterWorkspaceOfferSeed({ ...valid, extra: true }, valid, valid), false, 'extra field');
+  assert.equal(isExactStarterWorkspaceOfferSeed({ ...valid, reason: 'offered' }, valid, valid), false, 'wrong row');
+  assert.equal(isExactStarterWorkspaceOfferSeed(valid, valid, { ...valid, at: '2026-08-30T12:00:01.000Z' }), false, 'boot two drift');
+});
+
+test('workspace audit carrier is one bounded exact-v3.14 append, never an absent or vacuous file', () => {
+  const valid = `${JSON.stringify({
+    ts: '2026-08-30T12:00:00.000Z',
+    method: 'FIXTURE',
+    path: '/upgrade-rehearsal/v3.14',
+    outcome: 'ok',
+    bytes: 0,
+    note: 'Bounded exact-v3.14 workspace audit carrier.',
+  })}\n`;
+  assert.equal(isExactV314WorkspaceAuditCarrier(valid), true);
+  assert.equal(isExactV314WorkspaceAuditCarrier(null), false, 'missing carrier');
+  assert.equal(isExactV314WorkspaceAuditCarrier(''), false, 'empty carrier');
+  assert.equal(isExactV314WorkspaceAuditCarrier(`${valid}${valid}`), false, 'extra row');
+  assert.equal(isExactV314WorkspaceAuditCarrier(valid.replace('FIXTURE', 'PUT')), false, 'wrong row');
+});
+
+test('global audit proof requires the exact recovery and exercise approval appends plus boot-two stability', () => {
+  const before = `${JSON.stringify({ at: '2026-08-30T11:00:00.000Z', kind: 'approval_resolved' })}\n`;
+  const expected = {
+    at: '2026-08-30T12:00:00.000Z',
+    sessionId: 'upgrade-rehearsal-approval-owner-v314',
+    approvalId: 'approval-v314',
+    subject: 'Pending read-only fixture approval',
+    tool: 'fixture_read',
+    resolution: 'cancelled_by_system',
+    resolvedBy: 'reaper-dead-session',
+  };
+  const append = `${JSON.stringify({ kind: 'approval_resolved', ...expected })}\n`;
+  const first = `${before}${append}`;
+  const exerciseExpected = {
+    at: '2026-08-30T12:01:00.000Z',
+    sessionId: 'exercise-session',
+    approvalId: 'exercise-approval',
+    subject: 'Approve exact automation opportunity: Packaged upgrade durable project',
+    tool: 'automation_opportunity_review_decision',
+    resolution: 'approved',
+    resolvedBy: 'human.packaged-upgrade',
+  };
+  const exerciseRequestExpected = {
+    at: '2026-08-30T12:00:59.000Z',
+    kind: 'automation_opportunity_review' as const,
+    sessionId: 'exercise-session',
+    seq: 7,
+    turn: 0,
+    projectionId: 'exercise-projection',
+    proposalId: 'exercise-proposal',
+    proposalRevision: 2,
+    proposalDigest: 'a'.repeat(64),
+    tool: 'automation_opportunity_review_decision' as const,
+    subject: 'Approve exact automation opportunity: Packaged upgrade durable project',
+    approvalId: 'exercise-approval',
+    pendingActionId: null,
+    resumeKey: 'automation-opportunity-review:exercise',
+  };
+  const exerciseRequestAppend = `${JSON.stringify(exerciseRequestExpected)}\n`;
+  const exerciseAppend = `${JSON.stringify({ kind: 'approval_resolved', ...exerciseExpected })}\n`;
+  const postExercise = `${first}${exerciseRequestAppend}${exerciseAppend}`;
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    postExercise,
+    postExercise,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), true);
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    before,
+    postExercise,
+    postExercise,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'missing appended row');
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    `${first}${append}`,
+    postExercise,
+    postExercise,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'extra first-boot row');
+  const wrong = `${before}${JSON.stringify({ kind: 'approval_resolved', ...expected, resolvedBy: 'wrong' })}\n`;
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    wrong,
+    `${wrong}${exerciseRequestAppend}${exerciseAppend}`,
+    `${wrong}${exerciseRequestAppend}${exerciseAppend}`,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'wrong appended row');
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    first,
+    first,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'missing exercise row');
+  const missingResolution = `${first}${exerciseRequestAppend}`;
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    missingResolution,
+    missingResolution,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'missing exercise resolution');
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    `${postExercise}${exerciseAppend}`,
+    `${postExercise}${exerciseAppend}`,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'extra exercise row');
+  const wrongExercise = `${first}${exerciseRequestAppend}${JSON.stringify({
+    kind: 'approval_resolved',
+    ...exerciseExpected,
+    approvalId: 'wrong-exercise-approval',
+  })}\n`;
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    wrongExercise,
+    wrongExercise,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'wrong exercise row');
+  const wrongKindRequest = `${first}${JSON.stringify({
+    ...exerciseRequestExpected,
+    kind: 'custom_probe',
+  })}\n${exerciseAppend}`;
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    wrongKindRequest,
+    wrongKindRequest,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'wrong exercise request kind');
+  const nonApprovalExtra = `${postExercise}${JSON.stringify({
+    at: '2026-08-30T12:02:00.000Z',
+    kind: 'custom_probe',
+  })}\n`;
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    nonApprovalExtra,
+    nonApprovalExtra,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'non-approval extra exercise row');
+  assert.equal(isExactApprovalResolutionAuditAppend(
+    before,
+    first,
+    postExercise,
+    `${postExercise}${append}`,
+    expected,
+    exerciseRequestExpected,
+    exerciseExpected,
+  ), false, 'boot two append');
 });
 
 test('packaged rehearsal reclaims only its exact dead owner and cleanup is idempotent', () => {

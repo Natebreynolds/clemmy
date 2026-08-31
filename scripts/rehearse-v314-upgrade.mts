@@ -678,6 +678,22 @@ async function seedV314Fixture(checkout: string, home: string): Promise<void> {
       observedAt: '2026-08-07T22:41:08.000Z',
     }],
   });
+  // Seed one real v3.14 data-plane audit carrier through the archived public
+  // API.  An absent audit file made the packaged four-phase equality check
+  // vacuous: all four inspections could agree that no carrier existed.  The
+  // row is deliberately bounded and inert; its only job is to prove that an
+  // existing append-only workspace audit survives migration, daemon recovery,
+  // the installed-package exercise, and the second boot byte-for-byte.
+  const workspaceDataStore = await importFrom(checkout, 'src/spaces/data-store.ts') as {
+    appendAudit(slug: string, entry: Record<string, unknown>): void;
+  };
+  workspaceDataStore.appendAudit(REQUIRED_FIXTURE_IDENTITIES.workspaceId, {
+    method: 'FIXTURE',
+    path: '/upgrade-rehearsal/v3.14',
+    outcome: 'ok',
+    bytes: 0,
+    note: 'Bounded exact-v3.14 workspace audit carrier.',
+  });
 
   const approvalStoreModule = await importFrom(checkout, 'src/runtime/approval-store.ts') as {
     ApprovalStore: new () => { add(item: Record<string, unknown>): void };
@@ -1119,7 +1135,7 @@ function inspectSqlite(home: string, relativePath: string): SqliteInspection {
     if (tableExists(db, 'events')) {
       identities.events = rows(
         db,
-        'SELECT id, session_id, seq, turn, role, type, data_json FROM events ORDER BY session_id, seq',
+        'SELECT id, session_id, seq, turn, role, type, data_json, created_at FROM events ORDER BY session_id, seq',
       );
     }
     if (tableExists(db, 'pending_approvals')) {

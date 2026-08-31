@@ -1459,17 +1459,28 @@ export type PackagedFirstBootAddedFileCategory =
   | 'ephemeral_process_owner'
   | 'unexpected';
 
+export interface PackagedFirstBootCausalFiles {
+  /** True only after state/runs.json has passed the exact two-recovery-run
+   * projection proof below. A matching pathname is never sufficient. */
+  recoveredWorkflowRuns?: boolean;
+  /** True only after the one-shot existing-workspace marker has passed its
+   * exact shape and cross-boot stability proof below. */
+  starterWorkspaceOffer?: boolean;
+}
+
 /** Closed path classifier. Classification never grants acceptance by itself:
  * each causal category has a semantic assertion below, and surviving process
  * owner artifacts always fail even though they are recognizable. */
 export function classifyPackagedFirstBootAddedFile(
   relativePath: string,
   recoveryEventFiles: ReadonlySet<string> = new Set(),
+  causalFiles: PackagedFirstBootCausalFiles = {},
 ): PackagedFirstBootAddedFileCategory {
   if (
     relativePath === 'cron/daemon-state.json'
     || relativePath === 'state/notification-delivery-queue.json'
     || recoveryEventFiles.has(relativePath)
+    || (relativePath === 'state/runs.json' && causalFiles.recoveredWorkflowRuns === true)
   ) return 'recovery_projection';
   if (relativePath === 'state/space-schedule-state.json') return 'scheduler_observation';
   if (
@@ -1477,6 +1488,8 @@ export function classifyPackagedFirstBootAddedFile(
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/SKILL.md'
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md'
     || relativePath === `memory/tool-procedures/${V314_GATE_MACHINE_ID}/.canonical-procedure-migration-v1.json`
+    || (relativePath === 'state/starter-workspace-offer.json'
+      && causalFiles.starterWorkspaceOffer === true)
   ) return 'deterministic_boot_seed';
   if (
     relativePath === 'daemon.pid'
@@ -1491,6 +1504,7 @@ function addedFilesByCategory(
   reference: HomeInspection,
   actual: HomeInspection,
   recoveryEventFiles: ReadonlySet<string>,
+  causalFiles: PackagedFirstBootCausalFiles = {},
 ): Record<PackagedFirstBootAddedFileCategory, string[]> {
   const categories: Record<PackagedFirstBootAddedFileCategory, string[]> = {
     recovery_projection: [],
@@ -1501,12 +1515,17 @@ function addedFilesByCategory(
   };
   for (const relativePath of Object.keys(actual.allNonSqliteFiles).sort()) {
     if (relativePath in reference.allNonSqliteFiles) continue;
-    categories[classifyPackagedFirstBootAddedFile(relativePath, recoveryEventFiles)].push(relativePath);
+    categories[classifyPackagedFirstBootAddedFile(relativePath, recoveryEventFiles, causalFiles)]
+      .push(relativePath);
   }
   return categories;
 }
 
 function validDeterministicBootSeed(home: string, relativePath: string): boolean {
+  if (relativePath === 'state/starter-workspace-offer.json') {
+    const record = readJsonStateRecord(home, relativePath);
+    return isExactStarterWorkspaceOfferSeed(record, record, record);
+  }
   const checkInId = /^state\/check-in-templates\/(seed-[a-z-]+)\.json$/.exec(relativePath)?.[1]
     as (typeof CHECK_IN_SEED_IDS)[number] | undefined;
   if (checkInId && checkInId in CHECK_IN_SEED_TRIGGERS) {
@@ -1624,6 +1643,330 @@ function readJsonArrayRecords(home: string, relativePath: string): Array<Record<
   }
 }
 
+function readStrictJsonRecordArray(home: string, relativePath: string): Array<Record<string, Json>> | null {
+  const file = path.join(home, relativePath);
+  if (!existsSync(file)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    if (parsed.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))) return null;
+    return asJson(parsed) as Array<Record<string, Json>>;
+  } catch {
+    return null;
+  }
+}
+
+function readTextStateFile(home: string, relativePath: string): string | null {
+  const file = path.join(home, relativePath);
+  if (!existsSync(file)) return null;
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function isCanonicalIso(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const epoch = Date.parse(value);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
+}
+
+function exactObjectKeys(value: Record<string, Json>, keys: readonly string[]): boolean {
+  return stable(Object.keys(value).sort()) === stable([...keys].sort());
+}
+
+function exactRecoveredWorkflowActivityRow(
+  row: Record<string, Json>,
+  workflowName: string,
+  runId: string,
+): boolean {
+  const message = `Workflow "${workflowName}" is disabled — approve/enable it before it can run.`;
+  if (
+    !exactObjectKeys(row, [
+      'id', 'sessionId', 'channel', 'source', 'title', 'input', 'status',
+      'createdAt', 'updatedAt', 'completedAt', 'error', 'events',
+    ])
+    || row.id !== runId
+    || row.sessionId !== `workflow:${runId}`
+    || row.channel !== 'workflow'
+    || row.source !== 'workflow'
+    || row.title !== `Workflow: ${workflowName}`
+    || row.input !== `Starting workflow "${workflowName}"`
+    || row.status !== 'failed'
+    || row.error !== message
+    || !isCanonicalIso(row.createdAt)
+    || !isCanonicalIso(row.updatedAt)
+    || row.completedAt !== row.updatedAt
+    || Date.parse(row.updatedAt) < Date.parse(row.createdAt)
+    || !Array.isArray(row.events)
+    || row.events.length !== 2
+  ) return false;
+  const received = row.events[0];
+  const failed = row.events[1];
+  if (
+    !received || typeof received !== 'object' || Array.isArray(received)
+    || !failed || typeof failed !== 'object' || Array.isArray(failed)
+  ) return false;
+  const receivedRow = received as Record<string, Json>;
+  const failedRow = failed as Record<string, Json>;
+  return exactObjectKeys(receivedRow, ['id', 'type', 'message', 'createdAt'])
+    && typeof receivedRow.id === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receivedRow.id)
+    && receivedRow.type === 'received'
+    && receivedRow.message === 'Run received.'
+    && receivedRow.createdAt === row.createdAt
+    && exactObjectKeys(failedRow, ['id', 'type', 'message', 'createdAt', 'data'])
+    && typeof failedRow.id === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(failedRow.id)
+    && failedRow.id !== receivedRow.id
+    && failedRow.type === 'failed'
+    && failedRow.message === `Workflow failed before start: ${message}`
+    && failedRow.createdAt === row.updatedAt
+    && stable(failedRow.data) === stable({});
+}
+
+function exactExercisedWorkflowActivityRow(
+  row: Record<string, Json>,
+  workflowName: string,
+  runId: string,
+  outputPreview: string,
+): boolean {
+  if (
+    !exactObjectKeys(row, [
+      'id', 'sessionId', 'channel', 'source', 'title', 'input', 'status',
+      'createdAt', 'updatedAt', 'completedAt', 'outputPreview', 'events',
+    ])
+    || row.id !== runId
+    || row.sessionId !== `workflow:${runId}`
+    || row.channel !== 'workflow'
+    || row.source !== 'workflow'
+    || row.title !== `Workflow: ${workflowName}`
+    || row.input !== `Running workflow "${workflowName}"`
+    || row.status !== 'completed'
+    || row.outputPreview !== outputPreview
+    || !isCanonicalIso(row.createdAt)
+    || !isCanonicalIso(row.updatedAt)
+    || row.completedAt !== row.updatedAt
+    || Date.parse(row.updatedAt) < Date.parse(row.createdAt)
+    || !Array.isArray(row.events)
+    || row.events.length !== 2
+  ) return false;
+  const received = row.events[0];
+  const completed = row.events[1];
+  if (
+    !received || typeof received !== 'object' || Array.isArray(received)
+    || !completed || typeof completed !== 'object' || Array.isArray(completed)
+  ) return false;
+  const receivedRow = received as Record<string, Json>;
+  const completedRow = completed as Record<string, Json>;
+  const uuid = (value: Json): value is string => typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  return exactObjectKeys(receivedRow, ['id', 'type', 'message', 'createdAt'])
+    && uuid(receivedRow.id)
+    && receivedRow.type === 'received'
+    && receivedRow.message === 'Run received.'
+    && receivedRow.createdAt === row.createdAt
+    && exactObjectKeys(completedRow, ['id', 'type', 'message', 'createdAt', 'data'])
+    && uuid(completedRow.id)
+    && completedRow.id !== receivedRow.id
+    && completedRow.type === 'completed'
+    && completedRow.message === 'Completed'
+    && completedRow.createdAt === row.updatedAt
+    && stable(completedRow.data) === stable({});
+}
+
+export interface RecoveredWorkflowRunProjectionExpectation {
+  workflowName: string;
+  recoveredRunIds: readonly string[];
+  exerciseRunId: string;
+  exerciseOutputPreview: string;
+}
+
+/** Prove that state/runs.json is exactly the user-facing projection of the two
+ * old queued runs recovered by boot one, followed only by the one workflow
+ * deliberately executed by the installed-package exercise. The second daemon
+ * may not rewrite a byte or create another activity/execution row. */
+export function isExactRecoveredWorkflowRunProjection(
+  first: Array<Record<string, Json>>,
+  postExercise: Array<Record<string, Json>>,
+  second: Array<Record<string, Json>>,
+  expected: RecoveredWorkflowRunProjectionExpectation,
+): boolean {
+  const recoveredIds = [...new Set(expected.recoveredRunIds)];
+  if (
+    recoveredIds.length !== 2
+    || recoveredIds.some((id) => typeof id !== 'string' || id.length === 0)
+    || !expected.exerciseRunId
+    || recoveredIds.includes(expected.exerciseRunId)
+    || first.length !== recoveredIds.length
+    || postExercise.length !== recoveredIds.length + 1
+    || stable(postExercise) !== stable(second)
+  ) return false;
+  const firstById = new Map(first.flatMap((row) =>
+    typeof row.id === 'string' ? [[row.id, row] as const] : []));
+  const postById = new Map(postExercise.flatMap((row) =>
+    typeof row.id === 'string' ? [[row.id, row] as const] : []));
+  if (firstById.size !== first.length || postById.size !== postExercise.length) return false;
+  for (const runId of recoveredIds) {
+    const firstRow = firstById.get(runId);
+    const postRow = postById.get(runId);
+    if (
+      !firstRow
+      || !postRow
+      || !exactRecoveredWorkflowActivityRow(firstRow, expected.workflowName, runId)
+      || stable(firstRow) !== stable(postRow)
+    ) return false;
+  }
+  const exercise = postById.get(expected.exerciseRunId);
+  return Boolean(exercise)
+    && expected.exerciseOutputPreview.length > 0
+    && exactExercisedWorkflowActivityRow(
+      exercise!,
+      expected.workflowName,
+      expected.exerciseRunId,
+      expected.exerciseOutputPreview,
+    );
+}
+
+/** Exact once-ever seed emitted when the migrated home already owns a
+ * workspace. Missing, additional, or differently-valued fields fail closed. */
+export function isExactStarterWorkspaceOfferSeed(
+  first: Record<string, Json> | null,
+  postExercise: Record<string, Json> | null,
+  second: Record<string, Json> | null,
+): boolean {
+  return first !== null
+    && exactObjectKeys(first, ['offeredAt', 'reason', 'at'])
+    && first.offeredAt === null
+    && first.reason === 'already-has-workspaces'
+    && isCanonicalIso(first.at)
+    && stable(first) === stable(postExercise)
+    && stable(postExercise) === stable(second);
+}
+
+export interface ApprovalResolutionAuditExpectation {
+  at: string;
+  sessionId: string;
+  approvalId: string;
+  subject: string;
+  tool: string;
+  resolution: string;
+  resolvedBy: string;
+}
+
+export interface ExerciseApprovalRequestAuditExpectation {
+  at: string;
+  kind: 'automation_opportunity_review';
+  sessionId: string;
+  seq: number;
+  turn: number;
+  projectionId: string;
+  proposalId: string;
+  proposalRevision: number;
+  proposalDigest: string;
+  tool: 'automation_opportunity_review_decision';
+  subject: string;
+  approvalId: string;
+  pendingActionId: null;
+  resumeKey: string;
+}
+
+/** The archived appendAudit API must have produced one bounded, inert row.
+ * This prevents a four-way equality proof over four absent/empty carriers. */
+export function isExactV314WorkspaceAuditCarrier(bytes: string | null): boolean {
+  if (typeof bytes !== 'string') return false;
+  const lines = bytes.split(/\r?\n/).filter(Boolean);
+  if (lines.length !== 1) return false;
+  try {
+    const parsed = JSON.parse(lines[0] ?? '') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const row = asJson(parsed) as Record<string, Json>;
+    return exactObjectKeys(row, ['ts', 'method', 'path', 'outcome', 'bytes', 'note'])
+      && isCanonicalIso(row.ts)
+      && row.method === 'FIXTURE'
+      && row.path === '/upgrade-rehearsal/v3.14'
+      && row.outcome === 'ok'
+      && row.bytes === 0
+      && row.note === 'Bounded exact-v3.14 workspace audit carrier.';
+  } catch {
+    return false;
+  }
+}
+
+/** Closed append proof for the global monthly audit carrier. Boot one adds
+ * exactly the deliberately aged approval resolution; the installed exercise
+ * then adds exactly its reviewed-project approval. No other row or prefix
+ * rewrite is accepted, and boot two must be byte-idempotent. */
+export function isExactApprovalResolutionAuditAppend(
+  beforeBytes: string | null,
+  firstBytes: string | null,
+  postExerciseBytes: string | null,
+  secondBytes: string | null,
+  recoveredApproval: ApprovalResolutionAuditExpectation,
+  exerciseRequest: ExerciseApprovalRequestAuditExpectation,
+  exerciseApproval: ApprovalResolutionAuditExpectation,
+): boolean {
+  if (
+    typeof beforeBytes !== 'string'
+    || beforeBytes.length === 0
+    || typeof firstBytes !== 'string'
+    || typeof postExerciseBytes !== 'string'
+    || typeof secondBytes !== 'string'
+    || postExerciseBytes !== secondBytes
+    || !isCanonicalIso(recoveredApproval.at)
+    || !isCanonicalIso(exerciseRequest.at)
+    || !isCanonicalIso(exerciseApproval.at)
+  ) return false;
+  const exactAppend = (
+    prefix: string,
+    next: string,
+    expected: ApprovalResolutionAuditExpectation,
+  ): boolean => {
+    if (!next.startsWith(prefix) || next.length <= prefix.length) return false;
+    const appendedLines = next.slice(prefix.length).split(/\r?\n/).filter(Boolean);
+    if (appendedLines.length !== 1) return false;
+    try {
+      const parsed = JSON.parse(appendedLines[0] ?? '') as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      const appended = asJson(parsed) as Record<string, Json>;
+      return exactObjectKeys(appended, [
+        'at', 'kind', 'sessionId', 'approvalId', 'subject', 'tool',
+        'resolution', 'resolvedBy',
+      ]) && stable(appended) === stable({ kind: 'approval_resolved', ...expected });
+    } catch {
+      return false;
+    }
+  };
+  if (!exactAppend(beforeBytes, firstBytes, recoveredApproval)) return false;
+  if (!postExerciseBytes.startsWith(firstBytes) || postExerciseBytes.length <= firstBytes.length) return false;
+  const exerciseRows: Array<Record<string, Json>> = [];
+  try {
+    for (const line of postExerciseBytes.slice(firstBytes.length).split(/\r?\n/).filter(Boolean)) {
+      const parsed = JSON.parse(line) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      exerciseRows.push(asJson(parsed) as Record<string, Json>);
+    }
+  } catch {
+    return false;
+  }
+  const exerciseRequestRow = exerciseRows[0];
+  const exerciseResolution = exerciseRows[1];
+  return exerciseRows.length === 2
+    && exactObjectKeys(exerciseRequestRow!, [
+      'at', 'kind', 'sessionId', 'seq', 'turn', 'projectionId', 'proposalId',
+      'proposalRevision', 'proposalDigest', 'tool', 'subject', 'approvalId',
+      'pendingActionId', 'resumeKey',
+    ])
+    && stable(exerciseRequestRow) === stable(exerciseRequest)
+    && exerciseResolution?.kind === 'approval_resolved'
+    && exactObjectKeys(exerciseResolution, [
+      'at', 'kind', 'sessionId', 'approvalId', 'subject', 'tool',
+      'resolution', 'resolvedBy',
+    ])
+    && stable(exerciseResolution) === stable({ kind: 'approval_resolved', ...exerciseApproval });
+}
+
 export function isExactLegacyApprovalRetirement(
   before: Array<Record<string, Json>>,
   first: Array<Record<string, Json>>,
@@ -1680,12 +2023,26 @@ export async function runPackagedV314DaemonRehearsal(
   if (!existsSync(exerciseFixture)) throw new Error(`packaged exercise fixture is missing: ${exerciseFixture}`);
   const workspaceDataPath = `spaces/${REQUIRED_FIXTURE_IDENTITIES.workspaceId}/data.json`;
   const workspaceAuditPath = `spaces/${REQUIRED_FIXTURE_IDENTITIES.workspaceId}/audit.jsonl`;
+  const workflowActivityPath = 'state/runs.json';
+  const starterWorkspaceOfferPath = 'state/starter-workspace-offer.json';
+  // Fixture construction and the immediately following recovery boot are one
+  // bounded gate operation. Pin the global monthly carrier before boot so the
+  // exact preexisting bytes can be proven as an immutable prefix.
+  const currentAuditPath = `audit/audit-${new Date().toISOString().slice(0, 7)}.jsonl`;
   const before = inspectQuiescentRehearsalHome(daemonHome, 'pre-daemon fixture');
   const beforeLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
+  const beforeWorkflowActivityRuns = readStrictJsonRecordArray(daemonHome, workflowActivityPath);
+  const beforeStarterWorkspaceOffer = readJsonStateRecord(daemonHome, starterWorkspaceOfferPath);
+  const beforeCurrentAuditBytes = readTextStateFile(daemonHome, currentAuditPath);
+  const beforeWorkspaceAuditBytes = readTextStateFile(daemonHome, workspaceAuditPath);
   const beforeWork = workSnapshot(daemonHome, before);
   const firstProcess = await bootPackagedDaemon(1, packageEntry, daemonHome, hermeticRuntimePath);
   const first = inspectQuiescentRehearsalHome(daemonHome, 'first packaged boot');
   const firstLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
+  const firstWorkflowActivityRuns = readStrictJsonRecordArray(daemonHome, workflowActivityPath);
+  const firstStarterWorkspaceOffer = readJsonStateRecord(daemonHome, starterWorkspaceOfferPath);
+  const firstCurrentAuditBytes = readTextStateFile(daemonHome, currentAuditPath);
+  const firstWorkspaceAuditBytes = readTextStateFile(daemonHome, workspaceAuditPath);
   const firstScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
   const firstSpaceScheduleObservation = readJsonStateRecord(daemonHome, 'state/space-schedule-state.json');
   const firstDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
@@ -1699,6 +2056,10 @@ export async function runPackagedV314DaemonRehearsal(
   );
   const postExercise = inspectQuiescentRehearsalHome(daemonHome, 'installed exercise');
   const postExerciseLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
+  const postExerciseWorkflowActivityRuns = readStrictJsonRecordArray(daemonHome, workflowActivityPath);
+  const postExerciseStarterWorkspaceOffer = readJsonStateRecord(daemonHome, starterWorkspaceOfferPath);
+  const postExerciseCurrentAuditBytes = readTextStateFile(daemonHome, currentAuditPath);
+  const postExerciseWorkspaceAuditBytes = readTextStateFile(daemonHome, workspaceAuditPath);
   const postExerciseScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
   const postExerciseSpaceScheduleObservation = readJsonStateRecord(daemonHome, 'state/space-schedule-state.json');
   const postExerciseDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
@@ -1708,6 +2069,10 @@ export async function runPackagedV314DaemonRehearsal(
   const secondProcess = await bootPackagedDaemon(2, packageEntry, daemonHome, hermeticRuntimePath);
   const second = inspectQuiescentRehearsalHome(daemonHome, 'second packaged boot');
   const secondLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
+  const secondWorkflowActivityRuns = readStrictJsonRecordArray(daemonHome, workflowActivityPath);
+  const secondStarterWorkspaceOffer = readJsonStateRecord(daemonHome, starterWorkspaceOfferPath);
+  const secondCurrentAuditBytes = readTextStateFile(daemonHome, currentAuditPath);
+  const secondWorkspaceAuditBytes = readTextStateFile(daemonHome, workspaceAuditPath);
   const secondScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
   const secondSpaceScheduleObservation = readJsonStateRecord(daemonHome, 'state/space-schedule-state.json');
   const secondDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
@@ -1809,11 +2174,23 @@ export async function runPackagedV314DaemonRehearsal(
     second: second.allNonSqliteFiles[workspaceDataPath] ?? null,
   });
   add('workspace_audit_bytes_remain_exact_across_both_boots_and_exercise',
-    typeof before.allNonSqliteFiles[workspaceAuditPath] === 'string'
+    isExactV314WorkspaceAuditCarrier(beforeWorkspaceAuditBytes)
+      && beforeWorkspaceAuditBytes === firstWorkspaceAuditBytes
+      && firstWorkspaceAuditBytes === postExerciseWorkspaceAuditBytes
+      && postExerciseWorkspaceAuditBytes === secondWorkspaceAuditBytes
+      && typeof before.allNonSqliteFiles[workspaceAuditPath] === 'string'
       && before.allNonSqliteFiles[workspaceAuditPath] === first.allNonSqliteFiles[workspaceAuditPath]
       && first.allNonSqliteFiles[workspaceAuditPath] === postExercise.allNonSqliteFiles[workspaceAuditPath]
       && postExercise.allNonSqliteFiles[workspaceAuditPath] === second.allNonSqliteFiles[workspaceAuditPath],
-    { path: workspaceAuditPath });
+    {
+      path: workspaceAuditPath,
+      digests: {
+        before: before.allNonSqliteFiles[workspaceAuditPath] ?? null,
+        first: first.allNonSqliteFiles[workspaceAuditPath] ?? null,
+        postExercise: postExercise.allNonSqliteFiles[workspaceAuditPath] ?? null,
+        second: second.allNonSqliteFiles[workspaceAuditPath] ?? null,
+      },
+    });
   add('legacy_approval_store_retires_only_the_exact_pending_row_once',
     isExactLegacyApprovalRetirement(beforeLegacyApprovals, firstLegacyApprovals, postExerciseLegacyApprovals)
       && stable(postExerciseLegacyApprovals) === stable(secondLegacyApprovals), {
@@ -1845,6 +2222,104 @@ export async function runPackagedV314DaemonRehearsal(
       && pendingFirst.consumed_at === null
       && stable(pendingFirst) === stable(pendingSecond),
     { before: pendingBefore, first: pendingFirst, second: pendingSecond });
+  const exercisedApproval = rowByIdentity(
+    postExercise.sqlite['state/harness.db']?.identities.pendingApprovals,
+    'approval_id',
+    exercise.reviewApprovalId,
+  );
+  const exerciseApprovalRequestEvents = eventRows(
+    postExercise,
+    exercise.coldSessionId,
+    'approval_requested',
+  ).filter((row) => eventData(row)?.approvalId === exercise.reviewApprovalId);
+  const exerciseApprovalRequestEvent = exerciseApprovalRequestEvents.length === 1
+    ? exerciseApprovalRequestEvents[0]!
+    : null;
+  const exerciseApprovalRequestData = eventData(exerciseApprovalRequestEvent);
+  const exactExerciseApprovalRequestState = exerciseApprovalRequestEvent !== null
+    && exerciseApprovalRequestData !== null
+    && exactObjectKeys(exerciseApprovalRequestData, [
+      'kind', 'projectionId', 'proposalId', 'proposalRevision', 'proposalDigest',
+      'tool', 'subject', 'approvalId', 'pendingActionId', 'resumeKey',
+    ])
+    && exerciseApprovalRequestEvent.session_id === exercise.coldSessionId
+    && Number.isSafeInteger(exerciseApprovalRequestEvent.seq)
+    && exerciseApprovalRequestEvent.turn === 0
+    && isCanonicalIso(exerciseApprovalRequestEvent.created_at)
+    && exerciseApprovalRequestData.kind === 'automation_opportunity_review'
+    && exerciseApprovalRequestData.projectionId === exercise.reviewProjectionId
+    && exerciseApprovalRequestData.proposalId === exercise.proposalId
+    && exerciseApprovalRequestData.proposalRevision === exercise.proposalRevision - 1
+    && exerciseApprovalRequestData.proposalDigest === exercise.proposalDigest
+    && exerciseApprovalRequestData.tool === 'automation_opportunity_review_decision'
+    && exerciseApprovalRequestData.subject === 'Approve exact automation opportunity: Packaged upgrade durable project'
+    && exerciseApprovalRequestData.approvalId === exercise.reviewApprovalId
+    && exerciseApprovalRequestData.pendingActionId === null
+    && typeof exerciseApprovalRequestData.resumeKey === 'string'
+    && exerciseApprovalRequestData.resumeKey === exercisedApproval?.resume_key;
+  const exerciseApprovalRequestExpectation: ExerciseApprovalRequestAuditExpectation | null =
+    exactExerciseApprovalRequestState
+      ? {
+        at: exerciseApprovalRequestEvent!.created_at as string,
+        kind: 'automation_opportunity_review',
+        sessionId: exercise.coldSessionId,
+        seq: exerciseApprovalRequestEvent!.seq as number,
+        turn: 0,
+        projectionId: exercise.reviewProjectionId,
+        proposalId: exercise.proposalId,
+        proposalRevision: exercise.proposalRevision - 1,
+        proposalDigest: exercise.proposalDigest,
+        tool: 'automation_opportunity_review_decision',
+        subject: 'Approve exact automation opportunity: Packaged upgrade durable project',
+        approvalId: exercise.reviewApprovalId,
+        pendingActionId: null,
+        resumeKey: exerciseApprovalRequestData!.resumeKey as string,
+      }
+      : null;
+  const exactApprovalAuditAppend = typeof pendingFirst?.resolved_at === 'string'
+    && typeof pendingFirst.approval_id === 'string'
+    && typeof exercisedApproval?.resolved_at === 'string'
+    && exerciseApprovalRequestExpectation !== null
+    && currentAuditPath === `audit/audit-${pendingFirst.resolved_at.slice(0, 7)}.jsonl`
+    && currentAuditPath === `audit/audit-${exercisedApproval.resolved_at.slice(0, 7)}.jsonl`
+    && isExactApprovalResolutionAuditAppend(
+      beforeCurrentAuditBytes,
+      firstCurrentAuditBytes,
+      postExerciseCurrentAuditBytes,
+      secondCurrentAuditBytes,
+      {
+        at: pendingFirst.resolved_at,
+        sessionId: REQUIRED_FIXTURE_IDENTITIES.approvalOwnerSessionId,
+        approvalId: pendingFirst.approval_id,
+        subject: 'Pending read-only fixture approval',
+        tool: 'fixture_read',
+        resolution: 'cancelled_by_system',
+        resolvedBy: 'reaper-dead-session',
+      },
+      exerciseApprovalRequestExpectation,
+      {
+        at: exercisedApproval.resolved_at,
+        sessionId: exercise.coldSessionId,
+        approvalId: exercise.reviewApprovalId,
+        subject: 'Approve exact automation opportunity: Packaged upgrade durable project',
+        tool: 'automation_opportunity_review_decision',
+        resolution: 'approved',
+        resolvedBy: 'human.packaged-upgrade',
+      },
+    );
+  add('global_monthly_audit_preserves_prefix_and_appends_only_the_exact_aged_approval_resolution',
+    exactApprovalAuditAppend,
+    {
+      path: currentAuditPath,
+      beforeBytes: beforeCurrentAuditBytes?.length ?? null,
+      firstBytes: firstCurrentAuditBytes?.length ?? null,
+      postExerciseBytes: postExerciseCurrentAuditBytes?.length ?? null,
+      secondBytes: secondCurrentAuditBytes?.length ?? null,
+      approvalId: pendingFirst?.approval_id ?? null,
+      resolvedAt: pendingFirst?.resolved_at ?? null,
+      exerciseApproval: exercisedApproval,
+      exerciseApprovalRequestEvent,
+    });
   const beforeAttempt = rowByIdentity(
     before.sqlite['state/harness.db']?.identities.runAttempts,
     'attempt_id',
@@ -2024,13 +2499,74 @@ export async function runPackagedV314DaemonRehearsal(
   const firstEventAcceptance = acceptanceForReceipt(first, beforeTriggerEvent?.id ?? null);
   const secondScheduleAcceptance = acceptanceForReceipt(second, REQUIRED_FIXTURE_IDENTITIES.scheduleReceiptId);
   const secondEventAcceptance = acceptanceForReceipt(second, beforeTriggerEvent?.id ?? null);
+  const exerciseWorkflowNotifications = notificationRows(postExercise, (notification) => {
+    const metadata = notification.metadata;
+    return notification.kind === 'workflow'
+      && typeof notification.body === 'string'
+      && metadata !== null
+      && typeof metadata === 'object'
+      && !Array.isArray(metadata)
+      && (metadata as Record<string, Json>).runId === exercise.workflowRunId;
+  });
+  const exerciseOutputPreview = exerciseWorkflowNotifications.length === 1
+    && typeof exerciseWorkflowNotifications[0]?.body === 'string'
+    ? exerciseWorkflowNotifications[0].body.slice(0, 800)
+    : '';
+  const exactRecoveredWorkflowRuns = !(workflowActivityPath in before.allNonSqliteFiles)
+    && beforeWorkflowActivityRuns === null
+    && firstWorkflowActivityRuns !== null
+    && postExerciseWorkflowActivityRuns !== null
+    && secondWorkflowActivityRuns !== null
+    && isExactRecoveredWorkflowRunProjection(
+      firstWorkflowActivityRuns,
+      postExerciseWorkflowActivityRuns,
+      secondWorkflowActivityRuns,
+      {
+        workflowName: REQUIRED_FIXTURE_IDENTITIES.workflowName,
+        recoveredRunIds: [
+          typeof beforeScheduleRun?.id === 'string' ? beforeScheduleRun.id : '',
+          typeof beforeEventRun?.id === 'string' ? beforeEventRun.id : '',
+        ],
+        exerciseRunId: exercise.workflowRunId,
+        exerciseOutputPreview,
+      },
+    );
+  add('state_runs_is_only_the_exact_recovered_projection_then_one_exercised_run',
+    exactRecoveredWorkflowRuns,
+    {
+      before: beforeWorkflowActivityRuns,
+      first: firstWorkflowActivityRuns,
+      postExercise: postExerciseWorkflowActivityRuns,
+      second: secondWorkflowActivityRuns,
+      expectedRecoveredRunIds: [beforeScheduleRun?.id ?? null, beforeEventRun?.id ?? null],
+      expectedExerciseRunId: exercise.workflowRunId,
+      expectedExerciseOutputPreview: exerciseOutputPreview,
+      exerciseWorkflowNotifications,
+    });
+  const exactStarterWorkspaceOffer = !(starterWorkspaceOfferPath in before.allNonSqliteFiles)
+    && beforeStarterWorkspaceOffer === null
+    && isExactStarterWorkspaceOfferSeed(
+      firstStarterWorkspaceOffer,
+      postExerciseStarterWorkspaceOffer,
+      secondStarterWorkspaceOffer,
+    );
+  add('starter_workspace_offer_is_one_exact_existing_workspace_seed_and_boot_stable',
+    exactStarterWorkspaceOffer,
+    {
+      before: beforeStarterWorkspaceOffer,
+      first: firstStarterWorkspaceOffer,
+      postExercise: postExerciseStarterWorkspaceOffer,
+      second: secondStarterWorkspaceOffer,
+    });
   const firstBootMutableLegacyFiles = new Set<string>([
     'cron/daemon-state.json',
     'cron/workflow-schedule-state.json',
     'state/approvals.json',
     'state/notification-delivery-queue.json',
     'state/notifications.json',
-    workspaceAuditPath,
+    // This is not a pathname allowlist: the only changed global audit carrier
+    // is excluded after (and only after) its exact one-row append proof passes.
+    ...(exactApprovalAuditAppend ? [currentAuditPath] : []),
     ...before.carriers.workflowRuns.flatMap((entry) => {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
       const file = (entry as Record<string, Json>).file;
@@ -2040,7 +2576,11 @@ export async function runPackagedV314DaemonRehearsal(
   const preservedLegacyFiles = preservedPreexistingFiles(before, first, firstBootMutableLegacyFiles);
   add('first_packaged_boot_preserves_every_preexisting_non_sqlite_file_outside_named_recovery_owners',
     preservedLegacyFiles.ok,
-    { ...preservedLegacyFiles, allowedMutable: [...firstBootMutableLegacyFiles].sort() });
+    {
+      ...preservedLegacyFiles,
+      allowedMutable: [...firstBootMutableLegacyFiles].sort(),
+      exactAuditAppendVerified: exactApprovalAuditAppend ? currentAuditPath : null,
+    });
   const recoveryEventFiles = new Set<string>(
     [beforeScheduleRun, beforeEventRun].flatMap((run) => {
       const runId = typeof run?.id === 'string' ? run.id : '';
@@ -2052,13 +2592,18 @@ export async function runPackagedV314DaemonRehearsal(
   const expectedRecoveryAddedFiles = [
     'cron/daemon-state.json',
     'state/notification-delivery-queue.json',
+    workflowActivityPath,
     ...recoveryEventFiles,
   ].filter((relativePath) => !(relativePath in before.allNonSqliteFiles)).sort();
-  const firstBootAdded = addedFilesByCategory(before, first, recoveryEventFiles);
+  const firstBootAdded = addedFilesByCategory(before, first, recoveryEventFiles, {
+    recoveredWorkflowRuns: exactRecoveredWorkflowRuns,
+    starterWorkspaceOffer: exactStarterWorkspaceOffer,
+  });
   const canonicalMigrationSeed =
     `memory/tool-procedures/${V314_GATE_MACHINE_ID}/.canonical-procedure-migration-v1.json`;
   const expectedDeterministicSeedFiles = [
     ...CHECK_IN_SEED_IDS.map((id) => `state/check-in-templates/${id}.json`),
+    starterWorkspaceOfferPath,
     'vault/00-System/workflows/objective-execution-loop/SKILL.md',
     'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md',
     canonicalMigrationSeed,
