@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { appendEvent, getSession } from '../runtime/harness/eventlog.js';
-import { answerCheckIn, closeCheckIn, createCheckIn, listOpenCheckIns, validateCheckInQuestion } from '../agents/check-ins.js';
+import { closeCheckIn, createCheckIn, validateCheckInQuestion } from '../agents/check-ins.js';
+import { answerExactCheckIn, listActionableCheckIns } from '../execution/inbox-questions.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
 import { maybeSelfServeBounce } from '../agents/self-serve-gate.js';
 import { surfacePlan } from '../agents/plan-proposals.js';
@@ -255,7 +256,7 @@ export function registerAutonomyActionTools(server: McpServer): void {
       agentSlug: z.string().optional(),
     },
     async ({ agentSlug }) => {
-      const open = listOpenCheckIns(agentSlug);
+      const open = listActionableCheckIns(agentSlug);
       if (open.length === 0) return textResult('No open check-ins.');
       const lines = open.map((c) => {
         const urgency = c.urgency !== 'normal' ? ` [${c.urgency}]` : '';
@@ -282,10 +283,15 @@ export function registerAutonomyActionTools(server: McpServer): void {
         return textResult(`Check-in ${id} closed without answer.`);
       }
       if (!answer) return textResult('Either provide `answer` to resolve, or pass `close: true` to dismiss.');
-      const resolved = answerCheckIn(id, answer);
-      if (!resolved) return textResult(`No check-in found with id ${id}.`);
-      if (resolved.status !== 'answered') return textResult(`Check-in ${id} was already in status ${resolved.status} — no change.`);
-      return textResult(`Check-in ${id} answered. The agent (${resolved.agentSlug}) will pick this up on its next cycle.`);
+      const resolved = answerExactCheckIn({ checkInId: id, answer });
+      if (resolved.status === 'not_found') return textResult(`No check-in found with id ${id}.`);
+      if (resolved.status === 'storage_error') return textResult(`Check-in ${id} could not be saved: ${resolved.reason}`);
+      if (resolved.status !== 'answered' && resolved.status !== 'resuming') {
+        return textResult(`Check-in ${id} is stale or already resolved — no change. ${resolved.reason}`);
+      }
+      return textResult(resolved.status === 'resuming'
+        ? `Check-in ${id} answered. The exact linked task ${resolved.taskId} is queued to resume.`
+        : `Check-in ${id} answered. The agent (${resolved.record.agentSlug}) will pick this up on its next cycle.`);
     },
   );
 

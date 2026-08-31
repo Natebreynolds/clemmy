@@ -57,12 +57,20 @@ test('navigation is a left drawer — the bottom dock is gone from code and styl
 test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the current screen', () => {
   const app = read('../app.tsx');
   // Hamburger opens it from the header's left edge with a real touch target.
-  assert.match(app, /class="menu-btn"[\s\S]*?aria-label="Open menu"/);
+  assert.match(app, /class="menu-btn"[\s\S]*?aria-label=\{decisions > 0/);
   assert.match(app, /aria-expanded=\{drawerOpen\}/);
   // Dialog semantics + Escape + scrim close.
-  assert.match(app, /class=\{`drawer-layer\$\{drawerClosing \? \' closing\' : \'\'\}`\} role="dialog" aria-modal="true"/);
+  assert.match(app, /class=\{`drawer-layer\$\{drawerClosing \? ' closing' : ''\}`\}[\s\S]*?role=\{drawerClosing \? undefined : 'dialog'\}/);
+  assert.match(app, /aria-hidden=\{drawerClosing \? true : undefined\}/);
+  assert.match(app, /inert=\{drawerClosing \? true : undefined\}/,
+    'the animated closing layer is immediately non-interactive');
   assert.match(app, /event\.key === 'Escape'/);
   assert.match(app, /class="drawer-scrim"[\s\S]*?aria-label="Close menu"/);
+  const closeStart = app.indexOf('const closeDrawer =');
+  const closeEnd = app.indexOf('\n  };', closeStart);
+  const closeSource = app.slice(closeStart, closeEnd);
+  assert.ok(closeSource.indexOf('menuBtnRef.current?.focus()') < closeSource.indexOf('window.setTimeout'),
+    'focus returns before the exit animation rather than staying inside aria-hidden content');
   // The active section carries the page marker, accent-highlighted in CSS.
   assert.match(app, /aria-current=\{tab === t\.id \? 'page' : undefined\}/);
   const css = read('../styles.css');

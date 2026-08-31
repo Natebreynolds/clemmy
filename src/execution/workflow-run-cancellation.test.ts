@@ -21,6 +21,7 @@ const {
   writeWorkflowRunRecordDurablyUnlocked,
 } = await import('./workflow-run-record.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { addNotification, getNotification } = await import('../runtime/notifications.js');
 
 beforeEach(() => {
   _setWorkflowRunCancellationBeforeLockForTests();
@@ -183,6 +184,46 @@ test('cancelling an ambiguous mutation preserves unresolved external truth witho
   assert.equal(canonical.mutationBlock.state, 'cancelled_unreconciled');
   assert.equal(canonical.mutationBlock.cancelledAt, result.request.requestedAt);
   assert.doesNotMatch(canonical.error, /was not (performed|sent|written)/i);
+});
+
+test('terminal cancellation retires only the stable capability Needs You carrier', () => {
+  const runId = 'run-capability-cancelled';
+  writeRun(runId, {
+    status: 'blocked_capability',
+    capabilityBlock: {
+      state: 'blocked',
+      stepId: 'read',
+      tool: 'GOOGLEDRIVE_LIST_FILES',
+      toolkit: 'googledrive',
+      reason: 'not-connected',
+      retryCount: 1,
+      provenNoDispatch: true,
+    },
+  });
+  const gateId = `workflow-${runId}-capability-googledrive`;
+  const resultId = `workflow-${runId}-terminal`;
+  addNotification({
+    id: gateId, kind: 'workflow', title: 'Workflow needs you — connect Google Drive', body: 'Connect.',
+    createdAt: new Date().toISOString(), read: false,
+    metadata: { runId, status: 'blocked_capability', needsAttention: true },
+  });
+  addNotification({
+    id: resultId, kind: 'workflow', title: 'Workflow result', body: 'Terminal carrier.',
+    createdAt: new Date().toISOString(), read: false,
+    metadata: { runId, status: 'failed' },
+  });
+
+  const result = cancelWorkflowRunAtBoundary({
+    runId,
+    reason: 'Stopped by the user.',
+    source: 'test-dashboard',
+  });
+
+  assert.equal(result.status, 'cancelled');
+  assert.equal(getNotification(gateId)?.read, true);
+  assert.equal(getNotification(gateId)?.metadata?.needsAttention, false);
+  assert.equal(getNotification(gateId)?.metadata?.terminalStatus, 'cancelled');
+  assert.equal(getNotification(resultId)?.read, false, 'terminal/result notifications remain independent');
 });
 
 // Break-scenario C: the lifecycle-cleanup predicate + boundary contract that

@@ -31,10 +31,14 @@ const {
   _setWorkflowCallNodeForTests,
   _setWorkflowWatcherForTests,
   WorkflowCapabilityBlockedError,
+  reapCapabilityBlockedRuns,
+  reconcilePendingWorkflowRuns,
 } = await import('./workflow-runner.js');
+const { workflowCapabilityAccountChoiceSet } = await import('./workflow-live-call-compiler.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { getRun } = await import('../runtime/run-events.js');
+const { getNotification, isNeedsAttentionNotification } = await import('../runtime/notifications.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 
 _setWorkflowWatcherForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
@@ -159,5 +163,142 @@ test('the durable run state preserves the blocked operation identity as typed fi
     + '{stepId: pull_digest, tool: ALPHA_LIST_RECORDS, toolkit: alpha, reason: not-connected} — '
     + 'it survives only in the run file + notification metadata, so run-record consumers '
     + 'cannot name what is blocked or what the user must do next',
+  );
+});
+
+test('disconnected/auth block is a Needs You item with one concrete connect-and-retry CTA', async () => {
+  await driveCapabilityBlockedRun();
+  const runRecord = getRun(RUN_ID);
+  assert.ok(runRecord);
+  assert.equal(runRecord.needsAttention, true);
+  assert.equal(runRecord.pendingInput?.kind, 'capability_dependency');
+  if (runRecord.pendingInput?.kind !== 'capability_dependency') assert.fail('typed capability dependency missing');
+  assert.deepEqual(runRecord.pendingInput.resolution, {
+    kind: 'connect_and_retry',
+    actionTool: 'workflow_capability_resolve',
+    toolkit: 'alpha',
+    retryCount: 1,
+  });
+  assert.match(runRecord.pendingInput.nextAction, /Settings → Connections/i);
+  assert.match(runRecord.pendingInput.nextAction, /retry run capability-blocked-digest-run/i);
+
+  const notification = getNotification(`workflow-${RUN_ID}-capability-alpha`);
+  assert.ok(notification);
+  assert.equal(isNeedsAttentionNotification(notification), true);
+  assert.match(notification.title, /Workflow needs you/i);
+  assert.match(notification.body, /Settings → Connections/i);
+  assert.deepEqual(notification.metadata?.resolution, runRecord.pendingInput.resolution);
+});
+
+test('ambiguous account block asks one visible bounded question and cannot timer-dispatch before the answer', async () => {
+  const runId = 'capability-ambiguous-account-run';
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const choices = workflowCapabilityAccountChoiceSet([
+    { capabilityId: 'cap:alpha:account-a', account: 'account-a' },
+    { capabilityId: 'cap:alpha:account-b', account: 'account-b' },
+  ]);
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    workflow: WORKFLOW_NAME,
+    status: 'queued',
+    inputs: {},
+    createdAt: new Date().toISOString(),
+  }), 'utf-8');
+  let attemptedBodies = 0;
+  _setWorkflowCallNodeForTests(async (step) => {
+    // This seam represents compilation refusing before the provider kernel.
+    // A body counter here must remain zero by construction.
+    throw new WorkflowCapabilityBlockedError({
+      stepId: step.id,
+      tool: 'ALPHA_LIST_RECORDS',
+      toolkit: 'alpha',
+      reason: 'ambiguous-account',
+      message: 'Choose the exact alpha account before dispatch.',
+      accountChoiceSet: choices,
+    });
+  });
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    runConversation: (async () => {
+      attemptedBodies += 1;
+      throw new Error('the zero-LLM call node must not reach the model loop');
+    }) as never,
+  });
+  try {
+    await processWorkflowRuns({
+      respond: async () => { throw new Error('legacy respond path must not run'); },
+    } as never);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+    _setWorkflowCallNodeForTests();
+  }
+  assert.equal(attemptedBodies, 0);
+  assert.equal(reapCapabilityBlockedRuns(Date.now() + 24 * 60 * 60_000), 0, 'no timer may choose account A or B');
+
+  const runRecord = getRun(runId);
+  assert.ok(runRecord);
+  assert.equal(runRecord.status, 'awaiting_input');
+  assert.equal(runRecord.needsAttention, true);
+  assert.equal(runRecord.pendingInput?.kind, 'capability_dependency');
+  if (runRecord.pendingInput?.kind !== 'capability_dependency') assert.fail('typed capability dependency missing');
+  assert.deepEqual(runRecord.pendingInput.resolution, {
+    kind: 'choose_account',
+    actionTool: 'workflow_capability_resolve',
+    accountCandidates: choices.candidates,
+    choiceSetDigest: choices.digest,
+    choiceTotal: 2,
+    choicesTruncated: false,
+    retryCount: 1,
+  });
+  assert.match(runRecord.pendingInput.nextAction, /Which alpha account should I use/i);
+  assert.match(runRecord.pendingInput.nextAction, /1\. account-a/i);
+  assert.match(runRecord.pendingInput.nextAction, /2\. account-b/i);
+
+  const notification = getNotification(`workflow-${runId}-capability-alpha`);
+  assert.ok(notification);
+  assert.equal(isNeedsAttentionNotification(notification), true);
+  assert.match(notification.title, /Workflow needs you — choose an account for alpha/i);
+  assert.match(notification.body, /Choose the exact account ID in Needs You/i);
+  assert.deepEqual(notification.metadata?.resolution, runRecord.pendingInput.resolution);
+});
+
+test('the reaper reconstructs a missing ambiguous-account carrier from canonical run truth', () => {
+  const runId = 'capability-crash-before-notification-run';
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const choices = workflowCapabilityAccountChoiceSet([
+    { capabilityId: 'cap:alpha:crash-a', account: 'crash-account-a' },
+    { capabilityId: 'cap:alpha:crash-b', account: 'crash-account-b' },
+  ]);
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    workflow: WORKFLOW_NAME,
+    status: 'blocked_capability',
+    createdAt: new Date().toISOString(),
+    capabilityBlock: {
+      state: 'blocked',
+      stepId: 'pull_digest',
+      tool: 'ALPHA_LIST_RECORDS',
+      toolkit: 'alpha',
+      reason: 'ambiguous-account',
+      message: 'Choose the exact alpha account before dispatch.',
+      blockedAt: new Date().toISOString(),
+      retryAt: new Date(Date.now() + 60_000).toISOString(),
+      retryCount: 7,
+      provenNoDispatch: true,
+      accountChoiceSet: choices,
+    },
+  }), 'utf-8');
+  const notificationId = `workflow-${runId}-capability-alpha`;
+  assert.equal(getNotification(notificationId), undefined);
+
+  reconcilePendingWorkflowRuns();
+  const notification = getNotification(notificationId);
+  assert.ok(notification);
+  assert.equal(notification.read, false);
+  assert.equal(notification.metadata?.retryCount, 7);
+  assert.equal(notification.metadata?.needsAttention, true);
+  assert.equal(
+    (notification.metadata?.resolution as { choiceSetDigest?: string } | undefined)?.choiceSetDigest,
+    choices.digest,
   );
 });

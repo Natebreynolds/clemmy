@@ -3,6 +3,123 @@ import CryptoKit
 import SwiftUI
 import WebKit
 
+enum PinnedWebNavigationDisposition: Equatable {
+    case allowInWebView
+    case openExternally
+    case cancel
+}
+
+private struct PinnedWebOrigin: Hashable {
+    let scheme: String
+    let host: String
+    let port: Int
+}
+
+/// One policy for ordinary links, redirects, popups, and script-message
+/// origins. Only this paired Mac's `/m` surface belongs inside the shell.
+enum PinnedWebNavigationPolicy {
+    private static let externalSchemes: Set<String> = [
+        "http", "https", "mailto", "tel", "sms", "facetime", "facetime-audio",
+    ]
+
+    static func disposition(
+        for url: URL,
+        pairing: Pairing,
+        userInitiated: Bool
+    ) -> PinnedWebNavigationDisposition {
+        guard url.user == nil, url.password == nil else { return .cancel }
+        if isPairedOrigin(url: url, pairing: pairing) {
+            return isAllowedMobilePath(url)
+                ? .allowInWebView
+                : .cancel
+        }
+
+        guard userInitiated,
+              let scheme = url.scheme?.lowercased(),
+              externalSchemes.contains(scheme) else {
+            return .cancel
+        }
+        if scheme == "http" || scheme == "https" {
+            guard url.host?.isEmpty == false else { return .cancel }
+        }
+        return .openExternally
+    }
+
+    private static func isAllowedMobilePath(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        let encoded = components.percentEncodedPath.lowercased()
+        // Encoded separators can change route boundaries after another parser
+        // sees the request. Reject them instead of trying to predict every
+        // server/proxy normalization rule.
+        guard !encoded.contains("%2f"), !encoded.contains("%5c") else { return false }
+
+        let path = url.path
+        guard !path.contains("\\"),
+              !path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !path.split(separator: "/", omittingEmptySubsequences: false)
+                  .contains(where: { $0 == "." || $0 == ".." }) else {
+            return false
+        }
+        return path == "/m" || path.hasPrefix("/m/")
+    }
+
+    static func isPairedOrigin(url: URL, pairing: Pairing) -> Bool {
+        guard let origin = normalizedOrigin(url: url) else { return false }
+        return pairedOrigins(pairing).contains(origin)
+    }
+
+    static func isPairedOrigin(
+        scheme: String,
+        host: String,
+        port: Int,
+        pairing: Pairing
+    ) -> Bool {
+        guard let origin = normalizedOrigin(scheme: scheme, host: host, port: port) else {
+            return false
+        }
+        return pairedOrigins(pairing).contains(origin)
+    }
+
+    private static func pairedOrigins(_ pairing: Pairing) -> Set<PinnedWebOrigin> {
+        // PinnedWebView itself fails closed without this certificate identity.
+        guard pairing.fingerprint?.isEmpty == false else { return [] }
+        return Set(pairing.candidateOrigins.compactMap { raw in
+            guard let url = URL(string: raw) else { return nil }
+            return normalizedOrigin(url: url)
+        })
+    }
+
+    private static func normalizedOrigin(url: URL) -> PinnedWebOrigin? {
+        normalizedOrigin(
+            scheme: url.scheme ?? "",
+            host: url.host ?? "",
+            port: url.port ?? 0
+        )
+    }
+
+    private static func normalizedOrigin(
+        scheme rawScheme: String,
+        host rawHost: String,
+        port rawPort: Int
+    ) -> PinnedWebOrigin? {
+        let scheme = rawScheme.lowercased()
+        let host = rawHost.lowercased()
+        // Paired content is always HTTPS. HTTP may still open in the system
+        // browser after an explicit tap, but it can never enter the pinned view
+        // or claim a native bridge origin because no certificate pin runs there.
+        guard scheme == "https", !host.isEmpty else { return nil }
+        let port: Int
+        if rawPort > 0 {
+            port = rawPort
+        } else {
+            port = scheme == "https" ? 443 : 80
+        }
+        return PinnedWebOrigin(scheme: scheme, host: host, port: port)
+    }
+}
+
 /// Owns the WKWebView so SwiftUI, the push registrar, and Bonjour rediscovery
 /// all talk to one instance. The PWA inside owns the session (device-bound
 /// key in IndexedDB), so the data store must be the persistent default.
@@ -19,6 +136,9 @@ final class WebViewModel: NSObject, ObservableObject {
     /// or the certificate pin did (-999).
     @Published private(set) var lastNavigationErrorCode: Int?
     @Published private(set) var hasLoadedOnce = false
+    /// Set only by an explicit server-trust challenge failure, so the native
+    /// shell can distinguish a changed certificate from ordinary reachability.
+    @Published private(set) var certificatePinFailed = false
     /// Exact navigation requested by the native shell. Besides being useful
     /// diagnostics, this gives the hosted tests a causal oracle without
     /// asking the simulator to contact a real daemon.
@@ -27,6 +147,19 @@ final class WebViewModel: NSObject, ObservableObject {
     let webView: WKWebView
     /// Deferred until the page is up so the bridge function exists.
     private var pendingApnsToken: String?
+    private let pendingPushNavigations: PendingPushNavigationRepository
+    /// RootView owns this authorization bit. A successful web navigation while
+    /// the app is backgrounded or covered by Face ID must not drain a tap.
+    private var pendingPushNavigationAllowed = false
+    /// A foreground path probe/selection must settle before a notification can
+    /// choose its URL. Otherwise a late initial Home/relay load can overwrite a
+    /// fast notification load after the page has already acknowledged it.
+    private var connectionRouteReady = false
+    private var connectionRouteNavigation: WKNavigation?
+    /// Process-local delivery fence. The persisted envelope remains until the
+    /// page confirms that it rendered the addressed context.
+    private var inFlightPushNotificationID: String?
+    private var inFlightPushNavigation: WKNavigation?
 
     /// Pre-warmed so the first tap is as crisp as the hundredth — a cold
     /// generator costs a few milliseconds, which is exactly the delay that
@@ -36,8 +169,12 @@ final class WebViewModel: NSObject, ObservableObject {
     private let notify = UINotificationFeedbackGenerator()
     private let refreshControl = UIRefreshControl()
 
-    init(pairing: Pairing) {
+    init(
+        pairing: Pairing,
+        pendingPushNavigations: PendingPushNavigationRepository = PendingPushNavigationStore.repository
+    ) {
         self.pairing = pairing
+        self.pendingPushNavigations = pendingPushNavigations
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
@@ -52,6 +189,7 @@ final class WebViewModel: NSObject, ObservableObject {
             "clemHandoff",
             "clemHandoffResult",
             "clemConnectionLost",
+            "clemNotificationHandled",
         ] {
             config.userContentController.add(scriptProxy, name: name)
         }
@@ -95,10 +233,16 @@ final class WebViewModel: NSObject, ObservableObject {
         #endif
     }
 
-    func load(_ url: URL) {
+    func load(_ url: URL, pendingPushNotificationID: String? = nil) {
         connectionLost = false
         lastRequestedURL = url
-        webView.load(URLRequest(url: url))
+        let navigation = webView.load(URLRequest(url: url))
+        inFlightPushNotificationID = navigation == nil ? nil : pendingPushNotificationID
+        inFlightPushNavigation = pendingPushNotificationID == nil ? nil : navigation
+        if pendingPushNotificationID == nil {
+            connectionRouteReady = false
+            connectionRouteNavigation = navigation
+        }
     }
 
     /// Asks the page to reload its data in place. Falls back to a navigation
@@ -199,7 +343,13 @@ final class WebViewModel: NSObject, ObservableObject {
             // If the saved origin is already the relay, a successful cellular
             // probe must still perform the first navigation instead of leaving
             // a pristine WKWebView blank forever.
-            if !hasLoadedOnce || connectionLost { loadHome() }
+            if !hasLoadedOnce || connectionLost {
+                loadHome()
+            } else {
+                // The caller reached this branch only after its probe proved
+                // the already-selected door, so no redundant reload is needed.
+                setConnectionRouteReady(true)
+            }
             return
         }
         // Navigate to the new origin either way — but only PERSIST a remote
@@ -325,10 +475,146 @@ final class WebViewModel: NSObject, ObservableObject {
         webView.evaluateJavaScript("window.clemNative && window.clemNative.registerApnsToken('\(hexToken)')")
     }
 
-    /// Notification tap: payload carries a path like "/m/?tab=inbox".
-    func openPath(_ path: String) {
-        guard path.hasPrefix("/"), let url = URL(string: pairing.origin + path) else { return }
-        load(url)
+    /// RootView flips this only after the app is foregrounded and its owner has
+    /// passed the biometric gate. Enabling also drains a tap parked before the
+    /// model/view existed (cold launch) or while the gate covered it.
+    func setPendingPushNavigationAllowed(_ allowed: Bool) {
+        pendingPushNavigationAllowed = allowed
+        if allowed {
+            resumePendingPushNavigation()
+        } else {
+            // A delivery with no page receipt is retryable after the next
+            // unlock/foreground, even if its original WKNavigation completed
+            // while the process stayed warm behind the privacy cover.
+            inFlightPushNotificationID = nil
+            inFlightPushNavigation = nil
+        }
+    }
+
+    /// A separate gate from biometrics: foreground connection selection owns
+    /// which paired origin should receive the deep link.
+    func setConnectionRouteReady(_ ready: Bool) {
+        connectionRouteReady = ready
+        if ready {
+            resumePendingPushNavigation()
+        } else {
+            connectionRouteNavigation = nil
+            inFlightPushNotificationID = nil
+            inFlightPushNavigation = nil
+        }
+    }
+
+    /// At-least-once delivery with a process-local in-flight fence. A normal
+    /// LAN/relay navigation resets that fence through `load`, while the durable
+    /// envelope survives and is retried after the new door serves a page.
+    func resumePendingPushNavigation() {
+        guard pendingPushNavigationAllowed,
+              connectionRouteReady,
+              hasLoadedOnce,
+              let fingerprint = pairing.fingerprint,
+              let pending = pendingPushNavigations.current(
+                  pairingFingerprint: fingerprint
+              ) else {
+            return
+        }
+        guard pending.notificationID != inFlightPushNotificationID,
+              let url = pendingPushURL(for: pending) else {
+            return
+        }
+        load(url, pendingPushNotificationID: pending.notificationID)
+    }
+
+    /// The page sends this only after it rendered/focused the addressed card or
+    /// proved that the durable notification no longer exists. Accepting an old
+    /// ID never clears a newer tap.
+    @discardableResult
+    func acknowledgePendingPushNavigation(notificationID: String) -> Bool {
+        guard pendingPushNavigationAllowed,
+              connectionRouteReady,
+              inFlightPushNotificationID == notificationID,
+              let fingerprint = pairing.fingerprint,
+              pendingPushNavigations.acknowledge(
+                  notificationID: notificationID,
+                  pairingFingerprint: fingerprint
+              ) else {
+            return false
+        }
+        if inFlightPushNotificationID == notificationID {
+            inFlightPushNotificationID = nil
+            inFlightPushNavigation = nil
+        }
+        return true
+    }
+
+    private func pendingPushURL(for pending: PendingPushNavigation) -> URL? {
+        guard let route = URLComponents(string: pending.path),
+              var target = URLComponents(string: pairing.origin) else {
+            return nil
+        }
+        target.path = route.path
+        target.percentEncodedQuery = route.percentEncodedQuery
+        target.fragment = nil
+        guard let url = target.url,
+              PinnedWebNavigationPolicy.disposition(
+                  for: url,
+                  pairing: pairing,
+                  userInitiated: false
+              ) == .allowInWebView else {
+            return nil
+        }
+        return url
+    }
+
+    fileprivate func acceptsBridgeMessage(_ message: WKScriptMessage) -> Bool {
+        guard message.frameInfo.isMainFrame else { return false }
+        let origin = message.frameInfo.securityOrigin
+        return PinnedWebNavigationPolicy.isPairedOrigin(
+            scheme: origin.protocol,
+            host: origin.host,
+            port: origin.port,
+            pairing: pairing
+        )
+    }
+
+    private func finishPendingPushNavigation(_ navigation: WKNavigation?) {
+        guard let navigation,
+              let inFlightPushNavigation,
+              navigation === inFlightPushNavigation else {
+            return
+        }
+        // Keep the ID fence until the exact web receipt, but release the
+        // navigation object now that it has reached a terminal callback.
+        self.inFlightPushNavigation = nil
+    }
+
+    private func finishConnectionRouteNavigation(_ navigation: WKNavigation?) {
+        guard let navigation,
+              let connectionRouteNavigation,
+              navigation === connectionRouteNavigation else {
+            return
+        }
+        self.connectionRouteNavigation = nil
+        connectionRouteReady = true
+    }
+
+    private func failPendingPushNavigation(_ navigation: WKNavigation?) {
+        guard let navigation,
+              let inFlightPushNavigation,
+              navigation === inFlightPushNavigation else {
+            return
+        }
+        self.inFlightPushNavigation = nil
+        inFlightPushNotificationID = nil
+    }
+
+    private func failConnectionRouteNavigation(_ navigation: WKNavigation?) {
+        guard let navigation,
+              let connectionRouteNavigation,
+              navigation === connectionRouteNavigation else {
+            return
+        }
+        self.connectionRouteNavigation = nil
+        connectionRouteReady = false
     }
 }
 
@@ -355,19 +641,24 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
             return
         }
         guard let expected = pairing.fingerprint else {
+            certificatePinFailed = true
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
         if CertificatePin.trustMatches(trust, fingerprint: expected) {
             completionHandler(.useCredential, URLCredential(trust: trust))
         } else {
+            certificatePinFailed = true
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        finishPendingPushNavigation(navigation)
+        finishConnectionRouteNavigation(navigation)
         hasLoadedOnce = true
         connectionLost = false
+        certificatePinFailed = false
         // The page loaded, so a remote origin has now earned persistence.
         confirmPendingOrigin()
         if let token = pendingApnsToken {
@@ -385,9 +676,12 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
                 generation: lease.generation
             )
         }
+        resumePendingPushNavigation()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        failPendingPushNavigation(navigation)
+        failConnectionRouteNavigation(navigation)
         // Provisional failure is where a refused TLS handshake lands, which is
         // exactly the off-Wi-Fi case: roll back before the bad origin can
         // become what the next cold start wakes up on.
@@ -396,6 +690,8 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        failPendingPushNavigation(navigation)
+        failConnectionRouteNavigation(navigation)
         discardPendingOrigin()
         markIfConnectivity(error)
     }
@@ -442,15 +738,54 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
         }
     }
 
-    /// target=_blank links stay inside the one pinned view.
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+        switch PinnedWebNavigationPolicy.disposition(
+            for: url,
+            pairing: pairing,
+            userInitiated: navigationAction.navigationType == .linkActivated
+        ) {
+        case .allowInWebView:
+            decisionHandler(.allow)
+        case .openExternally:
+            UIApplication.shared.open(url)
+            decisionHandler(.cancel)
+        case .cancel:
+            decisionHandler(.cancel)
+        }
+    }
+
+    /// WKWebView has no second-window UI. Keep paired `/m` links in the pinned
+    /// view, send an explicit user-tapped external link to the system, and drop
+    /// script-created/untrusted popups instead of silently loading them here.
     func webView(
         _ webView: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        if let url = navigationAction.request.url {
-            webView.load(URLRequest(url: url))
+        guard navigationAction.targetFrame == nil,
+              let url = navigationAction.request.url else {
+            return nil
+        }
+        switch PinnedWebNavigationPolicy.disposition(
+            for: url,
+            pairing: pairing,
+            userInitiated: navigationAction.navigationType == .linkActivated
+        ) {
+        case .allowInWebView:
+            load(url)
+        case .openExternally:
+            UIApplication.shared.open(url)
+        case .cancel:
+            break
         }
         return nil
     }
@@ -487,6 +822,11 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        let accepted = MainActor.assumeIsolated {
+            model?.acceptsBridgeMessage(message) == true
+        }
+        guard accepted else { return }
+
         if message.name == "clemConnectionLost" {
             MainActor.assumeIsolated {
                 model?.connectionLost = true
@@ -529,6 +869,25 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
                   outcome == "consumed" || outcome == "invalid" else { return }
             MainActor.assumeIsolated {
                 model?.acknowledgeOriginHandoff(handoffId: handoffId, generation: generation)
+            }
+            return
+        }
+        if message.name == "clemNotificationHandled" {
+            guard let body = message.body as? [String: Any],
+                  Set(body.keys) == Set(["notificationId", "outcome"]),
+                  let notificationID = body["notificationId"] as? String,
+                  !notificationID.isEmpty,
+                  notificationID == notificationID.trimmingCharacters(in: .whitespacesAndNewlines),
+                  notificationID.utf8.count <= 512,
+                  !notificationID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  let outcome = body["outcome"] as? String,
+                  outcome == "presented" || outcome == "unavailable" else {
+                return
+            }
+            MainActor.assumeIsolated {
+                _ = model?.acknowledgePendingPushNavigation(
+                    notificationID: notificationID
+                )
             }
             return
         }

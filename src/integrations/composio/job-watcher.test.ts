@@ -374,8 +374,13 @@ test('daemon static containment: migration precedes runtime and no raw watcher/a
     start.indexOf('migrateLegacyComposioJobRecords()') < start.indexOf('await configureHarnessRuntime()'),
     'legacy containment runs before runtime/model/provider setup',
   );
-  assert.match(start, /composio_ambient_monitor_prepared_authority/,
-    'configured watches get explicit disabled readiness telemetry');
+  assert.match(runner, /composio_ambient_monitor_prepared_authority/,
+    'configured watches retain an explicit disabled readiness verdict identity');
+  assert.match(
+    start,
+    /recordOperationalEventOnce\(ambientComposioMonitorDisabledVerdict\(configuredAmbientComposioMonitors\)\)/,
+    'configured watches publish that verdict once per meaningful monitor policy',
+  );
 
   const source = readFileSync(new URL('./job-watcher.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /resolveJobGetter|checkJobOnce|executeComposioTool|respondPreferHarness/);

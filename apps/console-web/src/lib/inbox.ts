@@ -60,6 +60,38 @@ export interface NotificationRow {
   deliveredAt?: string;
   deliveryAttempts?: number;
   deliveryError?: string;
+  needsAttention?: boolean;
+  workflowCapability?: WorkflowCapabilityInboxGate | null;
+}
+
+export interface WorkflowCapabilityAccountChoice {
+  label: string;
+  capabilityId: string;
+  accountId: string;
+}
+
+export interface WorkflowCapabilityInboxGate {
+  notificationId: string;
+  workflow: string;
+  runId: string;
+  stepId: string;
+  tool: string;
+  toolkit: string;
+  reason: string;
+  retryAt: string | null;
+  provenNoDispatch: true;
+  resolution:
+    | {
+        kind: 'choose_account';
+        retryCount: number;
+        choiceSetDigest: string;
+        candidates: WorkflowCapabilityAccountChoice[];
+        choiceTotal: number;
+        choicesTruncated: boolean;
+      }
+    | { kind: 'retry_exact_metadata'; retryCount: number }
+    | { kind: 'connect_and_retry'; retryCount: number }
+    | { kind: 'review_run'; reason: string };
 }
 
 /** One visible needs-attention row per underlying subject. A flaky morning
@@ -77,6 +109,7 @@ export interface CollapsedAttentionRow {
 
 export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttentionRow[] {
   const keyFor = (row: NotificationRow): string => {
+    if (row.workflowCapability) return `capability:${row.workflowCapability.notificationId}`;
     const title = (row.title || row.body || '').trim();
     const workflow = /workflow needs attention:\s*(.+)$/i.exec(title)?.[1]?.trim();
     return workflow ? `wf:${workflow.toLowerCase()}` : `title:${title.toLowerCase()}`;
@@ -195,6 +228,8 @@ export const cancelStaleApprovals = () => apiPost('/api/console/approvals/cancel
 
 export interface TrustProposalRow {
   id: string;
+  scopeRevision: 1;
+  scopeDigest: string;
   toolkits: string[];
   recipients: string[];
   domains?: string[];
@@ -210,8 +245,83 @@ export interface TrustProposalRow {
 export const listTrustProposals = () =>
   apiGet<{ proposals: TrustProposalRow[] }>('/api/console/trust-proposals?status=pending');
 
-export const decideTrustProposal = (id: string, decision: 'approve' | 'decline') =>
-  apiPost(`/api/console/trust-proposals/${encodeURIComponent(id)}/${decision}`);
+export interface TrustProposalDecisionResponse {
+  ok: boolean;
+  reason: string;
+  scopeReceipt?: {
+    scopeRevision: 1;
+    scopeDigest: string;
+    toolkits: string[];
+    recipients: string[];
+    domains: string[];
+    maxRecipients: number;
+  };
+}
+
+export function trustProposalScopeExpectation(
+  proposal: Pick<TrustProposalRow, 'scopeRevision' | 'scopeDigest'>,
+): { scopeRevision: 1; scopeDigest: string } {
+  return {
+    scopeRevision: proposal.scopeRevision,
+    scopeDigest: proposal.scopeDigest,
+  };
+}
+
+export const decideTrustProposal = (proposal: TrustProposalRow, decision: 'approve' | 'decline') =>
+  apiPost<TrustProposalDecisionResponse>(
+    `/api/console/trust-proposals/${encodeURIComponent(proposal.id)}/${decision}`,
+    trustProposalScopeExpectation(proposal),
+  );
+
+export interface PlanProposalRow {
+  id: string;
+  proposedAt: string;
+  status: string;
+  originatingRequest: string;
+  sessionId?: string;
+  context?: string;
+  plan: {
+    objective: string;
+    steps?: Array<{ id?: string; description?: string; action?: string }>;
+    needsUserInput?: string[];
+  };
+}
+
+export const listPlanProposals = () =>
+  apiGet<{ proposals: PlanProposalRow[] }>('/api/console/plan-proposals?status=pending');
+
+export const decidePlanProposal = (id: string, decision: 'approve' | 'reject') =>
+  apiPost(
+    `/api/console/plan-proposals/${encodeURIComponent(id)}/${decision}`,
+    decision === 'reject' ? { reason: 'Rejected from the exact desktop plan card.' } : undefined,
+  );
+
+export interface InboxQuestionRow {
+  id: string;
+  source: 'check_in' | 'background_task' | 'workflow';
+  question: string;
+  options: string[];
+  context: string | null;
+  askedAt: string;
+  urgency: 'low' | 'normal' | 'high';
+  agentLabel: string;
+  sessionId: string | null;
+  taskId: string | null;
+  workflowName: string | null;
+  runId: string | null;
+  stepId: string | null;
+  answerable: boolean;
+  unavailableReason: string | null;
+}
+
+export const listInboxQuestions = () =>
+  apiGet<{ questions: InboxQuestionRow[]; count: number }>('/api/console/inbox/questions');
+
+export const answerInboxQuestion = (id: string, answer: string) =>
+  apiPost<{ status: 'answered' | 'resuming'; questionId: string; taskId?: string; runId?: string }>(
+    `/api/console/inbox/questions/${encodeURIComponent(id)}/answer`,
+    { answer },
+  );
 
 export const listRuns = (limit = 40) => apiGet<{ runs: RunRow[] }>(`/api/runs?limit=${limit}`);
 
@@ -230,6 +340,34 @@ export const markNotificationRead = (id: string) =>
 
 export const retryNotification = (id: string) =>
   apiPost(`/api/notifications/${encodeURIComponent(id)}/retry`);
+
+export const resolveWorkflowCapability = (
+  gate: WorkflowCapabilityInboxGate,
+  choice?: WorkflowCapabilityAccountChoice,
+) => apiPost<{
+  ok: true;
+  status: 'selected' | 'already_selected' | 'resumed' | 'already_resumed';
+  runId: string;
+  stepId: string;
+}>(
+  `/api/console/inbox/workflow-capabilities/${encodeURIComponent(gate.runId)}/resolve`,
+  gate.resolution.kind === 'choose_account'
+    ? {
+        action: 'choose_account',
+        stepId: gate.stepId,
+        tool: gate.tool,
+        retryCount: gate.resolution.retryCount,
+        choiceSetDigest: gate.resolution.choiceSetDigest,
+        capabilityId: choice?.capabilityId ?? '',
+        accountId: choice?.accountId ?? '',
+      }
+    : {
+        action: 'retry',
+        stepId: gate.stepId,
+        tool: gate.tool,
+        retryCount: gate.resolution.kind === 'review_run' ? 0 : gate.resolution.retryCount,
+      },
+);
 
 /** Friendly relative time ("4m", "2h", "3d", "now"). */
 export function relativeTime(value?: string | number | null): string {

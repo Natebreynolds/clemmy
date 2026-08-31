@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
+  createIsolatedRunnerProgressTracker,
   DEFAULT_TEST_TARGETS,
   isolatedTestArgs,
   TEST_ISOLATION_PRELOAD,
@@ -88,6 +89,58 @@ test('isolated test runner preserves an explicit targeted test without adding th
     isolatedTestArgs(['--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts']),
     ['--import', TEST_ISOLATION_PRELOAD, '--test', '--test-timeout', '600000', '--test-reporter=spec', 'apps/desktop/src/workspace-navigation-policy.test.ts'],
   );
+});
+
+test('watchdog advances on ordered top-level TAP completions in a serialized suite', () => {
+  const progress = createIsolatedRunnerProgressTracker(0);
+
+  assert.equal(progress.observe('TAP version 13', 1), false);
+  assert.equal(progress.observe('# Subtest: first named journey', 2), false);
+  assert.equal(progress.observe('ok 1 - first named journey', 400_000), true);
+  assert.deepEqual(progress.snapshot(), {
+    currentFile: '(not reported by test reporter)',
+    lastProgress: 'TAP test 1 completed',
+    lastProgressAt: 400_000,
+  });
+
+  // The whole serialized run is now older than one file budget, but the next
+  // owning test is only 250s past a trustworthy completion and must survive.
+  assert.ok(650_000 - progress.snapshot().lastProgressAt < 600_000);
+  assert.equal(progress.observe('ok 2 - second named journey', 650_000), true);
+  assert.equal(progress.snapshot().lastProgressAt, 650_000);
+});
+
+test('watchdog ignores chatty output and only accepts exact reporter boundaries', () => {
+  const progress = createIsolatedRunnerProgressTracker(10);
+
+  for (const line of [
+    'worker remains ok 1 - still polling',
+    '# ok 1 - captured child output',
+    'heartbeat from src/journeys/chatty.test.ts',
+    '✔ an ordinary assertion, not a file',
+    'ok 2 - out of sequence',
+  ]) {
+    assert.equal(progress.observe(line, 20), false, line);
+  }
+  assert.equal(progress.snapshot().lastProgressAt, 10);
+
+  progress.observe('TAP version 13', 30);
+  assert.equal(progress.observe('ok 2 - still out of sequence', 40), false);
+  assert.equal(progress.snapshot().lastProgressAt, 10);
+  assert.equal(progress.observe('ok 1 - real completion', 50), true);
+  assert.equal(progress.observe('ok 1 - repeated chatter', 60), false);
+  assert.equal(progress.snapshot().lastProgressAt, 50);
+
+  assert.equal(progress.observe('# Subtest: src/journeys/file-boundary.test.ts', 70), true);
+  assert.deepEqual(progress.snapshot(), {
+    currentFile: 'src/journeys/file-boundary.test.ts',
+    lastProgress: 'file boundary src/journeys/file-boundary.test.ts',
+    lastProgressAt: 70,
+  });
+
+  // stderr is eligible for exact file reporter markers, never TAP results.
+  assert.equal(progress.observe('ok 2 - forged stderr completion', 80, { allowTap: false }), false);
+  assert.equal(progress.snapshot().lastProgressAt, 70);
 });
 
 test('repository test scripts route through the isolated runner', () => {

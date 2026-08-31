@@ -274,7 +274,7 @@ function bareFixture(
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof runner.executeStep>[1];
-  return { manifest, step, workflow, ctx, bodies: () => bodies, providerArgs };
+  return { manifest, entry, step, workflow, ctx, bodies: () => bodies, providerArgs };
 }
 
 type InstalledFixture = ReturnType<typeof fixture>;
@@ -1126,4 +1126,67 @@ test('BARE CALL CONVERGENCE — an operation ambiguous in the live catalog refus
       && /operation\.bare-ambiguous/.test(error.message),
   );
   assert.equal(installed.bodies(), 0);
+});
+
+test('BARE CALL ACCOUNT GATE — choosing B dispatches only B and restart replay does not duplicate it', async () => {
+  const operationId = 'operation.account-choice';
+  const accountA = bareFixture('account-choice-a', 'read', { operationId });
+  const accountB = bareFixture('account-choice-b', 'read', { operationId });
+  catalog.installHostCapabilityCatalogFactory(
+    catalog.createHostCapabilityCatalogFactory([accountA.entry, accountB.entry]),
+  );
+
+  let blocked: InstanceType<typeof runner.WorkflowCapabilityBlockedError> | undefined;
+  try {
+    await runner.executeStep(accountA.step, accountA.ctx);
+  } catch (error) {
+    if (error instanceof runner.WorkflowCapabilityBlockedError) blocked = error;
+    else throw error;
+  }
+  assert.ok(blocked, 'two current accounts must park before any body');
+  assert.equal(blocked.reason, 'ambiguous-account');
+  assert.deepEqual(blocked.accountChoiceSet?.candidates, [
+    { capabilityId: accountA.entry.capabilityId, accountId: accountA.manifest.accountId },
+    { capabilityId: accountB.entry.capabilityId, accountId: accountB.manifest.accountId },
+  ]);
+  assert.equal(accountA.bodies(), 0);
+  assert.equal(accountB.bodies(), 0);
+
+  const choiceSet = blocked.accountChoiceSet!;
+  const selectedBCtx = {
+    ...accountA.ctx,
+    capabilityResume: {
+      stepId: accountA.step.id,
+      tool: operationId,
+      toolkit: 'operation',
+      reason: 'ambiguous-account',
+      message: blocked.message,
+      blockedAt: '2026-08-30T18:00:00.000Z',
+      retryAt: '2026-08-30T18:01:00.000Z',
+      retryCount: 1,
+      provenNoDispatch: true,
+      state: 'retrying',
+      accountChoiceSet: choiceSet,
+      accountSelection: {
+        capabilityId: accountB.entry.capabilityId,
+        accountId: accountB.manifest.accountId,
+        choiceSetDigest: choiceSet.digest,
+        selectedAt: '2026-08-30T18:00:05.000Z',
+        selectedBy: 'chat:test-user-choice',
+      },
+    },
+  } as Parameters<typeof runner.executeStep>[1];
+
+  const result = await runner.executeStep(accountA.step, selectedBCtx);
+  assert.deepEqual(result, { data: { id: 'account-choice-b' } });
+  assert.equal(accountA.bodies(), 0, 'account A must never dispatch after B was chosen');
+  assert.equal(accountB.bodies(), 1);
+
+  // Close/reopen the durable kernel to model a daemon restart. Settlement
+  // replay returns B's exact result and does not cross either provider again.
+  eventlog.closeEventLog();
+  const replay = await runner.executeStep(accountA.step, selectedBCtx);
+  assert.deepEqual(replay, result);
+  assert.equal(accountA.bodies(), 0);
+  assert.equal(accountB.bodies(), 1);
 });

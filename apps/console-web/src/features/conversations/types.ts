@@ -22,6 +22,8 @@ export interface Turn {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  /** Exact still-pending plan proposal restored by the server on reopen. */
+  planProposalId?: string;
   /** A still-pending approval attached by the server so a reopened chat
    *  renders the actionable card (A2, v2.3.0). */
   approval?: {

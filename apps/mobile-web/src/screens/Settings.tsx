@@ -11,7 +11,7 @@ import {
   type MobileDeviceRow,
 } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
-import { haptic, type ConnectionDoor } from '../lib/native-bridge';
+import { haptic, inNativeShell, type ConnectionDoor } from '../lib/native-bridge';
 import {
   getExistingSubscription,
   isStandalonePwa,
@@ -20,6 +20,7 @@ import {
   unsubscribePush,
 } from '../lib/push';
 import { BrainSheet } from '../components/BrainSheet';
+import { ScreenNotice } from '../components/ScreenNotice';
 
 /**
  * Settings — the pocket end of a trust relationship minted at home on the
@@ -43,6 +44,15 @@ export function Settings({ door, doorCopy, onSignOut }: {
   const connections = useScreenData(getConnectionsHealth);
 
   const thisDevice = devices.data?.devices.find((d) => d.current);
+  const failedSections = [
+    devices.error ? 'devices' : '',
+    daemon.error ? 'app status' : '',
+    models.error ? 'brain' : '',
+    connections.error ? 'connections' : '',
+  ].filter(Boolean);
+  const retryAll = () => Promise.allSettled([
+    devices.refresh(), daemon.refresh(), models.refresh(), connections.refresh(),
+  ]).then(() => undefined);
 
   return (
     <div class="stack settings">
@@ -51,6 +61,13 @@ export function Settings({ door, doorCopy, onSignOut }: {
         door={door}
         doorCopy={doorCopy}
         version={daemon.data?.daemon.version}
+      />
+
+      <ScreenNotice
+        error={failedSections.length ? `Could not refresh: ${failedSections.join(', ')}.` : null}
+        offline={devices.offline || daemon.offline || models.offline || connections.offline}
+        onRetry={() => void retryAll()}
+        hasData={Boolean(devices.data || daemon.data || models.data || connections.data)}
       />
 
       <NotificationsCard />
@@ -125,10 +142,12 @@ type PushState =
  */
 function NotificationsCard() {
   const [state, setState] = useState<PushState>({ kind: 'loading' });
+  const nativeShell = inNativeShell();
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
+      if (nativeShell) return;
       if (!pushSupported()) {
         const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
         if (!cancelled) setState(isIOS && !isStandalonePwa() ? { kind: 'needs-pwa-install' } : { kind: 'unsupported' });
@@ -143,7 +162,7 @@ function NotificationsCard() {
       if (!cancelled) setState(existing ? { kind: 'on' } : { kind: 'off' });
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [nativeShell]);
 
   const enabled = state.kind === 'on';
   const toggle = async () => {
@@ -159,9 +178,24 @@ function NotificationsCard() {
     setState(result.ok ? { kind: 'on' } : { kind: 'error', message: result.reason });
   };
 
+  if (nativeShell) {
+    return (
+      <section class="card settings-card" aria-label="Notifications">
+        <h2 class="settings-card-title">Notifications</h2>
+        <div class="settings-row">
+          <span class="settings-row-main">
+            <span class="settings-row-label">Push to this iPhone</span>
+            <span class="settings-row-note">Managed in iOS Settings. Clem alerts you when a response or decision is needed.</span>
+          </span>
+          <span class="settings-row-kind">iOS</span>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section class="card settings-card" aria-label="Notifications">
-      <h3 class="settings-card-title">Notifications</h3>
+      <h2 class="settings-card-title">Notifications</h2>
       {state.kind === 'needs-pwa-install' ? (
         <p class="card-note">iOS delivers push only after Add to Home Screen. Tap Share, then Add to Home Screen, and reopen from there.</p>
       ) : state.kind === 'unsupported' ? (
@@ -198,7 +232,7 @@ function BrainCard({ currentLabel, provider, inactive, actualModelId, codexRescu
   const [open, setOpen] = useState(false);
   return (
     <section class="card settings-card" aria-label="Brain">
-      <h3 class="settings-card-title">Brain</h3>
+      <h2 class="settings-card-title">Brain</h2>
       <button
         type="button"
         class="settings-row"
@@ -282,7 +316,7 @@ function ConnectionsCard({ rows, loading }: {
 }) {
   return (
     <section class="card settings-card" aria-label="Connections">
-      <h3 class="settings-card-title">Connections</h3>
+      <h2 class="settings-card-title">Connections</h2>
       {loading && !rows ? (
         <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>
       ) : !rows || rows.length === 0 ? (
@@ -294,7 +328,9 @@ function ConnectionsCard({ rows, loading }: {
               <span class={`health-dot ${row.state}`} aria-hidden="true" />
               <span class="settings-row-main">
                 <span class="settings-row-label truncate">{row.name}</span>
-                {row.cause ? <span class="settings-row-note">{row.cause}</span> : null}
+                <span class="settings-row-note">
+                  {row.cause ?? (row.state === 'ok' ? 'Connected' : row.state === 'warn' ? 'Needs attention' : 'Unavailable')}
+                </span>
               </span>
               <span class="settings-row-kind">{row.kind === 'cli' ? 'CLI' : 'App'}</span>
             </li>
@@ -346,7 +382,7 @@ function DevicesCard({ rows, loading, onRevoked, onSignOut }: {
 
   return (
     <section class="card settings-card" aria-label="Devices and security">
-      <h3 class="settings-card-title">Devices &amp; security</h3>
+      <h2 class="settings-card-title">Devices &amp; security</h2>
       {loading && !rows ? (
         <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>
       ) : (
@@ -364,18 +400,30 @@ function DevicesCard({ rows, loading, onRevoked, onSignOut }: {
               </span>
               {!device.current ? (
                 confirming === device.deviceId ? (
-                  <button
-                    type="button"
-                    class="settings-danger-btn confirming"
-                    disabled={busy !== null}
-                    onClick={() => void revoke(device.deviceId)}
-                  >
-                    {busy === device.deviceId ? '…' : 'Confirm'}
-                  </button>
+                  <span class="settings-danger-actions">
+                    <button
+                      type="button"
+                      class="settings-danger-btn confirming"
+                      aria-label={`Confirm revoke ${device.deviceLabel || device.deviceId}`}
+                      disabled={busy !== null}
+                      onClick={() => void revoke(device.deviceId)}
+                    >
+                      {busy === device.deviceId ? '…' : 'Confirm'}
+                    </button>
+                    <button
+                      type="button"
+                      class="settings-danger-btn"
+                      disabled={busy !== null}
+                      onClick={() => setConfirming(null)}
+                    >
+                      Cancel
+                    </button>
+                  </span>
                 ) : (
                   <button
                     type="button"
                     class="settings-danger-btn"
+                    aria-label={`Revoke ${device.deviceLabel || device.deviceId}`}
                     disabled={busy !== null}
                     onClick={() => setConfirming(device.deviceId)}
                   >
@@ -397,14 +445,24 @@ function DevicesCard({ rows, loading, onRevoked, onSignOut }: {
           Sign out on this device
         </button>
         {confirming === 'all' ? (
-          <button
-            type="button"
-            class="settings-danger-btn confirming"
-            disabled={busy !== null}
-            onClick={() => void signOutEverywhere()}
-          >
-            {busy === 'all' ? '…' : 'Confirm sign out everywhere'}
-          </button>
+          <span class="settings-danger-actions">
+            <button
+              type="button"
+              class="settings-danger-btn confirming"
+              disabled={busy !== null}
+              onClick={() => void signOutEverywhere()}
+            >
+              {busy === 'all' ? '…' : 'Confirm sign out everywhere'}
+            </button>
+            <button
+              type="button"
+              class="settings-danger-btn"
+              disabled={busy !== null}
+              onClick={() => setConfirming(null)}
+            >
+              Cancel
+            </button>
+          </span>
         ) : (
           <button
             type="button"

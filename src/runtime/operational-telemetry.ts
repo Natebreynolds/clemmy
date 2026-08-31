@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
+import { stableJsonDigest } from '../shared/stable-json-digest.js';
 import { actionBus } from './action-bus.js';
 import { redactSensitiveValue } from './security.js';
 
@@ -209,6 +210,8 @@ export interface CreateOperationalEventInput {
   eventId?: string;
 }
 
+export type CreateOperationalEventOnceInput = Omit<CreateOperationalEventInput, 'eventId'>;
+
 export const OPERATIONAL_TELEMETRY_STATE_DIR = path.join(BASE_DIR, 'state');
 export const OPERATIONAL_TELEMETRY_DB_PATH = path.join(OPERATIONAL_TELEMETRY_STATE_DIR, 'operational-telemetry.db');
 
@@ -334,6 +337,46 @@ export function recordOperationalEvent(
 }
 
 /**
+ * Publish a semantic verdict once while that verdict remains unchanged.
+ *
+ * Unlike the append-oriented writer above, this seam derives an event identity
+ * from the persisted envelope (excluding only its observation time) and uses an
+ * atomic no-replace insert. It is for restart-stable state announcements such
+ * as boot policy verdicts, not recurring lifecycle observations. A changed
+ * payload or correlation field produces a distinct event; an identical restart
+ * preserves the first row and does not re-emit it on the live action bus.
+ */
+export function recordOperationalEventOnce(
+  input: CreateOperationalEventOnceInput,
+  db?: Database.Database,
+): OperationalEventEnvelope {
+  const event = createOperationalEvent({
+    ...input,
+    eventId: deterministicOperationalEventId(input),
+  });
+  const externalDb = !!db;
+  let inserted = true;
+  let persisted = event;
+  try {
+    const targetDb = db ?? openOperationalTelemetryDb();
+    inserted = writeOperationalEvent(targetDb, event, true);
+    if (!inserted) persisted = readOperationalEvent(targetDb, event.eventId) ?? event;
+  } catch {
+    // Match recordOperationalEvent: observability cannot break live execution.
+    // If storage is unavailable there is no durable duplicate to suppress, so
+    // the attempted first publication may still flow over the live bus below.
+  }
+  if (!externalDb && inserted) {
+    try {
+      actionBus.emit({ kind: 'operational.event', event: persisted });
+    } catch {
+      // actionBus is already guarded; keep this writer fail-closed anyway.
+    }
+  }
+  return persisted;
+}
+
+/**
  * Retention sweep (2026-07-22 legacy audit): operational_events was the
  * highest-volume UNBOUNDED store — one row per tool call / workflow node /
  * memory tick, with no reaper. Telemetry value decays fast; keep a bounded
@@ -411,9 +454,29 @@ interface OperationalEventRow {
   payload_json: string | null;
 }
 
-function writeOperationalEvent(db: Database.Database, event: OperationalEventEnvelope): void {
-  db.prepare(`
-    INSERT OR REPLACE INTO operational_events (
+function deterministicOperationalEventId(input: CreateOperationalEventOnceInput): string {
+  return `operational-once:v1:${stableJsonDigest({
+    source: input.source,
+    type: input.type,
+    severity: input.severity ?? 'info',
+    workspaceId: input.workspaceId ?? null,
+    workflowRunId: input.workflowRunId ?? null,
+    workflowNodeRunId: input.workflowNodeRunId ?? null,
+    sessionId: input.sessionId ?? null,
+    modelCallId: input.modelCallId ?? null,
+    toolCallId: input.toolCallId ?? null,
+    actor: input.actor ?? null,
+    payload: redactPayload(input.payload ?? {}),
+  })}`;
+}
+
+function writeOperationalEvent(
+  db: Database.Database,
+  event: OperationalEventEnvelope,
+  ignoreExisting = false,
+): boolean {
+  const result = db.prepare(`
+    INSERT OR ${ignoreExisting ? 'IGNORE' : 'REPLACE'} INTO operational_events (
       event_id, ts, source, type, severity, workspace_id, workflow_run_id,
       workflow_node_run_id, session_id, model_call_id, tool_call_id, actor,
       payload_json
@@ -437,6 +500,14 @@ function writeOperationalEvent(db: Database.Database, event: OperationalEventEnv
     actor: event.actor ?? null,
     payloadJson: JSON.stringify(redactPayload(event.payload)),
   });
+  return result.changes > 0;
+}
+
+function readOperationalEvent(db: Database.Database, eventId: string): OperationalEventEnvelope | null {
+  const row = db.prepare(`
+    SELECT * FROM operational_events WHERE event_id = ?
+  `).get(eventId) as OperationalEventRow | undefined;
+  return row ? rowToOperationalEvent(row) : null;
 }
 
 function rowToOperationalEvent(row: OperationalEventRow): OperationalEventEnvelope {

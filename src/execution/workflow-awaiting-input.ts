@@ -4,7 +4,14 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { readWorkflowRunOriginSessionIds } from '../tools/workflow-run-queue.js';
 import { addRunEvent } from '../runtime/run-events.js';
 import {
+  loadNotifications,
+  markWorkflowQuestionNotificationsSettled,
+} from '../runtime/notifications.js';
+import { requestWorkflowRunDrainKick } from './workflow-origin-group.js';
+import { readWorkflowRunCancellation } from './workflow-run-cancellation.js';
+import {
   readWorkflowRunRecord,
+  readWorkflowRunRecordSnapshot,
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
   writeWorkflowRunRecordDurablyUnlocked,
@@ -36,6 +43,74 @@ export interface AwaitingInputWorkflowMatch {
   runId: string;
   workflowName: string;
   awaitingInput: WorkflowAwaitingInputState;
+}
+
+/** Authority-neutral read model for global response surfaces such as the
+ * paired mobile Inbox. Unlike findSoleAwaitingInputWorkflowRunForOrigin this
+ * deliberately returns every exact pause, including scheduled/catalog runs
+ * that have no shared chat RunRecord. */
+export interface AwaitingInputWorkflowInboxItem extends AwaitingInputWorkflowMatch {
+  /** An authorized origin conversation to bind a conversational answer to.
+   * Null means an authenticated owner Inbox must use the explicit global
+   * authority plus exact run/question/step CAS. */
+  originSessionId: string | null;
+}
+
+export function listAwaitingInputWorkflowRuns(): AwaitingInputWorkflowInboxItem[] {
+  reconcileSettledWorkflowQuestionNotifications();
+  const matches: AwaitingInputWorkflowInboxItem[] = [];
+  for (const filePath of workflowRunFiles()) {
+    const record = readWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(filePath);
+    if (
+      !record
+      || typeof record.id !== 'string'
+      || path.basename(filePath, '.json') !== record.id
+      || typeof record.workflow !== 'string'
+      || !record.workflow.trim()
+      || record.status !== 'awaiting_input'
+      || !isWorkflowAwaitingInputState(record.awaitingInput)
+      || record.awaitingInput.answer !== undefined
+    ) continue;
+    matches.push({
+      runId: record.id,
+      workflowName: record.workflow,
+      awaitingInput: record.awaitingInput,
+      originSessionId: workflowAwaitingInputRecordOrigins(record)[0] ?? null,
+    });
+  }
+  return matches.sort((a, b) => b.awaitingInput.askedAt.localeCompare(a.awaitingInput.askedAt));
+}
+
+/** Retire any exact question carrier whose canonical run has already answered,
+ * cancelled, or left that question generation. This repairs a crash after the
+ * run CAS but before the best-effort notification settlement. */
+export function reconcileSettledWorkflowQuestionNotifications(): number {
+  let settled = 0;
+  for (const notification of loadNotifications()) {
+    if (
+      notification.kind !== 'workflow'
+      || notification.read
+      || notification.metadata?.status !== 'awaiting_input'
+      || typeof notification.metadata?.runId !== 'string'
+      || typeof notification.metadata?.questionId !== 'string'
+    ) continue;
+    const runId = notification.metadata.runId;
+    const questionId = notification.metadata.questionId;
+    if (!/^[A-Za-z0-9_.:-]+$/.test(runId) || !questionId.trim()) continue;
+    const current = readWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(
+      path.join(WORKFLOW_RUNS_DIR, `${runId}.json`),
+    );
+    const stillWaiting = current?.id === runId
+      && current.status === 'awaiting_input'
+      && isWorkflowAwaitingInputState(current.awaitingInput)
+      && current.awaitingInput.questionId === questionId
+      && current.awaitingInput.answer === undefined;
+    if (stillWaiting) continue;
+    settled += markWorkflowQuestionNotificationsSettled(runId, questionId, {
+      resolvedFrom: 'workflow_reconciliation',
+    }).length;
+  }
+  return settled;
 }
 
 export function isWorkflowAwaitingInputState(value: unknown): value is WorkflowAwaitingInputState {
@@ -114,7 +189,15 @@ export interface WorkflowInputResolutionRequest {
   runId: string;
   questionId: string;
   stepId: string;
-  originSessionId: string;
+  /** Conversational answers must still prove exact origin ownership. */
+  originSessionId?: string;
+  /** Authenticated owner Inboxes have no conversation lineage for scheduled
+   * runs. Their authority is deliberately explicit and still bound by the
+   * exact run/question/step CAS below. */
+  globalInboxAuthority?: {
+    surface: 'desktop' | 'mobile';
+    requestId: string;
+  };
   answer: string;
 }
 
@@ -130,12 +213,18 @@ export function queueWorkflowRunInputResolution(
   const questionId = typeof input?.questionId === 'string' ? input.questionId.trim() : '';
   const stepId = typeof input?.stepId === 'string' ? input.stepId.trim() : '';
   const originSessionId = typeof input?.originSessionId === 'string' ? input.originSessionId.trim() : '';
+  const globalInboxAuthority = input?.globalInboxAuthority;
+  const globalInboxAuthorized = Boolean(
+    (globalInboxAuthority?.surface === 'desktop' || globalInboxAuthority?.surface === 'mobile')
+    && typeof globalInboxAuthority.requestId === 'string'
+    && globalInboxAuthority.requestId.trim().length > 0,
+  );
   const normalized = typeof input?.answer === 'string' ? input.answer.trim() : '';
   if (
     !/^[A-Za-z0-9_.:-]+$/.test(runId)
     || !questionId
     || !stepId
-    || !originSessionId
+    || (!originSessionId && !globalInboxAuthorized)
     || !normalized
   ) {
     return { status: 'stale', reason: 'The workflow answer or question identity was empty.' };
@@ -155,9 +244,19 @@ export function queueWorkflowRunInputResolution(
         || current.awaitingInput.questionId !== questionId
         || current.awaitingInput.stepId !== stepId
         || current.awaitingInput.answer !== undefined
-        || !workflowAwaitingInputRecordOrigins(current).includes(originSessionId)
+        || (
+          originSessionId
+            ? !workflowAwaitingInputRecordOrigins(current).includes(originSessionId)
+            : !globalInboxAuthorized
+        )
       ) {
         return { status: 'stale' as const, reason: 'That workflow question is no longer waiting for an answer.' };
+      }
+      // Cancellation is a separate fsynced receipt and may have won just
+      // before its mutable run projection. Never let a delayed Inbox answer
+      // revive that crash-split cancelled run.
+      if (readWorkflowRunCancellation(runId)) {
+        return { status: 'stale' as const, reason: 'That workflow run was cancelled before this answer could be claimed.' };
       }
       writeWorkflowRunRecordDurablyUnlocked(filePath, {
         ...current,
@@ -176,9 +275,26 @@ export function queueWorkflowRunInputResolution(
           type: 'run_resumed',
           status: 'queued',
           message: 'Your answer was received. The workflow is queued to resume.',
-          data: { questionId },
+          data: {
+            questionId,
+            answeredFrom: originSessionId
+              ? 'origin_conversation'
+              : `global_${globalInboxAuthority?.surface ?? 'inbox'}`,
+          },
         });
       } catch { /* the workflow record is the durable execution authority */ }
+      // Resolution may arrive from mobile, chat continuity, or another paired
+      // surface. Clear the one durable question carrier at the authority so
+      // every UI observes the same terminal state.
+      try {
+        markWorkflowQuestionNotificationsSettled(result.runId, questionId, {
+          resolvedFrom: 'workflow_authority',
+        });
+      } catch { /* notification projection is reconciliable after the run CAS */ }
+      // Do not make a successfully answered question wait for the periodic
+      // recovery scan. The kick is best-effort; durable running + answered
+      // state remains the restart backstop.
+      requestWorkflowRunDrainKick([result.runId]);
     }
     return result;
   } catch (error) {

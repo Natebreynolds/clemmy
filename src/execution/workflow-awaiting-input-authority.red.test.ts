@@ -20,6 +20,15 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { routeOpenQuestionPlan } = await import('../runtime/harness/plan-continuity.js');
+const { listAwaitingInputWorkflowRuns, queueWorkflowRunInputResolution } = await import('./workflow-awaiting-input.js');
+const {
+  addNotification,
+  getNotification,
+  listQueuedNotificationDeliveries,
+} = await import('../runtime/notifications.js');
+const { registerWorkflowRunDrainKick } = await import('./workflow-origin-group.js');
+const { requestWorkflowRunCancellation } = await import('./workflow-run-cancellation.js');
+const { reconcileAwaitingInputWorkflowRunProjections } = await import('./workflow-awaiting-input-projection.js');
 const { Runner } = await import('@openai/agents');
 
 const AUTHORITY_MODULE_URL = new URL('./workflow-awaiting-input.ts', import.meta.url).href;
@@ -79,6 +88,140 @@ test.beforeEach(() => {
 
 test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+test('global read model lists every canonical pause without requiring a shared RunRecord', () => {
+  writePaused({
+    runId: 'scheduled-pause-a',
+    workflowName: 'Scheduled Renewal Watch',
+    originSessionId: 'workflow-origin-a',
+    questionId: 'workflow-input:scheduled-a:scope:q1',
+  });
+  writePaused({
+    runId: 'scheduled-pause-b',
+    workflowName: 'Scheduled Pipeline Watch',
+    originSessionId: 'workflow-origin-b',
+    questionId: 'workflow-input:scheduled-b:scope:q1',
+  });
+
+  const rows = listAwaitingInputWorkflowRuns();
+  assert.equal(rows.length, 2);
+  assert.deepEqual(new Set(rows.map((row) => row.runId)), new Set(['scheduled-pause-a', 'scheduled-pause-b']));
+  assert.deepEqual(new Set(rows.map((row) => row.originSessionId)), new Set(['workflow-origin-a', 'workflow-origin-b']));
+});
+
+test('the central workflow authority clears its durable question carrier', () => {
+  const runId = 'central-cleanup-run';
+  const questionId = 'workflow-input:central-cleanup-run:scope:q1';
+  const originSessionId = 'mobile:central-cleanup-origin';
+  writePaused({ runId, originSessionId, questionId });
+  addNotification({
+    id: 'central-cleanup-notification',
+    kind: 'workflow',
+    title: 'Workflow needs input',
+    body: 'Choose a scope.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { runId, questionId, stepId: 'choose_scope' },
+  });
+
+  const kicks: string[][] = [];
+  const unregisterKick = registerWorkflowRunDrainKick((runIds) => kicks.push([...runIds]));
+  const result = (() => {
+    try {
+      return queueWorkflowRunInputResolution({
+        runId,
+        questionId,
+        stepId: 'choose_scope',
+        originSessionId,
+        answer: 'Use enterprise accounts.',
+      });
+    } finally {
+      unregisterKick();
+    }
+  })();
+
+  assert.equal(result.status, 'queued');
+  assert.equal(getNotification('central-cleanup-notification')?.read, true);
+  assert.equal(
+    getNotification('central-cleanup-notification')?.metadata?.resolvedFrom,
+    'workflow_authority',
+  );
+  assert.deepEqual(kicks, [[runId]], 'the durable answer requests an immediate same-run drain');
+});
+
+test('an Inbox answer cannot revive a crash-split cancellation receipt', () => {
+  const runId = 'cancelled-question-run';
+  const questionId = `workflow-input:${runId}:scope:q1`;
+  const file = writePaused({
+    runId,
+    originSessionId: 'mobile:cancelled-question-origin',
+    questionId,
+  });
+  requestWorkflowRunCancellation(runId, 'Cancelled before the delayed answer.', 'test');
+  const result = queueWorkflowRunInputResolution({
+    runId,
+    questionId,
+    stepId: 'choose_scope',
+    globalInboxAuthority: { surface: 'mobile', requestId: 'cancelled-question-request' },
+    answer: 'Use enterprise accounts.',
+  });
+  assert.equal(result.status, 'stale');
+  assert.equal(readPaused(file).status, 'awaiting_input');
+  assert.equal(readPaused(file).awaitingInput.answer, undefined);
+});
+
+test('question reconciliation retires a crash-stale carrier and its delivery cursor', () => {
+  const runId = 'stale-question-carrier-run';
+  const questionId = `workflow-input:${runId}:scope:q1`;
+  const file = writePaused({ runId, originSessionId: 'desktop:stale-question', questionId });
+  addNotification({
+    id: questionId,
+    kind: 'workflow',
+    title: 'Workflow needs input',
+    body: 'Choose a scope.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { runId, questionId, stepId: 'choose_scope', status: 'awaiting_input', needsAttention: true },
+  });
+  const answered = readPaused(file);
+  answered.status = 'running';
+  answered.awaitingInput.answer = 'Use enterprise accounts.';
+  writeFileSync(file, JSON.stringify(answered), 'utf-8');
+
+  assert.deepEqual(listAwaitingInputWorkflowRuns(), []);
+  assert.equal(getNotification(questionId)?.read, true);
+  assert.equal(getNotification(questionId)?.metadata?.needsAttention, false);
+  assert.equal(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === questionId),
+    false,
+  );
+});
+
+test('a scheduled question with no origin names the authenticated Inbox instead of a dead reply CTA', () => {
+  const runId = 'no-origin-question-run';
+  const questionId = `workflow-input:${runId}:scope:q1`;
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'Scheduled question workflow',
+    status: 'awaiting_input',
+    awaitingInput: {
+      questionId,
+      question: 'Which workspace should I use?',
+      stepId: 'choose_scope',
+      sessionId: `workflow:${runId}:choose_scope`,
+      sessionIdSuffix: 'choose_scope',
+      askedAt: '2026-08-11T18:00:00.000Z',
+    },
+  }), 'utf-8');
+
+  const summary = reconcileAwaitingInputWorkflowRunProjections({ runId });
+  assert.deepEqual(summary.failed, []);
+  const carrier = getNotification(questionId);
+  assert.match(carrier?.body ?? '', /authenticated desktop or mobile Inbox/i);
+  assert.doesNotMatch(carrier?.body ?? '', /Reply here/i);
+  assert.equal(carrier?.metadata?.needsAttention, true);
 });
 
 test('the runtime classifier sees the exact stored question identity before admitting its answer', async () => {

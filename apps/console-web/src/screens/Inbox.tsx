@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, X, RefreshCw, Mail, BellRing, Send } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -16,18 +16,22 @@ import {
   listWorkspaceDestinationChoosers, resolveWorkspaceDestinationChooser,
   listNotifications, markNotificationRead, retryNotification,
   listTrustProposals, decideTrustProposal,
+  listPlanProposals, decidePlanProposal,
+  listInboxQuestions, answerInboxQuestion,
+  resolveWorkflowCapability,
   relativeTime,
   approvalDecisionSuccessText, collapseAttentionRows, notifTone, notifFailed,
   summarizeApprovalDecisionBatch,
-  type ApprovalRow, type NotificationRow, type TrustProposalRow,
-  type WorkspaceDestinationChooser,
+  type ApprovalRow, type NotificationRow, type TrustProposalRow, type PlanProposalRow, type InboxQuestionRow,
+  type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
 } from '@/lib/inbox';
 
 /** Client mirror of the backend's needs-attention rule (runtime/notifications.ts)
  *  — these are DECISIONS/blocks for the user, so they belong on the "Needs you"
  *  tab beside approvals, not buried under general notifications. */
 function needsAttentionNotif(n: NotificationRow): boolean {
-  return /\bblocked\b|needs attention|needs input|couldn['\u2019]t finish|action required/i.test(n.title || '');
+  return n.needsAttention === true
+    || /\bblocked\b|needs attention|needs input|needs you|paused|couldn['\u2019]t finish|action required/i.test(n.title || '');
 }
 
 type Tab = 'needs' | 'notifications';
@@ -61,6 +65,14 @@ export function Inbox() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [decisionStates, setDecisionStates] = useState<Record<string, RowDecisionState>>({});
   const [chooserBusy, setChooserBusy] = useState<string | null>(null);
+  const [planBusy, setPlanBusy] = useState<string | null>(null);
+  const [questionBusy, setQuestionBusy] = useState<string | null>(null);
+  const [capabilityBusy, setCapabilityBusy] = useState<string | null>(null);
+  const questionLockRef = useRef<string | null>(null);
+  const capabilityLockRef = useRef<string | null>(null);
+  const [trustBusy, setTrustBusy] = useState<string | null>(null);
+  const trustLockRef = useRef<string | null>(null);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
   const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
   // Re-apply when the deep link changes while the screen stays mounted
   // (e.g. Home card → Inbox already open in the router tree).
@@ -80,6 +92,8 @@ export function Inbox() {
   );
   const notifications = usePoll(['notifications'], listNotifications, 8000);
   const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
+  const planProposals = usePoll(['plan-proposals'], listPlanProposals, 6000);
+  const questions = usePoll(['inbox-questions'], listInboxQuestions, 5000);
 
   const approvalRows = approvals.data?.approvals ?? [];
   const workspaceChooserRows = workspaceChoosers.data?.choosers ?? [];
@@ -89,6 +103,8 @@ export function Inbox() {
   const agedApprovalRows = approvalRows.filter((a) => a.stale);
   const notifRows = notifications.data?.notifications ?? [];
   const trustRows = trustProposals.data?.proposals ?? [];
+  const planRows = planProposals.data?.proposals ?? [];
+  const questionRows = questions.data?.questions ?? [];
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
   // beside approvals (and leave once read); everything else stays in Notifications.
   const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n));
@@ -97,13 +113,13 @@ export function Inbox() {
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
-  const needsCount = workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length;
-  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length;
+  const needsCount = workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length;
+  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
   const queryUnavailable = tab === 'needs'
-    ? approvals.isError || workspaceChoosers.isError || notifications.isError || trustProposals.isError
+    ? approvals.isError || workspaceChoosers.isError || notifications.isError || trustProposals.isError || planProposals.isError || questions.isError
     : notifications.isError;
   const hasRows = !queryUnavailable && (tab === 'needs' ? needsCount : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
@@ -230,18 +246,112 @@ export function Inbox() {
       invalidate('workspace-choosers', 'approvals', 'approvals-count', 'command-center');
     }
   };
-  const onDecideTrust = async (id: string, decision: 'approve' | 'decline') => {
+  const onDecideTrust = async (row: TrustProposalRow, decision: 'approve' | 'decline') => {
+    if (trustLockRef.current) return;
+    trustLockRef.current = row.id;
+    setTrustBusy(row.id);
     setDecisionNotice(null);
     try {
-      await decideTrustProposal(id, decision);
+      const result = await decideTrustProposal(row, decision);
+      const expectedReason = decision === 'approve' ? 'approved' : 'declined';
+      if (!result.ok || result.reason !== expectedReason) {
+        throw new Error(`The trust decision was not committed (${result.reason || 'unknown outcome'}).`);
+      }
+      const receipt = result.scopeReceipt;
+      if (!receipt) throw new Error('The server did not return the exact durable trust-scope receipt. Nothing is being reported as granted.');
+      const scope = [
+        receipt.recipients.length ? `exact recipients ${receipt.recipients.join(', ')}` : '',
+        receipt.domains.length ? `entire domains ${receipt.domains.map((domain) => `@${domain}`).join(', ')}` : '',
+        receipt.toolkits.length ? `send tools ${receipt.toolkits.join(', ')}` : '',
+        `up to ${receipt.maxRecipients} recipients`,
+      ].filter(Boolean).join(' · ');
       setDecisionNotice({
         tone: 'success',
-        text: decision === 'approve' ? 'Standing trust saved.' : 'Standing-trust suggestion declined.',
+        text: decision === 'approve'
+          ? `Standing trust saved for ${scope}.`
+          : `Standing-trust suggestion declined for ${scope}. Nothing was granted.`,
       });
     } catch (error) {
       setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not update that trust decision.') });
     } finally {
+      trustLockRef.current = null;
+      setTrustBusy(null);
       invalidate('trust-proposals', 'approvals-count', 'command-center');
+    }
+  };
+  const onDecidePlan = async (id: string, decision: 'approve' | 'reject') => {
+    if (planBusy) return;
+    setPlanBusy(id);
+    setDecisionNotice(null);
+    try {
+      await decidePlanProposal(id, decision);
+      setDecisionNotice({
+        tone: 'success',
+        text: decision === 'approve'
+          ? 'Plan approved. The exact proposal was queued and Clem is continuing it.'
+          : 'Plan rejected. Nothing from that proposal was queued.',
+      });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, `Could not ${decision} that plan.`) });
+    } finally {
+      setPlanBusy(null);
+      invalidate('plan-proposals', 'approvals-count', 'command-center');
+    }
+  };
+  const onAnswerQuestion = async (row: InboxQuestionRow, option?: string) => {
+    if (questionLockRef.current || !row.answerable) return;
+    const answer = (option ?? questionAnswers[row.id] ?? '').trim();
+    if (!answer) return;
+    questionLockRef.current = row.id;
+    setQuestionBusy(row.id);
+    setDecisionNotice(null);
+    try {
+      const result = await answerInboxQuestion(row.id, answer);
+      setDecisionNotice({
+        tone: 'success',
+        text: result.status === 'resuming'
+          ? `Answer recorded: “${answer.slice(0, 180)}”. Clem is resuming the same ${row.source === 'workflow' ? 'workflow run' : 'task'}.`
+          : `Answer recorded: “${answer.slice(0, 180)}”.`,
+      });
+      setQuestionAnswers((previous) => ({ ...previous, [row.id]: '' }));
+    } catch (error) {
+      setDecisionNotice({
+        tone: 'error',
+        text: actionError(error, 'That question changed or was already answered. Refreshing the exact Inbox state.'),
+      });
+    } finally {
+      questionLockRef.current = null;
+      setQuestionBusy(null);
+      invalidate('inbox-questions', 'notifications', 'command-center');
+    }
+  };
+  const onResolveCapability = async (
+    gate: WorkflowCapabilityInboxGate,
+    choice?: WorkflowCapabilityAccountChoice,
+  ) => {
+    if (capabilityLockRef.current || gate.resolution.kind === 'review_run') return;
+    capabilityLockRef.current = gate.notificationId;
+    setCapabilityBusy(gate.notificationId);
+    setDecisionNotice(null);
+    try {
+      const result = await resolveWorkflowCapability(gate, choice);
+      setDecisionNotice({
+        tone: 'success',
+        text: result.status === 'already_selected' || result.status === 'already_resumed'
+          ? 'That exact gate was already handled. The same run remains on its one-time resume path.'
+          : choice
+            ? `Account ${choice.label} (${choice.accountId}) saved. Clem is resuming the same run once.`
+            : 'The exact gate was reopened. Clem is resuming the same run once.',
+      });
+    } catch (error) {
+      setDecisionNotice({
+        tone: 'error',
+        text: actionError(error, 'That workflow gate changed. Nothing was dispatched; refreshing its exact state.'),
+      });
+    } finally {
+      capabilityLockRef.current = null;
+      setCapabilityBusy(null);
+      invalidate('notifications', 'command-center');
     }
   };
   const onRead = async (id: string) => {
@@ -271,16 +381,19 @@ export function Inbox() {
   ];
 
   const selApproval = approvalRows.find((a) => a.approvalId === selected);
+  const selPlan = planRows.find((p) => p.id === selected);
   const selNotif = notifRows.find((n) => n.id === selected);
 
   const loading =
-    (tab === 'needs' && (approvals.isLoading || workspaceChoosers.isLoading || notifications.isLoading || trustProposals.isLoading)) ||
+    (tab === 'needs' && (approvals.isLoading || workspaceChoosers.isLoading || notifications.isLoading || trustProposals.isLoading || planProposals.isLoading || questions.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
   const retryCurrentTab = () => {
     if (tab === 'needs') {
       void approvals.refetch();
       void workspaceChoosers.refetch();
       void trustProposals.refetch();
+      void planProposals.refetch();
+      void questions.refetch();
     }
     void notifications.refetch();
   };
@@ -362,6 +475,30 @@ export function Inbox() {
                     onChoose={(choiceId) => onChooseWorkspace(chooser, choiceId)}
                   />
                 ))}
+                {questionRows.map((question) => (
+                  <InboxQuestionCard
+                    key={question.id}
+                    row={question}
+                    selected={selected === question.id}
+                    answer={questionAnswers[question.id] ?? ''}
+                    busy={questionBusy === question.id}
+                    globallyBusy={questionBusy !== null}
+                    onSelect={() => setSelected(question.id)}
+                    onAnswerChange={(answer) => setQuestionAnswers((previous) => ({ ...previous, [question.id]: answer }))}
+                    onSubmit={(option) => { void onAnswerQuestion(question, option); }}
+                  />
+                ))}
+                {planRows.map((plan) => (
+                  <PlanProposalCard
+                    key={plan.id}
+                    row={plan}
+                    selected={selected === plan.id}
+                    busy={planBusy === plan.id}
+                    onSelect={() => setSelected(plan.id)}
+                    onApprove={() => onDecidePlan(plan.id, 'approve')}
+                    onReject={() => onDecidePlan(plan.id, 'reject')}
+                  />
+                ))}
                 {approvalRows.length > 1 && (
                   <div className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2">
                     <input type="checkbox" aria-label="Select all approvals"
@@ -415,14 +552,29 @@ export function Inbox() {
                 ))}
                 {trustRows.map((p) => (
                   <TrustProposalCard key={p.id} row={p}
-                    onApprove={() => onDecideTrust(p.id, 'approve')}
-                    onDecline={() => onDecideTrust(p.id, 'decline')} />
+                    busy={trustBusy === p.id}
+                    globallyBusy={trustBusy !== null}
+                    onApprove={() => onDecideTrust(p, 'approve')}
+                    onDecline={() => onDecideTrust(p, 'decline')} />
                 ))}
                 {collapsedAttention.map(({ row: n, collapsedCount }) => (
-                  <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
-                    title={n.title || n.body || 'Needs attention'}
-                    meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
-                    tone={{ tone: 'warning', label: 'Needs attention' }} />
+                  n.workflowCapability ? (
+                    <WorkflowCapabilityCard
+                      key={n.id}
+                      gate={n.workflowCapability}
+                      title={n.title}
+                      body={n.body}
+                      createdAt={n.createdAt}
+                      busy={capabilityBusy === n.id}
+                      globallyBusy={capabilityBusy !== null}
+                      onResolve={(choice) => { void onResolveCapability(n.workflowCapability as WorkflowCapabilityInboxGate, choice); }}
+                    />
+                  ) : (
+                    <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
+                      title={n.title || n.body || 'Needs attention'}
+                      meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
+                      tone={{ tone: 'warning', label: 'Needs attention' }} />
+                  )
                 ))}
               </>
             ))}
@@ -448,8 +600,28 @@ export function Inbox() {
                 onReject={() => onDecide(selApproval.approvalId, 'reject')}
               />
             )}
-            {selNotif && <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />}
-            {!selApproval && !selNotif && (
+            {selPlan && (
+              <PlanProposalDetail
+                row={selPlan}
+                busy={planBusy === selPlan.id}
+                onApprove={() => onDecidePlan(selPlan.id, 'approve')}
+                onReject={() => onDecidePlan(selPlan.id, 'reject')}
+              />
+            )}
+            {selNotif?.workflowCapability ? (
+              <WorkflowCapabilityCard
+                gate={selNotif.workflowCapability}
+                title={selNotif.title}
+                body={selNotif.body}
+                createdAt={selNotif.createdAt}
+                busy={capabilityBusy === selNotif.id}
+                globallyBusy={capabilityBusy !== null}
+                onResolve={(choice) => { void onResolveCapability(selNotif.workflowCapability as WorkflowCapabilityInboxGate, choice); }}
+              />
+            ) : selNotif ? (
+              <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />
+            ) : null}
+            {!selApproval && !selPlan && !selNotif && (
               <div className="flex h-full min-h-48 items-center justify-center text-center text-body text-faint">
                 Select an item to see the details
               </div>
@@ -508,6 +680,192 @@ function WorkspaceChooserCard({ chooser, busy, onChoose }: {
           </Button>
         ))}
       </div>
+    </div>
+  );
+}
+
+function InboxQuestionCard({ row, selected, answer, busy, globallyBusy, onSelect, onAnswerChange, onSubmit }: {
+  row: InboxQuestionRow;
+  selected: boolean;
+  answer: string;
+  busy: boolean;
+  globallyBusy: boolean;
+  onSelect: () => void;
+  onAnswerChange: (answer: string) => void;
+  onSubmit: (option?: string) => void;
+}) {
+  const disabled = globallyBusy || !row.answerable;
+  return (
+    <div id={`inbox-${row.id}`} className={cn('rounded-md border bg-warning-tint px-3.5 py-3', selected ? 'border-primary' : 'border-warning/40')}>
+      <button type="button" onClick={onSelect} className="flex w-full items-start gap-3 text-left cursor-pointer">
+        <StatusPill tone="warning">Question</StatusPill>
+        <div className="min-w-0 flex-1">
+          <div className="text-body font-medium text-fg">{row.question}</div>
+          <div className="mt-1 text-caption text-muted">
+            {row.agentLabel} · {row.source === 'workflow' ? 'workflow' : row.source === 'background_task' ? 'task' : 'check-in'} · {relativeTime(row.askedAt)}
+          </div>
+        </div>
+      </button>
+      {row.context && <p className="mt-2 whitespace-pre-wrap text-small text-muted">{row.context}</p>}
+      {row.unavailableReason && <p role="status" className="mt-2 text-small text-warning">{row.unavailableReason}</p>}
+      {row.options.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {row.options.map((option) => (
+            <Button key={option} size="sm" variant="secondary" disabled={disabled} onClick={() => onSubmit(option)}>
+              {option}
+            </Button>
+          ))}
+        </div>
+      )}
+      <div className="mt-3 flex items-end gap-2">
+        <label className="min-w-0 flex-1">
+          <span className="sr-only">Answer {row.question}</span>
+          <textarea
+            rows={2}
+            value={answer}
+            disabled={disabled}
+            onChange={(event) => onAnswerChange(event.target.value)}
+            placeholder={row.answerable ? 'Type the answer Clem needs…' : 'Open the authorized origin to answer'}
+            className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none focus:border-primary disabled:opacity-60"
+          />
+        </label>
+        <Button disabled={disabled || !answer.trim()} onClick={() => onSubmit()}>
+          {busy ? 'Sending…' : 'Answer & resume'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PlanProposalCard({ row, selected, busy, onSelect, onApprove, onReject }: {
+  row: PlanProposalRow;
+  selected: boolean;
+  busy: boolean;
+  onSelect: () => void;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const questions = (row.plan.needsUserInput ?? []).filter((question) => typeof question === 'string' && question.trim());
+  const needsInput = questions.length > 0;
+  return (
+    <div className={cn('rounded-md border px-3.5 py-3', selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
+      <button type="button" onClick={onSelect} className="flex w-full items-start gap-3 text-left cursor-pointer">
+        <StatusPill tone="warning">Plan</StatusPill>
+        <span className="min-w-0 flex-1 text-body text-fg">{row.plan.objective || row.originatingRequest}</span>
+        <span className="shrink-0 text-caption text-faint">{relativeTime(row.proposedAt)}</span>
+      </button>
+      <p className="mt-1 line-clamp-2 text-caption text-muted">{row.originatingRequest}</p>
+      {needsInput && (
+        <div className="mt-2 text-small text-muted">
+          <p className="font-medium text-fg">Clem needs these answers before this plan can be approved:</p>
+          <ul className="mt-1 list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
+          {row.sessionId ? (
+            <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
+              Answer in the exact conversation
+            </Link>
+          ) : (
+            <p role="status" className="mt-2 text-warning">This proposal has no linked conversation. Reject it and ask Clem to draft a new plan with your answers.</p>
+          )}
+        </div>
+      )}
+      <div className="mt-2.5 flex gap-2">
+        {!needsInput && (
+          <Button size="sm" disabled={busy} onClick={onApprove}>
+            <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve exact plan'}
+          </Button>
+        )}
+        <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
+          <X className="h-4 w-4" aria-hidden /> Reject
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PlanProposalDetail({ row, busy, onApprove, onReject }: {
+  row: PlanProposalRow;
+  busy: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const questions = (row.plan.needsUserInput ?? []).filter((question) => typeof question === 'string' && question.trim());
+  const needsInput = questions.length > 0;
+  return (
+    <div>
+      <h3 className="mb-3 text-h3 text-fg">{row.plan.objective || 'Proposed plan'}</h3>
+      <Field label="Original request"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
+      {row.context && <Field label="Context"><span className="whitespace-pre-wrap">{row.context}</span></Field>}
+      {row.sessionId && <Field label="Exact conversation"><span className="font-mono">{row.sessionId}</span></Field>}
+      <Field label="Proposed">{relativeTime(row.proposedAt) || row.proposedAt}</Field>
+      <Field label="Plan"><Mono value={row.plan} /></Field>
+      {needsInput && (
+        <Field label="Answers needed">
+          <ul className="list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
+          {row.sessionId ? (
+            <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
+              Answer in the exact conversation
+            </Link>
+          ) : (
+            <p className="mt-2 text-warning">No linked conversation is available. Reject this proposal and ask Clem for a new plan after supplying the answers.</p>
+          )}
+        </Field>
+      )}
+      <div className="mt-4 flex gap-2">
+        {!needsInput && <Button disabled={busy} onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve & continue'}</Button>}
+        <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Reject</Button>
+      </div>
+    </div>
+  );
+}
+
+function WorkflowCapabilityCard({ gate, title, body, createdAt, busy, globallyBusy, onResolve }: {
+  gate: WorkflowCapabilityInboxGate;
+  title?: string;
+  body?: string;
+  createdAt?: string;
+  busy: boolean;
+  globallyBusy: boolean;
+  onResolve: (choice?: WorkflowCapabilityAccountChoice) => void;
+}) {
+  const resolution = gate.resolution;
+  return (
+    <div id={`inbox-${gate.notificationId}`} className="rounded-md border border-warning/40 bg-warning-tint px-3.5 py-3" aria-busy={busy}>
+      <div className="flex items-start gap-3">
+        <StatusPill tone="warning">Workflow</StatusPill>
+        <div className="min-w-0 flex-1">
+          <div className="text-body font-medium text-fg">{title || `${gate.workflow} needs you`}</div>
+          <div className="mt-1 text-caption text-muted">{gate.workflow} · step {gate.stepId} · {relativeTime(createdAt)}</div>
+        </div>
+      </div>
+      {body && <p className="mt-2 whitespace-pre-wrap text-small text-muted">{body}</p>}
+      <p className="mt-2 text-caption text-muted">No {gate.tool} dispatch occurred. Completed work is preserved.</p>
+      {resolution.kind === 'choose_account' ? (
+        <div className="mt-3 space-y-2" aria-label={`Exact ${gate.toolkit} account choices`}>
+          {resolution.candidates.map((candidate) => (
+            <div key={`${candidate.capabilityId}\u0000${candidate.accountId}`} className="rounded border border-border bg-surface p-2.5">
+              <div className="text-small font-medium text-fg">{candidate.label}</div>
+              <div className="break-all font-mono text-caption text-faint">account {candidate.accountId}</div>
+              <div className="break-all font-mono text-caption text-faint">capability {candidate.capabilityId}</div>
+              <Button className="mt-2" size="sm" disabled={globallyBusy} onClick={() => onResolve(candidate)}>
+                {busy ? 'Saving…' : `Use ${candidate.label}`}
+              </Button>
+            </div>
+          ))}
+          {resolution.choicesTruncated && <p className="text-caption text-warning">Showing {resolution.candidates.length} of {resolution.choiceTotal} exact choices. Connect fewer accounts or choose one shown here.</p>}
+        </div>
+      ) : resolution.kind === 'connect_and_retry' ? (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Link to="/connect" className="rounded-md border border-border bg-surface px-3 py-1.5 text-small font-medium text-primary hover:bg-hover">Open Connections</Link>
+          <Button size="sm" disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Resuming…' : 'I connected it — resume this run'}</Button>
+        </div>
+      ) : resolution.kind === 'retry_exact_metadata' ? (
+        <div className="mt-3"><Button size="sm" disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Retrying…' : 'Retry exact metadata now'}</Button></div>
+      ) : (
+        <div className="mt-3">
+          <p role="status" className="text-small text-warning">{resolution.reason}</p>
+          <Link to="/automate" className="mt-2 inline-block font-medium text-primary hover:underline">Review the preserved run</Link>
+        </div>
+      )}
     </div>
   );
 }
@@ -575,8 +933,8 @@ function ApprovalCard({
   );
 }
 
-function TrustProposalCard({ row, onApprove, onDecline }: {
-  row: TrustProposalRow; onApprove: () => void; onDecline: () => void;
+function TrustProposalCard({ row, busy, globallyBusy, onApprove, onDecline }: {
+  row: TrustProposalRow; busy: boolean; globallyBusy: boolean; onApprove: () => void; onDecline: () => void;
 }) {
   const scope = [
     ...row.recipients,
@@ -594,8 +952,12 @@ function TrustProposalCard({ row, onApprove, onDecline }: {
         {row.evidence.cleanSendCount} clean sends over {row.evidence.distinctDays} days · via {row.toolkits.join(', ')}
       </div>
       <div className="mt-2.5 flex gap-2">
-        <Button size="sm" onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> Approve</Button>
-        <Button size="sm" variant="secondary" onClick={onDecline}><X className="h-4 w-4" aria-hidden /> Decline</Button>
+        <Button size="sm" disabled={globallyBusy} onClick={onApprove}>
+          <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve'}
+        </Button>
+        <Button size="sm" variant="secondary" disabled={globallyBusy} onClick={onDecline}>
+          <X className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Decline'}
+        </Button>
       </div>
     </div>
   );

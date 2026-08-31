@@ -20,6 +20,7 @@ import {
 } from './workflow-run-record.js';
 import {
   isWorkflowAwaitingInputState,
+  reconcileSettledWorkflowQuestionNotifications,
   workflowAwaitingInputRecordOrigins,
   type AwaitingInputWorkflowRecord,
 } from './workflow-awaiting-input.js';
@@ -49,15 +50,19 @@ function candidateFiles(runId?: string): string[] {
 
 function detailFor(record: AwaitingInputWorkflowRecord): string {
   const pending = record.awaitingInput!;
+  const hasOriginConversation = workflowAwaitingInputRecordOrigins(record).length > 0;
   return [
     `I paused "${record.workflow}" at step "${pending.stepId}" because I need one detail from you.`,
     pending.question,
-    'Everything completed so far is preserved. Reply here and I will continue this same run.',
+    hasOriginConversation
+      ? 'Everything completed so far is preserved. Reply in the conversation that started this workflow and I will continue this same run.'
+      : 'Everything completed so far is preserved. Open Needs You in the authenticated desktop or mobile Inbox and answer this exact question; I will continue this same run.',
   ].join('\n\n');
 }
 
 function pendingInputFor(record: AwaitingInputWorkflowRecord): RunInputBlocker {
   const pending = record.awaitingInput!;
+  const hasOriginConversation = workflowAwaitingInputRecordOrigins(record).length > 0;
   return {
     kind: 'workflow_clarification',
     questionId: pending.questionId,
@@ -68,7 +73,9 @@ function pendingInputFor(record: AwaitingInputWorkflowRecord): RunInputBlocker {
       runId: record.id,
       stepId: pending.stepId,
     },
-    nextAction: 'Reply in the conversation that started this workflow; the same run will resume with your answer.',
+    nextAction: hasOriginConversation
+      ? 'Reply in the conversation that started this workflow; the same run will resume with your answer.'
+      : 'Answer this exact question from the authenticated desktop or mobile Needs You Inbox; the same run will resume.',
   };
 }
 
@@ -118,6 +125,7 @@ function ensureNotification(record: AwaitingInputWorkflowRecord, detail: string)
       status: 'awaiting_input',
       questionId: pending.questionId,
       stepId: pending.stepId,
+      needsAttention: true,
     },
   });
   const durable = listNotifications(1_000).find((item) => item.id === pending.questionId);
@@ -220,6 +228,11 @@ export function reconcileAwaitingInputWorkflowRunProjections(
         reason: boundedReason(error),
       });
     }
+  }
+  try {
+    reconcileSettledWorkflowQuestionNotifications();
+  } catch (error) {
+    summary.failed.push({ runId: options.runId ?? '*', reason: boundedReason(error) });
   }
   return summary;
 }

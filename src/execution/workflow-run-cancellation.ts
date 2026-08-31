@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { markWorkflowCapabilityNotificationsSettled } from '../runtime/notifications.js';
 import {
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
@@ -335,6 +336,14 @@ export function cancelWorkflowRunAtBoundary(input: {
     || result.status === 'already_cancelled'
     || result.status === 'already_terminal'
   ) {
+    try {
+      markWorkflowCapabilityNotificationsSettled(input.runId, {
+        capabilityResolutionStatus: 'run_terminal',
+        terminalStatus: result.status === 'already_terminal'
+          ? result.terminalStatus
+          : 'cancelled',
+      });
+    } catch { /* terminal run truth is authoritative; a later replay can settle presentation */ }
     const settlement = settleCompiledProjectRootFromRun(file, result.run);
     if (settlement.kind === 'settled' || settlement.kind === 'already_settled') {
       stampCompiledProjectRootSettlement(file, settlement);

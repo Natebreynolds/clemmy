@@ -8,12 +8,12 @@ import {
   activateOriginHandoff,
   api,
   getAuthStatus,
+  getInboxSummary,
   isInvalidOriginHandoffError,
   logout,
   mintOriginHandoff,
   pairDevice,
   type AuthStatus,
-  type ChatSession,
 } from './lib/api';
 import {
   CONNECTION_EVENT,
@@ -37,16 +37,32 @@ import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
 import { Workspaces } from './screens/Workspaces';
 import { Settings } from './screens/Settings';
+import { Inbox } from './screens/Inbox';
+import type { ChatHandoff } from './screens/Chats';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 
-type Tab = 'home' | 'chats' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
+type Tab = 'home' | 'inbox' | 'chats' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
+
+const TAB_IDS = new Set<Tab>(['home', 'inbox', 'chats', 'agents', 'spaces', 'workflows', 'memory', 'activity', 'settings']);
+
+function tabFromSearch(search: string): Tab {
+  const value = new URLSearchParams(search).get('tab');
+  return value && TAB_IDS.has(value as Tab) ? value as Tab : 'home';
+}
+
+function inboxNotificationFromSearch(search: string): string | null {
+  return new URLSearchParams(search).get('notification');
+}
 
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [pairing, setPairing] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('home');
+  const [tab, setTab] = useState<Tab>(() => tabFromSearch(window.location.search));
+  const [inboxNotification, setInboxNotification] = useState<string | null>(
+    () => inboxNotificationFromSearch(window.location.search),
+  );
   // Left drawer (owner directive 2026-08-25): sections live in a slide-in
   // menu, never a bottom dock — content gets the full height.
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -54,15 +70,19 @@ export function App() {
   // instant unmount is the one visible tell next to a native drawer.
   const [drawerClosing, setDrawerClosing] = useState(false);
   const drawerClosingRef = useRef(false);
+  const drawerCloseTimer = useRef<number | null>(null);
   const menuBtnRef = useRef<HTMLButtonElement | null>(null);
+  const routeTitleRef = useRef<HTMLHeadingElement | null>(null);
+  const routeTitleMounted = useRef(false);
   const drawerRef = useRef<HTMLElement | null>(null);
   // Swipe-to-close needs horizontal INTENT before it acts, so it can never
   // fight the drawer's own vertical scrolling.
   const swipe = useRef<{ x: number; y: number; horizontal: boolean | null }>({ x: 0, y: 0, horizontal: null });
   const [name, setName] = useState('');
   const [decisions, setDecisions] = useState(0);
+  const [decisionsKnown, setDecisionsKnown] = useState(false);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
-  const [handoff, setHandoff] = useState<{ draft?: string; session?: ChatSession } | null>(null);
+  const [handoff, setHandoff] = useState<ChatHandoff | null>(null);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
 
   useEffect(() => {
@@ -92,7 +112,6 @@ export function App() {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         closeDrawer();
-        window.requestAnimationFrame(() => menuBtnRef.current?.focus());
         return;
       }
       if (event.key !== 'Tab' || !drawerRef.current) return;
@@ -114,6 +133,19 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [drawerOpen]);
 
+  useEffect(() => () => {
+    if (drawerCloseTimer.current !== null) window.clearTimeout(drawerCloseTimer.current);
+  }, []);
+
+  useEffect(() => {
+    document.title = `${TAB_TITLES[tab]} · Clem`;
+    if (!routeTitleMounted.current) {
+      routeTitleMounted.current = true;
+      return;
+    }
+    window.requestAnimationFrame(() => routeTitleRef.current?.focus());
+  }, [tab]);
+
   const refreshAuth = useCallback(async () => {
     try {
       const status = await getAuthStatus();
@@ -134,6 +166,53 @@ export function App() {
     window.addEventListener('clem:needs-login', handler);
     return () => window.removeEventListener('clem:needs-login', handler);
   }, [refreshAuth]);
+
+  // Push/native navigation can replace the URL while this shell is alive.
+  // Keep the visible destination and exact notification selection in sync.
+  useEffect(() => {
+    const syncLocation = () => {
+      setTab(tabFromSearch(window.location.search));
+      setInboxNotification(inboxNotificationFromSearch(window.location.search));
+    };
+    window.addEventListener('popstate', syncLocation);
+    return () => window.removeEventListener('popstate', syncLocation);
+  }, []);
+
+  // Needs-you is shell state, not Home state. Polling here keeps the hamburger
+  // and drawer truthful while the user is in Chat, Memory, or a deep detail.
+  useEffect(() => {
+    if (!authStatus?.authenticated) {
+      setDecisions(0);
+      setDecisionsKnown(false);
+      return;
+    }
+    let cancelled = false;
+    const refreshCount = async () => {
+      try {
+        const summary = await getInboxSummary();
+        if (!cancelled) {
+          setDecisions(summary.needsYou);
+          setDecisionsKnown(true);
+        }
+      } catch { /* each screen owns its visible error; the badge keeps last good */ }
+    };
+    void refreshCount();
+    const onWake = () => { if (document.visibilityState === 'visible') void refreshCount(); };
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('online', onWake);
+    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refreshCount(); }, 8_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('online', onWake);
+    };
+  }, [authStatus?.authenticated]);
+
+  const setAuthoritativeDecisionCount = useCallback((count: number) => {
+    setDecisions(count);
+    setDecisionsKnown(true);
+  }, []);
 
   // The greeting name, resolved at runtime from the profile — never hardcoded,
   // and a miss simply means an unnamed greeting.
@@ -267,14 +346,19 @@ export function App() {
         await refreshAuth();
       } catch (err) {
         if (cancelled) return;
-        cleanPairTokenFromUrl();
         const apiErr = err as { status?: number; body?: unknown; message?: string };
         const body = apiErr.body as { error?: string } | null;
         if (apiErr.status === 401 && body?.error === 'INVALID_PAIRING_CODE') {
+          cleanPairTokenFromUrl();
           setPairError('That QR code expired or was already used. Open Mobile on the desktop app and scan a fresh QR.');
         } else {
-          setPairError(apiErr.message || 'QR pairing failed. Try a fresh QR code or use your PIN.');
+          // A transport failure does not spend the one-time token. Keep it in
+          // the URL so reloading can retry the same pairing attempt.
+          setPairError(apiErr.message || 'QR pairing failed. Check the connection and try the same QR again.');
         }
+        // Leave the bootstrap state even after a failed pair. Without this,
+        // authStatus stayed null and the app rendered “Waking up…” forever.
+        await refreshAuth();
       } finally {
         if (!cancelled) setPairing(false);
       }
@@ -308,9 +392,20 @@ export function App() {
     return <Login pairError={pairError} />;
   }
 
-  const goToChat = (payload: { draft?: string; session?: ChatSession }) => {
+  const navigateTo = (next: Tab, notificationId?: string | null) => {
+    setTab(next);
+    const selectedNotification = next === 'inbox' ? notificationId ?? null : null;
+    setInboxNotification(selectedNotification);
+    const params = new URLSearchParams();
+    if (next !== 'home') params.set('tab', next);
+    if (next === 'inbox' && selectedNotification) params.set('notification', selectedNotification);
+    const query = params.toString();
+    window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+  };
+
+  const goToChat = (payload: ChatHandoff) => {
     setHandoff(payload);
-    setTab('chats');
+    navigateTo('chats');
   };
 
   // An open drawer is depth: a back swipe should close it rather than
@@ -318,20 +413,30 @@ export function App() {
   // the innermost layer always unwinds first.
   useBackGesture(drawerOpen && !drawerClosing, () => closeDrawer());
 
-  const closeDrawer = () => {
+  const openDrawer = () => {
+    if (drawerCloseTimer.current !== null) {
+      window.clearTimeout(drawerCloseTimer.current);
+      drawerCloseTimer.current = null;
+    }
+    drawerClosingRef.current = false;
+    setDrawerClosing(false);
+    setDrawerOpen(true);
+  };
+
+  const closeDrawer = (restoreOpener = true) => {
     if (drawerClosingRef.current) return;
     drawerClosingRef.current = true;
+    // End the modal contract immediately. The exiting pixels stay mounted,
+    // but are hidden from assistive tech and cannot keep focus trapped.
+    if (restoreOpener) menuBtnRef.current?.focus();
+    setDrawerOpen(false);
     setDrawerClosing(true);
-    // Focus returns to the control that opened the dialog, per the dialog
-    // pattern — the hamburger is always mounted.
-    window.requestAnimationFrame(() => menuBtnRef.current?.focus());
-    // Unmount after the exit animation (matches the 0.25s CSS; reduced-motion
-    // finishes early which only shortens the wait, never strands the layer).
-    window.setTimeout(() => {
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    drawerCloseTimer.current = window.setTimeout(() => {
+      drawerCloseTimer.current = null;
       drawerClosingRef.current = false;
       setDrawerClosing(false);
-      setDrawerOpen(false);
-    }, 250);
+    }, reduceMotion ? 0 : 250);
   };
 
   return (
@@ -340,10 +445,10 @@ export function App() {
         <button
           ref={menuBtnRef}
           class="menu-btn"
-          aria-label="Open menu"
+          aria-label={decisions > 0 ? `Open menu, ${decisions} ${decisions === 1 ? 'item needs' : 'items need'} you` : 'Open menu'}
           aria-haspopup="dialog"
           aria-expanded={drawerOpen}
-          onClick={() => { haptic('light'); setDrawerOpen(true); }}
+          onClick={() => { haptic('light'); openDrawer(); }}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <line x1="4" y1="7" x2="20" y2="7" /><line x1="4" y1="12" x2="20" y2="12" /><line x1="4" y1="17" x2="20" y2="17" />
@@ -352,21 +457,35 @@ export function App() {
               the hamburger carries it so the signal survives a closed menu. */}
           {decisions > 0 ? <span class="menu-badge">{decisions > 9 ? '9+' : decisions}</span> : null}
         </button>
-        <span class="brand-name app-title">{TAB_TITLES[tab]}</span>
+        <h1 ref={routeTitleRef} class="brand-name app-title" tabIndex={-1}>{TAB_TITLES[tab]}</h1>
         <div class="meta">
           {/* Compact running-work chip — the sheet's trigger, which must not
               float at the bottom now that the dock is gone. Absent at zero
               (presenter contract: the pill disappears when total is 0). */}
           <RunningTasksSheet />
-          <span class={`conn-pill conn-${door}`} title={DOOR_COPY[door].hint}>
+          <span
+            class={`conn-pill conn-${door}`}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            aria-label={`${DOOR_COPY[door].label}. ${DOOR_COPY[door].hint}`}
+            title={DOOR_COPY[door].hint}
+          >
             <span class="conn-dot" aria-hidden="true" />{DOOR_COPY[door].label}
           </span>
         </div>
       </header>
 
-      {drawerOpen ? (
-        <div class={`drawer-layer${drawerClosing ? ' closing' : ''}`} role="dialog" aria-modal="true" aria-label="Menu">
-          <button class="drawer-scrim" type="button" aria-label="Close menu" onClick={closeDrawer} />
+      {drawerOpen || drawerClosing ? (
+        <div
+          class={`drawer-layer${drawerClosing ? ' closing' : ''}`}
+          role={drawerClosing ? undefined : 'dialog'}
+          aria-modal={drawerClosing ? undefined : true}
+          aria-hidden={drawerClosing ? true : undefined}
+          inert={drawerClosing ? true : undefined}
+          aria-label={drawerClosing ? undefined : 'Menu'}
+        >
+          <button class="drawer-scrim" type="button" tabIndex={drawerClosing ? -1 : 0} aria-label="Close menu" onClick={() => closeDrawer()} />
           <aside
             ref={drawerRef}
             class="drawer"
@@ -393,6 +512,7 @@ export function App() {
             <div class="drawer-brand">
               <img class="brand-mark" src="/m/clemmy.png" alt="" width="32" height="32" />
               <span class="brand-name">Clementine</span>
+              <button class="drawer-close" type="button" aria-label="Close menu" onClick={() => closeDrawer()}>×</button>
             </div>
             <nav class="drawer-nav" aria-label="Sections">
               {TABS.map((t) => (
@@ -402,13 +522,13 @@ export function App() {
                   aria-current={tab === t.id ? 'page' : undefined}
                   onClick={() => {
                     if (tab !== t.id) haptic('light');
-                    setTab(t.id);
-                    closeDrawer();
+                    navigateTo(t.id);
+                    closeDrawer(false);
                   }}
                 >
                   <span class="drawer-item-icon">{t.icon}</span>
                   <span class="drawer-item-label">{t.label}</span>
-                  {t.id === 'home' && decisions > 0 ? (
+                  {t.id === 'inbox' && decisions > 0 ? (
                     <span class="drawer-badge">{decisions > 9 ? '9+' : decisions}</span>
                   ) : null}
                 </button>
@@ -422,8 +542,8 @@ export function App() {
                 aria-current={tab === 'settings' ? 'page' : undefined}
                 onClick={() => {
                   if (tab !== 'settings') haptic('light');
-                  setTab('settings');
-                  closeDrawer();
+                  navigateTo('settings');
+                  closeDrawer(false);
                 }}
               >
                 <span class="drawer-item-icon">
@@ -444,9 +564,19 @@ export function App() {
           {tab === 'home' ? (
             <Home
               name={name}
-              onAsk={(draft) => goToChat({ draft })}
+              onAsk={(draft) => goToChat({ draft, autoSend: true })}
               onOpenChat={(session) => goToChat({ session })}
-              onDecisionCount={setDecisions}
+              onOpenInbox={() => navigateTo('inbox')}
+              needsYouCount={decisions}
+              needsYouCountKnown={decisionsKnown}
+            />
+          ) : tab === 'inbox' ? (
+            <Inbox
+              initialNotificationId={inboxNotification}
+              onCount={setAuthoritativeDecisionCount}
+              onReply={(sessionId, draft) => goToChat({ sessionId: sessionId ?? undefined, draft })}
+              onOpenSettings={() => navigateTo('settings')}
+              onOpenWorkflows={() => navigateTo('workflows')}
             />
           ) : tab === 'chats' ? (
             <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
@@ -519,6 +649,7 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Clementine',
+  inbox: 'Inbox',
   chats: 'Chats',
   agents: 'Agents',
   spaces: 'Workspaces',
@@ -537,6 +668,15 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="m3 10 9-7 9 7v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M9 21V12h6v9" />
+      </svg>
+    ),
+  },
+  {
+    id: 'inbox',
+    label: 'Needs you',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <path d="M4 5h16v14H4z" /><path d="M4 14h4l2 3h4l2-3h4" />
       </svg>
     ),
   },

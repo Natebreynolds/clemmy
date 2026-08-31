@@ -5,7 +5,8 @@ import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
-import { chatApprovalReply, useChat, pendingActionFromEvent, type ChatMessage } from '@/lib/useChat';
+import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
+import { decidePlanProposal } from '@/lib/inbox';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
@@ -20,35 +21,7 @@ import { rawId } from '../lib/ids';
 import { originMeta } from '../lib/origin';
 import type { Session, Turn } from '../types';
 import { ReadOnlyNotice } from './ReadOnlyNotice';
-
-let seedSeq = 0;
-function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((t) => {
-    // A2 (v2.3.0): a still-pending approval the server attached renders as
-    // the real actionable card on reopen — not just the prose that pointed
-    // at a card somewhere else.
-    if (t.role === 'assistant' && t.approval) {
-      return {
-        id: `h${++seedSeq}`,
-        role: t.role,
-        text: t.text,
-        status: 'awaiting-approval' as const,
-        approval: {
-          subject: t.approval.subject,
-          reason: t.approval.reason,
-          approvalId: t.approval.approvalId,
-          pendingAction: pendingActionFromEvent(t.approval.pendingAction),
-        },
-      };
-    }
-    return {
-      id: `h${++seedSeq}`,
-      role: t.role,
-      text: t.text,
-      status: t.role === 'assistant' ? ('complete' as const) : undefined,
-    };
-  });
-}
+import { historyToMessages } from './conversation-history';
 
 function Header({ session }: { session: Session }) {
   const mutations = useSessionMutations();
@@ -110,6 +83,22 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
   };
 
+  const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
+    const intent = chatDecisionIntent(message, decision);
+    if (intent.kind === 'invalid-plan') throw new Error(intent.message);
+    if (intent.kind === 'approval-reply') {
+      await chat.send({ text: intent.text, attachmentIds: [], attachmentNames: [] });
+      return;
+    }
+    await decidePlanProposal(intent.planProposalId, intent.decision);
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: sessionKeys.detail(session.id) }),
+      qc.invalidateQueries({ queryKey: sessionKeys.lists() }),
+      qc.invalidateQueries({ queryKey: ['command-center'] }),
+      qc.invalidateQueries({ queryKey: ['plan-proposals'] }),
+    ]);
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
@@ -120,8 +109,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
             <ChatBubble
               key={m.id}
               message={m}
-              onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId), attachmentIds: [], attachmentNames: [] })}
-              onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId), attachmentIds: [], attachmentNames: [] })}
+              onApprove={() => resolveDecision(m, 'approve')}
+              onReject={() => resolveDecision(m, 'reject')}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
           ))}

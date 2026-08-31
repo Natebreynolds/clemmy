@@ -18,6 +18,7 @@ process.env.SLACK_ENABLED = 'false';
 process.env.WEBHOOK_ENABLED = 'false';
 
 const {
+  ambientComposioMonitorDisabledVerdict,
   bootAuthSetupSatisfied,
   bootModelWarmupEnabled,
   cliDiscoveryWarmupEnabled,
@@ -145,6 +146,40 @@ test('CLI discovery warmup is default-on but has an explicit recovery switch', (
     if (prior === undefined) delete process.env.CLEMMY_CLI_DISCOVERY_WARMUP;
     else process.env.CLEMMY_CLI_DISCOVERY_WARMUP = prior;
   }
+});
+
+test('ambient Composio boot verdict identity changes only with meaningful monitor policy', () => {
+  const calendar = { monitor: 'calendar' as const, intervalMinutes: 30, maxItems: 5 };
+  const inbox = { monitor: 'inbox' as const, intervalMinutes: 15, maxItems: 5 };
+  const canonical = ambientComposioMonitorDisabledVerdict([inbox, calendar]);
+  const reordered = ambientComposioMonitorDisabledVerdict([calendar, inbox]);
+  const irrelevantMetadataChanged = ambientComposioMonitorDisabledVerdict([
+    { ...calendar, updatedAt: '2026-08-30T12:00:00.000Z' },
+    inbox,
+  ]);
+  const cadenceChanged = ambientComposioMonitorDisabledVerdict([
+    inbox,
+    { ...calendar, intervalMinutes: 60 },
+  ]);
+  const monitorSetChanged = ambientComposioMonitorDisabledVerdict([inbox]);
+
+  assert.deepEqual(reordered, canonical, 'source enumeration order is not policy identity');
+  assert.deepEqual(irrelevantMetadataChanged, canonical, 'unowned metadata is not policy identity');
+  assert.notDeepEqual(cadenceChanged, canonical, 'an active monitor cadence changes the verdict');
+  assert.notDeepEqual(monitorSetChanged, canonical, 'the active monitor set changes the verdict');
+
+  const sourceFile = parseSource('runner.ts', RUNNER_SOURCE);
+  const startDaemon = namedFunction(sourceFile, 'startDaemon');
+  const oncePublications = callsNamed(startDaemon, 'recordOperationalEventOnce');
+  assert.equal(oncePublications.length, 1, 'ambient boot telemetry has exactly one insert-once publication');
+  const [publication] = oncePublications;
+  assert.ok(
+    publication.arguments.some((argument) => (
+      ts.isCallExpression(argument)
+      && callName(argument) === 'ambientComposioMonitorDisabledVerdict'
+    )),
+    'insert-once identity must be built from the canonical ambient monitor policy',
+  );
 });
 
 test('BYO all_in satisfies the boot auth check without an OpenAI key', () => {

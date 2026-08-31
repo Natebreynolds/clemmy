@@ -77,7 +77,10 @@ test('parseDesktopPendingResponse normalizes rows and drops malformed ones', () 
   const parsed = parseDesktopPendingResponse({
     now: '2026-07-22T10:00:00.000Z',
     items: [
-      { id: 'a', title: 'Hi', body: 'there', createdAt: '2026-07-22T09:59:00.000Z', kind: 'approval' },
+      {
+        id: 'a', title: 'Hi', body: 'there', createdAt: '2026-07-22T09:59:00.000Z', kind: 'approval',
+        href: '/inbox?tab=needs&select=approval-a', markReadOnOpen: false,
+      },
       { id: '   ', title: 'blank id dropped' },
       { title: 'missing id dropped' },
       'not an object',
@@ -87,9 +90,27 @@ test('parseDesktopPendingResponse normalizes rows and drops malformed ones', () 
   assert.equal(parsed.now, '2026-07-22T10:00:00.000Z');
   assert.deepEqual(parsed.items.map((i) => i.id), ['a', 'b']);
   assert.equal(parsed.items[0].kind, 'approval');
+  assert.equal(parsed.items[0].href, '/inbox?tab=needs&select=approval-a');
+  assert.equal(parsed.items[0].markReadOnOpen, false);
   // Defaults fill in when fields are absent.
   assert.equal(parsed.items[1].title, 'Clementine');
   assert.equal(parsed.items[1].body, '');
+  assert.equal(parsed.items[1].markReadOnOpen, true);
+});
+
+test('desktop toast navigation accepts only the first-party Inbox route', () => {
+  const parsed = parseDesktopPendingResponse({
+    items: [
+      { id: 'safe', href: '/inbox?tab=needs&select=gate' },
+      { id: 'external', href: 'https://evil.example/inbox' },
+      { id: 'protocol-relative', href: '//evil.example/inbox' },
+      { id: 'other-local', href: '/settings' },
+    ],
+  });
+  assert.equal(parsed.items.find((row) => row.id === 'safe')?.href, '/inbox?tab=needs&select=gate');
+  assert.equal(parsed.items.find((row) => row.id === 'external')?.href, undefined);
+  assert.equal(parsed.items.find((row) => row.id === 'protocol-relative')?.href, undefined);
+  assert.equal(parsed.items.find((row) => row.id === 'other-local')?.href, undefined);
 });
 
 test('parseDesktopPendingResponse tolerates junk payloads', () => {

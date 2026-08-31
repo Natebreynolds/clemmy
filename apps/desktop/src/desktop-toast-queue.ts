@@ -15,6 +15,10 @@ export interface DesktopPendingNotification {
   body: string;
   createdAt: string;
   kind?: string;
+  /** Authenticated first-party route to focus when the toast is opened. */
+  href?: string;
+  /** False for unresolved decisions/gates: opening is not settlement. */
+  markReadOnOpen?: boolean;
 }
 
 /** At most this many individual native toasts per poll cycle (burst safety). */
@@ -38,6 +42,17 @@ export interface DesktopToastPlan {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function safeInboxHref(value: unknown): string | undefined {
+  if (!isNonEmptyString(value)) return undefined;
+  try {
+    const parsed = new URL(value, 'http://clementine.local');
+    if (parsed.origin !== 'http://clementine.local' || parsed.pathname !== '/inbox') return undefined;
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -66,6 +81,8 @@ export function parseDesktopPendingResponse(payload: unknown): {
         body: typeof row.body === 'string' ? row.body : '',
         createdAt: isNonEmptyString(row.createdAt) ? row.createdAt : new Date().toISOString(),
         kind: isNonEmptyString(row.kind) ? row.kind : undefined,
+        href: safeInboxHref(row.href),
+        markReadOnOpen: typeof row.markReadOnOpen === 'boolean' ? row.markReadOnOpen : true,
       });
     }
   }

@@ -159,7 +159,7 @@ import { promoteWorkflowFromSession } from '../tools/orchestration-tools.js';
 import { resolveRealtimeVad, buildRealtimeSessionConfig, VOICE_DELIVERY_INSTRUCTIONS } from './realtime-session-config.js';
 import { ExecutionStore } from '../execution/store.js';
 import { isReservedProjectWorkflowRunRecord } from '../execution/compiled-project-run-contract.js';
-import { listOpenCheckIns, closeCheckIn } from '../agents/check-ins.js';
+import { closeCheckIn } from '../agents/check-ins.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import type { AssistantRequest, ExecutionRecord, PendingApproval } from '../types.js';
 import { buildRealtimeVoiceInstructions } from '../assistant/voice-context.js';
@@ -277,6 +277,11 @@ import {
 } from '../agents/goal-drafts.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import {
+  answerInboxQuestion,
+  listActionableCheckIns,
+  listInboxQuestions,
+} from '../execution/inbox-questions.js';
+import {
   parseGoalCommand,
   handleGoalContractCommand,
 } from '../agents/goal-commands.js';
@@ -333,7 +338,8 @@ import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
 import { enqueueDurableChatTask, renderDurableTaskQueued, shouldPromoteToDurable, detectBackgroundItIntent, detachRunningTurnToBackground } from '../execution/background-promote.js';
 import { getBackgroundTaskStatus } from '../execution/background-task-status.js';
 import { archiveRun, finishRun, getRun, listRuns } from '../runtime/run-events.js';
-import { addNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { addNotification, getNotification, isNeedsAttentionNotification, listNotifications, markNotificationGroupRead, markNotificationRead, markStaleApprovalNotificationsRead } from '../runtime/notifications.js';
+import { projectWorkflowCapabilityInboxGate } from '../execution/workflow-capability-inbox.js';
 import { actionBus, type ActionEvent } from '../runtime/action-bus.js';
 import { applySessionMountPrimers, composeSessionFromStore } from '../runtime/harness/session-composition.js';
 import {
@@ -532,7 +538,10 @@ import {
   resolveWorkflowDefinitionForRun,
   resumeCapabilityBlockedWorkflowRun,
   resumeMutationBlockedWorkflowRun,
+  resolveWorkflowCapabilityAccountChoice,
+  resolveWorkflowCapabilityRetry,
 } from '../execution/workflow-runner.js';
+import { requestWorkflowRunDrainKick } from '../execution/workflow-origin-group.js';
 import {
   findCatalogEntry,
   forgetConnectedCli,
@@ -10035,6 +10044,69 @@ export function registerConsoleRoutes(
     res.json({ goal: summarizeGoal(goal), ...buildGoalsPayload('all') });
   });
 
+  // ─── Exact questions (check-ins, background tasks, workflows) ──
+
+  app.get('/api/console/inbox/questions', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const questions = listInboxQuestions();
+      res.json({ questions, count: questions.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/inbox/questions/:id/answer', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const answer = typeof req.body?.answer === 'string' ? req.body.answer.trim().slice(0, 4_000) : '';
+    if (!answer) { res.status(400).json({ error: 'answer required' }); return; }
+    const result = answerInboxQuestion({
+      id: req.params.id,
+      answer,
+      requestId: `desktop-inbox:${Date.now()}:${randomBytes(6).toString('hex')}`,
+      surface: 'desktop',
+    });
+    if (result.status === 'answered' || result.status === 'resuming') { res.json(result); return; }
+    if (result.status === 'not_found') { res.status(404).json({ error: 'question not found', ...result }); return; }
+    if (result.status === 'requires_origin') {
+      res.status(409).json({ error: 'question requires its authorized origin conversation', ...result });
+      return;
+    }
+    if (result.status === 'storage_error') { res.status(503).json({ error: result.reason, ...result }); return; }
+    res.status(409).json({ error: 'question already answered or superseded', ...result });
+  });
+
+  app.post('/api/console/inbox/workflow-capabilities/:runId/resolve', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const runId = req.params.runId;
+    const action = req.body?.action;
+    const common = {
+      runId,
+      stepId: typeof req.body?.stepId === 'string' ? req.body.stepId : '',
+      tool: typeof req.body?.tool === 'string' ? req.body.tool : '',
+      retryCount: req.body?.retryCount,
+      selectedBy: 'desktop-inbox',
+    };
+    const result = action === 'choose_account'
+      ? resolveWorkflowCapabilityAccountChoice({
+          ...common,
+          choiceSetDigest: typeof req.body?.choiceSetDigest === 'string' ? req.body.choiceSetDigest : '',
+          capabilityId: typeof req.body?.capabilityId === 'string' ? req.body.capabilityId : '',
+          accountId: typeof req.body?.accountId === 'string' ? req.body.accountId : '',
+        })
+      : action === 'retry'
+        ? resolveWorkflowCapabilityRetry(common)
+        : null;
+    if (!result) { res.status(400).json({ error: 'action must be choose_account or retry' }); return; }
+    if (!result.ok) {
+      const status = result.status === 'invalid_request' ? 400 : result.status === 'run_unavailable' ? 404 : 409;
+      res.status(status).json({ error: result.message, status: result.status });
+      return;
+    }
+    requestWorkflowRunDrainKick([runId]);
+    res.json(result);
+  });
+
   // ─── Plan proposals (Planner sub-agent → user review) ──────────
 
   app.get('/api/console/plan-proposals', (req, res) => {
@@ -10221,9 +10293,19 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/trust-proposals/:id/approve', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const scopeRevision = Number(req.body?.scopeRevision);
+    const scopeDigest = typeof req.body?.scopeDigest === 'string' ? req.body.scopeDigest.trim() : '';
+    if (scopeRevision !== 1 || !/^sha256:[a-f0-9]{64}$/.test(scopeDigest)) {
+      res.status(400).json({ error: 'the exact rendered trust scope revision and digest are required' });
+      return;
+    }
     try {
-      const result = approveTrustProposal(req.params.id, 'desktop');
+      const result = approveTrustProposal(req.params.id, 'desktop', { scopeRevision, scopeDigest });
       if (result.reason === 'not-found') { res.status(404).json({ error: 'proposal not found' }); return; }
+      if (!result.ok) {
+        res.status(409).json(result);
+        return;
+      }
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -10232,9 +10314,19 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/trust-proposals/:id/decline', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const scopeRevision = Number(req.body?.scopeRevision);
+    const scopeDigest = typeof req.body?.scopeDigest === 'string' ? req.body.scopeDigest.trim() : '';
+    if (scopeRevision !== 1 || !/^sha256:[a-f0-9]{64}$/.test(scopeDigest)) {
+      res.status(400).json({ error: 'the exact rendered trust scope revision and digest are required' });
+      return;
+    }
     try {
-      const result = declineTrustProposal(req.params.id, 'desktop');
+      const result = declineTrustProposal(req.params.id, 'desktop', { scopeRevision, scopeDigest });
       if (result.reason === 'not-found') { res.status(404).json({ error: 'proposal not found' }); return; }
+      if (!result.ok) {
+        res.status(409).json(result);
+        return;
+      }
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -13018,7 +13110,20 @@ export function registerConsoleRoutes(
         .filter((n) => !n.silent && !n.read)
         .filter((n) => !Number.isFinite(since) || Date.parse(n.createdAt) > since)
         .slice(0, 5)
-        .map((n) => ({ id: n.id, title: n.title, body: (n.body || '').slice(0, 300), createdAt: n.createdAt, kind: n.kind }));
+        .map((n) => {
+          const needsAttention = isNeedsAttentionNotification(n);
+          return {
+            id: n.id,
+            title: n.title,
+            body: (n.body || '').slice(0, 300),
+            createdAt: n.createdAt,
+            kind: n.kind,
+            href: `/inbox?tab=${needsAttention ? 'needs' : 'notifications'}&select=${encodeURIComponent(n.id)}`,
+            // Opening an actionable card is navigation, not resolution. Keep
+            // its durable carrier until the exact owning authority settles it.
+            markReadOnOpen: !needsAttention,
+          };
+        });
       res.json({ items, now: new Date().toISOString() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -13027,7 +13132,20 @@ export function registerConsoleRoutes(
   app.post('/api/console/notifications/:id/read', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      markNotificationRead(String(req.params.id));
+      const id = String(req.params.id);
+      const existing = getNotification(id);
+      if (
+        existing
+        && !existing.read
+        && projectWorkflowCapabilityInboxGate(existing)
+      ) {
+        res.status(409).json({
+          error: 'workflow capability gate requires an exact Inbox resolution',
+          href: `/inbox?tab=needs&select=${encodeURIComponent(id)}`,
+        });
+        return;
+      }
+      markNotificationRead(id);
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -13081,7 +13199,8 @@ export function registerConsoleRoutes(
         .filter(approvalRegistry.isFormalApprovalSurface);
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
-      const openCheckIns = listOpenCheckIns();
+      const inboxQuestions = listInboxQuestions();
+      const openCheckIns = listActionableCheckIns();
       // For WORKING NOW we only want executions the daemon is RUNNING
       // right now. Blocked/paused are stalled — they show in Activity.
       // RECENCY guard (live 2026-07-08): a failed turn's execution record can
@@ -13216,6 +13335,7 @@ export function registerConsoleRoutes(
           meta: `plan ${proposal.id}`,
           panel: 'settings',
           urgency: 'high',
+          planProposalId: proposal.id,
           dismissKind: 'plan',
           dismissId: proposal.id,
         })),
@@ -13228,14 +13348,16 @@ export function registerConsoleRoutes(
           dismissKind: 'proposal',
           dismissId: proposal.id,
         })),
-        ...openCheckIns.map((checkIn) => ({
-          kind: 'checkin',
-          title: checkIn.question || '(check-in)',
-          meta: checkIn.urgency !== 'normal' ? `${checkIn.urgency} · ${checkIn.askedAt.slice(11, 16)}` : `asked ${checkIn.askedAt.slice(11, 16)}`,
+        ...inboxQuestions.map((question) => ({
+          kind: 'question',
+          title: question.question || '(question)',
+          meta: `${question.agentLabel} · ${question.answerable ? 'answer to resume' : 'open authorized origin'}`,
           panel: 'settings',
-          urgency: checkIn.urgency === 'high' ? 'high' : 'normal',
-          dismissKind: 'checkin',
-          dismissId: checkIn.id,
+          urgency: question.urgency === 'high' ? 'high' : 'normal',
+          questionId: question.id,
+          ...(question.source === 'check_in'
+            ? { dismissKind: 'checkin' as const, dismissId: question.id.slice('checkin:'.length) }
+            : {}),
         })),
         ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval' && !task.pendingApprovalId).map((task) => ({
           kind: 'background',
@@ -13881,7 +14003,7 @@ export function registerConsoleRoutes(
 
       // Open check-ins — these are waiting on the user, surface FIRST.
       try {
-        const open = listOpenCheckIns();
+        const open = listActionableCheckIns();
         for (const c of open) {
           agenda.push({
             kind: 'checkin',

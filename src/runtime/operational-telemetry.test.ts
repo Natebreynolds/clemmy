@@ -11,10 +11,12 @@ import {
   OPERATIONAL_TELEMETRY_SCHEMA_SQL,
   SAFETY_OPERATIONAL_EVENT_TYPES,
   recordOperationalEvent,
+  recordOperationalEventOnce,
   TOOL_OPERATIONAL_EVENT_TYPES,
   WORKFLOW_OPERATIONAL_EVENT_TYPES,
   WORKSPACE_OPERATIONAL_EVENT_TYPES,
 } from './operational-telemetry.js';
+import { actionBus } from './action-bus.js';
 
 test('operational event taxonomy includes release-critical graph and routing events', () => {
   for (const type of [
@@ -166,6 +168,72 @@ test('recordOperationalEvent persists redacted envelopes and list filters them',
     assert.equal(events[0].payload.toolName, 'send_email');
     assert.notEqual(events[0].payload.apiKey, 'secret-value');
   } finally {
+    db.close();
+  }
+});
+
+test('semantic once-publications preserve the first row and split on changed policy', () => {
+  const db = new Database(':memory:');
+  const emitted: string[] = [];
+  const unsubscribe = actionBus.subscribe((event) => {
+    if (event.kind === 'operational.event') emitted.push(event.event.eventId);
+  });
+  try {
+    db.exec(OPERATIONAL_TELEMETRY_SCHEMA_SQL);
+    const unchangedVerdict = {
+      source: 'harness' as const,
+      type: 'gate_verdict' as const,
+      severity: 'warn' as const,
+      actor: 'daemon-boot',
+      payload: {
+        gate: 'composio_ambient_monitor_prepared_authority',
+        decision: 'disabled',
+        monitors: ['calendar', 'inbox'],
+        monitorPolicy: [
+          { monitor: 'calendar', intervalMinutes: 30, maxItems: 5 },
+          { monitor: 'inbox', intervalMinutes: 15, maxItems: 5 },
+        ],
+        reason: 'prepared_read_authority_unavailable',
+      },
+    };
+
+    const first = recordOperationalEventOnce({
+      ...unchangedVerdict,
+      now: new Date('2026-08-30T10:00:00.000Z'),
+    }, db);
+    const firstRowBytes = JSON.stringify(db.prepare(
+      'SELECT * FROM operational_events ORDER BY event_id',
+    ).all());
+    const duplicate = recordOperationalEventOnce({
+      ...unchangedVerdict,
+      now: new Date('2026-08-30T11:00:00.000Z'),
+    }, db);
+    const duplicateRowBytes = JSON.stringify(db.prepare(
+      'SELECT * FROM operational_events ORDER BY event_id',
+    ).all());
+
+    assert.deepEqual(duplicate, first, 'duplicate publication returns the durable first observation');
+    assert.equal(duplicateRowBytes, firstRowBytes, 'duplicate publication does not replace any row bytes');
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM operational_events').get().count, 1);
+    assert.deepEqual(emitted, [], 'an explicit external DB never leaks test publications onto the live bus');
+
+    const changed = recordOperationalEventOnce({
+      ...unchangedVerdict,
+      now: new Date('2026-08-30T12:00:00.000Z'),
+      payload: {
+        ...unchangedVerdict.payload,
+        monitorPolicy: [
+          { monitor: 'calendar', intervalMinutes: 60, maxItems: 5 },
+          { monitor: 'inbox', intervalMinutes: 15, maxItems: 5 },
+        ],
+      },
+    }, db);
+
+    assert.notEqual(changed.eventId, first.eventId, 'a meaningful monitor-policy change is a new verdict');
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM operational_events').get().count, 2);
+    assert.deepEqual(emitted, [], 'external-DB changed publications also stay off the live bus');
+  } finally {
+    unsubscribe();
     db.close();
   }
 });

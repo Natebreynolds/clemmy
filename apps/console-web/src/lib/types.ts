@@ -60,6 +60,11 @@ export interface CommandCenterItem {
   urgency?: string;
   approvalKind?: 'runtime' | 'harness';
   approvalId?: string;
+  /** Exact durable plan card identity. */
+  planProposalId?: string;
+  /** Exact global Inbox question coordinate (`checkin:`, `task:`, or
+   * `workflow:<run>|<question>`). */
+  questionId?: string;
   targetSessionId?: string;
   /** Backing notification id for needs-attention cards — deep-links to the
    *  Inbox Notifications tab. */

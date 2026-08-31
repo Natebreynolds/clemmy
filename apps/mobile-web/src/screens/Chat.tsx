@@ -41,10 +41,12 @@ interface Props {
   initialTitle?: string;
   /** Text typed on Home's ask bar, waiting in the composer on arrival. */
   initialDraft?: string;
+  /** Only Home's explicit Send handoff uses this; response/edit handoffs stay editable. */
+  initialAutoSend?: boolean;
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAutoSend, onBack }: Props) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   const [title, setTitle] = useState(initialTitle ?? '');
   const [draft, setDraft] = useState(initialDraft ?? '');
@@ -68,6 +70,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   useEffect(loadBrain, []);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const autoSent = useRef(false);
 
   const engine = useMemo(() => new ChatEngine({
     transport: createChatStreamTransport(),
@@ -122,6 +125,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     };
   }, [engine]);
 
+  useEffect(() => {
+    const text = initialDraft?.trim();
+    if (!initialAutoSend || !text || autoSent.current) return;
+    autoSent.current = true;
+    setDraft('');
+    haptic('light');
+    void engine.send(text);
+  }, [engine, initialAutoSend, initialDraft]);
+
   const messages = snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
   const connection = snapshot?.connection ?? 'idle';
@@ -130,6 +142,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // indicator rather than a control that would silently do nothing.
   const cancelKey = snapshot?.cancelKey ?? null;
   const canStop = busy && Boolean(snapshot?.sessionId);
+  const followingTail = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
   useEffect(() => { if (!busy) setStopping(false); }, [busy]);
 
@@ -151,8 +165,35 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }
 
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const transcript = scrollRef.current;
+    if (!transcript) return;
+    if (followingTail.current) {
+      transcript.scrollTop = transcript.scrollHeight;
+      setShowJumpToLatest(false);
+    } else {
+      setShowJumpToLatest(true);
+    }
   }, [messages]);
+
+  function updateTailState() {
+    const transcript = scrollRef.current;
+    if (!transcript) return;
+    const nearTail = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 72;
+    followingTail.current = nearTail;
+    if (nearTail) setShowJumpToLatest(false);
+  }
+
+  function jumpToLatest() {
+    const transcript = scrollRef.current;
+    if (!transcript) return;
+    followingTail.current = true;
+    transcript.scrollTo({
+      top: transcript.scrollHeight,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    });
+    setShowJumpToLatest(false);
+    haptic('light');
+  }
 
   function autoresize(el: HTMLTextAreaElement) {
     el.style.height = 'auto';
@@ -215,7 +256,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     <div class="chat-shell">
       <div class="chat-header">
         <button class="chat-back" onClick={onBack} aria-label="Back">←</button>
-        <div class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</div>
+        <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
         {brainLabel ? (
           <button
             type="button"
@@ -244,7 +285,14 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <div class="conn-pill conn-detached">catching up in the background</div>
         ) : null}
       </div>
-      <div class="chat-transcript" ref={scrollRef}>
+      <div
+        class="chat-transcript"
+        ref={scrollRef}
+        role="log"
+        aria-live="off"
+        aria-label="Conversation"
+        onScroll={updateTailState}
+      >
         {error ? <div class="global-error">{error}</div> : null}
         {messages.length === 0 ? (
           <div class="inbox-empty">
@@ -266,11 +314,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           />
         ))}
       </div>
+      {showJumpToLatest ? (
+        <button type="button" class="chat-jump" onClick={jumpToLatest}>Jump to latest</button>
+      ) : null}
       <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
         <textarea
           ref={textareaRef}
           class="chat-input"
           rows={1}
+          aria-label="Message Clem"
           placeholder="Message Clem…"
           value={draft}
           onInput={(ev) => {
@@ -279,6 +331,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             autoresize(el);
           }}
           onKeyDown={(ev) => {
+            if (ev.isComposing) return;
             if (ev.key === 'Enter' && !ev.shiftKey) {
               ev.preventDefault();
               submitDraft();
@@ -376,11 +429,11 @@ function MessageRow({
               disabled={approvalActing !== null}
               onClick={() => onApprovalAction(approvalId, 'reject')}
             >
-              {approvalActing === approvalId ? '…' : 'Not now'}
+              {approvalActing === approvalId ? '…' : 'Don’t do this'}
             </button>
           </div>
         ) : !approvalId ? (
-          <div class="approval-reason">Open “Needs you” on Home to act on this.</div>
+          <div class="approval-reason">Open “Needs you” from the menu to act on this.</div>
         ) : null}
       </div>
     );

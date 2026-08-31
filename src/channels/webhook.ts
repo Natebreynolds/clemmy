@@ -76,6 +76,9 @@ import {
 } from '../runtime/http-origin-guard.js';
 import {
   addNotification,
+  getNotification,
+  isNeedsAttentionNotification,
+  loadNotifications,
   listNotifications,
   listNotificationDestinations,
   markNotificationRead,
@@ -84,6 +87,7 @@ import {
   removeNotificationDestination,
   upsertNotificationDestination,
 } from '../runtime/notifications.js';
+import { projectWorkflowCapabilityInboxGate } from '../execution/workflow-capability-inbox.js';
 import { buildNotificationDoctor } from '../runtime/notification-doctor.js';
 import { testNotificationDestination } from '../runtime/notification-delivery.js';
 import { runChannelAcceptance } from '../runtime/channel-acceptance.js';
@@ -1812,11 +1816,33 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     // anchors with an empty detail pane.
     const rawLimit = Number(req.query.limit);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 300) : 50;
-    res.json({ notifications: listNotifications(limit) });
+    const allNotifications = loadNotifications()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const actionable = allNotifications.filter((row) => !row.read && isNeedsAttentionNotification(row));
+    const actionableIds = new Set(actionable.map((row) => row.id));
+    const prioritized = [
+      ...actionable,
+      ...allNotifications.filter((row) => !actionableIds.has(row.id)),
+    ].slice(0, limit);
+    res.json({
+      notifications: prioritized.map((notification) => ({
+        ...notification,
+        needsAttention: isNeedsAttentionNotification(notification),
+        workflowCapability: projectWorkflowCapabilityInboxGate(notification),
+      })),
+    });
   });
 
   app.post('/api/notifications/:id/read', requireAuth, (req, res) => {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const existing = getNotification(id);
+    if (existing && !existing.read && projectWorkflowCapabilityInboxGate(existing)) {
+      res.status(409).json({
+        error: 'workflow capability gate requires an exact Inbox resolution',
+        href: `/inbox?tab=needs&select=${encodeURIComponent(id)}`,
+      });
+      return;
+    }
     const notification = markNotificationRead(id);
     if (!notification) {
       res.status(404).json({ error: 'Notification not found' });

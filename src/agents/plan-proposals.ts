@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { addNotification } from '../runtime/notifications.js';
+import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 import { goalProspectiveDefinition } from '../runtime/prospective-adapters.js';
 import {
   cancelProspectiveIntention,
@@ -177,6 +178,19 @@ export interface PlanProposal {
    * approved. The original `plan` field is preserved for audit.
    */
   approvedPlan?: Plan;
+  /**
+   * Durable intent created in the SAME locked write that accepts a surfaced
+   * plan for background execution. The task id is derived from the proposal,
+   * so a click replay or daemon restart can claim-or-rejoin one worker instead
+   * of inventing another. `completedAt` means the task/run/notification
+   * projections were all observed; the intent remains for audit and replay.
+   */
+  backgroundAdmission?: {
+    version: 1;
+    taskId: string;
+    requestedAt: string;
+    completedAt?: string;
+  };
   /**
    * Discriminator. Default (absent) === 'plan' — an ordinary drafted plan.
    * 'workflow_pending_inputs' is the ask-then-resume record: a workflow that
@@ -569,20 +583,49 @@ export interface ApprovePlanProposalOptions {
   allowedSends?: string[];
 }
 
-export function approvePlanProposal(id: string, options: ApprovePlanProposalOptions = {}): PlanProposal | null {
-  const proposal = readProposal(id);
-  if (!proposal) return null;
-  if (proposal.status !== 'pending') return null;
-  const approvedPlan = options.editedPlan ?? proposal.plan;
-  if (planNeedsUserInput(approvedPlan)) return null;
-  const resolved: PlanProposal = {
-    ...proposal,
-    status: 'approved',
-    resolvedAt: new Date().toISOString(),
-    resolvedBy: 'user',
-    approvedPlan,
-  };
-  writeProposal(resolved);
+let backgroundApprovalWriteFaultForTests: (() => void) | null = null;
+
+/** Test-only process-death seam at the exact approval-write boundary. */
+export function _setBackgroundApprovalWriteFaultForTests(fn: (() => void) | null): void {
+  backgroundApprovalWriteFaultForTests = fn;
+}
+
+interface BackgroundAdmissionRequest {
+  taskId: string;
+}
+
+function approvePlanProposalInternal(
+  id: string,
+  options: ApprovePlanProposalOptions,
+  backgroundAdmission?: BackgroundAdmissionRequest,
+): PlanProposal | null {
+  ensureDir(PROPOSALS_DIR);
+  const claimed = withFileLockSyncStrict(proposalPath(id), () => {
+    const proposal = readProposal(id);
+    if (!proposal || proposal.status !== 'pending') return null;
+    const approvedPlan = options.editedPlan ?? proposal.plan;
+    if (planNeedsUserInput(approvedPlan)) return null;
+    const resolvedAt = new Date().toISOString();
+    const resolved: PlanProposal = {
+      ...proposal,
+      status: 'approved',
+      resolvedAt,
+      resolvedBy: 'user',
+      approvedPlan,
+      ...(backgroundAdmission ? {
+        backgroundAdmission: {
+          version: 1 as const,
+          taskId: backgroundAdmission.taskId,
+          requestedAt: resolvedAt,
+        },
+      } : {}),
+    };
+    writeProposal(resolved);
+    if (backgroundAdmission) backgroundApprovalWriteFaultForTests?.();
+    return { proposal, approvedPlan, resolved };
+  });
+  if (!claimed) return null;
+  const { proposal, approvedPlan, resolved } = claimed;
 
   // Open a plan-scope so the next batch of tool calls (run_shell_command,
   // write_file) doesn't have to interrupt for per-call approval. The
@@ -621,7 +664,7 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   }
 
   addNotification({
-    id: `${Date.now()}-plan-proposal-${proposal.id}-approved`,
+    id: `plan-proposal-${proposal.id}-approved`,
     kind: 'system',
     title: `Plan approved: ${proposal.plan.objective.slice(0, 80)}`,
     body: [
@@ -630,7 +673,7 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
         ? `Auto-approval window open until ${scopeExpiresAt} for shell + file-write actions inside this plan. You can revoke from the dashboard.`
         : 'The agent will continue to ask before each shell or file-write action.',
     ].join(' '),
-    createdAt: new Date().toISOString(),
+    createdAt: resolved.resolvedAt ?? new Date().toISOString(),
     read: false,
     silent: true,
     metadata: { planProposalId: proposal.id, sessionId: proposal.sessionId, kind: 'plan_proposal' },
@@ -698,19 +741,69 @@ export function approvePlanProposal(id: string, options: ApprovePlanProposalOpti
   return resolved;
 }
 
+export function approvePlanProposal(id: string, options: ApprovePlanProposalOptions = {}): PlanProposal | null {
+  return approvePlanProposalInternal(id, options);
+}
+
+/**
+ * Background-approval front door. Unlike a generic conversational approval,
+ * this atomically records the stable worker reservation with the decision.
+ */
+export function approvePlanProposalForBackgroundTask(
+  id: string,
+  taskId: string,
+  options: ApprovePlanProposalOptions = {},
+): PlanProposal | null {
+  if (!taskId.trim()) return null;
+  return approvePlanProposalInternal(id, options, { taskId: taskId.trim() });
+}
+
+/** Monotonic admission acknowledgement; never rewrites plan or goal fields. */
+export function completePlanBackgroundAdmission(
+  id: string,
+  taskId: string,
+  completedAt = new Date().toISOString(),
+): PlanProposal | null {
+  ensureDir(PROPOSALS_DIR);
+  return withFileLockSyncStrict(proposalPath(id), () => {
+    const current = readProposal(id);
+    if (!current || current.backgroundAdmission?.taskId !== taskId) return null;
+    if (current.backgroundAdmission.completedAt) return current;
+    const updated: PlanProposal = {
+      ...current,
+      backgroundAdmission: {
+        ...current.backgroundAdmission,
+        completedAt,
+      },
+    };
+    writeProposal(updated);
+    return updated;
+  });
+}
+
 export function rejectPlanProposal(id: string, reason?: string): PlanProposal | null {
-  const proposal = readProposal(id);
-  if (!proposal) return null;
-  if (proposal.status !== 'pending') return proposal;
-  const resolved: PlanProposal = {
-    ...proposal,
-    status: 'rejected',
-    resolvedAt: new Date().toISOString(),
-    resolvedBy: 'user',
-    rejectionReason: reason?.trim() || undefined,
-  };
-  writeProposal(resolved);
-  logger.info({ proposalId: proposal.id, reason }, 'plan proposal rejected');
+  ensureDir(PROPOSALS_DIR);
+  const resolved = withFileLockSyncStrict(proposalPath(id), () => {
+    const proposal = readProposal(id);
+    if (!proposal) return null;
+    // An exact replay of the same terminal decision is truthful. Every other
+    // resolved state is a CAS loss: returning an approved/active/superseded row
+    // made HTTP/channel callers announce "rejected" even though work could
+    // already be running.
+    if (proposal.status === 'rejected') return proposal;
+    if (proposal.status !== 'pending') return null;
+    const rejected: PlanProposal = {
+      ...proposal,
+      status: 'rejected',
+      resolvedAt: new Date().toISOString(),
+      resolvedBy: 'user',
+      rejectionReason: reason?.trim() || undefined,
+    };
+    writeProposal(rejected);
+    return rejected;
+  });
+  if (!resolved) return null;
+  logger.info({ proposalId: resolved.id, reason }, 'plan proposal rejected');
   return resolved;
 }
 
@@ -728,18 +821,21 @@ export function deletePlanProposal(id: string): boolean {
  * negative feedback signal).
  */
 export function supersedePlanProposal(id: string, replacedBy?: string): PlanProposal | null {
-  const proposal = readProposal(id);
-  if (!proposal) return null;
-  if (proposal.status !== 'pending') return proposal;
-  const resolved: PlanProposal = {
-    ...proposal,
-    status: 'superseded',
-    resolvedAt: new Date().toISOString(),
-    resolvedBy: 'system',
-    rejectionReason: replacedBy ? `Replaced by ${replacedBy}` : undefined,
-  };
-  writeProposal(resolved);
-  return resolved;
+  ensureDir(PROPOSALS_DIR);
+  return withFileLockSyncStrict(proposalPath(id), () => {
+    const proposal = readProposal(id);
+    if (!proposal) return null;
+    if (proposal.status !== 'pending') return proposal;
+    const resolved: PlanProposal = {
+      ...proposal,
+      status: 'superseded',
+      resolvedAt: new Date().toISOString(),
+      resolvedBy: 'system',
+      rejectionReason: replacedBy ? `Replaced by ${replacedBy}` : undefined,
+    };
+    writeProposal(resolved);
+    return resolved;
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

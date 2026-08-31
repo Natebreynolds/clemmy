@@ -159,31 +159,49 @@ export function workflowProspectiveDefinitions(
 export function monitorProspectiveDefinitions(policy: ProactivityPolicy): ProspectiveIntentionDefinition[] {
   if (!policy.enabled) return [];
   const definitions: ProspectiveIntentionDefinition[] = [];
-  if (policy.inboxWatchEnabled) {
-    definitions.push({
-      id: prospectiveIntentionId('monitor', 'inbox'),
+  const pausedMonitor = (sourceId: 'inbox' | 'calendar', intervalMs: number): ProspectiveIntentionDefinition => {
+    const label = sourceId === 'inbox' ? 'inbox' : 'calendar';
+    return {
+      id: prospectiveIntentionId('monitor', sourceId),
       sourceKind: 'monitor',
-      sourceId: 'inbox',
-      objective: 'Watch connected inboxes and surface messages that genuinely need the user',
-      trigger: { kind: 'state', channel: 'inbox', intervalMs: policy.inboxWatchMinutes * 60_000 },
-      action: { kind: 'observe', ref: 'inbox-monitor' },
+      sourceId,
+      objective: `${label[0]!.toUpperCase()}${label.slice(1)} watch is paused until an exact read pilot is reviewed and approved`,
+      // There is no ambient source engine behind this legacy policy flag. A
+      // manual setup cue is honest; a state trigger would falsely project an
+      // active watch and could be mistaken for execution authority.
+      trigger: { kind: 'manual' },
+      action: {
+        kind: 'notify',
+        ref: 'automation_opportunity_propose',
+        summary: `Ask Clementine to prepare and request approval for an exact ${label} read pilot`,
+      },
       risk: 'read',
-      approvalMode: 'none',
-      recurring: true,
-    });
+      approvalMode: 'enforce_at_action',
+      recurring: false,
+      metadata: {
+        availability: 'paused',
+        reason: 'prepared_read_authority_unavailable',
+        requestedMonitor: sourceId,
+        requestedIntervalMs: intervalMs,
+        setupAction: {
+          kind: 'prepare_approved_read_pilot',
+          userPrompt: `Set up an approved ${label} read pilot`,
+          firstTool: 'automation_opportunity_propose',
+          authorityPath: [
+            'automation_opportunity_propose',
+            'automation_opportunity_review_request',
+            'automation_read_pilot_request',
+            'automation_recurrence_request',
+          ],
+        },
+      },
+    };
+  };
+  if (policy.inboxWatchEnabled) {
+    definitions.push(pausedMonitor('inbox', policy.inboxWatchMinutes * 60_000));
   }
   if (policy.calendarWatchEnabled) {
-    definitions.push({
-      id: prospectiveIntentionId('monitor', 'calendar'),
-      sourceKind: 'monitor',
-      sourceId: 'calendar',
-      objective: 'Watch connected calendars for conflicts, unanswered invitations, and imminent meetings',
-      trigger: { kind: 'state', channel: 'calendar', intervalMs: policy.calendarWatchMinutes * 60_000 },
-      action: { kind: 'observe', ref: 'calendar-monitor' },
-      risk: 'read',
-      approvalMode: 'none',
-      recurring: true,
-    });
+    definitions.push(pausedMonitor('calendar', policy.calendarWatchMinutes * 60_000));
   }
   return definitions;
 }

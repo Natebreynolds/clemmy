@@ -33,6 +33,11 @@ import {
   permanentlyDeleteSessionAuthorityPayloads,
 } from '../runtime/harness/dispatch-ledger.js';
 import { deriveTitle, humanizeReportBackTitle } from '../memory/derive-title.js';
+import {
+  listPlanProposals,
+  planProposalNeedsUserInput,
+  type PlanProposal,
+} from '../agents/plan-proposals.js';
 import type {
   SessionRecord,
   SessionOrigin,
@@ -368,9 +373,67 @@ function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
   const summary = summarizeHarness(summaryRow, runId && workflowName ? workflowName : undefined);
   const turns = reconstructHarnessDetailTurns(row);
   appendPendingApprovalTurns(row.id, turns);
+  // Only a continuable chat can own an inline plan decision. Workflow,
+  // execution, and agent transcripts are intentionally read-only; attaching
+  // an Approve card there would paint a gate whose handlers are no-ops.
+  if (row.kind === 'chat') appendPendingPlanProposalTurns(row.id, turns);
   summary.turnCount = turns.length;
   summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
   return { session: summary, turns, continueHint: continueHintFor(summary, row.id) };
+}
+
+function reopenedPlanText(proposal: PlanProposal): string {
+  const objective = clip(proposal.plan.objective || proposal.originatingRequest || 'Review this plan', 260);
+  const steps = proposal.plan.steps
+    .slice(0, 12)
+    .map((step) => `${step.n}. ${clip(step.action, 220)}`)
+    .join('\n');
+  return [
+    'I drafted this plan for review before I start.',
+    '',
+    `Goal: ${objective}`,
+    steps ? `\nWhat I will do:\n${steps}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Restore still-pending, approvable plan cards when a harness conversation is
+ * reopened. The plan registry is the current authority: resolved, rejected,
+ * superseded, held, and question-bearing plans never regain approval buttons.
+ */
+function appendPendingPlanProposalTurns(sessionId: string, turns: UnifiedSessionTurn[]): void {
+  try {
+    const proposals = listPlanProposals({ status: 'pending', sessionId, limit: 50 })
+      .filter((proposal) => proposal.kind !== 'workflow_pending_inputs')
+      .filter((proposal) => proposal.heldForLater !== true)
+      .filter((proposal) => !planProposalNeedsUserInput(proposal))
+      .sort((left, right) => left.proposedAt.localeCompare(right.proposedAt));
+    const pendingById = new Map(proposals.map((proposal) => [proposal.id, proposal]));
+
+    // Current plan-first terminals already carry their exact proposal id.
+    // Retain that id on the original assistant turn so reopen shows one plan
+    // description in its real timeline, not a duplicated synthetic card at the
+    // bottom. Resolved/stale ids lose actionability but keep their prose.
+    for (const turn of turns) {
+      if (!turn.planProposalId) continue;
+      if (pendingById.delete(turn.planProposalId)) continue;
+      delete turn.planProposalId;
+    }
+
+    // Rolling-upgrade and old pre-terminal records may have a pending proposal
+    // without planProposalId in their event. Only those need a synthetic card.
+    for (const proposal of pendingById.values()) {
+      turns.push({
+        role: 'assistant',
+        text: reopenedPlanText(proposal),
+        createdAt: proposal.proposedAt,
+        planProposalId: proposal.id,
+      });
+    }
+  } catch {
+    // A damaged optional proposal registry must not make conversation history
+    // unreadable. The Inbox retains its own explicit error surface.
+  }
 }
 
 /**

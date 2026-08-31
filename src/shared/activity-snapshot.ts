@@ -28,7 +28,7 @@ import {
 } from '../dashboard/activity-projection.js';
 import { loadCronJobs, loadWorkflows } from '../dashboard/state.js';
 import { getNextRun } from './cron.js';
-import { listOpenCheckIns } from '../agents/check-ins.js';
+import { listInboxQuestions } from '../execution/inbox-questions.js';
 import { listGoalDrafts } from '../agents/goal-drafts.js';
 import { listPlanProposals, planProposalNeedsUserInput } from '../agents/plan-proposals.js';
 
@@ -272,11 +272,12 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
   // ── "Waiting on you": the consolidated set genuinely blocked on the user.
   // Kept in lockstep with the Slack App Home formula so every surface agrees.
   const needsYouCount = safe(() => listPendingHarnessApprovals().length, 0)
-    + safe(() => listOpenCheckIns().length, 0)
+    // Unified questions dedupe an exact linked check-in/task pair and omit
+    // stale generations. Awaiting-input tasks therefore are not added again.
+    + safe(() => listInboxQuestions().length, 0)
     + safe(() => listGoalDrafts({ status: 'pending' }).length, 0)
     + safe(() => listPlanProposals({ status: 'all' }).filter(planProposalNeedsUserInput).length, 0)
     + safe(() => listBackgroundTasks({ status: 'blocked' }).length, 0)
-    + safe(() => listBackgroundTasks({ status: 'awaiting_input' }).length, 0)
     + safe(() => listBackgroundTasks({ status: 'awaiting_continue' }).length, 0)
     + stalledCount;
 

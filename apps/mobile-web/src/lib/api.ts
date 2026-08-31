@@ -355,6 +355,203 @@ export async function rejectApproval(id: string): Promise<unknown> {
   });
 }
 
+// ─── durable mobile inbox ─
+
+export interface InboxNotification {
+  id: string;
+  kind: 'cron' | 'workflow' | 'system' | 'approval' | 'execution';
+  title: string;
+  body: string;
+  createdAt: string;
+  read: boolean;
+  needsAttention: boolean;
+  deliveredAt: string | null;
+  deliveryError: string | null;
+  workflowCapability?: WorkflowCapabilityInboxGate | null;
+  context: {
+    actionItemId: string | null;
+    approvalId: string | null;
+    planProposalId: string | null;
+    trustProposalId: string | null;
+    relatedApprovalIds?: string[];
+    questionId: string | null;
+    sessionId: string | null;
+    runId: string | null;
+    stepId: string | null;
+    workflow: string | null;
+  };
+}
+
+export interface WorkflowCapabilityAccountChoice {
+  label: string;
+  capabilityId: string;
+  accountId: string;
+}
+
+export interface WorkflowCapabilityInboxGate {
+  notificationId: string;
+  workflow: string;
+  runId: string;
+  stepId: string;
+  tool: string;
+  toolkit: string;
+  reason: string;
+  retryAt: string | null;
+  provenNoDispatch: true;
+  resolution:
+    | {
+        kind: 'choose_account';
+        retryCount: number;
+        choiceSetDigest: string;
+        candidates: WorkflowCapabilityAccountChoice[];
+        choiceTotal: number;
+        choicesTruncated: boolean;
+      }
+    | { kind: 'retry_exact_metadata'; retryCount: number }
+    | { kind: 'connect_and_retry'; retryCount: number }
+    | { kind: 'review_run'; reason: string };
+}
+
+export interface InboxSummary {
+  needsYou: number;
+  questions: number;
+  approvals: number;
+  plans: number;
+  workspaceChoices: number;
+  trustProposals: number;
+  notificationNeedsYou: number;
+  unreadUpdates: number;
+}
+
+export interface InboxQuestion {
+  id: string;
+  source: 'check_in' | 'background_task' | 'workflow';
+  question: string;
+  options: string[];
+  context: string | null;
+  askedAt: string;
+  urgency: 'low' | 'normal' | 'high';
+  agentLabel: string;
+  sessionId: string | null;
+  taskId: string | null;
+  workflowName: string | null;
+  runId: string | null;
+  stepId: string | null;
+  answerable: boolean;
+  unavailableReason: string | null;
+}
+
+export interface InboxTrustProposal {
+  id: string;
+  scopeRevision: 1;
+  scopeDigest: string;
+  toolkits: string[];
+  recipients: string[];
+  domains: string[];
+  maxRecipients: number;
+  rationale: string;
+  createdAt: string;
+  evidence: {
+    cleanSendCount: number;
+    distinctDays: number;
+    firstAt: string;
+    lastAt: string;
+  };
+}
+
+export async function listInboxNotifications(limit = 100): Promise<{
+  notifications: InboxNotification[];
+  count: number;
+}> {
+  return api(`/m/api/inbox/notifications?limit=${Math.max(1, Math.min(200, Math.trunc(limit)))}`);
+}
+
+export async function getInboxNotification(id: string): Promise<{ notification: InboxNotification }> {
+  return api(`/m/api/inbox/notifications/${encodeURIComponent(id)}`);
+}
+
+export async function markInboxNotificationRead(id: string): Promise<{
+  ok: boolean;
+  cleared: number;
+  notification: InboxNotification;
+}> {
+  return api(`/m/api/inbox/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' });
+}
+
+export async function getInboxSummary(): Promise<InboxSummary> {
+  return api('/m/api/inbox/summary');
+}
+
+export async function listInboxQuestions(): Promise<{ questions: InboxQuestion[]; count: number }> {
+  return api('/m/api/inbox/questions');
+}
+
+export async function listInboxTrustProposals(): Promise<{ proposals: InboxTrustProposal[]; count: number }> {
+  return api('/m/api/inbox/trust-proposals');
+}
+
+export async function resolveInboxTrustProposal(
+  proposal: Pick<InboxTrustProposal, 'id' | 'scopeRevision' | 'scopeDigest'>,
+  decision: 'approve' | 'decline',
+): Promise<{
+  ok: boolean;
+  status: string;
+  nothingGranted: boolean;
+  message: string;
+  scopeReceipt: Pick<InboxTrustProposal, 'scopeRevision' | 'scopeDigest' | 'toolkits' | 'recipients' | 'domains' | 'maxRecipients'>;
+}> {
+  return api(`/m/api/inbox/trust-proposals/${encodeURIComponent(proposal.id)}/${decision}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      scopeRevision: proposal.scopeRevision,
+      scopeDigest: proposal.scopeDigest,
+    }),
+  });
+}
+
+export async function answerInboxQuestion(id: string, answer: string): Promise<{
+  ok: boolean;
+  status: 'answered' | 'resuming';
+  questionId: string;
+  taskId?: string;
+  runId?: string;
+}> {
+  return api(`/m/api/inbox/questions/${encodeURIComponent(id)}/answer`, {
+    method: 'POST',
+    body: JSON.stringify({ answer }),
+  });
+}
+
+export async function resolveInboxWorkflowCapability(
+  gate: WorkflowCapabilityInboxGate,
+  choice?: WorkflowCapabilityAccountChoice,
+): Promise<{
+  ok: true;
+  status: 'selected' | 'already_selected' | 'resumed' | 'already_resumed';
+  runId: string;
+  stepId: string;
+}> {
+  return api(`/m/api/inbox/workflow-capabilities/${encodeURIComponent(gate.runId)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify(gate.resolution.kind === 'choose_account'
+      ? {
+          action: 'choose_account',
+          stepId: gate.stepId,
+          tool: gate.tool,
+          retryCount: gate.resolution.retryCount,
+          choiceSetDigest: gate.resolution.choiceSetDigest,
+          capabilityId: choice?.capabilityId ?? '',
+          accountId: choice?.accountId ?? '',
+        }
+      : {
+          action: 'retry',
+          stepId: gate.stepId,
+          tool: gate.tool,
+          retryCount: gate.resolution.kind === 'review_run' ? 0 : gate.resolution.retryCount,
+        }),
+  });
+}
+
 // ─── plan approvals ─
 
 export interface WorkspaceDestinationChoice {
@@ -397,6 +594,8 @@ export async function resolveWorkspaceDestinationChooser(
 
 export interface PlanProposalRow {
   id: string;
+  /** Exact originating conversation; null means mobile cannot safely reply. */
+  sessionId: string | null;
   proposedAt: string;
   status: 'pending' | 'approved' | 'rejected' | 'superseded';
   objective: string;

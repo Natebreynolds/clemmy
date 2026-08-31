@@ -7,7 +7,9 @@ import UserNotifications
 /// exactly one credential path.
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     static let tokenNotification = Notification.Name("clem.apns.token")
-    static let openPathNotification = Notification.Name("clem.apns.openPath")
+    /// Wake signal only. The durable store, not NotificationCenter, is the
+    /// source of truth so a cold process or biometric gate cannot lose a tap.
+    static let pendingNavigationChanged = Notification.Name("clem.apns.pendingNavigationChanged")
 
     func application(
         _ application: UIApplication,
@@ -48,16 +50,29 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         completionHandler([.banner, .sound, .badge])
     }
 
-    /// Tap → deep link. The daemon puts a path like "/m/?tab=inbox" in the
+    /// Tap → deep link. The daemon puts the exact Inbox context path in the
     /// payload's `url` field (same field the web push payload uses).
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        if let path = response.notification.request.content.userInfo["url"] as? String {
-            NotificationCenter.default.post(name: Self.openPathNotification, object: nil, userInfo: ["path": path])
+        defer { completionHandler() }
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+              let path = response.notification.request.content.userInfo["url"] as? String,
+              let fingerprint = PairingStore.load()?.fingerprint,
+              PendingPushNavigationStore.park(
+                  path: path,
+                  pairingFingerprint: fingerprint
+              ) else {
+            return
         }
-        completionHandler()
+
+        // UNUserNotificationCenter may invoke its delegate off-main. SwiftUI's
+        // publisher is a wake-up optimization only, but still deliver it on the
+        // main queue; the persisted envelope covers any subscriber race.
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.pendingNavigationChanged, object: nil)
+        }
     }
 }

@@ -102,8 +102,13 @@ export interface ChatMessage {
 
 export type ChatApprovalDecision = 'approve' | 'reject';
 
-/** Button clicks carry the exact card identity back through the same chat
- * parser as typed decisions. A legacy/id-less plan remains a bare decision;
+export type ChatDecisionIntent =
+  | { kind: 'plan-proposal'; planProposalId: string; decision: ChatApprovalDecision }
+  | { kind: 'approval-reply'; text: string }
+  | { kind: 'invalid-plan'; message: string };
+
+/** Approval button clicks carry the exact card identity back through the same
+ * chat parser as typed decisions. Plan cards use their dedicated proposal API;
  * malformed server data is never echoed as authority. */
 export function chatApprovalReply(
   decision: ChatApprovalDecision,
@@ -113,6 +118,33 @@ export function chatApprovalReply(
     ? approvalId.trim().toLowerCase()
     : null;
   return id ? `${decision} ${id}` : decision;
+}
+
+/**
+ * Choose the authority surface for one visible decision card. Plan proposals
+ * are durable records with their own exact resolver; they must never fall
+ * through to a bare conversational "approve"/"reject" turn. This helper is
+ * shared by both chat screens so a reopened `/chat/:sessionId` behaves exactly
+ * like the primary `/chat` surface.
+ */
+export function chatDecisionIntent(
+  message: Pick<ChatMessage, 'status' | 'planProposalId' | 'approval'>,
+  decision: ChatApprovalDecision,
+): ChatDecisionIntent {
+  if (message.status === 'awaiting-plan') {
+    const planProposalId = message.planProposalId?.trim() ?? '';
+    if (!/^plan-[a-z0-9][a-z0-9_-]{0,119}$/i.test(planProposalId)) {
+      return {
+        kind: 'invalid-plan',
+        message: 'This plan no longer has a durable proposal identity. Open Inbox to review it.',
+      };
+    }
+    return { kind: 'plan-proposal', planProposalId, decision };
+  }
+  return {
+    kind: 'approval-reply',
+    text: chatApprovalReply(decision, message.approval?.approvalId),
+  };
 }
 
 /** Preserve every independently addressable approval emitted during one live

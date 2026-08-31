@@ -17,7 +17,7 @@ import { cn } from '@/lib/cn';
 import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
   checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
-  listWorkflows, resumeWorkflowCapability, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
+  listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
   type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
 } from '@/lib/automate';
@@ -324,11 +324,10 @@ function RunWorkspaceDrawer({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
-  const [resumingCapability, setResumingCapability] = useState(false);
-  const [resumeError, setResumeError] = useState<string | null>(null);
   const [showAllCriteria, setShowAllCriteria] = useState(false);
   const runsQ = useQuery({
     queryKey: ['wf-runs', workflow],
@@ -366,21 +365,6 @@ function RunWorkspaceDrawer({
       setCheckError(reason || 'unknown error');
     } finally {
       setChecking(false);
-    }
-  };
-
-  const resumeCapability = async () => {
-    if (!selectedRunId) return;
-    setResumingCapability(true);
-    setResumeError(null);
-    try {
-      await resumeWorkflowCapability(workflow, selectedRunId);
-      await runsQ.refetch();
-      void qc.invalidateQueries({ queryKey: ['runs'] });
-    } catch (e) {
-      setResumeError((e instanceof Error ? e.message : String(e)).slice(0, 180));
-    } finally {
-      setResumingCapability(false);
     }
   };
 
@@ -441,9 +425,12 @@ function RunWorkspaceDrawer({
                     </div>
                     <div className="flex flex-col items-end gap-1">
                       {selectedRun?.status === 'blocked_capability' && (
-                        <Button size="sm" onClick={resumeCapability} disabled={resumingCapability}>
-                          <RefreshCw className={cn('h-4 w-4', resumingCapability && 'animate-spin')} aria-hidden />
-                          {resumingCapability ? 'Retrying…' : 'Retry now'}
+                        <Button
+                          size="sm"
+                          onClick={() => navigate(`/inbox?tab=needs&select=${encodeURIComponent(`workflow-${selectedRun.id}-capability-${(selectedRun.capabilityBlock?.toolkit || 'tool').toLowerCase()}`)}`)}
+                        >
+                          <ArrowRight className="h-4 w-4" aria-hidden />
+                          Open exact Needs You gate
                         </Button>
                       )}
                       <Button size="sm" variant="secondary" onClick={runChecker} disabled={checking || !workspace}>
@@ -452,27 +439,43 @@ function RunWorkspaceDrawer({
                       {checkError && (
                         <span className="max-w-xs text-right text-caption text-danger">Check failed — {checkError}. Try again.</span>
                       )}
-                      {resumeError && (
-                        <span className="max-w-xs text-right text-caption text-danger">Retry failed — {resumeError}</span>
-                      )}
                     </div>
                   </div>
 
                   {selectedRun?.status === 'blocked_capability' && selectedRun.capabilityBlock && (
                     <section className="rounded-md border border-warning/30 bg-warning-tint px-4 py-3">
                       <div className="mb-1 flex items-center gap-1.5 text-label text-warning">
-                        <AlertTriangle className="h-4 w-4" aria-hidden /> Waiting for a connection
+                        <AlertTriangle className="h-4 w-4" aria-hidden />
+                        {selectedRun.capabilityBlock.reason === 'ambiguous-account'
+                          ? 'Choose an exact account'
+                          : selectedRun.capabilityBlock.reason === 'exact_schema_refresh_unavailable'
+                            || selectedRun.capabilityBlock.reason === 'exact_schema_boundary_mismatch'
+                            ? 'Exact action metadata needs review'
+                            : 'Connection needs attention'}
                       </div>
                       <p className="text-body text-fg">
                         {selectedRun.capabilityBlock.message
                           || `${selectedRun.capabilityBlock.toolkit || selectedRun.capabilityBlock.tool || 'This tool'} must be connected before the run can continue.`}
                       </p>
                       <p className="mt-1 text-caption text-muted">
-                        Completed work is preserved. Reconnect the account, then retry this same run
+                        No provider dispatch occurred and completed work is preserved. Open the exact Needs You gate
+                        {selectedRun.capabilityBlock.reason === 'ambiguous-account'
+                          ? ' to choose one of its current bounded account IDs'
+                          : selectedRun.capabilityBlock.reason === 'exact_schema_refresh_unavailable'
+                            || selectedRun.capabilityBlock.reason === 'exact_schema_boundary_mismatch'
+                            ? ' to authorize an exact metadata retry'
+                            : ' after reconnecting the account'}
                         {selectedRun.capabilityBlock.retryAt
-                          ? `, or Clem will check again around ${new Date(selectedRun.capabilityBlock.retryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                          ? `; Clem will also check again around ${new Date(selectedRun.capabilityBlock.retryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
                           : ''}.
                       </p>
+                      {selectedRun.capabilityBlock.reason !== 'ambiguous-account'
+                        && selectedRun.capabilityBlock.reason !== 'exact_schema_refresh_unavailable'
+                        && selectedRun.capabilityBlock.reason !== 'exact_schema_boundary_mismatch' && (
+                          <Button className="mt-3" size="sm" variant="secondary" onClick={() => navigate('/connect')}>
+                            Open Connections
+                          </Button>
+                        )}
                     </section>
                   )}
 

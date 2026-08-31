@@ -10,8 +10,19 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import { buildActionsForNotification, discordSlashCommandNamesForTest } from './discord.js';
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clementine-discord-actions-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+
+const { buildActionsForNotification, discordSlashCommandNamesForTest } = await import('./discord.js');
+const { createCheckIn, getCheckIn } = await import('../agents/check-ins.js');
+const { createBackgroundTask, updateBackgroundTask } = await import('../execution/background-tasks.js');
+
+test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
 
 function customIds(rows: ReturnType<typeof buildActionsForNotification>): string[] {
   if (!rows) return [];
@@ -50,12 +61,44 @@ test('buildActionsForNotification: approvalId attaches SDK approve/edit/reject',
 });
 
 test('buildActionsForNotification: checkInId attaches answer buttons', () => {
-  const rows = buildActionsForNotification({ checkInId: 'chk-abc123' });
+  const checkIn = createCheckIn({
+    agentSlug: 'Clem',
+    question: 'Which exact region should receive the finished report?',
+  });
+  const rows = buildActionsForNotification({ checkInId: checkIn.id });
   const ids = customIds(rows);
   assert.equal(ids.length, 1, 'a question gets one honestly labelled Answer control');
-  assert.ok(ids.some((id) => id.includes('checkin-answer:chk-abc123')));
-  assert.ok(!ids.some((id) => id.includes('checkin-approve:chk-abc123')));
-  assert.ok(!ids.some((id) => id.includes('checkin-reject:chk-abc123')));
+  assert.ok(ids.some((id) => id.includes(`checkin-answer:${checkIn.id}`)));
+  assert.ok(!ids.some((id) => id.includes(`checkin-approve:${checkIn.id}`)));
+  assert.ok(!ids.some((id) => id.includes(`checkin-reject:${checkIn.id}`)));
+});
+
+test('buildActionsForNotification: linked carrier requires exact coordinates and stale Q1 settles', () => {
+  const task = createBackgroundTask({ title: 'Discord exact question', prompt: 'Wait for the exact answer.' });
+  const q1 = `discord:${task.id}:q1`;
+  const q2 = `discord:${task.id}:q2`;
+  updateBackgroundTask(task.id, { status: 'awaiting_input', pendingQuestionId: q1, pendingQuestion: 'Choose A or B?' });
+  const checkIn = createCheckIn({
+    agentSlug: 'Clem',
+    question: 'Should I use account A or account B?',
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  });
+
+  assert.equal(customIds(buildActionsForNotification({ checkInId: checkIn.id })).length, 0, 'id-only legacy carrier has no linked authority');
+  assert.equal(customIds(buildActionsForNotification({
+    checkInId: checkIn.id,
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  })).length, 1);
+
+  updateBackgroundTask(task.id, { status: 'awaiting_input', pendingQuestionId: q2, pendingQuestion: 'Choose East or West?' });
+  assert.equal(customIds(buildActionsForNotification({
+    checkInId: checkIn.id,
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  })).length, 0, 'stale Q1 cannot keep a Discord Answer button');
+  assert.equal(getCheckIn(checkIn.id)?.status, 'closed');
 });
 
 test('buildActionsForNotification: stale goalDraftId does not attach dead buttons', () => {

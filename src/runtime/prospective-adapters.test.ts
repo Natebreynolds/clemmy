@@ -103,10 +103,28 @@ test('monitor, check-in, and background adapters stay read-only and omit disable
   const monitors = monitorProspectiveDefinitions({
     ...DEFAULT_PROACTIVITY_POLICY,
     inboxWatchEnabled: true,
-    calendarWatchEnabled: false,
+    calendarWatchEnabled: true,
   });
-  assert.deepEqual(monitors.map((item) => item.id), ['monitor:inbox']);
-  assert.equal(monitors[0]?.risk, 'read');
+  assert.deepEqual(monitors.map((item) => item.id), ['monitor:inbox', 'monitor:calendar']);
+  for (const monitor of monitors) {
+    assert.equal(monitor.risk, 'read');
+    assert.equal(monitor.approvalMode, 'enforce_at_action');
+    assert.equal(monitor.recurring, false);
+    assert.deepEqual(monitor.trigger, { kind: 'manual' });
+    assert.equal(monitor.action.kind, 'notify');
+    assert.equal(monitor.action.ref, 'automation_opportunity_propose');
+    assert.equal(monitor.metadata?.availability, 'paused');
+    assert.equal(monitor.metadata?.reason, 'prepared_read_authority_unavailable');
+    assert.match(monitor.objective, /paused until an exact read pilot is reviewed and approved/i);
+    const setup = monitor.metadata?.setupAction as Record<string, unknown>;
+    assert.equal(setup.firstTool, 'automation_opportunity_propose');
+    assert.deepEqual(setup.authorityPath, [
+      'automation_opportunity_propose',
+      'automation_opportunity_review_request',
+      'automation_read_pilot_request',
+      'automation_recurrence_request',
+    ]);
+  }
 
   const checkIn: CheckInTemplate = {
     id: 'check-a',

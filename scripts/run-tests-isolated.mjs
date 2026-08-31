@@ -12,7 +12,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { isolatedTestArgs } from './run-tests-isolated-args.mjs';
+import {
+  createIsolatedRunnerProgressTracker,
+  isolatedTestArgs,
+} from './run-tests-isolated-args.mjs';
 import {
   compareLiveHome,
   liveHomeOwnerPids,
@@ -79,15 +82,6 @@ function fileBudgetMs(argv) {
   return 600_000;
 }
 
-function parseOwningFile(line) {
-  const subtest = line.match(/# Subtest:\s+(\S+\.test\.\w+)/);
-  if (subtest) return subtest[1];
-  const arrow = line.match(/[▶✔✘]\s+(\S+\.test\.\w+)/);
-  if (arrow) return arrow[1];
-  const pathMatch = line.match(/((?:src|apps|scripts)\/\S+\.test\.(?:ts|mjs|js))/);
-  return pathMatch ? pathMatch[1] : null;
-}
-
 function killProcessTree(pid, signal = 'SIGKILL') {
   if (!pid) return;
   try {
@@ -143,31 +137,30 @@ try {
     detached: process.platform !== 'win32',
   });
   const groupPid = child.pid;
-  let currentFile = '(starting)';
-  let lastProgressAt = Date.now();
+  const progress = createIsolatedRunnerProgressTracker();
+  const partialLines = { stdout: '', stderr: '' };
   let watchdogFired = false;
 
-  const onChunk = (chunk, dest) => {
+  const onChunk = (chunk, dest, source) => {
     dest.write(chunk);
-    const text = String(chunk);
-    for (const line of text.split(/\r?\n/)) {
-      const owning = parseOwningFile(line);
-      if (owning) {
-        currentFile = owning;
-        lastProgressAt = Date.now();
-      }
+    const text = partialLines[source] + String(chunk);
+    const lines = text.split(/\r?\n/);
+    partialLines[source] = lines.pop() ?? '';
+    for (const line of lines) {
+      progress.observe(line, Date.now(), { allowTap: source === 'stdout' });
     }
   };
-  child.stdout?.on('data', (chunk) => onChunk(chunk, process.stdout));
-  child.stderr?.on('data', (chunk) => onChunk(chunk, process.stderr));
+  child.stdout?.on('data', (chunk) => onChunk(chunk, process.stdout, 'stdout'));
+  child.stderr?.on('data', (chunk) => onChunk(chunk, process.stderr, 'stderr'));
 
   const watchdog = setInterval(() => {
     if (watchdogFired) return;
+    const { currentFile, lastProgress, lastProgressAt } = progress.snapshot();
     if (Date.now() - lastProgressAt <= budgetMs + 15_000) return;
     watchdogFired = true;
     const descendants = collectDescendantPids(groupPid);
     console.error(
-      `watchdog: owning file=${currentFile} pid=${groupPid} descendants=${descendants.join(',') || 'none'} exceeded ${budgetMs}ms; terminating children`,
+      `watchdog: owning file=${currentFile} last progress=${lastProgress} pid=${groupPid} descendants=${descendants.join(',') || 'none'} exceeded ${budgetMs}ms; terminating children`,
     );
     killProcessTree(groupPid, 'SIGTERM');
     setTimeout(() => killProcessTree(groupPid, 'SIGKILL'), 2_000);

@@ -164,6 +164,18 @@ export function _setBackgroundTaskTerminalReportBackFaultForTests(
   backgroundTaskTerminalReportBackFaultForTests = fn;
 }
 
+export type BackgroundTaskCreationFaultPhase = 'after_task_write';
+
+let backgroundTaskCreationFaultForTests:
+  ((phase: BackgroundTaskCreationFaultPhase) => void) | null = null;
+
+/** Test-only process-death seam before any queued-task notification exists. */
+export function _setBackgroundTaskCreationFaultForTests(
+  fn: ((phase: BackgroundTaskCreationFaultPhase) => void) | null,
+): void {
+  backgroundTaskCreationFaultForTests = fn;
+}
+
 export type BackgroundTaskStatus =
   | 'pending'
   | 'running'
@@ -740,22 +752,6 @@ function withTaskTransitionLock<T>(id: string, fn: () => T): T | null {
     return fn();
   } finally {
     release();
-  }
-}
-
-/**
- * Claim a RESERVED task id across processes. The exclusive create is the whole
- * mechanism: two daemons materializing the same reservation both reach here,
- * and the kernel picks one. The loser reads the winner's task instead of
- * writing a second runnable copy of the same work.
- */
-function claimTaskId(id: string): boolean {
-  ensureTaskDir();
-  try {
-    closeSync(openSync(taskFilePath(id), 'wx', 0o600));
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -1485,63 +1481,83 @@ export function deriveTaskTitle(raw: string): string {
 }
 
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
-  const createdAt = nowIso();
-  // An explicit id is a RESERVATION the caller already derived from durable
-  // identity. Materializing it is claim-or-rejoin, never create-another: two
-  // processes racing the same reservation must end with one runnable task, not
-  // two workers that both do the work and both report back.
-  if (input.explicitId) {
-    const existing = getBackgroundTask(input.explicitId);
-    if (existing) return existing;
-    if (!claimTaskId(input.explicitId)) {
-      const winner = getBackgroundTask(input.explicitId);
-      if (winner) return winner;
-    }
-  }
-  const id = input.explicitId ?? makeTaskId(new Date(createdAt));
-  const task: BackgroundTaskRecord = {
-    id,
-    title: deriveTaskTitle(clean(input.title || input.prompt, 200)),
-    prompt: input.prompt.trim(),
-    status: 'pending',
-    ...(input.internal ? { internal: true } : {}),
-    originSessionId: input.originSessionId,
-    foregroundHandoff: input.foregroundHandoff,
-    runSessionId: `background:${id}`,
-    contractVersion: 1,
-    contractRevisions: [],
-    userId: input.userId,
-    channel: input.channel,
-    reportBackTarget: normalizeReportBackTarget(input.reportBackTarget)
-      ?? defaultReportBackTarget({ source: input.source ?? 'gateway', userId: input.userId, channel: input.channel, originSessionId: input.originSessionId }),
-    requestedModel: input.model,
-    model: input.model,
-    maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
-    ...(typeof input.maxTokens === 'number' && Number.isFinite(input.maxTokens) && input.maxTokens > 0
-      ? { maxTokens: Math.max(100_000, Math.min(1_000_000_000, Math.trunc(input.maxTokens))) }
-      : {}),
-    source: input.source ?? 'gateway',
-    createdAt,
-    updatedAt: createdAt,
-    resumedFromTaskId: input.resumedFromTaskId,
-    resumeCount: input.resumeCount,
+  const buildTask = (id: string): BackgroundTaskRecord => {
+    const createdAt = nowIso();
+    return {
+      id,
+      title: deriveTaskTitle(clean(input.title || input.prompt, 200)),
+      prompt: input.prompt.trim(),
+      status: 'pending',
+      ...(input.internal ? { internal: true } : {}),
+      originSessionId: input.originSessionId,
+      foregroundHandoff: input.foregroundHandoff,
+      runSessionId: `background:${id}`,
+      contractVersion: 1,
+      contractRevisions: [],
+      userId: input.userId,
+      channel: input.channel,
+      reportBackTarget: normalizeReportBackTarget(input.reportBackTarget)
+        ?? defaultReportBackTarget({ source: input.source ?? 'gateway', userId: input.userId, channel: input.channel, originSessionId: input.originSessionId }),
+      requestedModel: input.model,
+      model: input.model,
+      maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
+      ...(typeof input.maxTokens === 'number' && Number.isFinite(input.maxTokens) && input.maxTokens > 0
+        ? { maxTokens: Math.max(100_000, Math.min(1_000_000_000, Math.trunc(input.maxTokens))) }
+        : {}),
+      source: input.source ?? 'gateway',
+      createdAt,
+      updatedAt: createdAt,
+      resumedFromTaskId: input.resumedFromTaskId,
+      resumeCount: input.resumeCount,
+    };
   };
-  writeTask(task);
+
+  let created = false;
+  let task: BackgroundTaskRecord;
+  if (input.explicitId) {
+    // The task transition lease is the claim. Holding it across the existence
+    // check and first write closes the old empty-reservation race where a loser
+    // could overwrite a winner that had already advanced to `running`.
+    const claimed = withTaskTransitionLock(input.explicitId, () => {
+      const existing = getBackgroundTask(input.explicitId!);
+      if (existing) return existing;
+      const materialized = buildTask(input.explicitId!);
+      writeTask(materialized);
+      created = true;
+      return materialized;
+    });
+    if (!claimed) {
+      const existing = getBackgroundTask(input.explicitId);
+      if (!existing) throw new Error(`Could not claim reserved background task ${input.explicitId}.`);
+      task = existing;
+    } else {
+      task = claimed;
+    }
+  } else {
+    task = buildTask(makeTaskId());
+    writeTask(task);
+    created = true;
+  }
+
+  if (created) backgroundTaskCreationFaultForTests?.('after_task_write');
+
   // Dashboard-only — the queued ping is useful in the Activity panel
   // but pushes pure noise to Discord since the task hasn't done
   // anything yet. The "completed" notification (which has the actual
-  // result) is the one external destinations should see.
+  // result) is the one external destinations should see. Its stable id also
+  // repairs a crash after the task write: explicit-id rejoin replays this
+  // projection without duplicating it.
   addNotification({
-    id: `${Date.now()}-background-${task.id}-queued`,
+    id: `background-${task.id}-queued`,
     kind: 'execution',
     title: `Background task queued: ${task.title}`,
     body: `Task ${task.id} is queued and will run in the daemon loop.`,
-    createdAt,
+    createdAt: task.createdAt,
     read: false,
     silent: true,
     metadata: taskNotificationMetadata(task),
   });
-  emitBackgroundTaskOperational('background_task_created', task, { runSessionId: task.runSessionId });
+  if (created) emitBackgroundTaskOperational('background_task_created', task, { runSessionId: task.runSessionId });
   return task;
 }
 
@@ -1769,20 +1785,61 @@ function updateBackgroundTaskWhere(
   // that question. Any canonical state transition away from awaiting_input
   // clears the old Home/notification attention item, whether the user answered,
   // cancelled, or another terminal path closed the task.
-  if (
-    transition.task.status === 'awaiting_input'
-    && transition.updated.status !== 'awaiting_input'
-    && transition.task.pendingQuestionId
-  ) {
+  const priorQuestionId = transition.task.status === 'awaiting_input'
+    ? transition.task.pendingQuestionId
+    : undefined;
+  const priorQuestionCeasedToBeCurrent = Boolean(
+    priorQuestionId
+    && (
+      transition.updated.status !== 'awaiting_input'
+      || transition.updated.pendingQuestionId !== priorQuestionId
+    ),
+  );
+  if (priorQuestionCeasedToBeCurrent && priorQuestionId) {
     try {
-      markNotificationsReadByQuestionId(transition.task.pendingQuestionId, {
+      markNotificationsReadByQuestionId(priorQuestionId, {
         backgroundTaskStatus: transition.updated.status,
         backgroundTaskId: transition.updated.id,
+        ...(transition.updated.status === 'awaiting_input' && transition.updated.pendingQuestionId
+          ? { supersededByQuestionId: transition.updated.pendingQuestionId }
+          : {}),
       });
     } catch {
       // The task store is canonical; notification cleanup is best-effort and
       // must never prevent the actual task transition.
     }
+    // The check-in store is a projection of this exact task/question pair.
+    // Settle Q1 after the task CAS commits Q2/resume/terminal. Dynamic import
+    // avoids a module-init cycle; restart reconciliation is the crash backstop.
+    void import('../agents/check-ins.js').then(({ settleOpenLinkedCheckInsForQuestion }) => {
+      settleOpenLinkedCheckInsForQuestion({
+        linkedTaskId: transition.updated.id,
+        linkedQuestionId: priorQuestionId,
+        reason: transition.updated.status === 'awaiting_input'
+          ? 'Auto-closed: the linked task advanced to a newer question.'
+          : `Auto-closed: the linked task moved to ${transition.updated.status} and no longer accepts this question.`,
+      });
+    }).catch(() => { /* restart/read reconciliation retries */ });
+  }
+
+  // A terminal transition can strand a linked check-in created just before
+  // the worker parked (there is no prior pendingQuestionId yet). Close every
+  // linked generation only when the task has definitively stopped accepting
+  // questions; pending/running remain eligible for the create->park seam.
+  if (
+    transition.updated.archived
+    || transition.updated.status === 'done'
+    || transition.updated.status === 'blocked'
+    || transition.updated.status === 'failed'
+    || transition.updated.status === 'aborted'
+    || transition.updated.status === 'interrupted'
+  ) {
+    void import('../agents/check-ins.js').then(({ settleAllOpenLinkedCheckInsForTask }) => {
+      settleAllOpenLinkedCheckInsForTask({
+        linkedTaskId: transition.updated.id,
+        reason: `Auto-closed: the linked task moved to ${transition.updated.status} and no longer accepts questions.`,
+      });
+    }).catch(() => { /* restart/read reconciliation retries */ });
   }
   return transition.updated;
 }
@@ -4821,25 +4878,45 @@ export function queueBackgroundTaskInputResolution(
     void (async () => {
       try {
         const { listOpenCheckIns, closeCheckIn } = await import('../agents/check-ins.js');
+        const answeringCheckInId = opts.requestId?.startsWith('checkin:')
+          ? opts.requestId.slice('checkin:'.length)
+          : null;
         for (const checkIn of listOpenCheckIns()) {
-          if ((checkIn as { linkedTaskId?: string }).linkedTaskId === updated.id) {
+          if (
+            checkIn.linkedTaskId === updated.id
+            && checkIn.linkedQuestionId === questionId
+            // Composite check-in authority queues the task CAS first, then
+            // commits the check-in answer. Do not race that owner by closing
+            // its own row in this best-effort projection; sibling copies still
+            // settle immediately and restart reconciliation closes a crash gap.
+            && checkIn.id !== answeringCheckInId
+          ) {
             closeCheckIn(checkIn.id, 'Answered via the task — question resolved.');
           }
         }
       } catch { /* cross-store cleanup is best-effort */ }
     })();
-    addNotification({
-      id: `${Date.now()}-background-${updated.id}-input-resolution-queued`,
-      kind: 'execution',
-      title: `Background task resuming: ${updated.title}`,
-      body: `Task ${updated.id} will resume in the daemon with your answer.`,
-      createdAt: now,
-      read: false,
-      // This is an informational lifecycle event, not the still-actionable
-      // question card. Keeping questionId here made consumers (and people)
-      // treat the fresh "resuming" notice as the old unresolved request.
-      metadata: taskNotificationMetadata(updated, { resolvedQuestionId: questionId, status: 'pending' }),
-    });
+    try {
+      addNotification({
+        id: `${Date.now()}-background-${updated.id}-input-resolution-queued`,
+        kind: 'execution',
+        title: `Background task resuming: ${updated.title}`,
+        body: `Task ${updated.id} will resume in the daemon with your answer.`,
+        createdAt: now,
+        read: false,
+        // This is an informational lifecycle event, not the still-actionable
+        // question card. Keeping questionId here made consumers (and people)
+        // treat the fresh "resuming" notice as the old unresolved request.
+        metadata: taskNotificationMetadata(updated, {
+          resolvedQuestionId: questionId,
+          status: 'pending',
+          inboxOnly: true,
+        }),
+      });
+    } catch {
+      // The task CAS above is the continuation authority. A notification
+      // projection failure must not make the user retry a committed answer.
+    }
   }
   return updated;
 }
@@ -4912,6 +4989,19 @@ export function interruptStaleRunningBackgroundTasks(): number {
  * coverage/classify checks so a clarifying question is never misread as
  * blocked/done.
  */
+async function exactBackgroundQuestionId(
+  taskId: string,
+  question: string,
+  fallback: string,
+): Promise<string> {
+  try {
+    const { findOpenLinkedCheckIn } = await import('../agents/check-ins.js');
+    return findOpenLinkedCheckIn(taskId, question)?.linkedQuestionId ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 async function finishWorkerRun(
   task: BackgroundTaskRecord,
   run: { id: string },
@@ -4968,7 +5058,11 @@ async function finishWorkerRun(
     // Judge-gated check-in: the run asked the user a clarifying question. Park as
     // needs_input (surfaced to origin chat + needs-you card) and resume on the
     // answer. The question text IS response.text. MUST precede coverage/classify.
-    const questionId = `bgq-${task.id}-${Date.now().toString(36)}`;
+    const questionId = await exactBackgroundQuestionId(
+      task.id,
+      response.text,
+      `bgq-${task.id}-${Date.now().toString(36)}`,
+    );
     const parked = markBackgroundTaskAwaitingInput(task.id, questionId, response.text || 'I need your input to continue.');
     if (!acceptWorkerTransition(parked, 'awaiting_input')) return;
     finishRun(run.id, {
@@ -5111,7 +5205,11 @@ async function finishWorkerRun(
   if (outcome.outcome === 'blocked') {
     if (isResumableUserDependency(outcome.blockerType)) {
       const blockerType = outcome.blockerType!;
-      const questionId = `bgdep-${task.id}-${Date.now().toString(36)}`;
+      const questionId = await exactBackgroundQuestionId(
+        task.id,
+        dependencyResumeQuestion(blockerType),
+        `bgdep-${task.id}-${Date.now().toString(36)}`,
+      );
       const reason = outcome.reason ?? 'The task needs user input before it can continue.';
       const parked = markBackgroundTaskAwaitingInput(
         task.id,
@@ -5172,6 +5270,19 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
       logger.warn(
         { error: error instanceof Error ? error.message : String(error) },
         'Background terminal report-back tick drain failed; a later tick will retry',
+      );
+    }
+    // Repair the cross-store crash seam where a check-in answer committed just
+    // before process death but its exact background-question resolution did not.
+    // This runs before capacity/pending selection so a repaired task can resume
+    // in this same drain tick. Dynamic import avoids a module-init cycle.
+    try {
+      const { repairLinkedCheckInAnswers } = await import('../agents/check-ins.js');
+      await repairLinkedCheckInAnswers();
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        'Linked check-in answer repair failed; a later drain tick will retry',
       );
     }
     const policy = loadProactivityPolicy();
@@ -5492,7 +5603,11 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         }
 
         if (result.awaitingInputQuestion) {
-          const questionId = `bgq-${task.id}-${Date.now().toString(36)}`;
+          const questionId = await exactBackgroundQuestionId(
+            task.id,
+            result.awaitingInputQuestion,
+            `bgq-${task.id}-${Date.now().toString(36)}`,
+          );
           const parkedOnInput = markBackgroundTaskAwaitingInput(
             task.id,
             questionId,
@@ -5567,7 +5682,11 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         if (postApprovalOutcome.outcome === 'blocked') {
           if (isResumableUserDependency(postApprovalOutcome.blockerType)) {
             const blockerType = postApprovalOutcome.blockerType!;
-            const questionId = `bgdep-${task.id}-${Date.now().toString(36)}`;
+            const questionId = await exactBackgroundQuestionId(
+              task.id,
+              dependencyResumeQuestion(blockerType),
+              `bgdep-${task.id}-${Date.now().toString(36)}`,
+            );
             const reason = postApprovalOutcome.reason ?? 'The task needs user input before it can continue.';
             const parkedOnDependency = markBackgroundTaskAwaitingInput(
               task.id,

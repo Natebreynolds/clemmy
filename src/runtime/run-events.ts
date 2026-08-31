@@ -56,6 +56,29 @@ export type RunInputBlocker =
     source: { kind: 'workflow_step'; workflow: string; runId: string; stepId: string };
     operation: { stepId: string; tool: string; toolkit: string; reason: string };
     nextAction: string;
+    /** Machine-readable counterpart to the one plain user-visible question or
+     * setup instruction. It never carries provider authority by itself. */
+    resolution?:
+      | {
+        kind: 'choose_account';
+        actionTool: 'workflow_capability_resolve';
+        accountCandidates: ReadonlyArray<{ capabilityId: string; accountId: string }>;
+        choiceSetDigest: string;
+        choiceTotal: number;
+        choicesTruncated: boolean;
+        retryCount: number;
+      }
+      | {
+        kind: 'connect_and_retry';
+        actionTool: 'workflow_capability_resolve';
+        toolkit: string;
+        retryCount: number;
+      }
+      | {
+        kind: 'retry_exact_metadata';
+        actionTool: 'workflow_capability_resolve';
+        retryCount: number;
+      };
     retryAt?: string;
     provenNoDispatch: boolean;
   };
@@ -222,6 +245,9 @@ export function addRunEvent(
   if (event.status && event.status !== 'awaiting_approval' && event.status !== 'awaiting_input') {
     delete run.pendingApprovalId;
     delete run.pendingInput;
+  }
+  if (event.status === 'running' || event.status === 'received') {
+    delete run.needsAttention;
   }
   run.updatedAt = now;
   saveRuns(runs);

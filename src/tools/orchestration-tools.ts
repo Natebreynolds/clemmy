@@ -2180,6 +2180,73 @@ export function registerOrchestrationTools(server: McpServer): void {
   );
 
   server.tool(
+    'workflow_capability_resolve',
+    'Resolve a workflow Needs You capability pause without creating a new run. Use action=choose_account only with the exact coordinates shown by workflow_run_status after the user chooses an account; use action=retry after the user reconnects an account or asks to retry exact metadata. This host-only control never calls the provider itself.',
+    {
+      action: z.enum(['choose_account', 'retry']),
+      run_id: z.string().min(1),
+      step_id: z.string().optional(),
+      tool: z.string().optional(),
+      retry_count: z.number().int().positive().optional(),
+      choice_set_digest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+      capability_id: z.string().optional(),
+      account_id: z.string().optional(),
+    },
+    async ({ action, run_id, step_id, tool, retry_count, choice_set_digest, capability_id, account_id }) => {
+      const runner = await import('../execution/workflow-runner.js');
+      const { requestWorkflowRunDrainKick } = await import('../execution/workflow-origin-group.js');
+      if (action === 'retry') {
+        if (!step_id?.trim() || !tool?.trim() || retry_count === undefined) {
+          return textResult(
+            'retry requires the exact step_id, tool, and retry_count from workflow_run_status. Nothing was changed.',
+          );
+        }
+        const resolved = runner.resolveWorkflowCapabilityRetry({
+          runId: run_id,
+          stepId: step_id,
+          tool,
+          retryCount: retry_count,
+          selectedBy: 'clem-tool',
+        });
+        if (!resolved.ok) return textResult(`Capability retry was not applied: ${resolved.message}`);
+        requestWorkflowRunDrainKick([run_id]);
+        return textResult(
+          `Run ${run_id} is ${resolved.status === 'already_resumed' ? 'already resuming' : 'resuming'} from the exact preserved capability pause. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`,
+        );
+      }
+      if (
+        !step_id?.trim()
+        || !tool?.trim()
+        || retry_count === undefined
+        || !choice_set_digest
+        || !capability_id?.trim()
+        || !account_id?.trim()
+      ) {
+        return textResult(
+          'choose_account requires the exact step_id, tool, retry_count, choice_set_digest, capability_id, and account_id from workflow_run_status. Nothing was changed.',
+        );
+      }
+      const resolved = runner.resolveWorkflowCapabilityAccountChoice({
+        runId: run_id,
+        stepId: step_id,
+        tool,
+        retryCount: retry_count,
+        choiceSetDigest: choice_set_digest,
+        capabilityId: capability_id,
+        accountId: account_id,
+        selectedBy: getToolOutputContext()?.sessionId ?? 'user',
+      });
+      if (!resolved.ok) return textResult(`${resolved.message} Nothing was dispatched.`);
+      requestWorkflowRunDrainKick([run_id]);
+      return textResult(
+        resolved.status === 'already_selected'
+          ? `Account ${resolved.accountId} was already saved for step ${resolved.stepId}; run ${resolved.runId} remains on its same-run resume path. No duplicate dispatch was authorized.`
+          : `Saved exact account ${resolved.accountId} for step ${resolved.stepId} and resumed run ${resolved.runId}. No new run was created; Clementine will report back automatically. Do not poll or redo the work.`,
+      );
+    },
+  );
+
+  server.tool(
     'workflow_run_status',
     'Check workflow runs. Pass run_id for one run\'s detail, OR omit it to LIST what is running right now — use the no-id form to answer "what workflows are running / how is my flow going". Lists in-flight (queued/running/parked/mutation-review) + needs-attention runs and the few most-recent finished ones.',
     {
@@ -2223,11 +2290,30 @@ export function registerOrchestrationTools(server: McpServer): void {
           const capabilityBlock = record.capabilityBlock && typeof record.capabilityBlock === 'object' && !Array.isArray(record.capabilityBlock)
             ? record.capabilityBlock as Record<string, unknown>
             : undefined;
+          const accountChoiceSet = capabilityBlock?.accountChoiceSet
+            && typeof capabilityBlock.accountChoiceSet === 'object'
+            && !Array.isArray(capabilityBlock.accountChoiceSet)
+            ? capabilityBlock.accountChoiceSet as Record<string, unknown>
+            : undefined;
+          const accountCandidates = Array.isArray(accountChoiceSet?.candidates)
+            ? (accountChoiceSet.candidates as Array<Record<string, unknown>>)
+                .filter((candidate) => candidate && typeof candidate === 'object')
+                .slice(0, 16)
+            : [];
+          const accountChoiceLines = accountCandidates.map((candidate, index) => (
+            `  ${index + 1}. account ${String(candidate.accountId ?? '?')} · capability ${String(candidate.capabilityId ?? '?')}`
+          ));
           const capabilityLine = capabilityNeedsAttention
-            ? [
-                `Dependency pause: step ${String(capabilityBlock?.stepId ?? '?')}, tool ${String(capabilityBlock?.tool ?? '?')}, reason ${String(capabilityBlock?.reason ?? '?')}.`,
-                `Provider dispatch was proven not to occur; completed work is preserved and this same run will retry after ${String(capabilityBlock?.retryAt ?? 'the dependency is restored')}.`,
-              ].join(' ')
+            ? capabilityBlock?.reason === 'ambiguous-account' && accountChoiceLines.length > 0
+              ? [
+                  `Needs You: choose the exact account for step ${String(capabilityBlock.stepId ?? '?')} (${String(capabilityBlock.tool ?? '?')}). No provider dispatch occurred and completed work is preserved.`,
+                  ...accountChoiceLines,
+                  `After the user chooses, call workflow_capability_resolve with action="choose_account", run_id="${run_id}", step_id="${String(capabilityBlock.stepId ?? '')}", tool="${String(capabilityBlock.tool ?? '')}", retry_count=${String(capabilityBlock.retryCount ?? '')}, choice_set_digest="${String(accountChoiceSet?.digest ?? '')}", and that choice's exact capability_id + account_id. Never choose by catalog order.`,
+                ].join('\n')
+              : [
+                  `Needs You: step ${String(capabilityBlock?.stepId ?? '?')}, tool ${String(capabilityBlock?.tool ?? '?')}, reason ${String(capabilityBlock?.reason ?? '?')}.`,
+                  `No provider dispatch occurred; completed work is preserved. ${capabilityBlock?.reason === 'exact_schema_refresh_unavailable' || capabilityBlock?.reason === 'exact_schema_boundary_mismatch' ? 'Ask the user whether to retry exact metadata now' : `Connect ${String(capabilityBlock?.toolkit ?? 'the account')} in Settings → Connections`}, then call workflow_capability_resolve with action="retry", run_id="${run_id}", step_id="${String(capabilityBlock?.stepId ?? '')}", tool="${String(capabilityBlock?.tool ?? '')}", and retry_count=${String(capabilityBlock?.retryCount ?? '')}. Automatic safe retry remains scheduled for ${String(capabilityBlock?.retryAt ?? 'later')}.`,
+                ].join(' ')
             : '';
           // The one status whose resolution requires the model to STOP calling
           // this tool, and the only one with no branch here — so it rendered as

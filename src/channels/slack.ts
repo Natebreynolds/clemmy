@@ -44,7 +44,11 @@ import { selectSessionForAcceptedSource } from '../runtime/harness/accepted-sour
 import type { ApprovalResolutionResult } from '../types.js';
 import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal, listActiveGoalContracts, listPlanProposals } from '../agents/plan-proposals.js';
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft, listGoalDrafts } from '../agents/goal-drafts.js';
-import { answerCheckIn, getCheckIn, listOpenCheckIns } from '../agents/check-ins.js';
+import {
+  answerExactCheckIn,
+  linkedCheckInActionability,
+  listInboxQuestions,
+} from '../execution/inbox-questions.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { queueBackgroundTaskApprovalResolution, listBackgroundTasks, createBackgroundTask } from '../execution/background-tasks.js';
 import { getMemoryHealthSummary } from '../memory/facts.js';
@@ -205,12 +209,11 @@ function buildAppHomeBlocks(): KnownBlock[] {
       approvalId: a.approvalId,
       presentation: presentApproval(a, approvalContextForRow(a)),
     })), []);
-  const checkIns = safe(() => listOpenCheckIns(), []);
+  const questions = safe(() => listInboxQuestions(), []);
   const goalDrafts = safe(() => listGoalDrafts({ status: 'pending' }), []);
   const plansNeedInput = safe(() => listPlanProposals({ status: 'all' }).filter(planProposalNeedsUserInput), []);
   const blockedTasks = [
     ...safe(() => listBackgroundTasks({ status: 'blocked' }), []),
-    ...safe(() => listBackgroundTasks({ status: 'awaiting_input' }), []),
     ...safe(() => listBackgroundTasks({ status: 'awaiting_continue' }), []),
   ];
   // Running work + upcoming schedule come from the ONE shared snapshot every
@@ -246,7 +249,7 @@ function buildAppHomeBlocks(): KnownBlock[] {
   const goals = safe(() => listActiveGoalContracts(), [] as Array<{ originatingRequest?: string }>);
   const mem = safe(() => getMemoryHealthSummary(), { activeFacts: 0, pinned: 0, byKind: {} as Record<string, number>, newest: null, recallHitRate: null });
 
-  const needsYou = approvals.length + checkIns.length + goalDrafts.length + plansNeedInput.length + blockedTasks.length;
+  const needsYou = approvals.length + questions.length + goalDrafts.length + plansNeedInput.length + blockedTasks.length;
   const today = new Date().toISOString().slice(0, 10);
   const doneToday = doneAll.filter((t) => (t.completedAt ?? t.updatedAt ?? '').slice(0, 10) === today).length;
 
@@ -290,9 +293,11 @@ function buildAppHomeBlocks(): KnownBlock[] {
         ],
       });
     }
-    // Questions she asked you (open check-ins) — answer in the Messages tab.
-    for (const c of checkIns.slice(0, 4)) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `🙋 *Question:* ${clip((c.question || '').trim(), 150)}` } });
+    // Exact actionable questions (check-ins, task questions, workflows). A
+    // linked Q1 that has advanced to Q2 is reconciled before this list is built,
+    // so the count and every visible row have a real answer path.
+    for (const question of questions.slice(0, 4)) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `🙋 *Question:* ${clip((question.question || '').trim(), 150)}` } });
     }
     // Goal drafts awaiting your confirmation.
     for (const d of goalDrafts.slice(0, 3)) {
@@ -309,7 +314,7 @@ function buildAppHomeBlocks(): KnownBlock[] {
     }
     // Honest overflow: the count above is the TRUE total; sections are capped, so
     // tell the user when there's more than what's rendered.
-    const shownNeedsYou = Math.min(approvals.length, 5) + Math.min(checkIns.length, 4)
+    const shownNeedsYou = Math.min(approvals.length, 5) + Math.min(questions.length, 4)
       + Math.min(goalDrafts.length, 3) + Math.min(plansNeedInput.length, 3) + Math.min(blockedTasks.length, 5);
     if (needsYou > shownNeedsYou) {
       blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_…and ${needsYou - shownNeedsYou} more — open the Messages tab to see everything._` }] });
@@ -870,6 +875,12 @@ export function buildSlackActionsForNotification(metadata: Record<string, unknow
   }
   const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
   if (checkInId) {
+    const state = linkedCheckInActionability(checkInId);
+    if (state.status !== 'actionable') return undefined;
+    if (state.expectation && (
+      metadata.linkedTaskId !== state.expectation.linkedTaskId
+      || metadata.linkedQuestionId !== state.expectation.linkedQuestionId
+    )) return undefined;
     return [actionsBlock(`${SLACK_ACTION_PREFIX}:checkin:${checkInId}`, [
       btn('Answer', `${SLACK_ACTION_PREFIX}:checkin-answer:${checkInId}`, checkInId, 'primary'),
     ])];
@@ -1657,20 +1668,33 @@ async function handleSlackAction(opts: {
   }
 
   if (action === 'checkin-approve' || action === 'checkin-reject') {
-    const record = getCheckIn(targetId);
-    if (!record) { await opts.respondEphemeral(`Check-in \`${targetId}\` was not found.`); return; }
-    if (record.status !== 'open') { await opts.respondEphemeral(`Check-in is already ${record.status}.`); return; }
-    const resolved = answerCheckIn(targetId, action === 'checkin-approve' ? 'approve' : 'reject');
-    await opts.respondEphemeral(resolved ? `Recorded answer for \`${targetId}\`.` : `Check-in \`${targetId}\` was not found.`);
+    const resolved = answerExactCheckIn({
+      checkInId: targetId,
+      answer: action === 'checkin-approve' ? 'approve' : 'reject',
+    });
+    if (resolved.status === 'not_found') {
+      await opts.respondEphemeral(`Check-in \`${targetId}\` was not found.`);
+      return;
+    }
+    await opts.respondEphemeral(
+      resolved.status === 'answered' || resolved.status === 'resuming'
+        ? `Recorded answer for \`${targetId}\`${resolved.status === 'resuming' ? '; the exact linked task is resuming' : ''}.`
+        : resolved.status === 'storage_error'
+          ? `The answer could not be saved: ${resolved.reason}`
+          : `That question is stale or already resolved, so nothing changed. ${resolved.reason}`,
+    );
     return;
   }
 
   if (action === 'checkin-answer') {
-    const record = getCheckIn(targetId);
-    if (!record || record.status !== 'open') {
-      await opts.respondEphemeral(record ? `Check-in \`${targetId}\` is already ${record.status}.` : `Check-in \`${targetId}\` was not found.`);
+    const state = linkedCheckInActionability(targetId);
+    if (state.status !== 'actionable') {
+      await opts.respondEphemeral(state.status === 'not_found'
+        ? `Check-in \`${targetId}\` was not found.`
+        : `That question is stale or not ready, so it cannot be answered. ${state.reason}`);
       return;
     }
+    const record = state.record;
     if (!opts.triggerId) { await opts.respondEphemeral('Cannot open the answer dialog here.'); return; }
     await opts.client.views.open({
       trigger_id: opts.triggerId,
@@ -2024,9 +2048,23 @@ export async function startSlackBot(assistant: ClementineAssistant): Promise<voi
         const checkInId = callbackId.split(':')[2];
         const answer = view.state.values.answer_block?.answer?.value?.trim() ?? '';
         if (!answer) { await ack({ response_action: 'errors', errors: { answer_block: 'Answer cannot be empty.' } }); return; }
-        await ack();
         const userId = (body as { user?: { id?: string } }).user?.id;
-        if (userId && userAllowedSlack(userId)) answerCheckIn(checkInId, answer);
+        if (!userId || !userAllowedSlack(userId)) { await ack(); return; }
+        const resolved = answerExactCheckIn({ checkInId, answer });
+        if (resolved.status === 'answered' || resolved.status === 'resuming') {
+          await ack();
+          return;
+        }
+        await ack({
+          response_action: 'errors',
+          errors: {
+            answer_block: resolved.status === 'not_found'
+              ? 'This question no longer exists. Refresh Clementine Home.'
+              : resolved.status === 'storage_error'
+                ? `The answer could not be saved: ${resolved.reason}`.slice(0, 150)
+                : `This question is stale or already resolved. ${resolved.reason}`.slice(0, 150),
+          },
+        });
         return;
       }
       // edit-modal

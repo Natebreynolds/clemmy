@@ -83,7 +83,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -93,6 +93,10 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     Object.prototype.hasOwnProperty.call(data, 'presentation')
       || Object.prototype.hasOwnProperty.call(data, 'turnOutcome')
   );
+  const planProposalIdFrom = (data: Record<string, unknown>): string | undefined => {
+    const value = typeof data.planProposalId === 'string' ? data.planProposalId.trim() : '';
+    return /^plan-[a-z0-9][a-z0-9_-]{0,119}$/i.test(value) ? value : undefined;
+  };
 
   const sources = new Map<string, SourceRecord>();
   for (const event of events) {
@@ -121,6 +125,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         seq: event.seq,
         text: presentation.text,
         createdAt: event.createdAt,
+        planProposalId: planProposalIdFrom(event.data),
       });
     }
   }
@@ -167,11 +172,17 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         seq: event.seq,
         text,
         createdAt: event.createdAt,
+        planProposalId: planProposalIdFrom(event.data),
       });
     } else {
       orphanAssistants.push({
         order: event.seq,
-        turns: [{ role: 'assistant', text, createdAt: event.createdAt }],
+        turns: [{
+          role: 'assistant',
+          text,
+          createdAt: event.createdAt,
+          planProposalId: planProposalIdFrom(event.data),
+        }],
       });
     }
   }
@@ -195,7 +206,12 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         order: source.event.seq,
         turns: [
           ...userTurns,
-          { role: 'assistant', text: assistant.text, createdAt: assistant.createdAt },
+          {
+            role: 'assistant',
+            text: assistant.text,
+            createdAt: assistant.createdAt,
+            planProposalId: assistant.planProposalId,
+          },
         ],
       });
     } else if (userTurns.length > 0) {

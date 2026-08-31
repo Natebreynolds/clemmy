@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 import {
@@ -71,6 +72,7 @@ function isIrreversibleSendAction(toolName: string, args: unknown, kindHint?: 's
 const logger = pino({ name: 'clementine-next.plan-scope' });
 
 const SCOPES_FILE = path.join(BASE_DIR, 'state', 'plan-scopes.json');
+const SCOPES_STATE_LOCK_FILE = path.join(BASE_DIR, 'state', 'plan-scopes-state');
 
 const DEFAULT_SCOPE_TTL_MS = 15 * 60 * 1000;
 const ABSOLUTE_MAX_TTL_MS = 60 * 60 * 1000; // 1 hour hard ceiling
@@ -170,6 +172,12 @@ export interface SendTrustGrant {
   toolkits?: string[];
   /** Per-send recipient ceiling for THIS grant (still capped by the global floor). */
   maxRecipients?: number;
+  /** Durable recovery correlation for a trust-graduation decision. If the grant
+   * commits before the proposal's terminal write, a retry can recover the exact
+   * grant as approved instead of misreporting it as unrelated coverage. */
+  sourceProposalId?: string;
+  sourceProposalResolvedBy?: string;
+  sourceProposalResolvedAt?: string;
 }
 
 interface ScopesFile {
@@ -201,6 +209,14 @@ function writeAll(file: ScopesFile): void {
   const tmp = `${SCOPES_FILE}.${process.pid}.${randomUUID().slice(0, 6)}.tmp`;
   writeFileSync(tmp, JSON.stringify(file, null, 2), 'utf-8');
   renameSync(tmp, SCOPES_FILE);
+}
+
+/** Every writer to plan-scopes.json shares this strict process-wide lease. A
+ * lock around only send-trust would still lose grants when an overlapping plan
+ * scope or standing-grant writer saved an older snapshot of the same file. */
+function withScopesStateMutation<T>(work: () => T): T {
+  ensureDir(path.dirname(SCOPES_STATE_LOCK_FILE));
+  return withFileLockSyncStrict(SCOPES_STATE_LOCK_FILE, work);
 }
 
 export interface OpenPlanScopeInput {
@@ -259,9 +275,11 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
     version: 'v1',
   };
 
-  const file = readAll();
-  file.scopes[input.sessionId] = scope;
-  writeAll(file);
+  withScopesStateMutation(() => {
+    const file = readAll();
+    file.scopes[input.sessionId] = scope;
+    writeAll(file);
+  });
 
   logger.info({
     sessionId: scope.sessionId,
@@ -292,16 +310,19 @@ export function getPlanScope(sessionId: string): PlanScope | null {
 }
 
 export function closePlanScope(sessionId: string, reason: string = 'closed'): PlanScope | null {
-  const file = readAll();
-  const scope = file.scopes[sessionId];
-  if (!scope) return null;
-  if (scope.closedAt) return scope;
-  scope.closedAt = new Date().toISOString();
-  scope.closedReason = reason;
-  file.scopes[sessionId] = scope;
-  writeAll(file);
-  logger.info({ sessionId, reason }, 'plan scope closed');
-  return scope;
+  const result = withScopesStateMutation(() => {
+    const file = readAll();
+    const current = file.scopes[sessionId];
+    if (!current) return { scope: null, changed: false };
+    if (current.closedAt) return { scope: current, changed: false };
+    current.closedAt = new Date().toISOString();
+    current.closedReason = reason;
+    file.scopes[sessionId] = current;
+    writeAll(file);
+    return { scope: current, changed: true };
+  });
+  if (result.changed) logger.info({ sessionId, reason }, 'plan scope closed');
+  return result.scope;
 }
 
 function canonicalScopeJson(value: unknown, seen = new WeakSet<object>()): string {
@@ -526,17 +547,19 @@ export function evaluateAutoApprove(input: {
  * actually ran.
  */
 export function recordAutoApproval(sessionId: string, toolName: string, summary: string): void {
-  const file = readAll();
-  const scope = file.scopes[sessionId];
-  if (!scope) return;
-  scope.autoApprovals = scope.autoApprovals ?? [];
-  scope.autoApprovals.push({
-    at: new Date().toISOString(),
-    toolName,
-    summary: summary.slice(0, 400),
+  withScopesStateMutation(() => {
+    const file = readAll();
+    const scope = file.scopes[sessionId];
+    if (!scope) return;
+    scope.autoApprovals = scope.autoApprovals ?? [];
+    scope.autoApprovals.push({
+      at: new Date().toISOString(),
+      toolName,
+      summary: summary.slice(0, 400),
+    });
+    file.scopes[sessionId] = scope;
+    writeAll(file);
   });
-  file.scopes[sessionId] = scope;
-  writeAll(file);
 }
 
 /** Summarize args for the audit log without dumping secrets/long blobs. */
@@ -613,23 +636,29 @@ export function grantStandingApproval(
   if (!name) return null;
   if (opts.kind === 'send' || opts.kind === 'admin') return null; // never grantable
   if (isUngrantableMultiplexer(name)) return null; // granting the multiplexer grants all it can reach
-  const file = readAll();
-  file.grants = file.grants ?? {};
   const grant: StandingGrant = { toolName: name, grantedAt: new Date().toISOString(), note: opts.note?.trim() || undefined };
-  file.grants[name] = grant;
-  writeAll(file);
+  withScopesStateMutation(() => {
+    const file = readAll();
+    file.grants = file.grants ?? {};
+    file.grants[name] = grant;
+    writeAll(file);
+  });
   logger.info({ toolName: name }, 'standing grant added');
   return grant;
 }
 
 /** Revoke a standing grant (soft — keeps the row with revokedAt for audit). */
 export function revokeStandingApproval(toolName: string): boolean {
-  const file = readAll();
-  const grant = file.grants?.[toolName];
-  if (!grant || grant.revokedAt) return false;
-  grant.revokedAt = new Date().toISOString();
-  file.grants![toolName] = grant;
-  writeAll(file);
+  const revoked = withScopesStateMutation(() => {
+    const file = readAll();
+    const grant = file.grants?.[toolName];
+    if (!grant || grant.revokedAt) return false;
+    grant.revokedAt = new Date().toISOString();
+    file.grants![toolName] = grant;
+    writeAll(file);
+    return true;
+  });
+  if (!revoked) return false;
   logger.info({ toolName }, 'standing grant revoked');
   return true;
 }
@@ -672,6 +701,102 @@ function sendTrustEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_SEND_TRUST', 'on') || 'on').toLowerCase() !== 'off';
 }
 
+interface NormalizedSendTrustScope {
+  domains: string[];
+  recipients: string[];
+  toolkits: string[];
+  maxRecipients?: number;
+  note?: string;
+}
+
+function normalizeSendTrustScope(scope: {
+  domains?: string[];
+  recipients?: string[];
+  toolkits?: string[];
+  maxRecipients?: number;
+  note?: string;
+}): NormalizedSendTrustScope | null {
+  const domains = [...new Set((scope.domains ?? [])
+    .map((domain) => domain.trim().toLowerCase().replace(/^@/, ''))
+    .filter(Boolean))];
+  const recipients = [...new Set((scope.recipients ?? [])
+    .map((recipient) => recipient.trim().toLowerCase())
+    .filter(Boolean))];
+  const toolkits = [...new Set((scope.toolkits ?? [])
+    .map((toolkit) => toolkit.trim().toLowerCase())
+    .filter(Boolean))];
+  if (domains.length === 0 && recipients.length === 0) return null;
+  return {
+    domains,
+    recipients,
+    toolkits,
+    maxRecipients: scope.maxRecipients !== undefined
+      ? Math.max(1, Math.min(SEND_TRUST_MAX_RECIPIENTS, Math.floor(scope.maxRecipients)))
+      : undefined,
+    note: scope.note?.trim() || undefined,
+  };
+}
+
+function liveCoveringSendTrustGrant(
+  grants: readonly SendTrustGrant[],
+  scope: Pick<NormalizedSendTrustScope, 'recipients' | 'domains' | 'toolkits'>,
+): SendTrustGrant | null {
+  const toolkit = scope.toolkits[0] ?? '';
+  for (const grant of grants) {
+    if (grant.revokedAt) continue;
+    if (grant.toolkits && grant.toolkits.length > 0) {
+      if (!toolkit || !grant.toolkits.some((value) => toolkit.includes(value))) continue;
+    }
+    const grantDomains = grant.domains ?? [];
+    const grantRecipients = grant.recipients ?? [];
+    const recipientsCovered = scope.recipients.every((recipient) => (
+      grantRecipients.includes(recipient) || grantDomains.includes(recipient.split('@')[1] ?? '')
+    ));
+    const domainsCovered = scope.domains.every((domain) => grantDomains.includes(domain));
+    if (recipientsCovered && domainsCovered) return grant;
+  }
+  return null;
+}
+
+function sendTrustGrantMatchesExactScope(
+  grant: SendTrustGrant,
+  scope: Pick<NormalizedSendTrustScope, 'recipients' | 'domains' | 'toolkits' | 'maxRecipients'>,
+): boolean {
+  const sameValues = (left: readonly string[] | undefined, right: readonly string[]) => {
+    const normalizedLeft = [...(left ?? [])].sort();
+    const normalizedRight = [...right].sort();
+    return normalizedLeft.length === normalizedRight.length
+      && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+  };
+  return sameValues(grant.recipients, scope.recipients)
+    && sameValues(grant.domains, scope.domains)
+    && sameValues(grant.toolkits, scope.toolkits)
+    && grant.maxRecipients === scope.maxRecipients;
+}
+
+function appendSendTrustGrantUnlocked(
+  file: ScopesFile,
+  scope: NormalizedSendTrustScope,
+  source?: { proposalId: string; resolvedBy?: string; resolvedAt?: string },
+): SendTrustGrant {
+  const grant: SendTrustGrant = {
+    id: randomUUID(),
+    grantedAt: new Date().toISOString(),
+    note: scope.note,
+    domains: scope.domains.length ? scope.domains : undefined,
+    recipients: scope.recipients.length ? scope.recipients : undefined,
+    toolkits: scope.toolkits.length ? scope.toolkits : undefined,
+    maxRecipients: scope.maxRecipients,
+    sourceProposalId: source?.proposalId,
+    sourceProposalResolvedBy: source?.resolvedBy,
+    sourceProposalResolvedAt: source?.resolvedAt,
+  };
+  file.sendTrust = file.sendTrust ?? [];
+  file.sendTrust.push(grant);
+  writeAll(file);
+  return grant;
+}
+
 /**
  * Grant scoped send-trust. Refuses an UNSCOPED grant (no domain and no
  * recipient) — the whole point is a narrow, named boundary, never "trust all
@@ -686,38 +811,103 @@ export function grantSendTrust(scope: {
   note?: string;
 }): SendTrustGrant | null {
   if (!sendTrustEnabled()) return null;
-  const domains = (scope.domains ?? []).map((d) => d.trim().toLowerCase().replace(/^@/, '')).filter(Boolean);
-  const recipients = (scope.recipients ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean);
-  const toolkits = (scope.toolkits ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean);
+  const normalized = normalizeSendTrustScope(scope);
   // An unscoped send-trust ("trust everything") is refused by design.
-  if (domains.length === 0 && recipients.length === 0) return null;
-  const max = scope.maxRecipients !== undefined
-    ? Math.max(1, Math.min(SEND_TRUST_MAX_RECIPIENTS, Math.floor(scope.maxRecipients)))
-    : undefined;
-  const grant: SendTrustGrant = {
-    id: randomUUID(),
-    grantedAt: new Date().toISOString(),
-    note: scope.note?.trim() || undefined,
-    domains: domains.length ? domains : undefined,
-    recipients: recipients.length ? recipients : undefined,
-    toolkits: toolkits.length ? toolkits : undefined,
-    maxRecipients: max,
-  };
-  const file = readAll();
-  file.sendTrust = file.sendTrust ?? [];
-  file.sendTrust.push(grant);
-  writeAll(file);
-  logger.info({ id: grant.id, domains, recipients, toolkits, maxRecipients: max }, 'send-trust grant added');
+  if (!normalized) return null;
+  const grant = withScopesStateMutation(() => appendSendTrustGrantUnlocked(readAll(), normalized));
+  logger.info({
+    id: grant.id,
+    domains: normalized.domains,
+    recipients: normalized.recipients,
+    toolkits: normalized.toolkits,
+    maxRecipients: normalized.maxRecipients,
+  }, 'send-trust grant added');
   return grant;
+}
+
+export type TrustProposalGrantResult =
+  | { status: 'granted'; grant: SendTrustGrant; recovered: boolean }
+  | { status: 'covered'; grant: SendTrustGrant }
+  | { status: 'refused' };
+
+/** Atomically recover-or-create the exact grant for one proposal. The proposal
+ * store has its own outer lock; this inner state lock makes the coverage check
+ * and append indivisible relative to every other plan-scopes.json writer. */
+export function grantSendTrustForProposal(
+  proposalId: string,
+  scope: {
+    domains?: string[];
+    recipients?: string[];
+    toolkits?: string[];
+    maxRecipients?: number;
+    note?: string;
+  },
+  source: { resolvedBy?: string; resolvedAt?: string } = {},
+): TrustProposalGrantResult {
+  const sourceProposalId = proposalId.trim();
+  if (!sourceProposalId || !sendTrustEnabled()) return { status: 'refused' };
+  const normalized = normalizeSendTrustScope(scope);
+  if (!normalized) return { status: 'refused' };
+
+  const result = withScopesStateMutation((): TrustProposalGrantResult => {
+    const file = readAll();
+    const sourced = (file.sendTrust ?? []).find((grant) => grant.sourceProposalId === sourceProposalId);
+    if (sourced) {
+      return sendTrustGrantMatchesExactScope(sourced, normalized)
+        ? { status: 'granted' as const, grant: sourced, recovered: true }
+        : { status: 'refused' as const };
+    }
+    const covering = liveCoveringSendTrustGrant(file.sendTrust ?? [], normalized);
+    if (covering) return { status: 'covered' as const, grant: covering };
+    const grant = appendSendTrustGrantUnlocked(file, normalized, {
+      proposalId: sourceProposalId,
+      resolvedBy: source.resolvedBy,
+      resolvedAt: source.resolvedAt,
+    });
+    return { status: 'granted' as const, grant, recovered: false };
+  });
+  if (result.status === 'granted' && !result.recovered) {
+    logger.info({ id: result.grant.id, proposalId: sourceProposalId }, 'send-trust proposal grant added');
+  }
+  return result;
+}
+
+/** Read the exact proposal-correlated grant without creating authority. This is
+ * used when a competing decline or maintenance tick recovers an approval whose
+ * grant committed immediately before its proposal terminal write. */
+export function findSendTrustGrantForProposal(
+  proposalId: string,
+  scope: {
+    domains?: string[];
+    recipients?: string[];
+    toolkits?: string[];
+    maxRecipients?: number;
+  },
+): SendTrustGrant | null {
+  const sourceProposalId = proposalId.trim();
+  const normalized = normalizeSendTrustScope(scope);
+  if (!sourceProposalId || !normalized) return null;
+  return withScopesStateMutation(() => {
+    const grant = (readAll().sendTrust ?? []).find((entry) => entry.sourceProposalId === sourceProposalId);
+    if (!grant) return null;
+    if (!sendTrustGrantMatchesExactScope(grant, normalized)) {
+      throw new Error(`Proposal-correlated send trust ${sourceProposalId} does not match its persisted exact scope.`);
+    }
+    return grant;
+  });
 }
 
 /** Revoke a send-trust grant (soft — keeps the row with revokedAt for audit). */
 export function revokeSendTrust(id: string): boolean {
-  const file = readAll();
-  const grant = file.sendTrust?.find((g) => g.id === id);
-  if (!grant || grant.revokedAt) return false;
-  grant.revokedAt = new Date().toISOString();
-  writeAll(file);
+  const revoked = withScopesStateMutation(() => {
+    const file = readAll();
+    const grant = file.sendTrust?.find((entry) => entry.id === id);
+    if (!grant || grant.revokedAt) return false;
+    grant.revokedAt = new Date().toISOString();
+    writeAll(file);
+    return true;
+  });
+  if (!revoked) return false;
   logger.info({ id }, 'send-trust grant revoked');
   return true;
 }
@@ -749,25 +939,9 @@ export function isSendTrustScopeCovered(scope: {
   toolkits?: string[];
 }): boolean {
   if (!sendTrustEnabled()) return false;
-  const grants = listSendTrustGrants();
-  if (grants.length === 0) return false;
-  const recipients = (scope.recipients ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean);
-  const domains = (scope.domains ?? []).map((d) => d.trim().toLowerCase().replace(/^@/, '')).filter(Boolean);
-  const toolkit = (scope.toolkits ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean)[0] ?? '';
-  if (recipients.length === 0 && domains.length === 0) return false;
-  for (const g of grants) {
-    if (g.toolkits && g.toolkits.length > 0) {
-      if (!toolkit || !g.toolkits.some((t) => toolkit.includes(t))) continue;
-    }
-    const gDomains = g.domains ?? [];
-    const gRecipients = g.recipients ?? [];
-    const recipCovered = recipients.every((e) => (
-      gRecipients.includes(e) || gDomains.includes(e.split('@')[1] ?? '')
-    ));
-    const domainCovered = domains.every((d) => gDomains.includes(d));
-    if (recipCovered && domainCovered) return true;
-  }
-  return false;
+  const normalized = normalizeSendTrustScope(scope);
+  if (!normalized) return false;
+  return liveCoveringSendTrustGrant(readAll().sendTrust ?? [], normalized) !== null;
 }
 
 /**

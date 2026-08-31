@@ -882,6 +882,30 @@ function deliveryAdmissionNeedsRetention(item: NotificationRecord): boolean {
     && item.deliveryAdmissionPendingAt.trim().length > 0;
 }
 
+function isUnresolvedWorkflowCapabilityCarrier(item: NotificationRecord): boolean {
+  return item.kind === 'workflow'
+    && item.metadata?.status === 'blocked_capability'
+    && item.metadata?.provenNoDispatch === true
+    && item.metadata?.needsAttention !== false
+    && typeof item.metadata?.capabilitySettledAt !== 'string';
+}
+
+/** Human-owned workflow gates are durable execution dependencies, not an
+ * ordinary activity history row. Keep their current unread carrier until the
+ * exact run authority settles it, even after outbound delivery has completed. */
+function unresolvedWorkflowGateNeedsRetention(item: NotificationRecord): boolean {
+  if (
+    item.kind !== 'workflow'
+    || item.read
+  ) return false;
+  return isUnresolvedWorkflowCapabilityCarrier(item)
+    || (
+      item.metadata?.needsAttention === true
+      && typeof item.metadata?.questionId === 'string'
+      && item.metadata.questionId.trim().length > 0
+    );
+}
+
 function pruneNotifications(
   items: NotificationRecord[],
   queue: NotificationDeliveryJob[],
@@ -899,6 +923,7 @@ function pruneNotifications(
       protectedIds.has(item.id)
       || exactReceiptNeedsRetention(item, nowMs)
       || deliveryAdmissionNeedsRetention(item)
+      || unresolvedWorkflowGateNeedsRetention(item)
     ) {
       protectedItems.push(item);
     } else {
@@ -979,7 +1004,11 @@ function isTerminalOriginChatPushEligible(item: NotificationRecord): boolean {
 }
 
 function shouldQueueNotificationDelivery(item: NotificationRecord): boolean {
-  if (item.silent) return false;
+  // Read receipts and inbox-only lifecycle records are durable mobile history,
+  // not new outbound interruptions. In particular, an answer receipt often
+  // carries the same question/check-in identifier as the request it resolves;
+  // queueing it would immediately push “Clem needs you” a second time.
+  if (item.silent || item.read || item.metadata?.inboxOnly === true) return false;
   if (hasExactOriginDeliveryMode(item)) {
     // A malformed exact-origin envelope deliberately remains queueable: the
     // resolver returns zero destinations and the worker records a durable
@@ -1017,7 +1046,20 @@ function ensureNotificationDeliveryQueuedUnlocked(item: NotificationRecord): voi
   if (!notificationNeedsDeliveryQueue(item)) return;
 
   const queue = loadDeliveryQueueUnlocked().items;
-  if (queue.some((job) => job.notificationId === item.id)) return;
+  const existing = queue.find((job) => job.notificationId === item.id);
+  if (existing) {
+    const admissionAt = item.deliveryAdmissionPendingAt;
+    if (typeof admissionAt === 'string' && admissionAt && existing.queuedAt !== admissionAt) {
+      // A stable carrier can advance to a new monotonic content generation
+      // (workflow capability retryCount). Its old cursor may already contain
+      // completed destinations; reset that retry bookkeeping before the new
+      // carrier is eligible for delivery. The persisted admission marker makes
+      // this repair repeatable after a crash between the two state files.
+      Object.assign(existing, freshDeliveryJob(item.id, admissionAt));
+      saveDeliveryQueueUnlocked(queue);
+    }
+    return;
+  }
   queue.push(freshDeliveryJob(item.id, notificationDeliveryQueuedAt(item)));
   saveDeliveryQueueUnlocked(queue);
 }
@@ -1066,9 +1108,198 @@ export function addNotification(item: NotificationRecord): void {
     // recomputed gap values — confusing duplicate reports of the same
     // outage. Content-dedup (proactive briefs, approvals) stays as a
     // secondary safety net for kinds that don't bother setting a stable id.
-    const existingWithId = item.id
+    let existingWithId = item.id
       ? items.find((existing) => existing.id === item.id)
       : undefined;
+    const capabilityRunId = item.kind === 'workflow'
+      && item.metadata?.status === 'blocked_capability'
+      && typeof item.metadata.runId === 'string'
+      && item.metadata.runId
+      ? item.metadata.runId
+      : null;
+    let refreshedStableCapability = false;
+    if (
+      capabilityRunId
+      && existingWithId?.kind === 'workflow'
+      && existingWithId.metadata?.status === 'blocked_capability'
+      && existingWithId.metadata.runId === capabilityRunId
+    ) {
+      const incomingGeneration = item.metadata?.retryCount;
+      const existingGeneration = existingWithId.metadata?.retryCount;
+      const validIncomingGeneration = typeof incomingGeneration === 'number'
+        && Number.isSafeInteger(incomingGeneration)
+        && incomingGeneration > 0;
+      const validExistingGeneration = typeof existingGeneration === 'number'
+        && Number.isSafeInteger(existingGeneration)
+        && existingGeneration > 0;
+      if (validIncomingGeneration && !validExistingGeneration) {
+        const existingStep = existingWithId.metadata?.stepId;
+        const existingTool = existingWithId.metadata?.tool;
+        if (
+          (typeof existingStep === 'string' && existingStep !== item.metadata?.stepId)
+          || (typeof existingTool === 'string' && existingTool !== item.metadata?.tool)
+        ) return { emit: false, kick: false };
+        const nextMetadata = { ...(existingWithId.metadata ?? {}), ...(item.metadata ?? {}) };
+        const explicitlySettled = typeof existingWithId.metadata?.capabilitySettledAt === 'string';
+        // Older desktop shells marked actionable toasts read when they were
+        // merely opened. The canonical blocked run is the execution authority,
+        // so reconciliation must revive that carrier unless an exact resolver
+        // wrote the capability settlement marker. A presentation-only read bit
+        // can never strand an indefinitely parked run across an upgrade.
+        if (explicitlySettled) {
+          nextMetadata.needsAttention = false;
+          if (!existingWithId.read) {
+            existingWithId.read = true;
+            refreshedStableCapability = true;
+          }
+        } else {
+          nextMetadata.needsAttention = true;
+          if (existingWithId.read) {
+            existingWithId.read = false;
+            refreshedStableCapability = true;
+          }
+        }
+        if (existingWithId.title !== item.title) {
+          existingWithId.title = item.title;
+          refreshedStableCapability = true;
+        }
+        if (existingWithId.body !== item.body) {
+          existingWithId.body = item.body;
+          refreshedStableCapability = true;
+        }
+        if (JSON.stringify(existingWithId.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+          existingWithId.metadata = nextMetadata;
+          refreshedStableCapability = true;
+        }
+      }
+      if (validIncomingGeneration && validExistingGeneration && incomingGeneration < existingGeneration) {
+        // A delayed producer from an older pause can never replace the current
+        // account choices or reopen a gate the user already handled.
+        return { emit: false, kick: false };
+      }
+      if (validIncomingGeneration && validExistingGeneration && incomingGeneration > existingGeneration) {
+        // Capability notifications intentionally keep one stable run/toolkit
+        // address, while retryCount is the monotonic content generation. A
+        // newer durable block may carry different exact account candidates.
+        // Refresh that carrier in-place, preserving any already-bound delivery
+        // route so a reconnect cannot widen an admitted notification target.
+        if (
+          exactNotificationAuthorityDigest(existingWithId) !== undefined
+          || exactNotificationAuthorityDigest(item) !== undefined
+        ) return { emit: false, kick: false };
+        if (existingWithId.deliveryPlan && !item.deliveryPlan) {
+          item.deliveryPlan = existingWithId.deliveryPlan;
+        }
+        const existingIndex = items.indexOf(existingWithId);
+        if (existingIndex >= 0) items.splice(existingIndex, 1);
+        existingWithId = undefined;
+      }
+      if (existingWithId && validIncomingGeneration && validExistingGeneration && incomingGeneration === existingGeneration) {
+        const sameCoordinates = existingWithId.metadata?.stepId === item.metadata?.stepId
+          && existingWithId.metadata?.tool === item.metadata?.tool;
+        const existingResolution = existingWithId.metadata?.resolution;
+        const incomingResolution = item.metadata?.resolution;
+        const existingDigest = existingResolution && typeof existingResolution === 'object' && !Array.isArray(existingResolution)
+          ? (existingResolution as Record<string, unknown>).choiceSetDigest
+          : undefined;
+        const incomingDigest = incomingResolution && typeof incomingResolution === 'object' && !Array.isArray(incomingResolution)
+          ? (incomingResolution as Record<string, unknown>).choiceSetDigest
+          : undefined;
+        if (!sameCoordinates || (
+          typeof existingDigest === 'string'
+          && typeof incomingDigest === 'string'
+          && existingDigest !== incomingDigest
+        )) {
+          return { emit: false, kick: false };
+        }
+        const nextMetadata = { ...(existingWithId.metadata ?? {}), ...(item.metadata ?? {}) };
+        const explicitlySettled = typeof existingWithId.metadata?.capabilitySettledAt === 'string';
+        if (explicitlySettled) {
+          nextMetadata.needsAttention = false;
+          if (!existingWithId.read) {
+            existingWithId.read = true;
+            refreshedStableCapability = true;
+          }
+        } else {
+          nextMetadata.needsAttention = true;
+          if (existingWithId.read) {
+            existingWithId.read = false;
+            refreshedStableCapability = true;
+          }
+        }
+        if (existingWithId.title !== item.title) {
+          existingWithId.title = item.title;
+          refreshedStableCapability = true;
+        }
+        if (existingWithId.body !== item.body) {
+          existingWithId.body = item.body;
+          refreshedStableCapability = true;
+        }
+        if (JSON.stringify(existingWithId.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+          existingWithId.metadata = nextMetadata;
+          refreshedStableCapability = true;
+        }
+      }
+    }
+    let refreshedStableWorkflowQuestion = false;
+    if (
+      existingWithId?.kind === 'workflow'
+      && item.kind === 'workflow'
+      && existingWithId.metadata?.status === 'awaiting_input'
+      && item.metadata?.status === 'awaiting_input'
+      && typeof item.metadata?.runId === 'string'
+      && typeof item.metadata?.questionId === 'string'
+      && typeof item.metadata?.stepId === 'string'
+      && existingWithId.metadata?.runId === item.metadata.runId
+      && existingWithId.metadata?.questionId === item.metadata.questionId
+      && existingWithId.metadata?.stepId === item.metadata.stepId
+    ) {
+      // Upgrade/restart reconciliation may improve truthful CTA copy (notably
+      // for scheduled runs with no origin chat) without minting another gate.
+      // Preserve read/delivery state and refresh only the same exact authority.
+      const nextMetadata = { ...(existingWithId.metadata ?? {}), ...(item.metadata ?? {}) };
+      if (existingWithId.title !== item.title) {
+        existingWithId.title = item.title;
+        refreshedStableWorkflowQuestion = true;
+      }
+      if (existingWithId.body !== item.body) {
+        existingWithId.body = item.body;
+        refreshedStableWorkflowQuestion = true;
+      }
+      if (JSON.stringify(existingWithId.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+        existingWithId.metadata = nextMetadata;
+        refreshedStableWorkflowQuestion = true;
+      }
+    }
+    let supersededCapabilityCarrier = false;
+    // A capability pause is a monotonic gate generation, not one immutable
+    // notification for the whole run. Re-admission can legitimately reach a
+    // newer account set or retry checkpoint. Publish the new generation while
+    // holding the notification-store lease and retire every prior generation
+    // for this exact run so restart/reblock cannot expose stale choices.
+    if (capabilityRunId) {
+      const settledAt = new Date().toISOString();
+      for (const existing of items) {
+        if (
+          existing.id === item.id
+          || existing.kind !== 'workflow'
+          || existing.metadata?.runId !== capabilityRunId
+          || existing.metadata?.status !== 'blocked_capability'
+        ) continue;
+        const nextMetadata = {
+          ...(existing.metadata ?? {}),
+          needsAttention: false,
+          capabilitySettledAt: settledAt,
+          capabilityResolutionStatus: 'superseded',
+          supersededByNotificationId: item.id,
+        };
+        if (!existing.read) existing.read = true;
+        if (JSON.stringify(existing.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+          existing.metadata = nextMetadata;
+        }
+        supersededCapabilityCarrier = true;
+      }
+    }
     if (existingWithId) {
       // A stable exact-origin id is immutable authority, not merely a dedupe
       // hint. Reject a conflicting candidate before any repair, requeue, or
@@ -1099,6 +1330,12 @@ export function addNotification(item: NotificationRecord): void {
       if (deliveryAdmissionNeedsRetention(existingWithId)) {
         delete existingWithId.deliveryAdmissionPendingAt;
         saveNotificationsUnlocked(items);
+      } else if (
+        supersededCapabilityCarrier
+        || refreshedStableWorkflowQuestion
+        || refreshedStableCapability
+      ) {
+        saveNotificationsUnlocked(items);
       }
       return { emit: false, kick: needsQueue };
     }
@@ -1106,6 +1343,7 @@ export function addNotification(item: NotificationRecord): void {
       isRecentDuplicateProactiveBrief(existing, item) ||
       isDuplicateApprovalNotification(existing, item)
     )) {
+      if (supersededCapabilityCarrier) saveNotificationsUnlocked(items);
       return { emit: false, kick: false };
     }
 
@@ -1188,6 +1426,12 @@ export function markNotificationRead(id: string): NotificationRecord | undefined
     const items = loadNotificationsUnlocked();
     const item = items.find((entry) => entry.id === id);
     if (!item) return undefined;
+    if (isUnresolvedWorkflowCapabilityCarrier(item)) {
+      // Read/dismiss is presentation state, not authority to consume the only
+      // exact chooser for an indefinitely parked run. Capability carriers are
+      // retired only by account-choice/retry/cancellation/terminal settlement.
+      return item;
+    }
     item.read = true;
     saveNotificationsUnlocked(items);
     return item;
@@ -1203,8 +1447,27 @@ export function markNotificationRead(id: string): NotificationRecord | undefined
 export function isNeedsAttentionNotification(
   notification: Pick<NotificationRecord, 'title' | 'metadata'>,
 ): boolean {
+  const checkInId = notification.metadata?.checkInId;
+  const checkInStatus = notification.metadata?.status;
+  const openCheckIn = typeof checkInId === 'string'
+    && checkInId.length > 0
+    && checkInStatus !== 'answered'
+    && checkInStatus !== 'closed';
+  const unresolvedCapabilityGate = notification.metadata?.status === 'blocked_capability'
+    && notification.metadata?.provenNoDispatch === true
+    && notification.metadata?.needsAttention !== false
+    && typeof notification.metadata?.capabilitySettledAt !== 'string';
+  const unresolvedWorkflowQuestion = notification.metadata?.status === 'awaiting_input'
+    && typeof notification.metadata?.questionId === 'string'
+    && notification.metadata.questionId.trim().length > 0
+    && notification.metadata?.needsAttention !== false
+    && typeof notification.metadata?.questionResolvedAt !== 'string';
   return notification.metadata?.needsAttention === true ||
+    unresolvedCapabilityGate ||
+    unresolvedWorkflowQuestion ||
     Boolean(notification.metadata?.proposedFixId) ||
+    Boolean(notification.metadata?.trustProposalId) ||
+    openCheckIn ||
     /\bblocked\b|needs attention|needs input|couldn['’]t finish|action required/i.test(notification.title || '');
 }
 
@@ -1231,6 +1494,7 @@ export function markNotificationGroupRead(id: string): NotificationRecord[] {
     const changed: NotificationRecord[] = [];
     for (const item of items) {
       if (item.read) continue;
+      if (isUnresolvedWorkflowCapabilityCarrier(item)) continue;
       const itemWorkflow = typeof item.metadata?.workflow === 'string' ? item.metadata.workflow.toLowerCase() : '';
       const sameTitle = Boolean(titleKey) && (item.title || '').toLowerCase().trim() === titleKey;
       const sameWorkflow = Boolean(workflowKey) && itemWorkflow === workflowKey && isNeedsAttentionNotification(item);
@@ -1277,6 +1541,26 @@ export function markNotificationsReadByApprovalId(
   });
 }
 
+/** Persist presentation settlement before removing its outbound cursor. If a
+ * process dies between those two durable writes, the delivery worker's
+ * settled-carrier guard still drops the leftover cursor without disclosure. */
+function persistSettledNotificationRowsUnlocked(
+  items: NotificationRecord[],
+  changed: NotificationRecord[],
+): void {
+  if (changed.length === 0) return;
+  for (const item of changed) delete item.deliveryAdmissionPendingAt;
+  const changedIds = new Set(changed.map((item) => item.id));
+  const queueSnapshot = loadDeliveryQueueUnlocked();
+  saveNotificationsUnlocked(items, {
+    queue: queueSnapshot.items,
+    skipPrune: queueSnapshot.corrupted,
+  });
+  if (queueSnapshot.corrupted) return;
+  const retained = queueSnapshot.items.filter((job) => !changedIds.has(job.notificationId));
+  if (retained.length !== queueSnapshot.items.length) saveDeliveryQueueUnlocked(retained);
+}
+
 /** Resolve the durable "background task needs your input" card once its
  * freeform question has been answered or the task leaves that parked state.
  * Approval notifications already had this lifecycle cleanup; question-backed
@@ -1309,7 +1593,148 @@ export function markNotificationsReadByQuestionId(
       }
       if (didChange) changed.push(item);
     }
-    if (changed.length > 0) saveNotificationsUnlocked(items);
+    persistSettledNotificationRowsUnlocked(items, changed);
+    return changed;
+  });
+}
+
+/** Exact workflow-question carrier settlement. Question ids are normally
+ * content-addressed, but runId remains part of the authority so a malformed or
+ * legacy duplicate cannot clear another run's prompt. */
+export function markWorkflowQuestionNotificationsSettled(
+  runId: string,
+  questionId: string,
+  metadataPatch: Record<string, unknown> = {},
+): NotificationRecord[] {
+  if (!runId || !questionId) return [];
+  return withNotificationStateLock(() => {
+    const items = loadNotificationsUnlocked();
+    const changed: NotificationRecord[] = [];
+    const resolvedAt = new Date().toISOString();
+    for (const item of items) {
+      if (
+        item.kind !== 'workflow'
+        || item.metadata?.runId !== runId
+        || item.metadata?.questionId !== questionId
+      ) continue;
+      if (
+        item.read
+        && item.metadata?.needsAttention === false
+        && typeof item.metadata?.questionResolvedAt === 'string'
+        && Object.entries(metadataPatch).every(([key, value]) => item.metadata?.[key] === value)
+      ) continue;
+      const nextMetadata = {
+        ...(item.metadata ?? {}),
+        needsAttention: false,
+        questionResolvedAt: resolvedAt,
+        ...metadataPatch,
+      };
+      let didChange = false;
+      if (!item.read) {
+        item.read = true;
+        didChange = true;
+      }
+      if (item.deliveryAdmissionPendingAt !== undefined) {
+        delete item.deliveryAdmissionPendingAt;
+        didChange = true;
+      }
+      if (JSON.stringify(item.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+        item.metadata = nextMetadata;
+        didChange = true;
+      }
+      if (didChange) changed.push(item);
+    }
+    persistSettledNotificationRowsUnlocked(items, changed);
+    return changed;
+  });
+}
+
+/** Settle only the stable capability gate for one exact workflow run. The
+ * terminal/result notification for the same run is intentionally untouched. */
+export function markWorkflowCapabilityNotificationsSettled(
+  runId: string,
+  metadataPatch: Record<string, unknown> = {},
+): NotificationRecord[] {
+  if (!runId) return [];
+  return withNotificationStateLock(() => {
+    const items = loadNotificationsUnlocked();
+    const changed: NotificationRecord[] = [];
+    const settledAt = new Date().toISOString();
+    for (const item of items) {
+      if (
+        item.kind !== 'workflow'
+        || item.metadata?.runId !== runId
+        || item.metadata?.status !== 'blocked_capability'
+      ) continue;
+      if (
+        item.read
+        && item.metadata?.needsAttention === false
+        && typeof item.metadata?.capabilitySettledAt === 'string'
+        && Object.entries(metadataPatch).every(([key, value]) => item.metadata?.[key] === value)
+      ) continue;
+      const nextMetadata = {
+        ...(item.metadata ?? {}),
+        needsAttention: false,
+        capabilitySettledAt: settledAt,
+        ...metadataPatch,
+      };
+      let didChange = false;
+      if (!item.read) {
+        item.read = true;
+        didChange = true;
+      }
+      if (item.deliveryAdmissionPendingAt !== undefined) {
+        delete item.deliveryAdmissionPendingAt;
+        didChange = true;
+      }
+      if (JSON.stringify(item.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+        item.metadata = nextMetadata;
+        didChange = true;
+      }
+      if (didChange) changed.push(item);
+    }
+    persistSettledNotificationRowsUnlocked(items, changed);
+    return changed;
+  });
+}
+
+/** Resolve the durable carrier for an agent check-in at the check-in
+ * authority. Answers can arrive from mobile, chat, Slack, Discord, or tools;
+ * tying cleanup to one transport leaves stale “Clem needs you” cards on every
+ * other surface. */
+export function markNotificationsReadByCheckInId(
+  checkInId: string,
+  metadataPatch: Record<string, unknown> = {},
+): NotificationRecord[] {
+  if (!checkInId) return [];
+  return withNotificationStateLock(() => {
+    const items = loadNotificationsUnlocked();
+    const changed: NotificationRecord[] = [];
+    const resolvedAt = new Date().toISOString();
+    for (const item of items) {
+      if (item.metadata?.checkInId !== checkInId) continue;
+      // Do not rewrite a terminal receipt if this helper is invoked again.
+      if (item.metadata?.status === 'answered' || item.metadata?.status === 'closed') continue;
+      const nextMetadata = {
+        ...(item.metadata ?? {}),
+        checkInResolvedAt: resolvedAt,
+        ...metadataPatch,
+      };
+      let didChange = false;
+      if (!item.read) {
+        item.read = true;
+        didChange = true;
+      }
+      if (JSON.stringify(item.metadata ?? {}) !== JSON.stringify(nextMetadata)) {
+        item.metadata = nextMetadata;
+        didChange = true;
+      }
+      if (didChange) changed.push(item);
+    }
+    // Settling the carrier must also remove its undelivered queue cursor. A
+    // plain notifications.json write left a race where Q1 disappeared from
+    // Inbox but was still pushed to Discord/Slack after Q2 became current.
+    persistSettledNotificationRowsUnlocked(items, changed);
     return changed;
   });
 }

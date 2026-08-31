@@ -44,6 +44,7 @@ struct RootView: View {
                     // carry a credential from the previous pairing into the
                     // newly scanned origin.
                     OriginHandoffStore.clear()
+                    PendingPushNavigationStore.clear()
                     PairingStore.save(newPairing)
                     launchURL = newLaunchURL
                     model = WebViewModel(pairing: newPairing)
@@ -68,12 +69,31 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(.light)
+        .onAppear { synchronizePendingNavigationDelivery() }
+        .onChange(of: gate.unlocked) { _, _ in
+            synchronizePendingNavigationDelivery()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: AppDelegate.pendingNavigationChanged)
+        ) { _ in
+            // The signal may arrive while Face ID is covering the app. In that
+            // case this disables delivery and leaves the persisted intent for
+            // the successful unlock transition above.
+            synchronizePendingNavigationDelivery()
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             // .inactive fires before the app is visible in the switcher, so
             // locking here keeps the transcript out of the task snapshot.
-            case .inactive, .background: gate.noteBackgrounded()
-            case .active: gate.noteForegrounded()
+            case .inactive, .background:
+                // Stop pending deep links before the gate/scene transition. A
+                // page finishing behind the privacy cover must not drain one.
+                model?.setPendingPushNavigationAllowed(false)
+                model?.setConnectionRouteReady(false)
+                gate.noteBackgrounded()
+            case .active:
+                gate.noteForegrounded()
+                synchronizePendingNavigationDelivery()
             @unknown default: break
             }
         }
@@ -81,9 +101,15 @@ struct RootView: View {
 
     private func unpair() {
         OriginHandoffStore.clear()
+        PendingPushNavigationStore.clear()
         PairingStore.clear()
         launchURL = nil
         model = nil
+    }
+
+    private func synchronizePendingNavigationDelivery() {
+        let allowed = scenePhase == .active && gate.unlocked
+        model?.setPendingPushNavigationAllowed(allowed)
     }
 }
 
@@ -108,7 +134,14 @@ private struct CommandCenterView: View {
         PinnedWebView(model: model)
             .ignoresSafeArea()
             .overlay {
-                if searching {
+                if !model.hasLoadedOnce {
+                    InitialConnectionCover(
+                        state: initialConnectionState,
+                        canRetry: connectionCoordinator.currentKind?.isReachable == true,
+                        onRetry: retryInitialConnection,
+                        onRepair: { confirmUnpair = true }
+                    )
+                } else if searching {
                     VStack(spacing: 10) {
                         ProgressView()
                         Text("Looking for your Mac on the network…")
@@ -130,6 +163,9 @@ private struct CommandCenterView: View {
                 Text("You'll scan a fresh QR code from the desktop Mobile panel to reconnect.")
             }
             .onAppear {
+                // A persisted push must wait for this foreground's path probe
+                // instead of racing the initial Home/relay navigation.
+                model.setConnectionRouteReady(false)
                 connectionCoordinator.start { update in
                     handlePathUpdate(update)
                 }
@@ -138,6 +174,7 @@ private struct CommandCenterView: View {
                 reconnectGate.cancel()
                 initialNavigationStarted = false
                 connectionCoordinator.stop()
+                model.setConnectionRouteReady(false)
             }
             .onChange(of: model.hasLoadedOnce) { _, loaded in
                 guard loaded else { return }
@@ -181,11 +218,6 @@ private struct CommandCenterView: View {
                     model.deliverApnsToken(token)
                 }
             }
-            .onReceive(NotificationCenter.default.publisher(for: AppDelegate.openPathNotification)) { note in
-                if let path = note.userInfo?["path"] as? String {
-                    model.openPath(path)
-                }
-            }
             .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
                 confirmUnpair = true
             }
@@ -194,6 +226,17 @@ private struct CommandCenterView: View {
                 // unpair as the shake gesture, just discoverable.
                 confirmUnpair = true
             }
+    }
+
+    private var initialConnectionState: InitialConnectionState {
+        if model.certificatePinFailed { return .safetyCheckChanged }
+        if model.connectionLost, !searching { return .offline }
+        return .looking
+    }
+
+    private func retryInitialConnection() {
+        guard let kind = connectionCoordinator.currentKind, kind.isReachable else { return }
+        reconnect(preferRelay: kind.prefersRelay)
     }
 
     /// The reconnect ladder, cheapest and most private first:
@@ -207,6 +250,7 @@ private struct CommandCenterView: View {
         guard update.kind.isReachable else {
             reconnectGate.cancel()
             searching = false
+            model.setConnectionRouteReady(false)
             model.connectionLost = true
             return
         }
@@ -236,6 +280,7 @@ private struct CommandCenterView: View {
         // spending their timeouts first is why remote access felt dead.
         let kind: ConnectionPathKind = preferRelay ? .cellular : .wifi
         guard let generation = reconnectGate.begin(kind) else { return }
+        model.setConnectionRouteReady(false)
         searching = true
         let candidates = ConnectionRoutePolicy.candidates(for: kind, pairing: pairing)
         RelayDiscovery.firstReachable(candidates, fingerprint: pairing.fingerprint) { reachable in
@@ -309,6 +354,76 @@ private struct CommandCenterView: View {
             fingerprint: model.pairing.fingerprint
         ) { relay in
             if let relay { model.rememberRelayOrigin(relay) }
+        }
+    }
+}
+
+private enum InitialConnectionState {
+    case looking
+    case offline
+    case safetyCheckChanged
+}
+
+private struct InitialConnectionCover: View {
+    let state: InitialConnectionState
+    let canRetry: Bool
+    let onRetry: () -> Void
+    let onRepair: () -> Void
+
+    var body: some View {
+        VStack(spacing: 22) {
+            ContentUnavailableView {
+                Label(title, systemImage: systemImage)
+            } description: {
+                Text(message)
+            }
+
+            switch state {
+            case .looking:
+                ProgressView()
+                    .controlSize(.large)
+                    .accessibilityLabel("Looking for your Mac")
+            case .offline:
+                Button("Try Again", systemImage: "arrow.clockwise", action: onRetry)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(!canRetry)
+            case .safetyCheckChanged:
+                Button("Pair Again", systemImage: "qrcode.viewfinder", action: onRepair)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+            }
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(paper)
+        .tint(Color(red: 1, green: 0.45, blue: 0.16))
+    }
+
+    private var title: String {
+        switch state {
+        case .looking: return "Looking for your Mac"
+        case .offline: return "Clem is offline"
+        case .safetyCheckChanged: return "Safety check changed"
+        }
+    }
+
+    private var systemImage: String {
+        switch state {
+        case .looking: return "network"
+        case .offline: return "wifi.slash"
+        case .safetyCheckChanged: return "exclamationmark.shield.fill"
+        }
+    }
+
+    private var message: String {
+        switch state {
+        case .looking:
+            return "Checking your saved Mac and its secure relay."
+        case .offline:
+            return "Clem can’t reach your Mac right now. Keep the Mac awake and check this phone’s connection."
+        case .safetyCheckChanged:
+            return "This Mac’s security fingerprint no longer matches the one you paired with. Scan a fresh QR code before reconnecting."
         }
     }
 }

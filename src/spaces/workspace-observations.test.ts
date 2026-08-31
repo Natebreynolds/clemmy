@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -914,6 +915,73 @@ test('document-mode observations support full data.json replacement and restart 
         },
       },
     });
+  } finally {
+    db.close();
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('document-mode object bootstrap and repeated healing preserve exact bytes without legacy decomposition', () => {
+  const rootDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-observations-document-fixed-point-'));
+  const db = openTestDb(rootDir);
+  try {
+    commitWorkspaceObservationBatch({
+      db,
+      rootDir,
+      workspaceId: 'temporal-room',
+      observations: [{
+        sourceKey: 'fixture-document',
+        refreshId: 'put-object-1',
+        cause: 'direct_put',
+        projectionMode: 'document',
+        status: 'ok',
+        data: { release: 'v3.14.0', rows: [{ id: 1 }, { id: 2 }] },
+      }],
+    });
+
+    const projectionPath = path.join(rootDir, 'data.json');
+    const committedBytes = readFileSync(projectionPath);
+    const committedMtimeNs = statSync(projectionPath, { bigint: true }).mtimeNs;
+
+    for (let boot = 0; boot < 2; boot += 1) {
+      assert.deepEqual(
+        bootstrapWorkspaceObservationHistory('temporal-room', { db, rootDir }),
+        { ok: true, imported: 0, skipped: 0 },
+      );
+      assert.deepEqual(
+        healWorkspaceDataProjection('temporal-room', { db, rootDir }),
+        {
+          bytes: committedBytes.byteLength,
+          sources: 1,
+          changed: false,
+        },
+      );
+      assert.deepEqual(readFileSync(projectionPath), committedBytes);
+    }
+
+    assert.equal(statSync(projectionPath, { bigint: true }).mtimeNs, committedMtimeNs);
+    const observations = listWorkspaceDatasetObservations('temporal-room', { db });
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0]?.sourceKey, 'fixture-document');
+    assert.equal(observations[0]?.projectionMode, 'document');
+    assert.equal(
+      (db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM workspace_dataset_observations
+        WHERE workspace_id = ?
+          AND cause = 'legacy_import'
+      `).get('temporal-room') as { count: number }).count,
+      0,
+      'document fields must never become legacy source identities',
+    );
+    assert.equal(
+      listWorkspaceDatasetObservations('temporal-room', { db, sourceKey: 'release' }).length,
+      0,
+    );
+    assert.equal(
+      listWorkspaceDatasetObservations('temporal-room', { db, sourceKey: 'rows' }).length,
+      0,
+    );
   } finally {
     db.close();
     rmSync(rootDir, { recursive: true, force: true });

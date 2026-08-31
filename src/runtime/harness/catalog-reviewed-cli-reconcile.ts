@@ -22,6 +22,7 @@ import { findSafeCliCommand } from '../cli-discovery.js';
 import { getSavedClis } from '../saved-clis.js';
 import { recordCapabilityOperations } from '../../memory/capability-index.js';
 import {
+  currentReviewedCliDescriptor,
   REVIEWED_CLI_READ_ACCOUNT,
   REVIEWED_CLI_READ_CARRIER,
   listReviewedCliReadDescriptors,
@@ -165,7 +166,11 @@ export async function reconcileCatalogReviewedCliReads(
     }
     const existing = listReviewedCliReadDescriptors()
       .find((row) => row.descriptorId === contract.descriptorId);
-    if (existing && sameClosedContract(existing, contract, executableRealpath) && !rehash) {
+    if (
+      existing
+      && sameClosedContract(existing, contract, executableRealpath)
+      && (!rehash || currentReviewedCliDescriptor(existing) !== null)
+    ) {
       skipped.push(entry.id);
       continue;
     }

@@ -37,14 +37,16 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
-import { addNotification } from '../runtime/notifications.js';
+import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
+import { addNotification, markNotificationRead } from '../runtime/notifications.js';
 import { appendAuditRecord } from '../runtime/audit-ledger.js';
 import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js';
 import { listPending } from '../runtime/harness/approval-registry.js';
 import { listPendingActions } from '../runtime/harness/pending-actions.js';
 import {
   extractSendTargets,
-  grantSendTrust,
+  findSendTrustGrantForProposal,
+  grantSendTrustForProposal,
   inferToolkit,
   isSendTrustScopeCovered,
   listAllSendTrustGrants,
@@ -54,6 +56,7 @@ import {
 const logger = pino({ name: 'clementine-next.trust-graduation' });
 
 const STORE_FILE = path.join(BASE_DIR, 'state', 'trust-graduation-proposals.json');
+const STORE_STATE_LOCK_FILE = path.join(BASE_DIR, 'state', 'trust-graduation-proposals-state');
 const MAX_STORED_PROPOSALS = 40;
 
 /** Evidence window: only clean sends within this many days count. Wider than
@@ -110,6 +113,26 @@ function declineCooldownMs(): number {
 
 export type TrustProposalStatus = 'pending' | 'approved' | 'declined' | 'superseded' | 'expired';
 
+export const TRUST_PROPOSAL_SCOPE_REVISION = 1 as const;
+
+/** Canonical, user-visible proof of the exact authority a decision applies to.
+ * Surfaces should round-trip scopeRevision + scopeDigest from the proposal they
+ * rendered; the remaining fields make successful decisions independently
+ * auditable without re-reading mutable proposal state. */
+export interface TrustProposalScopeReceipt {
+  scopeRevision: typeof TRUST_PROPOSAL_SCOPE_REVISION;
+  scopeDigest: string;
+  toolkits: string[];
+  recipients: string[];
+  domains: string[];
+  maxRecipients: number;
+}
+
+export interface TrustProposalScopeExpectation {
+  scopeRevision: number;
+  scopeDigest: string;
+}
+
 export interface TrustProposalEvidence {
   cleanSendCount: number;
   distinctDays: number;
@@ -122,6 +145,9 @@ export interface TrustProposal {
   id: string;
   /** Stable hash of the proposed scope — dedupe key for "one pending per scope". */
   scopeKey: string;
+  /** Immutable identity of every authority-bearing field rendered for review. */
+  scopeRevision: typeof TRUST_PROPOSAL_SCOPE_REVISION;
+  scopeDigest: string;
   toolkits: string[];
   recipients: string[];
   domains?: string[];
@@ -163,7 +189,7 @@ export interface TrustCandidate {
 
 // ── Store ────────────────────────────────────────────────────────────
 
-function loadStore(): ProposalFile {
+function loadStoreUnmigrated(): ProposalFile {
   try {
     if (!existsSync(STORE_FILE)) return { version: 'v1', proposals: [] };
     const parsed = JSON.parse(readFileSync(STORE_FILE, 'utf-8')) as ProposalFile;
@@ -182,15 +208,32 @@ function saveStore(store: ProposalFile): void {
   renameSync(tmp, STORE_FILE);
 }
 
+/** All proposal generations, including maintenance expiry/drafting, share one
+ * strict lease. Atomic rename prevents torn JSON; this lease prevents two valid
+ * but stale snapshots from each becoming the next authority generation. */
+function withProposalStateMutation<T>(work: () => T): T {
+  mkdirSync(path.dirname(STORE_STATE_LOCK_FILE), { recursive: true });
+  return withFileLockSyncStrict(STORE_STATE_LOCK_FILE, work);
+}
+
+/** Focused race tests widen the old load/check/write window. The pause sits
+ * inside the proposal lease, so a second process must not reach it. */
+function pauseTrustResolutionForTest(): void {
+  const raw = Number.parseInt(process.env.CLEMENTINE_TEST_TRUST_RESOLUTION_PAUSE_MS ?? '', 10);
+  if (!Number.isFinite(raw) || raw <= 0) return;
+  const delayMs = Math.min(raw, 2_000);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+}
+
 export function listTrustProposals(status?: TrustProposalStatus): TrustProposal[] {
-  const proposals = loadStore().proposals;
+  const proposals = readStoreWithScopeMigration().proposals;
   return (status ? proposals.filter((p) => p.status === status) : proposals)
     .slice()
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 export function getTrustProposal(id: string): TrustProposal | null {
-  return loadStore().proposals.find((p) => p.id === id) ?? null;
+  return readStoreWithScopeMigration().proposals.find((p) => p.id === id) ?? null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -200,6 +243,68 @@ function domainOf(recipient: string): string | null {
   return at > 0 ? recipient.slice(at + 1) : null;
 }
 
+function canonicalScopeValues(scope: {
+  toolkits: readonly string[];
+  recipients: readonly string[];
+  domains?: readonly string[];
+  maxRecipients: number;
+}): Omit<TrustProposalScopeReceipt, 'scopeRevision' | 'scopeDigest'> {
+  const canonical = (values: readonly string[]) => [...new Set(values
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean))].sort();
+  const canonicalDomains = [...new Set((scope.domains ?? [])
+    .map((domain) => domain.trim().toLowerCase().replace(/^@/, ''))
+    .filter(Boolean))].sort();
+  return {
+    toolkits: canonical(scope.toolkits),
+    recipients: canonical(scope.recipients),
+    domains: canonicalDomains,
+    maxRecipients: Math.max(1, Math.floor(scope.maxRecipients)),
+  };
+}
+
+function digestScopeValues(
+  values: Omit<TrustProposalScopeReceipt, 'scopeRevision' | 'scopeDigest'>,
+): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify({
+    scopeRevision: TRUST_PROPOSAL_SCOPE_REVISION,
+    ...values,
+  })).digest('hex')}`;
+}
+
+/** Return the canonical receipt for the proposal's CURRENT scope fields. This
+ * intentionally recomputes the digest: callers can compare it with the stored
+ * scopeDigest to detect state corruption or an in-place scope rewrite. */
+export function trustProposalScopeReceipt(
+  proposal: Pick<TrustProposal, 'toolkits' | 'recipients' | 'domains' | 'maxRecipients'>,
+): TrustProposalScopeReceipt {
+  const values = canonicalScopeValues(proposal);
+  return {
+    scopeRevision: TRUST_PROPOSAL_SCOPE_REVISION,
+    scopeDigest: digestScopeValues(values),
+    ...values,
+  };
+}
+
+function proposalScopeIsIntact(proposal: TrustProposal): boolean {
+  const receipt = trustProposalScopeReceipt(proposal);
+  return proposal.scopeRevision === receipt.scopeRevision
+    && proposal.scopeDigest === receipt.scopeDigest;
+}
+
+function expectationMatchesProposal(
+  proposal: TrustProposal,
+  expected: TrustProposalScopeExpectation | undefined,
+): boolean {
+  // A pending decision without the receipt rendered to the user is ID-only
+  // authority and must fail closed. Already-terminal/recovered decisions are
+  // handled before this check because they create no new authority.
+  return expected !== undefined && (
+    expected.scopeRevision === proposal.scopeRevision
+    && expected.scopeDigest === proposal.scopeDigest
+  );
+}
+
 function scopeKeyFor(toolkits: string[], recipients: string[], domains: string[]): string {
   const canon = JSON.stringify({
     toolkits: [...toolkits].sort(),
@@ -207,6 +312,230 @@ function scopeKeyFor(toolkits: string[], recipients: string[], domains: string[]
     domains: [...domains].sort(),
   });
   return `tgp-${createHash('sha256').update(canon).digest('hex').slice(0, 16)}`;
+}
+
+interface ProposalStoreMigration {
+  store: ProposalFile;
+  changed: boolean;
+  quarantined: TrustProposal[];
+}
+
+function own(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function safeCanonicalScopeValues(record: Record<string, unknown>): Omit<
+  TrustProposalScopeReceipt,
+  'scopeRevision' | 'scopeDigest'
+> {
+  const strings = (value: unknown): string[] => (
+    Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
+  );
+  const rawMaxRecipients = record.maxRecipients;
+  const maxRecipients = typeof rawMaxRecipients === 'number' && Number.isFinite(rawMaxRecipients)
+    ? Math.max(1, Math.min(SEND_TRUST_MAX_RECIPIENTS, Math.floor(rawMaxRecipients)))
+    : 1;
+  return canonicalScopeValues({
+    toolkits: strings(record.toolkits),
+    recipients: strings(record.recipients),
+    domains: strings(record.domains),
+    maxRecipients,
+  });
+}
+
+function validatedCanonicalScopeValues(
+  proposal: TrustProposal,
+): { values: Omit<TrustProposalScopeReceipt, 'scopeRevision' | 'scopeDigest'> } | { error: string } {
+  const record = proposal as unknown as Record<string, unknown>;
+  if (!Array.isArray(record.toolkits) || record.toolkits.some((entry) => typeof entry !== 'string')) {
+    return { error: 'toolkits must be a string array' };
+  }
+  if (!Array.isArray(record.recipients) || record.recipients.some((entry) => typeof entry !== 'string')) {
+    return { error: 'recipients must be a string array' };
+  }
+  if (
+    record.domains !== undefined
+    && (!Array.isArray(record.domains) || record.domains.some((entry) => typeof entry !== 'string'))
+  ) {
+    return { error: 'domains must be a string array when present' };
+  }
+  if (
+    typeof record.maxRecipients !== 'number'
+    || !Number.isFinite(record.maxRecipients)
+    || !Number.isInteger(record.maxRecipients)
+    || record.maxRecipients < 1
+    || record.maxRecipients > SEND_TRUST_MAX_RECIPIENTS
+  ) {
+    return { error: `maxRecipients must be an integer from 1 to ${SEND_TRUST_MAX_RECIPIENTS}` };
+  }
+
+  const values = canonicalScopeValues({
+    toolkits: record.toolkits as string[],
+    recipients: record.recipients as string[],
+    domains: record.domains as string[] | undefined,
+    maxRecipients: record.maxRecipients,
+  });
+  if (values.toolkits.length === 0) return { error: 'toolkit scope is empty' };
+  if (values.recipients.length === 0 && values.domains.length === 0) {
+    return { error: 'recipient scope is empty' };
+  }
+  return { values };
+}
+
+function storedScopeIsCanonical(
+  proposal: TrustProposal,
+  values: Omit<TrustProposalScopeReceipt, 'scopeRevision' | 'scopeDigest'>,
+): boolean {
+  const record = proposal as unknown as Record<string, unknown>;
+  const exactStrings = (stored: unknown, canonical: readonly string[]): boolean => (
+    Array.isArray(stored)
+    && stored.length === canonical.length
+    && stored.every((entry, index) => entry === canonical[index])
+  );
+  const domainsAreCanonical = values.domains.length > 0
+    ? exactStrings(record.domains, values.domains)
+    : record.domains === undefined;
+  return exactStrings(record.toolkits, values.toolkits)
+    && exactStrings(record.recipients, values.recipients)
+    && domainsAreCanonical
+    && record.maxRecipients === values.maxRecipients;
+}
+
+function validateStoredPendingScopeReceipt(proposal: TrustProposal): string | null {
+  const record = proposal as unknown as Record<string, unknown>;
+  if (record.scopeRevision !== TRUST_PROPOSAL_SCOPE_REVISION) {
+    return `unsupported scope revision ${String(record.scopeRevision)}`;
+  }
+  if (typeof record.scopeDigest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(record.scopeDigest)) {
+    return 'scope digest is malformed';
+  }
+
+  const validated = validatedCanonicalScopeValues(proposal);
+  if ('error' in validated) return validated.error;
+  const { values } = validated;
+  if (!storedScopeIsCanonical(proposal, values)) {
+    return 'scope fields are not in canonical form';
+  }
+
+  if (record.scopeDigest !== digestScopeValues(values)) {
+    return 'scope digest does not match the canonical scope';
+  }
+  return null;
+}
+
+function bindCanonicalScope(
+  proposal: TrustProposal,
+  values: Omit<TrustProposalScopeReceipt, 'scopeRevision' | 'scopeDigest'>,
+): void {
+  proposal.toolkits = values.toolkits;
+  proposal.recipients = values.recipients;
+  proposal.domains = values.domains.length > 0 ? values.domains : undefined;
+  proposal.maxRecipients = values.maxRecipients;
+  proposal.scopeRevision = TRUST_PROPOSAL_SCOPE_REVISION;
+  proposal.scopeDigest = digestScopeValues(values);
+}
+
+function quarantinePendingLegacyScope(
+  proposal: TrustProposal,
+  reason: string,
+  now: Date,
+): void {
+  const record = proposal as unknown as Record<string, unknown>;
+  bindCanonicalScope(proposal, safeCanonicalScopeValues(record));
+  proposal.status = 'superseded';
+  proposal.resolvedAt = proposal.resolvedAt ?? now.toISOString();
+  proposal.resolvedReason = `legacy proposal quarantined: ${reason}`;
+}
+
+/**
+ * Upgrade or validate every pending row while the proposal lease is held.
+ * Pre-receipt rows use their legacy scopeKey as the integrity anchor; rows that
+ * already carry a receipt must prove that exact immutable generation. Any
+ * mismatch is terminally quarantined rather than re-sealed around potentially
+ * rewritten authority. This migration never calls the grant authority.
+ */
+function migratePendingScopeReceipts(store: ProposalFile, now: Date): ProposalStoreMigration {
+  let changed = false;
+  const quarantined: TrustProposal[] = [];
+  for (const proposal of store.proposals) {
+    if (proposal.status !== 'pending') continue;
+    const record = proposal as unknown as Record<string, unknown>;
+    const hasRevision = own(record, 'scopeRevision');
+    const hasDigest = own(record, 'scopeDigest');
+    // Receipt-bearing rows still pass through this locked read barrier. Merely
+    // owning both keys is not proof: a malformed revision/digest, non-canonical
+    // scope, or digest mismatch must become terminal before a
+    // desktop/mobile pending list can render an immortal, unresolvable card.
+    if (hasRevision && hasDigest) {
+      const receiptError = validateStoredPendingScopeReceipt(proposal);
+      if (receiptError !== null) {
+        quarantinePendingLegacyScope(proposal, receiptError, now);
+        quarantined.push(proposal);
+        changed = true;
+      }
+      continue;
+    }
+    if (hasRevision || hasDigest) {
+      quarantinePendingLegacyScope(proposal, 'partial scope receipt', now);
+      quarantined.push(proposal);
+      changed = true;
+      continue;
+    }
+
+    const validated = validatedCanonicalScopeValues(proposal);
+    if ('error' in validated) {
+      quarantinePendingLegacyScope(proposal, validated.error, now);
+      quarantined.push(proposal);
+      changed = true;
+      continue;
+    }
+
+    const { values } = validated;
+    const expectedScopeKey = scopeKeyFor(values.toolkits, values.recipients, values.domains);
+    if (
+      typeof record.scopeKey !== 'string'
+      || record.scopeKey !== expectedScopeKey
+    ) {
+      quarantinePendingLegacyScope(proposal, 'scope fields do not match the legacy scope key', now);
+      quarantined.push(proposal);
+      changed = true;
+      continue;
+    }
+
+    const before = JSON.stringify({
+      scopeRevision: record.scopeRevision,
+      scopeDigest: record.scopeDigest,
+      toolkits: record.toolkits,
+      recipients: record.recipients,
+      domains: record.domains,
+      maxRecipients: record.maxRecipients,
+    });
+    bindCanonicalScope(proposal, values);
+    const after = JSON.stringify({
+      scopeRevision: proposal.scopeRevision,
+      scopeDigest: proposal.scopeDigest,
+      toolkits: proposal.toolkits,
+      recipients: proposal.recipients,
+      domains: proposal.domains,
+      maxRecipients: proposal.maxRecipients,
+    });
+    if (before !== after) changed = true;
+  }
+  return { store, changed, quarantined };
+}
+
+/** Caller must already hold the proposal-state lease. */
+function loadStoreWithScopeMigration(now: Date): ProposalStoreMigration {
+  const migration = migratePendingScopeReceipts(loadStoreUnmigrated(), now);
+  if (migration.changed) saveStore(migration.store);
+  return migration;
+}
+
+/** Action surfaces receive only locked, migrated proposal generations. */
+function readStoreWithScopeMigration(): ProposalFile {
+  const migration = withProposalStateMutation(() => loadStoreWithScopeMigration(new Date()));
+  for (const proposal of migration.quarantined) markTerminalProposalNotificationRead(proposal);
+  return migration.store;
 }
 
 /** Do two recipient sets intersect (case-insensitive)? */
@@ -423,18 +752,36 @@ function buildRationale(c: TrustCandidate): string {
 
 // ── Tick ─────────────────────────────────────────────────────────────
 
-function expireStale(store: ProposalFile, now: Date): boolean {
+function recoverCommittedProposalApproval(proposal: TrustProposal): boolean {
+  const grant = findSendTrustGrantForProposal(proposal.id, {
+    recipients: proposal.recipients,
+    domains: proposal.domains,
+    toolkits: proposal.toolkits,
+    maxRecipients: proposal.maxRecipients,
+  });
+  if (!grant) return false;
+  proposal.status = 'approved';
+  proposal.resolvedAt = grant.sourceProposalResolvedAt ?? grant.grantedAt;
+  proposal.resolvedBy = grant.sourceProposalResolvedBy ?? 'recovered-committed-grant';
+  proposal.resolvedReason = grant.revokedAt
+    ? 'owner approved (recovered committed grant; grant was later revoked)'
+    : 'owner approved (recovered committed grant)';
+  proposal.grantId = grant.id;
+  return true;
+}
+
+function expireStale(store: ProposalFile, now: Date): TrustProposal[] {
   const cutoff = now.getTime() - PENDING_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
-  let changed = false;
+  const expired: TrustProposal[] = [];
   for (const p of store.proposals) {
     if (p.status === 'pending' && Date.parse(p.createdAt) < cutoff) {
       p.status = 'expired';
       p.resolvedAt = now.toISOString();
       p.resolvedReason = 'pending expired (no decision within 14 days)';
-      changed = true;
+      expired.push(p);
     }
   }
-  return changed;
+  return expired;
 }
 
 /** Is this candidate's recipient set a subset of any recently-declined scope? */
@@ -462,49 +809,87 @@ function blockedByDeclineCooldown(store: ProposalFile, c: TrustCandidate, now: D
 export function tickTrustGraduation(now: Date = new Date()): void {
   try {
     if (!trustGraduationEnabled()) return;
+    // Evidence collection can touch large approval histories. Keep it outside
+    // the short proposal critical section; authority is re-checked under lock.
+    const candidates = sendTrustEnabled()
+      ? deriveTrustCandidates(collectCleanSends(now), now)
+      : [];
+    const { proposed, expired, recovered, quarantined } = withProposalStateMutation(() => {
+      const migration = loadStoreWithScopeMigration(now);
+      const { store } = migration;
+      const recoveredRows: TrustProposal[] = [];
+      for (const proposal of store.proposals) {
+        if (proposal.status === 'pending' && recoverCommittedProposalApproval(proposal)) {
+          recoveredRows.push(proposal);
+        }
+      }
+      const expiredRows = expireStale(store, now);
+      const proposedRows: TrustProposal[] = [];
+      let pendingCount = store.proposals.filter((proposal) => proposal.status === 'pending').length;
+      for (const candidate of candidates) {
+        if (pendingCount >= MAX_PENDING) break;
+        // Already granted → nothing to propose. Approval performs the same check
+        // atomically with grant creation; this early check is noise suppression.
+        if (isSendTrustScopeCovered({
+          recipients: candidate.recipients,
+          domains: candidate.domains,
+          toolkits: candidate.toolkits,
+        })) continue;
+        if (store.proposals.some((proposal) => (
+          proposal.status === 'pending' && proposal.scopeKey === candidate.scopeKey
+        ))) continue;
+        if (blockedByDeclineCooldown(store, candidate, now)) continue;
 
-    const store = loadStore();
-    let changed = expireStale(store, now);
-
-    // With send-trust off there is nothing to grant — still expire stale
-    // pending, but never draft a suggestion we could not honor.
-    if (!sendTrustEnabled()) { if (changed) saveStore(store); return; }
-
-    const observations = collectCleanSends(now);
-    const candidates = deriveTrustCandidates(observations, now);
-
-    let pendingCount = store.proposals.filter((p) => p.status === 'pending').length;
-    for (const c of candidates) {
-      if (pendingCount >= MAX_PENDING) break;
-      // Already granted → nothing to propose.
-      if (isSendTrustScopeCovered({ recipients: c.recipients, domains: c.domains, toolkits: c.toolkits })) continue;
-      // One pending per scope.
-      if (store.proposals.some((p) => p.status === 'pending' && p.scopeKey === c.scopeKey)) continue;
-      // Cooldown after a decline of the same/wider scope.
-      if (blockedByDeclineCooldown(store, c, now)) continue;
-
-      const proposal: TrustProposal = {
-        id: `tgp-${randomUUID().slice(0, 12)}`,
-        scopeKey: c.scopeKey,
-        toolkits: c.toolkits,
-        recipients: c.recipients,
-        domains: c.domains.length ? c.domains : undefined,
-        maxRecipients: c.maxRecipients,
-        evidence: c.evidence,
-        rationale: buildRationale(c),
-        status: 'pending',
-        createdAt: now.toISOString(),
+        const receipt = trustProposalScopeReceipt(candidate);
+        const proposal: TrustProposal = {
+          id: `tgp-${randomUUID().slice(0, 12)}`,
+          scopeKey: candidate.scopeKey,
+          scopeRevision: receipt.scopeRevision,
+          scopeDigest: receipt.scopeDigest,
+          toolkits: receipt.toolkits,
+          recipients: receipt.recipients,
+          domains: receipt.domains.length > 0 ? receipt.domains : undefined,
+          maxRecipients: receipt.maxRecipients,
+          evidence: candidate.evidence,
+          rationale: buildRationale(candidate),
+          status: 'pending',
+          createdAt: now.toISOString(),
+        };
+        store.proposals.push(proposal);
+        proposedRows.push(proposal);
+        pendingCount += 1;
+      }
+      if (expiredRows.length > 0 || proposedRows.length > 0 || recoveredRows.length > 0) saveStore(store);
+      return {
+        proposed: proposedRows,
+        expired: expiredRows,
+        recovered: recoveredRows,
+        quarantined: migration.quarantined,
       };
-      store.proposals.push(proposal);
-      pendingCount += 1;
-      changed = true;
+    });
 
+    // The proposal file is canonical. Projections happen after its lease is
+    // released and are stable-id/best-effort so no callback can extend the
+    // authority critical section.
+    for (const proposal of quarantined) markTerminalProposalNotificationRead(proposal);
+    for (const proposal of expired) markTerminalProposalNotificationRead(proposal);
+    for (const proposal of recovered) {
+      markTerminalProposalNotificationRead(proposal);
+      auditResolved(proposal, 'approved');
+      logger.info({
+        proposalId: proposal.id,
+        grantId: proposal.grantId,
+      }, 'trust graduation recovered a committed proposal grant');
+    }
+    for (const proposal of proposed) {
       try {
         appendAuditRecord({
           at: proposal.createdAt,
           kind: 'trust_graduation_proposed',
           proposalId: proposal.id,
           scopeKey: proposal.scopeKey,
+          scopeRevision: proposal.scopeRevision,
+          scopeDigest: proposal.scopeDigest,
           toolkits: proposal.toolkits,
           recipients: proposal.recipients,
           domains: proposal.domains ?? [],
@@ -521,19 +906,26 @@ export function tickTrustGraduation(now: Date = new Date()): void {
           body: [
             proposal.rationale,
             '',
-            `Scope: ${describeScope(c)} · via ${proposal.toolkits.join(', ')}`,
+            `Scope: ${describeScope({ recipients: proposal.recipients, domains: proposal.domains ?? [] })} · via ${proposal.toolkits.join(', ')}`,
             'Approve or decline from Inbox → Needs you.',
           ].join('\n'),
           createdAt: proposal.createdAt,
           read: false,
-          metadata: { trustProposalId: proposal.id, kind: 'trust_graduation_proposal' },
+          metadata: {
+            trustProposalId: proposal.id,
+            trustProposalScopeRevision: proposal.scopeRevision,
+            trustProposalScopeDigest: proposal.scopeDigest,
+            kind: 'trust_graduation_proposal',
+          },
         });
       } catch { /* notification is best-effort */ }
 
-      logger.info({ proposalId: proposal.id, scopeKey: proposal.scopeKey, toolkit: c.toolkits[0] }, 'trust graduation proposed');
+      logger.info({
+        proposalId: proposal.id,
+        scopeKey: proposal.scopeKey,
+        toolkit: proposal.toolkits[0],
+      }, 'trust graduation proposed');
     }
-
-    if (changed) saveStore(store);
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err }, 'trust graduation tick failed');
   }
@@ -543,87 +935,329 @@ export function tickTrustGraduation(now: Date = new Date()): void {
 
 export interface ResolveTrustResult {
   ok: boolean;
-  reason: 'approved' | 'declined' | 'not-found' | 'not-pending' | 'superseded';
+  reason:
+    | 'approved'
+    | 'declined'
+    | 'not-found'
+    | 'not-pending'
+    | 'superseded'
+    | 'expired'
+    | 'scope-mismatch';
   proposal?: TrustProposal;
   grantId?: string;
+  /** Exact authority the decision did, or would have, covered. */
+  scopeReceipt?: TrustProposalScopeReceipt;
+}
+
+interface TrustResolutionCommit {
+  result: ResolveTrustResult;
+  newlyResolved?: 'approved' | 'declined' | 'superseded' | 'expired';
+}
+
+function proposalHasExpired(proposal: TrustProposal, now: Date): boolean {
+  const createdAtMs = Date.parse(proposal.createdAt);
+  if (!Number.isFinite(createdAtMs)) return true;
+  return createdAtMs <= now.getTime() - PENDING_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function expireProposalAtDecision(
+  proposal: TrustProposal,
+  store: ProposalFile,
+  now: Date,
+): TrustResolutionCommit | null {
+  if (!proposalHasExpired(proposal, now)) return null;
+  proposal.status = 'expired';
+  proposal.resolvedAt = now.toISOString();
+  proposal.resolvedReason = 'pending expired before owner decision (no decision within 14 days)';
+  saveStore(store);
+  return {
+    result: {
+      ok: false,
+      reason: 'expired',
+      proposal,
+      scopeReceipt: trustProposalScopeReceipt(proposal),
+    },
+    newlyResolved: 'expired',
+  };
+}
+
+function rejectCorruptProposalScope(
+  proposal: TrustProposal,
+  store: ProposalFile,
+  now: Date,
+): TrustResolutionCommit {
+  proposal.status = 'superseded';
+  proposal.resolvedAt = now.toISOString();
+  proposal.resolvedReason = 'stored proposal scope no longer matches its immutable digest';
+  saveStore(store);
+  return {
+    result: {
+      ok: false,
+      reason: 'scope-mismatch',
+      proposal,
+      scopeReceipt: trustProposalScopeReceipt(proposal),
+    },
+    newlyResolved: 'superseded',
+  };
+}
+
+function pendingScopeMismatch(
+  proposal: TrustProposal,
+): TrustResolutionCommit {
+  return {
+    result: {
+      ok: false,
+      reason: 'scope-mismatch',
+      proposal,
+      scopeReceipt: trustProposalScopeReceipt(proposal),
+    },
+  };
+}
+
+function markTerminalProposalNotificationRead(proposal: TrustProposal | undefined): void {
+  if (!proposal || proposal.status === 'pending') return;
+  try {
+    markNotificationRead(`trust-proposal-${proposal.id}`);
+  } catch {
+    // Proposal state is canonical. The stable notification can be reconciled by
+    // a terminal replay without turning an already-committed decision into 5xx.
+  }
+}
+
+function finishTrustResolution(commit: TrustResolutionCommit): ResolveTrustResult {
+  markTerminalProposalNotificationRead(commit.result.proposal);
+  if (commit.newlyResolved && commit.result.proposal) {
+    auditResolved(commit.result.proposal, commit.newlyResolved);
+    if (commit.newlyResolved === 'approved') {
+      logger.info({
+        proposalId: commit.result.proposal.id,
+        grantId: commit.result.grantId,
+      }, 'trust graduation approved → grant committed');
+    } else {
+      logger.info({
+        proposalId: commit.result.proposal.id,
+        resolution: commit.newlyResolved,
+      }, `trust graduation ${commit.newlyResolved}`);
+    }
+  }
+  return commit.result;
 }
 
 /**
- * Approve a proposal → grant the exact proposed scope via grantSendTrust (the
- * sole grant authority). Re-checks coverage at approve time: if a live grant now
- * covers the scope, or grantSendTrust refuses (send-trust disabled / unscoped),
- * the proposal is marked superseded and nothing new is granted.
+ * Approve a proposal under the proposal lease, then recover-or-create its exact
+ * send grant under the plan-scope lease. The sourceProposalId correlation closes
+ * the two-file crash window: if the grant committed first, a retry completes the
+ * proposal as approved with that same grant rather than double-granting or
+ * misreporting unrelated coverage.
  */
-export function approveTrustProposal(id: string, resolvedBy = 'user', now = new Date()): ResolveTrustResult {
-  const store = loadStore();
-  const proposal = store.proposals.find((p) => p.id === id);
-  if (!proposal) return { ok: false, reason: 'not-found' };
-  if (proposal.status !== 'pending') return { ok: false, reason: 'not-pending', proposal };
+export function approveTrustProposal(id: string, resolvedBy?: string, now?: Date): ResolveTrustResult;
+export function approveTrustProposal(
+  id: string,
+  resolvedBy: string | undefined,
+  expectedScope: TrustProposalScopeExpectation,
+  now?: Date,
+): ResolveTrustResult;
+export function approveTrustProposal(
+  id: string,
+  resolvedBy = 'user',
+  expectedScopeOrNow?: TrustProposalScopeExpectation | Date,
+  decisionNow = new Date(),
+): ResolveTrustResult {
+  const expectedScope = expectedScopeOrNow instanceof Date ? undefined : expectedScopeOrNow;
+  const now = expectedScopeOrNow instanceof Date ? expectedScopeOrNow : decisionNow;
+  const commit = withProposalStateMutation((): TrustResolutionCommit => {
+    const migration = loadStoreWithScopeMigration(now);
+    const { store } = migration;
+    const proposal = store.proposals.find((row) => row.id === id);
+    if (!proposal) return { result: { ok: false, reason: 'not-found' } };
+    if (migration.quarantined.includes(proposal)) {
+      return {
+        result: {
+          ok: false,
+          reason: 'scope-mismatch',
+          proposal,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+        newlyResolved: 'superseded',
+      };
+    }
+    if (proposal.status !== 'pending') {
+      return {
+        result: {
+          ok: false,
+          reason: 'not-pending',
+          proposal,
+          grantId: proposal.grantId,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+      };
+    }
+    if (recoverCommittedProposalApproval(proposal)) {
+      saveStore(store);
+      return {
+        result: {
+          ok: true,
+          reason: 'approved',
+          proposal,
+          grantId: proposal.grantId,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+        newlyResolved: 'approved',
+      };
+    }
+    const expired = expireProposalAtDecision(proposal, store, now);
+    if (expired) return expired;
+    if (!proposalScopeIsIntact(proposal)) return rejectCorruptProposalScope(proposal, store, now);
+    if (!expectationMatchesProposal(proposal, expectedScope)) return pendingScopeMismatch(proposal);
+    pauseTrustResolutionForTest();
 
-  const nowIso = now.toISOString();
+    const grantResult = grantSendTrustForProposal(proposal.id, {
+      recipients: proposal.recipients,
+      domains: proposal.domains,
+      toolkits: proposal.toolkits,
+      maxRecipients: proposal.maxRecipients,
+      note: `graduated: ${proposal.evidence.cleanSendCount} approved clean sends (${proposal.id})`,
+    }, {
+      resolvedBy,
+      resolvedAt: now.toISOString(),
+    });
+    const nowIso = now.toISOString();
+    proposal.resolvedAt = grantResult.status === 'granted' && grantResult.recovered
+      ? grantResult.grant.sourceProposalResolvedAt ?? grantResult.grant.grantedAt
+      : nowIso;
+    proposal.resolvedBy = grantResult.status === 'granted' && grantResult.recovered
+      ? grantResult.grant.sourceProposalResolvedBy ?? resolvedBy
+      : resolvedBy;
 
-  // Already covered since drafting → moot, don't double-grant.
-  if (isSendTrustScopeCovered({ recipients: proposal.recipients, domains: proposal.domains, toolkits: proposal.toolkits })) {
+    if (grantResult.status === 'granted') {
+      proposal.status = 'approved';
+      proposal.resolvedReason = grantResult.recovered
+        ? 'owner approved (recovered committed grant)'
+        : 'owner approved';
+      proposal.grantId = grantResult.grant.id;
+      saveStore(store);
+      return {
+        result: {
+          ok: true,
+          reason: 'approved',
+          proposal,
+          grantId: grantResult.grant.id,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+        newlyResolved: 'approved',
+      };
+    }
+
     proposal.status = 'superseded';
-    proposal.resolvedAt = nowIso;
-    proposal.resolvedBy = resolvedBy;
-    proposal.resolvedReason = 'an existing grant already covers this scope';
+    proposal.resolvedReason = grantResult.status === 'covered'
+      ? 'an existing grant already covers this scope'
+      : 'send-trust is disabled, revoked during recovery, or the scope was refused';
     saveStore(store);
-    auditResolved(proposal, 'superseded');
-    return { ok: false, reason: 'superseded', proposal };
-  }
-
-  const grant = grantSendTrust({
-    recipients: proposal.recipients,
-    domains: proposal.domains,
-    toolkits: proposal.toolkits,
-    maxRecipients: proposal.maxRecipients,
-    note: `graduated: ${proposal.evidence.cleanSendCount} approved clean sends (${proposal.id})`,
+    return {
+      result: {
+        ok: false,
+        reason: 'superseded',
+        proposal,
+        scopeReceipt: trustProposalScopeReceipt(proposal),
+      },
+      newlyResolved: 'superseded',
+    };
   });
-  if (!grant) {
-    proposal.status = 'superseded';
-    proposal.resolvedAt = nowIso;
-    proposal.resolvedBy = resolvedBy;
-    proposal.resolvedReason = 'send-trust is disabled or the scope was refused';
-    saveStore(store);
-    auditResolved(proposal, 'superseded');
-    return { ok: false, reason: 'superseded', proposal };
-  }
-
-  proposal.status = 'approved';
-  proposal.resolvedAt = nowIso;
-  proposal.resolvedBy = resolvedBy;
-  proposal.resolvedReason = 'owner approved';
-  proposal.grantId = grant.id;
-  saveStore(store);
-  auditResolved(proposal, 'approved');
-  logger.info({ proposalId: proposal.id, grantId: grant.id }, 'trust graduation approved → grant created');
-  return { ok: true, reason: 'approved', proposal, grantId: grant.id };
+  return finishTrustResolution(commit);
 }
 
 /** Decline a proposal → grants nothing, starts the decline cooldown. */
-export function declineTrustProposal(id: string, resolvedBy = 'user', now = new Date()): ResolveTrustResult {
-  const store = loadStore();
-  const proposal = store.proposals.find((p) => p.id === id);
-  if (!proposal) return { ok: false, reason: 'not-found' };
-  if (proposal.status !== 'pending') return { ok: false, reason: 'not-pending', proposal };
-  proposal.status = 'declined';
-  proposal.resolvedAt = now.toISOString();
-  proposal.resolvedBy = resolvedBy;
-  proposal.resolvedReason = 'owner declined';
-  saveStore(store);
-  auditResolved(proposal, 'declined');
-  logger.info({ proposalId: proposal.id }, 'trust graduation declined');
-  return { ok: true, reason: 'declined', proposal };
+export function declineTrustProposal(id: string, resolvedBy?: string, now?: Date): ResolveTrustResult;
+export function declineTrustProposal(
+  id: string,
+  resolvedBy: string | undefined,
+  expectedScope: TrustProposalScopeExpectation,
+  now?: Date,
+): ResolveTrustResult;
+export function declineTrustProposal(
+  id: string,
+  resolvedBy = 'user',
+  expectedScopeOrNow?: TrustProposalScopeExpectation | Date,
+  decisionNow = new Date(),
+): ResolveTrustResult {
+  const expectedScope = expectedScopeOrNow instanceof Date ? undefined : expectedScopeOrNow;
+  const now = expectedScopeOrNow instanceof Date ? expectedScopeOrNow : decisionNow;
+  const commit = withProposalStateMutation((): TrustResolutionCommit => {
+    const migration = loadStoreWithScopeMigration(now);
+    const { store } = migration;
+    const proposal = store.proposals.find((row) => row.id === id);
+    if (!proposal) return { result: { ok: false, reason: 'not-found' } };
+    if (migration.quarantined.includes(proposal)) {
+      return {
+        result: {
+          ok: false,
+          reason: 'scope-mismatch',
+          proposal,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+        newlyResolved: 'superseded',
+      };
+    }
+    if (proposal.status !== 'pending') {
+      return {
+        result: {
+          ok: false,
+          reason: 'not-pending',
+          proposal,
+          grantId: proposal.grantId,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+      };
+    }
+    if (recoverCommittedProposalApproval(proposal)) {
+      saveStore(store);
+      return {
+        result: {
+          ok: false,
+          reason: 'not-pending',
+          proposal,
+          grantId: proposal.grantId,
+          scopeReceipt: trustProposalScopeReceipt(proposal),
+        },
+        newlyResolved: 'approved',
+      };
+    }
+    const expired = expireProposalAtDecision(proposal, store, now);
+    if (expired) return expired;
+    if (!proposalScopeIsIntact(proposal)) return rejectCorruptProposalScope(proposal, store, now);
+    if (!expectationMatchesProposal(proposal, expectedScope)) return pendingScopeMismatch(proposal);
+    pauseTrustResolutionForTest();
+    proposal.status = 'declined';
+    proposal.resolvedAt = now.toISOString();
+    proposal.resolvedBy = resolvedBy;
+    proposal.resolvedReason = 'owner declined';
+    saveStore(store);
+    return {
+      result: {
+        ok: true,
+        reason: 'declined',
+        proposal,
+        scopeReceipt: trustProposalScopeReceipt(proposal),
+      },
+      newlyResolved: 'declined',
+    };
+  });
+  return finishTrustResolution(commit);
 }
 
-function auditResolved(proposal: TrustProposal, resolution: 'approved' | 'declined' | 'superseded'): void {
+function auditResolved(
+  proposal: TrustProposal,
+  resolution: 'approved' | 'declined' | 'superseded' | 'expired',
+): void {
+  const receipt = trustProposalScopeReceipt(proposal);
   try {
     appendAuditRecord({
       at: proposal.resolvedAt ?? new Date().toISOString(),
       kind: 'trust_graduation_resolved',
       proposalId: proposal.id,
       scopeKey: proposal.scopeKey,
+      scopeRevision: receipt.scopeRevision,
+      scopeDigest: receipt.scopeDigest,
       resolution,
       resolvedBy: proposal.resolvedBy ?? null,
       grantId: proposal.grantId ?? null,

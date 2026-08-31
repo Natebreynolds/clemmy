@@ -27,7 +27,8 @@ export interface WorkspaceTemporalInitDependencies {
   index(record: SpaceRecord): void;
   bootstrap(workspaceId: string): BootstrapWorkspaceObservationHistoryResult;
   hasNonLegacyObservation(workspaceId: string): boolean;
-  heal(workspaceId: string): void;
+  /** Returns true only when data.json was replaced with different bytes. */
+  heal(workspaceId: string): boolean;
   recoverMemory(workspaceId: string): Promise<WorkspaceObservationMemoryRecoveryResult>;
   prune(workspaceId: string): PruneWorkspaceDatasetHistoryResult;
   pruneProjectionReceipts?(workspaceId: string): number;
@@ -53,6 +54,7 @@ const defaultDependencies: WorkspaceTemporalInitDependencies = {
     actor: 'workspace-temporal-init',
     emitOperational: false,
     appendStateEvent: false,
+    strict: true,
   }),
   bootstrap: (workspaceId) => bootstrapWorkspaceObservationHistory(workspaceId),
   hasNonLegacyObservation: (workspaceId) => Boolean(openWorkspaceDb().prepare(`
@@ -61,9 +63,7 @@ const defaultDependencies: WorkspaceTemporalInitDependencies = {
     WHERE workspace_id = ? AND cause <> 'legacy_import'
     LIMIT 1
   `).get(workspaceId)),
-  heal: (workspaceId) => {
-    healWorkspaceDataProjection(workspaceId);
-  },
+  heal: (workspaceId) => healWorkspaceDataProjection(workspaceId).changed,
   recoverMemory: (workspaceId) => recoverWorkspaceObservationMemory(workspaceId),
   prune: (workspaceId) => pruneWorkspaceDatasetHistory(
     workspaceId,
@@ -102,8 +102,14 @@ export async function initializeWorkspaceTemporalStorage(
       // A newer observation means SQLite has become projection-authoritative,
       // so heal the crash seam before schedules or reads begin.
       if (dependencies.hasNonLegacyObservation(workspace.id)) {
-        dependencies.heal(workspace.id);
-        result.projectionsHealed += 1;
+        const projectionChanged = dependencies.heal(workspace.id);
+        if (projectionChanged) {
+          // The first index necessarily observed the pre-heal bytes. Close the
+          // file/read-model seam in this boot so workspace_files never remains
+          // one restart behind the authoritative observation ledger.
+          dependencies.index(workspace);
+          result.projectionsHealed += 1;
+        }
       }
       // Memory is a recoverable projection of the exact retained ledger.
       // Replay before retention so a crash after the durable commit cannot

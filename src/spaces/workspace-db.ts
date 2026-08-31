@@ -125,6 +125,11 @@ export interface WorkspaceProjectionResult {
   sources: number;
 }
 
+export interface HealWorkspaceProjectionResult extends WorkspaceProjectionResult {
+  /** True only when data.json was atomically replaced with different bytes. */
+  changed: boolean;
+}
+
 export interface ListWorkspaceDatasetObservationsOptions {
   db?: Database.Database;
   sourceKey?: string;
@@ -275,7 +280,21 @@ export function indexWorkspaceRecord(record: SpaceRecord, options: IndexWorkspac
     // Retirement is committed before the compatibility projection. If the
     // process stops between these steps, boot healing reads the durable
     // tombstone and converges data.json to the same retired/absent state.
-    try { healWorkspaceDataProjection(record.id, { db, rootDir }); } catch { /* rebuildable projection */ }
+    try {
+      const healed = healWorkspaceDataProjection(record.id, { db, rootDir });
+      if (healed.changed) {
+        // Healing happens after the index transaction, so close that local
+        // read-model seam immediately instead of leaving workspace_files one
+        // restart behind the projection this call just wrote.
+        const reindexHealedFiles = db.transaction(() => {
+          replaceFilesAndRevisions(db, record, rootDir);
+        });
+        reindexHealedFiles.immediate();
+      }
+    } catch (error) {
+      if (options.strict) throw error;
+      // Both projection and file index are rebuildable for ordinary callers.
+    }
   }
   if (options.emitOperational !== false && !options.db) {
     try {
@@ -548,14 +567,14 @@ export function getWorkspaceObservationDocument(
 export function healWorkspaceDataProjection(
   workspaceId: string,
   options: HealWorkspaceDataProjectionOptions = {},
-): WorkspaceProjectionResult {
+): HealWorkspaceProjectionResult {
   const db = options.db ?? openWorkspaceDb();
   const rootDir = options.rootDir ?? workspaceRootFromDb(db, workspaceId);
   const existing = readWorkspaceProjection(rootDir);
   const projection = buildWorkspaceProjection(db, workspaceId, existing);
   const serialized = serializeWorkspaceProjection(projection.document);
-  atomicWriteWorkspaceProjection(rootDir, serialized.text);
-  return { bytes: serialized.bytes, sources: projection.sources };
+  const changed = atomicWriteWorkspaceProjectionIfChanged(rootDir, serialized.text);
+  return { bytes: serialized.bytes, sources: projection.sources, changed };
 }
 
 /**
@@ -665,6 +684,32 @@ export function bootstrapWorkspaceObservationHistory(
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   }
+
+  // A current successful document-mode observation owns the complete
+  // compatibility document. Its object keys are user document fields, not
+  // legacy source identities. Trusting data.json as import input in this state
+  // would decompose one authoritative document into redundant `legacy_import`
+  // sources and then add source metadata during healing. Skip before reading or
+  // parsing the projection so a missing/torn file can continue to the normal
+  // SQLite-authoritative heal path instead of blocking recovery.
+  try {
+    const currentDocumentOwner = db.prepare(`
+      SELECT 1
+      FROM workspace_dataset_observations
+      WHERE workspace_id = ?
+        AND projection_mode = 'document'
+        AND status = 'ok'
+        AND is_current = 1
+      LIMIT 1
+    `).get(workspaceId);
+    if (currentDocumentOwner) return { ok: true, imported: 0, skipped: 0 };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `could not inspect current document authority: ${(err as Error).message}`,
+    };
+  }
+
   const file = path.join(rootDir, 'data.json');
   if (!existsSync(file)) return { ok: true, imported: 0, skipped: 0 };
 
@@ -1498,6 +1543,21 @@ function atomicWriteWorkspaceProjection(rootDir: string, text: string): void {
   const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   writeFileSync(tmp, text, 'utf-8');
   renameSync(tmp, file);
+}
+
+/** Preserve byte and mtime identity when healing has already converged. A read
+ * failure is treated as a mismatch so the durable SQLite projection repairs the
+ * file rather than allowing comparison uncertainty to suppress recovery. */
+function atomicWriteWorkspaceProjectionIfChanged(rootDir: string, text: string): boolean {
+  const file = path.join(rootDir, 'data.json');
+  try {
+    const expected = Buffer.from(text, 'utf-8');
+    if (readFileSync(file).equals(expected)) return false;
+  } catch {
+    // Missing, unreadable, or transiently invalid projection: heal below.
+  }
+  atomicWriteWorkspaceProjection(rootDir, text);
+  return true;
 }
 
 function workspaceRootFromDb(db: Database.Database, workspaceId: string): string {

@@ -105,6 +105,29 @@ export function reportOriginHandoffResult(
 }
 
 /**
+ * Commit the terminal UI outcome for an exact native notification tap.
+ *
+ * Native keeps the route parked across process death, biometric lock, and
+ * reconnects. It may delete that durable intent only after this page either
+ * focused the addressed Inbox item or learned from an exact 404 that the
+ * notification no longer exists.
+ */
+export function reportNativeNotificationHandled(
+  notificationId: string,
+  outcome: 'presented' | 'unavailable',
+): boolean {
+  if (!notificationId || notificationId.length > 512) return false;
+  try {
+    const handler = window.webkit?.messageHandlers?.clemNotificationHandled;
+    if (!handler) return false;
+    handler.postMessage({ notificationId, outcome });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Ask the native shell to clear its pairing and show the scanner.
  *
  * The stranded state this fixes (live): the web session expires inside a

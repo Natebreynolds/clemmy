@@ -8,9 +8,9 @@ import Security
 struct Pairing: Codable, Equatable {
     /// Origin only — scheme://host:port. Never carries the one-time token.
     var origin: String
-    /// base64url(SHA-256(cert DER)) from the QR's `fp` param. Nil when the QR
-    /// pointed at a publicly-trusted hostname (tunnel mode) — then the system
-    /// trust store applies unmodified.
+    /// base64url(SHA-256(cert DER)) from the QR's `fp` param. Optional only so
+    /// legacy Keychain records still decode; new pairings require this value
+    /// and every network trust decision fails closed without it.
     var fingerprint: String?
     /// The off-LAN door, learned from GET /m/relay-info on any LAN visit (so
     /// existing pairings gain remote access without re-scanning) or from the
@@ -37,19 +37,21 @@ enum PairingParseError: LocalizedError {
     case notAURL
     case notHTTPS
     case notAPairingLink
+    case missingFingerprint
 
     var errorDescription: String? {
         switch self {
         case .notAURL: return "That doesn't look like a link."
         case .notHTTPS: return "Pairing links are always https."
         case .notAPairingLink: return "That link has no pairing code. Open the Mobile panel on your Mac and scan the QR it shows."
+        case .missingFingerprint: return "That pairing code is missing its security fingerprint. Open the Mobile panel on your Mac and scan a fresh QR."
         }
     }
 }
 
 enum PairingParser {
     /// Accepts the exact URL the daemon encodes in its QR:
-    ///   https://<host>:<port>/m/?pair=<token>[&fp=<base64url sha-256>][&relay=<origin>]
+    ///   https://<host>:<port>/m/?pair=<token>&fp=<base64url sha-256>[&relay=<origin>]
     /// Returns the durable pairing plus the full one-time launch URL, which is
     /// loaded once so the PWA can consume the token.
     static func parse(_ raw: String) throws -> (pairing: Pairing, launchURL: URL) {
@@ -63,13 +65,17 @@ enum PairingParser {
         guard items.contains(where: { $0.name == "pair" && !($0.value ?? "").isEmpty }) else {
             throw PairingParseError.notAPairingLink
         }
-        let fp = items.first(where: { $0.name == "fp" })?.value
+        let fp = items.first(where: { $0.name == "fp" })?.value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let fp, !fp.isEmpty else {
+            throw PairingParseError.missingFingerprint
+        }
         var origin = "https://" + host
         if let port = url.port { origin += ":\(port)" }
         let relay = items.first(where: { $0.name == "relay" })?.value
         let pairing = Pairing(
             origin: origin,
-            fingerprint: fp?.isEmpty == false ? fp : nil,
+            fingerprint: fp,
             relayOrigin: relay?.isEmpty == false ? relay : nil,
             lanOrigin: origin
         )

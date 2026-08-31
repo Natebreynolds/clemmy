@@ -5,6 +5,7 @@ import {
   appendLiveApprovalCard,
   applyBridgedWorkflowActivity,
   chatApprovalReply,
+  chatDecisionIntent,
   createInboxOutcomeCursor,
   createInboxOutcomeDeliveryState,
   inboxOutcomeCursorForSession,
@@ -57,6 +58,37 @@ test('approval buttons address the exact card and use a real reject intent', () 
   assert.equal(chatApprovalReply('reject', 'apr-c3d4'), 'reject apr-c3d4');
   assert.equal(chatApprovalReply('reject', null), 'reject');
   assert.equal(chatApprovalReply('approve', 'not-an-approval'), 'approve');
+});
+
+test('plan decisions can only target the exact proposal API and never become bare chat turns', () => {
+  const plan = {
+    id: 'plan-card',
+    role: 'assistant' as const,
+    text: 'Review this plan',
+    status: 'awaiting-plan' as const,
+    planProposalId: 'plan-a1b2c3d4',
+  };
+  assert.deepEqual(chatDecisionIntent(plan, 'approve'), {
+    kind: 'plan-proposal',
+    planProposalId: 'plan-a1b2c3d4',
+    decision: 'approve',
+  });
+  assert.deepEqual(chatDecisionIntent(plan, 'reject'), {
+    kind: 'plan-proposal',
+    planProposalId: 'plan-a1b2c3d4',
+    decision: 'reject',
+  });
+  const missing = chatDecisionIntent({ ...plan, planProposalId: undefined }, 'approve');
+  assert.equal(missing.kind, 'invalid-plan');
+  assert.notEqual(missing.kind, 'approval-reply', 'missing identity must not emit bare approve');
+
+  assert.deepEqual(chatDecisionIntent({
+    status: 'awaiting-approval',
+    approval: { subject: 'Send it', approvalId: 'apr-a1b2' },
+  }, 'approve'), {
+    kind: 'approval-reply',
+    text: 'approve apr-a1b2',
+  });
 });
 
 test('live approval bursts keep independently addressable cards without overwriting the assistant turn', () => {

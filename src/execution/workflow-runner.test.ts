@@ -103,6 +103,7 @@ const {
   workflowCapabilityRetryDelayMs,
   reapCapabilityBlockedRuns,
   resumeCapabilityBlockedWorkflowRun,
+  resolveWorkflowCapabilityAccountChoice,
   latestWorkflowNotifyUserPresentation,
   mergeWorkflowPresentationContribution,
   scrubWorkflowTerminalPresentation,
@@ -246,6 +247,7 @@ const {
   createWorkflowRunDefinitionSnapshot,
   workflowDefinitionHash,
 } = await import('./workflow-run-definition.js');
+const { workflowCapabilityAccountChoiceSet } = await import('./workflow-live-call-compiler.js');
 const {
   queueCompiledWorkflowRun,
   queueWorkflowRun,
@@ -1906,6 +1908,94 @@ test('capability retry re-admits the same run only when due, and manual resume b
 
   rmSync(automatic, { force: true });
   rmSync(manual, { force: true });
+});
+
+test('ambiguous capability gate requires exact account CAS, selects B, and dedupes a restart replay', () => {
+  const runId = 'capability-account-choice-cas';
+  const filePath = writeCapabilityBlockedRun(runId, new Date(Date.now() - 1_000).toISOString());
+  const record = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  const choices = workflowCapabilityAccountChoiceSet([
+    { capabilityId: 'cap:sheet:account-a', account: 'account-a' },
+    { capabilityId: 'cap:sheet:account-b', account: 'account-b' },
+  ]);
+  writeFileSync(filePath, JSON.stringify({
+    ...record,
+    capabilityBlock: {
+      ...(record.capabilityBlock as Record<string, unknown>),
+      reason: 'ambiguous-account',
+      message: 'Choose an exact Sheets account.',
+      accountChoiceSet: choices,
+    },
+  }, null, 2), 'utf-8');
+
+  assert.equal(reapCapabilityBlockedRuns(Date.now()), 0, 'timer must not choose by catalog order');
+  assert.equal(resumeCapabilityBlockedWorkflowRun(runId), false, 'generic retry must not bypass the account question');
+
+  const selected = resolveWorkflowCapabilityAccountChoice({
+    runId,
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    retryCount: 1,
+    choiceSetDigest: choices.digest,
+    capabilityId: 'cap:sheet:account-b',
+    accountId: 'account-b',
+    selectedBy: 'chat:account-answer',
+  });
+  assert.deepEqual(selected, {
+    ok: true,
+    status: 'selected',
+    runId,
+    stepId: 'publish',
+    capabilityId: 'cap:sheet:account-b',
+    accountId: 'account-b',
+  });
+  const persisted = JSON.parse(readFileSync(filePath, 'utf-8')) as {
+    status: string;
+    capabilityBlock: {
+      state: string;
+      accountSelection?: Record<string, unknown>;
+    };
+  };
+  assert.equal(persisted.status, 'running');
+  assert.equal(persisted.capabilityBlock.state, 'retrying');
+  assert.deepEqual(persisted.capabilityBlock.accountSelection, {
+    capabilityId: 'cap:sheet:account-b',
+    accountId: 'account-b',
+    choiceSetDigest: choices.digest,
+    selectedAt: persisted.capabilityBlock.accountSelection?.selectedAt,
+    selectedBy: 'chat:account-answer',
+  });
+  assert.match(String(persisted.capabilityBlock.accountSelection?.selectedAt ?? ''), /^\d{4}-\d{2}-\d{2}T/);
+
+  // The resolver owns no process-local lease. Replaying the same exact answer
+  // from a restarted UI/daemon reads the durable retrying checkpoint and is a
+  // no-op; a different answer cannot retarget it.
+  const replay = resolveWorkflowCapabilityAccountChoice({
+    runId,
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    retryCount: 1,
+    choiceSetDigest: choices.digest,
+    capabilityId: 'cap:sheet:account-b',
+    accountId: 'account-b',
+  });
+  assert.equal(replay.ok, true);
+  assert.equal(replay.status, 'already_selected');
+  const conflict = resolveWorkflowCapabilityAccountChoice({
+    runId,
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    retryCount: 1,
+    choiceSetDigest: choices.digest,
+    capabilityId: 'cap:sheet:account-a',
+    accountId: 'account-a',
+  });
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.status, 'conflict');
+  const afterReplay = JSON.parse(readFileSync(filePath, 'utf-8')) as typeof persisted;
+  assert.equal(afterReplay.capabilityBlock.accountSelection?.accountId, 'account-b');
+
+  rmSync(filePath, { force: true });
 });
 
 test('reapResolvedParkedRuns keeps a run parked while its approval is pending, re-admits once resolved', () => {

@@ -54,10 +54,17 @@ import {
   type MobileAttemptScope,
 } from '../runtime/mobile-rate-limit.js';
 import {
+  addNotification,
+  getNotification,
+  isNeedsAttentionNotification,
+  loadNotifications,
+  listNotifications,
+  markNotificationRead,
   removeWebPushDestinationByEndpoint,
   removeWebPushDestinationsByDeviceId,
   upsertApnsDestination,
   upsertWebPushDestination,
+  type NotificationRecord,
 } from '../runtime/notifications.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
@@ -125,11 +132,32 @@ import {
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
+import {
+  approveTrustProposal,
+  declineTrustProposal,
+  getTrustProposal,
+  listTrustProposals,
+  type TrustProposal,
+} from '../agents/trust-graduation.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import {
   processBackgroundTasks,
   queueBackgroundTaskApprovalResolution,
 } from '../execution/background-tasks.js';
+import {
+  answerInboxQuestion as answerUnifiedInboxQuestion,
+  listInboxQuestions as listUnifiedInboxQuestions,
+  type InboxQuestionItem,
+} from '../execution/inbox-questions.js';
+import {
+  projectWorkflowCapabilityInboxGate,
+  type WorkflowCapabilityInboxGate,
+} from '../execution/workflow-capability-inbox.js';
+import {
+  resolveWorkflowCapabilityAccountChoice,
+  resolveWorkflowCapabilityRetry,
+} from '../execution/workflow-runner.js';
+import { requestWorkflowRunDrainKick } from '../execution/workflow-origin-group.js';
 import type { AssistantRouteDiagnostics, RunStoppedReason } from '../types.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
@@ -387,6 +415,7 @@ function serializeEventForMobile(event: HarnessEventRow): {
 
 function serializePlanProposalForMobile(proposal: PlanProposal): {
   id: string;
+  sessionId: string | null;
   proposedAt: string;
   status: string;
   objective: string;
@@ -400,6 +429,7 @@ function serializePlanProposalForMobile(proposal: PlanProposal): {
 } {
   return {
     id: proposal.id,
+    sessionId: proposal.sessionId ?? null,
     proposedAt: proposal.proposedAt,
     status: proposal.status,
     objective: proposal.plan.objective,
@@ -441,6 +471,157 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
     status: row.status,
     resolution: row.resolution,
   };
+}
+
+interface MobileInboxNotification {
+  id: string;
+  kind: NotificationRecord['kind'];
+  title: string;
+  body: string;
+  createdAt: string;
+  read: boolean;
+  needsAttention: boolean;
+  deliveredAt: string | null;
+  deliveryError: string | null;
+  workflowCapability: WorkflowCapabilityInboxGate | null;
+  context: {
+    actionItemId: string | null;
+    approvalId: string | null;
+    planProposalId: string | null;
+    trustProposalId: string | null;
+    relatedApprovalIds: string[];
+    questionId: string | null;
+    sessionId: string | null;
+    runId: string | null;
+    stepId: string | null;
+    workflow: string | null;
+  };
+}
+
+function notificationMetadataString(
+  metadata: Record<string, unknown> | undefined,
+  ...keys: string[]
+): string | null {
+  for (const key of keys) {
+    const value = metadata?.[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function notificationMetadataStrings(
+  metadata: Record<string, unknown> | undefined,
+  key: string,
+): string[] {
+  const values = metadata?.[key];
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim().slice(0, 160))
+    .filter(Boolean))]
+    .slice(0, 50);
+}
+
+function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInboxNotification {
+  const checkInId = notificationMetadataString(row.metadata, 'checkInId');
+  const questionId = notificationMetadataString(row.metadata, 'questionId');
+  const approvalId = notificationMetadataString(row.metadata, 'approvalId');
+  const planProposalId = notificationMetadataString(row.metadata, 'planProposalId');
+  const trustProposalId = notificationMetadataString(row.metadata, 'trustProposalId');
+  const relatedApprovalIds = notificationMetadataStrings(row.metadata, 'approvalIds');
+  const runId = notificationMetadataString(row.metadata, 'runId', 'workflowRunId', 'backgroundTaskId');
+  const stepId = notificationMetadataString(row.metadata, 'stepId');
+  const workflowQuestion = row.kind === 'workflow' && Boolean(questionId && runId && stepId);
+  return {
+    id: row.id,
+    kind: row.kind,
+    title: row.title,
+    body: row.body,
+    createdAt: row.createdAt,
+    read: row.read,
+    needsAttention: isNeedsAttentionNotification(row),
+    deliveredAt: row.deliveredAt ?? null,
+    deliveryError: row.deliveryError ?? null,
+    workflowCapability: projectWorkflowCapabilityInboxGate(row),
+    // Only navigation-bearing identifiers cross the mobile boundary. Delivery
+    // plans, provider receipts, webhook destinations, and arbitrary metadata
+    // stay daemon-side.
+    context: {
+      actionItemId: checkInId
+        ? `checkin:${checkInId}`
+        : workflowQuestion ? `workflow:${runId}|${questionId}`
+          : questionId ? `task:${questionId}`
+          : approvalId ? `approval:${approvalId}`
+            : planProposalId ? `plan:${planProposalId}`
+              : trustProposalId ? `trust:${trustProposalId}` : null,
+      approvalId,
+      planProposalId,
+      trustProposalId,
+      relatedApprovalIds,
+      questionId: questionId ?? checkInId,
+      sessionId: notificationMetadataString(row.metadata, 'sessionId', 'targetSessionId'),
+      runId,
+      stepId,
+      workflow: notificationMetadataString(row.metadata, 'workflow'),
+    },
+  };
+}
+
+function mobileInboxNotifications(limit = 200): NotificationRecord[] {
+  // The durable store is bounded to 1,000 rows. Filter the complete bounded
+  // set before applying the mobile page limit; otherwise silent heartbeats at
+  // the front can crowd real Inbox rows out and make list/summary disagree.
+  const rows = loadNotifications()
+    .filter((row) => !row.silent && row.metadata?.heartbeat !== true)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const actionable = rows.filter((row) => !row.read && isNeedsAttentionNotification(row));
+  const actionableIds = new Set(actionable.map((row) => row.id));
+  return [
+    ...actionable,
+    ...rows.filter((row) => !actionableIds.has(row.id)),
+  ].slice(0, limit);
+}
+
+interface MobileInboxTrustProposal {
+  id: string;
+  scopeRevision: 1;
+  scopeDigest: string;
+  toolkits: string[];
+  recipients: string[];
+  domains: string[];
+  maxRecipients: number;
+  rationale: string;
+  createdAt: string;
+  evidence: {
+    cleanSendCount: number;
+    distinctDays: number;
+    firstAt: string;
+    lastAt: string;
+  };
+}
+
+function serializeInboxTrustProposal(row: TrustProposal): MobileInboxTrustProposal {
+  return {
+    id: row.id,
+    scopeRevision: row.scopeRevision,
+    scopeDigest: row.scopeDigest,
+    toolkits: [...row.toolkits],
+    recipients: [...row.recipients],
+    domains: [...(row.domains ?? [])],
+    maxRecipients: row.maxRecipients,
+    rationale: row.rationale,
+    createdAt: row.createdAt,
+    evidence: {
+      cleanSendCount: row.evidence.cleanSendCount,
+      distinctDays: row.evidence.distinctDays,
+      firstAt: row.evidence.firstAt,
+      lastAt: row.evidence.lastAt,
+    },
+  };
+}
+
+function mobileInboxQuestions(): InboxQuestionItem[] {
+  return listUnifiedInboxQuestions();
 }
 
 interface MobileWorkflowRunSummary {
@@ -2085,6 +2266,275 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       lastSeenAt: ctx.record.lastSeenAt,
       name,
     });
+  });
+
+  // ─── Inbox ─────────────────────────────────────────────────────
+  //
+  // Notifications are already durable daemon state, but mobile previously
+  // exposed only the transient approval registries. A push could wake the app
+  // and still land on Home with no record to open. This is the paired-device
+  // projection of that durable feed: human-facing copy plus bounded context
+  // identifiers, never provider credentials or delivery-plan internals.
+
+  router.get('/api/inbox/notifications', requireMobileSession, (req, res) => {
+    try {
+      const limit = clampInt(req.query.limit, 100, 1, 200);
+      const notifications = mobileInboxNotifications(limit)
+        .map(serializeInboxNotificationForMobile);
+      res.json({ notifications, count: notifications.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/inbox/questions', requireMobileSession, (_req, res) => {
+    try {
+      const questions = mobileInboxQuestions();
+      res.json({ questions, count: questions.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/inbox/trust-proposals', requireMobileSession, (_req, res) => {
+    try {
+      const proposals = listTrustProposals('pending').map(serializeInboxTrustProposal);
+      res.json({ proposals, count: proposals.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post('/api/inbox/trust-proposals/:id/:decision', requireMobileSession, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const decision = Array.isArray(req.params.decision) ? req.params.decision[0] : req.params.decision;
+    if (decision !== 'approve' && decision !== 'decline') {
+      res.status(400).json({ error: 'INVALID_TRUST_DECISION' });
+      return;
+    }
+    const scopeRevision = req.body?.scopeRevision;
+    const scopeDigest = typeof req.body?.scopeDigest === 'string' ? req.body.scopeDigest.trim() : '';
+    if (scopeRevision !== 1 || !/^sha256:[0-9a-f]{64}$/.test(scopeDigest)) {
+      res.status(400).json({ error: 'INVALID_TRUST_SCOPE_RECEIPT' });
+      return;
+    }
+    if (!getTrustProposal(id)) {
+      res.status(404).json({ error: 'TRUST_PROPOSAL_NOT_FOUND' });
+      return;
+    }
+    const resolvedBy = `mobile:${req.mobileSession!.record.deviceId.slice(0, 80)}`;
+    const result = decision === 'approve'
+      ? approveTrustProposal(id, resolvedBy, { scopeRevision, scopeDigest })
+      : declineTrustProposal(id, resolvedBy, { scopeRevision, scopeDigest });
+    if (result.reason === 'not-found') {
+      res.status(404).json({ error: 'TRUST_PROPOSAL_NOT_FOUND' });
+      return;
+    }
+    if (result.reason === 'not-pending') {
+      try { markNotificationRead(`trust-proposal-${id}`); } catch { /* terminal authority already won */ }
+      res.status(409).json({
+        error: 'TRUST_PROPOSAL_ALREADY_RESOLVED',
+        status: result.proposal?.status ?? 'resolved',
+        scopeReceipt: result.scopeReceipt,
+      });
+      return;
+    }
+    if (result.reason === 'scope-mismatch' || result.reason === 'expired') {
+      res.status(409).json({
+        error: result.reason === 'expired'
+          ? 'TRUST_PROPOSAL_EXPIRED'
+          : 'TRUST_PROPOSAL_SCOPE_MISMATCH',
+        status: result.proposal?.status ?? 'pending',
+        nothingGranted: true,
+        scopeReceipt: result.scopeReceipt,
+      });
+      return;
+    }
+    const nothingGranted = result.reason === 'superseded';
+    try {
+      addNotification({
+        id: `trust-proposal-${id}-${result.reason}`,
+        kind: 'system',
+        title: nothingGranted
+          ? 'Send trust already covered'
+          : decision === 'approve' ? 'Send trust approved' : 'Send trust declined',
+        body: nothingGranted
+          ? 'That exact scope was already covered. Nothing new was granted.'
+          : decision === 'approve'
+            ? 'Clem may now send to that exact scope without asking each time. You can revoke this trust from the desktop.'
+            : 'Nothing was granted. Clem will keep asking before sending to that scope.',
+        createdAt: new Date().toISOString(),
+        read: true,
+        metadata: { trustProposalId: id, status: result.reason, inboxOnly: true },
+      });
+    } catch { /* canonical proposal status is the truthful response */ }
+    res.json({
+      ok: result.ok,
+      status: result.reason,
+      nothingGranted,
+      scopeReceipt: result.scopeReceipt,
+      message: nothingGranted
+        ? 'That scope was already covered; nothing new was granted.'
+        : decision === 'approve'
+          ? 'Future sends to that exact scope are now allowed.'
+          : 'Nothing was granted. Clem will keep asking.',
+    });
+  });
+
+  router.post('/api/inbox/questions/:id/answer', requireMobileSession, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const answer = typeof req.body?.answer === 'string' ? req.body.answer.trim().slice(0, 4000) : '';
+    if (!answer) {
+      res.status(400).json({ error: 'ANSWER_REQUIRED' });
+      return;
+    }
+    const result = answerUnifiedInboxQuestion({
+      id,
+      answer,
+      // The question id is a one-shot CAS coordinate. Stable per device and
+      // question means a transport retry can never mint a competing answer.
+      requestId: `mobile-inbox:${req.mobileSession!.record.deviceId}:${id}`,
+      surface: 'mobile',
+    });
+    if (result.status === 'answered' || result.status === 'resuming') {
+      res.json({ ok: true, ...result });
+      return;
+    }
+    if (result.status === 'not_found') {
+      res.status(404).json({ error: 'QUESTION_NOT_FOUND', ...result });
+      return;
+    }
+    if (result.status === 'requires_origin') {
+      res.status(409).json({ error: 'QUESTION_REQUIRES_ORIGIN_CONTEXT', ...result });
+      return;
+    }
+    if (result.status === 'storage_error') {
+      res.status(503).json({ error: 'QUESTION_COULD_NOT_BE_SAVED', ...result });
+      return;
+    }
+    res.status(409).json({ error: 'QUESTION_ALREADY_ANSWERED_OR_CLOSED', ...result });
+  });
+
+  router.post('/api/inbox/workflow-capabilities/:runId/resolve', requireMobileSession, (req, res) => {
+    const runId = Array.isArray(req.params.runId) ? req.params.runId[0] : req.params.runId;
+    const action = req.body?.action;
+    const common = {
+      runId,
+      stepId: typeof req.body?.stepId === 'string' ? req.body.stepId : '',
+      tool: typeof req.body?.tool === 'string' ? req.body.tool : '',
+      retryCount: req.body?.retryCount,
+      selectedBy: `mobile-inbox:${req.mobileSession!.record.deviceId}`,
+    };
+    const result = action === 'choose_account'
+      ? resolveWorkflowCapabilityAccountChoice({
+          ...common,
+          choiceSetDigest: typeof req.body?.choiceSetDigest === 'string' ? req.body.choiceSetDigest : '',
+          capabilityId: typeof req.body?.capabilityId === 'string' ? req.body.capabilityId : '',
+          accountId: typeof req.body?.accountId === 'string' ? req.body.accountId : '',
+        })
+      : action === 'retry'
+        ? resolveWorkflowCapabilityRetry(common)
+        : null;
+    if (!result) { res.status(400).json({ error: 'CAPABILITY_ACTION_REQUIRED' }); return; }
+    if (!result.ok) {
+      const status = result.status === 'invalid_request' ? 400 : result.status === 'run_unavailable' ? 404 : 409;
+      res.status(status).json({ error: 'CAPABILITY_GATE_CHANGED', detail: result.message, status: result.status });
+      return;
+    }
+    requestWorkflowRunDrainKick([runId]);
+    res.json(result);
+  });
+
+  router.get('/api/inbox/notifications/:id', requireMobileSession, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const notification = getNotification(id);
+    if (!notification || notification.silent) {
+      res.status(404).json({ error: 'NOTIFICATION_NOT_FOUND' });
+      return;
+    }
+    res.json({ notification: serializeInboxNotificationForMobile(notification) });
+  });
+
+  router.post('/api/inbox/notifications/:id/read', requireMobileSession, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const existing = getNotification(id);
+    if (!existing || existing.silent) {
+      res.status(404).json({ error: 'NOTIFICATION_NOT_FOUND' });
+      return;
+    }
+    if (!existing.read && projectWorkflowCapabilityInboxGate(existing)) {
+      res.status(409).json({
+        error: 'CAPABILITY_RESOLUTION_REQUIRED',
+        detail: 'Open this exact Needs You gate and choose its account or recovery action.',
+        notification: serializeInboxNotificationForMobile(existing),
+      });
+      return;
+    }
+    // Dismissal is presentation only, never resolution authority. Mark the
+    // exact addressed carrier read; a workflow name or title is not a safe
+    // group key because one workflow can have multiple independent blockers.
+    const changed = [markNotificationRead(id)]
+      .filter((row): row is NotificationRecord => Boolean(row));
+    res.json({
+      ok: changed.length > 0,
+      cleared: changed.length,
+      notification: serializeInboxNotificationForMobile(changed[0] ?? existing),
+    });
+  });
+
+  router.get('/api/inbox/summary', requireMobileSession, async (_req, res) => {
+    try {
+      const approvalRows = approvalRegistry.listPending({ status: 'pending' })
+        .filter((row) => !approvalRegistry.isExpired(row))
+        .filter((row) => approvalRegistry.isFormalApprovalSurface(row));
+      const planRows = listPlanProposals({ status: 'pending', limit: 100 });
+      const {
+        listAutomationPilotWorkspaceChoosers,
+      } = await import('../execution/automation-pilot-workspace-destination-authority.js');
+      const chooserRows = listAutomationPilotWorkspaceChoosers({ status: 'pending', limit: 100 });
+      const questionRows = mobileInboxQuestions();
+      const trustRows = listTrustProposals('pending');
+      const approvalIds = new Set(approvalRows.map((row) => row.approvalId));
+      const planIds = new Set(planRows.map((row) => row.id));
+      const trustIds = new Set(trustRows.map((row) => row.id));
+      const questionActionIds = new Set(questionRows.map((row) => row.id));
+      let notificationNeedsYou = 0;
+      let unreadUpdates = 0;
+      for (const notification of mobileInboxNotifications(200)) {
+        if (notification.read) continue;
+        const approvalId = notificationMetadataString(notification.metadata, 'approvalId');
+        const planProposalId = notificationMetadataString(notification.metadata, 'planProposalId');
+        const trustProposalId = notificationMetadataString(notification.metadata, 'trustProposalId');
+        const relatedApprovalIds = notificationMetadataStrings(notification.metadata, 'approvalIds');
+        const actionItemId = serializeInboxNotificationForMobile(notification).context.actionItemId;
+        if ((approvalId && approvalIds.has(approvalId)) || (planProposalId && planIds.has(planProposalId))) continue;
+        if (trustProposalId && trustIds.has(trustProposalId)) continue;
+        if (relatedApprovalIds.length > 0 && relatedApprovalIds.every((id) => approvalIds.has(id))) continue;
+        if (actionItemId && questionActionIds.has(actionItemId)) continue;
+        if (!isNeedsAttentionNotification(notification)) {
+          unreadUpdates += 1;
+          continue;
+        }
+        notificationNeedsYou += 1;
+      }
+      const approvals = approvalRows.length;
+      const plans = planRows.length;
+      const workspaceChoices = chooserRows.length;
+      const questions = questionRows.length;
+      const trustProposals = trustRows.length;
+      res.json({
+        needsYou: questions + approvals + plans + workspaceChoices + trustProposals + notificationNeedsYou,
+        questions,
+        approvals,
+        plans,
+        workspaceChoices,
+        trustProposals,
+        notificationNeedsYou,
+        unreadUpdates,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // ─── Remote Codex re-authentication (device code) ───────────────

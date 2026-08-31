@@ -42,8 +42,30 @@ const {
 const { claimSessionForAcceptedSource } = await import('../runtime/harness/accepted-source-session-branch.js');
 const { ClementineGateway } = await import('../gateway/router.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
+const {
+  surfacePlan,
+  surfaceAskingPlan,
+  rejectPlanProposal,
+} = await import('../agents/plan-proposals.js');
 
 const turn = (role: 'user' | 'assistant', text: string) => ({ role, text, createdAt: new Date().toISOString() });
+
+function exactPlan(overrides: Record<string, unknown> = {}) {
+  return {
+    objective: 'Prepare the exact release-readiness brief.',
+    steps: [
+      { n: 1, action: 'Collect the release evidence.', rationale: 'Ground the review.', verification: null },
+      { n: 2, action: 'Write the final brief.', rationale: 'Deliver the result.', verification: null },
+    ],
+    successCriteria: ['The brief names every release gate.'],
+    risks: [],
+    estimatedComplexity: 'moderate' as const,
+    recommendsTrackedExecution: false,
+    needsUserInput: [],
+    appliedInstructions: [],
+    ...overrides,
+  };
+}
 
 // ── Seed both stores ──────────────────────────────────────────────────────
 const store = new SessionStore();
@@ -636,6 +658,86 @@ test('session detail attaches pending approval cards and drops resolved ones', a
   approvalRegistry.resolve(row.approvalId, 'approved', 'a2-reopen-test');
   const after = getUnifiedSessionDetail(`harness:${origin.id}`);
   assert.equal(after!.turns.filter((t) => t.approval).length, 0, 'resolved approvals attach no card');
+});
+
+test('session detail restores each exact pending plan card and never revives non-approvable plans', () => {
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'Plan reopen' });
+  appendEvent({
+    sessionId: origin.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Prepare the release brief.' },
+  });
+  const first = surfacePlan({
+    plan: exactPlan(),
+    originatingRequest: 'Prepare the release brief.',
+    sessionId: origin.id,
+  });
+  appendEvent({
+    sessionId: origin.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'conversation_completed',
+    data: {
+      reply: 'I drafted the first plan for review.',
+      reason: 'plan_first',
+      planProposalId: first.id,
+    },
+  });
+  const second = surfacePlan({
+    plan: exactPlan({ objective: 'Prepare the exact launch checklist.' }),
+    originatingRequest: 'Also prepare the launch checklist.',
+    sessionId: origin.id,
+  });
+  const asking = surfaceAskingPlan({
+    plan: exactPlan({ needsUserInput: ['Which audience should receive the brief?'] }),
+    originatingRequest: 'Prepare a second audience-specific brief.',
+    sessionId: origin.id,
+  });
+
+  const detail = getUnifiedSessionDetail(`harness:${origin.id}`);
+  assert.ok(detail);
+  assert.deepEqual(
+    detail!.turns.filter((item) => item.planProposalId).map((item) => item.planProposalId),
+    [first.id, second.id],
+    'each independently addressable approvable plan keeps its exact identity',
+  );
+  assert.equal(
+    detail!.turns.filter((item) => item.planProposalId === first.id).length,
+    1,
+    'a current plan terminal becomes one actionable turn, never duplicate prose plus card',
+  );
+  assert.equal(
+    detail!.turns.find((item) => item.planProposalId === first.id)?.text,
+    'I drafted the first plan for review.',
+    'the card stays on the original assistant turn in timeline order',
+  );
+  assert.equal(
+    detail!.turns.some((item) => item.planProposalId === asking.id),
+    false,
+    'a plan that still needs input never regains an approve button',
+  );
+
+  rejectPlanProposal(first.id, 'test resolution');
+  const after = getUnifiedSessionDetail(`harness:${origin.id}`);
+  assert.deepEqual(
+    after!.turns.filter((item) => item.planProposalId).map((item) => item.planProposalId),
+    [second.id],
+    'resolved plans disappear while their pending sibling remains exact',
+  );
+
+  const readOnly = createSession({ kind: 'workflow', channel: 'workflow', title: 'Read-only plan transcript' });
+  const workflowPlan = surfacePlan({
+    plan: exactPlan({ objective: 'A workflow-owned plan must stay in Inbox.' }),
+    originatingRequest: 'Prepare a workflow-owned plan.',
+    sessionId: readOnly.id,
+  });
+  assert.equal(
+    getUnifiedSessionDetail(`harness:${readOnly.id}`)!.turns.some((item) => item.planProposalId === workflowPlan.id),
+    false,
+    'read-only workflow transcripts never paint an inline gate with no-op handlers',
+  );
 });
 
 test('raw report-back titles heal at read time; synthetic first turns derive human titles', () => {

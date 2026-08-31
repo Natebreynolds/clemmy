@@ -1386,15 +1386,22 @@ test('retention sweeps: stale rows reaped, fresh rows kept (cancellations / tele
 });
 
 test('question-store unification: answering the check-in copy resumes the linked task; task-side answers close the check-in', async () => {
-  const { createCheckIn, answerCheckIn, getCheckIn, listOpenCheckIns } = await import('../../agents/check-ins.js');
+  const { createCheckIn, getCheckIn, listOpenCheckIns } = await import('../../agents/check-ins.js');
+  const { answerExactCheckIn } = await import('../../execution/inbox-questions.js');
   const { createBackgroundTask, markBackgroundTaskAwaitingInput, getBackgroundTask, queueBackgroundTaskInputResolution } = await import('../../execution/background-tasks.js');
   const origin = eventlog.createSession({ id: 'sess-qstore-unify', kind: 'chat' });
 
   // Direction 1: check-in answer resumes the task.
   const task = createBackgroundTask({ title: 'Q-store unify A', prompt: 'x', originSessionId: origin.id });
   markBackgroundTaskAwaitingInput(task.id, 'q-unify-a', 'Which region?');
-  const checkIn = createCheckIn({ agentSlug: 'clementine', question: 'Which region should I use?', linkedTaskId: task.id });
-  answerCheckIn(checkIn.id, 'US-West');
+  const checkIn = createCheckIn({
+    agentSlug: 'clementine',
+    question: 'Which region should I use?',
+    linkedTaskId: task.id,
+    linkedQuestionId: 'q-unify-a',
+  });
+  const checkInAnswer = answerExactCheckIn({ checkInId: checkIn.id, answer: 'US-West' });
+  assert.equal(checkInAnswer.status, 'resuming');
   await new Promise((r) => setTimeout(r, 120)); // the bridge is fire-and-forget
   assert.equal(getBackgroundTask(task.id)?.status, 'pending', 'check-in answer queued the task continuation');
   assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'US-West');
@@ -1402,7 +1409,12 @@ test('question-store unification: answering the check-in copy resumes the linked
   // Direction 2: task-side answer closes the linked check-in copy.
   const task2 = createBackgroundTask({ title: 'Q-store unify B', prompt: 'y', originSessionId: origin.id });
   markBackgroundTaskAwaitingInput(task2.id, 'q-unify-b', 'Which workspace?');
-  const checkIn2 = createCheckIn({ agentSlug: 'clementine', question: 'Which workspace?', linkedTaskId: task2.id });
+  const checkIn2 = createCheckIn({
+    agentSlug: 'clementine',
+    question: 'Which workspace?',
+    linkedTaskId: task2.id,
+    linkedQuestionId: 'q-unify-b',
+  });
   queueBackgroundTaskInputResolution('q-unify-b', 'wspX');
   await new Promise((r) => setTimeout(r, 120));
   assert.equal(getCheckIn(checkIn2.id)?.status, 'closed', 'the ghost question was closed');

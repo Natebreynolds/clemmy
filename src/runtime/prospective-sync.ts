@@ -60,7 +60,8 @@ export function syncProspectiveIntentions(now = new Date()): ProspectiveSyncResu
   put('workflow_event', workflowDefinitions.filter((item) => item.sourceKind === 'workflow_event'));
   put('workflow_webhook', workflowDefinitions.filter((item) => item.sourceKind === 'workflow_webhook'));
 
-  put('monitor', monitorProspectiveDefinitions(loadProactivityPolicy()));
+  const monitors = monitorProspectiveDefinitions(loadProactivityPolicy());
+  put('monitor', monitors);
   put('check_in', listCheckInTemplates()
     .map(checkInProspectiveDefinition)
     .filter((value): value is ProspectiveIntentionDefinition => Boolean(value)));
@@ -121,6 +122,24 @@ export function syncProspectiveIntentions(now = new Date()): ProspectiveSyncResu
         }, now);
       }
     } catch { /* the background-task file remains authoritative */ }
+  }
+  // The legacy inbox/calendar policy flags express user intent, but their raw
+  // ambient monitor implementations are intentionally unavailable. Keep the
+  // Future Commitments projection explicitly BLOCKED with the prepared-read
+  // setup path; never let reconciliation's default `active` row claim a watch
+  // that the daemon cannot actually perform.
+  for (const monitor of monitors) {
+    const availability = monitor.metadata?.availability;
+    if (availability !== 'paused') continue;
+    try {
+      if (getProspectiveIntention(monitor.id)?.status !== 'blocked') {
+        recordProspectiveOutcome(monitor.id, 'blocked', {
+          reason: monitor.metadata?.reason ?? 'prepared_read_authority_unavailable',
+          requestedMonitor: monitor.sourceId,
+          setupAction: monitor.metadata?.setupAction ?? null,
+        }, now);
+      }
+    } catch { /* policy remains authoritative; next sync retries projection */ }
   }
   try {
     result.dueActivated = activateDueProspectiveIntentions(now)

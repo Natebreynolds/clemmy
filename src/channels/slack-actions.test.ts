@@ -17,6 +17,8 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clementine-sla
 const { __test__ } = await import('./slack.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
+const { createCheckIn, getCheckIn } = await import('../agents/check-ins.js');
+const { createBackgroundTask, updateBackgroundTask } = await import('../execution/background-tasks.js');
 const { buildSlackActionsForNotification, formatSlackNotificationMessage } = __test__;
 
 const basicSession = HarnessSession.create({
@@ -94,11 +96,43 @@ test('buildSlackActionsForNotification: a resolved approval never gets stale but
 });
 
 test('buildSlackActionsForNotification: checkInId attaches answer buttons', () => {
-  const ids = actionIds(buildSlackActionsForNotification({ checkInId: 'chk-abc123' }));
+  const checkIn = createCheckIn({
+    agentSlug: 'Clem',
+    question: 'Which exact region should receive the finished report?',
+  });
+  const ids = actionIds(buildSlackActionsForNotification({ checkInId: checkIn.id }));
   assert.equal(ids.length, 1, 'a question gets one honestly labelled Answer control');
-  assert.ok(ids.includes('clementine:checkin-answer:chk-abc123'));
-  assert.ok(!ids.includes('clementine:checkin-approve:chk-abc123'));
-  assert.ok(!ids.includes('clementine:checkin-reject:chk-abc123'));
+  assert.ok(ids.includes(`clementine:checkin-answer:${checkIn.id}`));
+  assert.ok(!ids.includes(`clementine:checkin-approve:${checkIn.id}`));
+  assert.ok(!ids.includes(`clementine:checkin-reject:${checkIn.id}`));
+});
+
+test('buildSlackActionsForNotification: linked carrier requires exact coordinates and stale Q1 settles', () => {
+  const task = createBackgroundTask({ title: 'Slack exact question', prompt: 'Wait for the exact answer.' });
+  const q1 = `slack:${task.id}:q1`;
+  const q2 = `slack:${task.id}:q2`;
+  updateBackgroundTask(task.id, { status: 'awaiting_input', pendingQuestionId: q1, pendingQuestion: 'Choose A or B?' });
+  const checkIn = createCheckIn({
+    agentSlug: 'Clem',
+    question: 'Should I use account A or account B?',
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  });
+
+  assert.equal(actionIds(buildSlackActionsForNotification({ checkInId: checkIn.id })).length, 0, 'id-only legacy carrier has no linked authority');
+  assert.equal(actionIds(buildSlackActionsForNotification({
+    checkInId: checkIn.id,
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  })).length, 1);
+
+  updateBackgroundTask(task.id, { status: 'awaiting_input', pendingQuestionId: q2, pendingQuestion: 'Choose East or West?' });
+  assert.equal(actionIds(buildSlackActionsForNotification({
+    checkInId: checkIn.id,
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  })).length, 0, 'stale Q1 cannot keep a Slack Answer button');
+  assert.equal(getCheckIn(checkIn.id)?.status, 'closed');
 });
 
 test('buildSlackActionsForNotification: stale planProposalId does not attach dead buttons', () => {

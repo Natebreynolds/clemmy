@@ -101,7 +101,7 @@ import {
 import {
   parseAutonomousSendConsentReply,
 } from '../runtime/harness/autonomous-send-consent.js';
-import { listOpenCheckIns } from '../agents/check-ins.js';
+import { listActionableCheckIns } from '../execution/inbox-questions.js';
 import { settleConversationalApprovalDecision } from '../runtime/harness/chat-approval-resume.js';
 import { listPlanProposals, approvePlanProposal, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { previewToolCall } from '../runtime/approval-summary.js';
@@ -2136,7 +2136,7 @@ function soleAutonomousSendConsentApproval(
   // files (including a clarification already consumed by continuity) cannot
   // strand a newly-presented exact send consent.
   const presentedAt = Date.parse(presentation.presentedAt);
-  if (listOpenCheckIns().some((checkIn) => {
+  if (listActionableCheckIns().some((checkIn) => {
     const askedAt = Date.parse(checkIn.askedAt);
     return !Number.isFinite(presentedAt) || !Number.isFinite(askedAt) || askedAt > presentedAt;
   })) return null;

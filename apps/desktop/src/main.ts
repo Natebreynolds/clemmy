@@ -2434,6 +2434,22 @@ function rememberDesktopNotifiedId(id: string): void {
   }
 }
 
+function focusDesktopNotificationRoute(href: string | undefined): void {
+  if (!href || !/^\/inbox(?:[?#]|$)/.test(href)) return;
+  const win = mainWindow;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  const script = `(() => {
+    const next = ${JSON.stringify(href)};
+    window.history.pushState(null, '', next);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  })()`;
+  const navigate = () => {
+    void win.webContents.executeJavaScript(script).catch(() => { /* best-effort focus */ });
+  };
+  if (win.webContents.isLoadingMainFrame()) win.webContents.once('did-finish-load', navigate);
+  else navigate();
+}
+
 function showDesktopNotificationToast(item: DesktopPendingNotification): void {
   if (!Notification.isSupported()) return;
   const notification = new Notification({
@@ -2443,10 +2459,14 @@ function showDesktopNotificationToast(item: DesktopPendingNotification): void {
   });
   notification.on('click', () => {
     revealMainWindow();
-    // Fire-and-forget: the click already surfaced the app; a failed read-mark
-    // just means the watermark/dedupe belt suppresses a possible repeat.
-    postDaemonJson(`/api/console/notifications/${encodeURIComponent(item.id)}/read`, {})
-      .catch(() => { /* best-effort */ });
+    focusDesktopNotificationRoute(item.href);
+    // An actionable toast remains unread until its exact decision authority
+    // resolves it. Merely opening the Inbox can never consume a capability
+    // choice or leave an indefinitely blocked run without its chooser.
+    if (item.markReadOnOpen !== false) {
+      postDaemonJson(`/api/console/notifications/${encodeURIComponent(item.id)}/read`, {})
+        .catch(() => { /* best-effort */ });
+    }
   });
   notification.show();
 }

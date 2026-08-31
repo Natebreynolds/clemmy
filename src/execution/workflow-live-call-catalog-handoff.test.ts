@@ -252,11 +252,34 @@ test('revalidation preserves the existing multiple-account ambiguity refusal', (
     expectedEffect: 'read',
   });
 
-  assert.deepEqual(result, {
-    ok: false,
-    recoverable: true,
-    reason: 'ambiguous-account',
-    message: `2 capabilities are registered for "${operationId}"; the account binding is ambiguous.`,
-  });
+  assert.equal(result.ok, false);
+  if (result.ok || !result.recoverable) assert.fail('expected recoverable exact-account choice gate');
+  assert.equal(result.reason, 'ambiguous-account');
+  assert.equal(result.message, `2 accounts are registered for "${operationId}"; choose the exact account before this workflow can dispatch.`);
+  assert.deepEqual(result.accountChoiceSet?.candidates, [
+    { capabilityId: manifests[0]!.manifestId, accountId: 'account-a' },
+    { capabilityId: manifests[1]!.manifestId, accountId: 'account-b' },
+  ]);
+  assert.equal(result.accountChoiceSet?.total, 2);
+  assert.equal(result.accountChoiceSet?.truncated, false);
+  assert.match(result.accountChoiceSet?.digest ?? '', /^[a-f0-9]{64}$/);
   assert.equal(factory.snapshot().length, 2, 'all exact accounts remain visible to ambiguity enforcement');
+
+  const selectedB = compiler.compileLiveCatalogWorkflowCallPlan({
+    ownerId: 'ambiguous-workflow',
+    nodeId: 'read_records',
+    operationId,
+    args: { scope: 'newest' },
+    expectedEffect: 'read',
+    selectedAccount: {
+      capabilityId: manifests[1]!.manifestId,
+      accountId: 'account-b',
+      choiceSetDigest: result.accountChoiceSet!.digest,
+    },
+  });
+  assert.equal(selectedB.ok, true, JSON.stringify(selectedB));
+  if (!selectedB.ok) assert.fail(selectedB.message);
+  assert.equal(selectedB.identity.capabilityId, manifests[1]!.manifestId);
+  assert.equal(selectedB.identity.account, 'account-b');
+  assert.equal(selectedB.plan.binding.accountId, 'account-b');
 });

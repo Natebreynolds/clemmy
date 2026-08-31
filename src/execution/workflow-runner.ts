@@ -57,9 +57,10 @@ import { bindStepInputs, resolveFrom } from './step-binding.js';
 import {
   addNotification,
   loadNotifications,
+  markWorkflowCapabilityNotificationsSettled,
   type NotificationRecord,
 } from '../runtime/notifications.js';
-import { addRunEvent, startRun, finishRun, getRun } from '../runtime/run-events.js';
+import { addRunEvent, startRun, finishRun, getRun, type RunInputBlocker } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR, listWorkspaceProjects } from '../tools/shared.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
@@ -259,7 +260,12 @@ import {
   parseWorkflowNodeInvocationPlan,
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
-import { compileLiveCatalogWorkflowCallPlan } from './workflow-live-call-compiler.js';
+import {
+  compileLiveCatalogWorkflowCallPlan,
+  type WorkflowCapabilityAccountCandidateV1,
+  type WorkflowCapabilityAccountChoiceSetV1,
+  type WorkflowCapabilityAccountSelectionV1,
+} from './workflow-live-call-compiler.js';
 import { ensureReviewedLocalWorkflowCapability } from '../runtime/harness/reviewed-local-workflow-capability.js';
 import {
   activatePreparedWorkflowNodeCall,
@@ -1702,6 +1708,12 @@ function writeRunRecord(
     };
   });
   if (isTerminalRunRecord(written.record)) {
+    try {
+      markWorkflowCapabilityNotificationsSettled(written.record.id, {
+        capabilityResolutionStatus: 'run_terminal',
+        terminalStatus: written.record.status,
+      });
+    } catch { /* terminal run truth is authoritative; boot/list reconciliation can retry */ }
     bestEffortSettleCompiledProjectRoot(filePath, written.record);
     if (written.publishedTerminal) {
       bestEffortFinalizeCanonicalEntityWorkspaceProjection(written.record);
@@ -1921,6 +1933,7 @@ export class WorkflowCapabilityBlockedError extends ExternalWritePreDispatchErro
   readonly tool: string;
   readonly toolkit: string;
   readonly reason: WorkflowCapabilityBlockReason;
+  readonly accountChoiceSet?: WorkflowCapabilityAccountChoiceSetV1;
   readonly provenNoDispatch = true;
 
   constructor(input: {
@@ -1929,6 +1942,7 @@ export class WorkflowCapabilityBlockedError extends ExternalWritePreDispatchErro
     toolkit: string;
     reason: WorkflowCapabilityBlockReason;
     message: string;
+    accountChoiceSet?: WorkflowCapabilityAccountChoiceSetV1;
   }) {
     super(input.message);
     this.name = 'WorkflowCapabilityBlockedError';
@@ -1936,6 +1950,7 @@ export class WorkflowCapabilityBlockedError extends ExternalWritePreDispatchErro
     this.tool = input.tool;
     this.toolkit = input.toolkit;
     this.reason = input.reason;
+    this.accountChoiceSet = input.accountChoiceSet;
   }
 }
 
@@ -1954,6 +1969,14 @@ export interface WorkflowCapabilityBlockState {
   retryCount: number;
   provenNoDispatch: true;
   state: 'blocked' | 'retrying' | 'consumed';
+  /** Bounded exact choices exposed by an ambiguous-account pause. */
+  accountChoiceSet?: WorkflowCapabilityAccountChoiceSetV1;
+  /** Human-selected exact identity. The compiler revalidates both the pair and
+   * the complete choice-set digest immediately before provider preparation. */
+  accountSelection?: WorkflowCapabilityAccountSelectionV1 & {
+    selectedAt: string;
+    selectedBy: string;
+  };
   resumedAt?: string;
   resumeAuthorityConsumedAt?: string;
 }
@@ -3072,12 +3095,19 @@ async function executeWorkflowCallNode(
           + (reviewedLocal.detail ? `: ${reviewedLocal.detail}` : ''),
       });
     }
+    const persistedAccountSelection = (
+      ctx.capabilityResume?.state === 'retrying'
+      && ctx.capabilityResume.reason === 'ambiguous-account'
+      && ctx.capabilityResume.stepId === step.id
+      && ctx.capabilityResume.tool === call.tool
+    ) ? ctx.capabilityResume.accountSelection : undefined;
     const compiled = compileLiveCatalogWorkflowCallPlan({
       ownerId: ctx.workflowSlug,
       nodeId: step.id,
       operationId: call.tool,
       args: renderedArgs,
       expectedEffect: structuredCallSideEffectClass(step),
+      ...(persistedAccountSelection ? { selectedAccount: persistedAccountSelection } : {}),
     });
     if (!compiled.ok) {
       if (compiled.recoverable) {
@@ -3087,6 +3117,7 @@ async function executeWorkflowCallNode(
           toolkit: bareCallToolkitOf(call.tool),
           reason: compiled.reason,
           message: compiled.message,
+          ...(compiled.accountChoiceSet ? { accountChoiceSet: compiled.accountChoiceSet } : {}),
         });
       }
       throw new WorkflowHarnessBlockedSignal({
@@ -3790,6 +3821,9 @@ interface StepExecutionContext {
   admittedCodeRevision?: string;
   /** Answer captured while this exact run was parked on a step question. */
   awaitingInput?: WorkflowAwaitingInputState;
+  /** One-shot, already-consumed-at-the-run-record resume authority. Bare live
+   * calls may use only its exact persisted account selection for this step. */
+  capabilityResume?: WorkflowCapabilityBlockState;
   /** Canonically resolved one-shot read-pilot authority for this exact run.
    * Ordinary workflow contexts leave this absent, so invocationPlan remains a
    * hard blocker rather than becoming a new prompt/name-based route. */
@@ -9835,7 +9869,7 @@ async function executeWorkflow(
       });
       const completedItems = resume.completedItems.get(step.id) ?? new Map();
       const output = await executeStepVerified(step, {
-        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput, workflowReadPilotAdmission, workflowRecurringReadAdmission,
+        workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput, capabilityResume, workflowReadPilotAdmission, workflowRecurringReadAdmission,
       });
       throwIfWorkflowRunCancelled(runId);
       stepOutputs[step.id] = output;
@@ -10044,7 +10078,7 @@ async function executeWorkflow(
                 ? (epoch.steerWave = context.wave, epoch.steer)
                 : undefined;
               const output = await executeStepVerified(step, {
-                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput, workflowReadPilotAdmission, workflowRecurringReadAdmission,
+                workflow: executionWorkflow, workflowSlug, runId, inputs, stepOutputs, assistant, completedItems, forEachFailures, qualityAdvisories, pendingAdvisories, goalFeedback, learnedPatternHint, originSessionId, admittedCodeRevision, awaitingInput, capabilityResume, workflowReadPilotAdmission, workflowRecurringReadAdmission,
                 ...(steerForStep ? { watcherSteer: steerForStep } : {}),
               });
               stepOutputs[step.id] = output;
@@ -10508,6 +10542,13 @@ function readmitCapabilityBlockedRun(
     || run.capabilityBlock.state !== 'blocked'
     || run.capabilityBlock.provenNoDispatch !== true
   ) return false;
+  // Ambiguous accounts require the exact human choice CAS below. A timer or
+  // generic manual retry must never turn catalog order into business-routing
+  // authority.
+  if (
+    run.capabilityBlock.reason === 'ambiguous-account'
+    && !run.capabilityBlock.accountSelection
+  ) return false;
   const admitted = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
   if (admitted.status !== 'valid') return false;
   const workflowSlug = admitted.snapshot.workflowSlug;
@@ -10528,16 +10569,36 @@ function readmitCapabilityBlockedRun(
       expectedState: 'blocked',
     }) !== run.capabilityBlock.stepId
   ) return false;
-  const resumedRecord = writeRunRecord(filePath, {
-    ...run,
-    status: 'running',
-    capabilityBlock: {
-      ...run.capabilityBlock,
-      state: 'retrying',
-      resumedAt,
-    },
-  }).record;
-  if (isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
+  const resumedRecord = withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    const currentBlock = current?.capabilityBlock;
+    if (
+      !current
+      || current.status !== 'blocked_capability'
+      || !currentBlock
+      || currentBlock.state !== 'blocked'
+      || currentBlock.provenNoDispatch !== true
+      || currentBlock.stepId !== run.capabilityBlock?.stepId
+      || currentBlock.tool !== run.capabilityBlock.tool
+      || currentBlock.retryCount !== run.capabilityBlock.retryCount
+    ) return null;
+    return writeRunRecord(filePath, {
+      ...current,
+      status: 'running',
+      capabilityBlock: {
+        ...currentBlock,
+        state: 'retrying',
+        resumedAt,
+      },
+    }).record;
+  });
+  if (!resumedRecord || isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;
+  try {
+    markWorkflowCapabilityNotificationsSettled(run.id, {
+      capabilityResolutionStatus: 'readmitted',
+      capabilityResolutionSource: source,
+    });
+  } catch { /* the run record is authoritative */ }
   try {
     appendWorkflowEvent(workflowSlug, run.id, {
       kind: 'run_resumed',
@@ -10581,6 +10642,297 @@ function readmitCapabilityBlockedRun(
   return true;
 }
 
+export type ResolveWorkflowCapabilityAccountChoiceResult =
+  | {
+      ok: true;
+      status: 'selected' | 'already_selected';
+      runId: string;
+      stepId: string;
+      capabilityId: string;
+      accountId: string;
+    }
+  | {
+      ok: false;
+      status: 'invalid_request' | 'run_unavailable' | 'stale_choice' | 'conflict';
+      message: string;
+    };
+
+/**
+ * Persist one exact human account choice and re-admit the SAME run in one
+ * locked compare-and-swap. This performs no provider/catalog dispatch. The
+ * live compiler revalidates the selected pair and complete choice-set digest
+ * when this one-shot retry reaches the blocked step.
+ */
+export function resolveWorkflowCapabilityAccountChoice(input: {
+  runId: string;
+  stepId: string;
+  tool: string;
+  retryCount: number;
+  choiceSetDigest: string;
+  capabilityId: string;
+  accountId: string;
+  selectedBy?: string;
+}): ResolveWorkflowCapabilityAccountChoiceResult {
+  const runId = input.runId.trim();
+  if (
+    !/^[A-Za-z0-9_.:-]+$/.test(runId)
+    || !input.stepId.trim()
+    || !input.tool.trim()
+    || !Number.isSafeInteger(input.retryCount)
+    || input.retryCount < 1
+    || !/^[a-f0-9]{64}$/.test(input.choiceSetDigest)
+    || !input.capabilityId.trim()
+    || !input.accountId.trim()
+  ) {
+    return { ok: false, status: 'invalid_request', message: 'Exact capability-choice coordinates are invalid.' };
+  }
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const result: ResolveWorkflowCapabilityAccountChoiceResult = withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    const block = current?.capabilityBlock;
+    if (!current || !block) {
+      return { ok: false, status: 'run_unavailable', message: `Workflow run "${runId}" is unavailable.` };
+    }
+    const sameCoordinates = block.stepId === input.stepId
+      && block.tool === input.tool
+      && block.retryCount === input.retryCount;
+    const sameSelection = block.accountSelection?.capabilityId === input.capabilityId
+      && block.accountSelection.accountId === input.accountId
+      && block.accountSelection.choiceSetDigest === input.choiceSetDigest;
+    if (
+      sameCoordinates
+      && sameSelection
+      && (block.state === 'retrying' || block.state === 'consumed')
+    ) {
+      return {
+        ok: true,
+        status: 'already_selected',
+        runId,
+        stepId: input.stepId,
+        capabilityId: input.capabilityId,
+        accountId: input.accountId,
+      };
+    }
+    if (
+      current.status !== 'blocked_capability'
+      || block.state !== 'blocked'
+      || block.provenNoDispatch !== true
+      || block.reason !== 'ambiguous-account'
+      || !sameCoordinates
+    ) {
+      return { ok: false, status: 'conflict', message: 'The workflow capability gate changed; reopen its current Needs You item.' };
+    }
+    const choices = block.accountChoiceSet;
+    if (!choices || choices.digest !== input.choiceSetDigest) {
+      return { ok: false, status: 'stale_choice', message: 'The account-choice set changed; reopen the current Needs You item.' };
+    }
+    const selected = choices.candidates.find((candidate) => (
+      candidate.capabilityId === input.capabilityId
+      && candidate.accountId === input.accountId
+    ));
+    if (!selected) {
+      return { ok: false, status: 'stale_choice', message: 'That exact account is not one of this gate\'s current bounded choices.' };
+    }
+    const admitted = resolveWorkflowRunDefinitionSnapshot(current.workflowDefinitionSnapshot);
+    if (
+      admitted.status !== 'valid'
+      || (
+        current.workflowSlug !== undefined
+        && current.workflowSlug !== admitted.snapshot.workflowSlug
+      )
+    ) {
+      return { ok: false, status: 'conflict', message: 'The admitted workflow snapshot is unavailable or no longer matches this run.' };
+    }
+    const selectedAt = new Date().toISOString();
+    const selectedBy = input.selectedBy?.replace(/\s+/g, ' ').trim().slice(0, 120) || 'user';
+    const written = writeRunRecord(filePath, {
+      ...current,
+      status: 'running',
+      capabilityBlock: {
+        ...block,
+        state: 'retrying',
+        resumedAt: selectedAt,
+        accountSelection: {
+          capabilityId: selected.capabilityId,
+          accountId: selected.accountId,
+          choiceSetDigest: choices.digest,
+          selectedAt,
+          selectedBy,
+        },
+      },
+    }).record;
+    if (
+      written.status !== 'running'
+      || written.capabilityBlock?.state !== 'retrying'
+      || written.capabilityBlock.accountSelection?.capabilityId !== selected.capabilityId
+      || written.capabilityBlock.accountSelection.accountId !== selected.accountId
+    ) {
+      return { ok: false, status: 'conflict', message: 'The workflow changed while saving the account choice; reopen its current status.' };
+    }
+    try {
+      appendWorkflowEvent(admitted.snapshot.workflowSlug, runId, {
+        kind: 'run_resumed',
+        meta: {
+          reason: 'capability_account_selected',
+          source: 'human-choice-cas',
+          stepId: block.stepId,
+          tool: block.tool,
+          capabilityId: selected.capabilityId,
+          accountId: selected.accountId,
+          retryCount: block.retryCount,
+          choiceSetDigest: choices.digest,
+          provenNoDispatch: true,
+        },
+      });
+    } catch { /* run record is authoritative */ }
+    try {
+      addRunEvent(runId, {
+        type: 'run_resumed',
+        status: 'running',
+        message: `Account ${selected.accountId} selected for ${block.stepId}; resuming the same run.`,
+        data: {
+          workflow: current.workflow,
+          workflowSlug: admitted.snapshot.workflowSlug,
+          stepId: block.stepId,
+          capabilityId: selected.capabilityId,
+          accountId: selected.accountId,
+          source: 'human-choice-cas',
+        },
+      });
+    } catch { /* Activity is best-effort */ }
+    return {
+      ok: true,
+      status: 'selected',
+      runId,
+      stepId: block.stepId,
+      capabilityId: selected.capabilityId,
+      accountId: selected.accountId,
+    };
+  });
+  if (result.ok) {
+    try {
+      markWorkflowCapabilityNotificationsSettled(result.runId, {
+        capabilityResolutionStatus: 'account_selected',
+        selectedCapabilityId: result.capabilityId,
+        selectedAccountId: result.accountId,
+      });
+    } catch { /* the exact run CAS is authoritative */ }
+  }
+  return result;
+}
+
+export type ResolveWorkflowCapabilityRetryResult =
+  | { ok: true; status: 'resumed' | 'already_resumed'; runId: string; stepId: string }
+  | {
+      ok: false;
+      status: 'invalid_request' | 'run_unavailable' | 'stale_gate' | 'requires_account_choice' | 'conflict';
+      message: string;
+    };
+
+/** Exact non-account capability retry for authenticated Inbox cards. Unlike
+ * the legacy operator retry, this compare-and-swap includes the visible gate
+ * generation so a delayed click can never readmit a newer pause. */
+export function resolveWorkflowCapabilityRetry(input: {
+  runId: string;
+  stepId: string;
+  tool: string;
+  retryCount: number;
+  selectedBy?: string;
+}): ResolveWorkflowCapabilityRetryResult {
+  const runId = input.runId.trim();
+  const stepId = input.stepId.trim();
+  const tool = input.tool.trim();
+  if (
+    !/^[A-Za-z0-9_.:-]+$/.test(runId)
+    || !stepId
+    || !tool
+    || !Number.isSafeInteger(input.retryCount)
+    || input.retryCount < 1
+  ) {
+    return { ok: false, status: 'invalid_request', message: 'Exact capability-retry coordinates are invalid.' };
+  }
+  const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const resumedAt = new Date().toISOString();
+  const result = withWorkflowRunRecordLock(filePath, () => {
+    const current = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
+    const block = current?.capabilityBlock;
+    if (!current || !block) {
+      return { ok: false, status: 'run_unavailable', message: `Workflow run "${runId}" is unavailable.` } as const;
+    }
+    const sameCoordinates = block.stepId === stepId
+      && block.tool === tool
+      && block.retryCount === input.retryCount;
+    if (sameCoordinates && current.status === 'running' && (block.state === 'retrying' || block.state === 'consumed')) {
+      return { ok: true, status: 'already_resumed', runId, stepId } as const;
+    }
+    if (!sameCoordinates) {
+      return { ok: false, status: 'stale_gate', message: 'The workflow capability gate changed; reopen its current Needs You item.' } as const;
+    }
+    if (block.reason === 'ambiguous-account') {
+      return { ok: false, status: 'requires_account_choice', message: 'Choose one of the exact account candidates shown on this gate.' } as const;
+    }
+    if (
+      current.status !== 'blocked_capability'
+      || block.state !== 'blocked'
+      || block.provenNoDispatch !== true
+    ) {
+      return { ok: false, status: 'conflict', message: 'That capability gate is no longer waiting for this retry.' } as const;
+    }
+    const admitted = resolveWorkflowRunDefinitionSnapshot(current.workflowDefinitionSnapshot);
+    if (
+      admitted.status !== 'valid'
+      || (
+        current.workflowSlug !== undefined
+        && (typeof current.workflowSlug !== 'string' || current.workflowSlug.trim() !== admitted.snapshot.workflowSlug)
+      )
+      || (
+        isExactSchemaCapabilityReason(block.reason)
+        && exactSchemaCapabilityResumeProofStepId({
+          workflow: admitted.snapshot.definition,
+          workflowSlug: admitted.snapshot.workflowSlug,
+          runId,
+          block,
+          expectedState: 'blocked',
+        }) !== block.stepId
+      )
+    ) {
+      return { ok: false, status: 'conflict', message: 'The admitted workflow snapshot no longer proves this exact retry.' } as const;
+    }
+    const written = writeRunRecord(filePath, {
+      ...current,
+      status: 'running',
+      capabilityBlock: { ...block, state: 'retrying', resumedAt },
+    }).record;
+    if (
+      written.status !== 'running'
+      || written.capabilityBlock?.stepId !== stepId
+      || written.capabilityBlock.tool !== tool
+      || written.capabilityBlock.retryCount !== input.retryCount
+      || written.capabilityBlock.state !== 'retrying'
+    ) {
+      return { ok: false, status: 'conflict', message: 'The workflow changed while saving this retry; reopen its current Needs You item.' } as const;
+    }
+    return { ok: true, status: 'resumed', runId, stepId } as const;
+  });
+  if (!result.ok) return result;
+  try {
+    markWorkflowCapabilityNotificationsSettled(runId, {
+      capabilityResolutionStatus: 'readmitted',
+      capabilityResolutionSource: 'authenticated-inbox',
+      selectedBy: input.selectedBy?.trim().slice(0, 120) || 'user',
+    });
+  } catch { /* the exact run CAS is authoritative */ }
+  try {
+    addRunEvent(runId, {
+      type: 'run_resumed',
+      status: 'running',
+      message: `Capability gate retried for ${stepId}; resuming the same run.`,
+      data: { stepId, tool, source: 'authenticated-inbox' },
+    });
+  } catch { /* Activity is best-effort */ }
+  return result;
+}
+
 /** Timer/boot scan for recoverable capability interruptions. This only
  * re-admits blocks created by a typed gateway that proved dispatch never
  * started, so retrying a write/send step cannot duplicate an external action. */
@@ -10590,9 +10942,37 @@ export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
   for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     const run = readRunRecordForScan(filePath);
+    if (!run) continue;
+    const currentBlockedGate = run.status === 'blocked_capability'
+      && run.capabilityBlock?.state === 'blocked'
+      && run.capabilityBlock.provenNoDispatch === true;
+    if (currentBlockedGate) {
+      try {
+        ensureWorkflowCapabilityBlockedNotification(run);
+      } catch (error) {
+        logger.warn(
+          { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+          'Canonical capability gate remains durable but its Needs You carrier could not be reconciled',
+        );
+      }
+    } else if (
+      run.capabilityBlock
+      && loadNotifications().some((notification) => (
+        notification.kind === 'workflow'
+        && notification.metadata?.runId === run.id
+        && notification.metadata?.status === 'blocked_capability'
+        && (!notification.read || notification.metadata?.needsAttention === true)
+      ))
+    ) {
+      try {
+        markWorkflowCapabilityNotificationsSettled(run.id, {
+          capabilityResolutionStatus: isTerminalRunRecord(run) ? 'run_terminal' : 'run_left_gate',
+          capabilityResolutionSource: 'workflow_reconciliation',
+        });
+      } catch { /* the canonical run remains authoritative */ }
+    }
     if (
-      !run
-      || run.status !== 'blocked_capability'
+      run.status !== 'blocked_capability'
       || !run.capabilityBlock
       || run.capabilityBlock.state !== 'blocked'
       || run.capabilityBlock.provenNoDispatch !== true
@@ -12523,6 +12903,125 @@ export function resolveWorkflowDefinitionForRun(
  * main execution heartbeat (exact-schema preflight) and from the execution
  * catch (gateway/auth/boundary refusal), so every such refusal has the same
  * durable same-run recovery semantics. */
+function workflowCapabilityNotificationPresentation(
+  workflowName: string,
+  block: WorkflowCapabilityBlockState,
+): {
+  exactSchemaBlock: boolean;
+  accountChoiceBlock: WorkflowCapabilityAccountChoiceSetV1 | undefined;
+  choiceQuestion: string;
+  detail: string;
+  title: string;
+  resolution: NonNullable<Extract<RunInputBlocker, { kind: 'capability_dependency' }>['resolution']>;
+} {
+  const exactSchemaBlock = isExactSchemaCapabilityReason(block.reason);
+  const accountChoiceBlock = block.reason === 'ambiguous-account'
+    ? block.accountChoiceSet
+    : undefined;
+  const accountChoices = accountChoiceBlock?.candidates ?? [];
+  const resolution = accountChoiceBlock
+    ? {
+        kind: 'choose_account' as const,
+        actionTool: 'workflow_capability_resolve' as const,
+        accountCandidates: accountChoices,
+        choiceSetDigest: accountChoiceBlock.digest,
+        choiceTotal: accountChoiceBlock.total,
+        choicesTruncated: accountChoiceBlock.truncated,
+        retryCount: block.retryCount,
+      }
+    : exactSchemaBlock
+      ? {
+          kind: 'retry_exact_metadata' as const,
+          actionTool: 'workflow_capability_resolve' as const,
+          retryCount: block.retryCount,
+        }
+      : {
+          kind: 'connect_and_retry' as const,
+          actionTool: 'workflow_capability_resolve' as const,
+          toolkit: block.toolkit,
+          retryCount: block.retryCount,
+        };
+  const choiceQuestion = accountChoiceBlock
+    ? [
+        `Which ${block.toolkit} account should I use for step "${block.stepId}"?`,
+        ...accountChoices.map((candidate, index) => (
+          `${index + 1}. ${candidate.accountId} (capability ${candidate.capabilityId})`
+        )),
+        accountChoiceBlock.truncated
+          ? `Only ${accountChoices.length} of ${accountChoiceBlock.total} exact account bindings are shown; connect fewer accounts or choose one of these.`
+          : '',
+        'Choose the exact account ID in Needs You. I will save that choice and resume this same run.',
+      ].filter(Boolean).join('\n')
+    : '';
+  const detail = [
+    accountChoiceBlock
+      ? `I paused "${workflowName}" before step "${block.stepId}" because more than one ${block.toolkit} account can perform ${block.tool}.`
+      : exactSchemaBlock
+        ? `I paused "${workflowName}" at step "${block.stepId}" because the exact action schema could not be proven at the provider boundary.`
+        : `I paused "${workflowName}" at step "${block.stepId}" because ${block.toolkit} is not currently usable.`,
+    block.message,
+    `Everything completed before this step is preserved. No ${block.tool} dispatch occurred, so this same run can safely resume.`,
+    accountChoiceBlock
+      ? choiceQuestion
+      : exactSchemaBlock
+        ? `Open Needs You to retry this exact metadata gate now, or I will retry safely after ${block.retryAt}; recovery performs no broader discovery or business action.`
+        : `Open Settings → Connections and connect ${block.toolkit}, then return to Needs You to retry this exact gate. It will also retry safely after ${block.retryAt}.`,
+  ].join('\n\n');
+  return {
+    exactSchemaBlock,
+    accountChoiceBlock,
+    choiceQuestion,
+    detail,
+    title: accountChoiceBlock
+      ? `Workflow needs you — choose an account for ${block.toolkit}`
+      : exactSchemaBlock
+        ? 'Workflow paused — exact action metadata unavailable'
+        : `Workflow needs you — connect ${block.toolkit}`,
+    resolution,
+  };
+}
+
+/** Rebuild the stable human gate from canonical blocked-run truth. This is
+ * safe on every tick and repairs a crash after the run fsync but before the
+ * original notification side effect. retryCount is the monotonic generation
+ * while the run/toolkit notification id remains a stable Inbox address. */
+function ensureWorkflowCapabilityBlockedNotification(
+  run: QueuedRunRecord,
+  workflowName: string = run.workflow,
+): ReturnType<typeof workflowCapabilityNotificationPresentation> | null {
+  const block = run.capabilityBlock;
+  if (
+    run.status !== 'blocked_capability'
+    || !block
+    || block.state !== 'blocked'
+    || block.provenNoDispatch !== true
+  ) return null;
+  const presentation = workflowCapabilityNotificationPresentation(workflowName, block);
+  addNotification({
+    id: `workflow-${run.id}-capability-${block.toolkit.toLowerCase()}`,
+    kind: 'workflow',
+    title: presentation.title,
+    body: presentation.detail,
+    createdAt: block.blockedAt,
+    read: false,
+    metadata: {
+      workflow: workflowName,
+      runId: run.id,
+      status: 'blocked_capability',
+      stepId: block.stepId,
+      tool: block.tool,
+      toolkit: block.toolkit,
+      reason: block.reason,
+      retryAt: block.retryAt,
+      retryCount: block.retryCount,
+      provenNoDispatch: true,
+      needsAttention: true,
+      resolution: presentation.resolution,
+    },
+  });
+  return presentation;
+}
+
 function parkWorkflowCapabilityBlockedRun(input: {
   filePath: string;
   run: QueuedRunRecord;
@@ -12545,6 +13044,7 @@ function parkWorkflowCapabilityBlockedRun(input: {
     retryCount,
     provenNoDispatch: true,
     state: 'blocked',
+    ...(error.accountChoiceSet ? { accountChoiceSet: error.accountChoiceSet } : {}),
   };
   const blockedRecord = writeRunRecord(filePath, {
     ...run,
@@ -12575,41 +13075,16 @@ function parkWorkflowCapabilityBlockedRun(input: {
       provenNoDispatch: true,
     },
   });
-  const exactSchemaBlock = error.reason === 'exact_schema_refresh_unavailable'
-    || error.reason === 'exact_schema_boundary_mismatch';
-  const detail = [
-    exactSchemaBlock
-      ? `I paused "${workflow.data.name}" at step "${error.stepId}" because the exact action schema could not be proven at the provider boundary.`
-      : `I paused "${workflow.data.name}" at step "${error.stepId}" because ${error.toolkit} is not currently usable.`,
-    error.message,
-    `Everything completed before this step is preserved. No ${error.tool} dispatch occurred, so this same run can safely resume.`,
-    exactSchemaBlock
-      ? `I will retry the same exact-slug metadata refresh automatically after ${retryAt}; no broader discovery or business action is performed during recovery.`
-      : `I will retry automatically after ${retryAt}; reconnect or disambiguate ${error.toolkit} first. You can also resume the run immediately after fixing it.`,
-  ].join('\n\n');
+  const presentation = workflowCapabilityNotificationPresentation(workflow.data.name, capabilityBlock);
+  const {
+    exactSchemaBlock,
+    accountChoiceBlock,
+    choiceQuestion,
+    detail,
+    resolution,
+  } = presentation;
   try {
-    addNotification({
-      id: `workflow-${run.id}-capability-${error.toolkit.toLowerCase()}`,
-      kind: 'workflow',
-      title: exactSchemaBlock
-        ? 'Workflow paused — exact action metadata unavailable'
-        : `Workflow paused — connect ${error.toolkit}`,
-      body: detail,
-      createdAt: blockedAt,
-      read: false,
-      metadata: {
-        workflow: workflow.data.name,
-        runId: run.id,
-        status: 'blocked_capability',
-        stepId: error.stepId,
-        tool: error.tool,
-        toolkit: error.toolkit,
-        reason: error.reason,
-        retryAt,
-        retryCount,
-        provenNoDispatch: true,
-      },
-    });
+    ensureWorkflowCapabilityBlockedNotification(blockedRecord, workflow.data.name);
   } catch { /* durable run state remains visible */ }
   // Preflight schema refusal occurs before the ordinary activity start. The
   // upsert is also safe for an already-running workflow caught at the gateway.
@@ -12617,10 +13092,13 @@ function parkWorkflowCapabilityBlockedRun(input: {
     startWorkflowActivityRun(run, workflow.data.name, `Running workflow "${workflow.data.name}"`);
     finishRun(run.id, {
       status: 'awaiting_input',
-      message: exactSchemaBlock
+      message: accountChoiceBlock
+        ? `Waiting for an exact ${error.toolkit} account choice at step ${error.stepId}; completed work is preserved.`
+        : exactSchemaBlock
         ? `Waiting for exact action metadata at step ${error.stepId}; completed work is preserved.`
         : `Waiting for ${error.toolkit} connection at step ${error.stepId}; completed work is preserved.`,
       outputPreview: detail,
+      needsAttention: true,
       pendingInput: {
         kind: 'capability_dependency',
         dependencyId: `workflow:${run.id}:${error.stepId}:${error.tool}`,
@@ -12636,7 +13114,12 @@ function parkWorkflowCapabilityBlockedRun(input: {
           toolkit: error.toolkit,
           reason: error.reason,
         },
-        nextAction: `${error.message} Resume this run after the dependency is available; its completed work stays preserved.`,
+        nextAction: accountChoiceBlock
+          ? choiceQuestion
+          : exactSchemaBlock
+            ? `Tell me to retry exact metadata for run ${run.id}; completed work stays preserved.`
+            : `Connect ${error.toolkit} in Settings → Connections, then tell me to retry run ${run.id}; completed work stays preserved.`,
+        resolution,
         retryAt,
         provenNoDispatch: true,
       },
@@ -15016,6 +15499,14 @@ export function reconcilePendingWorkflowRuns(): void {
     logger.warn(
       { failures: inputProjection.failed },
       'Boot left workflow clarification projections pending for the next workflow tick',
+    );
+  }
+  try {
+    reapCapabilityBlockedRuns();
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Boot left capability Needs You reconciliation pending for the next workflow tick',
     );
   }
   const pending = listPendingRuns();

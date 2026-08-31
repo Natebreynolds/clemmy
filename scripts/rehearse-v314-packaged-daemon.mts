@@ -61,9 +61,21 @@ export interface PackagedDaemonBoot {
   cleanExit: boolean;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
+  liveLease: PackagedDaemonLeaseObservation;
+  postExitLeaseClean: boolean;
   build: PackagedDaemonBuild;
   stdoutSha256: string;
   stderrSha256: string;
+}
+
+export interface PackagedDaemonLeaseObservation {
+  valid: boolean;
+  expectedPid: number;
+  projectedPid: number | null;
+  leaseEntryCount: number;
+  ownerCount: number;
+  ownerPid: number | null;
+  ownerStartedAt: string | null;
 }
 
 export interface WorkDelta {
@@ -115,6 +127,7 @@ export interface PackagedV314DaemonRehearsalReport {
     tarball: string;
     packageEntry: string;
     exerciseFixture: string;
+    hermeticRuntimePath: string;
     report: string;
   };
   candidate: {
@@ -142,6 +155,44 @@ const PACKAGED_CAPABILITY_ACQUISITION_MISSING_DETAILS = new Set([
   'no live-read carrier adapters are configured',
   'no current attested read capability matched the objective',
 ]);
+
+export const AUTOMATION_OPPORTUNITY_PROPOSAL_DB =
+  'state/automation-opportunities/automation-opportunities.db';
+export const HARNESS_DB = 'state/harness.db';
+
+const V314_GATE_MACHINE_ID = 'upgrade-rehearsal-machine-v314';
+const V314_GATE_PROACTIVITY_POLICY = Object.freeze({
+  enabled: false,
+  updatedAt: '1970-01-01T00:00:00.000Z',
+});
+const DAILY_MAINTENANCE_CURSOR_KEYS = Object.freeze([
+  'lastNightlyFireDay',
+  'lastSkillUpdateFireDay',
+  'lastBackupDay',
+  'lastMemorySelfHealDay',
+  'lastRelationshipBackfillDay',
+  'lastMergeDay',
+  'lastGoalReapDay',
+  'lastTaskLedgerHygieneDay',
+  'lastNotificationReapDay',
+  'lastStorageHygieneDay',
+  'lastCuratorReportDay',
+] as const);
+const CHECK_IN_SEED_IDS = Object.freeze([
+  'seed-monday-kickoff',
+  'seed-friday-wrap',
+  'seed-blocked-execution',
+  'seed-goal-drift',
+  'seed-inbox-backlog',
+] as const);
+
+const CHECK_IN_SEED_TRIGGERS = Object.freeze({
+  'seed-monday-kickoff': ['schedule', 'schedule', '0 9 * * 1'],
+  'seed-friday-wrap': ['schedule', 'schedule', '0 16 * * 5'],
+  'seed-blocked-execution': ['execution_blocked', 'blockedHours', 24],
+  'seed-goal-drift': ['goal_stale', 'staleDays', 7],
+  'seed-inbox-backlog': ['inbox_backed_up', 'inboxThreshold', 10],
+} as const);
 
 export function isPackagedCapabilityAcquisitionMissingDetail(value: unknown): value is string {
   return typeof value === 'string'
@@ -411,13 +462,29 @@ function packAndInstall(rehearsalRoot: string): { tarball: string; packageEntry:
   return { tarball, packageEntry };
 }
 
-function daemonEnv(home: string): NodeJS.ProcessEnv {
-  const env = sanitizePackagedGateEnvironment(process.env);
+/** Runtime-only boundary for the installed daemon and exercise. npm staging
+ * still needs the caller's toolchain PATH, but product execution gets an exact
+ * empty directory owned by this disposable gate. This prevents a host `sf`,
+ * `gcloud`, or other reviewed CLI from silently becoming test capability. */
+export function packagedRuntimeEnvironment(
+  source: NodeJS.ProcessEnv,
+  home: string,
+  hermeticRuntimePath: string,
+): NodeJS.ProcessEnv {
+  const env = sanitizePackagedGateEnvironment(source);
+  // Windows treats environment keys case-insensitively. Remove every inherited
+  // spelling before publishing the one authoritative PATH below, otherwise a
+  // host `Path` entry can win Node's child-environment de-duplication.
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === 'path') delete env[key];
+  }
   return {
     ...env,
+    PATH: path.resolve(hermeticRuntimePath),
     HOME: home,
     USERPROFILE: home,
     TMPDIR: os.tmpdir(),
+    TZ: 'UTC',
     CLEMENTINE_HOME: home,
     CLEMMY_TEST_ISOLATED_HOME: '1',
     CLEMMY_TEST_DISABLE_LIVE_MODELS: '1',
@@ -427,9 +494,20 @@ function daemonEnv(home: string): NodeJS.ProcessEnv {
     CLEMMY_MEMORY_DEDUP: 'off',
     CLEMMY_AUTHORITY_SEAL_KEY: 'ab'.repeat(32),
     CLEMMY_HARNESS_CRON: 'off',
+    // The normal independent lane is deliberately concurrent. The gate uses
+    // its production inline fallback so daemon.loop.sleep is an authority
+    // barrier after workflow recovery and automation convergence, not merely
+    // after the foreground scheduler tick.
+    CLEMMY_WORKFLOW_RUN_LANE: 'off',
     CLEMMY_MCP_PREWARM: 'off',
     CLEMMY_BOOT_WARMUP: 'off',
     CLEMMY_CLI_DISCOVERY_WARMUP: 'off',
+    CLEMMY_PROSPECTIVE_MEMORY: 'off',
+    CLEMMY_BGTASK_INTEGRITY_SWEEP: 'off',
+    CLEMMY_MEMORY_BACKUP: 'off',
+    CLEMMY_ENTITY_RELATIONSHIP_BACKFILL: 'off',
+    CLEMMY_TASK_LEDGER_HYGIENE: 'off',
+    CLEMMY_STORAGE_HYGIENE: 'off',
     MCP_AUTO_IMPORT_ENABLED: 'false',
     OPENAI_AGENTS_DISABLE_TRACING: '1',
     AUTH_MODE: 'api_key',
@@ -439,6 +517,111 @@ function daemonEnv(home: string): NodeJS.ProcessEnv {
     WEBHOOK_ALLOW_LAN: 'false',
     CLEMENTINE_MOBILE_APP_LISTENER: 'off',
   };
+}
+
+function daemonEnv(home: string, hermeticRuntimePath: string): NodeJS.ProcessEnv {
+  return packagedRuntimeEnvironment(process.env, home, hermeticRuntimePath);
+}
+
+interface PackagedGateSeeds {
+  utcDay: string;
+  digests: Record<string, string>;
+}
+
+function seedPackagedGateState(home: string): PackagedGateSeeds {
+  const utcDay = new Date().toISOString().slice(0, 10);
+  const stateDir = path.join(home, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  const maintenanceState = Object.fromEntries(
+    DAILY_MAINTENANCE_CURSOR_KEYS.map((key) => [key, utcDay]),
+  );
+  const seeds: Record<string, string> = {
+    'state/machine-id': `${V314_GATE_MACHINE_ID}\n`,
+    'state/proactivity-policy.json': `${JSON.stringify(V314_GATE_PROACTIVITY_POLICY, null, 2)}\n`,
+    'state/memory-maintenance-state.json': `${JSON.stringify(maintenanceState, null, 2)}\n`,
+  };
+  for (const [relativePath, bytes] of Object.entries(seeds)) {
+    writeFileSync(path.join(home, relativePath), bytes, { encoding: 'utf8', flag: 'wx' });
+  }
+  return {
+    utcDay,
+    digests: Object.fromEntries(Object.entries(seeds).map(([name, bytes]) => [name, sha256(bytes)])),
+  };
+}
+
+function packagedGateSeedsPreserved(
+  seeds: PackagedGateSeeds,
+  ...inspections: HomeInspection[]
+): boolean {
+  return inspections.every((inspection) => Object.entries(seeds.digests).every(
+    ([relativePath, digest]) => inspection.allNonSqliteFiles[relativePath] === digest,
+  ));
+}
+
+export function isExactDaemonLeaseOwnerRecord(
+  value: unknown,
+  expectedPid?: number,
+  expectedToken?: string,
+): value is { version: 1; pid: number; token: string; startedAt: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return stable(Object.keys(record).sort()) === stable(['pid', 'startedAt', 'token', 'version'])
+    && record.version === 1
+    && typeof record.pid === 'number'
+    && Number.isSafeInteger(record.pid)
+    && record.pid > 0
+    && (expectedPid === undefined || record.pid === expectedPid)
+    && typeof record.token === 'string'
+    && record.token.length > 0
+    && (expectedToken === undefined || record.token === expectedToken)
+    && typeof record.startedAt === 'string'
+    && Number.isFinite(Date.parse(record.startedAt));
+}
+
+function observeDaemonLease(home: string, expectedPid: number): PackagedDaemonLeaseObservation {
+  const pidFile = path.join(home, 'daemon.pid');
+  const leaseDir = path.join(home, 'daemon.lock');
+  const projectedPid = (() => {
+    if (!existsSync(pidFile)) return null;
+    const raw = readFileSync(pidFile, 'utf8').trim();
+    if (!/^[1-9]\d*$/.test(raw)) return null;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) ? value : null;
+  })();
+  const leaseEntries = existsSync(leaseDir) ? readdirSync(leaseDir).sort() : [];
+  const owners = leaseEntries.filter((name) => /^owner-[A-Za-z0-9-]+\.json$/.test(name));
+  const owner = (() => {
+    if (owners.length !== 1) return null;
+    try {
+      const token = /^owner-([A-Za-z0-9-]+)\.json$/.exec(owners[0]!)?.[1];
+      const parsed = JSON.parse(readFileSync(path.join(leaseDir, owners[0]!), 'utf8')) as Record<string, unknown>;
+      return token && isExactDaemonLeaseOwnerRecord(parsed, expectedPid, token) ? parsed : null;
+    } catch {
+      return null;
+    }
+  })();
+  const ownerPid = typeof owner?.pid === 'number' ? owner.pid : null;
+  const ownerStartedAt = typeof owner?.startedAt === 'string' ? owner.startedAt : null;
+  return {
+    valid: projectedPid === expectedPid
+      && leaseEntries.length === 1
+      && owners.length === 1
+      && ownerPid === expectedPid,
+    expectedPid,
+    projectedPid,
+    leaseEntryCount: leaseEntries.length,
+    ownerCount: owners.length,
+    ownerPid,
+    ownerStartedAt,
+  };
+}
+
+function daemonLeaseIsAbsent(home: string): boolean {
+  return !existsSync(path.join(home, 'daemon.pid'))
+    && !existsSync(path.join(home, 'daemon.lock'))
+    && readdirSync(home).every((name) =>
+      !/^\.daemon-owner-[A-Za-z0-9-]+\.tmp$/.test(name)
+      && !/^daemon\.pid\.[1-9]\d*\.[A-Za-z0-9-]+\.tmp$/.test(name));
 }
 
 function parseBuild(stdout: string): PackagedDaemonBuild | null {
@@ -585,10 +768,11 @@ async function bootPackagedDaemon(
   ordinal: 1 | 2,
   packageEntry: string,
   home: string,
+  hermeticRuntimePath: string,
 ): Promise<PackagedDaemonBoot> {
   const child = spawn(process.execPath, [packageEntry, 'daemon', '--foreground'], {
     cwd: path.dirname(path.dirname(packageEntry)),
-    env: daemonEnv(home),
+    env: daemonEnv(home, hermeticRuntimePath),
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   let stdout = '';
@@ -652,6 +836,12 @@ async function bootPackagedDaemon(
   // and heartbeat persistence) has completed. It is the deterministic boot
   // recovery barrier; stdout quietness is not authority.
   const pid = child.pid ?? 0;
+  const liveLease = observeDaemonLease(home, pid);
+  if (!liveLease.valid) {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    await waitForExit(child, 5_000).catch(() => undefined);
+    throw new Error(`packaged daemon boot ${ordinal} did not own exactly one valid lease: ${stable(liveLease)}`);
+  }
   child.kill('SIGTERM');
   let exited: { code: number | null; signal: NodeJS.Signals | null };
   try {
@@ -660,6 +850,10 @@ async function bootPackagedDaemon(
     try { child.kill('SIGKILL'); } catch { /* already gone */ }
     await waitForExit(child, 5_000).catch(() => undefined);
     throw error;
+  }
+  const postExitLeaseClean = daemonLeaseIsAbsent(home);
+  if (!postExitLeaseClean) {
+    throw new Error(`packaged daemon boot ${ordinal} left PID/owner lease artifacts after clean exit`);
   }
   const build = parseBuild(stdout);
   if (!build) throw new Error(`packaged daemon boot ${ordinal} did not self-report build identity\n${stdout}`);
@@ -674,6 +868,8 @@ async function bootPackagedDaemon(
     cleanExit: exited.code === 0 && exited.signal === null,
     exitCode: exited.code,
     signal: exited.signal,
+    liveLease,
+    postExitLeaseClean,
     build,
     stdoutSha256: sha256(stdout),
     stderrSha256: sha256(stderr),
@@ -686,11 +882,12 @@ function runPackagedUpgradeExercise(
   exerciseFixture: string,
   packageEntry: string,
   home: string,
+  hermeticRuntimePath: string,
 ): PackagedV314ExerciseReport {
   const installedRoot = path.dirname(path.dirname(packageEntry));
   const stdout = run(process.execPath, [exerciseFixture, installedRoot, home], {
     cwd: installedRoot,
-    env: daemonEnv(home),
+    env: daemonEnv(home, hermeticRuntimePath),
   });
   const markerLine = stdout.split(/\r?\n/)
     .findLast((line) => line.startsWith(PACKAGED_EXERCISE_MARKER));
@@ -774,40 +971,56 @@ function workDelta(before: WorkSnapshot, after: WorkSnapshot): WorkDelta {
   return { total, components };
 }
 
+/** Closed logical projection for the few process/scheduler observations whose
+ * value is expected to advance on a no-work restart. Every other field and
+ * every other file remains byte-sensitive. */
+export function normalizePackagedLogicalJson(
+  relativePath: string,
+  value: Record<string, Json>,
+): Record<string, Json> {
+  if (relativePath === 'cron/workflow-schedule-state.json') {
+    const { lastEvaluatedAtMs: _workflowScanObservation, ...authority } = value;
+    return authority;
+  }
+  if (relativePath === 'state/space-schedule-state.json') {
+    const { lastEvaluatedAtMs: _spaceScanObservation, ...authority } = value;
+    return authority;
+  }
+  if (relativePath === 'cron/daemon-state.json') {
+    const {
+      lastHealthyTickAt: _heartbeatObservation,
+      lastCronEvaluatedAtMs: _cronScanObservation,
+      ...authority
+    } = value;
+    return authority;
+  }
+  return value;
+}
+
 function nonSqliteState(
   home: string,
   inspection: HomeInspection,
   normalizeObservations: boolean,
 ): Record<string, string> {
+  if (!normalizeObservations) return { ...inspection.allNonSqliteFiles };
   const files = { ...inspection.allNonSqliteFiles };
-  if (!normalizeObservations) return files;
   for (const relativePath of Object.keys(files)) {
-    if (relativePath.endsWith('/workflow-schedule-state.json') || relativePath === 'workflow-schedule-state.json') {
-      files[relativePath] = sha256(stable(inspection.carriers.workflowScheduleState));
-    }
-  }
-  const daemonStatePath = 'cron/daemon-state.json';
-  if (files[daemonStatePath]) {
-    const record = (() => {
+    if (
+      relativePath === 'cron/workflow-schedule-state.json'
+      || relativePath === 'state/space-schedule-state.json'
+      || relativePath === 'cron/daemon-state.json'
+    ) {
+      const record = (() => {
       try {
-        const parsed = JSON.parse(readFileSync(path.join(home, daemonStatePath), 'utf8')) as unknown;
+        const parsed = JSON.parse(readFileSync(path.join(home, relativePath), 'utf8')) as unknown;
         return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-          ? parsed as Record<string, unknown>
+          ? asJson(parsed) as Record<string, Json>
           : null;
       } catch {
         return null;
       }
-    })();
-    if (record) {
-      // These two fields are observation cursors, not admitted occurrence or
-      // effect authority. Every pending occurrence and dedupe map remains in
-      // the projection and any other daemon-state mutation still fails.
-      const {
-        lastHealthyTickAt: _heartbeatObservation,
-        lastCronEvaluatedAtMs: _cronScanObservation,
-        ...authority
-      } = record;
-      files[daemonStatePath] = sha256(stable(authority));
+      })();
+      if (record) files[relativePath] = sha256(stable(normalizePackagedLogicalJson(relativePath, record)));
     }
   }
   return files;
@@ -893,6 +1106,24 @@ function noStateDifference(difference: StateDifference): boolean {
   return Object.values(difference).every((entries) => entries.length === 0);
 }
 
+/** A snapshot authority barrier: the child has already reported a clean exit,
+ * no singleton lease remains, and two complete logical reads agree without a
+ * timing sleep. Any detached gate-owned writer therefore fails closed instead
+ * of racing a favorable hash. */
+function inspectQuiescentRehearsalHome(home: string, label: string): HomeInspection {
+  if (!daemonLeaseIsAbsent(home)) {
+    throw new Error(`${label} cannot be snapshotted while a daemon PID/owner lease survives`);
+  }
+  const first = inspectV314RehearsalHome(home);
+  const second = inspectV314RehearsalHome(home);
+  const firstProjection = stateProjection(home, first, false);
+  const secondProjection = stateProjection(home, second, false);
+  if (stable(firstProjection) !== stable(secondProjection)) {
+    throw new Error(`${label} changed across consecutive post-exit state reads`);
+  }
+  return second;
+}
+
 function sqliteHealthy(inspection: HomeInspection): boolean {
   return Object.values(inspection.sqlite).every((value) =>
     value.integrity.length === 1
@@ -944,6 +1175,14 @@ function rowByIdentity(rows: Json[] | undefined, key: string, value: Json): Reco
     if (record[key] === value) return record;
   }
   return null;
+}
+
+export function isExactV314TriggerRegistry(rows: Array<Record<string, Json>>): boolean {
+  return rows.length === 1
+    && rows[0]?.kind === 'system_event'
+    && rows[0].event_type === 'upgrade.rehearsal.never-fired'
+    && rows[0].schedule === null
+    && rows[0].timezone === null;
 }
 
 function eventRows(
@@ -1036,14 +1275,108 @@ function preservedPreexistingFiles(
   return { ok: changed.length === 0 && missing.length === 0, changed, missing };
 }
 
-function unexpectedAddedFiles(
+export type PackagedFirstBootAddedFileCategory =
+  | 'recovery_projection'
+  | 'deterministic_boot_seed'
+  | 'scheduler_observation'
+  | 'ephemeral_process_owner'
+  | 'unexpected';
+
+/** Closed path classifier. Classification never grants acceptance by itself:
+ * each causal category has a semantic assertion below, and surviving process
+ * owner artifacts always fail even though they are recognizable. */
+export function classifyPackagedFirstBootAddedFile(
+  relativePath: string,
+  recoveryEventFiles: ReadonlySet<string> = new Set(),
+): PackagedFirstBootAddedFileCategory {
+  if (
+    relativePath === 'cron/daemon-state.json'
+    || relativePath === 'state/notification-delivery-queue.json'
+    || recoveryEventFiles.has(relativePath)
+  ) return 'recovery_projection';
+  if (relativePath === 'state/space-schedule-state.json') return 'scheduler_observation';
+  if (
+    CHECK_IN_SEED_IDS.some((id) => relativePath === `state/check-in-templates/${id}.json`)
+    || relativePath === 'vault/00-System/workflows/objective-execution-loop/SKILL.md'
+    || relativePath === 'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md'
+    || relativePath === `memory/tool-procedures/${V314_GATE_MACHINE_ID}/.canonical-procedure-migration-v1.json`
+  ) return 'deterministic_boot_seed';
+  if (
+    relativePath === 'daemon.pid'
+    || /^daemon\.lock\/owner-[A-Za-z0-9-]+\.json$/.test(relativePath)
+    || /^\.daemon-owner-[A-Za-z0-9-]+\.tmp$/.test(relativePath)
+    || /^daemon\.pid\.[1-9]\d*\.[A-Za-z0-9-]+\.tmp$/.test(relativePath)
+  ) return 'ephemeral_process_owner';
+  return 'unexpected';
+}
+
+function addedFilesByCategory(
   reference: HomeInspection,
   actual: HomeInspection,
-  allowedPaths: ReadonlySet<string>,
-): string[] {
-  return Object.keys(actual.allNonSqliteFiles)
-    .filter((file) => !(file in reference.allNonSqliteFiles) && !allowedPaths.has(file))
-    .sort();
+  recoveryEventFiles: ReadonlySet<string>,
+): Record<PackagedFirstBootAddedFileCategory, string[]> {
+  const categories: Record<PackagedFirstBootAddedFileCategory, string[]> = {
+    recovery_projection: [],
+    deterministic_boot_seed: [],
+    scheduler_observation: [],
+    ephemeral_process_owner: [],
+    unexpected: [],
+  };
+  for (const relativePath of Object.keys(actual.allNonSqliteFiles).sort()) {
+    if (relativePath in reference.allNonSqliteFiles) continue;
+    categories[classifyPackagedFirstBootAddedFile(relativePath, recoveryEventFiles)].push(relativePath);
+  }
+  return categories;
+}
+
+function validDeterministicBootSeed(home: string, relativePath: string): boolean {
+  const checkInId = /^state\/check-in-templates\/(seed-[a-z-]+)\.json$/.exec(relativePath)?.[1]
+    as (typeof CHECK_IN_SEED_IDS)[number] | undefined;
+  if (checkInId && checkInId in CHECK_IN_SEED_TRIGGERS) {
+    const record = readJsonStateRecord(home, relativePath);
+    if (!record) return false;
+    const [trigger, timingKey, timingValue] = CHECK_IN_SEED_TRIGGERS[checkInId];
+    const { createdAt, updatedAt } = record;
+    return typeof createdAt === 'string'
+      && Number.isFinite(Date.parse(createdAt))
+      && createdAt === updatedAt
+      && record.id === checkInId
+      && record.seededId === checkInId
+      && record.agentSlug === 'clementine'
+      && record.version === 'v1'
+      && record.enabled === false
+      && record.trigger === trigger
+      && record[timingKey] === timingValue
+      && typeof record.questionTemplate === 'string'
+      && record.questionTemplate.length > 0;
+  }
+  if (relativePath.endsWith('/objective-execution-loop/SKILL.md')) {
+    const bytes = readFileSync(path.join(home, relativePath), 'utf8');
+    return /(?:^|\n)name:\s*Objective Execution Loop(?:\n|$)/.test(bytes)
+      && bytes.includes('requires_approval: true');
+  }
+  if (relativePath.endsWith('/objective-execution-loop/references/operating-principles.md')) {
+    const bytes = readFileSync(path.join(home, relativePath), 'utf8');
+    return bytes.startsWith('# Objective Execution Operating Principles\n')
+      && bytes.includes('Report exact evidence, blockers, and next checkpoints');
+  }
+  const record = readJsonStateRecord(home, relativePath);
+  return record?.version === 1
+    && record.machineId === V314_GATE_MACHINE_ID
+    && typeof record.completedAt === 'string'
+    && Number.isFinite(Date.parse(record.completedAt))
+    && stable(record.report) === stable({
+      aliasesScanned: 0, aliasesLinked: 0, proceduresCreated: 0, quarantinedAliases: 0,
+    });
+}
+
+function validEmptySpaceScheduleObservation(state: Record<string, Json> | null): boolean {
+  return typeof state?.lastEvaluatedAtMs === 'number'
+    && Number.isFinite(state.lastEvaluatedAtMs)
+    && state.lastEvaluatedAtMs >= 0
+    && stable(state.lastRunByMinute) === stable({})
+    && stable(state.lastReengageByKey) === stable({})
+    && stable(state.pausedRetryBySlug) === stable({});
 }
 
 function legacyIdentitiesPreserved(reference: HomeInspection, actual: HomeInspection): boolean {
@@ -1099,6 +1432,51 @@ function legacyIdentitiesPreserved(reference: HomeInspection, actual: HomeInspec
   ].every(Boolean);
 }
 
+function readJsonArrayRecords(home: string, relativePath: string): Array<Record<string, Json>> {
+  const file = path.join(home, relativePath);
+  if (!existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.flatMap((entry) => entry && typeof entry === 'object' && !Array.isArray(entry)
+        ? [asJson(entry) as Record<string, Json>]
+        : [])
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function isExactLegacyApprovalRetirement(
+  before: Array<Record<string, Json>>,
+  first: Array<Record<string, Json>>,
+  second: Array<Record<string, Json>>,
+): boolean {
+  const byId = (rows: Array<Record<string, Json>>): Map<string, Record<string, Json>> =>
+    new Map(rows.flatMap((row) => typeof row.id === 'string' ? [[row.id, row] as const] : []));
+  const beforeById = byId(before);
+  const firstById = byId(first);
+  const secondById = byId(second);
+  const pendingId = 'legacy-approval-v314-pending';
+  const approvedId = 'legacy-approval-v314-approved';
+  const pendingBefore = beforeById.get(pendingId);
+  const pendingFirst = firstById.get(pendingId);
+  const approvedBefore = beforeById.get(approvedId);
+  const approvedFirst = firstById.get(approvedId);
+  return before.length === 2
+    && first.length === 2
+    && second.length === 2
+    && beforeById.size === 2
+    && firstById.size === 2
+    && secondById.size === 2
+    && pendingBefore?.status === 'pending'
+    && pendingFirst?.status === 'rejected'
+    && stable(pendingFirst) === stable({ ...pendingBefore, status: 'rejected' })
+    && approvedBefore?.status === 'approved'
+    && stable(approvedBefore) === stable(approvedFirst)
+    && stable(first) === stable(second);
+}
+
 export async function runPackagedV314DaemonRehearsal(
   options: PackagedV314DaemonRehearsalOptions = {},
 ): Promise<PackagedV314DaemonRehearsalReport> {
@@ -1114,27 +1492,47 @@ export async function runPackagedV314DaemonRehearsal(
     force: false,
     preserveTimestamps: true,
   });
+  const gateSeeds = seedPackagedGateState(daemonHome);
+  const hermeticRuntimePath = path.join(rehearsalRoot, 'hermetic-runtime-path');
+  mkdirSync(hermeticRuntimePath, { recursive: false });
+  if (readdirSync(hermeticRuntimePath).length !== 0) {
+    throw new Error(`packaged runtime PATH must be an empty gate-owned directory: ${hermeticRuntimePath}`);
+  }
   const { tarball, packageEntry } = packAndInstall(rehearsalRoot);
   const exerciseFixture = path.join(repoRoot, 'scripts', 'rehearse-v314-packaged-exercise.mjs');
   if (!existsSync(exerciseFixture)) throw new Error(`packaged exercise fixture is missing: ${exerciseFixture}`);
-  const before = inspectV314RehearsalHome(daemonHome);
+  const workspaceDataPath = `spaces/${REQUIRED_FIXTURE_IDENTITIES.workspaceId}/data.json`;
+  const workspaceAuditPath = `spaces/${REQUIRED_FIXTURE_IDENTITIES.workspaceId}/audit.jsonl`;
+  const before = inspectQuiescentRehearsalHome(daemonHome, 'pre-daemon fixture');
+  const beforeLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
   const beforeWork = workSnapshot(daemonHome, before);
-  const firstProcess = await bootPackagedDaemon(1, packageEntry, daemonHome);
-  const first = inspectV314RehearsalHome(daemonHome);
+  const firstProcess = await bootPackagedDaemon(1, packageEntry, daemonHome, hermeticRuntimePath);
+  const first = inspectQuiescentRehearsalHome(daemonHome, 'first packaged boot');
+  const firstLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
   const firstScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
+  const firstSpaceScheduleObservation = readJsonStateRecord(daemonHome, 'state/space-schedule-state.json');
   const firstDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
   const firstLogicalState = stateProjection(daemonHome, first, true);
   const firstWork = workSnapshot(daemonHome, first);
-  const exercise = runPackagedUpgradeExercise(exerciseFixture, packageEntry, daemonHome);
-  const postExercise = inspectV314RehearsalHome(daemonHome);
+  const exercise = runPackagedUpgradeExercise(
+    exerciseFixture,
+    packageEntry,
+    daemonHome,
+    hermeticRuntimePath,
+  );
+  const postExercise = inspectQuiescentRehearsalHome(daemonHome, 'installed exercise');
+  const postExerciseLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
   const postExerciseScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
+  const postExerciseSpaceScheduleObservation = readJsonStateRecord(daemonHome, 'state/space-schedule-state.json');
   const postExerciseDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
   const postExerciseRawState = stateProjection(daemonHome, postExercise, false);
   const postExerciseLogicalState = stateProjection(daemonHome, postExercise, true);
   const postExerciseWork = workSnapshot(daemonHome, postExercise);
-  const secondProcess = await bootPackagedDaemon(2, packageEntry, daemonHome);
-  const second = inspectV314RehearsalHome(daemonHome);
+  const secondProcess = await bootPackagedDaemon(2, packageEntry, daemonHome, hermeticRuntimePath);
+  const second = inspectQuiescentRehearsalHome(daemonHome, 'second packaged boot');
+  const secondLegacyApprovals = readJsonArrayRecords(daemonHome, 'state/approvals.json');
   const secondScheduleObservation = readJsonStateRecord(daemonHome, 'cron/workflow-schedule-state.json');
+  const secondSpaceScheduleObservation = readJsonStateRecord(daemonHome, 'state/space-schedule-state.json');
   const secondDaemonObservation = readJsonStateRecord(daemonHome, 'cron/daemon-state.json');
   const secondRawState = stateProjection(daemonHome, second, false);
   const secondLogicalState = stateProjection(daemonHome, second, true);
@@ -1159,8 +1557,41 @@ export async function runPackagedV314DaemonRehearsal(
       && !lstatSync(path.dirname(path.dirname(packageEntry))).isSymbolicLink()
       && !existsSync(path.join(path.dirname(path.dirname(packageEntry)), 'src')),
     { packageEntry });
-  add('first_packaged_daemon_boot_reaches_ready_and_closes_cleanly', firstProcess.ready && firstProcess.cleanExit, firstProcess);
-  add('second_packaged_daemon_boot_reaches_ready_and_closes_cleanly', secondProcess.ready && secondProcess.cleanExit, secondProcess);
+  const runtimeEnvironment = packagedRuntimeEnvironment(process.env, daemonHome, hermeticRuntimePath);
+  add('daemon_and_exercise_execute_with_one_empty_gate_owned_path_and_absolute_node',
+    runtimeEnvironment.PATH === hermeticRuntimePath
+      && readdirSync(hermeticRuntimePath).length === 0
+      && path.isAbsolute(process.execPath), {
+    runtimePath: runtimeEnvironment.PATH ?? null,
+    runtimePathEntries: readdirSync(hermeticRuntimePath),
+    node: process.execPath,
+  });
+  add('gate_owned_machine_policy_and_daily_maintenance_seeds_remain_exact',
+    packagedGateSeedsPreserved(gateSeeds, before, first, postExercise, second), {
+    utcDay: gateSeeds.utcDay,
+    digests: gateSeeds.digests,
+  });
+  add('first_packaged_daemon_boot_reaches_ready_owns_one_lease_and_closes_cleanly',
+    firstProcess.ready
+      && firstProcess.cleanExit
+      && firstProcess.liveLease.valid
+      && firstProcess.postExitLeaseClean,
+    firstProcess);
+  add('second_packaged_daemon_boot_reaches_ready_owns_one_lease_and_closes_cleanly',
+    secondProcess.ready
+      && secondProcess.cleanExit
+      && secondProcess.liveLease.valid
+      && secondProcess.postExitLeaseClean,
+    secondProcess);
+  add('packaged_process_owner_generations_are_single_valid_and_monotonic',
+    firstProcess.liveLease.ownerCount === 1
+      && secondProcess.liveLease.ownerCount === 1
+      && firstProcess.liveLease.ownerStartedAt !== null
+      && secondProcess.liveLease.ownerStartedAt !== null
+      && Date.parse(secondProcess.liveLease.ownerStartedAt) >= Date.parse(firstProcess.liveLease.ownerStartedAt), {
+    first: firstProcess.liveLease,
+    second: secondProcess.liveLease,
+  });
   add('both_packaged_daemons_complete_one_full_recovery_tick_before_shutdown',
     firstProcess.recoverySettled
       && secondProcess.recoverySettled
@@ -1189,6 +1620,31 @@ export async function runPackagedV314DaemonRehearsal(
     legacyIdentitiesPreserved(base.firstBoot, first)
       && legacyIdentitiesPreserved(base.firstBoot, postExercise)
       && legacyIdentitiesPreserved(base.firstBoot, second));
+  add('workspace_data_projection_bytes_remain_exact_across_both_boots_and_exercise',
+    typeof before.allNonSqliteFiles[workspaceDataPath] === 'string'
+      && before.allNonSqliteFiles[workspaceDataPath] === first.allNonSqliteFiles[workspaceDataPath]
+      && first.allNonSqliteFiles[workspaceDataPath] === postExercise.allNonSqliteFiles[workspaceDataPath]
+      && postExercise.allNonSqliteFiles[workspaceDataPath] === second.allNonSqliteFiles[workspaceDataPath], {
+    path: workspaceDataPath,
+    before: before.allNonSqliteFiles[workspaceDataPath] ?? null,
+    first: first.allNonSqliteFiles[workspaceDataPath] ?? null,
+    postExercise: postExercise.allNonSqliteFiles[workspaceDataPath] ?? null,
+    second: second.allNonSqliteFiles[workspaceDataPath] ?? null,
+  });
+  add('workspace_audit_bytes_remain_exact_across_both_boots_and_exercise',
+    typeof before.allNonSqliteFiles[workspaceAuditPath] === 'string'
+      && before.allNonSqliteFiles[workspaceAuditPath] === first.allNonSqliteFiles[workspaceAuditPath]
+      && first.allNonSqliteFiles[workspaceAuditPath] === postExercise.allNonSqliteFiles[workspaceAuditPath]
+      && postExercise.allNonSqliteFiles[workspaceAuditPath] === second.allNonSqliteFiles[workspaceAuditPath],
+    { path: workspaceAuditPath });
+  add('legacy_approval_store_retires_only_the_exact_pending_row_once',
+    isExactLegacyApprovalRetirement(beforeLegacyApprovals, firstLegacyApprovals, postExerciseLegacyApprovals)
+      && stable(postExerciseLegacyApprovals) === stable(secondLegacyApprovals), {
+    before: beforeLegacyApprovals,
+    first: firstLegacyApprovals,
+    postExercise: postExerciseLegacyApprovals,
+    second: secondLegacyApprovals,
+  });
   const pendingApproval = (inspection: HomeInspection): Record<string, Json> | null => {
     const rows = inspection.sqlite['state/harness.db']?.identities.pendingApprovals ?? [];
     for (const entry of rows) {
@@ -1394,9 +1850,10 @@ export async function runPackagedV314DaemonRehearsal(
   const firstBootMutableLegacyFiles = new Set<string>([
     'cron/daemon-state.json',
     'cron/workflow-schedule-state.json',
-    'state/executions.json',
+    'state/approvals.json',
     'state/notification-delivery-queue.json',
     'state/notifications.json',
+    workspaceAuditPath,
     ...before.carriers.workflowRuns.flatMap((entry) => {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
       const file = (entry as Record<string, Json>).file;
@@ -1407,26 +1864,48 @@ export async function runPackagedV314DaemonRehearsal(
   add('first_packaged_boot_preserves_every_preexisting_non_sqlite_file_outside_named_recovery_owners',
     preservedLegacyFiles.ok,
     { ...preservedLegacyFiles, allowedMutable: [...firstBootMutableLegacyFiles].sort() });
-  const allowedFirstBootAddedFiles = new Set<string>([
-    'cron/daemon-state.json',
-    'state/notification-delivery-queue.json',
-    ...[beforeScheduleRun, beforeEventRun].flatMap((run) => {
+  const recoveryEventFiles = new Set<string>(
+    [beforeScheduleRun, beforeEventRun].flatMap((run) => {
       const runId = typeof run?.id === 'string' ? run.id : '';
       return runId
         ? [`vault/00-System/workflows/${REQUIRED_FIXTURE_IDENTITIES.workflowName}/runs/${runId}/events.jsonl`]
         : [];
     }),
-  ]);
-  const unexpectedFirstBootAddedFiles = unexpectedAddedFiles(before, first, allowedFirstBootAddedFiles);
-  add('first_packaged_boot_adds_only_named_recovery_projection_files',
-    unexpectedFirstBootAddedFiles.length === 0,
-    {
-      unexpected: unexpectedFirstBootAddedFiles,
-      allowed: [...allowedFirstBootAddedFiles].sort(),
-      added: Object.keys(first.allNonSqliteFiles)
-        .filter((file) => !(file in before.allNonSqliteFiles))
-        .sort(),
-    });
+  );
+  const expectedRecoveryAddedFiles = [
+    'cron/daemon-state.json',
+    'state/notification-delivery-queue.json',
+    ...recoveryEventFiles,
+  ].filter((relativePath) => !(relativePath in before.allNonSqliteFiles)).sort();
+  const firstBootAdded = addedFilesByCategory(before, first, recoveryEventFiles);
+  const canonicalMigrationSeed =
+    `memory/tool-procedures/${V314_GATE_MACHINE_ID}/.canonical-procedure-migration-v1.json`;
+  const expectedDeterministicSeedFiles = [
+    ...CHECK_IN_SEED_IDS.map((id) => `state/check-in-templates/${id}.json`),
+    'vault/00-System/workflows/objective-execution-loop/SKILL.md',
+    'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md',
+    canonicalMigrationSeed,
+  ].sort();
+  add('first_packaged_boot_added_files_are_closed_causal_categories_with_exact_seed_semantics',
+    firstBootAdded.unexpected.length === 0
+      && firstBootAdded.ephemeral_process_owner.length === 0
+      && stable(firstBootAdded.recovery_projection) === stable(expectedRecoveryAddedFiles)
+      && stable(firstBootAdded.scheduler_observation) === stable(['state/space-schedule-state.json'])
+      && stable(firstBootAdded.deterministic_boot_seed) === stable(expectedDeterministicSeedFiles)
+      && expectedDeterministicSeedFiles.every((relativePath) =>
+        validDeterministicBootSeed(daemonHome, relativePath))
+      && validEmptySpaceScheduleObservation(firstSpaceScheduleObservation)
+      && expectedDeterministicSeedFiles.every((relativePath) =>
+        first.allNonSqliteFiles[relativePath] === postExercise.allNonSqliteFiles[relativePath]
+        && postExercise.allNonSqliteFiles[relativePath] === second.allNonSqliteFiles[relativePath]), {
+    categories: firstBootAdded,
+    expected: {
+      recovery: expectedRecoveryAddedFiles,
+      deterministicSeeds: expectedDeterministicSeedFiles,
+      schedulerObservation: ['state/space-schedule-state.json'],
+      ephemeralProcessOwners: [],
+    },
+  });
   add('first_packaged_boot_recovers_the_exact_trigger_queue_crash_without_rebinding',
     before.carriers.triggerEvents.length === 1
       && beforeTriggerEvent?.state === 'pending'
@@ -1667,16 +2146,11 @@ export async function runPackagedV314DaemonRehearsal(
   const beforeTriggers = workflowTriggerRows(before);
   const firstTriggers = workflowTriggerRows(first);
   const secondTriggers = workflowTriggerRows(second);
-  const exactTriggerTopology = beforeTriggers.length === 2
-    && beforeTriggers.filter((row) => row.kind === 'schedule').length === 1
-    && beforeTriggers.filter((row) => row.kind === 'system_event').length === 1
-    && beforeTriggers.some((row) =>
-      row.kind === 'schedule'
-      && row.schedule === '0 0 1 1 *'
-      && row.timezone === 'UTC')
-    && beforeTriggers.some((row) =>
-      row.kind === 'system_event'
-      && row.event_type === 'upgrade.rehearsal.never-fired');
+  // v3.14's registry owns only webhook/system-event subscriptions. Schedule
+  // occurrence authority is the separate queue+receipt proof above; inventing
+  // a schedule registry row here would validate a topology the release never
+  // produced.
+  const exactTriggerTopology = isExactV314TriggerRegistry(beforeTriggers);
   const triggerReconciled = exactTriggerTopology
     && beforeTriggers.length === firstTriggers.length
     && firstTriggers.length === secondTriggers.length
@@ -1695,7 +2169,7 @@ export async function runPackagedV314DaemonRehearsal(
         && firstTrigger.generation === Number(beforeTrigger.generation) + 1
         && stable(firstTrigger) === stable(secondTrigger);
     });
-  add('first_packaged_boot_reconciles_the_disabled_trigger_once',
+  add('first_packaged_boot_reconciles_the_single_event_trigger_once_while_schedule_proof_stays_separate',
     triggerReconciled,
     { before: beforeTriggers, first: firstTriggers, second: secondTriggers });
   add('first_daemon_boot_does_not_replay_model_provider_business_or_local_body_work',
@@ -1711,13 +2185,16 @@ export async function runPackagedV314DaemonRehearsal(
     { exercise, exerciseWorkDelta });
   const postExerciseHarness = postExercise.sqlite['state/harness.db']?.identities ?? {};
   const secondHarness = second.sqlite['state/harness.db']?.identities ?? {};
+  const postExerciseProposalStore =
+    postExercise.sqlite[AUTOMATION_OPPORTUNITY_PROPOSAL_DB]?.identities ?? {};
+  const secondProposalStore = second.sqlite[AUTOMATION_OPPORTUNITY_PROPOSAL_DB]?.identities ?? {};
   const exercisedProposal = rowByIdentity(
-    postExerciseHarness.automationOpportunityProposals,
+    postExerciseProposalStore.automationOpportunityProposals,
     'proposal_id',
     exercise.proposalId,
   );
   const secondProposal = rowByIdentity(
-    secondHarness.automationOpportunityProposals,
+    secondProposalStore.automationOpportunityProposals,
     'proposal_id',
     exercise.proposalId,
   );
@@ -1750,7 +2227,9 @@ export async function runPackagedV314DaemonRehearsal(
     ? exercisedAdvancementBlocked as Record<string, Json>
     : null;
   add('approved_project_review_and_blocked_acquisition_are_an_exact_second_boot_fixed_point',
-    exercisedProposal?.status === 'approved'
+    Boolean(postExercise.sqlite[AUTOMATION_OPPORTUNITY_PROPOSAL_DB])
+      && Boolean(postExercise.sqlite[HARNESS_DB])
+      && exercisedProposal?.status === 'approved'
       && exercisedProposal.revision === exercise.proposalRevision
       && exercisedProposal.digest === exercise.proposalDigest
       && exercisedReview?.proposal_id === exercise.proposalId
@@ -1791,6 +2270,9 @@ export async function runPackagedV314DaemonRehearsal(
   const firstScheduleWatermark = firstScheduleObservation?.lastEvaluatedAtMs;
   const postScheduleWatermark = postExerciseScheduleObservation?.lastEvaluatedAtMs;
   const secondScheduleWatermark = secondScheduleObservation?.lastEvaluatedAtMs;
+  const firstSpaceScheduleWatermark = firstSpaceScheduleObservation?.lastEvaluatedAtMs;
+  const postSpaceScheduleWatermark = postExerciseSpaceScheduleObservation?.lastEvaluatedAtMs;
+  const secondSpaceScheduleWatermark = secondSpaceScheduleObservation?.lastEvaluatedAtMs;
   const firstHealthyAt = firstDaemonObservation?.lastHealthyTickAt;
   const postHealthyAt = postExerciseDaemonObservation?.lastHealthyTickAt;
   const secondHealthyAt = secondDaemonObservation?.lastHealthyTickAt;
@@ -1801,12 +2283,20 @@ export async function runPackagedV314DaemonRehearsal(
     typeof value === 'number' && Number.isFinite(value) && value >= 0;
   const validIso = (value: Json | undefined): value is string =>
     typeof value === 'string' && Number.isFinite(Date.parse(value));
-  add('normalized_daemon_and_schedule_observation_watermarks_are_present_well_formed_and_monotonic',
+  add('normalized_daemon_workflow_and_space_schedule_observations_are_well_formed_and_monotonic',
     finiteNonnegative(firstScheduleWatermark)
       && finiteNonnegative(postScheduleWatermark)
       && finiteNonnegative(secondScheduleWatermark)
       && firstScheduleWatermark === postScheduleWatermark
       && secondScheduleWatermark >= postScheduleWatermark
+      && finiteNonnegative(firstSpaceScheduleWatermark)
+      && finiteNonnegative(postSpaceScheduleWatermark)
+      && finiteNonnegative(secondSpaceScheduleWatermark)
+      && firstSpaceScheduleWatermark === postSpaceScheduleWatermark
+      && secondSpaceScheduleWatermark >= postSpaceScheduleWatermark
+      && validEmptySpaceScheduleObservation(firstSpaceScheduleObservation)
+      && validEmptySpaceScheduleObservation(postExerciseSpaceScheduleObservation)
+      && validEmptySpaceScheduleObservation(secondSpaceScheduleObservation)
       && validIso(firstHealthyAt)
       && validIso(postHealthyAt)
       && validIso(secondHealthyAt)
@@ -1819,9 +2309,16 @@ export async function runPackagedV314DaemonRehearsal(
       && secondCronWatermark >= postCronWatermark,
     {
       schedule: {
-        first: firstScheduleWatermark ?? null,
-        postExercise: postScheduleWatermark ?? null,
-        second: secondScheduleWatermark ?? null,
+        workflow: {
+          first: firstScheduleWatermark ?? null,
+          postExercise: postScheduleWatermark ?? null,
+          second: secondScheduleWatermark ?? null,
+        },
+        space: {
+          first: firstSpaceScheduleWatermark ?? null,
+          postExercise: postSpaceScheduleWatermark ?? null,
+          second: secondSpaceScheduleWatermark ?? null,
+        },
       },
       daemon: {
         healthy: { first: firstHealthyAt ?? null, postExercise: postHealthyAt ?? null, second: secondHealthyAt ?? null },
@@ -1841,6 +2338,7 @@ export async function runPackagedV314DaemonRehearsal(
       'cron/workflow-schedule-state.json:lastEvaluatedAtMs',
       'cron/daemon-state.json:lastHealthyTickAt',
       'cron/daemon-state.json:lastCronEvaluatedAtMs',
+      'state/space-schedule-state.json:lastEvaluatedAtMs',
     ],
   });
   add('second_daemon_boot_does_not_duplicate_notifications_or_trigger_runs',
@@ -1875,6 +2373,7 @@ export async function runPackagedV314DaemonRehearsal(
       tarball,
       packageEntry,
       exerciseFixture,
+      hermeticRuntimePath,
       report: reportPath,
     },
     candidate: {

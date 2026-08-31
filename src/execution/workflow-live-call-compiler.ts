@@ -43,6 +43,64 @@ const PLAN_EFFECTS = new Set<WorkflowNodeInvocationEffectV1>([
 
 export type LiveCallExpectedEffect = 'read' | 'write' | 'send';
 
+/**
+ * The only account identity a blocked workflow may offer to a human. Labels,
+ * provider ordering, and remembered account names are deliberately excluded:
+ * resumption binds the exact current capability + account pair.
+ */
+export interface WorkflowCapabilityAccountCandidateV1 {
+  capabilityId: string;
+  accountId: string;
+}
+
+export interface WorkflowCapabilityAccountChoiceSetV1 {
+  candidates: readonly WorkflowCapabilityAccountCandidateV1[];
+  /** Digest of the complete sorted set, including candidates outside the
+   * bounded presentation window. A changed catalog therefore invalidates a
+   * stale answer instead of silently retargeting it. */
+  digest: string;
+  total: number;
+  truncated: boolean;
+}
+
+export interface WorkflowCapabilityAccountSelectionV1 {
+  capabilityId: string;
+  accountId: string;
+  choiceSetDigest: string;
+}
+
+const MAX_WORKFLOW_ACCOUNT_CANDIDATES = 16;
+
+function canonicalAccountCandidates(
+  identities: readonly Pick<CanonicalCatalogIdentityV1, 'capabilityId' | 'account'>[],
+): WorkflowCapabilityAccountCandidateV1[] {
+  const pairs = new Map<string, WorkflowCapabilityAccountCandidateV1>();
+  for (const identity of identities) {
+    const candidate = {
+      capabilityId: identity.capabilityId,
+      accountId: identity.account,
+    };
+    pairs.set(`${candidate.capabilityId}\u0000${candidate.accountId}`, candidate);
+  }
+  return [...pairs.values()].sort((left, right) => (
+    left.capabilityId.localeCompare(right.capabilityId)
+      || left.accountId.localeCompare(right.accountId)
+  ));
+}
+
+/** Build the bounded, content-addressed choice set persisted with a gate. */
+export function workflowCapabilityAccountChoiceSet(
+  identities: readonly Pick<CanonicalCatalogIdentityV1, 'capabilityId' | 'account'>[],
+): WorkflowCapabilityAccountChoiceSetV1 {
+  const all = canonicalAccountCandidates(identities);
+  return Object.freeze({
+    candidates: Object.freeze(all.slice(0, MAX_WORKFLOW_ACCOUNT_CANDIDATES).map((candidate) => Object.freeze({ ...candidate }))),
+    digest: createHash('sha256').update(JSON.stringify({ version: 1, candidates: all }), 'utf8').digest('hex'),
+    total: all.length,
+    truncated: all.length > MAX_WORKFLOW_ACCOUNT_CANDIDATES,
+  });
+}
+
 export type CompileLiveCatalogWorkflowCallPlanResult =
   | {
       ok: true;
@@ -54,6 +112,7 @@ export type CompileLiveCatalogWorkflowCallPlanResult =
       recoverable: true;
       reason: 'not-connected' | 'ambiguous-account';
       message: string;
+      accountChoiceSet?: WorkflowCapabilityAccountChoiceSetV1;
     }
   | { ok: false; recoverable: false; message: string };
 
@@ -149,6 +208,9 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
   /** Optional identity namespaces for non-Workflow carriers. */
   requirementNamespace?: string;
   logicalCapabilityNamespace?: string;
+  /** Exact human-selected account from the durable capability gate. The
+   * choice-set digest is mandatory so catalog drift can never retarget it. */
+  selectedAccount?: WorkflowCapabilityAccountSelectionV1;
 }): CompileLiveCatalogWorkflowCallPlanResult {
   const factory = peekHostCapabilityCatalogFactory();
   if (!factory) {
@@ -169,17 +231,41 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
     };
   }
 
-  const distinctCapabilities = new Set(candidates.map((identity) => identity.capabilityId));
-  if (distinctCapabilities.size > 1) {
+  const accountChoiceSet = workflowCapabilityAccountChoiceSet(candidates);
+  let identity: CanonicalCatalogIdentityV1 | undefined;
+  if (input.selectedAccount) {
+    identity = candidates.find((candidate) => (
+      candidate.capabilityId === input.selectedAccount!.capabilityId
+      && candidate.account === input.selectedAccount!.accountId
+    ));
+    if (!identity || input.selectedAccount.choiceSetDigest !== accountChoiceSet.digest) {
+      return {
+        ok: false,
+        recoverable: true,
+        reason: 'ambiguous-account',
+        message: identity
+          ? `The available account set for "${input.operationId}" changed after the choice was saved; choose an exact current account again.`
+          : `The selected account for "${input.operationId}" is no longer a current capability; choose an exact current account again.`,
+        accountChoiceSet,
+      };
+    }
+  } else if (accountChoiceSet.total > 1) {
     return {
       ok: false,
       recoverable: true,
       reason: 'ambiguous-account',
-      message: `${distinctCapabilities.size} capabilities are registered for "${input.operationId}"; the account binding is ambiguous.`,
+      message: `${accountChoiceSet.total} accounts are registered for "${input.operationId}"; choose the exact account before this workflow can dispatch.`,
+      accountChoiceSet,
     };
+  } else {
+    identity = candidates[0];
   }
 
-  const identity = candidates[0]!;
+  // A non-empty candidate list and the branches above always establish one
+  // exact identity. Keep this guard fail-closed if that invariant changes.
+  if (!identity) {
+    return { ok: false, recoverable: false, message: 'no exact live account identity was selected' };
+  }
   if (!PLAN_EFFECTS.has(identity.effect as WorkflowNodeInvocationEffectV1)) {
     return {
       ok: false,

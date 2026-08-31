@@ -35,7 +35,9 @@ const {
   listNotifications,
   markStaleApprovalNotificationsRead,
   markNotificationsReadByApprovalId,
+  markNotificationsReadByCheckInId,
   markNotificationsReadByQuestionId,
+  isNeedsAttentionNotification,
   isDeliveryJobStale,
   listQueuedNotificationDeliveries,
   replaceQueuedNotificationDeliveries,
@@ -74,6 +76,75 @@ test('isDeliveryJobStale: caps the backlog so a flush cannot dump old notificati
   assert.equal(isDeliveryJobStale(new Date(now).toISOString(), now, dayMs), false);
   // Unparseable timestamp → NOT stale (safer to keep than silently drop).
   assert.equal(isDeliveryJobStale('not-a-date', now, dayMs), false);
+});
+
+test('a pending trust proposal is actionable even when its title is calm', () => {
+  assert.equal(isNeedsAttentionNotification({
+    title: 'A suggestion from Clem',
+    metadata: { trustProposalId: 'trust-42' },
+  }), true);
+});
+
+test('check-in carriers are actionable but answered receipts are updates', () => {
+  assert.equal(isNeedsAttentionNotification({
+    title: 'A question from Clem',
+    metadata: { checkInId: 'checkin-open' },
+  }), true);
+  assert.equal(isNeedsAttentionNotification({
+    title: 'Answer recorded',
+    metadata: { checkInId: 'checkin-open', status: 'answered', inboxOnly: true },
+  }), false);
+});
+
+test('markNotificationsReadByCheckInId clears only the unresolved carrier', () => {
+  addNotification({
+    ...makeNotification('checkin-carrier'),
+    metadata: { checkInId: 'checkin-central' },
+  });
+  addNotification({
+    ...makeNotification('checkin-receipt'),
+    metadata: { checkInId: 'checkin-central', status: 'answered', inboxOnly: true },
+  });
+  assert.ok(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === 'checkin-carrier'),
+    'the unresolved carrier starts with an outward delivery cursor',
+  );
+  const changed = markNotificationsReadByCheckInId('checkin-central', { resolvedFrom: 'test' });
+  assert.deepEqual(changed.map((row) => row.id), ['checkin-carrier']);
+  const rows = new Map(listNotifications(20).map((row) => [row.id, row]));
+  assert.equal(rows.get('checkin-carrier')?.read, true);
+  assert.equal(rows.get('checkin-receipt')?.read, false);
+  assert.equal(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === 'checkin-carrier'),
+    false,
+    'settlement removes the queued Discord/Slack carrier before it can arrive stale',
+  );
+  rmSync(NOTIFICATIONS_FILE, { force: true });
+  rmSync(DELIVERY_FILE, { force: true });
+});
+
+test('read and inbox-only receipts never enter the outward delivery queue', () => {
+  addNotification({
+    ...makeNotification('receipt-read'),
+    read: true,
+    metadata: { questionId: 'resolved-workflow-question' },
+  });
+  addNotification({
+    ...makeNotification('receipt-checkin'),
+    metadata: { checkInId: 'resolved-checkin', inboxOnly: true },
+  });
+  addNotification({
+    ...makeNotification('receipt-trust'),
+    kind: 'approval',
+    read: true,
+    metadata: { trustProposalId: 'resolved-trust' },
+  });
+  const queued = new Set(listQueuedNotificationDeliveries().map((job) => job.notificationId));
+  assert.equal(queued.has('receipt-read'), false);
+  assert.equal(queued.has('receipt-checkin'), false);
+  assert.equal(queued.has('receipt-trust'), false);
+  rmSync(NOTIFICATIONS_FILE, { force: true });
+  rmSync(DELIVERY_FILE, { force: true });
 });
 
 test('addNotification: writes atomically and leaves no .tmp behind', () => {

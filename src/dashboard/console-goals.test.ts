@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -15,7 +15,16 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
-const { getPlanProposal } = await import('../agents/plan-proposals.js');
+const { getPlanProposal, surfacePlan } = await import('../agents/plan-proposals.js');
+const {
+  createBackgroundTask,
+  getBackgroundTask,
+  listBackgroundTasks,
+  updateBackgroundTask,
+} = await import('../execution/background-tasks.js');
+const { getRun } = await import('../runtime/run-events.js');
+const { getTrustProposal, trustProposalScopeReceipt } = await import('../agents/trust-graduation.js');
+const { findSendTrustGrantForProposal } = await import('../agents/plan-scope.js');
 const { syncProspectiveIntentions } = await import('../runtime/prospective-sync.js');
 const { cancelProspectiveIntention } = await import('../runtime/prospective-intentions.js');
 
@@ -187,6 +196,226 @@ test('console goals API is authorization-gated', async () => {
   try {
     const res = await fetch(`${h.url}/api/console/goals`);
     assert.equal(res.status, 401);
+  } finally {
+    await h.close();
+  }
+});
+
+test('desktop plan decision resolves the exact proposal id once without a model turn', async () => {
+  const plan = (objective: string) => ({
+    objective,
+    steps: [{ n: 1, action: `Complete ${objective}`, rationale: 'The user approved this exact plan.', verification: null }],
+    successCriteria: [`${objective} is complete.`],
+    risks: [],
+    estimatedComplexity: 'simple' as const,
+    recommendsTrackedExecution: false,
+    needsUserInput: [],
+    appliedInstructions: [],
+  });
+  const first = surfacePlan({
+    plan: plan('Exact desktop plan A'),
+    originatingRequest: 'Keep plan A pending.',
+    sessionId: 'console-plan-origin-a',
+  });
+  const second = surfacePlan({
+    plan: plan('Exact desktop plan B'),
+    originatingRequest: 'Approve plan B only.',
+    sessionId: 'console-plan-origin-b',
+  });
+  const h = await boot();
+  try {
+    const approvedResponse = await fetch(`${h.url}/api/console/plan-proposals/${encodeURIComponent(second.id)}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(approvedResponse.status, 200);
+    const approved = await approvedResponse.json() as {
+      proposal: { id: string; status: string };
+      queuedTask: { id: string; originSessionId?: string };
+      run: { id: string };
+    };
+    assert.equal(approved.proposal.id, second.id);
+    assert.equal(approved.proposal.status, 'active');
+    assert.equal(approved.queuedTask.originSessionId, 'console-plan-origin-b');
+    assert.equal(getPlanProposal(first.id)?.status, 'pending', 'sibling plan A was not consumed by a bare approve intent');
+    assert.equal(getPlanProposal(second.id)?.status, 'active');
+
+    const replay = await fetch(`${h.url}/api/console/plan-proposals/${encodeURIComponent(second.id)}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(replay.status, 200, 'a transport/double-click replay rejoins the committed admission');
+    const replayed = await replay.json() as { queuedTask: { id: string }; run: { id: string } };
+    assert.equal(replayed.queuedTask.id, approved.queuedTask.id, 'replay returns the exact same task identity');
+    assert.equal(replayed.run.id, approved.run.id, 'replay returns the exact same run identity');
+    assert.equal(
+      listBackgroundTasks({ includeArchived: true }).filter((task) => task.id === approved.queuedTask.id).length,
+      1,
+      'the exact proposal has one stored worker',
+    );
+    const projectedRun = getRun(approved.run.id);
+    assert.equal(projectedRun?.events.filter((event) => event.type === 'queued_background').length, 1);
+    assert.ok(
+      (projectedRun?.events.filter((event) => event.type === 'model_started').length ?? 0) <= 1,
+      'the replay never dispatches a second worker turn',
+    );
+    const staleReject = await fetch(`${h.url}/api/console/plan-proposals/${encodeURIComponent(second.id)}/reject`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'stale competing click' }),
+    });
+    assert.equal(staleReject.status, 404, 'a stale Reject cannot claim the already-running plan was rejected');
+    assert.equal(getPlanProposal(first.id)?.status, 'pending');
+  } finally {
+    await h.close();
+  }
+});
+
+test('desktop Inbox answers the exact durable task question once', async () => {
+  const task = createBackgroundTask({
+    title: 'Choose the exact connected account',
+    prompt: 'Wait for one exact account choice, then resume this task.',
+  });
+  const questionId = `question:${task.id}:account-choice`;
+  updateBackgroundTask(task.id, {
+    status: 'awaiting_input',
+    pendingQuestionId: questionId,
+    pendingQuestion: 'Use the North account or the South account?',
+    pendingQuestionOptions: ['North', 'South'],
+  });
+
+  const h = await boot();
+  try {
+    const listedResponse = await fetch(`${h.url}/api/console/inbox/questions`);
+    assert.equal(listedResponse.status, 200);
+    const listed = await listedResponse.json() as {
+      questions: Array<{ id: string; taskId: string | null; answerable: boolean }>;
+    };
+    const listedQuestion = listed.questions.find((row) => row.taskId === task.id);
+    assert.equal(listedQuestion?.id, `task:${questionId}`);
+    assert.equal(listedQuestion?.taskId, task.id);
+    assert.equal(
+      listedQuestion?.answerable,
+      true,
+      'the desktop projects the exact durable task/question coordinate as actionable',
+    );
+
+    const answeredResponse = await fetch(
+      `${h.url}/api/console/inbox/questions/${encodeURIComponent(`task:${questionId}`)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ answer: 'South' }),
+      },
+    );
+    assert.equal(answeredResponse.status, 200);
+    const answered = await answeredResponse.json() as { status: string; taskId?: string };
+    assert.equal(answered.status, 'resuming');
+    assert.equal(answered.taskId, task.id);
+    assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+    assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'South');
+
+    const replay = await fetch(
+      `${h.url}/api/console/inbox/questions/${encodeURIComponent(`task:${questionId}`)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ answer: 'North' }),
+      },
+    );
+    assert.equal(replay.status, 409, 'the exact durable question is consumable only once');
+    assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'South');
+  } finally {
+    await h.close();
+  }
+});
+
+test('desktop trust decision round-trips the exact rendered scope receipt', async () => {
+  const id = `trust-console-${Date.now()}`;
+  const scope = {
+    toolkits: ['gmail_send_email'],
+    recipients: ['owner@public.test'],
+    domains: ['example.test'],
+    maxRecipients: 2,
+  };
+  const receipt = trustProposalScopeReceipt(scope);
+  writeFileSync(path.join(TMP_HOME, 'state', 'trust-graduation-proposals.json'), JSON.stringify({
+    version: 'v1',
+    proposals: [{
+      id,
+      scopeKey: `scope-${id}`,
+      scopeRevision: receipt.scopeRevision,
+      scopeDigest: receipt.scopeDigest,
+      ...scope,
+      evidence: {
+        cleanSendCount: 5,
+        distinctDays: 5,
+        firstAt: '2026-08-20T12:00:00.000Z',
+        lastAt: '2026-08-29T12:00:00.000Z',
+        sampleApprovalIds: ['approval-a'],
+      },
+      rationale: 'Exact route contract fixture.',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    }],
+  }, null, 2), 'utf-8');
+
+  const h = await boot();
+  try {
+    const missingReceipt = await fetch(`${h.url}/api/console/trust-proposals/${id}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(missingReceipt.status, 400);
+    assert.equal(getTrustProposal(id)?.status, 'pending');
+
+    const staleReceipt = await fetch(`${h.url}/api/console/trust-proposals/${id}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scopeRevision: receipt.scopeRevision,
+        scopeDigest: `sha256:${'0'.repeat(64)}`,
+      }),
+    });
+    assert.equal(staleReceipt.status, 409);
+    assert.equal(getTrustProposal(id)?.status, 'pending');
+    assert.equal(findSendTrustGrantForProposal(id, scope), null);
+
+    const approvedResponse = await fetch(`${h.url}/api/console/trust-proposals/${id}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scopeRevision: receipt.scopeRevision,
+        scopeDigest: receipt.scopeDigest,
+      }),
+    });
+    assert.equal(approvedResponse.status, 200);
+    const approved = await approvedResponse.json() as {
+      ok: boolean;
+      reason: string;
+      scopeReceipt: typeof receipt;
+    };
+    assert.equal(approved.ok, true);
+    assert.equal(approved.reason, 'approved');
+    assert.deepEqual(approved.scopeReceipt, receipt);
+    assert.equal(getTrustProposal(id)?.status, 'approved');
+    assert.equal(findSendTrustGrantForProposal(id, scope)?.sourceProposalId, id);
+    const grantId = findSendTrustGrantForProposal(id, scope)?.id;
+    assert.ok(grantId);
+
+    const replay = await fetch(`${h.url}/api/console/trust-proposals/${id}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scopeRevision: receipt.scopeRevision,
+        scopeDigest: receipt.scopeDigest,
+      }),
+    });
+    assert.equal(replay.status, 409, 'an already-resolved proposal cannot grant again');
+    assert.equal(findSendTrustGrantForProposal(id, scope)?.id, grantId, 'replay preserves the one durable grant');
   } finally {
     await h.close();
   }

@@ -8,6 +8,7 @@ import {
   pushSupported,
   requestAndSubscribe,
 } from '../lib/push';
+import { inNativeShell } from '../lib/native-bridge';
 
 type State =
   | { kind: 'hidden' }
@@ -26,10 +27,18 @@ type State =
  */
 export function PushPrompt() {
   const [state, setState] = useState<State>({ kind: 'hidden' });
+  const nativeShell = inNativeShell();
 
   useEffect(() => {
     let cancelled = false;
     async function decide() {
+      // The native app owns APNs and its iOS permission ceremony. Showing the
+      // browser Web Push/Add-to-Home-Screen flow inside WKWebView contradicts
+      // the permission the user just answered.
+      if (nativeShell) {
+        if (!cancelled) setState({ kind: 'hidden' });
+        return;
+      }
       if (!pushSupported()) {
         if (!cancelled) setState({ kind: 'unsupported' });
         return;
@@ -66,7 +75,7 @@ export function PushPrompt() {
     }
     decide();
     return () => { cancelled = true; };
-  }, []);
+  }, [nativeShell]);
 
   const enable = useCallback(async () => {
     setState({ kind: 'enabling' });
@@ -80,7 +89,7 @@ export function PushPrompt() {
     setState({ kind: 'hidden' });
   }, []);
 
-  if (state.kind === 'hidden' || state.kind === 'enabled' || state.kind === 'unsupported') {
+  if (nativeShell || state.kind === 'hidden' || state.kind === 'enabled' || state.kind === 'unsupported') {
     return null;
   }
 

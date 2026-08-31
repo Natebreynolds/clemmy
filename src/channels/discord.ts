@@ -112,8 +112,20 @@ import {
 import { buildDiscordInstallUrl } from './discord-install.js';
 import { getPlanProposal, planProposalNeedsUserInput, rejectPlanProposal } from '../agents/plan-proposals.js';
 import { createGoalFromDraft, dismissGoalDraft, getGoalDraft } from '../agents/goal-drafts.js';
-import { answerCheckIn, getCheckIn, listOpenCheckIns, type CheckInRecord } from '../agents/check-ins.js';
-import { approveTrustProposal, declineTrustProposal, getTrustProposal } from '../agents/trust-graduation.js';
+import { getCheckIn, type CheckInRecord } from '../agents/check-ins.js';
+import {
+  answerExactCheckIn,
+  linkedCheckInActionability,
+  listActionableCheckIns,
+} from '../execution/inbox-questions.js';
+import {
+  approveTrustProposal,
+  declineTrustProposal,
+  getTrustProposal,
+  type ResolveTrustResult,
+  type TrustProposal,
+  type TrustProposalScopeExpectation,
+} from '../agents/trust-graduation.js';
 import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-tasks.js';
 import { cancelBackgroundTask, queueBackgroundTaskApprovalResolution, listBackgroundTasks } from '../execution/background-tasks.js';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
@@ -1183,15 +1195,57 @@ function buildCheckInActions(checkInId: string) {
   ];
 }
 
-function buildTrustProposalActions(trustProposalId: string) {
+/** Discord custom IDs are capped at 100 characters. Preserve the exact
+ * revision/digest receipt in a compact, lossless representation rather than
+ * falling back to ID-only authority. */
+function encodeTrustProposalScopeToken(
+  proposal: Pick<TrustProposal, 'scopeRevision' | 'scopeDigest'>,
+): string | null {
+  const digestMatch = /^sha256:([0-9a-f]{64})$/.exec(proposal.scopeDigest);
+  if (!Number.isSafeInteger(proposal.scopeRevision) || proposal.scopeRevision < 1 || !digestMatch) return null;
+  return `${proposal.scopeRevision}.${Buffer.from(digestMatch[1], 'hex').toString('base64url')}`;
+}
+
+function decodeTrustProposalScopeToken(token: string | undefined): TrustProposalScopeExpectation | null {
+  const match = /^(\d+)\.([A-Za-z0-9_-]{43})$/.exec(token ?? '');
+  if (!match) return null;
+  const scopeRevision = Number.parseInt(match[1], 10);
+  if (!Number.isSafeInteger(scopeRevision) || scopeRevision < 1) return null;
+  const digest = Buffer.from(match[2], 'base64url');
+  // Buffer's decoder is intentionally permissive; canonical re-encoding makes
+  // malformed aliases fail closed instead of becoming a second token spelling.
+  if (digest.length !== 32 || digest.toString('base64url') !== match[2]) return null;
+  return {
+    scopeRevision,
+    scopeDigest: `sha256:${digest.toString('hex')}`,
+  };
+}
+
+function resolveDiscordTrustProposalAction(input: {
+  action: 'trust-approve' | 'trust-decline';
+  proposalId: string;
+  scopeToken?: string;
+}): ResolveTrustResult | null {
+  const expectedScope = decodeTrustProposalScopeToken(input.scopeToken);
+  if (!expectedScope) return null;
+  return input.action === 'trust-approve'
+    ? approveTrustProposal(input.proposalId, 'discord', expectedScope)
+    : declineTrustProposal(input.proposalId, 'discord', expectedScope);
+}
+
+function buildTrustProposalActions(
+  proposal: Pick<TrustProposal, 'id' | 'scopeRevision' | 'scopeDigest'>,
+) {
+  const scopeToken = encodeTrustProposalScopeToken(proposal);
+  if (!scopeToken) return undefined;
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:trust-approve:${trustProposalId}`)
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:trust-approve:${proposal.id}:${scopeToken}`)
         .setLabel('Approve')
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
-        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:trust-decline:${trustProposalId}`)
+        .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:trust-decline:${proposal.id}:${scopeToken}`)
         .setLabel('Decline')
         .setStyle(ButtonStyle.Danger),
     ),
@@ -1225,12 +1279,25 @@ export function buildActionsForNotification(metadata: Record<string, unknown> | 
   if (trustProposalId) {
     const proposal = getTrustProposal(trustProposalId);
     if (!proposal || proposal.status !== 'pending') return undefined;
-    return buildTrustProposalActions(trustProposalId);
+    return buildTrustProposalActions(proposal);
   }
   const approvalId = typeof metadata.approvalId === 'string' ? metadata.approvalId : undefined;
   if (approvalId) return buildApprovalActions(approvalId);
   const checkInId = typeof metadata.checkInId === 'string' ? metadata.checkInId : undefined;
-  if (checkInId) return buildCheckInActions(checkInId);
+  if (checkInId) {
+    const state = linkedCheckInActionability(checkInId);
+    if (state.status !== 'actionable') return undefined;
+    if (state.expectation) {
+      // Linked carrier buttons are valid only for the exact immutable
+      // task/question coordinates frozen when the notification was created.
+      // An id-only legacy carrier cannot mint authority for a linked row.
+      if (
+        metadata.linkedTaskId !== state.expectation.linkedTaskId
+        || metadata.linkedQuestionId !== state.expectation.linkedQuestionId
+      ) return undefined;
+    }
+    return buildCheckInActions(checkInId);
+  }
   return undefined;
 }
 
@@ -1254,7 +1321,7 @@ type NaturalApprovalAction = 'approve_one' | 'approve_all' | 'reject_one' | 'rej
 
 function hasRecentOpenCheckIn(): boolean {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  return listOpenCheckIns().some((item) => Date.parse(item.askedAt) > cutoff);
+  return listActionableCheckIns().some((item) => Date.parse(item.askedAt) > cutoff);
 }
 
 function detectNaturalApprovalAction(text: string): NaturalApprovalAction | null {
@@ -1302,16 +1369,21 @@ async function resolveNaturalApproval(input: {
 
   if (approvals.length === 0) {
     const approve = action.startsWith('approve');
-    const recentCheckIns = listOpenCheckIns()
+    const recentCheckIns = listActionableCheckIns()
       .filter((item) => Date.now() - Date.parse(item.askedAt) < 24 * 60 * 60 * 1000)
       .sort((left, right) => right.askedAt.localeCompare(left.askedAt));
     if (action.endsWith('_one') && recentCheckIns.length === 1) {
       const checkIn = recentCheckIns[0];
-      const resolved = answerCheckIn(checkIn.id, approve ? 'approve' : 'reject');
-      if (resolved) {
+      const resolved = answerExactCheckIn({
+        checkInId: checkIn.id,
+        answer: approve ? 'approve' : 'reject',
+      });
+      if (resolved.status === 'answered' || resolved.status === 'resuming') {
         await input.send(`Recorded ${approve ? 'approval' : 'rejection'} for check-in \`${checkIn.id}\`.`);
         return true;
       }
+      await input.send(`That question is stale or already resolved, so nothing changed. ${'reason' in resolved ? resolved.reason : ''}`.trim());
+      return true;
     }
     if (action.endsWith('_one') && recentCheckIns.length > 1) {
       await input.send(`No pending tool approval is waiting on this Discord thread. I found ${recentCheckIns.length} recent open questions; use the buttons or /approvals so I resolve the right one.`);
@@ -1695,6 +1767,8 @@ export const __test__ = {
   buildDiscordRestTransport,
   relevantApprovalsForContext,
   stopDiscordContext,
+  decodeTrustProposalScopeToken,
+  resolveDiscordTrustProposalAction,
 };
 
 const DISCORD_STOP_CONTROL_RE = /^(stop|halt|abort|kill it|stop it|cancel the run|stop the run)$/i;
@@ -2100,7 +2174,7 @@ async function handleDiscordCommand(
       channelId: message.channelId,
       guildId: message.guildId,
     });
-    const checkIns = listOpenCheckIns();
+    const checkIns = listActionableCheckIns();
     await send(renderCombinedApprovalList(approvals, harnessApprovals, checkIns));
     for (const approval of harnessApprovals.slice(0, 5)) {
       await sendComponentMessage(message.channel, {
@@ -2292,7 +2366,7 @@ async function handleDiscordRestCommand(input: {
   if (/^(approvals|pending approvals)$/i.test(normalized)) {
     const approvals = relevantApprovalsForContext(input, runtime.listPendingApprovals());
     const harnessApprovals = relevantHarnessApprovalsForContext(input);
-    const checkIns = listOpenCheckIns();
+    const checkIns = listActionableCheckIns();
     await send(renderCombinedApprovalList(approvals, harnessApprovals, checkIns));
     for (const approval of harnessApprovals.slice(0, 5)) {
       await sendDiscordRestComponentMessage(input.channelId, {
@@ -2349,7 +2423,7 @@ async function sendLiveApprovalsInteraction(
     channelId: interaction.channelId,
     guildId: interaction.guildId,
   });
-  const checkIns = listOpenCheckIns();
+  const checkIns = listActionableCheckIns();
 
   const summary = [
     '**Live Clementine approvals**',
@@ -2655,15 +2729,17 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction): Promise<v
       await interaction.reply({ content: 'Answer was empty — submit cancelled.', ephemeral: true });
       return;
     }
-    const record = answerCheckIn(checkInId, answer);
-    if (!record) {
+    const result = answerExactCheckIn({ checkInId, answer });
+    if (result.status === 'not_found') {
       await interaction.reply({ content: `Check-in \`${checkInId}\` was not found.`, ephemeral: true });
       return;
     }
     await interaction.reply({
-      content: record.status === 'answered'
-        ? `Recorded your answer for \`${checkInId}\`.`
-        : `Check-in \`${checkInId}\` is already ${record.status}.`,
+      content: result.status === 'answered' || result.status === 'resuming'
+        ? `Recorded your answer for \`${checkInId}\`${result.status === 'resuming' ? '; the exact linked task is resuming' : ''}.`
+        : result.status === 'storage_error'
+          ? `Your answer could not be saved: ${result.reason}`
+          : `That question is stale or already resolved, so nothing changed. ${result.reason}`,
       ephemeral: true,
     });
     return;
@@ -2885,7 +2961,7 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
     return;
   }
 
-  const [, action, targetId] = interaction.customId.split(':');
+  const [, action, targetId, actionReceipt] = interaction.customId.split(':');
   if (!action || !targetId) {
     await interaction.reply({ content: 'Malformed action.', ephemeral: true });
     return;
@@ -3122,11 +3198,59 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         await collapseApprovalCard(interaction, 'already-resolved', `suggestion is already ${proposal.status}`);
         return;
       }
+      const expectedScope = decodeTrustProposalScopeToken(actionReceipt);
+      if (!expectedScope) {
+        const refreshedActions = buildTrustProposalActions(proposal);
+        if (refreshedActions) {
+          await interaction.update({ components: refreshedActions });
+          await interaction.followUp({
+            content: 'That trust button was stale or malformed, so nothing changed. I refreshed the receipt-bound buttons; review the suggestion and click again.',
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({
+            content: 'That trust suggestion no longer has a valid scope receipt. Nothing changed; review it in Inbox.',
+            ephemeral: true,
+          });
+        }
+        return;
+      }
       // The SAME module functions the desktop routes call — one code path,
       // desktop↔Discord parity. Approve is the sole grant path.
-      const result = action === 'trust-approve'
-        ? approveTrustProposal(targetId, 'discord')
-        : declineTrustProposal(targetId, 'discord');
+      const result = resolveDiscordTrustProposalAction({
+        action,
+        proposalId: targetId,
+        scopeToken: actionReceipt,
+      });
+      if (!result) {
+        await interaction.reply({ content: 'Malformed trust receipt. Nothing changed; review the suggestion in Inbox.', ephemeral: true });
+        return;
+      }
+      if (result.reason === 'scope-mismatch' && result.proposal?.status === 'pending') {
+        const refreshedActions = buildTrustProposalActions(result.proposal);
+        if (refreshedActions) {
+          await interaction.update({ components: refreshedActions });
+          await interaction.followUp({
+            content: 'The trust scope changed after this card was shown, so nothing changed. I refreshed the buttons with the current scope receipt; review and click again.',
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({ content: 'The trust scope receipt no longer matches. Nothing changed; review it in Inbox.', ephemeral: true });
+        }
+        return;
+      }
+      if (result.reason === 'expired') {
+        await collapseApprovalCard(interaction, 'already-resolved', 'suggestion expired — nothing granted');
+        return;
+      }
+      if (result.reason === 'scope-mismatch') {
+        await collapseApprovalCard(interaction, 'already-resolved', 'scope integrity check failed — nothing changed');
+        return;
+      }
+      if (result.reason === 'not-pending') {
+        await collapseApprovalCard(interaction, 'already-resolved', `suggestion is already ${result.proposal?.status ?? 'resolved'}`);
+        return;
+      }
       if (action === 'trust-approve') {
         const detail = result.reason === 'approved'
           ? `granted send-trust ${result.grantId ? `\`${result.grantId}\`` : ''}`.trim()
@@ -3135,7 +3259,11 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
             : 'could not grant';
         await collapseApprovalCard(interaction, result.reason === 'approved' ? 'approved' : 'already-resolved', detail);
       } else {
-        await collapseApprovalCard(interaction, 'rejected', 'declined — nothing granted');
+        await collapseApprovalCard(
+          interaction,
+          result.reason === 'declined' ? 'rejected' : 'already-resolved',
+          result.reason === 'declined' ? 'declined — nothing granted' : 'could not decline — nothing changed',
+        );
       }
       return;
     }
@@ -3151,9 +3279,21 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
         return;
       }
       const approved = action === 'checkin-approve';
-      const resolved = answerCheckIn(targetId, approved ? 'approve' : 'reject');
-      if (!resolved) {
+      const resolved = answerExactCheckIn({
+        checkInId: targetId,
+        answer: approved ? 'approve' : 'reject',
+      });
+      if (resolved.status === 'not_found') {
         await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
+        return;
+      }
+      if (resolved.status !== 'answered' && resolved.status !== 'resuming') {
+        await interaction.reply({
+          content: resolved.status === 'storage_error'
+            ? `The answer could not be saved: ${resolved.reason}`
+            : `That question is stale or already resolved, so nothing changed. ${resolved.reason}`,
+          ephemeral: true,
+        });
         return;
       }
       await collapseApprovalCard(interaction, approved ? 'approved' : 'rejected', `recorded answer for ${targetId}`);
@@ -3161,15 +3301,16 @@ async function handleButtonInteraction(interaction: ButtonInteraction, assistant
     }
 
     if (action === 'checkin-answer') {
-      const record = getCheckIn(targetId);
-      if (!record) {
+      const state = linkedCheckInActionability(targetId);
+      if (state.status === 'not_found') {
         await interaction.reply({ content: `Check-in \`${targetId}\` was not found.`, ephemeral: true });
         return;
       }
-      if (record.status !== 'open') {
-        await interaction.reply({ content: `Check-in \`${targetId}\` is already ${record.status}.`, ephemeral: true });
+      if (state.status !== 'actionable') {
+        await interaction.reply({ content: `That question is stale or not ready, so it cannot be answered. ${state.reason}`, ephemeral: true });
         return;
       }
+      const record = state.record;
       const title = 'Answer Clementine';
       const modal = new ModalBuilder()
         .setCustomId(`${DISCORD_CUSTOM_ID_PREFIX}:checkin-modal:${targetId}`)

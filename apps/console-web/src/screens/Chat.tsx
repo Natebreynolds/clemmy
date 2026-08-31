@@ -6,8 +6,8 @@ import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { getContext } from '@/lib/memory';
 import { greetingName, timeGreeting } from '@/lib/greeting';
-import { dismissInboxItem } from '@/lib/inbox';
-import { chatApprovalReply, useChat } from '@/lib/useChat';
+import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
+import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import { DogMark } from '@/components/DogMark';
@@ -30,6 +30,8 @@ const SUGGESTIONS = [
 function inboxTarget(item: CommandCenterItem): string {
   if (item.notifId) return `/inbox?tab=needs&select=${encodeURIComponent(item.notifId)}`;
   if (item.approvalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.approvalId)}`;
+  if (item.planProposalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.planProposalId)}`;
+  if (item.questionId) return `/inbox?tab=needs&select=${encodeURIComponent(item.questionId)}`;
   return '/inbox';
 }
 
@@ -103,6 +105,19 @@ export function Chat() {
 
   const needsYou = cc.data?.needsYou ?? [];
   const hasThread = chat.messages.length > 0;
+  const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
+    const intent = chatDecisionIntent(message, decision);
+    if (intent.kind === 'invalid-plan') throw new Error(intent.message);
+    if (intent.kind === 'approval-reply') {
+      await chat.send({ text: intent.text });
+      return;
+    }
+    await decidePlanProposal(intent.planProposalId, intent.decision);
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ['command-center'] }),
+      qc.invalidateQueries({ queryKey: ['plan-proposals'] }),
+    ]);
+  };
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -219,8 +234,8 @@ export function Chat() {
             <ChatBubble
               key={m.id}
               message={m}
-              onApprove={() => chat.send({ text: chatApprovalReply('approve', m.approval?.approvalId) })}
-              onReject={() => chat.send({ text: chatApprovalReply('reject', m.approval?.approvalId) })}
+              onApprove={() => resolveDecision(m, 'approve')}
+              onReject={() => resolveDecision(m, 'reject')}
               onBackground={chat.background}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />

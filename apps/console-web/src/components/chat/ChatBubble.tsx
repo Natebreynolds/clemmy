@@ -129,8 +129,8 @@ export function ChatBubble({
   traceHref,
 }: {
   message: ChatMessage;
-  onApprove: () => void;
-  onReject: () => void;
+  onApprove: () => void | Promise<void>;
+  onReject: () => void | Promise<void>;
   /** Detach THIS running turn to a durable background task (shown while thinking). */
   onBackground?: () => void;
   /** Deep link to this session's card/trace on the Tasks board. */
@@ -139,7 +139,10 @@ export function ChatBubble({
   const isUser = message.role === 'user';
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
   // without a local latch the buttons stay live forever. Latch on first click.
-  const [resolved, setResolved] = useState(false);
+  const [resolvedDecision, setResolvedDecision] = useState<'approve' | 'reject' | null>(null);
+  const [decisionBusy, setDecisionBusy] = useState<'approve' | 'reject' | null>(null);
+  const [decisionError, setDecisionError] = useState<string | null>(null);
+  const resolved = resolvedDecision !== null;
   // Execute-button truth (U3): a pending-action card's Execute fires the exact
   // stored call server-side and shows the DURABLE outcome — never a client-side
   // "Submitted" that outruns whether the send actually happened.
@@ -170,7 +173,7 @@ export function ChatBubble({
   };
   const runExecute = async () => {
     if (!pendingActionId) return;
-    setResolved(true);
+    setResolvedDecision('approve');
     setExec({ phase: 'running' });
     try {
       const result = await approveExecutePendingAction(pendingActionId, message.approval?.approvalId ?? undefined, alwaysAllow);
@@ -197,6 +200,21 @@ export function ChatBubble({
         () => getPendingActionStatus(pendingActionId),
       );
       showDurablePresentation(presentation);
+    }
+  };
+  const resolvePlainDecision = async (decision: 'approve' | 'reject') => {
+    if (resolved || decisionBusy) return;
+    setDecisionBusy(decision);
+    setDecisionError(null);
+    try {
+      await Promise.resolve(decision === 'approve' ? onApprove() : onReject());
+      setResolvedDecision(decision);
+    } catch (error) {
+      setDecisionError(error instanceof Error && error.message.trim()
+        ? error.message.trim()
+        : `Could not ${decision} this ${message.status === 'awaiting-plan' ? 'plan' : 'request'}.`);
+    } finally {
+      setDecisionBusy(null);
     }
   };
 
@@ -335,13 +353,13 @@ export function ChatBubble({
               <div className="mt-2.5 flex items-center gap-2">
                 <Button
                   size="sm"
-                  disabled={resolved || exec.phase === 'running'}
-                  onClick={pendingAction ? runExecute : () => { setResolved(true); onApprove(); }}
+                  disabled={resolved || decisionBusy !== null || exec.phase === 'running'}
+                  onClick={pendingAction ? runExecute : () => { void resolvePlainDecision('approve'); }}
                 >
                   {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
                   {pendingAction ? 'Execute queued action' : 'Approve'}
                 </Button>
-                <Button size="sm" variant="secondary" disabled={resolved} onClick={() => { setResolved(true); onReject(); }}><X className="h-4 w-4" aria-hidden /> Not now</Button>
+                <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> Not now</Button>
                 {/* Truth, not a latch: for a pending-action card the label reflects
                     the durable executor outcome; the plain approve/plan path keeps
                     the "Submitted" acknowledgement (its follow-up turn carries the
@@ -358,9 +376,16 @@ export function ChatBubble({
                                   : null}
                   </span>
                 ) : (
-                  resolved && <span className="text-caption text-muted">Submitted</span>
+                  resolved && (
+                    <span className="text-caption text-muted">
+                      {message.status === 'awaiting-plan'
+                        ? resolvedDecision === 'approve' ? 'Plan approved and queued' : 'Plan rejected — nothing queued'
+                        : 'Submitted'}
+                    </span>
+                  )
                 )}
               </div>
+              {decisionError && <p role="alert" className="mt-1.5 text-caption text-danger">{decisionError}</p>}
               {pendingAction && exec.note && exec.phase !== 'idle' && (
                 <p
                   className={cn('mt-1.5 whitespace-pre-wrap text-caption', exec.phase === 'failed' ? 'text-danger' : 'text-muted')}

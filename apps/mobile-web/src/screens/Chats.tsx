@@ -6,16 +6,32 @@ import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 
+export interface ChatHandoff {
+  draft?: string;
+  /** Home's send arrow means send; contextual reply handoffs remain drafts. */
+  autoSend?: boolean;
+  session?: ChatSession;
+  sessionId?: string;
+  title?: string;
+}
+
 interface Props {
   /** Home hands over a question to ask, or a thread to open. Consumed once. */
-  handoff?: { draft?: string; session?: ChatSession } | null;
+  handoff?: ChatHandoff | null;
   onHandoffConsumed?: () => void;
 }
 
 export function Chats({ handoff, onHandoffConsumed }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  useBackGesture(selectedId !== null, () => setSelectedId(null));
-  const [composing, setComposing] = useState<{ draft?: string } | null>(null);
+  const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
+  const [selectedTitle, setSelectedTitle] = useState<string | undefined>();
+  const closeSelected = () => {
+    setSelectedId(null);
+    setSelectedDraft(undefined);
+    setSelectedTitle(undefined);
+  };
+  useBackGesture(selectedId !== null, closeSelected);
+  const [composing, setComposing] = useState<{ draft?: string; autoSend?: boolean } | null>(null);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.
   const listVisible = !composing && !selectedId;
@@ -29,18 +45,33 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
   // already in the composer; a tapped thread opens that thread.
   useEffect(() => {
     if (!handoff) return;
-    if (handoff.session) setSelectedId(handoff.session.id);
-    else setComposing({ draft: handoff.draft });
+    if (handoff.session) {
+      setSelectedId(handoff.session.id);
+      setSelectedTitle(handoff.session.title);
+      setSelectedDraft(handoff.draft);
+    } else if (handoff.sessionId) {
+      setSelectedId(handoff.sessionId);
+      setSelectedTitle(handoff.title);
+      setSelectedDraft(handoff.draft);
+    }
+    else setComposing({ draft: handoff.draft, autoSend: handoff.autoSend });
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
   if (composing) {
-    return <Chat initialDraft={composing.draft} onBack={() => { setComposing(null); void refresh(); }} />;
+    return <Chat initialDraft={composing.draft} initialAutoSend={composing.autoSend} onBack={() => { setComposing(null); void refresh(); }} />;
   }
 
   if (selectedId) {
     const session = sessions.find((s) => s.id === selectedId);
-    return <Chat sessionId={selectedId} initialTitle={session?.title ?? ''} onBack={() => { setSelectedId(null); void refresh(); }} />;
+    return (
+      <Chat
+        sessionId={selectedId}
+        initialTitle={selectedTitle ?? session?.title ?? ''}
+        initialDraft={selectedDraft}
+        onBack={() => { closeSelected(); void refresh(); }}
+      />
+    );
   }
 
   return (
@@ -68,7 +99,10 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
 
       <div class="stack">
         {sessions.map((session, i) => (
-          <button key={session.id} class="card card-tap rise" style={{ '--i': i }} onClick={() => setSelectedId(session.id)}>
+          <button key={session.id} class="card card-tap rise" style={{ '--i': i }} onClick={() => {
+            setSelectedId(session.id);
+            setSelectedTitle(session.title);
+          }}>
             <div class="min-w-0">
               <div class="card-title-sm truncate">{session.title || 'Untitled'}</div>
               <div class="card-when">

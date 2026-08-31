@@ -1,7 +1,7 @@
 import webPush from 'web-push';
 import { createHash } from 'node:crypto';
 import type { NotificationDestination, NotificationRecord } from './notifications.js';
-import { removeWebPushDestinationByEndpoint } from './notifications.js';
+import { isNeedsAttentionNotification, removeWebPushDestinationByEndpoint } from './notifications.js';
 import {
   exactOriginDeliveryDestinationMatches,
   exactOriginDeliveryTarget,
@@ -140,7 +140,9 @@ function exactSlackDeliveryIdentity(
  * Sanitized payload for Web Push. We deliberately strip everything
  * beyond a short generic title + body so the push payload that lands
  * on Apple/Google's relay carries no sensitive content. The PWA fetches
- * the full notification via `/m/api/events/<id>` after the user taps.
+ * the full notification from the authenticated mobile Inbox after the user
+ * taps. The notification id is an address, not content; push relays still see
+ * only generic copy.
  */
 function buildWebPushPayload(notification: NotificationRecord): {
   title: string;
@@ -149,15 +151,20 @@ function buildWebPushPayload(notification: NotificationRecord): {
   notificationId: string;
   kind: string;
 } {
-  // Approvals show a slightly more specific title so the user knows
-  // a yes/no is waiting; everything else is generic.
-  const isApproval = notification.kind === 'approval';
+  const needsUser = !notification.read
+    && notification.metadata?.inboxOnly !== true
+    && (
+      notification.kind === 'approval'
+      || isNeedsAttentionNotification(notification)
+      || typeof notification.metadata?.checkInId === 'string'
+      || typeof notification.metadata?.questionId === 'string'
+    );
   return {
-    title: isApproval ? 'Approval pending' : 'Clementine',
-    body: isApproval
-      ? `Tap to review${notification.metadata?.tool ? ` (${String(notification.metadata.tool)})` : ''}`
-      : (notification.title || 'You have an update.'),
-    url: isApproval ? '/m/?tab=inbox' : '/m/',
+    title: needsUser ? 'Clem needs you' : 'Clementine',
+    body: needsUser
+      ? 'Tap to review and respond.'
+      : 'You have an update.',
+    url: `/m/?tab=inbox&notification=${encodeURIComponent(notification.id)}`,
     notificationId: notification.id,
     kind: notification.kind,
   };
@@ -531,6 +538,7 @@ export async function testNotificationDestination(destination: NotificationDesti
 }
 
 export const notificationDeliveryInternalsForTest = {
+  buildWebPushPayload,
   buildDiscordComponentsForNotification,
   buildSlackBlocksForNotification,
   shouldDeliverDiscordNotification,

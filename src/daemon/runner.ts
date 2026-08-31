@@ -29,6 +29,7 @@ import { warmModelDiscovery } from '../runtime/harness/model-discovery.js';
 import { processExecutionController } from '../execution/controller.js';
 import { ExecutionStore } from '../execution/store.js';
 import { interruptStaleRunningBackgroundTasks, resumeInterruptedBackgroundTasks, processBackgroundTasks, reapStaleBackgroundTasks, registerBackgroundDrainKick, sweepInvalidDoneBackgroundTasks, listBackgroundTasks } from '../execution/background-tasks.js';
+import { reconcileApprovedPlanTaskAdmissions } from '../execution/approved-plan-tasks.js';
 import {
   installBackgroundTaskApprovalReconciler,
   reconcileBackgroundTaskApprovals,
@@ -75,7 +76,7 @@ import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog
 import { migrateLegacyComposioJobRecords } from '../integrations/composio/job-watcher.js';
 import { runRoutePolicyJob } from '../runtime/harness/route-policy.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
-import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import { recordOperationalEvent, recordOperationalEventOnce } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { verifyDelivered } from '../runtime/harness/verify-delivered.js';
 import { withModelUsageAttribution } from '../runtime/usage-log.js';
@@ -1548,6 +1549,25 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
       continue;
     }
 
+    // A queued delivery cursor is retry bookkeeping, not permission to send a
+    // gate after its canonical run authority has resolved it. Settlement writes
+    // the carrier first and then removes the cursor; this guard makes the crash
+    // between those writes disclosure-safe and also cleans legacy stale jobs.
+    const settledCapabilityGate = notification.kind === 'workflow'
+      && notification.metadata?.status === 'blocked_capability'
+      && (notification.read || notification.metadata?.needsAttention !== true);
+    const settledWorkflowQuestion = notification.kind === 'workflow'
+      && typeof notification.metadata?.questionId === 'string'
+      && notification.metadata.questionId.trim().length > 0
+      && (
+        notification.read
+        || notification.metadata?.needsAttention === false
+        || typeof notification.metadata?.questionResolvedAt === 'string'
+      );
+    if (settledCapabilityGate || settledWorkflowQuestion) {
+      continue;
+    }
+
     const exactTarget = exactOriginDeliveryTarget(notification);
     const pendingExactExternalDelivery = Boolean(
       hasExactOriginDeliveryMode(notification)
@@ -1926,6 +1946,40 @@ export interface StartDaemonOptions {
   onReady?: () => Promise<void> | void;
 }
 
+export interface AmbientComposioMonitorPolicy {
+  monitor: 'calendar' | 'inbox';
+  intervalMinutes: number;
+  maxItems: number;
+}
+
+/** Canonical boot verdict material: set order is not policy identity, while a
+ * changed active monitor, cadence, or item bound is. Exported for the focused
+ * restart-idempotence proof; it performs no I/O. */
+export function ambientComposioMonitorDisabledVerdict(
+  configured: readonly AmbientComposioMonitorPolicy[],
+) {
+  const monitorPolicy = [...configured]
+    .map((entry) => ({
+      monitor: entry.monitor,
+      intervalMinutes: entry.intervalMinutes,
+      maxItems: entry.maxItems,
+    }))
+    .sort((left, right) => left.monitor.localeCompare(right.monitor));
+  return {
+    source: 'harness' as const,
+    type: 'gate_verdict' as const,
+    severity: 'warn' as const,
+    actor: 'daemon-boot',
+    payload: {
+      gate: 'composio_ambient_monitor_prepared_authority',
+      decision: 'disabled',
+      monitors: monitorPolicy.map((entry) => entry.monitor),
+      monitorPolicy,
+      reason: 'prepared_read_authority_unavailable',
+    },
+  };
+}
+
 export async function startDaemon(
   assistant: ClementineAssistant,
   options: StartDaemonOptions = {},
@@ -1957,12 +2011,20 @@ export async function startDaemon(
   // user settings intact, but do not schedule them until they are migrated to
   // the prepared terminal path. This warning is explicit readiness truth, not
   // a fabricated claim that monitoring is active.
-  const configuredAmbientComposioMonitors = (() => {
+  const configuredAmbientComposioMonitors: AmbientComposioMonitorPolicy[] = (() => {
     try {
       const policy = getProactivityPolicySnapshot().policy;
       return [
-        ...(policy.enabled && policy.inboxWatchEnabled ? ['inbox'] : []),
-        ...(policy.enabled && policy.calendarWatchEnabled ? ['calendar'] : []),
+        ...(policy.enabled && policy.inboxWatchEnabled ? [{
+          monitor: 'inbox' as const,
+          intervalMinutes: policy.inboxWatchMinutes,
+          maxItems: policy.inboxWatchMax,
+        }] : []),
+        ...(policy.enabled && policy.calendarWatchEnabled ? [{
+          monitor: 'calendar' as const,
+          intervalMinutes: policy.calendarWatchMinutes,
+          maxItems: policy.calendarWatchMax,
+        }] : []),
       ];
     } catch {
       return [];
@@ -1970,21 +2032,13 @@ export async function startDaemon(
   })();
   if (configuredAmbientComposioMonitors.length > 0) {
     logger.warn(
-      { monitors: configuredAmbientComposioMonitors, reason: 'prepared_read_authority_unavailable' },
-      'Ambient Composio monitors are disabled; configured watches are preserved but not executing',
-    );
-    recordOperationalEvent({
-      source: 'harness',
-      type: 'gate_verdict',
-      severity: 'warn',
-      actor: 'daemon-boot',
-      payload: {
-        gate: 'composio_ambient_monitor_prepared_authority',
-        decision: 'disabled',
-        monitors: configuredAmbientComposioMonitors,
+      {
+        monitors: configuredAmbientComposioMonitors.map((entry) => entry.monitor),
         reason: 'prepared_read_authority_unavailable',
       },
-    });
+      'Ambient Composio monitors are disabled; configured watches are preserved but not executing',
+    );
+    recordOperationalEventOnce(ambientComposioMonitorDisabledVerdict(configuredAmbientComposioMonitors));
   }
   try {
     await configureHarnessRuntime();
@@ -2140,6 +2194,20 @@ export async function startDaemon(
     }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Boot grounded resource finalization failed');
+  }
+  // Approval and worker creation are separate durable stores. Repair any
+  // process death between them before the first background drain so accepted
+  // plans cannot remain approved-but-never-started after restart.
+  try {
+    const admissions = reconcileApprovedPlanTaskAdmissions();
+    if (admissions.materialized > 0 || admissions.completed > 0 || admissions.failed > 0) {
+      logger.warn(admissions, 'Reconciled approved-plan background admissions on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Approved-plan admission boot reconcile failed; ordinary tick will retry',
+    );
   }
   const interrupted = interruptStaleRunningBackgroundTasks();
   if (interrupted > 0) {
@@ -2603,6 +2671,17 @@ export async function startDaemon(
   // itself has an in-flight guard, so explicit approval kicks and this
   // timer cannot double-run the same task.
   const drainBackgroundTasks = () => {
+    try {
+      const admissions = reconcileApprovedPlanTaskAdmissions();
+      if (admissions.materialized > 0 || admissions.completed > 0 || admissions.failed > 0) {
+        logger.warn(admissions, 'Reconciled approved-plan background admissions');
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Approved-plan admission tick failed; unfinished admissions remain non-dispatching until retry',
+      );
+    }
     try {
       const approvals = reconcileBackgroundTaskApprovals();
       if (

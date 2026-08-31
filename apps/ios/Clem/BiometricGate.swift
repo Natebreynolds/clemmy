@@ -91,44 +91,73 @@ final class BiometricGate: ObservableObject {
 /// preview, no counts, nothing that leaks over a shoulder.
 struct LockScreen: View {
     @ObservedObject var gate: BiometricGate
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @AccessibilityFocusState private var failureIsFocused: Bool
+    @ScaledMetric(relativeTo: .largeTitle) private var lockIconSize: CGFloat = 72
 
     private let paper = Color(red: 252 / 255, green: 249 / 255, blue: 244 / 255)
 
     var body: some View {
         ZStack {
             paper.ignoresSafeArea()
-            VStack(spacing: 18) {
-                Image(systemName: "lock.circle.fill")
-                    .font(.system(size: 72))
-                    .foregroundStyle(Color(red: 1, green: 0.54, blue: 0.24))
-                Text("Clem is locked")
-                    .font(.system(.title2, design: .rounded).weight(.bold))
-                    .foregroundStyle(Color(red: 43 / 255, green: 31 / 255, blue: 20 / 255))
-                if let message = gate.failureMessage {
-                    Text(message)
-                        .font(.footnote)
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 32)
+            GeometryReader { proxy in
+                ScrollView {
+                    VStack(spacing: 18) {
+                        Image(systemName: "lock.circle.fill")
+                            .font(.system(size: lockIconSize))
+                            .foregroundStyle(Color(red: 1, green: 0.54, blue: 0.24))
+                            .accessibilityHidden(true)
+                        Text("Clem is locked")
+                            .font(.system(.title2, design: .rounded).weight(.bold))
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(Color(red: 43 / 255, green: 31 / 255, blue: 20 / 255))
+                        if let message = gate.failureMessage {
+                            Text(message)
+                                .font(.footnote)
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityLabel("Authentication failed. \(message)")
+                                .accessibilityFocused($failureIsFocused)
+                        }
+                        Button(action: { gate.authenticate() }) {
+                            HStack(spacing: 10) {
+                                if gate.prompting {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(Color(red: 0.1, green: 0.05, blue: 0.01))
+                                        .accessibilityHidden(true)
+                                }
+                                Text(gate.prompting ? "Verifying…" : "Unlock")
+                            }
+                            .font(.system(.body, design: .rounded).weight(.bold))
+                            .foregroundStyle(Color(red: 0.1, green: 0.05, blue: 0.01))
+                            .frame(maxWidth: dynamicTypeSize.isAccessibilitySize ? .infinity : 260)
+                            .padding(.vertical, 15)
+                            .background(
+                                LinearGradient(
+                                    colors: [Color(red: 1, green: 0.65, blue: 0.4), Color(red: 0.94, green: 0.37, blue: 0.05)],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                ),
+                                in: RoundedRectangle(cornerRadius: 20)
+                            )
+                        }
+                        .disabled(gate.prompting)
+                        .accessibilityLabel(gate.prompting ? "Verifying your identity" : "Unlock Clem")
+                        .accessibilityValue(gate.prompting ? "In progress" : "")
+                        .accessibilityHint("Uses Face ID, Touch ID, or your device passcode.")
+                    }
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 24)
+                    .frame(maxWidth: .infinity, minHeight: proxy.size.height)
                 }
-                Button(action: { gate.authenticate() }) {
-                    Text(gate.prompting ? "Verifying…" : "Unlock")
-                        .font(.system(.body, design: .rounded).weight(.bold))
-                        .foregroundStyle(Color(red: 0.1, green: 0.05, blue: 0.01))
-                        .frame(maxWidth: 260)
-                        .padding(.vertical, 15)
-                        .background(
-                            LinearGradient(
-                                colors: [Color(red: 1, green: 0.65, blue: 0.4), Color(red: 0.94, green: 0.37, blue: 0.05)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            ),
-                            in: RoundedRectangle(cornerRadius: 20)
-                        )
-                }
-                .disabled(gate.prompting)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
         .preferredColorScheme(.light)
+        .onChange(of: gate.failureMessage) { _, message in
+            failureIsFocused = message != nil
+        }
     }
 }

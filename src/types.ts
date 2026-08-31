@@ -166,6 +166,10 @@ export interface UnifiedSessionTurn {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  /** Exact still-pending plan proposal attached on transcript reopen. Plan
+   *  decisions must resolve this id through the proposal API, never through a
+   *  generic conversational "approve" turn. */
+  planProposalId?: string;
   /** A2 (v2.3.0): a STILL-PENDING approval attached to this turn, so a
    *  reopened chat renders the actionable approve/execute card — not just
    *  the prose that told the user a card exists somewhere else. */

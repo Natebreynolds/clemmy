@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
@@ -61,9 +61,18 @@ const {
   markBackgroundTaskAwaitingApproval,
   markBackgroundTaskAwaitingInput,
   markBackgroundTaskRunning,
+  updateBackgroundTask,
 } = await import('../execution/background-tasks.js');
 const { resetMemoryDb } = await import('../memory/db.js');
 const { rememberFact } = await import('../memory/facts.js');
+const { closeCheckIn, createCheckIn, getCheckIn } = await import('../agents/check-ins.js');
+const { addNotification, getNotification, markNotificationRead } = await import('../runtime/notifications.js');
+const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { writeWorkflow } = await import('../memory/workflow-store.js');
+const { createWorkflowRunDefinitionSnapshot } = await import('../execution/workflow-run-definition.js');
+const { workflowCapabilityAccountChoiceSet } = await import('../execution/workflow-live-call-compiler.js');
+const { getTrustProposal, trustProposalScopeReceipt } = await import('../agents/trust-graduation.js');
+const { listSendTrustGrants } = await import('../agents/plan-scope.js');
 
 interface Harness {
   url: string;
@@ -146,6 +155,595 @@ function matchingApprovalInterrupt(tool: string, args: Record<string, unknown>):
   };
   return JSON.stringify(json);
 }
+
+test('mobile plan projection carries only the exact originating session for safe replies', async () => {
+  const planId = `plan-mobile-session-${Date.now()}`;
+  const sessionId = `session-mobile-plan-${Date.now()}`;
+  const planDir = path.join(TMP_ROOT, 'state', 'plan-proposals');
+  const planFile = path.join(planDir, `${planId}.json`);
+  mkdirSync(planDir, { recursive: true });
+  writeFileSync(planFile, JSON.stringify({
+    id: planId,
+    proposedAt: '2026-08-30T18:00:00.000Z',
+    proposedByAgent: 'clementine',
+    status: 'pending',
+    originatingRequest: 'Prepare the exact renewal plan.',
+    sessionId,
+    plan: {
+      objective: 'Prepare the renewal plan.',
+      steps: [{ n: 1, action: 'Confirm the scope', rationale: 'Avoid guessing.', verification: null }],
+      successCriteria: ['The scope is confirmed.'],
+      risks: [],
+      estimatedComplexity: 'moderate',
+      recommendsTrackedExecution: false,
+      needsUserInput: ['Which segment should I use?'],
+      appliedInstructions: [],
+    },
+    version: 'v1',
+  }), 'utf-8');
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Plan reply phone');
+    const response = await fetch(`${h.url}/m/api/plan-proposals`, { headers: { cookie } });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      proposals: Array<{ id: string; sessionId: string | null }>;
+    };
+    assert.equal(body.proposals.find((row) => row.id === planId)?.sessionId, sessionId);
+  } finally {
+    await h.close();
+    rmSync(planFile, { force: true });
+  }
+});
+
+test('mobile notification paging filters before limit and dismissal reads only the exact carrier', async () => {
+  const key = Date.now();
+  const visibleId = `mobile-visible-before-limit-${key}`;
+  const silentId = `mobile-silent-before-limit-${key}`;
+  const siblingId = `mobile-distinct-blocker-${key}`;
+  addNotification({
+    id: visibleId,
+    kind: 'workflow',
+    title: 'Workflow needs attention: renewal review',
+    body: 'First independent blocker.',
+    createdAt: '2099-01-01T00:00:00.000Z',
+    read: false,
+    metadata: { workflow: 'renewal-review', needsAttention: true },
+  });
+  addNotification({
+    id: siblingId,
+    kind: 'workflow',
+    title: 'Workflow needs attention: renewal review',
+    body: 'Second independent blocker with the same presentation title.',
+    createdAt: '2098-01-01T00:00:00.000Z',
+    read: false,
+    metadata: { workflow: 'renewal-review', needsAttention: true },
+  });
+  addNotification({
+    id: silentId,
+    kind: 'execution',
+    title: 'Internal heartbeat',
+    body: '',
+    createdAt: '2100-01-01T00:00:00.000Z',
+    read: false,
+    silent: true,
+    metadata: { heartbeat: true },
+  });
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Exact dismissal phone');
+    const listed = await fetch(`${h.url}/m/api/inbox/notifications?limit=1`, { headers: { cookie } });
+    assert.equal(listed.status, 200);
+    const listedBody = await listed.json() as { notifications: Array<{ id: string }> };
+    assert.deepEqual(listedBody.notifications.map((row) => row.id), [visibleId],
+      'a newer silent row cannot consume the visible page limit');
+
+    const dismissed = await fetch(`${h.url}/m/api/inbox/notifications/${visibleId}/read`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+    assert.equal(dismissed.status, 200);
+    assert.equal((await dismissed.json() as { cleared: number }).cleared, 1);
+
+    const sibling = await fetch(`${h.url}/m/api/inbox/notifications/${siblingId}`, { headers: { cookie } });
+    assert.equal(sibling.status, 200);
+    assert.equal((await sibling.json() as { notification: { read: boolean } }).notification.read, false,
+      'same workflow/title is not authority to dismiss a distinct issue');
+  } finally {
+    await h.close();
+    markNotificationRead(visibleId);
+    markNotificationRead(siblingId);
+    markNotificationRead(silentId);
+  }
+});
+
+test('mobile check-in answer is single-winner and late answers return 409 without overwriting', async () => {
+  const checkIn = createCheckIn({
+    agentSlug: 'mobile-check-in-race',
+    question: 'Which exact customer segment should the renewal analysis cover?',
+    contextSummary: 'The analysis is paused until this scope is known.',
+  });
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Check-in race phone');
+    const answers = ['Enterprise renewals only', 'Every renewal customer'];
+    const responses = await Promise.all(answers.map((answer) => fetch(
+      `${h.url}/m/api/inbox/questions/${encodeURIComponent(`checkin:${checkIn.id}`)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ answer }),
+      },
+    )));
+
+    assert.deepEqual(
+      responses.map((response) => response.status).sort((a, b) => a - b),
+      [200, 409],
+      'exactly one competing mobile answer should win',
+    );
+    const winnerIndex = responses.findIndex((response) => response.status === 200);
+    assert.notEqual(winnerIndex, -1);
+    const winningAnswer = answers[winnerIndex];
+    const afterRace = getCheckIn(checkIn.id);
+    assert.equal(afterRace?.status, 'answered');
+    assert.equal(afterRace?.answer, winningAnswer);
+
+    const late = await fetch(
+      `${h.url}/m/api/inbox/questions/${encodeURIComponent(`checkin:${checkIn.id}`)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ answer: 'A third, late answer' }),
+      },
+    );
+    assert.equal(late.status, 409);
+    const lateBody = await late.json() as { error: string; status: string; questionId: string };
+    assert.equal(lateBody.error, 'QUESTION_ALREADY_ANSWERED_OR_CLOSED');
+    assert.equal(lateBody.status, 'already_resolved');
+    assert.equal(lateBody.questionId, `checkin:${checkIn.id}`);
+    const afterLateAnswer = getCheckIn(checkIn.id);
+    assert.equal(afterLateAnswer?.answer, winningAnswer, 'the 409 response must not overwrite the winner');
+    assert.equal(afterLateAnswer?.answeredAt, afterRace?.answeredAt);
+  } finally {
+    await h.close();
+  }
+});
+
+test('mobile Inbox never lets a stale linked Q1 hide or answer the current task Q2', async () => {
+  const key = Date.now();
+  const task = createBackgroundTask({
+    explicitId: `bg-mobile-question-generation-${key}`,
+    title: 'Resolve the exact report scope',
+    prompt: 'Wait for the exact current scope answer.',
+    originSessionId: `mobile-question-origin-${key}`,
+  });
+  const q1 = `mobile-question:${task.id}:q1`;
+  const q2 = `mobile-question:${task.id}:q2`;
+  updateBackgroundTask(task.id, {
+    status: 'awaiting_input',
+    pendingQuestionId: q1,
+    pendingQuestion: 'Should I use account A or account B?',
+    pendingQuestionOptions: ['Account A', 'Account B'],
+  });
+  const checkIn = createCheckIn({
+    agentSlug: 'Clem',
+    question: 'Should I use account A or account B?',
+    linkedTaskId: task.id,
+    linkedQuestionId: q1,
+  });
+  updateBackgroundTask(task.id, {
+    status: 'awaiting_input',
+    pendingQuestionId: q2,
+    pendingQuestion: 'Should I use East or West?',
+    pendingQuestionOptions: ['East', 'West'],
+  });
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Question generation phone');
+    const listed = await fetch(`${h.url}/m/api/inbox/questions`, { headers: { cookie } });
+    assert.equal(listed.status, 200);
+    const questions = (await listed.json() as {
+      questions: Array<{ id: string; answerable: boolean; unavailableReason: string | null }>;
+    }).questions;
+    const staleId = `checkin:${checkIn.id}`;
+    const currentId = `task:${q2}`;
+    assert.equal(
+      questions.some((row) => row.id === staleId),
+      false,
+      'a superseded question is settled, not left as an unopenable Needs You card',
+    );
+    assert.equal(questions.find((row) => row.id === currentId)?.answerable, true);
+
+    const staleAnswer = await fetch(`${h.url}/m/api/inbox/questions/${encodeURIComponent(staleId)}/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ answer: 'Account B' }),
+    });
+    assert.equal(staleAnswer.status, 409);
+    assert.equal(getCheckIn(checkIn.id)?.status, 'closed');
+    assert.equal(getBackgroundTask(task.id)?.pendingQuestionId, q2);
+
+    const exactAnswer = await fetch(`${h.url}/m/api/inbox/questions/${encodeURIComponent(currentId)}/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ answer: 'West' }),
+    });
+    assert.equal(exactAnswer.status, 200);
+    assert.equal(getBackgroundTask(task.id)?.status, 'pending');
+    assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'West');
+  } finally {
+    await h.close();
+    closeCheckIn(checkIn.id, 'Test cleanup: stale linked question fixture.');
+  }
+});
+
+test('/api/inbox/summary counts one active typed question and keeps stale question-linked attention', async () => {
+  const fixtureKey = Date.now();
+  const activeQuestionId = `mobile-summary-active-question-${fixtureKey}`;
+  const staleQuestionId = `mobile-summary-stale-question-${fixtureKey}`;
+  const task = createBackgroundTask({
+    explicitId: `bg-mobile-summary-${fixtureKey}`,
+    title: 'Choose the renewal scope',
+    prompt: 'Prepare the renewal analysis after the user chooses its exact scope.',
+    originSessionId: `mobile-summary-origin-${fixtureKey}`,
+  });
+  assert.ok(markBackgroundTaskAwaitingInput(
+    task.id,
+    activeQuestionId,
+    'Which exact customer segment should the renewal analysis cover?',
+  ));
+  addNotification({
+    id: `mobile-summary-stale-notification-${fixtureKey}`,
+    kind: 'execution',
+    title: 'Action required for an older question',
+    body: 'This unread question carrier no longer has a live typed question row.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: {
+      questionId: staleQuestionId,
+      needsAttention: true,
+    },
+  });
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Inbox summary phone');
+    const notifications = await fetch(`${h.url}/m/api/inbox/notifications`, { headers: { cookie } });
+    assert.equal(notifications.status, 200);
+    const notificationBody = await notifications.json() as {
+      notifications: Array<{ id: string; context: { actionItemId: string | null } }>;
+    };
+    assert.equal(
+      notificationBody.notifications.find((row) => row.id === `mobile-summary-stale-notification-${fixtureKey}`)
+        ?.context.actionItemId,
+      `task:${staleQuestionId}`,
+      'the stale carrier deliberately has a question action id',
+    );
+
+    const response = await fetch(`${h.url}/m/api/inbox/summary`, { headers: { cookie } });
+    assert.equal(response.status, 200);
+    const summary = await response.json() as {
+      needsYou: number;
+      questions: number;
+      notificationNeedsYou: number;
+    };
+    assert.equal(summary.questions, 1, 'the live question and its notification carrier count once');
+    assert.equal(summary.notificationNeedsYou, 1, 'an orphaned question id alone must not suppress attention');
+    assert.equal(summary.needsYou, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+test('authenticated mobile Inbox lists and atomically answers an exact workflow question with no origin chat', async () => {
+  const runId = `mobile-inbox-workflow-${Date.now()}`;
+  const questionId = `workflow-input:${runId}:choose_scope:q1`;
+  const actionId = `workflow:${runId}|${questionId}`;
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(file, JSON.stringify({
+    id: runId,
+    workflow: 'Renewal Review',
+    status: 'awaiting_input',
+    awaitingInput: {
+      questionId,
+      question: 'Should I revise the term to 12 months?',
+      stepId: 'choose_scope',
+      sessionId: `workflow:${runId}:choose_scope`,
+      sessionIdSuffix: 'choose_scope',
+      askedAt: '2026-08-30T18:00:00.000Z',
+    },
+  }), 'utf-8');
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Workflow Inbox phone');
+    const listed = await fetch(`${h.url}/m/api/inbox/questions`, { headers: { cookie } });
+    assert.equal(listed.status, 200);
+    const listBody = await listed.json() as {
+      questions: Array<{ id: string; source: string; runId: string; answerable: boolean }>;
+    };
+    const listedQuestion = listBody.questions.find((row) => row.id === actionId);
+    assert.equal(listedQuestion?.source, 'workflow');
+    assert.equal(listedQuestion?.runId, runId);
+    assert.equal(listedQuestion?.answerable, true);
+
+    const answer = await fetch(`${h.url}/m/api/inbox/questions/${encodeURIComponent(actionId)}/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ answer: 'Use 12 months and show me the draft.' }),
+    });
+    assert.equal(answer.status, 200);
+    const stored = JSON.parse(readFileSync(file, 'utf-8')) as {
+      status: string;
+      awaitingInput: { answer?: string };
+    };
+    assert.equal(stored.status, 'running');
+    assert.equal(stored.awaitingInput.answer, 'Use 12 months and show me the draft.');
+
+    const late = await fetch(`${h.url}/m/api/inbox/questions/${encodeURIComponent(actionId)}/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ answer: 'A conflicting late answer' }),
+    });
+    assert.equal(late.status, 409);
+    const unchanged = JSON.parse(readFileSync(file, 'utf-8')) as { awaitingInput: { answer?: string } };
+    assert.equal(unchanged.awaitingInput.answer, 'Use 12 months and show me the draft.');
+  } finally {
+    await h.close();
+    try { rmSync(file, { force: true }); } catch { /* best effort */ }
+  }
+});
+
+test('mobile Needs You projects bounded exact account choices and resolves B through the same-run CAS', async () => {
+  const stamp = Date.now();
+  const slug = `mobile-choice-flow-${stamp}`;
+  const workflowName = `Mobile choice flow ${stamp}`;
+  const runId = `mobile-choice-run-${stamp}`;
+  const definition = {
+    name: workflowName,
+    description: 'Choose the exact workbook account.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'publish', prompt: 'Publish the workbook.', sideEffect: 'write' as const }],
+  };
+  writeWorkflow(slug, definition);
+  const choices = workflowCapabilityAccountChoiceSet([
+    { capabilityId: 'cap:mobile:sheet:a', account: 'mobile-account-a' },
+    { capabilityId: 'cap:mobile:sheet:b', account: 'mobile-account-b' },
+  ]);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({
+    id: runId,
+    workflow: workflowName,
+    workflowDefinitionSnapshot: createWorkflowRunDefinitionSnapshot(slug, definition, new Date().toISOString()),
+    status: 'blocked_capability',
+    createdAt: new Date().toISOString(),
+    capabilityBlock: {
+      state: 'blocked', stepId: 'publish', tool: 'GOOGLESHEETS_BATCH_UPDATE', toolkit: 'googlesheets',
+      reason: 'ambiguous-account', message: 'Choose an exact account.', blockedAt: new Date().toISOString(),
+      retryAt: new Date(Date.now() + 60_000).toISOString(), retryCount: 1, provenNoDispatch: true,
+      accountChoiceSet: choices,
+    },
+  }), 'utf-8');
+  const notificationId = `workflow-${runId}-capability-googlesheets`;
+  addNotification({
+    id: notificationId,
+    kind: 'workflow',
+    title: 'Workflow needs you — choose an account for googlesheets',
+    body: 'Choose the exact account.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: {
+      workflow: workflowName, runId, status: 'blocked_capability', stepId: 'publish',
+      tool: 'GOOGLESHEETS_BATCH_UPDATE', toolkit: 'googlesheets', reason: 'ambiguous-account',
+      retryAt: new Date(Date.now() + 60_000).toISOString(), retryCount: 1, provenNoDispatch: true,
+      needsAttention: true,
+      resolution: {
+        kind: 'choose_account', actionTool: 'workflow_capability_resolve',
+        accountCandidates: choices.candidates, choiceSetDigest: choices.digest,
+        choiceTotal: choices.total, choicesTruncated: choices.truncated, retryCount: 1,
+      },
+    },
+  });
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Capability choice phone');
+    const listed = await fetch(`${h.url}/m/api/inbox/notifications`, { headers: { cookie } });
+    assert.equal(listed.status, 200);
+    const gate = (await listed.json() as {
+      notifications: Array<{ id: string; workflowCapability?: { resolution: { kind: string; candidates: Array<{ accountId: string; capabilityId: string }> } } }>;
+    }).notifications.find((row) => row.id === notificationId)?.workflowCapability;
+    assert.equal(gate?.resolution.kind, 'choose_account');
+    assert.deepEqual(gate?.resolution.candidates.map((choice) => choice.accountId), ['mobile-account-a', 'mobile-account-b']);
+
+    const opened = await fetch(`${h.url}/m/api/inbox/notifications/${encodeURIComponent(notificationId)}/read`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: '{}',
+    });
+    assert.equal(opened.status, 409, 'opening/dismissing cannot consume the only exact chooser');
+    assert.equal(getNotification(notificationId)?.read, false);
+
+    const resolved = await fetch(`${h.url}/m/api/inbox/workflow-capabilities/${runId}/resolve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        action: 'choose_account', stepId: 'publish', tool: 'GOOGLESHEETS_BATCH_UPDATE', retryCount: 1,
+        choiceSetDigest: choices.digest, capabilityId: 'cap:mobile:sheet:b', accountId: 'mobile-account-b',
+      }),
+    });
+    assert.equal(resolved.status, 200);
+    assert.equal((await resolved.json() as { status: string }).status, 'selected');
+    const stored = JSON.parse(readFileSync(file, 'utf-8')) as {
+      status: string; capabilityBlock: { accountSelection: { accountId: string } };
+    };
+    assert.equal(stored.status, 'running');
+    assert.equal(stored.capabilityBlock.accountSelection.accountId, 'mobile-account-b');
+  } finally {
+    await h.close();
+    rmSync(file, { force: true });
+  }
+});
+
+test('mobile Inbox trust decision uses only the persisted exact scope', async () => {
+  const proposalId = `tgp-mobile-${Date.now()}`;
+  const expiredProposalId = `${proposalId}-expired`;
+  const scope = {
+    toolkits: ['gmail_send_email'],
+    recipients: ['renewals@acme.test'],
+    domains: ['partners.acme.test'],
+    maxRecipients: 1,
+  };
+  const scopeReceipt = trustProposalScopeReceipt(scope);
+  const expiredScope = {
+    toolkits: ['gmail_send_email'],
+    recipients: ['expired@acme.test'],
+    domains: [] as string[],
+    maxRecipients: 1,
+  };
+  const expiredReceipt = trustProposalScopeReceipt(expiredScope);
+  const storeFile = path.join(TMP_ROOT, 'state', 'trust-graduation-proposals.json');
+  mkdirSync(path.dirname(storeFile), { recursive: true });
+  writeFileSync(storeFile, JSON.stringify({
+    version: 'v1',
+    proposals: [{
+      id: proposalId,
+      scopeKey: 'internal-scope-key',
+      ...scope,
+      scopeRevision: scopeReceipt.scopeRevision,
+      scopeDigest: scopeReceipt.scopeDigest,
+      evidence: {
+        cleanSendCount: 6,
+        distinctDays: 4,
+        firstAt: '2026-08-01T18:00:00.000Z',
+        lastAt: '2026-08-29T18:00:00.000Z',
+        sampleApprovalIds: ['private-approval-id'],
+      },
+      rationale: 'You approved this exact recipient six times.',
+      status: 'pending',
+      createdAt: '2026-08-30T18:00:00.000Z',
+    }, {
+      id: expiredProposalId,
+      scopeKey: 'expired-scope-key',
+      ...expiredScope,
+      scopeRevision: expiredReceipt.scopeRevision,
+      scopeDigest: expiredReceipt.scopeDigest,
+      evidence: {
+        cleanSendCount: 6,
+        distinctDays: 4,
+        firstAt: '2026-07-01T18:00:00.000Z',
+        lastAt: '2026-07-10T18:00:00.000Z',
+        sampleApprovalIds: [],
+      },
+      rationale: 'This request is intentionally expired.',
+      status: 'pending',
+      createdAt: '2026-07-10T18:00:00.000Z',
+    }],
+  }), 'utf-8');
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Trust Inbox phone');
+    const listed = await fetch(`${h.url}/m/api/inbox/trust-proposals`, { headers: { cookie } });
+    assert.equal(listed.status, 200);
+    const body = await listed.json() as { proposals: Array<Record<string, unknown>> };
+    const projected = body.proposals.find((row) => row.id === proposalId);
+    assert.deepEqual(projected?.recipients, ['renewals@acme.test']);
+    assert.deepEqual(projected?.domains, ['partners.acme.test']);
+    assert.equal(projected?.scopeRevision, 1);
+    assert.equal(projected?.scopeDigest, scopeReceipt.scopeDigest);
+    assert.equal('scopeKey' in (projected ?? {}), false);
+    assert.equal('sampleApprovalIds' in ((projected?.evidence as Record<string, unknown>) ?? {}), false);
+    assert.equal(
+      body.proposals.some((row) => row.id === expiredProposalId),
+      false,
+      'the locked receipt migration terminally removes the non-canonical legacy row before action',
+    );
+
+    const missingReceipt = await fetch(`${h.url}/m/api/inbox/trust-proposals/${proposalId}/decline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({}),
+    });
+    assert.equal(missingReceipt.status, 400);
+    assert.equal(getTrustProposal(proposalId)?.status, 'pending');
+
+    const staleReceipt = await fetch(`${h.url}/m/api/inbox/trust-proposals/${proposalId}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        scopeRevision: 1,
+        scopeDigest: `sha256:${'0'.repeat(64)}`,
+      }),
+    });
+    assert.equal(staleReceipt.status, 409);
+    const staleBody = await staleReceipt.json() as { error: string; nothingGranted: boolean };
+    assert.equal(staleBody.error, 'TRUST_PROPOSAL_SCOPE_MISMATCH');
+    assert.equal(staleBody.nothingGranted, true);
+    assert.equal(getTrustProposal(proposalId)?.status, 'pending', 'stale UI scope cannot resolve the proposal');
+
+    const declined = await fetch(`${h.url}/m/api/inbox/trust-proposals/${proposalId}/decline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        scopeRevision: scopeReceipt.scopeRevision,
+        scopeDigest: scopeReceipt.scopeDigest,
+        recipients: ['attacker@example.test'],
+        toolkits: ['arbitrary_tool'],
+        maxRecipients: 1000,
+      }),
+    });
+    assert.equal(declined.status, 200);
+    assert.deepEqual((await declined.json() as { scopeReceipt: unknown }).scopeReceipt, scopeReceipt);
+    const stored = getTrustProposal(proposalId);
+    assert.equal(stored?.status, 'declined');
+    assert.deepEqual(stored?.recipients, ['renewals@acme.test']);
+    assert.deepEqual(stored?.domains, ['partners.acme.test']);
+    assert.deepEqual(stored?.toolkits, ['gmail_send_email']);
+    assert.equal(stored?.maxRecipients, 1);
+
+    const repeated = await fetch(`${h.url}/m/api/inbox/trust-proposals/${proposalId}/decline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        scopeRevision: scopeReceipt.scopeRevision,
+        scopeDigest: scopeReceipt.scopeDigest,
+      }),
+    });
+    assert.equal(repeated.status, 409);
+
+    const expired = await fetch(`${h.url}/m/api/inbox/trust-proposals/${expiredProposalId}/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({
+        scopeRevision: expiredReceipt.scopeRevision,
+        scopeDigest: expiredReceipt.scopeDigest,
+      }),
+    });
+    assert.equal(expired.status, 409);
+    const expiredBody = await expired.json() as { error: string; status: string; scopeReceipt: unknown };
+    assert.equal(expiredBody.error, 'TRUST_PROPOSAL_ALREADY_RESOLVED');
+    assert.equal(expiredBody.status, 'superseded');
+    assert.deepEqual(expiredBody.scopeReceipt, expiredReceipt);
+    assert.equal(getTrustProposal(expiredProposalId)?.status, 'superseded');
+    assert.equal(
+      listSendTrustGrants().some((grant) => grant.recipients.includes('expired@acme.test')),
+      false,
+      'terminal migration never grants send authority',
+    );
+    const relisted = await fetch(`${h.url}/m/api/inbox/trust-proposals`, { headers: { cookie } });
+    const relistedBody = await relisted.json() as { proposals: Array<{ id: string }> };
+    assert.equal(relistedBody.proposals.some((row) => row.id === expiredProposalId), false, 'no dead pending card survives');
+  } finally {
+    await h.close();
+  }
+});
 
 test('login fails with PIN_NOT_CONFIGURED before any PIN is set', async () => {
   const h = await startHarness();

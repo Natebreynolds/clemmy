@@ -30,6 +30,7 @@ const {
   listNotifications,
   listNotificationDestinations,
   listQueuedNotificationDeliveries,
+  markWorkflowCapabilityNotificationsSettled,
   recoverCorruptedNotificationDeliveryQueue,
   removeNotificationDestination,
   requeueNotificationDelivery,
@@ -55,6 +56,63 @@ const assistantStub = {
     };
   },
 } as never;
+
+test('a settled capability gate cannot leak through an already-admitted delivery cursor', async () => {
+  replaceQueuedNotificationDeliveries([]);
+  const destinationId = 'dest-settled-capability-guard';
+  const notificationId = 'workflow-settled-capability-gmail';
+  upsertNotificationDestination({
+    id: destinationId,
+    name: 'Capability guard webhook',
+    type: 'generic_webhook',
+    url: 'https://example.invalid/capability-guard',
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  });
+  addNotification({
+    id: notificationId,
+    kind: 'workflow',
+    title: 'Workflow needs you — connect gmail',
+    body: 'Connect the exact account and retry.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: {
+      runId: 'settled-delivery-run',
+      status: 'blocked_capability',
+      provenNoDispatch: true,
+      needsAttention: true,
+      retryCount: 1,
+    },
+  });
+  const admitted = listQueuedNotificationDeliveries().find((job) => job.notificationId === notificationId);
+  assert.ok(admitted, 'unresolved gate was admitted before settlement');
+  markWorkflowCapabilityNotificationsSettled('settled-delivery-run', {
+    capabilityResolutionStatus: 'readmitted',
+  });
+  assert.equal(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === notificationId),
+    false,
+    'normal settlement removes its outbound cursor',
+  );
+
+  // Simulate a crash after the carrier settlement fsync but before the queue
+  // removal fsync. The worker must treat carrier truth as authoritative.
+  replaceQueuedNotificationDeliveries([admitted]);
+  let sends = 0;
+  _setNotificationDeliveryForTests(async () => { sends += 1; });
+  try {
+    await processNotificationDeliveries(assistantStub);
+    assert.equal(sends, 0);
+    assert.equal(
+      listQueuedNotificationDeliveries().some((job) => job.notificationId === notificationId),
+      false,
+    );
+  } finally {
+    _setNotificationDeliveryForTests(null);
+    replaceQueuedNotificationDeliveries([]);
+    removeNotificationDestination(destinationId);
+  }
+});
 
 test('U5 (v2.3.0): a LOUD notification with nothing configured resolves the desktop leg and DELIVERS', async () => {
   addNotification({

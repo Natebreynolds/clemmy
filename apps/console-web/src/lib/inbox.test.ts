@@ -1,11 +1,14 @@
 /** Run: npx tsx --test apps/console-web/src/lib/inbox.test.ts */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   approvalDecisionSuccessText,
   collapseAttentionRows,
   summarizeApprovalDecisionBatch,
+  trustProposalScopeExpectation,
   type NotificationRow,
+  type TrustProposalRow,
 } from './inbox.js';
 
 const row = (id: string, title: string, createdAt: string): NotificationRow => ({ id, title, createdAt });
@@ -35,6 +38,45 @@ test('unrelated titles never merge; ordering is newest-first across groups', () 
   ]);
   assert.deepEqual(collapsed.map((c) => c.row.id), ['b', 'c']);
   assert.equal(collapsed[0].collapsedCount, 1);
+});
+
+test('exact workflow capability gates never collapse by presentation title', () => {
+  const gate = (notificationId: string): NotificationRow['workflowCapability'] => ({
+    notificationId,
+    workflow: 'Renewal workbook',
+    runId: notificationId,
+    stepId: 'publish',
+    tool: 'GOOGLESHEETS_BATCH_UPDATE',
+    toolkit: 'googlesheets',
+    reason: 'ambiguous-account',
+    retryAt: null,
+    provenNoDispatch: true,
+    resolution: { kind: 'review_run', reason: 'fixture' },
+  });
+  const collapsed = collapseAttentionRows([
+    { ...row('cap-a', 'Workflow needs you — choose an account', '2026-08-30T10:00:00Z'), workflowCapability: gate('cap-a') },
+    { ...row('cap-b', 'Workflow needs you — choose an account', '2026-08-30T10:01:00Z'), workflowCapability: gate('cap-b') },
+  ]);
+  assert.deepEqual(collapsed.map((entry) => entry.row.id), ['cap-b', 'cap-a']);
+  assert.ok(collapsed.every((entry) => entry.collapsedCount === 0));
+});
+
+test('desktop Inbox makes workflow gates actionable and never approves a plan that still needs answers', () => {
+  const source = readFileSync(new URL('../screens/Inbox.tsx', import.meta.url), 'utf8');
+  const automate = readFileSync(new URL('../screens/Automate.tsx', import.meta.url), 'utf8');
+  const api = readFileSync(new URL('./inbox.ts', import.meta.url), 'utf8');
+  assert.match(source, /WorkflowCapabilityCard/);
+  assert.match(api, /choiceSetDigest: gate\.resolution\.choiceSetDigest/);
+  assert.match(source, /Use \$\{candidate\.label\}/);
+  assert.match(source, /I connected it — resume this run/);
+  assert.match(source, /Retry exact metadata now/);
+  assert.match(source, /!needsInput && \(/);
+  assert.match(source, /Answer in the exact conversation/);
+  assert.match(source, /to=\{`\/chat\/\$\{encodeURIComponent\(row\.sessionId\)\}`\}/);
+  assert.match(source, /Reject it and ask Clem to draft a new plan/);
+  assert.match(automate, /Open exact Needs You gate/);
+  assert.match(automate, /Choose an exact account/);
+  assert.doesNotMatch(automate, /resumeWorkflowCapability/);
 });
 
 test('queued-action approval copy never claims the external action executed', () => {
@@ -87,4 +129,29 @@ test('bulk approval summary exposes partial failure and keeps failed items actio
     }),
     'Rejected 2 of 2.',
   );
+});
+
+test('desktop trust decision binds the exact rendered scope revision and digest', () => {
+  const proposal: TrustProposalRow = {
+    id: 'trust-exact-scope',
+    scopeRevision: 1,
+    scopeDigest: `sha256:${'a'.repeat(64)}`,
+    toolkits: ['gmail_send_email'],
+    recipients: ['owner@public.test'],
+    domains: ['example.test'],
+    maxRecipients: 2,
+    evidence: {
+      cleanSendCount: 5,
+      distinctDays: 4,
+      firstAt: '2026-08-20T12:00:00.000Z',
+      lastAt: '2026-08-29T12:00:00.000Z',
+    },
+    rationale: 'Exact scope fixture.',
+    status: 'pending',
+    createdAt: '2026-08-30T12:00:00.000Z',
+  };
+  assert.deepEqual(trustProposalScopeExpectation(proposal), {
+    scopeRevision: proposal.scopeRevision,
+    scopeDigest: proposal.scopeDigest,
+  });
 });

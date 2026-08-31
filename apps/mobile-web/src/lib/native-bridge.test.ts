@@ -7,6 +7,7 @@ import {
   installNativeBridge,
   ORIGIN_HANDOFF_STORED_EVENT,
   reportConnectionLost,
+  reportNativeNotificationHandled,
   reportOriginHandoffResult,
 } from './native-bridge.js';
 
@@ -153,6 +154,32 @@ test('origin handoff result acknowledges the exact handoff id and generation', (
       generation: 17,
       outcome: 'consumed',
     }]);
+  } finally {
+    if (priorWindow === undefined) delete (globalThis as { window?: unknown }).window;
+    else Object.defineProperty(globalThis, 'window', { configurable: true, value: priorWindow });
+  }
+});
+
+test('notification handling acknowledges only the exact terminal Inbox outcome', () => {
+  const messages: unknown[] = [];
+  const priorWindow = globalThis.window;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      webkit: {
+        messageHandlers: {
+          clemNotificationHandled: {
+            postMessage: (body: unknown) => messages.push(body),
+          },
+        },
+      },
+    },
+  });
+
+  try {
+    assert.equal(reportNativeNotificationHandled('notification-42', 'presented'), true);
+    assert.equal(reportNativeNotificationHandled('', 'unavailable'), false);
+    assert.deepEqual(messages, [{ notificationId: 'notification-42', outcome: 'presented' }]);
   } finally {
     if (priorWindow === undefined) delete (globalThis as { window?: unknown }).window;
     else Object.defineProperty(globalThis, 'window', { configurable: true, value: priorWindow });

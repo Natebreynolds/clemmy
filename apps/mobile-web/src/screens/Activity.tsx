@@ -44,11 +44,11 @@ export function Activity() {
     return <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>;
   }
 
-  const notice = <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0} />;
+  const notice = <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0 || workingView.total > 0} />;
 
-  if (runs.length === 0 && (error || offline)) return <div class="home">{notice}</div>;
+  if (runs.length === 0 && workingView.total === 0 && (error || offline)) return <div class="home">{notice}</div>;
 
-  if (runs.length === 0) {
+  if (runs.length === 0 && workingView.total === 0) {
     return (
       <div class="empty">
         <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />

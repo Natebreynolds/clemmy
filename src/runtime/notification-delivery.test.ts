@@ -106,6 +106,70 @@ function customIds(rows: ReturnType<typeof notificationDeliveryInternalsForTest.
   return ids;
 }
 
+test('mobile push is private and deep-links to the exact Inbox notification', () => {
+  const approval = notification({
+    id: 'notify/private approval',
+    kind: 'approval',
+    title: 'Email the confidential renewal quote to Acme',
+    body: 'Sensitive body that must not cross a push relay.',
+    metadata: { approvalId: 'approval-1' },
+  });
+  const payload = notificationDeliveryInternalsForTest.buildWebPushPayload(approval);
+
+  assert.deepEqual(payload, {
+    title: 'Clem needs you',
+    body: 'Tap to review and respond.',
+    url: '/m/?tab=inbox&notification=notify%2Fprivate%20approval',
+    notificationId: approval.id,
+    kind: 'approval',
+  });
+  assert.equal(JSON.stringify(payload).includes('Acme'), false);
+  assert.equal(JSON.stringify(payload).includes('Sensitive'), false);
+});
+
+test('ordinary mobile push also keeps notification content off the relay', () => {
+  const update = notification({
+    id: 'notify-update',
+    kind: 'execution',
+    title: 'Quarterly analysis for confidential customer',
+  });
+
+  assert.deepEqual(notificationDeliveryInternalsForTest.buildWebPushPayload(update), {
+    title: 'Clementine',
+    body: 'You have an update.',
+    url: '/m/?tab=inbox&notification=notify-update',
+    notificationId: update.id,
+    kind: 'execution',
+  });
+});
+
+test('resolved Inbox receipts never present themselves as a fresh request', () => {
+  const receipts = [
+    notification({
+      id: 'checkin-answer-receipt',
+      metadata: { checkInId: 'checkin-1', status: 'answered', inboxOnly: true },
+    }),
+    notification({
+      id: 'workflow-answer-receipt',
+      kind: 'workflow',
+      read: true,
+      metadata: { questionId: 'workflow-question-1', status: 'resuming' },
+    }),
+    notification({
+      id: 'trust-decision-receipt',
+      kind: 'approval',
+      read: true,
+      metadata: { trustProposalId: 'trust-1', status: 'approved' },
+    }),
+  ];
+
+  for (const receipt of receipts) {
+    const payload = notificationDeliveryInternalsForTest.buildWebPushPayload(receipt);
+    assert.equal(payload.title, 'Clementine');
+    assert.equal(payload.body, 'You have an update.');
+  }
+});
+
 test('Discord delivery: stale plan metadata still delivers but has no dead buttons', () => {
   const approval = notification({
     kind: 'approval',

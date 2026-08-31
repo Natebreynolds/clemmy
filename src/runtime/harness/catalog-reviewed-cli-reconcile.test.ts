@@ -1,6 +1,13 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/catalog-reviewed-cli-reconcile.test.ts */
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -37,6 +44,7 @@ const catalogs = await import('./host-capability-catalog-factory.js');
 const ports = await import('./production-capability-ports.js');
 const observations = await import('./independent-capability-observation.js');
 const instructions = await import('../../assistant/instructions.js');
+const capabilityIndex = await import('../../memory/capability-index.js');
 
 test.after(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
@@ -48,6 +56,21 @@ test.after(() => {
 
 const salesforce = catalog.CLI_CATALOG.find((entry) => entry.id === 'salesforce')!;
 const liveSearch = 'query Salesforce opportunities closing today via sf CLI';
+
+function salesforceCapabilityRow(): Record<string, unknown> | undefined {
+  return capabilityIndex.capabilityIndexDatabase().prepare(`
+    SELECT *
+    FROM capability_operations
+    WHERE identifier = 'salesforce_sf_soql_query'
+      AND account_identity = 'reviewed_cli:host'
+  `).get() as Record<string, unknown> | undefined;
+}
+
+function capabilityTotalChanges(): number {
+  return (capabilityIndex.capabilityIndexDatabase().prepare(
+    'SELECT total_changes() AS changes',
+  ).get() as { changes: number }).changes;
+}
 
 test('unbounded run_shell_command still cannot enter local planning as a read', () => {
   assert.equal(local.isRegistryDeclaredLocalPlanningCapability('run_shell_command'), false);
@@ -92,6 +115,35 @@ test('connected catalog Salesforce CLI provisions a reviewed SOQL read that live
   assert.deepEqual(soql?.argvPrefix, ['data', 'query', '--json']);
   assert.equal(soql?.arguments.some((argument) => argument.token === '--query' && argument.required), true);
 
+  const registryPath = config.reviewedCliReadConfigPath();
+  const registryBeforeSecondBoot = readFileSync(registryPath);
+  const capabilityBeforeSecondBoot = salesforceCapabilityRow();
+  assert.ok(capabilityBeforeSecondBoot);
+  const capabilityChangesBeforeSecondBoot = capabilityTotalChanges();
+
+  const secondBoot = await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+  assert.equal(
+    secondBoot.provisioned.includes('salesforce'),
+    false,
+    'daemon rehash must not reprovision a current contract and executable',
+  );
+  assert.equal(secondBoot.skipped.includes('salesforce'), true, JSON.stringify(secondBoot));
+  assert.equal(
+    readFileSync(registryPath).equals(registryBeforeSecondBoot),
+    true,
+    'an unchanged daemon rehash must preserve the exact sealed registry bytes',
+  );
+  assert.deepEqual(
+    salesforceCapabilityRow(),
+    capabilityBeforeSecondBoot,
+    'an unchanged daemon rehash must preserve the indexed capability row',
+  );
+  assert.equal(
+    capabilityTotalChanges(),
+    capabilityChangesBeforeSecondBoot,
+    'an unchanged daemon rehash must not refresh capability or FTS rows',
+  );
+
   const installed = await acquisition.createProductionLiveReadAcquisitionRegistry().acquire({
     requirementId: 'requirement-salesforce-soql',
     objective: liveSearch,
@@ -113,6 +165,47 @@ test('connected catalog Salesforce CLI provisions a reviewed SOQL read that live
 
   const second = await reconcile.reconcileCatalogReviewedCliReads();
   assert.equal(second.provisioned.includes('salesforce'), false, 'same closed contract is not rehashed on a dashboard poll');
+});
+
+test('daemon rehash reprovisions the reviewed read when executable bytes drift', async () => {
+  catalog.recordConnectedCli(salesforce);
+  await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+  const before = config.listReviewedCliReadDescriptors()
+    .find((row) => row.descriptorId === 'salesforce.data.query');
+  assert.ok(before);
+  const registryPath = config.reviewedCliReadConfigPath();
+  const registryBeforeDrift = readFileSync(registryPath);
+  const executableBeforeDrift = readFileSync(fakeSf);
+  const capabilityChangesBeforeDrift = capabilityTotalChanges();
+
+  try {
+    writeFileSync(fakeSf, Buffer.concat([
+      executableBeforeDrift,
+      Buffer.from('\n// reviewed executable byte drift\n', 'utf8'),
+    ]));
+    chmodSync(fakeSf, 0o700);
+
+    const drift = await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    assert.equal(drift.provisioned.includes('salesforce'), true, JSON.stringify(drift));
+    assert.equal(drift.skipped.includes('salesforce'), false, JSON.stringify(drift));
+    const after = config.listReviewedCliReadDescriptors()
+      .find((row) => row.descriptorId === 'salesforce.data.query');
+    assert.ok(after);
+    assert.notEqual(after.binarySha256, before.binarySha256);
+    assert.ok(
+      capabilityTotalChanges() > capabilityChangesBeforeDrift,
+      'byte drift must refresh the indexed capability',
+    );
+    assert.equal(
+      readFileSync(registryPath).equals(registryBeforeDrift),
+      false,
+      'byte drift must replace the sealed descriptor',
+    );
+  } finally {
+    writeFileSync(fakeSf, executableBeforeDrift);
+    chmodSync(fakeSf, 0o700);
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+  }
 });
 
 test('CLI-only live-read acquire still installs when a sibling MCP carrier is unavailable', async () => {

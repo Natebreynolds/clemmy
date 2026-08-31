@@ -4,9 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  AUTOMATION_OPPORTUNITY_PROPOSAL_DB,
   WORK_TABLES,
+  classifyPackagedFirstBootAddedFile,
   isPackagedCapabilityAcquisitionMissingDetail,
+  isExactDaemonLeaseOwnerRecord,
+  isExactLegacyApprovalRetirement,
+  isExactV314TriggerRegistry,
+  normalizePackagedLogicalJson,
   notificationDeliverySettlement,
+  packagedRuntimeEnvironment,
   runPackagedV314DaemonRehearsal,
   sanitizePackagedGateEnvironment,
 } from './rehearse-v314-packaged-daemon.mts';
@@ -79,6 +86,121 @@ test('packaged gate environment drops checkout, npm lifecycle, credential, and t
     'npm_package_name', 'npm_lifecycle_event', 'npm_config_local_prefix',
     'CLEMMY_TEST_ISOLATED_HOME', 'CLEMENTINE_RESOURCES_PATH', 'MCP_AUTO_IMPORT_ENABLED', 'OPENAI_API_KEY',
   ]) assert.equal(cleaned[key], undefined, `${key} leaked into the packaged gate`);
+});
+
+test('packaged daemon and exercise PATH is the exact empty gate directory', () => {
+  const home = path.join(os.tmpdir(), 'clem-packaged-runtime-home');
+  const emptyPath = path.join(os.tmpdir(), 'clem-packaged-runtime-empty-path');
+  const runtime = packagedRuntimeEnvironment({
+    PATH: ['/usr/local/bin', '/opt/salesforce/bin', path.join(process.cwd(), 'node_modules/.bin')]
+      .join(path.delimiter),
+    Path: '/host/mixed-case-path',
+    HOME: '/host/home',
+    OPENAI_API_KEY: 'must-not-cross',
+    SAFE_RELEASE_FLAG: 'retained',
+  }, home, emptyPath);
+  assert.equal(runtime.PATH, emptyPath);
+  assert.equal(runtime.HOME, home);
+  assert.equal(runtime.CLEMENTINE_HOME, home);
+  assert.equal(runtime.CLEMMY_CLI_DISCOVERY_WARMUP, 'off');
+  assert.equal(runtime.CLEMMY_PROSPECTIVE_MEMORY, 'off');
+  assert.equal(runtime.CLEMMY_WORKFLOW_RUN_LANE, 'off');
+  assert.equal(runtime.OPENAI_API_KEY, undefined);
+  assert.equal(runtime.SAFE_RELEASE_FLAG, 'retained');
+  assert.deepEqual(Object.keys(runtime).filter((key) => key.toLowerCase() === 'path'), ['PATH']);
+  assert.doesNotMatch(runtime.PATH ?? '', /salesforce|node_modules/);
+});
+
+test('first-boot added-file classifier is closed over causal recovery, seed, scheduler, and owner paths', () => {
+  const eventFile = 'vault/00-System/workflows/upgrade-rehearsal-workflow/runs/run-1/events.jsonl';
+  const recovery = new Set([eventFile]);
+  const cases = [
+    ['cron/daemon-state.json', 'recovery_projection'],
+    [eventFile, 'recovery_projection'],
+    ['state/check-in-templates/seed-friday-wrap.json', 'deterministic_boot_seed'],
+    ['state/space-schedule-state.json', 'scheduler_observation'],
+    ['daemon.lock/owner-123e4567-e89b-12d3-a456-426614174000.json', 'ephemeral_process_owner'],
+    ['daemon.pid.123.123e4567-e89b-12d3-a456-426614174000.tmp', 'ephemeral_process_owner'],
+  ] as const;
+  for (const [file, category] of cases) {
+    assert.equal(classifyPackagedFirstBootAddedFile(file, recovery), category, file);
+  }
+  for (const file of [
+    'state/reviewed-cli-scan.json',
+    'state/capability-catalog.json',
+    'spaces/upgrade-rehearsal-space/data.json',
+    'state/operational-telemetry.json',
+    'vault/00-System/workflows/other/SKILL.md',
+  ]) assert.equal(classifyPackagedFirstBootAddedFile(file, recovery), 'unexpected', file);
+
+  const lease = {
+    version: 1,
+    pid: 123,
+    token: '123e4567-e89b-12d3-a456-426614174000',
+    startedAt: '2026-08-30T12:00:00.000Z',
+  };
+  assert.equal(isExactDaemonLeaseOwnerRecord(lease, 123, lease.token), true);
+  assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, pid: 124 }, 123, lease.token), false);
+  assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, extra: true }, 123, lease.token), false);
+});
+
+test('logical projection normalizes only proven scheduler and daemon cursors', () => {
+  assert.deepEqual(normalizePackagedLogicalJson('cron/daemon-state.json', {
+    lastHealthyTickAt: '2026-08-30T12:00:00.000Z',
+    lastCronEvaluatedAtMs: 10,
+    pendingCronOccurrences: { exact: true },
+  }), { pendingCronOccurrences: { exact: true } });
+  assert.deepEqual(normalizePackagedLogicalJson('cron/workflow-schedule-state.json', {
+    lastEvaluatedAtMs: 10,
+    pendingOccurrences: { exact: true },
+  }), { pendingOccurrences: { exact: true } });
+  assert.deepEqual(normalizePackagedLogicalJson('state/space-schedule-state.json', {
+    lastEvaluatedAtMs: 10,
+    lastRunByMinute: {},
+    lastReengageByKey: {},
+    pausedRetryBySlug: {},
+  }), { lastRunByMinute: {}, lastReengageByKey: {}, pausedRetryBySlug: {} });
+  for (const file of [
+    'state/reviewed-cli-scan.json',
+    'state/capability-catalog.json',
+    'spaces/upgrade-rehearsal-space/data.json',
+    'state/operational-telemetry.json',
+  ]) {
+    const exact = { lastEvaluatedAtMs: 10, exact: true } as const;
+    assert.deepEqual(normalizePackagedLogicalJson(file, exact), exact, file);
+  }
+});
+
+test('legacy approval file permits only one exact pending-to-rejected retirement', () => {
+  const before = [
+    { id: 'legacy-approval-v314-pending', status: 'pending', state: '{"fixture":true}' },
+    { id: 'legacy-approval-v314-approved', status: 'approved', state: '{"fixture":true}' },
+  ];
+  const first = [
+    { ...before[0], status: 'rejected' },
+    { ...before[1] },
+  ];
+  assert.equal(isExactLegacyApprovalRetirement(before, first, structuredClone(first)), true);
+  assert.equal(isExactLegacyApprovalRetirement(before, [
+    { ...first[0], state: '{"changed":true}' },
+    first[1],
+  ], structuredClone(first)), false);
+  assert.equal(isExactLegacyApprovalRetirement(before, [before[0], before[1]], [before[0], before[1]]), false);
+});
+
+test('v3.14 registry truth is one system event while schedule proof remains out of registry', () => {
+  const event = {
+    id: 'system-event',
+    kind: 'system_event',
+    event_type: 'upgrade.rehearsal.never-fired',
+    schedule: null,
+    timezone: null,
+  };
+  assert.equal(isExactV314TriggerRegistry([event]), true);
+  assert.equal(isExactV314TriggerRegistry([event, {
+    ...event, kind: 'schedule', event_type: null, schedule: '0 0 1 1 *', timezone: 'UTC',
+  }]), false);
+  assert.equal(AUTOMATION_OPPORTUNITY_PROPOSAL_DB, 'state/automation-opportunities/automation-opportunities.db');
 });
 
 test('packaged exercise is a package-root driver with no Clementine source import', () => {
