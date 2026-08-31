@@ -79,6 +79,7 @@ export interface PackagedDaemonLeaseObservation {
   leaseEntryCount: number;
   ownerCount: number;
   ownerPid: number | null;
+  ownerToken: string | null;
   ownerStartedAt: string | null;
 }
 
@@ -659,23 +660,29 @@ function observeDaemonLease(home: string, expectedPid: number): PackagedDaemonLe
     try {
       const token = /^owner-([A-Za-z0-9-]+)\.json$/.exec(owners[0]!)?.[1];
       const parsed = JSON.parse(readFileSync(path.join(leaseDir, owners[0]!), 'utf8')) as Record<string, unknown>;
-      return token && isExactDaemonLeaseOwnerRecord(parsed, expectedPid, token) ? parsed : null;
+      return token && isExactDaemonLeaseOwnerRecord(parsed, expectedPid, token)
+        ? { record: parsed, token }
+        : null;
     } catch {
       return null;
     }
   })();
-  const ownerPid = typeof owner?.pid === 'number' ? owner.pid : null;
-  const ownerStartedAt = typeof owner?.startedAt === 'string' ? owner.startedAt : null;
+  const ownerPid = typeof owner?.record.pid === 'number' ? owner.record.pid : null;
+  const ownerToken = owner?.token ?? null;
+  const ownerStartedAt = typeof owner?.record.startedAt === 'string' ? owner.record.startedAt : null;
   return {
     valid: projectedPid === expectedPid
       && leaseEntries.length === 1
       && owners.length === 1
-      && ownerPid === expectedPid,
+      && ownerPid === expectedPid
+      && ownerToken !== null
+      && ownerStartedAt !== null,
     expectedPid,
     projectedPid,
     leaseEntryCount: leaseEntries.length,
     ownerCount: owners.length,
     ownerPid,
+    ownerToken,
     ownerStartedAt,
   };
 }
@@ -686,6 +693,95 @@ function daemonLeaseIsAbsent(home: string): boolean {
     && readdirSync(home).every((name) =>
       !/^\.daemon-owner-[A-Za-z0-9-]+\.tmp$/.test(name)
       && !/^daemon\.pid\.[1-9]\d*\.[A-Za-z0-9-]+\.tmp$/.test(name));
+}
+
+function pidIsProvablyAbsent(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ESRCH';
+  }
+}
+
+function retainedDaemonLeaseExactlyMatches(input: {
+  home: string;
+  expectedPid: number;
+  expectedToken: string;
+  expectedStartedAt: string;
+}): boolean {
+  const { home, expectedPid, expectedToken, expectedStartedAt } = input;
+  if (!/^[a-f0-9-]+$/.test(expectedToken)) return false;
+  const pidFile = path.join(home, 'daemon.pid');
+  const leaseDir = path.join(home, 'daemon.lock');
+  const ownerFile = path.join(leaseDir, `owner-${expectedToken}.json`);
+  try {
+    const pidStat = lstatSync(pidFile);
+    const leaseStat = lstatSync(leaseDir);
+    const ownerStat = lstatSync(ownerFile);
+    const observed = observeDaemonLease(home, expectedPid);
+    const transientOwner = readdirSync(home).some((name) =>
+      /^\.daemon-owner-[A-Za-z0-9-]+\.tmp$/.test(name)
+      || /^daemon\.pid\.[1-9]\d*\.[A-Za-z0-9-]+\.tmp$/.test(name));
+    return pidStat.isFile() && !pidStat.isSymbolicLink()
+      && leaseStat.isDirectory() && !leaseStat.isSymbolicLink()
+      && ownerStat.isFile() && !ownerStat.isSymbolicLink()
+      && readFileSync(pidFile, 'utf8') === `${expectedPid}\n`
+      && observed.valid
+      && observed.ownerToken === expectedToken
+      && observed.ownerStartedAt === expectedStartedAt
+      && !transientOwner;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Establish a rehearsal-only authority to run the installed package's normal
+ * stale-owner cleanup. Preparation is read-only and succeeds only while the
+ * retained PID projection, owner token, and owner generation exactly match the
+ * already-dead child. The returned operation revalidates that identity before
+ * every invocation and is deliberately idempotent.
+ */
+export function prepareExitedPackagedDaemonLeaseCleanup(input: {
+  home: string;
+  expectedPid: number;
+  expectedToken: string;
+  expectedStartedAt: string;
+  runInstalledDaemonStop: () => void;
+}): () => { cleaned: boolean; alreadyClean: boolean } {
+  const home = assertDisposable(input.home, 'packaged daemon cleanup home');
+  const identity = {
+    home,
+    expectedPid: input.expectedPid,
+    expectedToken: input.expectedToken,
+    expectedStartedAt: input.expectedStartedAt,
+  };
+  if (!pidIsProvablyAbsent(identity.expectedPid)) {
+    throw new Error(`refused packaged daemon lease cleanup while PID ${identity.expectedPid} is live or unreadable`);
+  }
+  if (!retainedDaemonLeaseExactlyMatches(identity)) {
+    throw new Error('retained packaged daemon lease is not the exact exited owner');
+  }
+
+  return () => {
+    if (!pidIsProvablyAbsent(identity.expectedPid)) {
+      throw new Error(`refused packaged daemon lease cleanup while PID ${identity.expectedPid} is live or unreadable`);
+    }
+    const alreadyClean = daemonLeaseIsAbsent(home);
+    if (!alreadyClean && !retainedDaemonLeaseExactlyMatches(identity)) {
+      throw new Error('retained packaged daemon lease is not the exact exited owner');
+    }
+    input.runInstalledDaemonStop();
+    if (!daemonLeaseIsAbsent(home)) {
+      throw new Error('installed packaged daemon stop did not remove the exact stale PID/owner lease');
+    }
+    return {
+      cleaned: !alreadyClean,
+      alreadyClean,
+    };
+  };
 }
 
 function parseBuild(stdout: string): PackagedDaemonBuild | null {
@@ -915,6 +1011,23 @@ async function bootPackagedDaemon(
     await waitForExit(child, 5_000).catch(() => undefined);
     throw error;
   }
+  if (liveLease.ownerToken === null || liveLease.ownerStartedAt === null) {
+    throw new Error(`packaged daemon boot ${ordinal} lost its observed lease identity before cleanup`);
+  }
+  const cleanupExitedLease = prepareExitedPackagedDaemonLeaseCleanup({
+    home,
+    expectedPid: pid,
+    expectedToken: liveLease.ownerToken,
+    expectedStartedAt: liveLease.ownerStartedAt,
+    runInstalledDaemonStop: () => {
+      const installedRoot = path.dirname(path.dirname(packageEntry));
+      run(process.execPath, [packageEntry, 'daemon', 'stop'], {
+        cwd: installedRoot,
+        env: daemonEnv(home, hermeticRuntimePath),
+      });
+    },
+  });
+  cleanupExitedLease();
   const postExitLeaseClean = daemonLeaseIsAbsent(home);
   if (!postExitLeaseClean) {
     throw new Error(`packaged daemon boot ${ordinal} left PID/owner lease artifacts after clean exit`);

@@ -15,11 +15,35 @@ import {
   normalizePackagedLogicalJson,
   notificationDeliverySettlement,
   packagedRuntimeEnvironment,
+  prepareExitedPackagedDaemonLeaseCleanup,
   runPackagedV314DaemonRehearsal,
   sanitizePackagedGateEnvironment,
   seedPackagedGateState,
 } from './rehearse-v314-packaged-daemon.mts';
 import { V314_GATE_MACHINE_ID } from './rehearse-v314-upgrade.mts';
+
+const PROVABLY_DEAD_PID = 2_147_483_647;
+const LEASE_TOKEN = '123e4567-e89b-42d3-a456-426614174000';
+const LEASE_STARTED_AT = '2026-08-30T12:00:00.000Z';
+
+function writeDaemonLeaseFixture(input: {
+  home: string;
+  pid?: number;
+  token?: string;
+  startedAt?: string;
+}): void {
+  const pid = input.pid ?? PROVABLY_DEAD_PID;
+  const token = input.token ?? LEASE_TOKEN;
+  const startedAt = input.startedAt ?? LEASE_STARTED_AT;
+  mkdirSync(path.join(input.home, 'daemon.lock'), { recursive: true });
+  writeFileSync(path.join(input.home, 'daemon.pid'), `${pid}\n`);
+  writeFileSync(path.join(input.home, 'daemon.lock', `owner-${token}.json`), JSON.stringify({
+    version: 1,
+    pid,
+    token,
+    startedAt,
+  }));
+}
 
 function writeNotificationState(
   home: string,
@@ -198,6 +222,104 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
   assert.equal(isExactDaemonLeaseOwnerRecord(lease, 123, lease.token), true);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, pid: 124 }, 123, lease.token), false);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, extra: true }, 123, lease.token), false);
+});
+
+test('packaged rehearsal reclaims only its exact dead owner and cleanup is idempotent', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-packaged-dead-lease-'));
+  let stopCalls = 0;
+  try {
+    writeDaemonLeaseFixture({ home });
+    const cleanup = prepareExitedPackagedDaemonLeaseCleanup({
+      home,
+      expectedPid: PROVABLY_DEAD_PID,
+      expectedToken: LEASE_TOKEN,
+      expectedStartedAt: LEASE_STARTED_AT,
+      runInstalledDaemonStop: () => {
+        stopCalls += 1;
+        rmSync(path.join(home, 'daemon.pid'), { force: true });
+        rmSync(path.join(home, 'daemon.lock'), { recursive: true, force: true });
+      },
+    });
+    assert.deepEqual(cleanup(), {
+      cleaned: true,
+      alreadyClean: false,
+    });
+    assert.equal(existsSync(path.join(home, 'daemon.pid')), false);
+    assert.equal(existsSync(path.join(home, 'daemon.lock')), false);
+    assert.deepEqual(cleanup(), {
+      cleaned: false,
+      alreadyClean: true,
+    });
+    assert.equal(stopCalls, 2, 'the installed daemon stop path remains a safe idempotent operation');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('packaged rehearsal cannot clear mismatched, live, or structurally unsafe lease evidence', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-packaged-unsafe-lease-'));
+  let stopCalls = 0;
+  const runner = (): void => { stopCalls += 1; };
+  try {
+    const mismatched = path.join(root, 'mismatched');
+    writeDaemonLeaseFixture({ home: mismatched });
+    assert.throws(() => prepareExitedPackagedDaemonLeaseCleanup({
+      home: mismatched,
+      expectedPid: PROVABLY_DEAD_PID,
+      expectedToken: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      expectedStartedAt: LEASE_STARTED_AT,
+      runInstalledDaemonStop: runner,
+    }), /not the exact exited owner/);
+    assert.equal(existsSync(path.join(mismatched, 'daemon.pid')), true);
+
+    const live = path.join(root, 'live');
+    writeDaemonLeaseFixture({ home: live, pid: process.pid });
+    assert.throws(() => prepareExitedPackagedDaemonLeaseCleanup({
+      home: live,
+      expectedPid: process.pid,
+      expectedToken: LEASE_TOKEN,
+      expectedStartedAt: LEASE_STARTED_AT,
+      runInstalledDaemonStop: runner,
+    }), /while PID .* is live or unreadable/);
+    assert.equal(existsSync(path.join(live, 'daemon.pid')), true);
+
+    const unsafe = path.join(root, 'unsafe');
+    writeDaemonLeaseFixture({ home: unsafe });
+    writeFileSync(path.join(unsafe, 'daemon.lock', 'unexpected-owner-evidence'), 'unsafe');
+    assert.throws(() => prepareExitedPackagedDaemonLeaseCleanup({
+      home: unsafe,
+      expectedPid: PROVABLY_DEAD_PID,
+      expectedToken: LEASE_TOKEN,
+      expectedStartedAt: LEASE_STARTED_AT,
+      runInstalledDaemonStop: runner,
+    }), /not the exact exited owner/);
+    assert.equal(existsSync(path.join(unsafe, 'daemon.lock', 'unexpected-owner-evidence')), true);
+    assert.equal(stopCalls, 0, 'no stop command may run without an exact dead-owner proof');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('packaged rehearsal never reports cleanup success when daemon stop leaves the lease behind', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-packaged-false-clean-'));
+  try {
+    writeDaemonLeaseFixture({ home });
+    const cleanup = prepareExitedPackagedDaemonLeaseCleanup({
+      home,
+      expectedPid: PROVABLY_DEAD_PID,
+      expectedToken: LEASE_TOKEN,
+      expectedStartedAt: LEASE_STARTED_AT,
+      runInstalledDaemonStop: () => undefined,
+    });
+    assert.throws(
+      () => cleanup(),
+      /installed packaged daemon stop did not remove the exact stale PID\/owner lease/,
+    );
+    assert.equal(existsSync(path.join(home, 'daemon.pid')), true);
+    assert.equal(existsSync(path.join(home, 'daemon.lock')), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('logical projection normalizes only proven scheduler and daemon cursors', () => {
