@@ -1521,13 +1521,14 @@ function addedFilesByCategory(
   return categories;
 }
 
-function validDeterministicBootSeed(home: string, relativePath: string): boolean {
+export function validDeterministicBootSeed(home: string, relativePath: string): boolean {
   if (relativePath === 'state/starter-workspace-offer.json') {
     const record = readJsonStateRecord(home, relativePath);
     return isExactStarterWorkspaceOfferSeed(record, record, record);
   }
-  const checkInId = /^state\/check-in-templates\/(seed-[a-z-]+)\.json$/.exec(relativePath)?.[1]
-    as (typeof CHECK_IN_SEED_IDS)[number] | undefined;
+  const checkInId = (
+    /^state\/check-in-templates\/(seed-[a-z-]+)\.json$/.exec(relativePath)?.[1]
+  ) as (typeof CHECK_IN_SEED_IDS)[number] | undefined;
   if (checkInId && checkInId in CHECK_IN_SEED_TRIGGERS) {
     const record = readJsonStateRecord(home, relativePath);
     if (!record) return false;

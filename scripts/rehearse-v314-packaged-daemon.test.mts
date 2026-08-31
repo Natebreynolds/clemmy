@@ -23,6 +23,7 @@ import {
   runPackagedV314DaemonRehearsal,
   sanitizePackagedGateEnvironment,
   seedPackagedGateState,
+  validDeterministicBootSeed,
 } from './rehearse-v314-packaged-daemon.mts';
 import { V314_GATE_MACHINE_ID } from './rehearse-v314-upgrade.mts';
 
@@ -269,6 +270,31 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
   assert.equal(isExactDaemonLeaseOwnerRecord(lease, 123, lease.token), true);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, pid: 124 }, 123, lease.token), false);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, extra: true }, 123, lease.token), false);
+});
+
+test('deterministic check-in seed validation executes the typed identifier branch at runtime', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-packaged-check-in-seed-'));
+  const relativePath = 'state/check-in-templates/seed-inbox-backlog.json';
+  const createdAt = '2026-08-30T12:00:00.000Z';
+  try {
+    mkdirSync(path.join(home, 'state', 'check-in-templates'), { recursive: true });
+    writeFileSync(path.join(home, relativePath), JSON.stringify({
+      id: 'seed-inbox-backlog',
+      seededId: 'seed-inbox-backlog',
+      agentSlug: 'clementine',
+      version: 'v1',
+      enabled: false,
+      trigger: 'inbox_backed_up',
+      inboxThreshold: 10,
+      questionTemplate: 'What should I prioritize?',
+      createdAt,
+      updatedAt: createdAt,
+    }));
+    assert.equal(validDeterministicBootSeed(home, relativePath), true);
+    assert.equal(validDeterministicBootSeed(home, 'state/check-in-templates/seed-unknown.json'), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('recovered workflow activity projection accepts exactly two failed recoveries, one exercise, and a stable boot two', () => {
