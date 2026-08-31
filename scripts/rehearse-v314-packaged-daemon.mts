@@ -9,11 +9,14 @@
 import { spawn, spawnSync, execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  closeSync,
   cpSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -28,6 +31,7 @@ import {
   inspectV314RehearsalHome,
   REQUIRED_FIXTURE_IDENTITIES,
   runV314UpgradeRehearsal,
+  V314_GATE_MACHINE_ID,
   type HomeInspection,
 } from './rehearse-v314-upgrade.mts';
 import { fingerprintRuntimeSourceFromGit } from '../src/runtime/source-fingerprint.ts';
@@ -160,7 +164,6 @@ export const AUTOMATION_OPPORTUNITY_PROPOSAL_DB =
   'state/automation-opportunities/automation-opportunities.db';
 export const HARNESS_DB = 'state/harness.db';
 
-const V314_GATE_MACHINE_ID = 'upgrade-rehearsal-machine-v314';
 const V314_GATE_PROACTIVITY_POLICY = Object.freeze({
   enabled: false,
   updatedAt: '1970-01-01T00:00:00.000Z',
@@ -528,15 +531,73 @@ interface PackagedGateSeeds {
   digests: Record<string, string>;
 }
 
-function seedPackagedGateState(home: string): PackagedGateSeeds {
+export interface V314FixtureMachineIdCandidate {
+  present: boolean;
+  regularFile: boolean;
+  symbolicLink: boolean;
+  byteLength: number;
+  bytes?: string;
+}
+
+/** Pure fail-closed boundary used before the packaged rehearsal trusts an identity. */
+export function isExactV314FixtureMachineIdCandidate(
+  candidate: V314FixtureMachineIdCandidate,
+): boolean {
+  const expected = `${V314_GATE_MACHINE_ID}\n`;
+  return candidate.present
+    && candidate.regularFile
+    && !candidate.symbolicLink
+    && candidate.byteLength === Buffer.byteLength(expected, 'utf8')
+    && candidate.bytes === expected;
+}
+
+function readExactV314FixtureMachineId(home: string): string {
+  const machineIdPath = path.join(home, 'state', 'machine-id');
+  const expected = `${V314_GATE_MACHINE_ID}\n`;
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(machineIdPath);
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error
+      ? String((error as NodeJS.ErrnoException).code)
+      : 'unknown';
+    throw new Error(`packaged v3.14 fixture machine-id is missing or unreadable (${code})`);
+  }
+  if (
+    !stat.isFile()
+    || stat.isSymbolicLink()
+    || stat.size !== Buffer.byteLength(expected, 'utf8')
+  ) {
+    throw new Error('packaged v3.14 fixture machine-id must be the exact bounded regular fixture file');
+  }
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(machineIdPath, 'r');
+    const opened = fstatSync(descriptor);
+    const bytes = readFileSync(descriptor, 'utf8');
+    const unchanged = opened.dev === stat.dev && opened.ino === stat.ino;
+    if (!unchanged || !isExactV314FixtureMachineIdCandidate({
+      present: true,
+      regularFile: opened.isFile(),
+      symbolicLink: false,
+      byteLength: opened.size,
+      bytes,
+    })) {
+      throw new Error('packaged v3.14 fixture machine-id does not match the deterministic fixture identity');
+    }
+    return bytes;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+export function seedPackagedGateState(home: string): PackagedGateSeeds {
   const utcDay = new Date().toISOString().slice(0, 10);
-  const stateDir = path.join(home, 'state');
-  mkdirSync(stateDir, { recursive: true });
+  const machineIdBytes = readExactV314FixtureMachineId(home);
   const maintenanceState = Object.fromEntries(
     DAILY_MAINTENANCE_CURSOR_KEYS.map((key) => [key, utcDay]),
   );
   const seeds: Record<string, string> = {
-    'state/machine-id': `${V314_GATE_MACHINE_ID}\n`,
     'state/proactivity-policy.json': `${JSON.stringify(V314_GATE_PROACTIVITY_POLICY, null, 2)}\n`,
     'state/memory-maintenance-state.json': `${JSON.stringify(maintenanceState, null, 2)}\n`,
   };
@@ -545,7 +606,10 @@ function seedPackagedGateState(home: string): PackagedGateSeeds {
   }
   return {
     utcDay,
-    digests: Object.fromEntries(Object.entries(seeds).map(([name, bytes]) => [name, sha256(bytes)])),
+    digests: {
+      'state/machine-id': sha256(machineIdBytes),
+      ...Object.fromEntries(Object.entries(seeds).map(([name, bytes]) => [name, sha256(bytes)])),
+    },
   };
 }
 

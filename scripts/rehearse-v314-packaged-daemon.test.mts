@@ -10,13 +10,16 @@ import {
   isPackagedCapabilityAcquisitionMissingDetail,
   isExactDaemonLeaseOwnerRecord,
   isExactLegacyApprovalRetirement,
+  isExactV314FixtureMachineIdCandidate,
   isExactV314TriggerRegistry,
   normalizePackagedLogicalJson,
   notificationDeliverySettlement,
   packagedRuntimeEnvironment,
   runPackagedV314DaemonRehearsal,
   sanitizePackagedGateEnvironment,
+  seedPackagedGateState,
 } from './rehearse-v314-packaged-daemon.mts';
+import { V314_GATE_MACHINE_ID } from './rehearse-v314-upgrade.mts';
 
 function writeNotificationState(
   home: string,
@@ -57,6 +60,59 @@ test('packaged work accounting includes schema-v69 model-result projection recei
     WORK_TABLES.includes('logical_model_result_projection_receipts'),
     'a receipt created or removed on the second boot must make the packaged fixed-point gate fail',
   );
+});
+
+test('packaged fixture machine identity accepts only the exact bounded regular file', () => {
+  const bytes = `${V314_GATE_MACHINE_ID}\n`;
+  const exact = {
+    present: true,
+    regularFile: true,
+    symbolicLink: false,
+    byteLength: Buffer.byteLength(bytes),
+    bytes,
+  };
+  assert.equal(isExactV314FixtureMachineIdCandidate(exact), true);
+  assert.equal(isExactV314FixtureMachineIdCandidate({ ...exact, present: false }), false);
+  assert.equal(isExactV314FixtureMachineIdCandidate({ ...exact, regularFile: false }), false);
+  assert.equal(isExactV314FixtureMachineIdCandidate({ ...exact, symbolicLink: true }), false);
+  assert.equal(isExactV314FixtureMachineIdCandidate({ ...exact, byteLength: exact.byteLength + 1 }), false);
+  assert.equal(isExactV314FixtureMachineIdCandidate({ ...exact, bytes: `${V314_GATE_MACHINE_ID}!` }), false);
+});
+
+test('packaged gate preserves the preseeded fixture identity and refuses missing or mismatched identity', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-v314-machine-id-test-'));
+  const exactHome = path.join(root, 'exact');
+  const missingHome = path.join(root, 'missing');
+  const mismatchHome = path.join(root, 'mismatch');
+  const expected = `${V314_GATE_MACHINE_ID}\n`;
+  try {
+    for (const home of [exactHome, missingHome, mismatchHome]) {
+      mkdirSync(path.join(home, 'state'), { recursive: true });
+    }
+    const exactPath = path.join(exactHome, 'state', 'machine-id');
+    writeFileSync(exactPath, expected, { encoding: 'utf8', flag: 'wx' });
+    seedPackagedGateState(exactHome);
+    assert.equal(readFileSync(exactPath, 'utf8'), expected, 'the copied v3.14 identity was overwritten');
+
+    assert.throws(
+      () => seedPackagedGateState(missingHome),
+      /machine-id is missing or unreadable/,
+    );
+    writeFileSync(path.join(mismatchHome, 'state', 'machine-id'), 'x'.repeat(expected.length), {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
+    assert.throws(
+      () => seedPackagedGateState(mismatchHome),
+      /does not match the deterministic fixture identity/,
+    );
+    for (const home of [missingHome, mismatchHome]) {
+      assert.equal(existsSync(path.join(home, 'state', 'proactivity-policy.json')), false);
+      assert.equal(existsSync(path.join(home, 'state', 'memory-maintenance-state.json')), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('packaged gate environment drops checkout, npm lifecycle, credential, and test authority', () => {

@@ -50,6 +50,13 @@ export const V314_RELEASE = Object.freeze({
 });
 
 /**
+ * Deterministic install identity owned by the disposable v3.14 fixture.
+ * Seed it before importing any exact-tag module because legacy tool-choice
+ * paths may otherwise create a random identity as a read-side effect.
+ */
+export const V314_GATE_MACHINE_ID = 'upgrade-rehearsal-machine-v314';
+
+/**
  * The v3.16 release pins schema 69's model-result projection receipt to
  * lineage and digest metadata only. The projected result stays in the
  * accepted model history; the migration must not create a second payload
@@ -359,6 +366,12 @@ async function seedV314Fixture(checkout: string, home: string): Promise<void> {
   assertDisposablePath(checkout, 'exact-tag checkout');
   assertDisposablePath(home, 'legacy fixture home');
   mkdirSync(home, { recursive: true });
+  const stateDir = path.join(home, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, 'machine-id'), `${V314_GATE_MACHINE_ID}\n`, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
 
   const eventlog = await importFrom(checkout, 'src/runtime/harness/eventlog.ts') as {
     createSession(input: Record<string, unknown>): unknown;
