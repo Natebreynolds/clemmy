@@ -268,6 +268,7 @@ export function buildWorkflowImprovementPrompt(input: {
     '3. Re-author each legacy script step as exact `call` steps for the external reads/writes the script performed — one call step per provider operation, with the exact operation name (use tool_search to find the exact reviewed CLI read or provider action; do not invent names) and the literal arguments the script used — plus a `transform` step or a short prose step for the pure computation/rendering the script did. Keep the same output contract (required_keys / non_empty) that downstream steps consume; if the old step produced several fields, the last new step must produce all of them.',
     '4. Write the improved definition with workflow_update, sending the COMPLETE steps array (it replaces the whole graph). Do not disable the workflow. Do not change its name.',
     '5. End with a 3–6 line plain-language note for the user: which step changed, what it does now, and anything they should glance at.',
+    '6. Do not ask the user questions and do not stop at a proposal — nobody is in this session. Where the script did something exact steps cannot express (runtime-built queries, a local state file, a delta against a previous run), choose the option that preserves the MOST of the original behavior, drop only what cannot be expressed, and say exactly what was dropped in the final note; the user can steer from that note afterwards.',
     '',
     'Step shapes the runner executes (no other step kinds; do not search for documentation):',
     '- exact provider read/write:  { id, prompt: "", side_effect: read|write|send, call: { tool: <exact operation name from tool_search>, args: { ...literal arguments } }, output: { type: object, required_keys: [stdout], non_empty: [stdout] } }',
@@ -444,14 +445,21 @@ export async function runWorkflowImprovement(input: {
   if (!guard.ok) {
     revertWorkflowDefinitionFile(entry, backupPath);
     const detail = guard.violations.join('; ');
-    updateRequest(request.slug, { status: 'failed', finishedAt: new Date(now()).toISOString(), detail }, input.stateFile);
+    const modelNote = text.trim().slice(0, 1_200);
+    updateRequest(request.slug, {
+      status: 'failed',
+      finishedAt: new Date(now()).toISOString(),
+      detail: modelNote ? `${detail}\n\nClem's note: ${modelNote}` : detail,
+    }, input.stateFile);
     logger.warn({ slug: request.slug, violations: guard.violations }, 'workflow self-improvement rejected by the intent guard; definition reverted');
     return {
       slug: request.slug,
       status: 'failed',
       backupPath,
       violations: guard.violations,
-      summary: `The rewrite did not keep the workflow's intent or is still not runnable (${detail}); the original definition was restored.`,
+      // The model's own closing note (often the exact fork it could not
+      // resolve) rides with the failure so the user can steer from it.
+      summary: `The rewrite did not keep the workflow's intent or is still not runnable (${detail}); the original definition was restored.${modelNote ? `\n\nClem's note: ${modelNote}` : ''}`,
     };
   }
   updateRequest(request.slug, {

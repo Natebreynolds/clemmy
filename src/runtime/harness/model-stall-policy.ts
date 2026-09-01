@@ -10,11 +10,13 @@ export function modelStreamStallMs(): number {
   return raw <= 0 ? 0 : raw;
 }
 
-/** Shared first-content wall used by streaming transports. */
+/** Shared first-content wall used by streaming transports. 2026-09-01: 75s →
+ * 180s together with the brain fallover budget (60s → 150s), which must stay
+ * strictly below this wall; see brainFalloverFirstByteMs. */
 export function modelFirstByteStallMs(): number {
   const ceiling = modelStreamStallMs();
   const raw = Number.parseInt(
-    getRuntimeEnv('CLEMMY_MODEL_FIRST_BYTE_STALL_MS', '75000') ?? '75000',
+    getRuntimeEnv('CLEMMY_MODEL_FIRST_BYTE_STALL_MS', '180000') ?? '180000',
     10,
   );
   if (!Number.isFinite(raw) || raw <= 0) return ceiling;

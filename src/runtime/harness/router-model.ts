@@ -81,14 +81,17 @@ function brainFalloverEnabled(): boolean {
  *  default 75s) so a hung provider falls over to the next brain instead of dead-ending. */
 function brainFalloverFirstByteMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS', '') || '', 10);
-  // 60s: the fallover budget MUST stay strictly below the loop's first-byte stall
-  // watchdog (~75s) — otherwise the watchdog kills the turn before fallover can
-  // switch brains, DISABLING cross-brain fallover for a silent hang (the exact
-  // case it exists for; adversarial review 07-06 caught a 90s value regressing
-  // this). Giving high-effort turns more first-byte headroom requires raising the
-  // watchdog AND the fallover budget together (a coordinated follow-up), not this
-  // value alone. Tunable via CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS.
-  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+  // The fallover budget MUST stay strictly below the loop's first-byte stall
+  // watchdog (modelFirstByteStallMs) — otherwise the watchdog kills the turn
+  // before fallover can switch brains, DISABLING cross-brain fallover for a
+  // silent hang (adversarial review 07-06 caught a 90s value regressing this
+  // against a 75s watchdog). 2026-09-01: raised from 60s to 150s TOGETHER with
+  // the watchdog (75s → 180s): a 45k-token authoring prompt on Sonnet crossed
+  // 60s before its first content twice, was silenced, and the turn fell to a
+  // rate-limited rescue. Interactive foreground turns keep their own 60s
+  // pre-actionable wall (modelInteractivePreActionableMs); this budget governs
+  // silence, not UX pace. Tunable via CLEMMY_BRAIN_FALLOVER_FIRST_BYTE_MS.
+  return Number.isFinite(raw) && raw > 0 ? raw : 150_000;
 }
 
 /** BYO's fallover budget, kept strictly under the loop's first-byte watchdog. */
