@@ -126,6 +126,10 @@ import { DISCORD_BOT_TOKEN, DISCORD_ENABLED, WEBHOOK_ENABLED, WEBHOOK_SECRET } f
 import { getOrRefreshScan as warmCliScan } from '../runtime/cli-discovery.js';
 import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import {
+  listPendingWorkflowImprovements,
+  runWorkflowImprovement,
+} from '../execution/workflow-self-improvement.js';
+import {
   finalizeExtractedFactEntityEvidenceOnBoot,
   finalizeGroundedEntityLinksOnBoot,
   finalizeGroundedResourceLinksOnBoot,
@@ -1051,6 +1055,88 @@ interface CronScheduleLane {
 // single-flight lane owns the turn while the main loop continues scheduling,
 // watchdog, autonomy, and report-back work.
 let cronScheduleLaneInFlight: CronScheduleLane | undefined;
+
+let workflowImprovementLaneInFlight = false;
+
+/**
+ * Workflow self-improvement consumer. A workflow the queue could not run
+ * because of a legacy script step left a durable request; run one at a time
+ * through the same system-turn bridge cron uses, then notify and re-queue
+ * the run that asked. Never blocks the tick: the turn runs off the loop.
+ */
+async function processWorkflowImprovements(assistant: ClementineAssistant): Promise<void> {
+  if (workflowImprovementLaneInFlight) return;
+  const [request] = listPendingWorkflowImprovements();
+  if (!request) return;
+  workflowImprovementLaneInFlight = true;
+  void (async () => {
+    try {
+      const outcome = await runWorkflowImprovement({
+        request,
+        model: MODELS.primary,
+        executeTurn: async (turn) => {
+          const response = await cronResponseExecutor(assistant, {
+            sessionId: turn.sessionId,
+            runId: turn.runId,
+            channel: turn.channel,
+            message: turn.message,
+            ...(turn.model ? { model: turn.model } : {}),
+            maxWallClockMs: turn.maxWallClockMs,
+          });
+          return { text: response.text };
+        },
+        openScope: (scope) => {
+          openPlanScope({
+            sessionId: scope.sessionId,
+            planProposalId: scope.planProposalId,
+            approvedPlanObjective: scope.approvedPlanObjective,
+            allowedTools: ['*'],
+            attemptBound: true,
+          });
+        },
+        closeScope: (sessionId, reason) => closePlanScope(sessionId, reason),
+      });
+      const observedAt = new Date().toISOString();
+      if (outcome.status === 'done') {
+        const { queueWorkflowRun } = await import('../tools/workflow-run-queue.js');
+        let requeue: string;
+        try {
+          const queued = queueWorkflowRun(request.slug, {}, { source: request.source, dedupe: false });
+          requeue = queued.status === 'queued'
+            ? `Running it now (run ${queued.id ?? '?'}).`
+            : `Re-queue result: ${queued.status} — ${queued.message}`;
+        } catch (error) {
+          requeue = `Re-queue failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        addNotification({
+          id: `workflow-improvement-${request.slug}-${Date.now()}`,
+          kind: 'workflow',
+          title: `Improved before running: ${request.slug}`,
+          body: `${outcome.summary}\n\n${requeue}\nThe previous definition is kept at ${outcome.backupPath ?? 'its backup file'} if you want to compare or revert.`,
+          createdAt: observedAt,
+          read: false,
+          metadata: { workflow: request.slug, source: request.source, status: 'improved', backupPath: outcome.backupPath },
+        });
+        logger.info({ slug: request.slug, requeue }, 'workflow self-improvement applied and run re-queued');
+      } else {
+        addNotification({
+          id: `workflow-improvement-${request.slug}-${Date.now()}-failed`,
+          kind: 'workflow',
+          title: `Could not improve: ${request.slug}`,
+          body: `${outcome.summary}\n\nNothing ran and nothing changed. ${outcome.violations?.length ? `Checks that failed: ${outcome.violations.join('; ')}.` : ''}`.trim(),
+          createdAt: observedAt,
+          read: false,
+          metadata: { workflow: request.slug, source: request.source, status: 'improvement_failed', violations: outcome.violations ?? [] },
+        });
+        logger.warn({ slug: request.slug, violations: outcome.violations }, 'workflow self-improvement failed; definition reverted');
+      }
+    } catch (error) {
+      logger.error({ slug: request.slug, err: error instanceof Error ? error.message : String(error) }, 'workflow self-improvement consumer failed');
+    } finally {
+      workflowImprovementLaneInFlight = false;
+    }
+  })();
+}
 
 async function processCronSchedules(assistant: ClementineAssistant, state: DaemonState, now: Date = new Date()): Promise<void> {
   normalizeDaemonScheduleState(state);
@@ -3243,6 +3329,7 @@ export async function startDaemon(
     tickCount++;
     setDaemonRuntimePhase('daemon.loop.tick', { tickCount });
     await withDaemonRuntimePhase('daemon.loop.cron_schedules', { tickCount }, () => processCronSchedules(assistant, state));
+    await withDaemonRuntimePhase('daemon.loop.workflow_improvements', { tickCount }, () => processWorkflowImprovements(assistant));
     await withDaemonRuntimePhase('daemon.loop.cron_triggers', { tickCount }, () => processCronTriggers(assistant));
     await withDaemonRuntimePhase('daemon.loop.plan_task_preparation_recovery', { tickCount }, async () => {
       try {

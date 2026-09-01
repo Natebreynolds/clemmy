@@ -1056,7 +1056,7 @@ export function exactScheduledSendCallEligibility(
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   if (!step.deterministic) return null;
   const runner = typeof step.deterministic.runner === 'string' ? step.deterministic.runner.trim() : '';
-  if (!runner) return `Step "${step.id}" has deterministic config but no runner. Add deterministic.runner pointing at a scripts/ helper or remove deterministic.`;
+  if (!runner) return `Step "${step.id}" has deterministic config but no runner. Script runners are retired: express external work as exact \`call\` steps and pure computation as a \`transform\` step, then remove \`deterministic\`.`;
   if (runner.includes('..') || runner.startsWith('/') || /\s/.test(runner)) {
     return `Step "${step.id}" deterministic runner must be a relative scripts/ path with no inline arguments.`;
   }

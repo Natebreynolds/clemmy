@@ -20,6 +20,7 @@ import { listWorkflows, type WorkflowDefinition } from '../memory/workflow-store
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
 import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
+import { requestWorkflowImprovement, workflowImprovementHoldMessage } from '../execution/workflow-self-improvement.js';
 import {
   buildWorkflowMutationContractSnapshot,
   isWorkflowMutationContractSnapshot,
@@ -2524,6 +2525,25 @@ function queueWorkflowRunUnlocked(
     // readiness is red so the user can still Skip it; Resume rechecks the
     // current workflow and leaves the record held until blockers are fixed.
     persistReadinessBlock = !readiness.ok && scheduledReadinessBlock !== undefined;
+    if (!readiness.ok) {
+      // A legacy script step is not a dead end: Clem re-authors it herself
+      // (workflow-self-improvement.ts) and this run is re-queued when the
+      // rewrite passes its checks. A scheduled occurrence still persists its
+      // durable readiness block below so the schedule ledger stays honest.
+      const improvement = requestWorkflowImprovement({
+        slug: workflowEntry.name,
+        definition: workflowEntry.data,
+        readiness,
+        source: normalizedOptionalString(opts?.source) ?? 'manual',
+      });
+      if (improvement && !catchupHold && !persistReadinessBlock) {
+        return {
+          status: 'held',
+          message: workflowImprovementHoldMessage(workflowEntry.name, improvement.request.runners),
+          readiness,
+        };
+      }
+    }
     if (!readiness.ok && !catchupHold && !persistReadinessBlock) {
       return {
         status: 'blocked_readiness',
