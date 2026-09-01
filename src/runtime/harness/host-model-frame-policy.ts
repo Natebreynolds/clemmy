@@ -52,11 +52,23 @@ export type HostModelFrameDisposition =
     }
   | { kind: 'refused'; reason: HostModelFrameRefusal };
 
-const SINGLE_ACTION_WORK_CALL_FIELDS = new Set([
+/** Every key the host-planned work_call transport schema can materialize.
+ *
+ * Strict materialization injects `null` for each absent required+nullable
+ * key BEFORE this policy classifies the frame, so this set must mirror
+ * `HostPlannedWorkCallInputSchema.shape` exactly: a schema field missing here
+ * silently disables the sole-action lane (every dependency-free once-mutation
+ * is refused `host_planned_work_call_requires_plan_sibling`, then the
+ * no-progress governor terminalizes the turn). The mirror is pinned by
+ * `work-call-inner-schema.test.ts`; a field added to the schema must be
+ * added here with its sole-action rule below. */
+export const SINGLE_ACTION_WORK_CALL_FIELDS: ReadonlySet<string> = new Set([
   'requirement_id',
   'universe_item_id',
   'universe_selector',
   'seal_amendment',
+  'source_call_ids',
+  'source_record_ids',
   'name',
   'args_json',
 ]);
@@ -79,6 +91,11 @@ function exactSingleActionMutation(
     || (value.universe_item_id !== undefined && value.universe_item_id !== null)
     || (value.universe_selector !== undefined && value.universe_selector !== null)
     || (value.seal_amendment !== undefined && value.seal_amendment !== null)
+    // A dependency-free once-action has no source lineage: nominated source
+    // calls or records mean the call depends on settled work and must be
+    // compiled through plan_task, not the sole-action lane.
+    || (value.source_call_ids !== undefined && value.source_call_ids !== null)
+    || (value.source_record_ids !== undefined && value.source_record_ids !== null)
   ) return null;
   const requirementId = typeof value.requirement_id === 'string'
     ? value.requirement_id.trim()
