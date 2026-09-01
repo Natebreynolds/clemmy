@@ -1524,10 +1524,12 @@ export function readPrimaryModelPlanningCardSnapshot(input: {
   }
 }
 
-/** Install exactly one initial card before a host call authority or model batch
- * can exist. A racing process adopts the already-committed exact bytes; an
- * older/progressed source with no snapshot stays held instead of being
- * restamped from today's catalog. */
+/** Install exactly one initial card for an accepted source. First writer
+ * wins: a racing process adopts the already-committed exact bytes. The card is
+ * private presentation data and carries no execution authority, so a source
+ * that already progressed without one (a legacy/in-flight turn at upgrade, a
+ * home stamped by an earlier candidate) installs it late instead of being held
+ * unresumable — safe-but-unavailable is a failure, not a safety outcome. */
 export function recordPrimaryModelPlanningCardSnapshotOnce(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -1561,44 +1563,6 @@ export function recordPrimaryModelPlanningCardSnapshotOnce(input: {
         input.sourceUserSeq,
       );
       if (!source) return { status: 'conflict', reason: 'planning-card accepted source is missing' };
-
-      const progressed = db.prepare(`
-        SELECT 1 AS progressed
-          FROM accepted_turn_call_authorities
-         WHERE session_id = ? AND source_user_seq = ?
-        UNION ALL
-        SELECT 1
-          FROM accepted_model_batch_admissions
-         WHERE session_id = ? AND source_user_seq = ?
-        UNION ALL
-        SELECT 1
-          FROM events
-         WHERE session_id = ?
-           AND (
-             (type = 'turn_graph_compiled' AND parent_event_id = ?)
-             OR (
-               type = 'capability_discovered'
-               AND json_valid(data_json)
-               AND json_extract(data_json, '$.sourceUserSeq') = ?
-             )
-           )
-         LIMIT 1
-      `).get(
-        input.sessionId,
-        input.sourceUserSeq,
-        input.sessionId,
-        input.sourceUserSeq,
-        input.sessionId,
-        source.row.id,
-        input.sourceUserSeq,
-      ) as { progressed: number } | undefined;
-      if (progressed) {
-        return {
-          status: 'conflict',
-          reason: 'planning-card snapshot is missing after this accepted source already progressed',
-        };
-      }
-
       const snapshotDigest = createHash('sha256').update(input.snapshotJson, 'utf8').digest('hex');
       const eventId = primaryModelPlanningCardSnapshotEventId({
         sessionId: input.sessionId,
