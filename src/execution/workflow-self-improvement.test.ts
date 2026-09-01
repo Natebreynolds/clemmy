@@ -221,3 +221,21 @@ test('a faithful improvement turn is applied, a drifting one is reverted byte-fo
   assert.deepEqual(restored.data.trigger, legacyDefinition().trigger);
   assert.equal(improvement.readWorkflowImprovement(SLUG)?.status, 'failed');
 });
+
+test('a request left running by a daemon that stopped mid-turn becomes pending again once its wall clock has elapsed', () => {
+  const stateFile = path.join(TEST_HOME, 'state', 'improvements-stale.json');
+  const requested = improvement.requestWorkflowImprovement({
+    slug: 'stale-runner',
+    definition: { name: 'stale-runner', steps: [{ id: 'x', prompt: '', deterministic: { runner: 'scripts/x.mjs' } }] } as never,
+    readiness: { blockers: [{ kind: 'script', name: 'x', reason: 'workflow_raw_subprocess_authority_unrepresented: legacy' } as never] },
+    source: 'schedule',
+    stateFile,
+  });
+  assert.equal(requested?.status, 'requested');
+  const startedAt = Date.now() - improvement.WORKFLOW_IMPROVEMENT_WALL_CLOCK_MS - 120_000;
+  writeFileSync(stateFile, JSON.stringify({
+    'stale-runner': { ...requested!.request, status: 'running', startedAt: new Date(startedAt).toISOString() },
+  }));
+  assert.equal(improvement.listPendingWorkflowImprovements(stateFile, () => startedAt + 1_000).length, 0, 'a fresh running turn is left alone');
+  assert.equal(improvement.listPendingWorkflowImprovements(stateFile).length, 1, 'a stale running turn is retried');
+});

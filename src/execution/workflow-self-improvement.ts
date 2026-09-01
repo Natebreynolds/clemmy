@@ -157,9 +157,18 @@ export function requestWorkflowImprovement(input: {
   return { status: 'requested', request };
 }
 
-export function listPendingWorkflowImprovements(stateFile?: string): WorkflowImprovementRequest[] {
+export function listPendingWorkflowImprovements(stateFile?: string, now: () => number = Date.now): WorkflowImprovementRequest[] {
   return Object.values(readState(stateFile))
-    .filter((request) => request.status === 'pending')
+    .filter((request) => (
+      request.status === 'pending'
+      // A request left `running` by a daemon that stopped mid-turn (restart,
+      // crash) is not a dead end: once its wall clock has certainly elapsed
+      // it is picked up again. The definition is untouched until the turn's
+      // final workflow_update, and the guard/revert run again regardless.
+      || (request.status === 'running'
+        && typeof request.startedAt === 'string'
+        && now() - Date.parse(request.startedAt) > WORKFLOW_IMPROVEMENT_WALL_CLOCK_MS + 60_000)
+    ))
     .sort((a, b) => a.requestedAt.localeCompare(b.requestedAt));
 }
 

@@ -1071,9 +1071,13 @@ async function processWorkflowImprovements(assistant: ClementineAssistant): Prom
   workflowImprovementLaneInFlight = true;
   void (async () => {
     try {
+      // No explicit model: the respond bridge resolves the ACTIVE brain role
+      // (resolveRoleModel('brain')). Passing MODELS.primary pinned the env
+      // primary (a Codex id) and silently overrode the user's brain switch
+      // (live 2026-09-01: an improvement turn meant for Sonnet 5 ran on a
+      // rate-limited Codex, then fell over to GLM).
       const outcome = await runWorkflowImprovement({
         request,
-        model: MODELS.primary,
         executeTurn: async (turn) => {
           const response = await cronResponseExecutor(assistant, {
             sessionId: turn.sessionId,
