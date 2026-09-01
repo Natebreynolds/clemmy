@@ -165,7 +165,12 @@ function nonEmptyString(value: unknown): boolean {
 }
 
 const PRIVATE_REASONING_RE = /(?:^|[._-])(reasoning|thinking)(?:$|[._-])/;
-const TOOL_CONTENT_RE = /(function_call|tool_call|tool-call|tool_use|input_json|computer_call|shell_call|apply_patch_call|mcp_call|search_call|code_interpreter_call|image_generation_call|function_call_output|tool_result)/;
+// `tool-input-start|delta|end` are the AI SDK v5 parts the raw Claude
+// Messages adapter streams while the model writes a tool call's arguments —
+// live 2026-09-01 a frame that was one 10 KB workflow_update call streamed
+// tool input for >150s, matched nothing here, and the first-content budget
+// falled the turn over to a rate-limited rescue mid-authoring.
+const TOOL_CONTENT_RE = /(function_call|tool_call|tool-call|tool_use|tool-input|tool_input|input_json|computer_call|shell_call|apply_patch_call|mcp_call|search_call|code_interpreter_call|image_generation_call|function_call_output|tool_result)/;
 const TEXT_CONTENT_RE = /(?:^|[._-])(output_text|text|refusal)(?:$|[._-])/;
 
 function modelItemType(value: unknown): string {

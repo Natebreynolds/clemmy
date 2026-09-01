@@ -1231,3 +1231,53 @@ test('a silent cooldown never preselects away from the brain the USER pinned (Cl
     reviveDeadBrains();
   }
 });
+
+// --- AI SDK tool-input parts are the model's actionable output being streamed (live 2026-09-01) ---
+{
+  const { streamEventHasActionableContent: actionable, streamEventHasModelActivity: activity } = await import('./fallback-model.js');
+  test('AI SDK tool-input stream parts are actionable output, not silence', () => {
+    const start = { type: 'model', event: { type: 'tool-input-start', id: 'call_1', toolName: 'workflow_update' } } as any;
+    const delta = { type: 'model', event: { type: 'tool-input-delta', id: 'call_1', delta: '{"name":"team-' } } as any;
+    const end = { type: 'model', event: { type: 'tool-input-end', id: 'call_1' } } as any;
+    for (const event of [start, delta, end]) {
+      assert.equal(actionable(event), true, `${event.event.type} is actionable`);
+      assert.equal(activity(event), true);
+    }
+    const metadata = { type: 'model', event: { type: 'stream-start', warnings: [] } } as any;
+    assert.equal(actionable(metadata), false);
+    assert.equal(activity(metadata), false);
+  });
+
+  test('a primary streaming tool input past the first-byte budget keeps the turn instead of falling over', async () => {
+    let rescueCalls = 0;
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const primary = model({ getStreamedResponse: async function* () {
+      yield { type: 'response_started' } as any;
+      yield { type: 'model', event: { type: 'tool-input-start', id: 'call_1', toolName: 'workflow_update' } } as any;
+      await sleep(90); // well past the 40ms first-byte budget: the model is writing arguments
+      yield { type: 'model', event: { type: 'tool-input-delta', id: 'call_1', delta: '{"name":"x"}' } } as any;
+      yield {
+        type: 'response_done',
+        response: {
+          id: 'primary-tool-call',
+          usage: { requests: 1, inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          output: [{ type: 'function_call', callId: 'call_1', name: 'workflow_update', arguments: '{"name":"x"}', status: 'completed' }],
+        },
+      } as any;
+    } });
+    const rescue = model({ getStreamedResponse: async function* () {
+      rescueCalls += 1;
+      yield { type: 'response_started' } as any;
+      yield { type: 'output_text_delta', delta: 'rescue' } as any;
+      yield { type: 'response_done', response: { id: 'rescue', usage: { requests: 1, inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [] } } as any;
+    } });
+    const events: any[] = [];
+    for await (const event of withModelFallback(
+      [target('primary', primary), target('rescue', rescue)],
+      { firstByteTimeoutMs: 40 },
+    ).getStreamedResponse(req())) events.push(event);
+    assert.equal(rescueCalls, 0, 'tool-input streaming is model output; the rescue must not start');
+    const done = events.find((event) => event.type === 'response_done');
+    assert.equal(done?.response?.id, 'primary-tool-call');
+  });
+}
