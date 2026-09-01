@@ -7,11 +7,23 @@ import { readWorkflowRunRecord } from '../../execution/workflow-run-record.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { WORKFLOW_RUNS_DIR } from '../../tools/shared.js';
 import { digestSchema } from '../../tools/tool-contract-store.js';
+import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import {
   getPlanScope,
   installAuthoredWorkflowWriteAuthorityScope,
   readAuthoredWorkflowWriteAuthorityScope,
+  type PlanScope,
 } from '../../agents/plan-scope.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  classifyRuntimeToolEffect,
+  unwrapRuntimeEffectiveToolIdentity,
+} from './tool-effect.js';
+import {
+  localPlanningArgumentsMatch,
+  observeCurrentLocalPlanningDefinitions,
+  type AuthorizedLocalPlanningDefinitionV1,
+} from './local-planning-capability.js';
 import {
   acceptedTurnSourceEventDigest,
   getSession,
@@ -75,12 +87,19 @@ interface AuthoredWorkflowWriteReceiptV1 {
   planProposalId: string;
   definitionHash: string;
   admissionHash: string;
-  stepSideEffect: 'write';
-  requiresApproval: false;
+  /** The immutable step's authored side-effect class. A `send` step also
+   * covers the ordinary/local writes it contains; the send itself is decided
+   * by its own effect-aware branch. */
+  stepSideEffect: 'write' | 'send';
+  requiresApproval: boolean;
   promptDigest: string;
+  /** Exact external write identities named by the immutable step. Empty for a
+   * step whose only mutations are Clementine's own registry ledgers. */
   catalogIdentities: readonly CanonicalCatalogIdentityV1[];
   authorityDigest: string;
 }
+
+const AUTHORED_STEP_SIDE_EFFECTS = new Set<string>(['write', 'send']);
 
 export type RecordAuthoredWorkflowWriteAuthorityResult =
   | { status: 'ready'; authorityDigest: string }
@@ -231,12 +250,12 @@ function parseReceipt(value: unknown): AuthoredWorkflowWriteReceiptV1 | null {
     || !DIGEST.test(row.definitionHash)
     || typeof row.admissionHash !== 'string'
     || !DIGEST.test(row.admissionHash)
-    || row.stepSideEffect !== 'write'
-    || row.requiresApproval !== false
+    || typeof row.stepSideEffect !== 'string'
+    || !AUTHORED_STEP_SIDE_EFFECTS.has(row.stepSideEffect)
+    || typeof row.requiresApproval !== 'boolean'
     || typeof row.promptDigest !== 'string'
     || !DIGEST.test(row.promptDigest)
     || !Array.isArray(row.catalogIdentities)
-    || row.catalogIdentities.length === 0
     || row.catalogIdentities.length > MAX_BINDINGS
     || typeof row.authorityDigest !== 'string'
     || !DIGEST.test(row.authorityDigest)
@@ -306,8 +325,12 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
     const externalWrites = sortedCatalogIdentities(input.catalogIdentities.filter((identity) => (
       identity.effect === 'external_write'
     )));
-    if (externalWrites.length === 0) return { status: 'none' };
+    // Zero external identities is an ordinary authored shape: the step's only
+    // mutations are Clementine's own registry ledgers (tasks, goals, spaces).
+    // The immutable step is still the accepted work, so the receipt is minted
+    // with an empty identity list and the local-envelope branch binds to it.
     if (
+      externalWrites.length > 0 && (
       externalWrites.length > MAX_BINDINGS
       || new Set(externalWrites.map((identity) => identity.manifestId)).size !== externalWrites.length
       || new Set(externalWrites.map((identity) => identity.operationId)).size !== externalWrites.length
@@ -316,6 +339,7 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
         || !['create_new', 'named_existing', 'not_applicable'].includes(identity.destination.posture)
       ))
       || !currentIdentitiesAreExact(externalWrites)
+      )
     ) return { status: 'refused', reason: 'catalog_identity_missing_or_ambiguous' };
 
     const source = sourceEvent(input.sessionId, input.sourceUserSeq);
@@ -352,7 +376,14 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
     ) return { status: 'refused', reason: 'workflow_definition_authority_missing_or_changed' };
     const steps = resolved.snapshot.definition.steps.filter((candidate) => candidate.id === input.stepId);
     const step = steps.length === 1 ? steps[0]! : null;
-    if (!step || step.sideEffect !== 'write' || step.requiresApproval === true) {
+    // Owner rule: the only human-in-the-loop gate inside a saved workflow is a
+    // step AUTHORED `requiresApproval`. Every other authored write/send step's
+    // save + enable/run chain is the consent, so it gets an exact receipt.
+    if (
+      !step
+      || (step.sideEffect !== 'write' && step.sideEffect !== 'send')
+      || step.requiresApproval === true
+    ) {
       return { status: 'none' };
     }
     const inheritedAllowed = step.allowedTools && step.allowedTools.length > 0
@@ -396,8 +427,8 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
       planProposalId: input.expectedPlanProposalId,
       definitionHash: resolved.snapshot.definitionHash,
       admissionHash: resolved.snapshot.admissionHash,
-      stepSideEffect: 'write' as const,
-      requiresApproval: false as const,
+      stepSideEffect: step.sideEffect,
+      requiresApproval: false,
       promptDigest: digest(step.prompt),
       catalogIdentities: externalWrites,
     };
@@ -512,6 +543,516 @@ function interactiveDestination(input: {
   };
 }
 
+
+interface ReopenedAuthoredStep {
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  step: {
+    id: string;
+    prompt: string;
+    sideEffect?: string;
+    requiresApproval?: boolean;
+  };
+  planScope: PlanScope;
+}
+
+/**
+ * Re-bind the durable receipt pointer to the exact immutable step it was
+ * minted for: session kind/owner, active attempt, unchanged run definition and
+ * admission hash, the step's own prompt bytes, and the open step PlanScope.
+ * Shared by every effect branch so no branch can bind more loosely than
+ * another.
+ */
+function reopenAuthoredStepAuthority(
+  attestation: HostCallAttestation,
+): ReopenedAuthoredStep | null {
+  const pointer = readAuthoredWorkflowWriteAuthorityScope(attestation.sessionId);
+  if (
+    !pointer
+    || pointer.sourceUserSeq !== attestation.sourceUserSeq
+    || pointer.attemptId.trim().length === 0
+  ) return null;
+  const loaded = readReceipt(attestation.sessionId, attestation.sourceUserSeq);
+  if (!loaded || loaded.receipt.authorityDigest !== pointer.authorityDigest) return null;
+  const { receipt } = loaded;
+  if (
+    receipt.attemptId !== pointer.attemptId
+    || receipt.workflowRunId !== pointer.workflowRunId
+    || receipt.stepId !== pointer.stepId
+    || receipt.sourceEventId !== attestation.sourceEventId
+    || receipt.sourceEventDigest !== attestation.sourceEventDigest
+  ) return null;
+  const attempt = getRunAttemptBySourceUserSeq(attestation.sessionId, attestation.sourceUserSeq);
+  if (
+    !attempt
+    || attempt.status !== 'active'
+    || attempt.attemptId !== receipt.attemptId
+    || attempt.runId !== receipt.attemptRunId
+    || attempt.sourceUserSeq !== receipt.sourceUserSeq
+  ) return null;
+  const run = readWorkflowRunRecord<Record<string, unknown>>(
+    path.join(WORKFLOW_RUNS_DIR, `${receipt.workflowRunId}.json`),
+  );
+  const resolved = resolveWorkflowRunDefinitionSnapshot(run?.workflowDefinitionSnapshot);
+  if (
+    !run
+    || run.id !== receipt.workflowRunId
+    || run.status !== 'running'
+    || resolved.status !== 'valid'
+    || resolved.snapshot.workflowSlug !== receipt.workflowSlug
+    || resolved.snapshot.definitionHash !== receipt.definitionHash
+    || resolved.snapshot.admissionHash !== receipt.admissionHash
+    || resolved.snapshot.definition.name !== receipt.workflowName
+  ) return null;
+  const steps = resolved.snapshot.definition.steps.filter((candidate) => candidate.id === receipt.stepId);
+  const step = steps.length === 1 ? steps[0]! : null;
+  if (
+    !step
+    || step.sideEffect !== receipt.stepSideEffect
+    || (step.requiresApproval === true) !== receipt.requiresApproval
+    || digest(step.prompt) !== receipt.promptDigest
+  ) return null;
+  if (!workflowSessionMatches({
+    sessionId: attestation.sessionId,
+    workflowRunId: receipt.workflowRunId,
+    workflowName: receipt.workflowName,
+    stepId: receipt.stepId,
+  })) return null;
+  const planScope = getPlanScope(attestation.sessionId);
+  if (
+    !planScope
+    || planScope.closedAt
+    || planScope.goalScoped
+    || planScope.planProposalId !== receipt.planProposalId
+  ) return null;
+  return { receipt, step, planScope };
+}
+
+function acceptedOccurrenceBinds(input: {
+  attestation: HostCallAttestation;
+  acceptedBatch: AcceptedModelBatchRef;
+  callIndex: number;
+}): boolean {
+  const reopened = reopenAcceptedModelBatch(input.acceptedBatch);
+  return reopened.status === 'open'
+    && input.acceptedBatch.sessionId === input.attestation.sessionId
+    && input.acceptedBatch.sourceUserSeq === input.attestation.sourceUserSeq
+    && input.acceptedBatch.acceptedTaskId === input.attestation.acceptedTaskId
+    && reopened.admission.callIds[input.callIndex] === input.attestation.logicalToolCallId;
+}
+
+function occurrenceCardinality(input: {
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  acceptedBatch: AcceptedModelBatchRef;
+}): { kind: 'each'; universeDigest: string } {
+  return {
+    kind: 'each',
+    universeDigest: digest({
+      version: VERSION,
+      authorityDigest: input.receipt.authorityDigest,
+      batchId: input.acceptedBatch.batchId,
+      batchOrdinal: input.acceptedBatch.batchOrdinal,
+    }),
+  };
+}
+
+function occurrenceBindingDigest(input: {
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  attestation: HostCallAttestation;
+  argumentDigest: string;
+  acceptedBatch: AcceptedModelBatchRef;
+  callIndex: number;
+}): string {
+  return digest({
+    version: VERSION,
+    authorityDigest: input.receipt.authorityDigest,
+    hostBindingDigest: input.attestation.bindingDigest,
+    outerArgumentDigest: input.attestation.argumentDigest,
+    providerArgsDigest: input.argumentDigest,
+    batchId: input.acceptedBatch.batchId,
+    batchOrdinal: input.acceptedBatch.batchOrdinal,
+    callIndex: input.callIndex,
+    logicalToolCallId: input.attestation.logicalToolCallId,
+  });
+}
+
+function occurrenceReservationKey(input: {
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  attestation: HostCallAttestation;
+  acceptedBatch: AcceptedModelBatchRef;
+  callIndex: number;
+}): string {
+  return digest({
+    version: VERSION,
+    authorityDigest: input.receipt.authorityDigest,
+    acceptedBatchId: input.acceptedBatch.batchId,
+    acceptedBatchOrdinal: input.acceptedBatch.batchOrdinal,
+    callIndex: input.callIndex,
+    logicalToolCallId: input.attestation.logicalToolCallId,
+  });
+}
+
+function coverageFor(input: {
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  attestation: HostCallAttestation;
+  call: CapabilityRiskAttestationV1;
+  acceptedBatch: AcceptedModelBatchRef;
+  callIndex: number;
+}): ExactWorkCoverageV1 {
+  const { call } = input;
+  return {
+    version: 1,
+    source: call.source,
+    acceptedTaskId: call.acceptedTaskId,
+    contractId: `authored-workflow:${input.receipt.authorityDigest}`,
+    requirementId: input.attestation.operationId,
+    requirementDigest: input.receipt.authorityDigest,
+    semanticScope: {
+      operationId: call.operationId,
+      schemaFingerprint: call.schemaFingerprint,
+      effect: call.effect,
+      accountId: call.accountId,
+      destination: call.destination,
+      cardinality: call.cardinality,
+      semanticBasis: call.semanticBasis,
+    },
+    callBinding: {
+      logicalToolCallId: call.logicalToolCallId,
+      argumentDigest: call.argumentDigest,
+      bindingDigest: call.bindingDigest,
+    },
+    reservationKey: occurrenceReservationKey(input),
+  };
+}
+
+/**
+ * Exact external-catalog branch: one frozen catalog identity named by the
+ * immutable step, current schema/account/manifest/port, ordinary reversible
+ * risk, and the standing workflow grant. High-consequence projections (send,
+ * delete, admin, destructive, irreversible) deliberately return null here.
+ */
+async function evaluateAuthoredCatalogWrite(input: {
+  attestation: HostCallAttestation;
+  args: Record<string, unknown>;
+  acceptedBatch: AcceptedModelBatchRef;
+  callIndex: number;
+  reopened: ReopenedAuthoredStep;
+}): Promise<HostInteractiveConsentResult | null> {
+  const { attestation, reopened } = input;
+  const { receipt } = reopened;
+  const acceptedScope = currentAcceptedSourceCatalogManifestScope();
+  if (!acceptedScope) return null;
+  const candidates = receipt.catalogIdentities.filter((identity) => (
+    identity.capabilityId === attestation.capabilityId
+    && identity.manifestId === attestation.manifestId
+    && identity.operationId === attestation.operationId
+  ));
+  if (candidates.length !== 1) return null;
+  const identity = candidates[0]!;
+  if (
+    !acceptedScope.manifestIds.has(identity.manifestId)
+    || !acceptedScope.operationIds.has(identity.operationId.toUpperCase())
+    || identity.manifestDigest !== attestation.manifestDigest
+    || identity.schemaDigest !== attestation.schemaFingerprint
+    || identity.account !== attestation.accountId
+    || identity.effect !== attestation.effect
+    || identity.invokePortId !== attestation.invokePortId
+    || identity.providerInputSchemaDigest !== attestation.providerInputSchemaDigest
+  ) return null;
+  const factory = peekHostCapabilityCatalogFactory();
+  const entry = factory?.get(identity.capabilityId);
+  const current = entry && isCurrentCallableCatalogEntry(entry)
+    ? canonicalCatalogIdentityOf(entry)
+    : null;
+  if (!entry || !current || !catalogIdentityBytesEqual(current, identity)) return null;
+  const schema = getCachedToolSchema(identity.operationId);
+  if (
+    !schema
+    || !identity.providerInputSchemaDigest
+    || digestSchema(schema) !== identity.providerInputSchemaDigest
+  ) return null;
+
+  if (!acceptedOccurrenceBinds(input)) return null;
+  const destination = interactiveDestination({ receipt, identity });
+  if (!destination) return null;
+  const providerArgsDigest = digest(input.args);
+  const exactDestination: InteractiveConsentDestination = {
+    ...destination,
+    digest: digest({
+      version: VERSION,
+      destinationDigest: destination.digest,
+      providerArgsDigest,
+    }),
+  };
+  const callSignals = deriveExternalCapabilityCallSignalsV1({
+    version: 1,
+    inputSchema: schema,
+    arguments: input.args,
+  });
+  if (callSignals.status !== 'projected') return null;
+  const risk = loadCatalogManifestExternalRiskAttestationV1({
+    version: 1,
+    binding: {
+      bindingKind: 'catalog_manifest',
+      capabilityId: attestation.capabilityId,
+      ...(attestation.providerInputSchemaDigest
+        ? { providerInputSchemaDigest: attestation.providerInputSchemaDigest }
+        : {}),
+      schemaFingerprint: attestation.schemaFingerprint,
+      accountId: attestation.accountId,
+      invokePortId: attestation.invokePortId,
+      operationId: attestation.operationId,
+      manifestId: attestation.manifestId,
+      manifestDigest: attestation.manifestDigest,
+      effect: attestation.effect,
+    },
+    inputSchema: schema,
+    destination: exactDestination,
+    callSignals: callSignals.callSignals,
+    safety: 'admissible',
+  });
+  if (!risk.ok) return null;
+  const projection = risk.attestation.projection;
+  const highConsequence = projection.effect !== 'external_write'
+    || projection.safety !== 'admissible'
+    || projection.risk.destructive
+    || !['reversible', 'ordinary_non_destructive'].includes(projection.risk.reversibility)
+    || projection.risk.consequence === 'send'
+    || projection.risk.consequence === 'delete'
+    || projection.risk.consequence === 'admin';
+  if (highConsequence) return null;
+  const crossing = crossingFor({
+    sessionId: attestation.sessionId,
+    sourceUserSeq: attestation.sourceUserSeq,
+    logicalToolCallId: attestation.logicalToolCallId,
+  });
+  if (!crossing) return null;
+  const call: CapabilityRiskAttestationV1 = {
+    version: 1,
+    source: {
+      kind: 'accepted_turn',
+      id: receipt.sourceEventId,
+      digest: receipt.sourceEventDigest,
+    },
+    acceptedTaskId: attestation.acceptedTaskId,
+    bindingDigest: occurrenceBindingDigest({ ...input, receipt, argumentDigest: providerArgsDigest }),
+    logicalToolCallId: attestation.logicalToolCallId,
+    operationId: attestation.operationId,
+    argumentDigest: providerArgsDigest,
+    schemaFingerprint: attestation.schemaFingerprint,
+    effect: 'external_write',
+    accountId: attestation.accountId,
+    destination: exactDestination,
+    cardinality: occurrenceCardinality({ receipt, acceptedBatch: input.acceptedBatch }),
+    risk: projection.risk,
+    semanticBasis: projection.semanticBasis,
+    safety: projection.safety,
+  };
+  const coverage = coverageFor({ ...input, receipt, call });
+  const grantScope: ExactUserGrantV1['scope'] = {
+    source: call.source,
+    acceptedTaskId: call.acceptedTaskId,
+    logicalToolCallId: call.logicalToolCallId,
+    bindingDigest: call.bindingDigest,
+    operationId: call.operationId,
+    argumentDigest: call.argumentDigest,
+    schemaFingerprint: call.schemaFingerprint,
+    effect: call.effect,
+    accountId: call.accountId,
+    destination: call.destination,
+    cardinality: call.cardinality,
+    risk: call.risk,
+    semanticBasis: call.semanticBasis,
+  };
+  const standingGrant: ExactUserGrantV1 = {
+    version: 1,
+    source: 'standing_workflow_scope',
+    grantDigest: digest({
+      version: VERSION,
+      authorityDigest: receipt.authorityDigest,
+      planProposalId: receipt.planProposalId,
+      scope: grantScope,
+    }),
+    scope: grantScope,
+  };
+  const decision = evaluateInteractiveConsentV1({
+    call,
+    coverage,
+    userGrant: standingGrant,
+    readiness: { kind: 'ready' },
+    crossing,
+    reservationAlreadyClaimed: false,
+  });
+  if (
+    decision.kind !== 'proceed'
+    || !['exact_user_grant', 'settled_replay'].includes(decision.basis)
+  ) return null;
+  return { status: 'decided', decision, call, coverage };
+}
+
+interface AuthoredLocalWriteRisk {
+  risk: CapabilityRiskAttestationV1['risk'];
+  destination: InteractiveConsentDestination;
+  semanticBasis: CapabilityRiskAttestationV1['semanticBasis'];
+}
+
+/**
+ * Project one registry-declared local write into exact risk facts.
+ *
+ * Two legible sources, no tool names:
+ *  - a row that DECLARES local planning semantics (write_file, workspace
+ *    definition writes) must match exactly one declared, non-destructive,
+ *    reversible/create-only definition for THESE arguments — an overwrite or
+ *    append mode therefore stays uncovered;
+ *  - a row with no declared semantics is covered only when the registry
+ *    classifies it as a CONTROL-plane operation: Clementine's own ledgers
+ *    (tasks, goals, spaces, execution bookkeeping). Business-role local
+ *    writes without declared semantics remain uncovered.
+ */
+async function authoredLocalWriteRisk(input: {
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  attestation: HostCallAttestation;
+  args: Record<string, unknown>;
+}): Promise<AuthoredLocalWriteRisk | null> {
+  const { attestation } = input;
+  const decision = classifyRuntimeToolEffect(attestation.toolName, input.args);
+  if (decision.effect !== 'local_write' || decision.source !== 'registry') return null;
+  const effective = unwrapRuntimeEffectiveToolIdentity(attestation.toolName, input.args);
+  const effectiveName = effective.toolName?.trim() ?? '';
+  if (!effectiveName) return null;
+  const rows = TOOL_REGISTRY.filter((row) => row.name === effectiveName);
+  if (rows.length !== 1) return null;
+  const row = rows[0]!;
+  if (row.sideEffect !== 'write' || row.runtimeEffect === 'host_only') return null;
+  const declaresSemantics = Boolean(row.localPlanning)
+    || (row.localPlanningVariants?.length ?? 0) > 0;
+  if (declaresSemantics) {
+    const observed = await observeCurrentLocalPlanningDefinitions({
+      name: effectiveName,
+      carrier: 'work_call',
+    });
+    if (!observed.ok) return null;
+    const matching: AuthorizedLocalPlanningDefinitionV1[] = observed.definitions.filter((definition) => (
+      localPlanningArgumentsMatch(definition, effective.args)
+    ));
+    if (matching.length !== 1) return null;
+    const definition = matching[0]!;
+    if (
+      definition.destructive
+      || definition.descriptor.effect !== 'local_write'
+      || (definition.reversibility !== 'reversible' && definition.reversibility !== 'create_only')
+    ) return null;
+    const posture = definition.descriptor.destinationPosture ?? 'not_applicable';
+    return {
+      risk: {
+        reversibility: 'reversible',
+        consequence: posture === 'create_new'
+          ? 'create'
+          : posture === 'named_existing'
+            ? 'update'
+            : 'execute',
+        destructive: false,
+      },
+      destination: {
+        posture,
+        digest: digest({
+          version: VERSION,
+          authorityDigest: input.receipt.authorityDigest,
+          capabilityRef: definition.capabilityRef,
+          posture,
+        }),
+      },
+      semanticBasis: { kind: 'local_registry', digest: definition.envelopeFingerprint },
+    };
+  }
+  if (actionTopologyRoleForRuntimeCall(attestation.toolName, input.args) !== 'control') return null;
+  return {
+    risk: { reversibility: 'reversible', consequence: 'update', destructive: false },
+    destination: {
+      posture: 'not_applicable',
+      digest: digest({
+        version: VERSION,
+        authorityDigest: input.receipt.authorityDigest,
+        operationId: attestation.operationId,
+        registryOperation: effectiveName,
+      }),
+    },
+    semanticBasis: {
+      kind: 'local_registry',
+      digest: digest({
+        version: VERSION,
+        registryOperation: effectiveName,
+        sideEffect: row.sideEffect,
+        role: 'control',
+        schemaFingerprint: attestation.schemaFingerprint,
+      }),
+    },
+  };
+}
+
+/**
+ * Local-envelope branch: a reversible registry write inside the authored step
+ * is the accepted work. The reducer is handed exact coverage (never a user
+ * grant), so it proceeds only via exact_reversible_work / exact_ordinary_work
+ * or replays a settled occurrence. Anything the reducer would escalate stays
+ * null and falls to the uncovered path exactly as before.
+ */
+async function evaluateAuthoredLocalWrite(input: {
+  attestation: HostCallAttestation;
+  args: Record<string, unknown>;
+  acceptedBatch: AcceptedModelBatchRef;
+  callIndex: number;
+  reopened: ReopenedAuthoredStep;
+}): Promise<HostInteractiveConsentResult | null> {
+  const { attestation, reopened } = input;
+  const { receipt } = reopened;
+  if (attestation.accountId !== '' || attestation.manifestId !== '') return null;
+  const projected = await authoredLocalWriteRisk({ receipt, attestation, args: input.args });
+  if (!projected) return null;
+  if (!acceptedOccurrenceBinds(input)) return null;
+  const crossing = crossingFor({
+    sessionId: attestation.sessionId,
+    sourceUserSeq: attestation.sourceUserSeq,
+    logicalToolCallId: attestation.logicalToolCallId,
+  });
+  if (!crossing) return null;
+  const argumentDigest = digest(input.args);
+  const call: CapabilityRiskAttestationV1 = {
+    version: 1,
+    source: {
+      kind: 'accepted_turn',
+      id: receipt.sourceEventId,
+      digest: receipt.sourceEventDigest,
+    },
+    acceptedTaskId: attestation.acceptedTaskId,
+    bindingDigest: occurrenceBindingDigest({ ...input, receipt, argumentDigest }),
+    logicalToolCallId: attestation.logicalToolCallId,
+    operationId: attestation.operationId,
+    argumentDigest,
+    schemaFingerprint: attestation.schemaFingerprint,
+    effect: 'local_write',
+    accountId: '',
+    destination: projected.destination,
+    cardinality: occurrenceCardinality({ receipt, acceptedBatch: input.acceptedBatch }),
+    risk: projected.risk,
+    semanticBasis: projected.semanticBasis,
+    safety: 'admissible',
+  };
+  const coverage = coverageFor({ ...input, receipt, call });
+  const decision = evaluateInteractiveConsentV1({
+    call,
+    coverage,
+    userGrant: null,
+    readiness: { kind: 'ready' },
+    crossing,
+    reservationAlreadyClaimed: false,
+  });
+  if (
+    decision.kind !== 'proceed'
+    || !['exact_reversible_work', 'exact_ordinary_work', 'settled_replay'].includes(decision.basis)
+  ) return null;
+  return { status: 'decided', decision, call, coverage };
+}
+
 /**
  * Reopen one saved workflow's exact, pre-model write receipt and project it
  * into the shared consent reducer. This is coverage, never a bypass: current
@@ -528,274 +1069,20 @@ export async function evaluateAuthoredWorkflowMutationConsent(input: {
 }): Promise<HostInteractiveConsentResult | null> {
   try {
     const attestation = input.attestation;
-    if (
-      attestation.bindingKind !== 'catalog_manifest'
-      || attestation.effect !== 'external_write'
-      || !Number.isSafeInteger(input.callIndex)
-      || input.callIndex < 0
-    ) return null;
-    const pointer = readAuthoredWorkflowWriteAuthorityScope(attestation.sessionId);
-    if (
-      !pointer
-      || pointer.sourceUserSeq !== attestation.sourceUserSeq
-      || pointer.attemptId.trim().length === 0
-    ) return null;
-    const loaded = readReceipt(attestation.sessionId, attestation.sourceUserSeq);
-    if (!loaded || loaded.receipt.authorityDigest !== pointer.authorityDigest) return null;
-    const { receipt } = loaded;
-    if (
-      receipt.attemptId !== pointer.attemptId
-      || receipt.workflowRunId !== pointer.workflowRunId
-      || receipt.stepId !== pointer.stepId
-      || receipt.sourceEventId !== attestation.sourceEventId
-      || receipt.sourceEventDigest !== attestation.sourceEventDigest
-    ) return null;
-    const attempt = getRunAttemptBySourceUserSeq(attestation.sessionId, attestation.sourceUserSeq);
-    if (
-      !attempt
-      || attempt.status !== 'active'
-      || attempt.attemptId !== receipt.attemptId
-      || attempt.runId !== receipt.attemptRunId
-      || attempt.sourceUserSeq !== receipt.sourceUserSeq
-    ) return null;
-    const run = readWorkflowRunRecord<Record<string, unknown>>(
-      path.join(WORKFLOW_RUNS_DIR, `${receipt.workflowRunId}.json`),
-    );
-    const resolved = resolveWorkflowRunDefinitionSnapshot(run?.workflowDefinitionSnapshot);
-    if (
-      !run
-      || run.id !== receipt.workflowRunId
-      || run.status !== 'running'
-      || resolved.status !== 'valid'
-      || resolved.snapshot.workflowSlug !== receipt.workflowSlug
-      || resolved.snapshot.definitionHash !== receipt.definitionHash
-      || resolved.snapshot.admissionHash !== receipt.admissionHash
-      || resolved.snapshot.definition.name !== receipt.workflowName
-    ) return null;
-    const steps = resolved.snapshot.definition.steps.filter((candidate) => candidate.id === receipt.stepId);
-    const step = steps.length === 1 ? steps[0]! : null;
-    if (
-      !step
-      || step.sideEffect !== 'write'
-      || step.requiresApproval === true
-      || digest(step.prompt) !== receipt.promptDigest
-    ) return null;
-    if (!workflowSessionMatches({
-      sessionId: attestation.sessionId,
-      workflowRunId: receipt.workflowRunId,
-      workflowName: receipt.workflowName,
-      stepId: receipt.stepId,
-    })) return null;
-    const planScope = getPlanScope(attestation.sessionId);
-    if (
-      !planScope
-      || planScope.closedAt
-      || planScope.goalScoped
-      || planScope.planProposalId !== receipt.planProposalId
-    ) return null;
-    const acceptedScope = currentAcceptedSourceCatalogManifestScope();
-    if (!acceptedScope) return null;
-    const candidates = receipt.catalogIdentities.filter((identity) => (
-      identity.capabilityId === attestation.capabilityId
-      && identity.manifestId === attestation.manifestId
-      && identity.operationId === attestation.operationId
-    ));
-    if (candidates.length !== 1) return null;
-    const identity = candidates[0]!;
-    if (
-      !acceptedScope.manifestIds.has(identity.manifestId)
-      || !acceptedScope.operationIds.has(identity.operationId.toUpperCase())
-      || identity.manifestDigest !== attestation.manifestDigest
-      || identity.schemaDigest !== attestation.schemaFingerprint
-      || identity.account !== attestation.accountId
-      || identity.effect !== attestation.effect
-      || identity.invokePortId !== attestation.invokePortId
-      || identity.providerInputSchemaDigest !== attestation.providerInputSchemaDigest
-    ) return null;
-    const factory = peekHostCapabilityCatalogFactory();
-    const entry = factory?.get(identity.capabilityId);
-    const current = entry && isCurrentCallableCatalogEntry(entry)
-      ? canonicalCatalogIdentityOf(entry)
-      : null;
-    if (!entry || !current || !catalogIdentityBytesEqual(current, identity)) return null;
-    const schema = getCachedToolSchema(identity.operationId);
-    if (
-      !schema
-      || !identity.providerInputSchemaDigest
-      || digestSchema(schema) !== identity.providerInputSchemaDigest
-    ) return null;
-
-    const reopened = reopenAcceptedModelBatch(input.acceptedBatch);
-    if (
-      reopened.status !== 'open'
-      || input.acceptedBatch.sessionId !== attestation.sessionId
-      || input.acceptedBatch.sourceUserSeq !== attestation.sourceUserSeq
-      || input.acceptedBatch.acceptedTaskId !== attestation.acceptedTaskId
-      || reopened.admission.callIds[input.callIndex] !== attestation.logicalToolCallId
-    ) return null;
-    const destination = interactiveDestination({ receipt, identity });
-    if (!destination) return null;
-    const providerArgsDigest = digest(input.args);
-    const exactDestination: InteractiveConsentDestination = {
-      ...destination,
-      digest: digest({
-        version: VERSION,
-        destinationDigest: destination.digest,
-        providerArgsDigest,
-      }),
-    };
-    const callSignals = deriveExternalCapabilityCallSignalsV1({
-      version: 1,
-      inputSchema: schema,
-      arguments: input.args,
-    });
-    if (callSignals.status !== 'projected') return null;
-    const risk = loadCatalogManifestExternalRiskAttestationV1({
-      version: 1,
-      binding: {
-        bindingKind: 'catalog_manifest',
-        capabilityId: attestation.capabilityId,
-        ...(attestation.providerInputSchemaDigest
-          ? { providerInputSchemaDigest: attestation.providerInputSchemaDigest }
-          : {}),
-        schemaFingerprint: attestation.schemaFingerprint,
-        accountId: attestation.accountId,
-        invokePortId: attestation.invokePortId,
-        operationId: attestation.operationId,
-        manifestId: attestation.manifestId,
-        manifestDigest: attestation.manifestDigest,
-        effect: attestation.effect,
-      },
-      inputSchema: schema,
-      destination: exactDestination,
-      callSignals: callSignals.callSignals,
-      safety: 'admissible',
-    });
-    if (!risk.ok) return null;
-    const projection = risk.attestation.projection;
-    const highConsequence = projection.effect !== 'external_write'
-      || projection.safety !== 'admissible'
-      || projection.risk.destructive
-      || !['reversible', 'ordinary_non_destructive'].includes(projection.risk.reversibility)
-      || projection.risk.consequence === 'send'
-      || projection.risk.consequence === 'delete'
-      || projection.risk.consequence === 'admin';
-    if (highConsequence) return null;
-    const crossing = crossingFor({
-      sessionId: attestation.sessionId,
-      sourceUserSeq: attestation.sourceUserSeq,
-      logicalToolCallId: attestation.logicalToolCallId,
-    });
-    if (!crossing) return null;
-    const cardinality = {
-      kind: 'each' as const,
-      universeDigest: digest({
-        version: VERSION,
-        authorityDigest: receipt.authorityDigest,
-        batchId: input.acceptedBatch.batchId,
-        batchOrdinal: input.acceptedBatch.batchOrdinal,
-      }),
-    };
-    const call: CapabilityRiskAttestationV1 = {
-      version: 1,
-      source: {
-        kind: 'accepted_turn',
-        id: receipt.sourceEventId,
-        digest: receipt.sourceEventDigest,
-      },
-      acceptedTaskId: attestation.acceptedTaskId,
-      bindingDigest: digest({
-        version: VERSION,
-        authorityDigest: receipt.authorityDigest,
-        hostBindingDigest: attestation.bindingDigest,
-        outerArgumentDigest: attestation.argumentDigest,
-        providerArgsDigest,
-        batchId: input.acceptedBatch.batchId,
-        batchOrdinal: input.acceptedBatch.batchOrdinal,
-        callIndex: input.callIndex,
-        logicalToolCallId: attestation.logicalToolCallId,
-      }),
-      logicalToolCallId: attestation.logicalToolCallId,
-      operationId: attestation.operationId,
-      argumentDigest: providerArgsDigest,
-      schemaFingerprint: attestation.schemaFingerprint,
-      effect: 'external_write',
-      accountId: attestation.accountId,
-      destination: exactDestination,
-      cardinality,
-      risk: projection.risk,
-      semanticBasis: projection.semanticBasis,
-      safety: projection.safety,
-    };
-    const coverage: ExactWorkCoverageV1 = {
-      version: 1,
-      source: call.source,
-      acceptedTaskId: call.acceptedTaskId,
-      contractId: `authored-workflow:${receipt.authorityDigest}`,
-      requirementId: attestation.operationId,
-      requirementDigest: receipt.authorityDigest,
-      semanticScope: {
-        operationId: call.operationId,
-        schemaFingerprint: call.schemaFingerprint,
-        effect: call.effect,
-        accountId: call.accountId,
-        destination: call.destination,
-        cardinality: call.cardinality,
-        semanticBasis: call.semanticBasis,
-      },
-      callBinding: {
-        logicalToolCallId: call.logicalToolCallId,
-        argumentDigest: call.argumentDigest,
-        bindingDigest: call.bindingDigest,
-      },
-      reservationKey: digest({
-        version: VERSION,
-        authorityDigest: receipt.authorityDigest,
-        acceptedBatchId: input.acceptedBatch.batchId,
-        acceptedBatchOrdinal: input.acceptedBatch.batchOrdinal,
-        callIndex: input.callIndex,
-        logicalToolCallId: attestation.logicalToolCallId,
-      }),
-    };
-    const grantScope: ExactUserGrantV1['scope'] = {
-      source: call.source,
-      acceptedTaskId: call.acceptedTaskId,
-      logicalToolCallId: call.logicalToolCallId,
-      bindingDigest: call.bindingDigest,
-      operationId: call.operationId,
-      argumentDigest: call.argumentDigest,
-      schemaFingerprint: call.schemaFingerprint,
-      effect: call.effect,
-      accountId: call.accountId,
-      destination: call.destination,
-      cardinality: call.cardinality,
-      risk: call.risk,
-      semanticBasis: call.semanticBasis,
-    };
-    const standingGrant: ExactUserGrantV1 = {
-      version: 1,
-      source: 'standing_workflow_scope',
-      grantDigest: digest({
-        version: VERSION,
-        authorityDigest: receipt.authorityDigest,
-        planProposalId: receipt.planProposalId,
-        scope: grantScope,
-      }),
-      scope: grantScope,
-    };
-    const decision = evaluateInteractiveConsentV1({
-      call,
-      coverage,
-      userGrant: standingGrant,
-      readiness: { kind: 'ready' },
-      crossing,
-      reservationAlreadyClaimed: false,
-    });
-    if (
-      decision.kind !== 'proceed'
-      || !['exact_user_grant', 'settled_replay'].includes(decision.basis)
-    ) return null;
-    return { status: 'decided', decision, call, coverage };
+    if (!Number.isSafeInteger(input.callIndex) || input.callIndex < 0) return null;
+    const catalogWrite = attestation.bindingKind === 'catalog_manifest'
+      && attestation.effect === 'external_write';
+    const localWrite = attestation.bindingKind === 'local_envelope'
+      && attestation.effect === 'local_write';
+    if (!catalogWrite && !localWrite) return null;
+    const reopened = reopenAuthoredStepAuthority(attestation);
+    if (!reopened) return null;
+    // A step AUTHORED `requiresApproval` keeps its human gate; it never takes
+    // the standing/self-coverage branches below.
+    if (reopened.receipt.requiresApproval || reopened.step.requiresApproval === true) return null;
+    return catalogWrite
+      ? await evaluateAuthoredCatalogWrite({ ...input, reopened })
+      : await evaluateAuthoredLocalWrite({ ...input, reopened });
   } catch {
     return null;
   }

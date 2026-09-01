@@ -4842,7 +4842,13 @@ async function runStepViaHarness(
           operationIds: preparedExternalCatalog.operationIds,
         }
       : undefined;
-    if (preparedExternalCatalog.status === 'ready') {
+    // The immutable authored step is the accepted work for its own mutations.
+    // Record the exact receipt whether or not the step names external
+    // operations: a prose step whose only writes are Clementine's registry
+    // ledgers (tasks, goals, spaces) gets an identity-free receipt so the host
+    // can cover those reversible local writes instead of refusing them for
+    // lack of a plan. `none` (read step / authored approval gate) is ordinary.
+    {
       const writeAuthority = recordAuthoredWorkflowWriteAuthority({
         sessionId: realSessionId,
         sourceUserSeq: sourceUserEvent.seq,
@@ -4851,11 +4857,25 @@ async function runStepViaHarness(
         workflowSlug: workflowStorageName,
         stepId: step.id,
         expectedPlanProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
-        catalogIdentities: preparedExternalCatalog.catalogIdentities,
+        catalogIdentities: preparedExternalCatalog.status === 'ready'
+          ? preparedExternalCatalog.catalogIdentities
+          : [],
       });
       if (writeAuthority.status === 'refused') {
-        throw new Error(
-          `workflow step "${step.id}" authored write authority refused:${writeAuthority.reason}`,
+        // An authored EXTERNAL write whose authority cannot be bound must not
+        // reach the model: fail the step loudly. An identity-free receipt is
+        // coverage for the step's own local ledgers only; when it cannot be
+        // bound (no run definition snapshot, legacy run record) the step runs
+        // exactly as it did before receipts existed — local writes fall to the
+        // uncovered consent path and reads/notifications proceed.
+        if (preparedExternalCatalog.status === 'ready') {
+          throw new Error(
+            `workflow step "${step.id}" authored write authority refused:${writeAuthority.reason}`,
+          );
+        }
+        logger.warn(
+          { stepId: step.id, workflowRunId, reason: writeAuthority.reason },
+          'authored step local-write coverage not recorded; local writes fall to uncovered consent',
         );
       }
     }
