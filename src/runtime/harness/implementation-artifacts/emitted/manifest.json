@@ -684,10 +684,10 @@
           "bytes": 3080
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 2735
+          "bytes": 2896
         },
         "src/runtime/harness/router-model.ts": {
-          "bytes": 19156
+          "bytes": 19380
         },
         "src/runtime/semantic-boundary/plan-grounding.ts": {
           "bytes": 14843
@@ -1026,7 +1026,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 23462
+          "bytes": 24233
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -3159,10 +3159,10 @@
           "bytes": 3080
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 2735
+          "bytes": 2896
         },
         "src/runtime/harness/router-model.ts": {
-          "bytes": 19156
+          "bytes": 19380
         },
         "src/runtime/semantic-boundary/plan-grounding.ts": {
           "bytes": 14843
@@ -3501,7 +3501,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 23462
+          "bytes": 24233
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
