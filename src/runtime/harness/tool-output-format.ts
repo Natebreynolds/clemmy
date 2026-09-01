@@ -105,12 +105,48 @@ export function exactToolOutputForInvocation(input: {
   return input.compactResult;
 }
 
+const NARROWER_SCOPE_HINT = 're-call with a narrower scope (offset/limit, filter, specific query) if you need the rest';
+
+function omittedMarker(omitted: number, total: number): string {
+  return `…[truncated — ${omitted.toLocaleString()} of ${total.toLocaleString()} chars omitted; ${NARROWER_SCOPE_HINT}]`;
+}
+
+/**
+ * HEAD-budget clip: `maxChars` is the budget for the CONTENT head, and the
+ * truncation marker is appended beyond it. Callers that hand the model a
+ * plain (non-recallable) result rely on the first `maxChars` characters being
+ * the untouched head of the text (src/tools/shared.test.ts pins this), so the
+ * marker never eats into the content budget here. When the whole visible
+ * result must stay within a hard cap, use `truncateToolTextWithin`.
+ */
 export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
   if (text.length <= maxChars) return text;
-  const marker = `…[truncated — ${text.length.toLocaleString()} total chars]`;
-  if (marker.length >= maxChars) return marker.slice(0, Math.max(0, maxChars));
-  const headLength = Math.max(0, maxChars - marker.length - 2);
-  return `${text.slice(0, headLength)}\n\n${marker}`;
+  const head = text.slice(0, maxChars);
+  return `${head}\n\n${omittedMarker(text.length - maxChars, text.length)}`;
+}
+
+/**
+ * TOTAL-bounded clip: the returned string (head + marker) never exceeds
+ * `maxChars`. formatRecallableToolText composes several pieces (id index,
+ * digest body, recovery line, exact-output receipt) inside ONE visible budget,
+ * so each piece has to be bounded as a whole or the sum escapes the cap. The
+ * marker stays truthful about how many characters were dropped; when even the
+ * full marker cannot fit, a shorter total-only marker is used, and when not
+ * even that fits the marker itself is cut.
+ */
+function truncateToolTextWithin(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  // Size the marker with the largest possible omitted count (the full length)
+  // so the digits of the real count can never push the result past the cap.
+  const widestMarker = omittedMarker(text.length, text.length);
+  if (widestMarker.length + 2 < maxChars) {
+    const headLength = maxChars - widestMarker.length - 2;
+    return `${text.slice(0, headLength)}\n\n${omittedMarker(text.length - headLength, text.length)}`;
+  }
+  const shortMarker = `…[truncated — ${text.length.toLocaleString()} total chars]`;
+  if (shortMarker.length >= maxChars) return shortMarker.slice(0, Math.max(0, maxChars));
+  const headLength = Math.max(0, maxChars - shortMarker.length - 2);
+  return `${text.slice(0, headLength)}\n\n${shortMarker}`;
 }
 
 // Keys whose array value is a list of ADDRESSABLE resources the model targets
@@ -240,10 +276,10 @@ export function formatRecallableToolText(
 
   if (!sessionId || !callId || persistenceFailed) {
     const dense = densifyMarkdownForModelHead(text);
-    if (!idIndex) return truncateToolText(dense, maxChars);
-    const boundedIndex = truncateToolText(idIndex, Math.max(1, Math.floor(maxChars * 0.5)));
+    if (!idIndex) return truncateToolTextWithin(dense, maxChars);
+    const boundedIndex = truncateToolTextWithin(idIndex, Math.max(1, Math.floor(maxChars * 0.5)));
     const bodyBudget = Math.max(1, maxChars - boundedIndex.length - 2);
-    return `${boundedIndex}\n\n${truncateToolText(dense, bodyBudget)}`;
+    return `${boundedIndex}\n\n${truncateToolTextWithin(dense, bodyBudget)}`;
   }
 
   const settlementNonce = active?.settlementNonce;
@@ -301,7 +337,7 @@ export function formatRecallableToolText(
       const available = Math.max(0, bodyLimit - recovery.length - 1);
       compact = available > 0 ? `${compact.slice(0, available)}\n${recovery}` : recovery;
     } else {
-      compact = truncateToolText(recovery, bodyLimit);
+      compact = truncateToolTextWithin(recovery, bodyLimit);
     }
   }
   return exactReceipt ? (compact ? `${compact}\n${exactReceipt}` : exactReceipt) : compact;

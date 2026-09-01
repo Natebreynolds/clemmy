@@ -306,7 +306,12 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
     .filter((call) => nearestContainingFunction(call) === startDaemon);
   const activatedDispatchRecovery = callsNamed(startDaemon, 'reconcileActivatedWorkflowDispatchGroups')
     .filter((call) => nearestContainingFunction(call) === startDaemon);
-  const genericChatRecovery = callsNamed(startDaemon, 'reportInterruptedChatRuns');
+  // The per-tick exact-checkpoint retry re-issues this call from inside a
+  // nested runtime-phase callback; the boot registration is the one whose
+  // nearest containing function is startDaemon itself, exactly as the two
+  // workflow dispatch recoveries above are counted.
+  const genericChatRecovery = callsNamed(startDaemon, 'reportInterruptedChatRuns')
+    .filter((call) => nearestContainingFunction(call) === startDaemon);
   const terminalReportBack = callsNamed(startDaemon, 'startTerminalReportBackWatcher');
   for (const [label, calls] of [
     ['canonical tool-memory migration', canonicalToolMigration],
