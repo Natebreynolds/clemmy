@@ -2788,6 +2788,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   };
 
   let lastExactProductionMiss = '';
+  // One JIT read-provisioning attempt per carried operation per turn.
+  const jitReadProvisionAttempted = new Set<string>();
   const exactProductionHostCall = (
     name: string,
     args: Record<string, unknown> | null,
@@ -3433,6 +3435,60 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     return `Tool '${name}' was refused before dispatch by the read-only canary because its exact attested pure-local read contract is absent or does not match the configured object. No local or external mutation was attempted.`;
   };
 
+  // JIT READ EDGE: a carried provider operation the model selected is absent
+  // from this turn's frozen snapshot and was never proven this turn. The host
+  // holds the exact provider definition, so provision it once per turn and let
+  // the caller re-run the exact production check: a READ then binds through
+  // the proven-live-read path; a WRITE stays behind the frozen/authored bar.
+  // Nothing is synthesized from the model's spelling — the definition must
+  // exist and revalidate byte-exactly, or the original refusal stands.
+  const jitProvisionCarriedOperation = async (
+    callName: string,
+    parsedArguments: Record<string, unknown> | null,
+  ): Promise<boolean> => {
+    const carried = unwrapRuntimeEffectiveToolIdentity(callName, parsedArguments).toolName?.trim() ?? '';
+    const carriedOperation = carried && carried !== callName ? carried : '';
+    if (!carriedOperation || jitReadProvisionAttempted.has(carriedOperation)) return false;
+    jitReadProvisionAttempted.add(carriedOperation);
+    const jitIdentity = exactHostIdentity();
+    const acceptedEvent = listEvents(jitIdentity.sessionId, {
+      sinceSeq: jitIdentity.sourceUserSeq - 1,
+      types: ['user_input_received'],
+      limit: 1,
+    }).find((event) => event.seq === jitIdentity.sourceUserSeq);
+    const acceptedDisplay = typeof acceptedEvent?.data.displayText === 'string'
+      ? acceptedEvent.data.displayText
+      : '';
+    const acceptedText = acceptedDisplay.trim()
+      ? acceptedDisplay
+      : (typeof acceptedEvent?.data.text === 'string' ? acceptedEvent.data.text : '');
+    let provisioned: Awaited<ReturnType<HostJitReadProvisioner>>;
+    try {
+      provisioned = await hostJitReadProvisioner({
+        sessionId: jitIdentity.sessionId,
+        sourceUserSeq: jitIdentity.sourceUserSeq,
+        acceptedInput: acceptedText,
+        operationIds: [carriedOperation],
+        deadlineAt: Date.now() + HOST_JIT_READ_PROVISION_BUDGET_MS,
+      });
+    } catch (error) {
+      provisioned = {
+        ok: false,
+        code: 'jit_read_provision_failed',
+        identifier: carriedOperation,
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    hostTurnLogger.info({
+      sessionId: jitIdentity.sessionId,
+      sourceUserSeq: jitIdentity.sourceUserSeq,
+      operationId: carriedOperation,
+      ok: provisioned.ok,
+      ...(provisioned.ok ? {} : { code: provisioned.code, detail: provisioned.detail }),
+    }, 'host jit read provisioning');
+    return provisioned.ok;
+  };
+
   const executeCall = async (
     call: { callId: string; name: string; argumentsJson: string },
     observation: HostCallInvocationObservation = { invocationEntered: false },
@@ -3465,13 +3521,28 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let admittedEffect: RuntimeToolEffect = parsedArguments
       ? classifyRuntimeToolEffect(call.name, parsedArguments).effect
       : 'unknown';
-    const canaryRefusal = readOnlyCanaryRefusal(
+    let canaryRefusal = readOnlyCanaryRefusal(
       call.name,
       parsedArguments,
       argumentsJson,
       tool,
       call.callId,
     );
+    if (
+      canaryRefusal
+      && lastExactProductionMiss.startsWith('catalog_entry_or_manifest_missing')
+      && await jitProvisionCarriedOperation(call.name, parsedArguments)
+    ) {
+      // Re-run the exact check against the now-provisioned definition; the
+      // refusal (and the miss it names) is recomposed, never edited.
+      canaryRefusal = readOnlyCanaryRefusal(
+        call.name,
+        parsedArguments,
+        argumentsJson,
+        tool,
+        call.callId,
+      );
+    }
     // Read synchronously: sibling reads share a bounded pool, and the exact
     // miss belongs to the refusal composed on the line above.
     const literalFaultOperation = canaryRefusal
@@ -6327,7 +6398,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           name: call.name,
           arguments: argumentsJson,
         };
-        const exactProduction = exactProductionHostCall(
+        let exactProduction = exactProductionHostCall(
           call.name,
           parsedArguments,
           argumentsJson,
@@ -6336,6 +6407,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           runContext,
           { toolCall: approvalToolCallItem },
         );
+        if (
+          !exactProduction
+          && lastExactProductionMiss.startsWith('catalog_entry_or_manifest_missing')
+          && await jitProvisionCarriedOperation(call.name, parsedArguments)
+        ) {
+          exactProduction = exactProductionHostCall(
+            call.name,
+            parsedArguments,
+            argumentsJson,
+            tool,
+            call.callId,
+            runContext,
+            { toolCall: approvalToolCallItem },
+          );
+        }
         approvalExactProduction = exactProduction;
         if (!approvalExactProduction) {
           preApprovalRefused = true;
@@ -6686,6 +6772,32 @@ export const hostRunRunner: RunRunnerFn = async (runner, agent, itemsOrState, op
  * so the turn stops and explains instead of entering a repair loop that the
  * no-progress governor would only terminalize as an opaque "internal error".
  * Live 2026-08-31: one run refused the same literally named read 15 times. */
+/**
+ * JIT READ EDGE (2026-09-01): a provider READ the accepted source never named
+ * is not a refusal the model can correct — the host holds the exact provider
+ * definition and can provision it on the spot (Platform 49 died calling the
+ * spreadsheet-info read it needed for a required `sheet_id`). Writes stay
+ * behind the frozen/authored bar: provisioning only makes a READ dispatchable
+ * through the existing proven-live-read path. One attempt per operation per
+ * turn, bounded wall time, and the provider definition must revalidate
+ * exactly — nothing is synthesized from the model's spelling.
+ */
+export type HostJitReadProvisioner = (input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedInput: string;
+  operationIds: readonly string[];
+  deadlineAt: number;
+}) => Promise<{ ok: true } | { ok: false; code: string; identifier: string; detail?: string }>;
+const HOST_JIT_READ_PROVISION_BUDGET_MS = 20_000;
+const productionHostJitReadProvisioner: HostJitReadProvisioner = async (input) => {
+  const { provisionExactWorkflowProviderOperations } = await import('../../tools/tool-search-provider-sources.js');
+  return provisionExactWorkflowProviderOperations(input);
+};
+let hostJitReadProvisioner: HostJitReadProvisioner = productionHostJitReadProvisioner;
+export function _setHostJitReadProvisionerForTests(provisioner: HostJitReadProvisioner | null): void {
+  hostJitReadProvisioner = provisioner ?? productionHostJitReadProvisioner;
+}
 export const HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX = 'literal_workflow_operation_not_frozen:';
 
 export function literalOperationNotFrozenReason(operationId: string): string {

@@ -36,6 +36,7 @@ const {
   isReturnedPreDispatchHostRefusalSettlement,
   hostBlockedTerminalDetail,
   literalOperationNotFrozenReason,
+  _setHostJitReadProvisionerForTests,
 } = await import('./host-turn-runner.js');
 const catalogScope = await import('./accepted-source-catalog-scope.js');
 const hostRunRunner: typeof productionHostRunRunner = (
@@ -8001,6 +8002,140 @@ test('a done claim after the host refused this source\'s only work before dispat
     assert.deepEqual(committed.event.data.verificationMissing, ['work_refused_without_business_evidence']);
     assert.equal(committed.presentation.text.startsWith('Your calendar is ready.'), true,
       'the model\'s own words are held, never rewritten by the committer');
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+// ── JIT READ EDGE (gate 2/10 class) ───────────────────────────────────────────
+// Live 2026-09-01: platform-49 needed the numeric sheet_id for a required
+// nested write field and called the spreadsheet-info READ the workflow never
+// names. The frozen snapshot had no candidate, nothing had proven it, and the
+// host refused it twice → no-progress terminal. The host holds the exact
+// provider definition: a carried READ absent from the snapshot is provisioned
+// once and dispatched through the proven-live-read path; a carried WRITE is
+// provisioned the same way but stays behind the frozen/authored bar.
+test('a carried provider READ absent from the frozen snapshot is provisioned once and dispatched; a WRITE stays refused', async (t) => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+
+  const runVariant = async (input: { label: string; effect: 'read' | 'external_write'; shouldExecute: boolean }) => {
+    const fixture = acceptHostCanarySource(`jit-read-${input.label}`);
+    const operationId = `market_${input.label}__lookup_sheet_info`;
+    const manifest = capabilityManifests.attachSemanticContract({
+      version: 1,
+      manifestId: `cap:${input.label}:sheet-info`,
+      providerKind: 'native_mcp',
+      operationId,
+      providerIdentity: `configured-market-directory:${input.label}`,
+      providerVersion: '2026-09-01',
+      operationVersion: '1',
+      definitionFingerprint: 'c'.repeat(64),
+      effect: input.effect,
+      accountId: `account:${input.label}:primary`,
+      idempotency: { required: false, policy: 'none' },
+      reconciliation: { supported: false, policy: 'none' },
+      outputContract: { kind: input.effect === 'read' ? 'sheet_records' : 'created_resource' },
+      evidenceContract: { kinds: ['receipt'], readbackRequired: false },
+      provenance: { issuer: 'host-turn-runner:test', issuedAt: '2026-09-01T00:00:00.000Z', trusted: true },
+      lifecycle: { state: 'current' },
+      advisoryRoles: ['lookup'],
+    });
+    let portBodies = 0;
+    const portInvoke = async () => {
+      portBodies += 1;
+      return { kind: 'clementine.external-read.result', version: 1, records: [{ sheetId: 7 }] };
+    };
+    // The frozen surface holds NOTHING for this operation: an empty factory.
+    const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+    capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+    productionPorts.clearProductionCapabilityPorts();
+    assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
+      productionPorts.productionPortIdentityFromManifest(manifest),
+      { invoke: portInvoke as never },
+    ), { ok: true });
+    const provisionCalls: string[][] = [];
+    _setHostJitReadProvisionerForTests(async (request) => {
+      provisionCalls.push([...request.operationIds]);
+      assert.equal(request.sessionId, fixture.session.id);
+      assert.equal(request.sourceUserSeq, fixture.source.seq);
+      assert.ok(request.deadlineAt > Date.now());
+      // The real provisioner revalidates the provider definition and registers
+      // the exact proof-provisioned capability; the fixture registers the same
+      // direct shape into the installed factory.
+      factory.register({
+        capabilityId: manifest.manifestId,
+        toolName: manifest.operationId,
+        schemaVersion: manifest.operationVersion,
+        schemaDigest: manifest.definitionFingerprint,
+        effect: manifest.effect,
+        account: manifest.accountId,
+        manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+        providerKind: manifest.providerKind,
+        liveFingerprint: manifest.definitionFingerprint,
+        manifest,
+        invoke: portInvoke as never,
+      });
+      return { ok: true } as const;
+    });
+    try {
+      const carrier = brackets.wrapToolForHarness({
+        type: 'function',
+        name: 'call_tool',
+        description: 'Invoke one exact schema acquired from the frozen capability catalog.',
+        parameters: {
+          type: 'object',
+          properties: { name: { type: 'string' }, args_json: { type: 'string' } },
+          required: ['name', 'args_json'],
+        },
+        needsApproval: async () => false,
+        invoke: async () => { throw new Error('the generic carrier body must not replace the exact production port'); },
+      });
+      const model = stubModel([
+        [toolCall(`${input.label}-jit-call`, 'call_tool', { name: operationId, args_json: JSON.stringify({ spreadsheet: 'sheet-1' }) })],
+        [toolCall(`${input.label}-jit-call-again`, 'call_tool', { name: operationId, args_json: JSON.stringify({ spreadsheet: 'sheet-1' }) })],
+        [textMsg(`${input.label} settled`)],
+      ]);
+      const agent = { model, tools: [carrier] };
+      bindHostCanarySurface(fixture, agent, [carrier]);
+      const outcome = await runProductionHost(fixture, agent);
+      const db = eventlog.openEventLog();
+      const physical = (db.prepare(`
+        SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+      `).get(fixture.session.id, fixture.source.seq) as { n: number }).n;
+      assert.equal(provisionCalls.length, 1, `exactly one JIT provisioning attempt per operation per turn; history: ${
+        JSON.stringify(outcome.history).match(/Failed check: [^."]*/)?.[0] ?? JSON.stringify(outcome.history).slice(0, 1200)
+      }`);
+      assert.deepEqual(provisionCalls[0], [operationId]);
+      if (input.shouldExecute) {
+        assert.equal(portBodies >= 1, true, JSON.stringify({ terminal: outcome.terminal, history: outcome.history }).slice(0, 2000));
+        assert.equal(physical >= 1, true);
+        assert.doesNotMatch(JSON.stringify(outcome.history), /catalog_entry_or_manifest_missing/);
+      } else {
+        assert.equal(portBodies, 0, 'a JIT-provisioned WRITE never crosses: the frozen/authored bar holds');
+        assert.equal(physical, 0);
+        assert.match(JSON.stringify(outcome.history), /catalog_entry_or_manifest_missing/);
+      }
+    } finally {
+      _setHostJitReadProvisionerForTests(null);
+    }
+  };
+
+  try {
+    await t.test('carried READ: provisioned once, dispatched through the proven-live-read path', () => runVariant({
+      label: 'read', effect: 'read', shouldExecute: true,
+    }));
+    await t.test('carried WRITE: provisioned once, still refused pre-dispatch', () => runVariant({
+      label: 'write', effect: 'external_write', shouldExecute: false,
+    }));
   } finally {
     productionPorts.clearProductionCapabilityPorts();
     for (const prior of priorPorts) {
