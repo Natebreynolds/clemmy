@@ -52,7 +52,12 @@ import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistry
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolution.js';
-import { isHarnessRefusalText, textResult } from './shared.js';
+import {
+  describeInvalidToolInput,
+  isHarnessRefusalText,
+  isSdkToolInputValidationError,
+  textResult,
+} from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
 import { resolveAcceptedExactMcpCarrier } from '../runtime/harness/accepted-mcp-carrier.js';
@@ -80,6 +85,7 @@ import {
   type ResolvedCarrierTarget,
 } from '../runtime/harness/resolved-carrier-refusal.js';
 import {
+  InvalidArgumentsPreDispatchResult,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
   type SettleToolAttemptInput,
@@ -628,7 +634,17 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       if (error instanceof ToolCallsLimitExceeded) throw error;
       if (options.propagateInvocationError?.(error) === true) throw error;
       const details = error instanceof Error ? error.toString() : String(error);
-      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+      const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
+      // The outer {name, args_json} envelope failed the SDK schema: no inner
+      // tool was resolved, no arg_validation refusal was minted, nothing
+      // dispatched. Same bytes for the model, nominal carrier for settlement.
+      if (isSdkToolInputValidationError(error)) {
+        const guidance = describeInvalidToolInput(error, 'call_tool');
+        return new InvalidArgumentsPreDispatchResult(
+          guidance ? `${base}\n${guidance}` : base,
+        ) as unknown as string;
+      }
+      return base;
     },
     // needsApproval intentionally omitted → false. Gate decisions come from the
     // INNER tool via dispatchBatchItemTool (see file header). Do NOT set this true.

@@ -4,7 +4,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { RunContext } from '@openai/agents';
+import { ModelBehaviorError, RunContext } from '@openai/agents';
 
 const TEST_HOME = '/tmp/clemmy-test-local-tools';
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -12,6 +12,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 const {
   getLocalToolCatalog,
   getLocalRuntimeTools,
+  getLocalDeferredDispatchTools,
   recoverMemoryRememberRequiredPrefix,
   describeInvalidToolInput,
   buildLocalToolErrorFunction,
@@ -60,11 +61,34 @@ test('invalid tool input returns the violated paths and a tool_search pointer, n
     parameters: {},
     handler: async () => { throw new Error('handler must not run on input errors'); },
   });
-  const message = await errorFunction(undefined, Object.assign(new Error('Invalid JSON input for tool'), invalidInput));
-  // Keeps the SDK default prefix (failure detection keys on it) AND adds guidance.
-  assert.match(message, /^An error occurred while running the tool/);
-  assert.match(message, /did not match its schema/);
-  assert.match(message, /tool_search/);
+  // The SDK's private InvalidToolInputError: its exported nominal base plus the
+  // two own fields its constructor assigns.
+  const message = await errorFunction(
+    undefined,
+    Object.assign(new ModelBehaviorError('Invalid JSON input for tool'), invalidInput),
+  );
+  // The nominal no-dispatch carrier rides to settlement; the model-facing
+  // bytes keep the SDK default prefix (failure detection keys on it) AND add
+  // guidance.
+  assert.ok(message instanceof InvalidArgumentsPreDispatchResult,
+    'validation refused before execute must not be laundered into a plain string');
+  assert.deepEqual(attemptSignalsFromTypedResult(message), {
+    preDispatch: true,
+    argumentValidationFailed: true,
+    schemaAvailable: true,
+  });
+  assert.match(String(message), /^An error occurred while running the tool/);
+  assert.match(String(message), /did not match its schema/);
+  assert.match(String(message), /tool_search/);
+
+  // Spelling is not identity: a forged error merely NAMED InvalidToolInputError
+  // still gets the guidance text but never the nominal carrier.
+  const forged = await errorFunction(
+    undefined,
+    Object.assign(new Error('Invalid JSON input for tool'), invalidInput),
+  );
+  assert.equal(typeof forged, 'string');
+  assert.match(forged as string, /did not match its schema/);
 
   // A plain execution error keeps the exact SDK default shape — no guidance.
   const executionMessage = await errorFunction(undefined, new Error('disk full'));
@@ -115,6 +139,61 @@ test('local runtime preserves file_query argument refusal as a nominal invalid-a
   });
   assert.match(String(output), /pass exactly ONE of `file` \/ `call_id`/i,
     'the model-facing corrective text remains unchanged');
+});
+
+test('task_list literal "null" enum value returns the nominal invalid-arguments carrier', async () => {
+  // Live 2026-08-31 end-of-day wrap_up (event 102340): the SDK schema layer
+  // rejected priority:"null" before the handler, and the errorFunction's plain
+  // string settled 'succeeded'/'host_execution' with a result handle on lane
+  // byo. The exact live arguments, through the real first-class tool.
+  const liveArgs = { status: 'completed', since: 'today', priority: 'null', project: 'null', limit: 50 };
+  const taskList = getLocalRuntimeTools()
+    .find((candidate) => (candidate as { name?: string }).name === 'task_list');
+  assert.ok(taskList && taskList.type === 'function');
+
+  const output = await taskList.invoke(
+    new RunContext({ sessionId: 'local-task-list-invalid-enum' }),
+    JSON.stringify(liveArgs),
+  );
+  assert.ok(output instanceof InvalidArgumentsPreDispatchResult,
+    'the SDK errorFunction value is the tool result; it must carry the nominal no-dispatch class');
+  assert.equal(output.outcomeKind, 'invalid_arguments');
+  assert.equal(output.executionKind, 'refused_pre_dispatch');
+  assert.deepEqual(attemptSignalsFromTypedResult(output), {
+    preDispatch: true,
+    argumentValidationFailed: true,
+    schemaAvailable: true,
+  });
+  assert.match(String(output), /^An error occurred while running the tool/,
+    'the laundered-prefix detectors (inner-dispatch, batch-runner) keep matching the bytes');
+  assert.match(String(output), /InvalidToolInputError/);
+  assert.match(String(output), /priority: Invalid option/);
+  assert.match(String(output), /tool_search/);
+
+  // The deferred call_tool/work_call carrier validates with its own canonical
+  // schema (the envelope admits any object): same input, same carrier, same
+  // bytes — lane parity at the producer.
+  const deferred = getLocalDeferredDispatchTools()
+    .find((candidate) => (candidate as { name?: string }).name === 'task_list');
+  assert.ok(deferred && deferred.type === 'function');
+  const deferredOutput = await deferred.invoke(
+    new RunContext({ sessionId: 'local-task-list-invalid-enum-deferred' }),
+    JSON.stringify(liveArgs),
+  );
+  assert.ok(deferredOutput instanceof InvalidArgumentsPreDispatchResult,
+    'a canonical-schema ZodError must not be laundered into an execution-error string');
+  assert.deepEqual(attemptSignalsFromTypedResult(deferredOutput), attemptSignalsFromTypedResult(output));
+  assert.match(String(deferredOutput), /^An error occurred while running the tool/);
+  assert.match(String(deferredOutput), /priority: Invalid option/);
+
+  // Positive control: the corrected call (strict schema: every key present,
+  // optional ones null) executes normally and returns a plain string.
+  const repaired = await taskList.invoke(
+    new RunContext({ sessionId: 'local-task-list-repaired' }),
+    JSON.stringify({ ...liveArgs, priority: 'high', project: null }),
+  );
+  assert.equal(typeof repaired, 'string', String(repaired));
+  assert.doesNotMatch(String(repaired), /InvalidToolInputError/);
 });
 
 test('space_save collision is a no-effect invalid-arguments result and a new slug can commit once', async () => {

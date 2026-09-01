@@ -7,7 +7,17 @@ import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import type { RuntimeContextValue } from '../types.js';
-import { AGENTS_DIR, DELEGATIONS_DIR, PENDING_ACTIONS_DIR, TEAM_COMMS_LOG, TEAM_REQUESTS_DIR, getWorkspaceDirs } from './shared.js';
+import {
+  AGENTS_DIR,
+  DELEGATIONS_DIR,
+  PENDING_ACTIONS_DIR,
+  TEAM_COMMS_LOG,
+  TEAM_REQUESTS_DIR,
+  describeInvalidToolInput,
+  getWorkspaceDirs,
+  isSdkToolInputValidationError,
+} from './shared.js';
+import { InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
@@ -1558,7 +1568,17 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         return `${SHELL_POLICY_DENIAL_PREFIX} ${error.message}`;
       }
       const details = error instanceof Error ? error.toString() : String(error);
-      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+      const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
+      // A malformed argument object never reached execute: keep the exact
+      // SDK bytes for the model and the nominal no-dispatch carrier for
+      // settlement, as every other tool surface does (see shared.js).
+      if (isSdkToolInputValidationError(error)) {
+        const guidance = describeInvalidToolInput(error, 'run_shell_command');
+        return new InvalidArgumentsPreDispatchResult(
+          guidance ? `${base}\n${guidance}` : base,
+        ) as unknown as string;
+      }
+      return base;
     },
     execute: async (input, runContext, details) => {
       if (shellMutatesMemoryStore(input.command)) {
