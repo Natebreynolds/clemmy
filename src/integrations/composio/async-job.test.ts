@@ -18,6 +18,8 @@ import {
   resolveJobGetter,
   registerJobFamily,
   recipeFor,
+  FIRECRAWL_BATCH_SCRAPE_GETTER,
+  FIRECRAWL_BATCH_SCRAPE_START,
   type JobReceipt,
   type ComposioToolkitTool,
   type JobFamilyRecipe,
@@ -298,6 +300,38 @@ test('pollJobToResolution: DataForSEO with no discoverable getter falls back (ne
 // ── S1: Firecrawl poll recipe ─────────────────────────────────────────────────────
 const FIRECRAWL_INPROGRESS = { data: { id: 'fc-123', status: 'scraping', data: [] }, successful: true };
 const fcReceipt = (): JobReceipt => detectJobReceipt('FIRECRAWL_CRAWL_URLS', FIRECRAWL_INPROGRESS)!;
+
+test('current Firecrawl batch-scrape id-only start is one exact receipt with one exact read getter', async () => {
+  const receipt = detectJobReceipt(FIRECRAWL_BATCH_SCRAPE_START, {
+    successful: true,
+    error: null,
+    data: {
+      success: true,
+      id: 'batch-fixture-1',
+      url: 'https://api.firecrawl.dev/v1/batch/scrape/batch-fixture-1',
+    },
+  });
+  assert.ok(receipt);
+  assert.equal(receipt.family, 'firecrawl');
+  assert.equal(receipt.jobId, 'batch-fixture-1');
+  assert.equal(receipt.status, 'started');
+  assert.equal(detectJobReceipt('FIRECRAWL_SCRAPE', {
+    data: { success: true, id: 'not-a-batch-owner', url: 'https://example.test' },
+  }), null, 'an arbitrary id-bearing Firecrawl response cannot mint batch poll authority');
+
+  const plan = await resolveJobGetter(receipt, async () => { throw new Error('resolution must not dispatch'); }, {
+    listToolkitTools: async () => [tool(FIRECRAWL_BATCH_SCRAPE_GETTER, {
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+    })],
+  });
+  assert.deepEqual(plan, {
+    getterSlug: FIRECRAWL_BATCH_SCRAPE_GETTER,
+    idArg: 'id',
+    idSource: 'job',
+  });
+});
 
 test('Firecrawl in-progress crawl is detected as a receipt', () => {
   const r = fcReceipt();

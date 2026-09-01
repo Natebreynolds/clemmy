@@ -163,6 +163,18 @@ export interface ComposioToolkitTool {
   version?: string;
 }
 
+// Process-local provenance for provider definitions hydrated only because a
+// deprecated row explicitly named them as its current replacements. Keeping
+// this out of the serialized provider shape prevents catalog prose from
+// manufacturing a public authority flag.
+const providerRecommendedSuccessorDefinitions = new WeakSet<object>();
+
+export function composioToolIsProviderRecommendedSuccessor(
+  tool: ComposioToolkitTool,
+): boolean {
+  return providerRecommendedSuccessorDefinitions.has(tool);
+}
+
 /** The live discovery boundary is deliberately smaller than the foreground
  * result surface. One server-side query may oversample for ranking/dedupe, but
  * it never enumerates a toolkit page. */
@@ -2447,6 +2459,25 @@ function rankAgainstRequest(items: readonly unknown[], query: string): unknown[]
     .map((entry) => entry.value);
 }
 
+/**
+ * Some provider rows carry their lifecycle authority only in prose (the live
+ * Firecrawl catalog is one example): the row says it is deprecated and names
+ * exact replacement action slugs after "prefer". Treat those identifiers as
+ * discovery hints, never executable authority. They are admitted only if an
+ * exact provider lookup returns the same identifier for a connected toolkit.
+ */
+function providerRecommendedSuccessorSlugs(value: unknown): string[] {
+  const description = str(obj(value).description) ?? '';
+  if (!/\bdeprecat(?:e|ed|ing|ion)\b/i.test(description)) return [];
+  const successors: string[] = [];
+  for (const match of description.matchAll(/\bprefer\b([^.!?\n]+)/gi)) {
+    for (const identifier of (match[1] ?? '').match(/\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+\b/g) ?? []) {
+      if (!successors.includes(identifier)) successors.push(identifier);
+    }
+  }
+  return successors.slice(0, 4);
+}
+
 export function providerKeywordSearchRungs(
   query: string,
   connectedToolkits: readonly string[],
@@ -2515,7 +2546,10 @@ export async function searchConnectedComposioTools(
     return items;
   };
 
-  const ingest = (items: readonly unknown[]): void => {
+  const ingest = (
+    items: readonly unknown[],
+    preferredIdentities: ReadonlySet<string> = new Set<string>(),
+  ): void => {
     const observedAt = Date.now();
     for (const value of items) {
     const item = obj(value);
@@ -2549,6 +2583,9 @@ export async function searchConnectedComposioTools(
       outputParameters: item.outputParameters ?? item.output_parameters,
       version: str(item.version),
     };
+    if (preferredIdentities.has(identity)) {
+      providerRecommendedSuccessorDefinitions.add(tool);
+    }
     toolSchemaObservedAt.set(tool, observedAt);
     out.push(tool);
       if (out.length >= returnLimit) break;
@@ -2562,6 +2599,65 @@ export async function searchConnectedComposioTools(
         ...(search === PROVIDER_SEARCH_UNFILTERED_RUNG ? {} : { search }),
         limit: COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
       } as never)));
+    const providerRows = responses.flatMap(parse);
+
+    // A deprecated result can fill the provider's bounded page while the
+    // current action it explicitly recommends is absent. Hydrate only those
+    // provider-named successors through exact no-list lookups. This is generic
+    // lifecycle handling: no toolkit or operation is hard-coded, and a prose
+    // identifier that the provider does not return exactly grants nothing.
+    const lifecycleRecommendations = providerRows.map((value) => {
+      const item = obj(value);
+      const slug = str(item.slug)?.trim().toUpperCase() ?? '';
+      const toolkit = obj(item.toolkit);
+      const toolkitSlug = (
+        str(toolkit.slug)
+        ?? str(item.toolkitSlug)
+        ?? str(item.toolkit_slug)
+        ?? connected
+          .filter((candidate) => slug.startsWith(`${candidate.toUpperCase()}_`))
+          .sort((left, right) => right.length - left.length)[0]
+        ?? ''
+      ).toLowerCase();
+      // Lifecycle prose from one carrier cannot promote an operation from a
+      // different carrier. Exact lookup proves identity; this prefix check
+      // keeps the recommendation inside the already-connected authority.
+      const successors = providerRecommendedSuccessorSlugs(value)
+        .filter((identifier) => toolkitSlug
+          && identifier.toUpperCase().startsWith(`${toolkitSlug.toUpperCase()}_`));
+      return { value, successors };
+    });
+    const recommended = [...new Set(lifecycleRecommendations.flatMap((entry) => entry.successors))]
+      .slice(0, 4);
+    const exactSuccessors = recommended.length === 0
+      ? []
+      : parse(await composio.tools.getRawComposioTools({
+          tools: recommended,
+          limit: recommended.length,
+        } as never))
+        .filter((value) => {
+          const item = obj(value);
+          const slug = str(item.slug)?.trim().toUpperCase() ?? '';
+          if (!recommended.includes(slug)) return false;
+          const toolkit = obj(item.toolkit);
+          const toolkitSlug = (
+            str(toolkit.slug)
+            ?? str(item.toolkitSlug)
+            ?? str(item.toolkit_slug)
+            ?? connected
+              .filter((candidate) => slug.startsWith(`${candidate.toUpperCase()}_`))
+              .sort((left, right) => right.length - left.length)[0]
+            ?? ''
+          ).toLowerCase();
+          return connectedSet.has(toolkitSlug)
+            && (item.inputParameters ?? item.input_parameters ?? item.parameters) !== undefined;
+        });
+    const resolvedSuccessorSlugs = new Set(exactSuccessors
+      .map((value) => str(obj(value).slug)?.trim().toUpperCase())
+      .filter((value): value is string => Boolean(value)));
+    const effectiveProviderRows = lifecycleRecommendations
+      .filter((entry) => !entry.successors.some((slug) => resolvedSuccessorSlugs.has(slug)))
+      .map((entry) => entry.value);
     // Order the rung's whole union against the ORIGINAL request before the
     // bounded window is spent. A rung can ask several terms at once, and each
     // answer arrives in the provider's own order, so draining them as they
@@ -2571,7 +2667,13 @@ export async function searchConnectedComposioTools(
     // actually about never entered the window at all. Every row here still
     // came from a real provider response — this chooses among them, it never
     // invents one.
-    ingest(rankAgainstRequest(responses.flatMap(parse), normalizedQuery));
+    // Exact current successors own the front of the bounded card. The
+    // deprecated row they replace is omitted; unrelated provider rows retain
+    // their ordinary relevance order behind it.
+    ingest([
+      ...rankAgainstRequest(exactSuccessors, normalizedQuery),
+      ...rankAgainstRequest(effectiveProviderRows, normalizedQuery),
+    ], resolvedSuccessorSlugs);
     // The first rung the provider actually answers owns the result. A later
     // rung is never paid once discovery has rows to rank.
     if (out.length > 0) break;

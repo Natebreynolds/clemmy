@@ -11,6 +11,8 @@ import { createHash } from 'node:crypto';
 import { realpathSync, statSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
+import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
+import { digestSchema } from '../../tools/tool-contract-store.js';
 import { persistCapabilityLiveIdentity } from './capability-live-identity.js';
 import { observeComposioIndependently } from './production-capability-adapters.js';
 import { observeHostCallable } from './production-capability-catalog.js';
@@ -40,6 +42,7 @@ import {
   type HostCapabilityCatalogFactory,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
+import { createProofProviderForegroundPayloadValidator } from './proof-provider-args.js';
 
 export interface LiveCapabilityObservation {
   definitionFingerprint: string;
@@ -134,7 +137,7 @@ function observeComposio(manifest: CapabilityManifestV1): LiveCapabilityObservat
   const fromPort = port?.observe?.(manifest);
   const independently = fromPort && typeof fromPort !== 'string'
     ? fromPort
-    : observeComposioIndependently(manifest.operationId);
+    : observeComposioIndependently(manifest.operationId, manifest.accountId);
   if (!independently || typeof independently === 'string') return independently ?? 'missing';
   if (!independently.accountId.trim() || !independently.providerVersion.trim()) return 'missing';
   if (!independently.definitionFingerprint.trim()) return 'missing';
@@ -241,12 +244,39 @@ export function observationMatchesManifest(
   return { ok: true, observation };
 }
 
+function proofForegroundValidatorForManifest(
+  manifest: CapabilityManifestV1,
+): RegisteredHostCapability['validateForegroundPayload'] {
+  if (
+    manifest.providerKind !== 'composio'
+    || manifest.argumentCompiler.id !== 'compile:proof-schema:v1'
+    || manifest.argumentCompiler.version !== '1'
+    || !manifest.externalDefinition
+  ) return undefined;
+  try {
+    const schema = getCachedToolSchema(manifest.operationId);
+    if (
+      !schema
+      || digestSchema(schema) !== manifest.externalDefinition.providerInputSchemaDigest
+    ) return undefined;
+    return createProofProviderForegroundPayloadValidator({
+      operationId: manifest.operationId,
+      schema,
+    }) ?? undefined;
+  } catch {
+    // A missing or malformed validation hint never changes callable identity.
+    // Exact execution still uses the manifest's sealed compiler.
+    return undefined;
+  }
+}
+
 export function registeredCapabilityFromManifest(input: {
   manifest: CapabilityManifestV1;
   observation: LiveCapabilityObservation;
   invoke: GraphNodeCapabilityInvoke;
   reconcile?: GraphNodeCapabilityReconcile;
 }): RegisteredHostCapability {
+  const validateForegroundPayload = proofForegroundValidatorForManifest(input.manifest);
   return {
     capabilityId: input.manifest.manifestId,
     toolName: input.manifest.operationId,
@@ -267,6 +297,7 @@ export function registeredCapabilityFromManifest(input: {
     liveFingerprint: input.observation.definitionFingerprint,
     delegatedFrom: input.manifest.delegatedFrom,
     manifest: input.manifest,
+    ...(validateForegroundPayload ? { validateForegroundPayload } : {}),
     ...(input.reconcile ? { reconcile: input.reconcile } : {}),
     invoke: input.invoke,
     implementationDigest: portImplementationIdentity({
@@ -357,6 +388,10 @@ export function createProductionCapabilityAdapter(input: {
             observedAt: priorIndependent.observedAt,
           }).ok
         ) {
+          const validateForegroundPayload = proofForegroundValidatorForManifest(current);
+          if (validateForegroundPayload && !already.validateForegroundPayload) {
+            factory.register({ ...already, validateForegroundPayload });
+          }
           registered += 1;
           continue;
         }

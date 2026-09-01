@@ -1,4 +1,5 @@
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
+import { isHostStructuralPlanningControlLookup } from '../../tools/structural-control-lookup.js';
 import { appendEvent } from './eventlog.js';
 import { classifyAttemptOutcome, type AttemptSignals } from './attempt-outcome.js';
 import { withLogicalToolCall } from './attempt-identity.js';
@@ -190,6 +191,11 @@ export function classifyDiscoveryCall(
       || cursor.startsWith('tool_search_schema:v1:')
     ) return null;
     const query = scoped.query;
+    // The broker proves this exact query is answered entirely by its local
+    // host-control branch. It performs no catalog/provider discovery and mints
+    // no capability authority, so it must not consume the task's unscoped
+    // provider claim (live Salesforce→Sheets request, 2026-08-31).
+    if (isHostStructuralPlanningControlLookup(query)) return null;
     const exact = explicitlyNamesBuiltinTool(query) || exactToolIdentifierQuery(query);
     return {
       category: exact ? 'exact_schema_refresh' : 'broad_discovery',

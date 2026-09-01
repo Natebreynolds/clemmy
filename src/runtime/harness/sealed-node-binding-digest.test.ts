@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { bindingDigestOf, type SealedNodeBinding } from './host-capability-catalog-factory.js';
 import { sealedNodeBindingDigestOf } from './sealed-node-binding-digest.js';
+import { deriveAsyncReadContinuationRecipe } from './async-read-continuation-contract.js';
 
 const base = {
   nodeId: 'write_once',
@@ -38,5 +39,53 @@ test('mint and terminal re-derivation share one digest that seals generic operat
     }),
     minted,
     'changing the provider-neutral risk semantic changes the binding authority',
+  );
+});
+
+test('the final node-binding digest covers the exact async read successor recipe', () => {
+  const recipe = deriveAsyncReadContinuationRecipe({
+    acceptedTaskId: 'task:session#1',
+    workContractId: `expected-work:v1:${'4'.repeat(64)}`,
+    ownerRequirementId: 'verify_recent_articles',
+    ownerBindingDigest: sealedNodeBindingDigestOf(base),
+    owner: {
+      providerIdentity: 'provider:firecrawl',
+      operationId: 'FIRECRAWL_BATCH_SCRAPE',
+      schemaVersion: '20260826_00',
+      providerInputSchemaDigest: '1'.repeat(64),
+      providerOutputSchemaDigest: 'a'.repeat(64),
+      account: 'connection:firecrawl',
+    },
+    getter: {
+      capabilityId: 'cap:firecrawl:batch-get',
+      manifestId: 'manifest:firecrawl:batch-get',
+      manifestDigest: '5'.repeat(64),
+      operationId: 'FIRECRAWL_BATCH_SCRAPE_GET',
+      schemaVersion: '20260826_00',
+      schemaDigest: '6'.repeat(64),
+      providerKind: 'composio',
+      providerVersion: '20260826_00',
+      providerInputSchemaDigest: '7'.repeat(64),
+      liveFingerprint: '8'.repeat(64),
+      account: 'connection:firecrawl',
+      effect: 'read',
+      destination: null,
+      idempotency: { required: false, policy: 'none' },
+      reconciliation: { supported: false, policy: 'none' },
+      invokePortId: 'invoke:composio:firecrawl',
+      argumentCompiler: { id: 'composio', version: '1' },
+    },
+    getterProviderIdentity: 'provider:firecrawl',
+    getterProviderOutputSchemaDigest: '9'.repeat(64),
+  });
+  assert.ok(recipe);
+  const withAsync = { ...base, asyncRead: recipe! };
+  assert.notEqual(sealedNodeBindingDigestOf(withAsync), sealedNodeBindingDigestOf(base));
+  assert.notEqual(
+    sealedNodeBindingDigestOf({
+      ...withAsync,
+      asyncRead: { ...recipe!, getterProviderOutputSchemaDigest: 'a'.repeat(64) },
+    }),
+    sealedNodeBindingDigestOf(withAsync),
   );
 });

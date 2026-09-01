@@ -308,6 +308,38 @@ export interface RuntimeEffectiveToolIdentity {
 }
 
 /**
+ * Recover a local, graph-neutral control that was placed inside a trusted
+ * provider carrier. This is deliberately a closed structural projection:
+ * the inner name must be an exact registry declaration, that declaration must
+ * be both read-only and control-plane, and the trusted carrier must already
+ * have produced one contractible object payload. Unknown names, local writes,
+ * and business reads stay on the ordinary provider path.
+ */
+export function resolveProviderCarrierLocalReadControl(
+  toolName: string,
+  rawArgs: unknown,
+): { toolName: string; args: Record<string, unknown> } | null {
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, rawArgs);
+  if (
+    effective.composioCarrier !== true
+    || !effective.toolName
+    || !effective.args
+    || typeof effective.args !== 'object'
+    || Array.isArray(effective.args)
+  ) return null;
+  const declaration = TOOL_REGISTRY.find((candidate) => candidate.name === effective.toolName);
+  if (
+    !declaration
+    || declaration.sideEffect !== 'read'
+    || declaration.actionTopologyRole !== 'control'
+  ) return null;
+  return {
+    toolName: declaration.name,
+    args: effective.args as Record<string, unknown>,
+  };
+}
+
+/**
  * Peel schema/discovery carriers using the full invocation payload. Callers
  * must run this before event previews are clipped: the returned identity is a
  * small durable fact, while `args` may be arbitrarily large and remains only
@@ -711,6 +743,16 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
     return { effect: 'compute', mutating: false, dangerousWrite: false, source: 'shell' };
   }
 
+  // A model may put a LOCAL schema/discovery control inside a provider carrier
+  // after reading two adjacent carrier instructions. Exact registry identity
+  // wins only for a read-only control; execution still has to re-route through
+  // the configured local surface at the host boundary. This keeps the mistake
+  // out of business-write accounting without turning arbitrary inner strings
+  // into local authority.
+  const carriedLocalControl = resolveProviderCarrierLocalReadControl(toolName, args);
+  if (carriedLocalControl) {
+    return classifyRegistered(carriedLocalControl.toolName) ?? unknownDecision();
+  }
   if (isTrustedComposioGateway(toolName)) return classifyComposio(args);
   if (isTrustedDynamicComposioTool(toolName)) {
     return classifyComposio({ tool_slug: tail.slice(3), arguments: args });

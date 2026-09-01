@@ -30,6 +30,7 @@ import {
   searchComposioToolsViaCli,
   composioToolSchemaObservedAt,
   composioToolOperationVersion,
+  composioToolIsProviderRecommendedSuccessor,
   ComposioPreDispatchError,
   ComposioSearchProviderContractError,
   COMPOSIO_LIVE_SEARCH_OVERSAMPLE_LIMIT,
@@ -4820,11 +4821,21 @@ export async function searchComposioBrokerCandidates(
         queryTerms,
       ),
       inputParameters: candidate.inputParameters,
+      providerRecommendedSuccessor: composioToolIsProviderRecommendedSuccessor(candidate),
     }))
-    .filter((candidate) => queryTerms.length === 0 || candidate.score > 0)
+    .filter((candidate) => (
+      candidate.providerRecommendedSuccessor
+      || queryTerms.length === 0
+      || candidate.score > 0
+    ))
     .filter((candidate) => candidate.slug && candidate.inputParameters !== undefined)
-    .sort((left, right) => right.score - left.score || left.slug.localeCompare(right.slug))
-    .slice(0, maxResults);
+    .sort((left, right) => (
+      Number(right.providerRecommendedSuccessor) - Number(left.providerRecommendedSuccessor)
+      || right.score - left.score
+      || left.slug.localeCompare(right.slug)
+    ))
+    .slice(0, maxResults)
+    .map(({ providerRecommendedSuccessor: _providerRecommendedSuccessor, ...candidate }) => candidate);
 }
 
 export async function getDynamicComposioRuntimeTools(options: {

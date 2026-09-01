@@ -547,6 +547,12 @@ export interface BuildCallToolOptions {
     },
     dispatch: () => Promise<unknown>,
   ) => Promise<unknown>;
+  /** Narrow host-owned escape hatch for private scheduler signals raised by an
+   * `aroundResolvedDispatch` owner. The generic carrier normally converts
+   * invocation errors into model-visible corrective text; a durable owner may
+   * instead nominate an exact typed error that must keep propagating to the
+   * host runner. Never use this for provider/application errors. */
+  propagateInvocationError?: (error: unknown) => boolean;
   /** Adapter attribution for a trusted refusal after inner resolution. */
   resolvedRefusalLane?: SettleToolAttemptInput['lane'];
   /** Restrict this transport to registry-declared local controls. Action turns
@@ -620,6 +626,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     // result would cost zero calls and could be retried forever.
     errorFunction: (_context, error) => {
       if (error instanceof ToolCallsLimitExceeded) throw error;
+      if (options.propagateInvocationError?.(error) === true) throw error;
       const details = error instanceof Error ? error.toString() : String(error);
       return `An error occurred while running the tool. Please try again. Error: ${details}`;
     },

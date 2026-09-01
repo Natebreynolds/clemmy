@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto';
 import type { CapabilityManifestOperationSemanticsV1 } from './capability-manifest.js';
 import type { MutationVerificationRecipeV1 } from './mutation-verification-contract.js';
+import type { AsyncReadContinuationRecipeV1 } from './async-read-continuation-contract.js';
 import type { RuntimeToolEffect } from './tool-effect.js';
 
 export interface SealedNodeBindingDigestInput {
@@ -34,6 +35,8 @@ export interface SealedNodeBindingDigestInput {
   operationSemantics?: CapabilityManifestOperationSemanticsV1;
   /** Host-derived verification work; never a semantic graph node. */
   verification?: MutationVerificationRecipeV1;
+  /** Host-owned async read successor; never inferred after graph admission. */
+  asyncRead?: AsyncReadContinuationRecipeV1;
 }
 
 export function sealedNodeBindingDigestOf(binding: SealedNodeBindingDigestInput): string {
@@ -52,5 +55,6 @@ export function sealedNodeBindingDigestOf(binding: SealedNodeBindingDigestInput)
     destination: binding.destination ?? null,
     ...(binding.operationSemantics ? { operationSemantics: binding.operationSemantics } : {}),
     ...(binding.verification ? { verification: binding.verification } : {}),
+    ...(binding.asyncRead ? { asyncRead: binding.asyncRead } : {}),
   }), 'utf8').digest('hex');
 }

@@ -15,6 +15,7 @@ import {
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
 import {
+  actionTopologyRoleForRuntimeCall,
   classifyRuntimeToolEffect,
   isDelegationPrimitiveRuntimeCall,
   isUnscopedShellRuntimeCall,
@@ -23,6 +24,7 @@ import {
   projectCanonicalTopLevelToolEvents,
   runtimeToolAccountingMetadata,
   runtimeToolAuthorityBinding,
+  resolveProviderCarrierLocalReadControl,
   unwrapRuntimeEffectiveToolIdentity,
 } from './tool-effect.js';
 
@@ -428,6 +430,44 @@ test('trusted carriers preserve the exact direct-call digest and keep ordinary i
     durableLogicalCallContract('task:carrier-parity#1', 'call_tool', nestedCarrier),
     directContract,
   );
+});
+
+test('trusted provider carriers recover only exact registry read controls as local control calls', () => {
+  const localControl = {
+    tool_slug: 'tool_search',
+    arguments: JSON.stringify({ query: 'OP_LOOKUP' }),
+  };
+  assert.deepEqual(
+    resolveProviderCarrierLocalReadControl('composio_execute_tool', localControl),
+    { toolName: 'tool_search', args: { query: 'OP_LOOKUP' } },
+  );
+  assert.deepEqual(classifyRuntimeToolEffect('composio_execute_tool', localControl), {
+    effect: 'read',
+    mutating: false,
+    dangerousWrite: false,
+    source: 'registry',
+  });
+  assert.equal(
+    actionTopologyRoleForRuntimeCall('composio_execute_tool', localControl),
+    'control',
+  );
+
+  for (const tool_slug of ['NOT_A_REGISTERED_CONTROL', 'read_file', 'memory_remember']) {
+    const carrier = { tool_slug, arguments: '{}' };
+    assert.equal(
+      resolveProviderCarrierLocalReadControl('composio_execute_tool', carrier),
+      null,
+      `${tool_slug} must stay on the ordinary provider/business path`,
+    );
+    assert.notEqual(
+      classifyRuntimeToolEffect('composio_execute_tool', carrier).source,
+      'registry',
+    );
+    assert.equal(
+      actionTopologyRoleForRuntimeCall('composio_execute_tool', carrier),
+      'business',
+    );
+  }
 });
 
 test('trusted Composio carriers fail closed when their exact inner arguments are malformed', () => {

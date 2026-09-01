@@ -1124,6 +1124,12 @@ test('a named candidate-source unavailability reaches the model, never as silent
       source: 'authorized_composio',
       code: 'no_connections',
       reason: 'No Composio toolkits are connected.',
+      dependencySubject: {
+        version: 1,
+        kind: 'provider_reconnect_and_rerun',
+        source: 'authorized_composio',
+        query: 'zzz-no-such-builtin-matches-zzz',
+      },
     },
   ]);
   assert.match(body.hint, /Could not reach/);

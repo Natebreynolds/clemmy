@@ -24,6 +24,10 @@ import {
   type MutationVerificationRecipeV1,
 } from './mutation-verification-contract.js';
 import {
+  parseAsyncReadContinuationRecipe,
+  type AsyncReadContinuationRecipeV1,
+} from './async-read-continuation-contract.js';
+import {
   peekCapabilityManifestStore,
   type CapabilityManifestStore,
   type InstalledCapabilityManifest,
@@ -39,6 +43,7 @@ import {
   sealedNodeBindingDigestOf,
   type SealedNodeBindingDigestInput,
 } from './sealed-node-binding-digest.js';
+import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 
 export type {
   GraphNodeCapabilityInvoke,
@@ -55,6 +60,10 @@ export const EFFECT_RANK: Record<string, number> = {
   external_write: 4,
   admin: 5,
 };
+
+export type ForegroundCapabilityPayloadValidation =
+  | { ok: true }
+  | { ok: false; repair: string; schemaAvailable: boolean };
 
 export interface RegisteredHostCapability {
   capabilityId: string;
@@ -82,6 +91,11 @@ export interface RegisteredHostCapability {
     keyFor(input: { nodeId: string; acceptedTaskId: string; payload: unknown }): string;
   };
   reconcile?: GraphNodeCapabilityReconcile;
+  /** Optional denial-only validator for a foreground payload explicitly
+   * authored as provider arguments. It may refuse before a physical crossing;
+   * it cannot rewrite arguments, select a capability, or authorize dispatch.
+   * Semantic graph payloads continue through the capability's sealed compiler. */
+  validateForegroundPayload?: (payload: unknown) => ForegroundCapabilityPayloadValidation;
   invoke: GraphNodeCapabilityInvoke;
   implementationDigest?: string;
   invokeImplementationDigest?: string;
@@ -682,7 +696,15 @@ interface LiveCatalogIdentity {
 }
 
 function liveCatalogIdentities(factory: HostCapabilityCatalogFactory): LiveCatalogIdentity[] {
+  const scope = currentAcceptedSourceCatalogManifestScope();
   return factory.snapshot().flatMap((entry) => {
+    const externallyScoped = (entry.providerKind ?? entry.manifest?.providerKind) === 'composio';
+    if (
+      scope
+      && externallyScoped
+      && !scope.manifestIds.has(entry.manifest?.manifestId ?? entry.capabilityId)
+      && !scope.operationIds.has((entry.manifest?.operationId ?? entry.toolName).toUpperCase())
+    ) return [];
     const identity = canonicalCatalogIdentityOf(entry);
     return identity ? [{ identity, entry }] : [];
   });
@@ -743,6 +765,61 @@ function readPersistedSnapshotRow(input: {
     snapshot_digest: string;
     snapshot_json: string;
   } | undefined;
+}
+
+export type PersistedCatalogSnapshotManifestIdsResult =
+  | {
+      ok: true;
+      manifestIds: readonly string[];
+      identities: readonly CanonicalCatalogIdentityV1[];
+    }
+  | { ok: false; reason: 'missing_snapshot' | 'corrupt_snapshot' };
+
+/**
+ * Return only the manifest ids already frozen for an accepted source. This is
+ * restart materialization input, not catalog authority: the caller must
+ * independently reconstruct current definitions/ports and then re-run the
+ * ordinary byte-exact snapshot comparison before using any entry.
+ */
+export function persistedCatalogSnapshotManifestIdsForSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): PersistedCatalogSnapshotManifestIdsResult {
+  const row = readPersistedSnapshotRow(input);
+  if (!row) return { ok: false, reason: 'missing_snapshot' };
+  let identities: unknown;
+  try {
+    identities = JSON.parse(row.snapshot_json) as unknown;
+  } catch {
+    return { ok: false, reason: 'corrupt_snapshot' };
+  }
+  if (
+    !Array.isArray(identities)
+    || catalogSnapshotDigestOf(identities as CanonicalCatalogIdentityV1[])
+      !== row.snapshot_digest
+  ) return { ok: false, reason: 'corrupt_snapshot' };
+  const manifestIds: string[] = [];
+  const capabilityIds = new Set<string>();
+  for (const value of identities) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, reason: 'corrupt_snapshot' };
+    }
+    const identity = value as Record<string, unknown>;
+    if (
+      typeof identity.capabilityId !== 'string'
+      || !identity.capabilityId.trim()
+      || capabilityIds.has(identity.capabilityId)
+      || typeof identity.manifestId !== 'string'
+      || !identity.manifestId.trim()
+    ) return { ok: false, reason: 'corrupt_snapshot' };
+    capabilityIds.add(identity.capabilityId);
+    manifestIds.push(identity.manifestId);
+  }
+  return {
+    ok: true,
+    manifestIds: [...new Set(manifestIds)].sort(),
+    identities: identities as CanonicalCatalogIdentityV1[],
+  };
 }
 
 export function freezeCatalogSnapshotForSource(input: {
@@ -875,6 +952,30 @@ export function loadSealedNodeBinding(
     ) return null;
     if (binding.bindingDigest !== row.binding_digest) return null;
     if (binding.verification !== undefined && !parseMutationVerificationRecipe(binding.verification)) return null;
+    const asyncRead = binding.asyncRead === undefined
+      ? null
+      : parseAsyncReadContinuationRecipe(binding.asyncRead);
+    if (binding.asyncRead !== undefined && !asyncRead) return null;
+    if (
+      asyncRead
+      && (
+        binding.verification !== undefined
+        ||
+        binding.providerOperationId !== asyncRead.owner.operationId
+        || binding.schemaVersion !== asyncRead.owner.schemaVersion
+        || binding.providerInputSchemaDigest !== asyncRead.owner.providerInputSchemaDigest
+        || binding.account !== asyncRead.owner.account
+        || binding.effect !== 'read'
+        || (() => {
+          const {
+            bindingDigest: _bindingDigest,
+            asyncRead: _asyncRead,
+            ...baseBinding
+          } = binding;
+          return bindingDigestOf(baseBinding) !== asyncRead.ownerBindingDigest;
+        })()
+      )
+    ) return null;
     if (
       binding.operationSemantics !== undefined
       && !parseCapabilityManifestOperationSemantics(binding.operationSemantics)
@@ -893,6 +994,7 @@ export function sealBoundCapability(input: {
   /** Receives the base binding digest so the recipe can bind its owner without
    * creating a digest cycle. The final binding digest covers the recipe. */
   verification?: (baseBindingDigest: string) => MutationVerificationRecipeV1 | null;
+  asyncRead?: (baseBindingDigest: string) => AsyncReadContinuationRecipeV1 | null;
 }): SealedNodeBinding {
   const providerOperationId = input.binding.manifest?.operationId ?? input.binding.toolName;
   const logicalToolName = canonicalLogicalToolName(providerOperationId);
@@ -923,7 +1025,12 @@ export function sealBoundCapability(input: {
   };
   const baseBindingDigest = bindingDigestOf(sealed);
   const verification = input.verification?.(baseBindingDigest) ?? null;
-  if (!verification) return { ...sealed, bindingDigest: baseBindingDigest };
-  const withVerification = { ...sealed, verification };
-  return { ...withVerification, bindingDigest: bindingDigestOf(withVerification) };
+  const asyncRead = input.asyncRead?.(baseBindingDigest) ?? null;
+  if (!verification && !asyncRead) return { ...sealed, bindingDigest: baseBindingDigest };
+  const withRecipes = {
+    ...sealed,
+    ...(verification ? { verification } : {}),
+    ...(asyncRead ? { asyncRead } : {}),
+  };
+  return { ...withRecipes, bindingDigest: bindingDigestOf(withRecipes) };
 }

@@ -22,7 +22,10 @@ const {
   settleDiscoveryBoundary,
 } = await import('./discovery-boundary.js');
 const { renderCapabilityCandidateCard } = await import('../read-path/capability-candidates.js');
+const { resolveTurnCapabilityCandidates } = await import('../read-path/capability-candidates.js');
 const { registerToolSearchTool } = await import('../../tools/tool-search-tool.js');
+const { rememberToolSchema } = await import('../../tools/composio-schema-cache.js');
+const { buildScopedLocalToolSearch } = await import('../../tools/local-runtime-tools.js');
 const {
   ToolCallsCounter,
   withHarnessRunContext,
@@ -101,6 +104,186 @@ function assertDeniedAttemptTerminal(
     crossings: 0,
   }]);
 }
+
+test('Salesforce read and complete Sheets destination keep independent scoped searches beside local planning lookup', async () => {
+  const prompt = 'Can you find me the deals Tim still has to close this quarter in salesforce and create me a Google sheet with the data please';
+  const rememberedChoice = (intent: string, identifier: string) => ({
+    intent,
+    description: intent,
+    choice: {
+      kind: 'composio' as const,
+      identifier,
+      testedAt: '2026-08-31T00:00:00.000Z',
+    },
+    fallbacks: [],
+    body: '',
+    filePath: `/fixture/${identifier}`,
+  });
+  rememberToolSchema('SALESFORCE_QUERY_OPEN_DEALS', {
+    type: 'object', properties: { query: { type: 'string' } }, required: ['query'],
+  }, Date.now());
+  rememberToolSchema('GOOGLESHEETS_CREATE_GOOGLE_SHEET1', {
+    type: 'object', properties: { title: { type: 'string' } }, required: ['title'],
+  }, Date.now());
+  const candidates = await resolveTurnCapabilityCandidates({
+    userInput: prompt,
+    semantic: false,
+    choices: [
+      rememberedChoice('salesforce find deals close this quarter', 'SALESFORCE_QUERY_OPEN_DEALS'),
+      rememberedChoice(
+        'google sheets create spreadsheet write multiple rows values',
+        'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+      ),
+    ] as never,
+  });
+  assert.deepEqual(
+    candidates.requirements.map((requirement) => [requirement.roleKey, requirement.resolved]),
+    [['clause-0:mixed', false], ['clause-1:write', false]],
+    'partial remembered operations cannot consume either business discovery role',
+  );
+
+  const key = acceptedTask(prompt, candidates.requirements);
+  let candidateSourceCalls = 0;
+  const searchedQueries: string[] = [];
+  const search = wrapToolForHarness(buildScopedLocalToolSearch(
+    new Set<string>(),
+    'work_call',
+    undefined,
+    [{
+      kind: 'authorized_composio',
+      search: async ({ query }) => {
+        candidateSourceCalls += 1;
+        searchedQueries.push(query);
+        if (/salesforce|deals|soql/i.test(query)) {
+          return [{
+            name: 'SALESFORCE_QUERY_OPEN_DEALS',
+            summary: 'Read current open Salesforce opportunities with a bounded SOQL query.',
+            schema: {
+              type: 'object', properties: { query: { type: 'string' } }, required: ['query'],
+            },
+            carrier: 'work_call',
+            score: 1,
+          }, {
+            name: 'APIFY_RUN_ACTOR',
+            summary: 'Irrelevant broad actor catalog row.',
+            schema: { type: 'object', properties: { actor: { type: 'string' } }, required: ['actor'] },
+            carrier: 'work_call',
+            score: 0.01,
+          }];
+        }
+        return [{
+          name: 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+          summary: 'Create one new Google spreadsheet.',
+          schema: {
+            type: 'object', properties: { title: { type: 'string' } }, required: ['title'],
+          },
+          carrier: 'work_call',
+          score: 1,
+        }, {
+          name: 'GOOGLESHEETS_VALUES_UPDATE',
+          summary: 'Write rows into one exact Google spreadsheet.',
+          schema: {
+            type: 'object',
+            properties: {
+              spreadsheet_id: { type: 'string' },
+              range: { type: 'string' },
+              values: { type: 'array', items: { type: 'array' } },
+            },
+            required: ['spreadsheet_id', 'range', 'values'],
+          },
+          carrier: 'work_call',
+          score: 0.99,
+        }, {
+          name: 'AIRTABLE_CREATE_BASE',
+          summary: 'Irrelevant broad table catalog row.',
+          schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+          carrier: 'work_call',
+          score: 0.01,
+        }];
+      },
+    }],
+  ) as never) as unknown as {
+    invoke: (context: unknown, input: string, details: unknown) => Promise<unknown>;
+  };
+  const context = { ...key, turn: 1, counter: new ToolCallsCounter(8) };
+  const invoke = (callId: string, input: Record<string, unknown>) => search.invoke(
+    { context: { sessionId: key.sessionId, sourceUserSeq: key.sourceUserSeq, turn: 1 } },
+    JSON.stringify(input),
+    { toolCall: { callId } },
+  );
+  const [salesforceRaw, structuralRaw, sheetsRaw] = await withHarnessRunContext(
+    context,
+    () => Promise.all([
+      invoke('salesforce-scoped-search', {
+        query: 'read Tim open Salesforce deals closing this quarter with SOQL',
+        role_key: 'clause-0:mixed',
+        limit: 1,
+      }),
+      invoke('local-structural-planning-lookup', {
+        query: 'create a plan for multi-step dependent work and execute work calls',
+        role_key: null,
+        limit: 5,
+      }),
+      invoke('sheets-scoped-search', {
+        query: 'Google Sheets create a new spreadsheet and write rows of data into it',
+        role_key: 'clause-1:write',
+        limit: 2,
+      }),
+    ]),
+  );
+  const salesforce = JSON.parse(String(salesforceRaw)) as { results?: Array<Record<string, unknown>> };
+  const structural = JSON.parse(String(structuralRaw)) as { kind?: string; results?: Array<Record<string, unknown>> };
+  const sheets = JSON.parse(String(sheetsRaw)) as { results?: Array<Record<string, unknown>> };
+
+  assert.equal(candidateSourceCalls, 2, 'only the two effectful business roles consult candidate sources');
+  assert.equal(searchedQueries.some((query) => /multi-step dependent work/i.test(query)), false,
+    'host structural lookup never falls through to provider/business discovery');
+  assert.deepEqual(salesforce.results?.map((row) => row.name), ['SALESFORCE_QUERY_OPEN_DEALS']);
+  assert.deepEqual(sheets.results?.map((row) => row.name), [
+    'GOOGLESHEETS_CREATE_GOOGLE_SHEET1',
+    'GOOGLESHEETS_VALUES_UPDATE',
+  ]);
+  assert.equal(structural.kind, 'host_structural_control_lookup_v1');
+  assert.deepEqual(structural.results?.map((row) => row.name), ['plan_task', 'work_call']);
+  const visibleBytes = JSON.stringify({ prompt, salesforce, structural, sheets });
+  assert.doesNotMatch(visibleBytes, /AIRTABLE|APIFY/,
+    'irrelevant provider rows never enter the next model-visible page');
+  assert.ok(Buffer.byteLength(visibleBytes, 'utf8') <= 12 * 1024,
+    'the complete three-result next-model evidence stays bounded');
+  assert.ok(
+    [...(salesforce.results ?? []), ...(sheets.results ?? []), ...(structural.results ?? [])]
+      .every((row) => !Object.prototype.hasOwnProperty.call(row, 'capabilityRef')),
+    'metadata search alone cannot mint effect authority in this fixture',
+  );
+
+  const state = discoveryGovernor.getTaskState(key);
+  assert.deepEqual(
+    state?.epochClaims
+      .filter((claim) => claim.category === 'broad_discovery')
+      .map((claim) => claim.subject)
+      .sort(),
+    ['clause-0:mixed', 'clause-1:write'],
+    'both business searches own independent scoped claims and local planning owns none',
+  );
+  assert.equal(state?.epochClaims.some((claim) => claim.subject === HOST_UNSCOPED_DISCOVERY_SUBJECT), false);
+  assert.equal(
+    eventlog.getTurnGraphEventForSource(key.sessionId, key.sourceUserSeq)?.data.shadow,
+    true,
+    'discovery leaves the accepted source at its original non-executable shadow graph',
+  );
+  const workBindings = eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS count
+      FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(key.sessionId, key.sourceUserSeq) as { count: number };
+  assert.equal(workBindings.count, 0, 'discovery cannot freeze expected work');
+  const businessSettlements = eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS count
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
+  `).get(key.sessionId, key.sourceUserSeq) as { count: number };
+  assert.equal(businessSettlements.count, 0, 'no Salesforce, Sheets, or other effect crossed');
+});
 
 test('distinct unresolved roles each get one provider slot while synonyms and carriers share its denial key', () => {
   const sourceRole = 'clause-0:read';

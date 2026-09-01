@@ -40,6 +40,17 @@ type ComposioToolSchema = {
 type ComposioClientSurface = {
   isComposioEnabled: () => boolean;
   peekConnectedToolkits: () => unknown[];
+  revalidateSelectedComposioConnections: (selections: readonly {
+    identifier: string;
+    connectionId: string;
+  }[]) => Promise<
+    | { ok: true }
+    | {
+        ok: false;
+        identifier: string;
+        reason: 'missing_or_changed' | 'inactive_or_suppressed';
+      }
+  >;
   prepareComposioOneShotDispatch: (input: {
     toolSlug: string;
     args: Record<string, unknown>;
@@ -146,6 +157,45 @@ export async function executeAttestedTransport(call: AttestedTransportCall): Pro
     providerOperationVersion,
   });
   return client.executePreparedComposioTool(prepared);
+}
+
+/**
+ * Last async account preparation for one sealed Composio call.
+ *
+ * The host invokes this before it reserves the following business physical
+ * dispatch. That placement is material: a provider outage or changed account
+ * is a typed pre-dispatch refusal with zero business crossings, never an
+ * uncertain write. On success the packaged client owns a fresh process-local
+ * snapshot that the immediately following synchronous one-shot mint consumes.
+ */
+export async function prepareAttestedComposioDispatch(input: {
+  operationId: string;
+  accountId: string;
+}): Promise<void> {
+  if (loopbackOutboundDenied()) {
+    throw new Error(`${input.operationId} exact connected-account refresh was unavailable`);
+  }
+  const client = loadComposioClient();
+  if (!client.isComposioEnabled()) {
+    throw new Error(`${input.operationId} exact connected-account refresh was unavailable`);
+  }
+  let connection;
+  try {
+    connection = await client.revalidateSelectedComposioConnections([{
+      identifier: input.operationId,
+      connectionId: input.accountId,
+    }]);
+  } catch (cause) {
+    throw new Error(
+      `${input.operationId} exact connected-account refresh was unavailable`,
+      { cause },
+    );
+  }
+  if (!connection.ok) {
+    throw new Error(
+      `${input.operationId} sealed connected account ${input.accountId} is ${connection.reason}`,
+    );
+  }
 }
 
 /** Observations this transport actually made, keyed by operation and account. */

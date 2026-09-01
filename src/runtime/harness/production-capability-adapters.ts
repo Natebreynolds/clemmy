@@ -27,6 +27,11 @@ import {
   requireAttestedTransport,
   type AttestedTransportCall,
 } from './implementation-artifacts/attested-transport.js';
+import {
+  observeReviewedLocalTool,
+  prepareReviewedLocalToolExecution,
+  reviewedLocalCapabilityManifest,
+} from './reviewed-local-tool-transport.js';
 
 export const SHEET_CREATE = 'GOOGLESHEETS_SHEET_FROM_JSON';
 export const SHEET_READBACK = 'GOOGLESHEETS_BATCH_GET';
@@ -350,12 +355,20 @@ function attestedExpectationForManifest(
   };
 }
 
-export function observeComposioIndependently(operationId: string): LiveCapabilityObservation | 'missing' {
+export function observeComposioIndependently(
+  operationId: string,
+  accountId: string,
+): LiveCapabilityObservation | 'missing' {
   const definitionFingerprint = liveComposioSchemaFingerprint(operationId);
-  if (!definitionFingerprint) return 'missing';
+  const exactAccountId = accountId.trim();
+  if (!definitionFingerprint || !exactAccountId) return 'missing';
   try {
-    const live = requireAttestedTransport().observe({ operationId, accountId: '' });
-    if (!live) return 'missing';
+    const live = requireAttestedTransport().observe({ operationId, accountId: exactAccountId });
+    if (
+      !live
+      || live.operationId !== operationId
+      || live.accountId !== exactAccountId
+    ) return 'missing';
     persistCapabilityLiveIdentity({
       operationId,
       providerKind: 'composio',
@@ -382,6 +395,25 @@ function refuseRoleSwitch(role: string, sealedPurpose: string): void {
   if (role === 'readback' && sealedPurpose === 'locate_source') {
     throw new Error('source capability refuses readback role before transport');
   }
+}
+
+/**
+ * The beta Sheets adapter reconstructs an exact created-resource probe from a
+ * predecessor `{id, range}`.  `GOOGLESHEETS_BATCH_GET` is also an ordinary
+ * read operation, so its operation identity alone must never select that
+ * adapter.  Purpose/input kind are immutable manifest facts; role is the
+ * current graph edge.  All three must agree before provider arguments may be
+ * rewritten into the legacy readback shape.
+ */
+function isLegacySheetArtifactReadback(
+  manifest: Pick<CapabilityManifestV1, 'operationId' | 'purpose' | 'effect' | 'acceptedInputKinds'>,
+  role: string | undefined,
+): boolean {
+  return role === 'readback'
+    && manifest.operationId === BETA_PROVIDER_OPERATIONS.readback
+    && manifest.purpose === 'verify_created_resource'
+    && manifest.effect === 'read'
+    && manifest.acceptedInputKinds.includes('created_resource');
 }
 
 export function compileSealedProviderArgs(
@@ -421,7 +453,7 @@ export function compileSealedProviderArgs(
       sheet_json: args.sheet_json,
     });
   }
-  if (manifest.operationId === BETA_PROVIDER_OPERATIONS.readback) {
+  if (isLegacySheetArtifactReadback(manifest, envelope?.node.role)) {
     const predecessor = envelope?.predecessors.find((prior) => (
       prior.value && typeof prior.value === 'object' && 'id' in (prior.value as object)
     ))?.value as { id?: unknown; range?: unknown } | undefined;
@@ -439,6 +471,15 @@ export function compileSealedProviderArgs(
       spreadsheet_id: id,
       ranges: [range],
     });
+  }
+  if (
+    manifest.operationId === BETA_PROVIDER_OPERATIONS.readback
+    && manifest.effect === 'read'
+    && payload
+    && typeof payload === 'object'
+    && !Array.isArray(payload)
+  ) {
+    return Object.freeze({ ...(payload as Record<string, unknown>) });
   }
   return Object.freeze({ digest: JSON.stringify(payload ?? null) });
 }
@@ -551,7 +592,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
             : undefined),
       };
     }
-    if (sealed.operationId === BETA_PROVIDER_OPERATIONS.readback) {
+    if (isLegacySheetArtifactReadback(sealed, role)) {
       const predecessor = envelope?.predecessors.find((prior) => (
         prior.value && typeof prior.value === 'object' && 'id' in (prior.value as object)
       ))?.value as { id?: unknown; range?: unknown; sheet_name?: unknown; grid?: unknown } | undefined;
@@ -629,6 +670,21 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
           : null
       );
       if (!compiled) throw new Error('reviewed local invoke requires canonical object arguments');
+      const prepared = prepareReviewedLocalToolExecution({
+        operationId: sealed.operationId,
+        args: compiled,
+        accountId,
+        expected: expectedTransport(),
+      });
+      if (prepared.adapter === 'workspace_dataset_v1') {
+        // Lazy by design: SpaceStore's host-local commit proof imports this
+        // production adapter. A static Workspace carrier edge here would
+        // re-enter store/finalization while their defaults are still in TDZ.
+        // The literal import remains bundled into the shipped invoke artifact,
+        // so its executable bytes are still content-addressed and attested.
+        const carrier = await import('../../spaces/workspace-set-data-carrier.js');
+        return carrier.executeReviewedWorkspaceSetData(prepared.args);
+      }
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
     // A read-effect Composio operation this turn separately PROVED (proof-
@@ -643,7 +699,6 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
     if (
       sealed.effect === 'read'
       && sealed.providerKind === 'composio'
-      && sealed.purpose !== 'verify_created_resource'
     ) {
       const compiled = authority?.canonicalArgs ?? (
         payload && typeof payload === 'object' && !Array.isArray(payload)
@@ -732,7 +787,14 @@ export function reconcileForSealedManifest(manifest: CapabilityManifestV1): Grap
   const operationId = manifest.operationId === BETA_PROVIDER_OPERATIONS.create
     ? SHEET_RECONCILE
     : manifest.operationId;
-  return async ({ artifactId }) => {
+  const reviewedLocal = manifest.providerKind === 'local_registry'
+    ? observeReviewedLocalTool(manifest.operationId)
+    : null;
+  const reviewedManifest = reviewedLocal ? reviewedLocalCapabilityManifest(reviewedLocal) : null;
+  const workspaceDatasetReconcile = reviewedLocal?.execution.adapter === 'workspace_dataset_v1'
+    && reviewedManifest !== null
+    && capabilityManifestDigest(reviewedManifest) === capabilityManifestDigest(manifest);
+  return async ({ artifactId, intendedDigest }) => {
     if (
       !supported
       || policy === 'uncertain_if_absent'
@@ -742,6 +804,20 @@ export function reconcileForSealedManifest(manifest: CapabilityManifestV1): Grap
     }
     const id = artifactId?.trim() || '';
     if (!id || looksLikeContentDigest(id)) return { exists: false };
+    if (workspaceDatasetReconcile) {
+      // See the invoke-side note above. Reconcile is already async and keeps
+      // this storage module cold until an exact Workspace artifact is probed.
+      const carrier = await import('../../spaces/workspace-set-data-carrier.js');
+      const recovered = carrier.reconcileWorkspaceDatasetArtifact(id);
+      if (!recovered.exists || recovered.contentDigest !== intendedDigest) return { exists: false };
+      return {
+        exists: true,
+        id: recovered.artifactId,
+        handle: recovered.handle,
+        receipt: recovered.receipt,
+        contentDigest: recovered.contentDigest,
+      };
+    }
     const attested = (() => {
       try {
         return requireAttestedTransport();

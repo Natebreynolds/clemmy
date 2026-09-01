@@ -42,6 +42,9 @@ import {
   createHostCapabilityCatalogFactory,
   installHostCapabilityCatalogFactory,
   peekHostCapabilityCatalogFactory,
+  canonicalCatalogIdentityOf,
+  catalogIdentitiesEqual,
+  type CanonicalCatalogIdentityV1,
 } from './host-capability-catalog-factory.js';
 import {
   peekCapabilityManifestStore,
@@ -84,8 +87,13 @@ function sha256(value: string): string {
 
 export {
   compileProofProviderArgs,
+  createProofProviderForegroundPayloadValidator,
+  validateProofProviderArguments,
 } from './proof-provider-args.js';
-import { compileProofProviderArgs } from './proof-provider-args.js';
+import {
+  compileProofProviderArgs,
+  createProofProviderForegroundPayloadValidator,
+} from './proof-provider-args.js';
 import pino from 'pino';
 
 
@@ -225,6 +233,12 @@ export async function registerProofProvisionedCapabilities(identity: {
    * Provider refresh may finish after its deadline, but no manifest, catalog
    * entry, port, or compiler may publish after this predicate turns false. */
   publicationGuard?: () => boolean;
+  /** Restart-only: after independent current-definition readiness, retain the
+   * exact registration shape that byte-matches the already-frozen source
+   * identity. This chooses between two independently re-proven shapes (direct
+   * selected-definition registration and production-adapter registration); it
+   * never copies optional identity fields from the persisted snapshot. */
+  recoveryExpectedIdentities?: readonly CanonicalCatalogIdentityV1[];
 } = {}): Promise<ProofProvisionResult> {
   const registered: string[] = [];
   try {
@@ -676,6 +690,11 @@ export async function registerProofProvisionedCapabilities(identity: {
         };
       }
       const primaryRole = advisoryRoles[0]!;
+      const validateForegroundPayload = createProofProviderForegroundPayloadValidator({
+        operationId: slug,
+        schema,
+      });
+      if (!validateForegroundPayload) continue;
       factory.register({
         capabilityId,
         toolName: slug,
@@ -709,13 +728,45 @@ export async function registerProofProvisionedCapabilities(identity: {
               },
             }
           : {}),
-        invoke: async ({ payload, role, envelope }) => {
+        validateForegroundPayload,
+        invoke: async ({ payload, role, envelope, nodeId, identity, authority }) => {
+          let authorityOwnsPayload = false;
+          try {
+            authorityOwnsPayload = Boolean(
+              authority
+              && authority.acceptedSource.sessionId === identity.sessionId
+              && authority.acceptedSource.sourceUserSeq === identity.sourceUserSeq
+              && authority.acceptedTaskId === identity.acceptedTaskId
+              && authority.nodeId === nodeId
+              && authority.operationId === manifest.operationId
+              && authority.capabilityRef === manifest.manifestId
+              && authority.manifestId === manifest.manifestId
+              && authority.manifestDigest === capabilityManifestDigest(manifest)
+              && authority.accountId === manifest.accountId
+              && authority.resolvedEffect === manifest.effect
+              && authority.operationVersion === manifest.operationVersion
+              && authority.liveFingerprint === manifest.definitionFingerprint
+              && authority.invokePortId === manifest.invokePortId
+              // Generic proof manifests are minted over this exact payload
+              // serialization before the catalog invoke is reachable.
+              && authority.canonicalArgs.digest === JSON.stringify(payload ?? null)
+            );
+          } catch {
+            authorityOwnsPayload = false;
+          }
           const args = compileProofProviderArgs({
             schema,
             role: role || primaryRole,
             effect,
             payload,
             envelope,
+            // The payload crosses only when this accepted source's minted call
+            // authority owns the exact node, manifest, account, effect, and
+            // serialized payload. None can be nominated by a payload field.
+            acceptAuthorityBoundPayload: authorityOwnsPayload,
+            authorityBoundPayloadKind: role === 'foreground'
+              ? 'provider_arguments'
+              : 'semantic',
           });
           if (!args) {
             throw new Error(`proof-provisioned ${slug} could not compile schema-grounded arguments`);
@@ -832,7 +883,25 @@ export async function registerProofProvisionedCapabilities(identity: {
       // sweep collaterally wiped unrelated residue from earlier sessions. This
       // capability's own freshness is still fully enforced below; only the
       // OTHERS' staleness stops mattering to a call that never asked about them.
+      const directRegistrations = new Map(registered.flatMap((capabilityId) => {
+        const entry = factory.get(capabilityId);
+        return entry ? [[capabilityId, entry] as const] : [];
+      }));
       refreshTypedExecutionReadiness(registered);
+      if (options.recoveryExpectedIdentities) {
+        for (const expected of options.recoveryExpectedIdentities) {
+          if (!registered.includes(expected.capabilityId)) continue;
+          const candidates = [
+            directRegistrations.get(expected.capabilityId),
+            factory.get(expected.capabilityId),
+          ].filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+          const exact = candidates.find((entry) => {
+            const identity = canonicalCatalogIdentityOf(entry);
+            return Boolean(identity && catalogIdentitiesEqual(identity, expected));
+          });
+          if (exact) factory.register(exact);
+        }
+      }
     }
     return { registered };
   } catch (error) {

@@ -486,6 +486,8 @@ const dataforseoRecipe: JobFamilyRecipe = {
 // ── Firecrawl family ──────────────────────────────────────────────────────────────
 
 const FIRECRAWL_STATUS_GETTER = 'FIRECRAWL_GET_THE_STATUS_OF_A_CRAWL_JOB';
+export const FIRECRAWL_BATCH_SCRAPE_START = 'FIRECRAWL_BATCH_SCRAPE' as const;
+export const FIRECRAWL_BATCH_SCRAPE_GETTER = 'FIRECRAWL_BATCH_SCRAPE_GET' as const;
 const GENERIC_JOB_ID_ARGS: readonly GetterArgChoice[] = [
   { name: 'task_id', source: 'job' },
   { name: 'job_id', source: 'job' },
@@ -501,6 +503,31 @@ const GENERIC_JOB_ID_ARGS: readonly GetterArgChoice[] = [
 const firecrawlRecipe: JobFamilyRecipe = {
   family: 'firecrawl',
   detect(s, d, slug) {
+    // Current v20260826 batch-scrape start is an id-only asynchronous receipt:
+    // `{success:true,id,url}`. Keep this exact-slug and exact-shape so an
+    // arbitrary Firecrawl payload containing an id cannot mint poll authority.
+    if (
+      s === FIRECRAWL_BATCH_SCRAPE_START
+      && d.success === true
+      && typeof d.id === 'string'
+      && d.id.trim() === d.id
+      && d.id.length > 0
+      && d.id.length <= 512
+      && typeof d.url === 'string'
+      && /^https?:\/\//u.test(d.url)
+      && !Array.isArray(d.data)
+    ) {
+      return {
+        family: 'firecrawl',
+        jobId: d.id,
+        status: 'started',
+        originSlug: slug,
+        pollGuidance:
+          `This Firecrawl batch scrape is IN PROGRESS (job id "${d.id}"). `
+          + `Poll the exact live ${FIRECRAWL_BATCH_SCRAPE_GETTER} read getter with that id `
+          + 'until status is "completed"; the start receipt is not page evidence.',
+      };
+    }
     // The Composio CRAWL action is usually SYNC ({completed,data:[…]}); this only
     // fires on the rarer in-progress shape.
     if (!(s.startsWith('FIRECRAWL') && s.includes('CRAWL'))) return null;
@@ -528,9 +555,16 @@ const firecrawlRecipe: JobFamilyRecipe = {
       let tools: ComposioToolkitTool[];
       try { tools = await liveToolkitTools(receipt, deps, GENERIC_GETTER_DISCOVERY_LIMIT); } catch { return null; }
       const getter = resolveGetterHint(tools, {
-        hints: [deps.preferredPlan?.getterSlug, FIRECRAWL_STATUS_GETTER]
+        hints: [
+          deps.preferredPlan?.getterSlug,
+          receipt.originSlug?.toUpperCase() === FIRECRAWL_BATCH_SCRAPE_START
+            ? FIRECRAWL_BATCH_SCRAPE_GETTER
+            : FIRECRAWL_STATUS_GETTER,
+        ]
           .filter((slug): slug is string => Boolean(slug)),
-        discoveryIdentity: FIRECRAWL_STATUS_GETTER,
+        discoveryIdentity: receipt.originSlug?.toUpperCase() === FIRECRAWL_BATCH_SCRAPE_START
+          ? FIRECRAWL_BATCH_SCRAPE_GETTER
+          : FIRECRAWL_STATUS_GETTER,
         choices: GENERIC_JOB_ID_ARGS,
       });
       return getter

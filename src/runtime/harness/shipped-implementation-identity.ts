@@ -63,6 +63,10 @@ interface ShippedImplementations {
     operationVersion: string;
     observedAt: number;
   }) => void;
+  prepareComposioDispatch: (input: {
+    operationId: string;
+    accountId: string;
+  }) => Promise<void>;
   refreshTransportObservation: (input: { operationId: string; accountId: string }) => Promise<{
     operationId: string;
     accountId: string;
@@ -334,6 +338,10 @@ export function loadShippedImplementations(): ShippedImplementations {
   const transportModule = requireArtifact<{
     createAttestedTransport: (digest: string) => AttestedTransport;
     bindIsolatedTransportHandler?: (handler: ((call: AttestedTransportCall) => Promise<unknown>) | null) => void;
+    prepareAttestedComposioDispatch?: (input: {
+      operationId: string;
+      accountId: string;
+    }) => Promise<void>;
     registerIsolatedObservation?: (observation: {
       operationId: string;
       accountId: string;
@@ -394,6 +402,12 @@ export function loadShippedImplementations(): ShippedImplementations {
     },
     registerIsolatedObservation: (observation) => {
       transportModule.registerIsolatedObservation?.(observation);
+    },
+    prepareComposioDispatch: async (input) => {
+      if (typeof transportModule.prepareAttestedComposioDispatch !== 'function') {
+        throw new Error('shipped transport lacks exact Composio dispatch preparation');
+      }
+      await transportModule.prepareAttestedComposioDispatch(input);
     },
     refreshTransportObservation: async (input) => (
       transport.refreshObservation ? transport.refreshObservation(input) : null

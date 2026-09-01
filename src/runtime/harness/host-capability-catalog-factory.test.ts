@@ -80,6 +80,78 @@ function asRegistered(
   };
 }
 
+test('a mixed-generation proof compiler entry without a foreground validator remains callable', async () => {
+  const manifest = attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:fixture:existing-proof-operation',
+    providerKind: 'composio',
+    operationId: 'OP_EXISTING_LOOKUP',
+    providerIdentity: 'composio',
+    providerVersion: 'fixture-provider-v1',
+    operationVersion: '1',
+    definitionFingerprint: sha256('fixture:existing-proof-operation'),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: sha256('fixture:existing-proof-operation:schema'),
+      providerOutputSchemaObserved: true,
+      semanticName: 'existing proof operation',
+      behaviorHints: {
+        readOnly: true,
+        destructive: false,
+        idempotent: null,
+        openWorld: null,
+      },
+    },
+    effect: 'read',
+    purpose: 'invoke_live_read',
+    accountId: 'account:fixture:existing-proof-operation',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:test', issuedAt: '2026-08-31T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['lookup'],
+    argumentCompiler: { id: 'compile:proof-schema:v1', version: '1' },
+  });
+  let bodies = 0;
+  const entry: RegisteredHostCapability = {
+    ...asRegistered(manifest),
+    invoke: async () => {
+      bodies += 1;
+      return { records: [{ id: 'record-42' }] };
+    },
+  };
+  const factory = createHostCapabilityCatalogFactory([entry]);
+  const current = factory.get(entry.capabilityId);
+  assert.ok(current);
+  assert.equal(current?.validateForegroundPayload, undefined,
+    'a durable pre-validator registration remains a valid mixed-generation row');
+  assert.equal(isCurrentCallableCatalogEntry(current!), true);
+  const result = await current!.invoke({
+    nodeId: 'node-existing-proof-operation',
+    role: 'foreground',
+    payload: { record_key: 'record-42' },
+    identity: { sessionId: 'session-fixture', sourceUserSeq: 1, acceptedTaskId: 'task-fixture' },
+    binding: {
+      capabilityId: entry.capabilityId,
+      toolName: entry.toolName,
+      schemaVersion: entry.schemaVersion,
+      schemaDigest: entry.schemaDigest,
+      args: { record_key: 'record-42' },
+      account: entry.account,
+      effect: entry.effect,
+      manifestDigest: entry.manifestDigest,
+      providerKind: entry.providerKind,
+      liveFingerprint: entry.liveFingerprint,
+      manifest,
+      invoke: entry.invoke,
+    },
+  });
+  assert.deepEqual(result, { records: [{ id: 'record-42' }] });
+  assert.equal(bodies, 1);
+});
+
 test('current-callable attestation refuses post-registration provider, port, and compiler drift', () => {
   for (const drift of [
     (manifest: CapabilityManifestV1): CapabilityManifestV1 => ({

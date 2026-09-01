@@ -59,10 +59,25 @@ const WRITE_OPERATION_RE = /\b(?:accept|add|append|approve|archive|assign|book|c
 const READ_DEPENDENCY_RE = /\b(?:latest|recent|current|existing|matching|unread|summary|report|digest|analysis|availability|available|conflicts?|free|slots?)\b|\b(?:from|based\s+on|using)\s+(?:(?:my|our|the)\s+)?(?:[a-z0-9_-]+\s+){0,2}(?:availability|data|emails?|events?|files?|messages?|records?|rows?)\b|\bof\s+(?:(?:my|our|the)\s+)?(?:[a-z0-9_-]+\s+){0,2}(?:data|emails?|events?|files?|messages?|records?|rows?)\b|\b(?:all|each|old|older|matching|unread)\s+(?:[a-z0-9_-]+\s+){0,2}(?:emails?|events?|files?|messages?|records?|rows?)\b|\b(?:emails?|events?|files?|messages?|records?|rows?)\s+(?:after|before|from|matching|with|without)\b/i;
 const CONVERSATIONAL_READ_QUESTION_RE = /^(?:what(?:['’]?s|\s+is|\s+are|\s+was|\s+were)\s+(?:on|in|inside|scheduled|happening|available|due)\b|(?:who|when|where)\b|how\s+many\b)/i;
 const EXPLICIT_READ_ONLY_RE = /\bread[- ]only\b/i;
+// Remove mutation verbs that occur only inside a prohibition before deciding
+// whether a scoped read-only instruction also contains real write work. The
+// span ends at a sentence/step boundary or an explicit pivot, so
+// "never post; update the sheet" retains the update while
+// "do not send, delete, move, or modify" retains none of those verbs.
+const NEGATED_WRITE_SPAN_RE =
+  /\b(?:do\s+not|don't|dont|never)\b(?:(?!\b(?:but|except|instead|only)\b)[^.!?;\n—–])*/gi;
+const SCOPED_WRITE_ALLOWANCE_RE =
+  /\b(?:the\s+)?only\s+writes?\s+(?:are|is)\s+to\b/i;
 // Weak payload grammar on a direct external effect is not itself a source
 // read. A selection/reference cue keeps true read-before-write work mixed.
 const EXPLICIT_SOURCE_SELECTION_RE =
   /\b(?:all|current|each|existing|latest|matching|old|older|recent|unread)\b|\b(?:based\s+on|from|using)\b|\bof\s+(?:my|our|the)\b/i;
+
+function hasPositiveWriteInstruction(input: string): boolean {
+  const withoutProhibitions = input.replace(NEGATED_WRITE_SPAN_RE, ' ');
+  return WRITE_OPERATION_RE.test(withoutProhibitions)
+    || SCOPED_WRITE_ALLOWANCE_RE.test(withoutProhibitions);
+}
 
 /** The effect family the accepted request clearly asks to perform. */
 export function requestedCapabilityEffectScope(text: string): RequestedCapabilityEffectScope {
@@ -71,6 +86,7 @@ export function requestedCapabilityEffectScope(text: string): RequestedCapabilit
   const intent = classifyMessageIntent(input).intent;
   const externalEffect = classifyExternalEffectRequest(input);
   const conversationalReadQuestion = CONVERSATIONAL_READ_QUESTION_RE.test(input);
+  const positiveWriteInstruction = hasPositiveWriteInstruction(input);
 
   // Questions, advice, history, verification, and explicit read operations
   // consume information even when their SUBJECT mentions a send/write.
@@ -89,6 +105,7 @@ export function requestedCapabilityEffectScope(text: string): RequestedCapabilit
     EXPLICIT_READ_ONLY_RE.test(input)
     && READ_OPERATION_RE.test(input)
     && !externalEffect.requested
+    && !positiveWriteInstruction
   ) {
     return 'read';
   }

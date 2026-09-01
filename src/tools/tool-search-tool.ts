@@ -17,6 +17,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
@@ -451,6 +452,44 @@ export type CandidateSourceUnavailableCode =
   | 'timed_out';
 
 /**
+ * Host-owned connection target attached by a configured candidate source.
+ *
+ * This is deliberately smaller than the model-visible dependency subject:
+ * the broker adds the exact accepted query/role and source identity while it
+ * serializes the canonical tool_search result. Candidate prose and a later
+ * ask_user_question can never manufacture or widen these fields.
+ */
+export type CandidateSourceConnectionSubjectHint =
+  | {
+      kind: 'exact_capability_connection';
+      toolkit: string;
+      capability: string;
+      capabilityRef: string;
+    }
+  | {
+      kind: 'provider_reconnect_and_rerun';
+    };
+
+export type ToolSearchUnavailableConnectionSubjectV1 =
+  | {
+      version: 1;
+      kind: 'exact_capability_connection';
+      source: ToolSearchCandidateSourceKind;
+      query: string;
+      roleKey?: string;
+      toolkit: string;
+      capability: string;
+      capabilityRef: string;
+    }
+  | {
+      version: 1;
+      kind: 'provider_reconnect_and_rerun';
+      source: ToolSearchCandidateSourceKind;
+      query: string;
+      roleKey?: string;
+    };
+
+/**
  * A candidate source's `search()` throws this to report that the PROVIDER
  * did not answer — never that no matching capability exists. The two facts
  * were previously collapsed into the same empty array by every source's own
@@ -466,12 +505,60 @@ export type CandidateSourceUnavailableCode =
  */
 export class CandidateSourceUnavailableError extends Error {
   readonly code: CandidateSourceUnavailableCode;
+  readonly connectionSubject?: CandidateSourceConnectionSubjectHint;
 
-  constructor(code: CandidateSourceUnavailableCode, message: string) {
+  constructor(
+    code: CandidateSourceUnavailableCode,
+    message: string,
+    connectionSubject?: CandidateSourceConnectionSubjectHint,
+  ) {
     super(message);
     this.name = 'CandidateSourceUnavailableError';
     this.code = code;
+    this.connectionSubject = connectionSubject;
   }
+}
+
+function canonicalUnavailableConnectionSubject(input: {
+  source: ToolSearchCandidateSourceKind;
+  code: CandidateSourceUnavailableCode;
+  query: string;
+  roleKey?: string | null;
+  hint?: CandidateSourceConnectionSubjectHint;
+}): ToolSearchUnavailableConnectionSubjectV1 | undefined {
+  if (input.code !== 'no_connections' && input.code !== 'not_authenticated') return undefined;
+  const query = input.query.trim();
+  const roleKey = input.roleKey?.trim() || undefined;
+  if (!query || query.length > 240 || /[\u0000-\u001f\u007f]/.test(query)) return undefined;
+  const common = {
+    version: 1 as const,
+    source: input.source,
+    query,
+    ...(roleKey && /^[a-z][a-z0-9_:-]{0,79}$/.test(roleKey) ? { roleKey } : {}),
+  };
+  if (input.hint?.kind === 'exact_capability_connection') {
+    const toolkit = input.hint.toolkit.trim().toLowerCase();
+    const capability = input.hint.capability.trim().toUpperCase();
+    const capabilityRef = input.hint.capabilityRef.trim();
+    if (
+      /^[a-z0-9][a-z0-9_]{0,79}$/.test(toolkit)
+      && /^[A-Z0-9][A-Z0-9_]{1,159}$/.test(capability)
+      && capability.startsWith(`${toolkit.toUpperCase()}_`)
+      && capabilityRef === `cap:resolved:${capability.toLowerCase()}`
+    ) {
+      return {
+        ...common,
+        kind: 'exact_capability_connection',
+        toolkit,
+        capability,
+        capabilityRef,
+      };
+    }
+  }
+  // If the adapter could prove only the provider outage, retain exactly that
+  // fact. A model may present a helpful example, but it cannot turn this
+  // provider-neutral reconnect-and-rerun subject into a toolkit lease.
+  return { ...common, kind: 'provider_reconnect_and_rerun' };
 }
 
 export interface ToolSearchPlanningDisclosureCandidate {
@@ -774,6 +861,13 @@ export function registerToolSearchTool(
         const continued = continuations.read(continuation, continuationSessionId);
         return textResult(continued.text, { isError: continued.isError });
       }
+      // plan_task/work_call are host-owned controls, not business/provider
+      // capabilities. Answer their narrowly recognized structural lookup
+      // locally before any candidate source, schema materializer, or planning
+      // disclosure callback can run. The result grants no capabilityRef; the
+      // ordinary orchestrator lifecycle owns when their real schemas appear.
+      const structuralControl = hostStructuralPlanningControlLookup(query);
+      if (structuralControl) return textResult(JSON.stringify(structuralControl));
       const brokerDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
       const remainingBrokerMs = (): number => Math.max(0, brokerDeadlineAt - Date.now());
       // An exact tool name is an explicit selection, not another fuzzy search
@@ -806,6 +900,7 @@ export function registerToolSearchTool(
         source: ToolSearchCandidateSourceKind;
         code: CandidateSourceUnavailableCode;
         reason: string;
+        dependencySubject?: ToolSearchUnavailableConnectionSubjectV1;
       }> = [];
       // An exact registered built-in is already resolved and never pays for
       // provider I/O. Provider adapters are consulted only for an unresolved
@@ -878,14 +973,27 @@ export function registerToolSearchTool(
                   sourceKind: source.kind,
                 }));
             } catch (error) {
+              const code: CandidateSourceUnavailableCode = error instanceof CandidateSourceUnavailableError
+                ? error.code
+                : 'search_failed';
               unavailable.push({
                 source: source.kind,
-                code: error instanceof CandidateSourceUnavailableError
-                  ? error.code
-                  : 'search_failed',
+                code,
                 reason: error instanceof CandidateSourceUnavailableError
                   ? error.message
                   : `${source.kind} raised an unexpected error during discovery.`,
+                ...(() => {
+                  const dependencySubject = canonicalUnavailableConnectionSubject({
+                    source: source.kind,
+                    code,
+                    query,
+                    roleKey: role_key,
+                    ...(error instanceof CandidateSourceUnavailableError && error.connectionSubject
+                      ? { hint: error.connectionSubject }
+                      : {}),
+                  });
+                  return dependencySubject ? { dependencySubject } : {};
+                })(),
               });
               return [];
             } finally {

@@ -394,6 +394,12 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
     type: 'user_input_received',
     data: { text: 'quux wibble frobnicator' },
   });
+  const initial = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: replaySession.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(initial.ok, true, initial.ok ? '' : initial.reason);
+  if (!initial.ok) throw new Error(initial.reason);
   const currentByIdentifier = new Map([create, readback, generic].map((identifier) => {
     const entry = factory.snapshot().find((candidate) =>
       candidate.manifest?.operationId === identifier);
@@ -449,19 +455,30 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
     data: { sourceUserSeq: source.seq, capabilities: legacyRows },
   });
 
-  const primed = await semantic.primePrimaryModelPlanningCatalog({
+  const replayed = await semantic.primePrimaryModelPlanningCatalog({
     sessionId: replaySession.id,
     sourceUserSeq: source.seq,
   });
-  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
-  if (!primed.ok) throw new Error(primed.reason);
-  const citable = new Set(primed.planning.capabilities.map((descriptor) => descriptor.id));
-  assert.equal(citable.has(currentByIdentifier.get(create)!.descriptor.id), false,
+  assert.equal(replayed.ok, true, replayed.ok ? '' : replayed.reason);
+  if (!replayed.ok) throw new Error(replayed.reason);
+  assert.deepEqual(
+    replayed.planning.capabilities,
+    initial.planning.capabilities,
+    'a later disclosure cannot rewrite the immutable initial planning card',
+  );
+  const staged = new Set(semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: replayed.planning.authority,
+    identity: replayed.planning.identity,
+    selectedRefs: new Set(
+      [...currentByIdentifier.values()].map((current) => current.descriptor.id),
+    ),
+  }).map((descriptor) => descriptor.id));
+  assert.equal(staged.has(currentByIdentifier.get(create)!.descriptor.id), false,
     'a historical row cannot inject a retired mutation verification declaration');
-  assert.equal(citable.has(currentByIdentifier.get(readback)!.descriptor.id), false,
+  assert.equal(staged.has(currentByIdentifier.get(readback)!.descriptor.id), false,
     'a historical row cannot inject a retired readback verification declaration');
-  assert.equal(citable.has(currentByIdentifier.get(generic)!.descriptor.id), true,
-    'a legacy row for a still-current non-verification operation retains compatibility');
+  assert.equal(staged.has(currentByIdentifier.get(generic)!.descriptor.id), true,
+    'a legacy row for a still-current non-verification operation remains staged for exact selection');
   assert.equal(businessCalls, 0, 'replay and catalog priming perform no business provider I/O');
 });
 
@@ -857,6 +874,12 @@ test('legacy disclosure from account A cannot replay against a current account B
     type: 'user_input_received',
     data: { text: 'quux wibble frobnicator' },
   });
+  const initial = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: replaySession.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(initial.ok, true, initial.ok ? '' : initial.reason);
+  if (!initial.ok) throw new Error(initial.reason);
   eventlog.appendEvent({
     sessionId: replaySession.id,
     turn: 1,
@@ -878,15 +901,23 @@ test('legacy disclosure from account A cannot replay against a current account B
     },
   });
 
-  const primed = await semantic.primePrimaryModelPlanningCatalog({
+  const replayed = await semantic.primePrimaryModelPlanningCatalog({
     sessionId: replaySession.id,
     sourceUserSeq: source.seq,
   });
-  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
-  if (!primed.ok) throw new Error(primed.reason);
-  assert.equal(
-    primed.planning.capabilities.some((descriptor) => descriptor.id === targetDescriptor!.id),
-    false,
+  assert.equal(replayed.ok, true, replayed.ok ? '' : replayed.reason);
+  if (!replayed.ok) throw new Error(replayed.reason);
+  assert.deepEqual(
+    replayed.planning.capabilities,
+    initial.planning.capabilities,
+    'a later disclosure cannot rewrite the immutable initial planning card',
+  );
+  const staged = semantic.snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: replayed.planning.authority,
+    identity: replayed.planning.identity,
+    selectedRefs: new Set([targetDescriptor!.id]),
+  });
+  assert.equal(staged.some((descriptor) => descriptor.id === targetDescriptor!.id), false,
     'the legacy input digest cannot upgrade across an account-identity change',
   );
 });

@@ -268,7 +268,107 @@ test('a disposable packaged production child executes and observes reviewed CLI/
   });
 });
 
-test('the packaged isolated transport keeps reviewed CLI special handling and the generic bound handler', async () => {
+test('the packaged Composio leaf JIT-revalidates the sealed account and fails before the business body on mismatch', async () => {
+  const built = await bundle(transportEntry);
+  const packageRoot = path.join(TEST_ROOT, `clemmy-composio-${nonce}`);
+  const artifact = path.join(packageRoot, 'runtime', 'transport.cjs');
+  const clientFile = path.join(packageRoot, 'dist', 'integrations', 'composio', 'client.js');
+  mkdirSync(path.dirname(artifact), { recursive: true });
+  mkdirSync(path.dirname(clientFile), { recursive: true });
+  writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'clemmy' }));
+  writeFileSync(artifact, built.bytes);
+  writeFileSync(clientFile, `
+    const events = [];
+    let current = null;
+    module.exports = {
+      events,
+      isComposioEnabled: () => true,
+      peekConnectedToolkits: () => [],
+      async revalidateSelectedComposioConnections(selections) {
+        events.push({ kind: 'connection', selections });
+        const selected = selections[0];
+        if (selected?.identifier !== 'SLACK_FETCH_CONVERSATION_HISTORY'
+          || selected?.connectionId !== 'ca-current') {
+          current = null;
+          return {
+            ok: false,
+            identifier: selected?.identifier || '',
+            reason: 'missing_or_changed',
+          };
+        }
+        current = selected.connectionId;
+        return { ok: true };
+      },
+      prepareComposioOneShotDispatch(input) {
+        events.push({ kind: 'prepare', input });
+        if (current !== input.connectedAccountId) throw new Error('connection was not JIT-revalidated');
+        return { input };
+      },
+      async executePreparedComposioTool(prepared) {
+        events.push({ kind: 'business', prepared });
+        return { ok: true, accountId: prepared.input.connectedAccountId };
+      },
+    };
+  `, 'utf8');
+  const child = runPackagedChild({
+    artifact,
+    home: TEST_HOME,
+    source: `
+      for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) delete process.env[key];
+      const transport = require(process.env.TRANSPORT_ARTIFACT);
+      const client = require(${JSON.stringify(clientFile)});
+      const base = {
+        operationId: 'SLACK_FETCH_CONVERSATION_HISTORY',
+        args: { channel: 'C123' },
+        expected: { providerKind: 'composio', operationVersion: '20260831_01' },
+      };
+      (async () => {
+        await transport.prepareAttestedComposioDispatch({
+          operationId: base.operationId,
+          accountId: 'ca-current',
+        });
+        const result = await transport.executeAttestedTransport({ ...base, accountId: 'ca-current' });
+        let refusal = '';
+        try {
+          await transport.prepareAttestedComposioDispatch({
+            operationId: base.operationId,
+            accountId: 'ca-changed',
+          });
+        } catch (error) {
+          refusal = error?.message || String(error);
+        }
+        process.stdout.write(JSON.stringify({ result, refusal, events: client.events }));
+      })().catch((error) => {
+        process.stderr.write(error?.stack || String(error));
+        process.exit(9);
+      });
+    `,
+  });
+  assert.equal(child.status, 0, `${child.status} ${child.stderr} ${child.stdout}`);
+  const result = JSON.parse(child.stdout) as {
+    result: { ok: boolean; accountId: string };
+    refusal: string;
+    events: Array<{ kind: string; selections?: Array<{ identifier: string; connectionId: string }> }>;
+  };
+  assert.deepEqual(result.result, { ok: true, accountId: 'ca-current' });
+  assert.match(result.refusal, /sealed connected account ca-changed is missing_or_changed/);
+  assert.deepEqual(result.events.map((event) => event.kind), [
+    'connection',
+    'prepare',
+    'business',
+    'connection',
+  ]);
+  assert.deepEqual(result.events[0]?.selections, [{
+    identifier: 'SLACK_FETCH_CONVERSATION_HISTORY',
+    connectionId: 'ca-current',
+  }]);
+  assert.deepEqual(result.events[3]?.selections, [{
+    identifier: 'SLACK_FETCH_CONVERSATION_HISTORY',
+    connectionId: 'ca-changed',
+  }]);
+});
+
+test('the packaged isolated transport requires exact registered Composio preparation and keeps its bound handlers', async () => {
   const built = await bundle(isolatedEntry);
   const artifact = path.join(TEST_ROOT, 'transport-isolated.cjs');
   writeFileSync(artifact, built.bytes);
@@ -292,13 +392,40 @@ test('the packaged isolated transport keeps reviewed CLI special handling and th
         return { handled: call.operationId };
       });
       (async () => {
+        transport.registerIsolatedObservation({
+          operationId: 'fixture_generic_read',
+          accountId: 'fixture:account',
+          definitionFingerprint: 'f'.repeat(64),
+          providerVersion: '2026-08-31',
+          operationVersion: '1',
+          observedAt: Date.now(),
+        });
+        await transport.prepareAttestedComposioDispatch({
+          operationId: 'fixture_generic_read',
+          accountId: 'fixture:account',
+        });
+        let preparationRefusal = '';
+        try {
+          await transport.prepareAttestedComposioDispatch({
+            operationId: 'fixture_generic_read',
+            accountId: 'fixture:changed',
+          });
+        } catch (error) {
+          preparationRefusal = error?.message || String(error);
+        }
         const cli = await transport.executeAttestedTransport(cliCall);
         const generic = await transport.executeAttestedTransport({
           operationId: 'fixture_generic_read',
           accountId: 'fixture:account',
           args: { query: 'x' },
         });
-        process.stdout.write(JSON.stringify({ cli, generic, handlerCalls, calls: transport.isolatedTransportCalls() }));
+        process.stdout.write(JSON.stringify({
+          cli,
+          generic,
+          handlerCalls,
+          preparationRefusal,
+          calls: transport.isolatedTransportCalls(),
+        }));
       })().catch((error) => {
         process.stderr.write(error?.stack || String(error));
         process.exit(9);
@@ -310,10 +437,12 @@ test('the packaged isolated transport keeps reviewed CLI special handling and th
     cli: { status: string };
     generic: { handled: string };
     handlerCalls: number;
+    preparationRefusal: string;
     calls: Array<{ operationId: string }>;
   };
   assert.equal(result.cli.status, 'exited');
   assert.deepEqual(result.generic, { handled: 'fixture_generic_read' });
   assert.equal(result.handlerCalls, 1);
+  assert.match(result.preparationRefusal, /sealed connected account fixture:changed is missing_or_changed/);
   assert.deepEqual(result.calls.map((call) => call.operationId), [operationId, 'fixture_generic_read']);
 });

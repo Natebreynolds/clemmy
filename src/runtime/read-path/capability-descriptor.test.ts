@@ -32,7 +32,7 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-function choice(intent: string, identifier: string) {
+function choice(intent: string, identifier: string, accountIdentity?: string) {
   return {
     intent,
     description: intent,
@@ -40,6 +40,7 @@ function choice(intent: string, identifier: string) {
       kind: 'composio' as const,
       identifier,
       testedAt: '2026-01-01T00:00:00.000Z',
+      ...(accountIdentity ? { accountIdentity } : {}),
     },
     fallbacks: [],
     body: '',
@@ -199,6 +200,166 @@ test('every resolved requirement descriptor carries its own current contract', a
   );
   assert.ok(resolved.requirements.every((requirement) =>
     requirement.resolvedCapabilities[0]?.schemaAuthority === 'live'));
+});
+
+test('a create-only pin cannot close a create-and-populate destination role', async () => {
+  const prompt = 'Can you find me the deals Tim still has to close this quarter in salesforce and create me a Google sheet with the data please';
+  rememberToolSchema('SALESFORCE_QUERY_OPEN_DEALS', {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }, Date.now());
+  rememberToolSchema('GOOGLESHEETS_CREATE_GOOGLE_SHEET1', {
+    type: 'object',
+    properties: { title: { type: 'string' } },
+    required: ['title'],
+  }, Date.now());
+
+  const resolved = await resolveTurnCapabilityCandidates({
+    userInput: prompt,
+    choices: [
+      choice('salesforce find deals close this quarter', 'SALESFORCE_QUERY_OPEN_DEALS'),
+      // This is the misleading live remembered intent: the physical operation
+      // creates a blank spreadsheet and its current schema accepts no rows.
+      choice('google sheets create spreadsheet write multiple rows values', 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1'),
+    ] as never,
+    semantic: false,
+  });
+
+  assert.deepEqual(
+    resolved.requirements.map((requirement) => [requirement.roleKey, requirement.resolved]),
+    [
+      ['clause-0:mixed', false],
+      ['clause-1:write', false],
+    ],
+    'both Salesforce read and Sheets create+populate retain their own discovery role',
+  );
+  const destination = resolved.requirements.find((requirement) => requirement.roleKey === 'clause-1:write');
+  assert.ok(destination);
+  assert.deepEqual(destination.resolvedCapabilities, [],
+    'a title-only create operation is partial evidence, not a complete destination capability');
+  assert.ok(resolved.candidates.some((candidate) =>
+    candidate.identifier === 'GOOGLESHEETS_CREATE_GOOGLE_SHEET1'),
+  'the partial pin remains advisory without consuming the clause discovery slot');
+});
+
+test('unrelated Google product pins cannot union into one complete Sheets destination', async () => {
+  const prompt = 'Can you find me the deals Tim still has to close this quarter in salesforce and create me a Google sheet with the data please';
+  rememberToolSchema('GOOGLESHEETS_ADD_SHEET', {
+    type: 'object',
+    properties: {
+      spreadsheet_id: { type: 'string' },
+      title: { type: 'string' },
+    },
+    required: ['spreadsheet_id', 'title'],
+  }, Date.now());
+  rememberToolSchema('GOOGLEDOCS_INSERT_TEXT_ACTION', {
+    type: 'object',
+    properties: {
+      document_id: { type: 'string' },
+      text: { type: 'string' },
+    },
+    required: ['document_id', 'text'],
+  }, Date.now());
+
+  const resolved = await resolveTurnCapabilityCandidates({
+    userInput: prompt,
+    limit: 5,
+    choices: [
+      choice('google sheets create google sheet', 'GOOGLESHEETS_ADD_SHEET'),
+      choice('google sheet with data write content', 'GOOGLEDOCS_INSERT_TEXT_ACTION'),
+    ] as never,
+    semantic: false,
+  });
+  const destination = resolved.requirements.find((requirement) => requirement.roleKey === 'clause-1:write');
+  assert.ok(destination);
+  assert.equal(destination.resolved, false,
+    'a Sheets create and a Docs text write are not one coherent executable destination');
+  assert.deepEqual(destination.resolvedCapabilities, []);
+  assert.ok(resolved.candidates.some((candidate) => candidate.identifier === 'GOOGLESHEETS_ADD_SHEET'));
+  assert.ok(resolved.candidates.some((candidate) => candidate.identifier === 'GOOGLEDOCS_INSERT_TEXT_ACTION'));
+});
+
+test('accountless sibling aliases cannot union create and populate authority', async () => {
+  rememberToolSchema('GOOGLESHEETS_CREATE_SPREADSHEET', {
+    type: 'object',
+    properties: { title: { type: 'string' } },
+    required: ['title'],
+  }, Date.now());
+  rememberToolSchema('GOOGLESHEETS_VALUES_UPDATE', {
+    type: 'object',
+    properties: {
+      spreadsheet_id: { type: 'string' },
+      range: { type: 'string' },
+      values: { type: 'array', items: { type: 'array' } },
+    },
+    required: ['spreadsheet_id', 'range', 'values'],
+  }, Date.now());
+  const resolved = await resolveTurnCapabilityCandidates({
+    userInput: 'Create me a Google sheet with the data please.',
+    limit: 5,
+    choices: [
+      choice('google sheets create sheet', 'GOOGLESHEETS_CREATE_SPREADSHEET'),
+      choice('google sheets write data values', 'GOOGLESHEETS_VALUES_UPDATE'),
+    ] as never,
+    semantic: false,
+  });
+
+  assert.equal(resolved.requirements[0]?.resolved, false,
+    'separate unbound aliases do not prove that both operations target one destination/account');
+  assert.deepEqual(resolved.requirements[0]?.resolvedCapabilities, []);
+});
+
+test('one account cannot make cross-product create and populate aliases coherent', async () => {
+  rememberToolSchema('GOOGLESHEETS_CREATE_SPREADSHEET_ONLY', {
+    type: 'object',
+    properties: { title: { type: 'string' } },
+    required: ['title'],
+  }, Date.now());
+  rememberToolSchema('GOOGLEDOCS_INSERT_TEXT_FOR_SHEET', {
+    type: 'object',
+    properties: { document_id: { type: 'string' }, text: { type: 'string' } },
+    required: ['document_id', 'text'],
+  }, Date.now());
+  const resolved = await resolveTurnCapabilityCandidates({
+    userInput: 'Create me a Google sheet with the data please.',
+    limit: 5,
+    choices: [
+      choice('google sheets create sheet', 'GOOGLESHEETS_CREATE_SPREADSHEET_ONLY', 'conn-google-primary'),
+      choice('google sheet with data write content', 'GOOGLEDOCS_INSERT_TEXT_FOR_SHEET', 'conn-google-primary'),
+    ] as never,
+    semantic: false,
+  });
+
+  assert.equal(resolved.requirements[0]?.resolved, false,
+    'principal equality is not destination/resource/dependency proof');
+  assert.deepEqual(resolved.requirements[0]?.resolvedCapabilities, []);
+});
+
+test('one atomic create-with-content contract can close the same complete destination role', async () => {
+  rememberToolSchema('TABLESTORE_CREATE_TABLE_WITH_ROWS', {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      rows: { type: 'array', items: { type: 'object' } },
+    },
+    required: ['title', 'rows'],
+  }, Date.now());
+
+  const resolved = await resolveTurnCapabilityCandidates({
+    userInput: 'Create me a TableStore table with the data please.',
+    choices: [choice(
+      'tablestore create table with data rows',
+      'TABLESTORE_CREATE_TABLE_WITH_ROWS',
+    )] as never,
+    semantic: false,
+  });
+
+  assert.equal(resolved.requirements[0]?.resolved, true);
+  assert.deepEqual(
+    resolved.requirements[0]?.resolvedCapabilities.map((candidate) => candidate.identifier),
+    ['TABLESTORE_CREATE_TABLE_WITH_ROWS'],
+  );
 });
 
 test('a semantic read hit cannot rewrite or settle an unknown read/write role', async () => {

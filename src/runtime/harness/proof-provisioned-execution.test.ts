@@ -36,7 +36,10 @@ const {
 const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
 const { rememberToolSchema } = await import('../../tools/composio-schema-cache.js');
 const { installProductionTransport } = await import('./production-capability-adapters.js');
-const { compileProofProviderArgs } = await import('./proof-provisioned-catalog.js');
+const {
+  compileProofProviderArgs,
+  validateProofProviderArguments,
+} = await import('./proof-provisioned-catalog.js');
 
 saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
@@ -98,6 +101,129 @@ test('the arg compiler is schema-grounded for the exact live shapes', () => {
     a: 'top three Big Bear Lake restaurants',
     b: 'top three Big Bear Lake restaurants',
   });
+});
+
+test('the arg compiler preserves exact foreground provider args before semantic fallback', () => {
+  const insertSchema = {
+    type: 'object',
+    required: ['spreadsheet_id', 'insert_dimension'],
+    properties: {
+      spreadsheet_id: { type: 'string' },
+      insert_dimension: {
+        type: 'object',
+        required: ['range'],
+        properties: {
+          range: {
+            type: 'object',
+            required: ['sheet_id', 'dimension', 'start_index', 'end_index'],
+            properties: {
+              sheet_id: { type: 'integer' },
+              dimension: { type: 'string', enum: ['ROWS', 'COLUMNS'] },
+              start_index: { type: 'integer' },
+              end_index: { type: 'integer' },
+            },
+            additionalProperties: false,
+          },
+          inherit_from_before: { type: 'boolean' },
+        },
+        additionalProperties: false,
+      },
+    },
+  };
+  const insertArgs = {
+    spreadsheet_id: 'sheet-platform-49',
+    insert_dimension: {
+      range: {
+        sheet_id: 1535967397,
+        dimension: 'ROWS',
+        start_index: 1,
+        end_index: 2,
+      },
+      inherit_from_before: false,
+    },
+  };
+  const compiledInsert = compileProofProviderArgs({
+    schema: insertSchema,
+    role: 'destination',
+    effect: 'external_write',
+    payload: insertArgs,
+    acceptAuthorityBoundPayload: true,
+  });
+  assert.deepEqual(compiledInsert, insertArgs,
+    'a nested exact write must not be replaced by the record-array synthesizer');
+  assert.notEqual(compiledInsert, insertArgs, 'provider arguments cross as a defensive clone');
+
+  const exactLookupArgs = { record_key: 'record-42', include_metadata: false };
+  const lookupSchema = {
+    type: 'object',
+    properties: {
+      record_key: { type: 'string' },
+      include_metadata: { type: 'boolean' },
+    },
+  };
+  const compiledLookup = compileProofProviderArgs({
+    schema: lookupSchema,
+    role: 'foreground',
+    effect: 'read',
+    payload: exactLookupArgs,
+    acceptAuthorityBoundPayload: true,
+    authorityBoundPayloadKind: 'provider_arguments',
+  });
+  assert.deepEqual(compiledLookup, exactLookupArgs,
+    'optional-but-operational exact read arguments must not collapse to an empty object');
+
+  const mismatch = validateProofProviderArguments({
+    schema: lookupSchema,
+    payload: { wrong_id: 'record-42' },
+  });
+  assert.equal(mismatch.ok, false);
+  if (!mismatch.ok) {
+    assert.deepEqual(mismatch.allowedFields, ['record_key', 'include_metadata']);
+    assert.deepEqual(mismatch.requiredFields, []);
+    assert.deepEqual(mismatch.unknownFields, ['wrong_id']);
+  }
+  assert.equal(compileProofProviderArgs({
+    schema: lookupSchema,
+    role: 'foreground',
+    effect: 'read',
+    payload: { wrong_id: 'record-42' },
+    acceptAuthorityBoundPayload: true,
+    authorityBoundPayloadKind: 'provider_arguments',
+  }), null, 'an explicit provider object cannot fall through to synthetic empty arguments');
+
+  const semanticFallback = compileProofProviderArgs({
+    schema: lookupSchema,
+    role: 'lookup',
+    effect: 'read',
+    payload: { records: [{ id: 'record-42' }] },
+    acceptAuthorityBoundPayload: true,
+    authorityBoundPayloadKind: 'semantic',
+  });
+  assert.deepEqual(semanticFallback, {},
+    'a host-declared semantic payload keeps the existing schema-grounded fallback');
+
+  assert.deepEqual(compileProofProviderArgs({
+    schema: lookupSchema,
+    role: 'lookup',
+    effect: 'read',
+    payload: exactLookupArgs,
+  }), {}, 'an unsealed compiler caller cannot opt itself into payload passthrough');
+
+  const rejectedUnknown = compileProofProviderArgs({
+    schema: insertSchema,
+    role: 'destination',
+    effect: 'external_write',
+    payload: {
+      ...insertArgs,
+      insert_dimension: {
+        ...insertArgs.insert_dimension,
+        range: { ...insertArgs.insert_dimension.range, arbitrary_provider_field: 'no' },
+      },
+    },
+    acceptAuthorityBoundPayload: true,
+  });
+  assert.equal(rejectedUnknown, null,
+    'authority-bound passthrough must reject undeclared nested provider fields');
 });
 
 test.after(() => {

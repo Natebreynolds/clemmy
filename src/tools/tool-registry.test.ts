@@ -21,6 +21,7 @@ import {
 } from './tool-registry.js';
 import {
   _withHostLocalWriteCommitFactsForTest,
+  expectsHostLocalWorkspaceCompoundCommit,
   hostLocalWriteCommitResultIsProven,
   parseHostLocalWriteCommitFacts,
 } from '../runtime/harness/host-local-write-commit.js';
@@ -190,6 +191,37 @@ test('host local-write commit evidence is exact and effect-generic, not an autho
     false,
     'an echoed receipt-like user field is not a host receipt unless it is the exact first line',
   );
+});
+
+test('only one static space_save call may use its compound receipt as intrinsic readback', () => {
+  const exact = {
+    slug: 'local-llm-calendar',
+    title: 'Local LLM Calendar',
+    view_html: '<html><body>calendar</body></html>',
+    view_path: null,
+    initial_data_json: JSON.stringify({
+      posts: [{ body: 'one' }],
+      _mobile: { records: { items: [{ primary: 'one', body: 'one' }] } },
+    }),
+    data_sources: null,
+  };
+  assert.equal(expectsHostLocalWorkspaceCompoundCommit({ toolName: 'space_save', args: exact }), true);
+  for (const [label, toolName, args] of [
+    ['other local write', 'workflow_create', exact],
+    ['external lookalike', 'COMPOSIO_SPACE_SAVE', exact],
+    ['missing data document', 'space_save', { ...exact, initial_data_json: null }],
+    ['invalid data document', 'space_save', { ...exact, initial_data_json: '{' }],
+    ['array data document', 'space_save', { ...exact, initial_data_json: '[]' }],
+    ['dynamic sources', 'space_save', { ...exact, data_sources: [{ operation: 'READ' }] }],
+    ['missing view', 'space_save', { ...exact, view_html: null }],
+    ['ambiguous views', 'space_save', { ...exact, view_path: '/tmp/view.html' }],
+  ] as const) {
+    assert.equal(
+      expectsHostLocalWorkspaceCompoundCommit({ toolName, args }),
+      false,
+      `${label} cannot bypass an explicit successor readback`,
+    );
+  }
 });
 
 test('SDK full (brain) ⊇ authoring + execution + brain-only fan-out', () => {

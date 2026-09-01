@@ -168,9 +168,9 @@ export interface LocalPlanningSemantics {
  */
 export interface ReviewedLocalExecutionContractV1 {
   version: 1;
-  adapter: 'artifact_bundle_v1';
+  adapter: 'artifact_bundle_v1' | 'workspace_dataset_v1';
   idempotency: 'content_addressed';
-  reconciliation: 'artifact_bundle_v1';
+  reconciliation: 'artifact_bundle_v1' | 'workspace_dataset_v1';
 }
 
 export type ActionControlContextRequirement = 'task_recovery' | 'alternate_action_owner';
@@ -415,7 +415,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'space_refresh', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Re-run a Workspace\'s data source(s) NOW (server-side, no LLM) and persist the fresh datas…' },
   { name: 'space_revert_runner', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Undo the most recent space_edit_runner on a runner, restoring its prior source from the s…' },
   { name: 'space_save', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workspace_definition', reversibility: 'reversible', destructive: false, purpose: 'author_workspace', inputKind: 'workspace_definition', outputKind: 'workspace_revision', deliverableKind: 'workspace', destinationPosture: 'create_new', advisoryRoles: ['author', 'create', 'destination'] }, description: 'Create or update a Workspace — a persistent, interactive HTML surface you build for the u…' },
-  { name: 'space_set_data', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id —…' },
+  { name: 'space_set_data', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', loopClass: 'mutating', localPlanning: { consequence: 'workspace_definition', reversibility: 'reversible', destructive: false, purpose: 'update_workspace_dataset', inputKind: 'workspace_dataset', outputKind: 'workspace_observation', deliverableKind: 'workspace', destinationPosture: 'named_existing', advisoryRoles: ['update', 'destination'] }, localExecution: { version: 1, adapter: 'workspace_dataset_v1', idempotency: 'content_addressed', reconciliation: 'workspace_dataset_v1' }, description: 'Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id —…' },
   { name: 'space_try_runner', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', actionTopologyRole: 'control', description: 'Statically inspect a legacy Workspace runner\'s declared role and provenance without executing it; execution remains behind space_refresh or the normal Workspace action approval path.' },
   { name: 'surface_plan', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', description: 'Surface a Plan you just received from `draft_plan` to the user for review.' },
   { name: 'task_add', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Add a passive one-time item to the user\'s TODO list; it does not fire at a scheduled time.' },

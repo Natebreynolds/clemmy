@@ -64,6 +64,16 @@ test('request scope distinguishes reads, writes, compounds, and ambiguous asks',
     'read',
     'negated mutation names describe the boundary rather than requesting writes',
   );
+  assert.equal(
+    requestedCapabilityEffectScope([
+      'Read the Slack channel and compare it with the current tracker.',
+      'READ-ONLY IN SLACK — never post, reply, react, or DM. The only writes are to the Google Sheet.',
+      'WRITE — insert new rows, update changed rows, and refresh the daily digest.',
+      'REPORT — notify Nate on every run, including when nothing changed.',
+    ].join('\n')),
+    'mixed',
+    'a resource-scoped read-only rule cannot erase later required writes and notification work',
+  );
   assert.equal(requestedCapabilityEffectScope("What's on my Outlook calendar?"), 'read');
   assert.equal(requestedCapabilityEffectScope('whats on my Outlook calendar tomorrow'), 'read');
   assert.equal(

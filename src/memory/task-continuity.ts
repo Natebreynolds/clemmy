@@ -14,6 +14,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { openEventLog } from '../runtime/harness/eventlog.js';
+import {
+  strategicMetaActionFromVisibleLabel,
+  type StrategicMetaAction,
+} from './strategic-option-intent.js';
 
 export const TASK_CONTINUITY_PACKET_VERSION = 1 as const;
 export const DEFAULT_TASK_CONTINUITY_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -53,10 +57,15 @@ export interface TaskContinuityPacket {
   sessionId: string;
   originatingSourceUserSeq: number;
   originatingSourceEventId: string;
+  /** Present on a chained clarification reask/customization packet. */
+  rootSourceUserSeq?: number;
+  rootSourceEventId?: string;
+  parentPacketId?: string;
   pause: {
     kind: TaskContinuityPauseKind;
     question: string;
     options: string[];
+    optionIntents?: Array<{ optionIndex: number; action: StrategicMetaAction }>;
     slot?: {
       goalId: string;
       revision: number;
@@ -94,6 +103,22 @@ export interface TaskContinuityPacketInput {
     resourceRefs?: readonly string[];
     schemaFingerprint?: string;
   }>;
+  /**
+   * Chained-question lineage. The store verifies the parent is the one exact
+   * currently-open packet and that this source is its adjacent accepted reply.
+   */
+  lineage?: {
+    rootSourceUserSeq: number;
+    parentPacketId: string;
+  };
+  /**
+   * Exact durable host events proving non-empty options were actually exposed
+   * by the paired ask/terminal. Hidden implementation options remain invalid.
+   */
+  publicDeliveryBinding?: {
+    awaitingEventId: string;
+    terminalEventId: string;
+  };
   /** Mutually exclusive with ttlMs. Must be a canonical future ISO timestamp. */
   expiresAt?: string;
   /** Defaults to seven days and is capped at thirty days. */
@@ -188,6 +213,9 @@ interface RawPacketRow {
   session_id: string;
   originating_source_user_seq: number;
   originating_source_event_id: string;
+  root_source_user_seq: number | null;
+  root_source_event_id: string | null;
+  parent_packet_id: string | null;
   pause_kind: string;
   pause_question: string;
   pause_options_json: string;
@@ -209,6 +237,9 @@ interface RawPacketRow {
   resolution_active_task_input: string | null;
   resolution_semantic_input_hash: string | null;
   pause_slot_json: string | null;
+  pause_option_intents_json: string | null;
+  public_awaiting_event_id: string | null;
+  public_terminal_event_id: string | null;
 }
 
 interface RawSourceRow {
@@ -267,6 +298,9 @@ function ensureSchema(db: Database.Database): void {
       session_id                      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
       originating_source_user_seq     INTEGER NOT NULL CHECK (originating_source_user_seq > 0),
       originating_source_event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+      root_source_user_seq            INTEGER,
+      root_source_event_id            TEXT REFERENCES events(id) ON DELETE CASCADE,
+      parent_packet_id                TEXT REFERENCES task_continuity_packets(packet_id) ON DELETE RESTRICT,
       pause_kind                      TEXT NOT NULL
                                       CHECK (pause_kind IN ('clarification', 'approval', 'recovery')),
       pause_question                  TEXT NOT NULL,
@@ -286,6 +320,9 @@ function ensureSchema(db: Database.Database): void {
                                       )),
       origin_audience_hash            TEXT,
       pause_slot_json                 TEXT,
+      pause_option_intents_json       TEXT,
+      public_awaiting_event_id         TEXT REFERENCES events(id) ON DELETE RESTRICT,
+      public_terminal_event_id        TEXT REFERENCES events(id) ON DELETE RESTRICT,
       consumer_audience_hash          TEXT,
       resolver_version                TEXT,
       resolution_disposition          TEXT,
@@ -293,6 +330,16 @@ function ensureSchema(db: Database.Database): void {
       resolution_active_task_input    TEXT,
       resolution_semantic_input_hash  TEXT,
       CHECK (expires_at > created_at),
+      CHECK (
+        (root_source_user_seq IS NULL AND root_source_event_id IS NULL AND parent_packet_id IS NULL)
+        OR
+        (root_source_user_seq > 0 AND root_source_event_id IS NOT NULL AND parent_packet_id IS NOT NULL)
+      ),
+      CHECK (
+        (public_awaiting_event_id IS NULL AND public_terminal_event_id IS NULL)
+        OR
+        (public_awaiting_event_id IS NOT NULL AND public_terminal_event_id IS NOT NULL)
+      ),
       CHECK (
         (consumed_at IS NULL AND consumed_by_source_user_seq IS NULL AND consumed_by_source_event_id IS NULL)
         OR
@@ -392,6 +439,24 @@ function ensureSchema(db: Database.Database): void {
   if (!columns.has('pause_slot_json')) {
     db.exec('ALTER TABLE task_continuity_packets ADD COLUMN pause_slot_json TEXT');
   }
+  if (!columns.has('root_source_user_seq')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN root_source_user_seq INTEGER');
+  }
+  if (!columns.has('root_source_event_id')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN root_source_event_id TEXT');
+  }
+  if (!columns.has('parent_packet_id')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN parent_packet_id TEXT');
+  }
+  if (!columns.has('public_awaiting_event_id')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN public_awaiting_event_id TEXT');
+  }
+  if (!columns.has('public_terminal_event_id')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN public_terminal_event_id TEXT');
+  }
+  if (!columns.has('pause_option_intents_json')) {
+    db.exec('ALTER TABLE task_continuity_packets ADD COLUMN pause_option_intents_json TEXT');
+  }
   initializedDatabases.add(db);
 }
 
@@ -483,12 +548,15 @@ function normalizeCapabilityEvidence(
   return out;
 }
 
-function normalizePauseOptions(values: readonly string[] | undefined): string[] {
+function normalizePauseOptions(
+  values: readonly string[] | undefined,
+  publiclyBound = false,
+): string[] {
   const raw = values ?? [];
   if (!Array.isArray(raw) || raw.length > MAX_PAUSE_OPTIONS) {
     throw new Error(`Task continuity pause options must contain at most ${MAX_PAUSE_OPTIONS} rows.`);
   }
-  if (raw.length > 0) {
+  if (raw.length > 0 && !publiclyBound) {
     throw new Error('Task continuity pause options require an exact public delivery binding.');
   }
   const normalized = raw.map((option) =>
@@ -504,10 +572,58 @@ function parsePauseOptionsJson(raw: string): string[] | null {
   try { parsed = JSON.parse(raw); } catch { return null; }
   if (!Array.isArray(parsed)) return null;
   try {
-    return normalizePauseOptions(parsed as string[]);
+    // A persisted non-empty list is accepted only after rowToPacket re-proves
+    // its awaiting/terminal event binding below.
+    return normalizePauseOptions(parsed as string[], true);
   } catch {
     return null;
   }
+}
+
+function derivedOptionIntents(
+  options: readonly string[],
+): Array<{ optionIndex: number; action: StrategicMetaAction }> {
+  return options.flatMap((label, optionIndex) => {
+    const action = strategicMetaActionFromVisibleLabel(label);
+    return action ? [{ optionIndex, action }] : [];
+  });
+}
+
+function parseOptionIntentsJson(
+  raw: string | null,
+  options: readonly string[],
+): Array<{ optionIndex: number; action: StrategicMetaAction }> | null {
+  if (!raw) return options.length === 0 ? [] : null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  if (!Array.isArray(parsed)) return null;
+  const normalized: Array<{ optionIndex: number; action: StrategicMetaAction }> = [];
+  const seen = new Set<number>();
+  for (const row of parsed) {
+    if (
+      !isPlainObject(row)
+      || Object.keys(row).some((key) => key !== 'optionIndex' && key !== 'action')
+      || !Number.isSafeInteger(row.optionIndex)
+      || Number(row.optionIndex) < 0
+      || Number(row.optionIndex) >= options.length
+      || (row.action !== 'explain' && row.action !== 'customize')
+      || seen.has(Number(row.optionIndex))
+    ) return null;
+    seen.add(Number(row.optionIndex));
+    normalized.push({
+      optionIndex: Number(row.optionIndex),
+      action: row.action,
+    });
+  }
+  const derived = derivedOptionIntents(options);
+  if (
+    normalized.length !== derived.length
+    || normalized.some((row, index) => (
+      row.optionIndex !== derived[index]?.optionIndex
+      || row.action !== derived[index]?.action
+    ))
+  ) return null;
+  return normalized;
 }
 
 function parseEvidenceJson(raw: string): TaskContinuityCapabilityEvidence[] | null {
@@ -546,6 +662,71 @@ function rawSource(db: Database.Database, sessionId: string, sourceUserSeq: numb
      WHERE session_id = ? AND seq = ?
      LIMIT 1
   `).get(sessionId, sourceUserSeq) as RawSourceRow | undefined) ?? null;
+}
+
+function rawEventById(
+  db: Database.Database,
+  sessionId: string,
+  eventId: string,
+): RawSourceRow | null {
+  return (db.prepare(`
+    SELECT seq, id, session_id, role, type, data_json, created_at
+      FROM events
+     WHERE session_id = ? AND id = ?
+     LIMIT 1
+  `).get(sessionId, eventId) as RawSourceRow | undefined) ?? null;
+}
+
+function parsedEventData(row: RawSourceRow | null): Record<string, unknown> | null {
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.data_json) as unknown;
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedVisibleText(value: unknown): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+function exactPublicDeliveryBinding(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  question: string;
+  options: readonly string[];
+  awaitingEventId: string | null;
+  terminalEventId: string | null;
+}): boolean {
+  if (!input.awaitingEventId || !input.terminalEventId) return input.options.length === 0;
+  const awaiting = rawEventById(input.db, input.sessionId, input.awaitingEventId);
+  const terminal = rawEventById(input.db, input.sessionId, input.terminalEventId);
+  if (!awaiting || !terminal || awaiting.type !== 'awaiting_user_input'
+    || terminal.type !== 'conversation_completed' || awaiting.seq >= terminal.seq) return false;
+  const awaitingData = parsedEventData(awaiting);
+  const terminalData = parsedEventData(terminal);
+  if (!awaitingData || !terminalData) return false;
+  const presentation = isPlainObject(terminalData.presentation)
+    ? terminalData.presentation
+    : null;
+  const identity = presentation && isPlainObject(presentation.identity)
+    ? presentation.identity
+    : null;
+  const sourceUserSeq = Number(awaitingData.sourceUserSeq);
+  const terminalSourceUserSeq = Number(identity?.sourceUserSeq ?? terminalData.sourceUserSeq);
+  const terminalQuestion = normalizedVisibleText(presentation?.text ?? terminalData.reply);
+  const awaitingQuestion = normalizedVisibleText(awaitingData.question);
+  const awaitingOptions = Array.isArray(awaitingData.options)
+    ? awaitingData.options.map(normalizedVisibleText).filter(Boolean)
+    : [];
+  return sourceUserSeq === input.sourceUserSeq
+    && terminalSourceUserSeq === input.sourceUserSeq
+    && awaitingQuestion === normalizedVisibleText(input.question)
+    && terminalQuestion === normalizedVisibleText(input.question)
+    && awaitingOptions.length === input.options.length
+    && awaitingOptions.every((option, index) => option === normalizedVisibleText(input.options[index]));
 }
 
 function acceptedSourceFromRow(row: RawSourceRow | null): AcceptedSource | null {
@@ -763,6 +944,8 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
   if (!capabilities) return null;
   const options = parsePauseOptionsJson(row.pause_options_json);
   if (!options) return null;
+  const optionIntents = parseOptionIntentsJson(row.pause_option_intents_json, options);
+  if (!optionIntents) return null;
   let createdAt: { iso: string; ms: number };
   let expiresAt: { iso: string; ms: number };
   try {
@@ -778,6 +961,56 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
   // rows and later mutation of event.data user/channel identity fail closed.
   if (!row.origin_audience_hash || row.origin_audience_hash !== acceptedAudienceHash(origin)) return null;
   if (createdAt.ms < Date.parse(origin.createdAt)) return null;
+  if (!exactPublicDeliveryBinding({
+    db,
+    sessionId,
+    sourceUserSeq: sourceSeq,
+    question,
+    options,
+    awaitingEventId: row.public_awaiting_event_id,
+    terminalEventId: row.public_terminal_event_id,
+  })) return null;
+  const hasAnyLineage = row.root_source_user_seq !== null
+    || row.root_source_event_id !== null
+    || row.parent_packet_id !== null;
+  let lineage: Pick<TaskContinuityPacket,
+    'rootSourceUserSeq' | 'rootSourceEventId' | 'parentPacketId'> = {};
+  if (hasAnyLineage) {
+    if (
+      row.root_source_user_seq === null
+      || row.root_source_event_id === null
+      || row.parent_packet_id === null
+    ) return null;
+    let rootSeq: number;
+    try {
+      rootSeq = positiveSeq(row.root_source_user_seq, 'rootSourceUserSeq');
+      boundedString(row.root_source_event_id, 'rootSourceEventId', 128);
+      boundedString(row.parent_packet_id, 'parentPacketId', 128);
+    } catch {
+      return null;
+    }
+    const root = acceptedSource(db, sessionId, rootSeq);
+    const parent = db.prepare('SELECT * FROM task_continuity_packets WHERE packet_id = ? AND session_id = ?')
+      .get(row.parent_packet_id, sessionId) as RawPacketRow | undefined;
+    if (!root || root.eventId !== row.root_source_event_id || !parent) return null;
+    const expectedRootSeq = parent.root_source_user_seq ?? parent.originating_source_user_seq;
+    const parentOrigin = acceptedSource(db, sessionId, parent.originating_source_user_seq);
+    const adjacent = parentOrigin
+      ? nextAcceptedSource(db, sessionId, parentOrigin.seq)
+      : null;
+    if (
+      expectedRootSeq !== rootSeq
+      || !parentOrigin
+      || adjacent?.seq !== sourceSeq
+      || !sameAcceptedAudience(root, origin)
+      || !sameAcceptedAudience(parentOrigin, origin)
+    ) return null;
+    lineage = {
+      rootSourceUserSeq: rootSeq,
+      rootSourceEventId: root.eventId,
+      parentPacketId: row.parent_packet_id,
+    };
+  }
   const slot = parsePauseSlotJson(row.pause_slot_json);
   return {
     version: TASK_CONTINUITY_PACKET_VERSION,
@@ -785,10 +1018,12 @@ function rowToPacket(db: Database.Database, row: RawPacketRow): TaskContinuityPa
     sessionId,
     originatingSourceUserSeq: sourceSeq,
     originatingSourceEventId: row.originating_source_event_id,
+    ...lineage,
     pause: {
       kind: row.pause_kind as TaskContinuityPauseKind,
       question,
       options,
+      ...(optionIntents.length > 0 ? { optionIntents } : {}),
       ...(slot ? { slot } : {}),
     },
     capabilities,
@@ -896,7 +1131,29 @@ export class TaskContinuityStore {
     const sourceUserSeq = positiveSeq(input.originatingSourceUserSeq, 'originatingSourceUserSeq');
     if (!PAUSE_KINDS.has(input.pause?.kind)) throw new Error('Task continuity pause kind is invalid.');
     const question = boundedString(input.pause?.question, 'pause question', MAX_QUESTION_CHARS);
-    const pauseOptions = normalizePauseOptions(input.pause?.options);
+    const deliveryBinding = input.publicDeliveryBinding;
+    let awaitingEventId: string | null = null;
+    let terminalEventId: string | null = null;
+    if (deliveryBinding !== undefined) {
+      awaitingEventId = boundedString(
+        deliveryBinding.awaitingEventId,
+        'publicDeliveryBinding.awaitingEventId',
+        128,
+      );
+      terminalEventId = boundedString(
+        deliveryBinding.terminalEventId,
+        'publicDeliveryBinding.terminalEventId',
+        128,
+      );
+    }
+    const pauseOptions = normalizePauseOptions(input.pause?.options, Boolean(deliveryBinding));
+    const optionIntents = derivedOptionIntents(pauseOptions);
+    const lineage = input.lineage === undefined
+      ? null
+      : {
+          rootSourceUserSeq: positiveSeq(input.lineage.rootSourceUserSeq, 'rootSourceUserSeq'),
+          parentPacketId: boundedString(input.lineage.parentPacketId, 'parentPacketId', 128),
+        };
     const capabilities = normalizeCapabilityEvidence(input.capabilities);
     if (input.expiresAt !== undefined && input.ttlMs !== undefined) {
       throw new Error('Task continuity expiresAt and ttlMs are mutually exclusive.');
@@ -937,6 +1194,45 @@ export class TaskContinuityStore {
       if (openPacketRows(db, sessionId).length > 1) {
         throw new Error('Task continuity has multiple open questions for one session.');
       }
+      if (!exactPublicDeliveryBinding({
+        db,
+        sessionId,
+        sourceUserSeq,
+        question,
+        options: pauseOptions,
+        awaitingEventId,
+        terminalEventId,
+      })) {
+        throw new Error('Task continuity pause options are not bound to the exact public ask and terminal.');
+      }
+
+      let rootSourceEventId: string | null = null;
+      if (lineage) {
+        const [openParent] = openPacketRows(db, sessionId);
+        if (!openParent || openParent.packet_id !== lineage.parentPacketId) {
+          throw new Error('Task continuity successor does not name the exact current parent packet.');
+        }
+        const parentPacket = rowToPacket(db, openParent);
+        const expectedRootSeq = parentPacket?.rootSourceUserSeq
+          ?? parentPacket?.originatingSourceUserSeq;
+        const parentOrigin = parentPacket
+          ? acceptedSource(db, sessionId, parentPacket.originatingSourceUserSeq)
+          : null;
+        const adjacent = parentOrigin ? nextAcceptedSource(db, sessionId, parentOrigin.seq) : null;
+        const root = acceptedSource(db, sessionId, lineage.rootSourceUserSeq);
+        if (
+          !parentPacket
+          || expectedRootSeq !== lineage.rootSourceUserSeq
+          || adjacent?.seq !== sourceUserSeq
+          || !root
+          || !sameAcceptedAudience(root, source)
+          || !parentOrigin
+          || !sameAcceptedAudience(parentOrigin, source)
+        ) {
+          throw new Error('Task continuity successor lineage is stale or does not preserve its exact root.');
+        }
+        rootSourceEventId = root.eventId;
+      }
 
       // Latest pause wins. Supersession is reversible audit history, not deletion.
       db.prepare(`
@@ -954,23 +1250,32 @@ export class TaskContinuityStore {
         INSERT INTO task_continuity_packets (
           packet_id, version, session_id,
           originating_source_user_seq, originating_source_event_id,
-          pause_kind, pause_question, pause_options_json, capability_evidence_json,
-          created_at, expires_at, origin_audience_hash, pause_slot_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          root_source_user_seq, root_source_event_id, parent_packet_id,
+          pause_kind, pause_question, pause_options_json, pause_option_intents_json,
+          capability_evidence_json,
+          created_at, expires_at, origin_audience_hash, pause_slot_json,
+          public_awaiting_event_id, public_terminal_event_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         packetId,
         TASK_CONTINUITY_PACKET_VERSION,
         sessionId,
         sourceUserSeq,
         source.eventId,
+        lineage?.rootSourceUserSeq ?? null,
+        rootSourceEventId,
+        lineage?.parentPacketId ?? null,
         input.pause.kind,
         question,
         JSON.stringify(pauseOptions),
+        JSON.stringify(optionIntents),
         JSON.stringify({ version: TASK_CONTINUITY_PACKET_VERSION, capabilities }),
         now.iso,
         expiresAt.iso,
         acceptedAudienceHash(source),
         input.pause.slot ? JSON.stringify(input.pause.slot) : null,
+        awaitingEventId,
+        terminalEventId,
       );
       const row = db.prepare('SELECT * FROM task_continuity_packets WHERE packet_id = ?')
         .get(packetId) as RawPacketRow;

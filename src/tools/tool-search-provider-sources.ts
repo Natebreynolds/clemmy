@@ -69,6 +69,7 @@ import {
 import {
   attachToolSearchSelectedAccountEvidence,
   CandidateSourceUnavailableError,
+  TOOL_SEARCH_TOTAL_DEADLINE_MS,
 } from './tool-search-tool.js';
 import type {
   ToolSearchCandidateSource,
@@ -1062,7 +1063,7 @@ function isSchemaRecord(value: unknown): value is Record<string, unknown> {
  * cannot be proven live simply does not exist. Plan admission still revalidates
  * the selected definition afterwards, unchanged.
  */
-type ExactMaterializationRequest = {
+export type ExactMaterializationRequest = {
   slug: string;
   toolkit: string;
 };
@@ -1163,6 +1164,231 @@ async function freshConnectionsWithin(input: {
   return outcome.kind === 'settled' && discoveryStillActive(input)
     ? outcome.value
     : null;
+}
+
+export type ExactWorkflowProviderProvisionResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code:
+        | 'accepted_source_missing_or_changed'
+        | 'invalid_exact_operation'
+        | 'exact_definition_unavailable'
+        | 'fresh_connections_unavailable'
+        | 'account_selection_required'
+        | 'connection_unavailable'
+        | 'proof_publication_expired'
+        | 'proof_provisioning_refused';
+      identifier: string;
+      detail?: string;
+      choices?: readonly string[];
+    };
+
+export interface ExactWorkflowProviderProvisionDependencies {
+  materializeExact?: (input: {
+    requests: readonly ExactMaterializationRequest[];
+    signal?: AbortSignal;
+    deadlineAt: number;
+  }) => Promise<ComposioBrokerCandidate[]>;
+  freshConnections?: (input: {
+    signal?: AbortSignal;
+    deadlineAt: number;
+  }) => Promise<Awaited<ReturnType<typeof listUsableConnectedToolkits>> | null>;
+  recordResolution?: typeof recordAdmissionCapabilityResolution;
+  registerProof?: typeof registerProofProvisionedCapabilities;
+}
+
+function normalizedAcceptedSourceText(value: unknown): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+/**
+ * Pre-model supply for exact Composio operations authored by an immutable
+ * workflow step but absent from the durable manifest store.
+ *
+ * This is deliberately not a fuzzy/tool_search invocation. The caller has
+ * already reduced the immutable source to an exact, registered operation set;
+ * this helper performs one bounded exact provider lookup, binds one current
+ * account per operation, records that proof against the already-persisted
+ * source, and publishes only that exact set through the ordinary selected-
+ * definition revalidation path. Both reads and writes are metadata-provisioned
+ * here; all normal graph/effect/physical-dispatch gates remain downstream.
+ */
+export async function provisionExactWorkflowProviderOperations(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedInput: string;
+  operationIds: readonly string[];
+  signal?: AbortSignal;
+  deadlineAt?: number;
+}, dependencies: ExactWorkflowProviderProvisionDependencies = {}): Promise<ExactWorkflowProviderProvisionResult> {
+  const accepted = listEvents(input.sessionId, {
+    sinceSeq: input.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === input.sourceUserSeq);
+  const acceptedText = normalizedAcceptedSourceText(
+    typeof accepted?.data.displayText === 'string' && accepted.data.displayText.trim()
+      ? accepted.data.displayText
+      : accepted?.data.text,
+  );
+  if (
+    !acceptedText
+    || acceptedText !== normalizedAcceptedSourceText(input.acceptedInput)
+  ) {
+    return {
+      ok: false,
+      code: 'accepted_source_missing_or_changed',
+      identifier: input.operationIds[0]?.trim().toUpperCase() || 'unknown',
+    };
+  }
+
+  const operationIds = [...new Set(input.operationIds.map((value) => value.trim().toUpperCase()))]
+    .filter(Boolean)
+    .sort();
+  if (operationIds.length === 0 || operationIds.length > 32) {
+    return {
+      ok: false,
+      code: 'invalid_exact_operation',
+      identifier: operationIds[32] ?? operationIds[0] ?? 'unknown',
+    };
+  }
+  const requests: ExactMaterializationRequest[] = [];
+  for (const operation of operationIds) {
+    const toolkit = registeredToolkitOfSlug(operation).trim().toLowerCase();
+    if (
+      !/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){2,}$/.test(operation)
+      || !isRegisteredToolkitSlug(toolkit)
+      || !operation.startsWith(`${toolkit.toUpperCase()}_`)
+    ) {
+      return { ok: false, code: 'invalid_exact_operation', identifier: operation };
+    }
+    requests.push({ slug: operation, toolkit });
+  }
+
+  // One aggregate deadline covers definition lookup, account refresh, proof,
+  // and publication. A late provider promise is consumed by awaitBounded, and
+  // publicationGuard prevents it from mutating authority after expiry.
+  const ownDeadlineAt = Date.now() + TOOL_SEARCH_TOTAL_DEADLINE_MS;
+  const deadlineAt = input.deadlineAt === undefined
+    ? ownDeadlineAt
+    : Math.min(ownDeadlineAt, input.deadlineAt);
+  const guard = { signal: input.signal, deadlineAt };
+  if (!discoveryStillActive(guard)) {
+    return {
+      ok: false,
+      code: 'proof_publication_expired',
+      identifier: operationIds[0]!,
+    };
+  }
+
+  const [materialized, connections] = await Promise.all([
+    (dependencies.materializeExact ?? materializeExactProviderBatch)({ requests, ...guard }),
+    (dependencies.freshConnections ?? freshConnectionsWithin)(guard),
+  ]);
+  if (!discoveryStillActive(guard)) {
+    return {
+      ok: false,
+      code: 'proof_publication_expired',
+      identifier: operationIds[0]!,
+    };
+  }
+  const materializedBySlug = new Map(materialized.map((candidate) => [
+    candidate.slug.trim().toUpperCase(),
+    candidate,
+  ]));
+  for (const operation of operationIds) {
+    if (!materializedBySlug.has(operation)) {
+      return { ok: false, code: 'exact_definition_unavailable', identifier: operation };
+    }
+  }
+  if (!connections) {
+    return {
+      ok: false,
+      code: 'fresh_connections_unavailable',
+      identifier: operationIds[0]!,
+    };
+  }
+
+  const entries: CapabilityResolutionEntry[] = [];
+  for (const operation of operationIds) {
+    const selection = planningConnectionForOperation(
+      operation,
+      input.acceptedInput,
+      connections,
+      { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
+    );
+    if (selection.kind === 'account_selection_required') {
+      return {
+        ok: false,
+        code: 'account_selection_required',
+        identifier: operation,
+        choices: Object.freeze([...selection.choices]),
+      };
+    }
+    if (selection.kind !== 'resolved') {
+      return { ok: false, code: 'connection_unavailable', identifier: operation };
+    }
+    entries.push({
+      intent: 'immutable workflow source names this exact operation',
+      kind: 'composio',
+      identifier: operation,
+      status: 'proven',
+      connection: 'active',
+      accountIdentity: selection.connection.connectionId,
+      effectClass: classifyComposioSlugEffect(operation) === 'read' ? 'read' : 'write',
+    });
+  }
+
+  (dependencies.recordResolution ?? recordAdmissionCapabilityResolution)({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedInput: input.acceptedInput,
+    entries,
+  });
+  const expectedSchemaDigests = operationIds.map((identifier) => ({
+    identifier,
+    schemaDigest: digestSchema(
+      materializedBySlug.get(identifier)!.inputParameters as Record<string, unknown>,
+    ),
+  }));
+  const publication = await awaitBounded({
+    start: () => (dependencies.registerProof ?? registerProofProvisionedCapabilities)(
+      { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
+      {
+        allowedIdentifiers: operationIds,
+        expectedSchemaDigests,
+        publicationGuard: () => discoveryStillActive(guard),
+      },
+    ),
+    ...guard,
+  });
+  if (publication.kind === 'failed') {
+    return {
+      ok: false,
+      code: 'proof_provisioning_refused',
+      identifier: operationIds[0]!,
+      detail: publication.error instanceof Error
+        ? publication.error.message
+        : String(publication.error),
+    };
+  }
+  if (publication.kind !== 'settled' || !discoveryStillActive(guard)) {
+    return {
+      ok: false,
+      code: 'proof_publication_expired',
+      identifier: operationIds[0]!,
+    };
+  }
+  if (publication.value.refusal) {
+    return {
+      ok: false,
+      code: 'proof_provisioning_refused',
+      identifier: publication.value.refusal.identifier,
+      detail: publication.value.refusal.code,
+    };
+  }
+  return { ok: true };
 }
 
 async function materializeNamedComposioOperation(input: {
@@ -1409,6 +1635,31 @@ export function buildAuthorizedToolSearchCandidateSources(
       if (signal?.aborted) return [];
       const exactOperation = exactComposioOperationFromQuery(query);
       if (exactOperation) {
+        const exactToolkit = registeredToolkitOfSlug(exactOperation).trim().toLowerCase();
+        const connectionDeadlineAt = exactDiscoveryDeadline(deadlineAt);
+        const currentConnections = await freshConnectionsWithin({
+          signal,
+          deadlineAt: connectionDeadlineAt,
+        });
+        if (signal?.aborted) return [];
+        if (
+          currentConnections
+          && !currentConnections.some((connection) => (
+            connection.slug.trim().toLowerCase() === exactToolkit
+            && /active|enabled|initiat/i.test(connection.status ?? '')
+          ))
+        ) {
+          throw new CandidateSourceUnavailableError(
+            'no_connections',
+            `No current ${exactToolkit} connection can authorize ${exactOperation}.`,
+            {
+              kind: 'exact_capability_connection',
+              toolkit: exactToolkit,
+              capability: exactOperation,
+              capabilityRef: `cap:resolved:${exactOperation.toLowerCase()}`,
+            },
+          );
+        }
         const exact = await materializeNamedComposioOperation({
           operation: exactOperation,
           signal,

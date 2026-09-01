@@ -9,12 +9,14 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-adapter-'
 
 const {
   assertDistinctReadyRecords,
+  compileSealedProviderArgs,
   createArgsFromEnvelope,
   installProductionTransport,
   invokeForSealedManifest,
   invokeHostCompute,
   invokeHostCreate,
   normalizeSheetRows,
+  observeComposioIndependently,
   productionProviderCrossingAllowed,
   reconcileForSealedManifest,
   reconcileHostCreate,
@@ -319,6 +321,76 @@ test('exact-id readback content equals the intended written rows', async () => {
   assert.deepEqual((result as { content: unknown }).content, FIVE);
 });
 
+test('BATCH_GET in a source role stays an ordinary read even when its manifest can verify mutations', async () => {
+  const sourceRead = attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:resolved:batch-get-as-source',
+    providerKind: 'composio',
+    operationId: 'GOOGLESHEETS_BATCH_GET',
+    providerIdentity: 'composio',
+    providerVersion: 'composio-tool-router-v1',
+    operationVersion: 'v20260831_00',
+    definitionFingerprint: '7'.repeat(64),
+    effect: 'read',
+    accountId: 'ca_exact_sheets_account',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    // A verifier-capable operation may still be selected as this turn's
+    // material source. Purpose alone therefore cannot select readback mode.
+    purpose: 'verify_created_resource',
+    acceptedInputKinds: ['evidence', 'spreadsheet'],
+    producedOutputKinds: ['evidence', 'records'],
+    applicableDeliverableKinds: ['evidence', 'spreadsheet'],
+    evidenceContract: { kinds: ['payload'], readbackRequired: false },
+    provenance: { issuer: 'host:resolution-proof', issuedAt: '1970-01-01T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source', 'lookup', 'readback'],
+    argumentCompiler: { id: 'compile:proof-schema:v1', version: '1' },
+    invokePortId: 'port:batch-get-as-source',
+  });
+  const canonicalArgs = {
+    spreadsheet_id: 'existing-sheet-source',
+    ranges: ['Data!A1:C5'],
+  };
+  assert.deepEqual(
+    compileSealedProviderArgs(sourceRead, envelopeFor('source'), canonicalArgs),
+    canonicalArgs,
+    'source compilation must not reinterpret provider arguments as a created artifact payload',
+  );
+
+  const calls: Array<{ operationId: string; args: Record<string, unknown>; accountId: string }> = [];
+  installProductionTransport(async (call) => {
+    calls.push(call);
+    return { successful: true, data: { valueRanges: [] } };
+  });
+  const result = await invokeForSealedManifest(sourceRead)({
+    nodeId: 'op-source-sheet',
+    role: 'source',
+    payload: canonicalArgs,
+    identity,
+    binding: {
+      capabilityId: sourceRead.manifestId,
+      toolName: sourceRead.operationId,
+      schemaVersion: sourceRead.operationVersion,
+      schemaDigest: sourceRead.definitionFingerprint,
+      args: canonicalArgs,
+      account: sourceRead.accountId,
+      effect: 'read',
+      invoke: async () => ({}),
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.operationId, 'GOOGLESHEETS_BATCH_GET');
+  assert.equal(calls[0]?.accountId, sourceRead.accountId);
+  assert.deepEqual(calls[0]?.args, canonicalArgs);
+  assert.deepEqual(result, {
+    result: { successful: true, data: { valueRanges: [] } },
+    complete: true,
+  });
+});
+
 test('lost create recovery is unsupported and does not retry', async () => {
   const dest = manifestByPurpose('persist_collection');
   let calls = 0;
@@ -555,4 +627,40 @@ test('an arbitrary external write cannot inherit the transport\'s Sheets-shaped 
   assert.deepEqual(result, { exists: false });
   assert.equal(executes, 0);
   assert.equal(reconciles, 0);
+});
+
+test('Composio observation is requested and returned for the exact manifest account', async () => {
+  const operationId = 'SLACK_FETCH_CONVERSATION_HISTORY';
+  const accountId = 'ca_exact_slack_account';
+  const operationVersion = 'v20260831_00';
+  const definitionFingerprint = '6'.repeat(64);
+  rememberToolSchema(operationId, { type: 'object', properties: {} }, Date.now(), operationVersion, null);
+  const { bindAttestedTransport } = await import('./implementation-artifacts/attested-transport.js');
+  const observedInputs: Array<{ operationId: string; accountId: string }> = [];
+  bindAttestedTransport({
+    digest: 'fixture:account-bound-observation',
+    execute: async () => ({}),
+    observe: (input) => {
+      observedInputs.push(input);
+      return {
+        operationId,
+        accountId,
+        definitionFingerprint,
+        providerVersion: 'composio-tool-router-v1',
+        operationVersion,
+        observedAt: Date.now(),
+      };
+    },
+    reconcile: async () => ({ exists: false }),
+  });
+
+  const observed = observeComposioIndependently(operationId, accountId);
+  assert.deepEqual(observedInputs, [{ operationId, accountId }]);
+  assert.deepEqual(observed, {
+    accountId,
+    definitionFingerprint,
+    providerVersion: 'composio-tool-router-v1',
+    operationVersion,
+    observedAt: (observed as Exclude<typeof observed, 'missing'>).observedAt,
+  });
 });

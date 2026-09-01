@@ -2,11 +2,11 @@
  * Schema-grounded provider-argument compiler for proof-provisioned operations.
  *
  * Leaf module (no catalog/runtime imports) so the graph compiler's host-bind
- * pass can consult it without closing an import cycle. The model's args never
- * cross this boundary: values come from the immutable envelope (goal,
- * cardinality, predecessor values) and are placed into the slug's OWN required
- * fields — the exact inversion of the live failure where the model remembered
- * `query` for a schema that requires `q`.
+ * pass can consult it without closing an import cycle. Ordinarily values come
+ * from the immutable envelope. A sealed proof-provisioned catalog entry may
+ * explicitly opt its already-admitted call payload into the recursively closed
+ * provider-schema path; operation, account, effect, and schema remain closure-
+ * bound by that entry and cannot be nominated by payload fields.
  */
 import type { GraphNodeInvocationEnvelopeV1 } from './graph-node-envelope.js';
 
@@ -35,33 +35,60 @@ function propertyType(property: Record<string, unknown> | undefined): string {
 
 function providerReadyValueMatchesSchema(value: unknown, schema: Record<string, unknown> | undefined): boolean {
   if (!schema) return false;
+  if (value === null && schema.nullable === true) return true;
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) return false;
+  if (Object.prototype.hasOwnProperty.call(schema, 'const') && !Object.is(schema.const, value)) return false;
+  const alternatives = Array.isArray(schema.anyOf)
+    ? schema.anyOf
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf
+      : null;
+  if (alternatives) {
+    return alternatives.some((candidate) => (
+      isRecord(candidate) && providerReadyValueMatchesSchema(value, candidate)
+    ));
+  }
   switch (propertyType(schema)) {
     case 'string': return typeof value === 'string';
     case 'number': return typeof value === 'number' && Number.isFinite(value);
     case 'integer': return Number.isSafeInteger(value);
     case 'boolean': return typeof value === 'boolean';
-    case 'array': return Array.isArray(value);
-    case 'object': return isRecord(value);
-    case '': return value !== undefined;
+    case 'array': {
+      if (!Array.isArray(value)) return false;
+      if (schema.items === undefined) return true;
+      if (!isRecord(schema.items)) return false;
+      return value.every((item) => providerReadyValueMatchesSchema(item, schema.items as Record<string, unknown>));
+    }
+    case 'object': {
+      if (!isRecord(value)) return false;
+      const { required, properties } = schemaShape(schema);
+      if (required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) return false;
+      // Exact passthrough is deliberately stricter than ordinary provider
+      // validation: every key, including nested keys, must be named by the
+      // selected schema. Open/extension shapes take the semantic fallback.
+      return Object.entries(value).every(([key, child]) => (
+        Object.prototype.hasOwnProperty.call(properties, key)
+        && providerReadyValueMatchesSchema(child, properties[key])
+      ));
+    }
+    case '':
+      // A declared but untyped scalar can cross; an unresolved object/array
+      // schema cannot prove that its nested fields are closed.
+      return value !== undefined && !isRecord(value) && !Array.isArray(value);
     default: return false;
   }
 }
 
-/** Closed host-only projection for an already recipe-instantiated verifier.
- * The adapter still validates the exact current provider schema; no operation
- * name, role label, description, or id-looking field nominates a verifier. */
+/** Closed projection for arguments that already match the exact provider
+ * schema. The adapter still validates the exact current provider schema; no
+ * operation name, role label, description, or id-looking field nominates a
+ * capability. */
 function exactProviderReadyArgs(
   schema: Record<string, unknown>,
   payload: unknown,
 ): Record<string, unknown> | null {
   if (!isRecord(payload)) return null;
-  const { required, properties } = schemaShape(schema);
-  if (required.some((key) => !Object.prototype.hasOwnProperty.call(payload, key))) return null;
-  if (schema.additionalProperties === false
-    && Object.keys(payload).some((key) => !Object.prototype.hasOwnProperty.call(properties, key))) return null;
-  if (Object.entries(payload).some(([key, value]) => !providerReadyValueMatchesSchema(value, properties[key]))) {
-    return null;
-  }
+  if (!providerReadyValueMatchesSchema(payload, schema)) return null;
   try {
     return structuredClone(payload);
   } catch {
@@ -69,12 +96,124 @@ function exactProviderReadyArgs(
   }
 }
 
+const MAX_REPAIR_FIELDS = 24;
+
+export type ProofProviderArgumentValidation =
+  | { ok: true; args: Record<string, unknown> }
+  | {
+      ok: false;
+      requiredFields: string[];
+      allowedFields: string[];
+      missingRequiredFields: string[];
+      unknownFields: string[];
+      invalidFields: string[];
+      fieldsTruncated: boolean;
+    };
+
 /**
- * Schema-grounded argument compiler for a proof-provisioned operation. The
- * model's args never cross this boundary: values come from the immutable
- * envelope (goal, cardinality, predecessor values) and are placed into the
- * slug's OWN required fields — the exact inversion of the live failure where
- * the model remembered `query` for a schema that requires `q`.
+ * Validate an object that explicitly claims to be provider-ready arguments.
+ * The bounded diagnostics intentionally expose only the selected schema's
+ * top-level field names. They are enough for an in-turn model repair without
+ * copying descriptions, examples, values, account data, or an unbounded
+ * provider schema into a tool result.
+ */
+export function validateProofProviderArguments(input: {
+  schema: Record<string, unknown>;
+  payload: unknown;
+}): ProofProviderArgumentValidation {
+  const exact = exactProviderReadyArgs(input.schema, input.payload);
+  if (exact) return { ok: true, args: exact };
+
+  const { required, properties } = schemaShape(input.schema);
+  const allAllowed = Object.keys(properties);
+  const payload = isRecord(input.payload) ? input.payload : {};
+  const missingRequiredFields = required.filter((key) => (
+    !Object.prototype.hasOwnProperty.call(payload, key)
+  ));
+  const unknownFields = Object.keys(payload).filter((key) => (
+    !Object.prototype.hasOwnProperty.call(properties, key)
+  ));
+  const invalidFields = Object.entries(payload)
+    .filter(([key, value]) => (
+      Object.prototype.hasOwnProperty.call(properties, key)
+      && !providerReadyValueMatchesSchema(value, properties[key])
+    ))
+    .map(([key]) => key);
+  const fieldsTruncated = [required, allAllowed, missingRequiredFields, unknownFields, invalidFields]
+    .some((fields) => fields.length > MAX_REPAIR_FIELDS);
+  return {
+    ok: false,
+    requiredFields: required.slice(0, MAX_REPAIR_FIELDS),
+    allowedFields: allAllowed.slice(0, MAX_REPAIR_FIELDS),
+    missingRequiredFields: missingRequiredFields.slice(0, MAX_REPAIR_FIELDS),
+    unknownFields: unknownFields.slice(0, MAX_REPAIR_FIELDS),
+    invalidFields: invalidFields.slice(0, MAX_REPAIR_FIELDS),
+    fieldsTruncated,
+  };
+}
+
+export type ProofProviderForegroundPayloadValidation =
+  | { ok: true }
+  | { ok: false; repair: string; schemaAvailable: true };
+
+export type ProofProviderForegroundPayloadValidator = (
+  payload: unknown,
+) => ProofProviderForegroundPayloadValidation;
+
+function boundedRepairFieldList(fields: readonly string[]): string {
+  if (fields.length === 0) return '(none)';
+  return fields.map((field) => JSON.stringify(field.slice(0, 80))).join(', ');
+}
+
+/**
+ * Build a denial-only foreground validator over an isolated snapshot of one
+ * exact provider schema. The caller remains responsible for proving that the
+ * schema digest belongs to its manifest; this helper never selects an
+ * operation, account, effect, or capability.
+ */
+export function createProofProviderForegroundPayloadValidator(input: {
+  operationId: string;
+  schema: Record<string, unknown>;
+}): ProofProviderForegroundPayloadValidator | null {
+  const operationId = input.operationId.trim();
+  if (!operationId) return null;
+  let schema: Record<string, unknown>;
+  try {
+    schema = structuredClone(input.schema);
+  } catch {
+    return null;
+  }
+  return (payload) => {
+    const validation = validateProofProviderArguments({ schema, payload });
+    if (validation.ok) return { ok: true };
+    const details = [
+      `[provider-dispatch:not-started:invalid-args] ${operationId} arguments did not match its exact current schema.`,
+      `Required top-level fields: ${boundedRepairFieldList(validation.requiredFields)}.`,
+      `Allowed top-level fields: ${boundedRepairFieldList(validation.allowedFields)}.`,
+      ...(validation.missingRequiredFields.length > 0
+        ? [`Missing required fields: ${boundedRepairFieldList(validation.missingRequiredFields)}.`]
+        : []),
+      ...(validation.unknownFields.length > 0
+        ? [`Remove unknown fields: ${boundedRepairFieldList(validation.unknownFields)}.`]
+        : []),
+      ...(validation.invalidFields.length > 0
+        ? [`Fields with invalid value shapes: ${boundedRepairFieldList(validation.invalidFields)}.`]
+        : []),
+      ...(validation.fieldsTruncated
+        ? ['The displayed field list was bounded; inspect the complete selected schema with the first-class local tool_search control.']
+        : []),
+      `If any value or nested object shape is unclear, call the first-class local tool_search control directly with query ${JSON.stringify(operationId)}; do not put a local control name inside a provider execution carrier and do not substitute another operation.`,
+      'Then retry with one JSON object using the allowed field names. No provider request was sent.',
+    ].join(' ');
+    return { ok: false, repair: details.slice(0, 2_000), schemaAvailable: true };
+  };
+}
+
+/**
+ * Schema-grounded argument compiler for a proof-provisioned operation.
+ * Payload passthrough is opt-in because only the sealed catalog invoke owns an
+ * admitted operation/account/schema tuple; all other callers retain semantic
+ * synthesis (apart from the pre-existing host-verification recipe path).
  */
 export function compileProofProviderArgs(input: {
   schema: Record<string, unknown>;
@@ -82,10 +221,41 @@ export function compileProofProviderArgs(input: {
   effect: 'read' | 'external_write';
   payload: unknown;
   envelope?: GraphNodeInvocationEnvelopeV1;
+  acceptAuthorityBoundPayload?: boolean;
+  /** The trusted caller, never payload content, declares whether this object
+   * is already authored against the provider schema or is semantic material
+   * from which the host may synthesize provider arguments. */
+  authorityBoundPayloadKind?: 'provider_arguments' | 'semantic';
 }): Record<string, unknown> | null {
-  if (input.role === 'host_verification') {
-    return exactProviderReadyArgs(input.schema, input.payload);
+  // Foreground tool_search returns the provider's exact schema and work_call
+  // carries arguments authored against that schema. Preserve those bytes when
+  // they already satisfy the closed top-level contract. Previously only the
+  // host_verification role took this path, so ordinary proof-provisioned
+  // operations discarded exact arguments and tried to synthesize replacements
+  // from the semantic envelope. That made nested write shapes impossible and
+  // erased optional-but-operational identifiers from exact read calls.
+  const explicitProviderArguments = input.acceptAuthorityBoundPayload === true
+    && (
+      input.authorityBoundPayloadKind === 'provider_arguments'
+      // Compatibility for current foreground catalog callers while the
+      // explicit kind propagates through every registration/recovery path.
+      || input.role === 'foreground'
+    );
+  if (input.role === 'host_verification' || input.acceptAuthorityBoundPayload === true) {
+    const validation = validateProofProviderArguments({
+      schema: input.schema,
+      payload: input.payload,
+    });
+    if (validation.ok) return validation.args;
+    // An explicit provider object that fails its exact selected schema must
+    // never fall through to semantic synthesis. In particular, an optional-
+    // only read schema used to turn {wrong_id: "..."} into {}, which crossed
+    // the provider and produced a misleading business failure.
+    if (explicitProviderArguments) return null;
   }
+  // A host-instantiated verifier has no semantic fallback: accepting anything
+  // other than its exact recipe arguments would change the verification proof.
+  if (input.role === 'host_verification') return null;
   const { required, properties } = schemaShape(input.schema);
   const args: Record<string, unknown> = {};
   const predecessorValues = (input.envelope?.predecessors ?? [])

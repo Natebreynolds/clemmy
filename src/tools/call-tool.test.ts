@@ -663,6 +663,44 @@ test('resolved local workflow authority keeps the canonical deferred schema', as
     'the resolved work contract must match the deferred parser, not the lossy first-class projection');
 });
 
+test('an exact host durable continuation escapes the nested call_tool SDK wrapper unchanged', async () => {
+  const {
+    HostDurableContinuationPendingError,
+    isHostDurableContinuationPendingError,
+  } = await import('../runtime/harness/host-durable-continuation.js');
+  const pending = new HostDurableContinuationPendingError(
+    'async_read_refinement',
+    'logical-refinement-owner',
+    'terminal getter has not settled',
+  );
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['workflow_create']),
+    propagateInvocationError: isHostDurableContinuationPendingError,
+    aroundResolvedDispatch: async () => {
+      throw pending;
+    },
+  }) as unknown as ToolLike;
+  const args = {
+    name: 'Durable continuation escape proof',
+    description: 'The private host scheduler signal must not become model-visible text.',
+    steps: [{
+      id: 'read_latest',
+      call: { tool: 'PROVIDER_QUERY_RECORDS', args: { top: 1 } },
+      sideEffect: 'read',
+    }],
+  };
+
+  await assert.rejects(
+    invokeCallToolFixture(
+      callTool,
+      'sess-durable-continuation-escape',
+      JSON.stringify({ name: 'workflow_create', args_json: JSON.stringify(args) }),
+      'call-durable-continuation-escape',
+    ),
+    (error: unknown) => error === pending,
+  );
+});
+
 test('materialization survives a nullish (double-anyOf) wrapper around a nested array', async () => {
   _resetCallToolSchemaCacheForTest();
   // Live failure (proof workspace-build, 2026-07-27): space_save's

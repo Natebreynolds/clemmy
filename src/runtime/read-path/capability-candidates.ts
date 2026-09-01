@@ -590,6 +590,95 @@ export function effectClassMayCloseRole(
   return true;
 }
 
+type EffectfulOperationFacet = 'create_resource' | 'populate_content';
+
+const CONTENT_PAYLOAD_FIELD_TERMS = new Set([
+  'body',
+  'cell',
+  'cells',
+  'content',
+  'data',
+  'initial',
+  'item',
+  'items',
+  'record',
+  'records',
+  'request',
+  'requests',
+  'row',
+  'rows',
+  'text',
+  'value',
+  'values',
+]);
+
+function operationWords(value: string): string[] {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/**
+ * A remembered operation may be exact while still covering only part of one
+ * natural-language clause. The live Salesforce→Sheets miss was precisely this
+ * shape: the clause asked to CREATE a spreadsheet WITH the retrieved data,
+ * while the high lexical pin was a title-only blank-spreadsheet create. That
+ * pin is useful advisory context, but treating it as complete spent the
+ * destination's only scoped discovery slot before the row-write operation was
+ * found.
+ *
+ * Keep this vocabulary provider-neutral and deliberately conservative. It is
+ * used only to decide whether discovery is still required; it grants neither
+ * planning nor execution authority.
+ */
+function requiredEffectfulOperationFacets(
+  requirement: CapabilityRequirementSegment,
+): ReadonlySet<EffectfulOperationFacet> {
+  if (requirement.effect !== 'write') return new Set();
+  const text = requirement.text.toLowerCase().replace(/\s+/g, ' ').trim();
+  const facets = new Set<EffectfulOperationFacet>();
+  if (/\b(?:create|make|provision|initialize|start|build)\b/.test(text)) {
+    facets.add('create_resource');
+  }
+  if (
+    /\b(?:with|using|from)\s+(?:(?:the|those|these|that)\s+)?(?:data|results?|records?|rows?|values?|items?|content|information)\b/.test(text)
+    || /\b(?:write|populate|append|insert|fill|place|put|store|save)\b[^.;]{0,80}\b(?:data|results?|records?|rows?|values?|items?|content|information)\b/.test(text)
+  ) {
+    facets.add('populate_content');
+  }
+  return facets;
+}
+
+function candidateEffectfulOperationFacets(
+  candidate: CapabilityCandidate,
+): ReadonlySet<EffectfulOperationFacet> {
+  const facets = new Set<EffectfulOperationFacet>();
+  const operation = new Set(operationWords(candidate.identifier));
+  if ([...operation].some((word) => (
+    word === 'create'
+    || word === 'make'
+    || word === 'provision'
+    || word === 'initialize'
+    || word === 'start'
+    || word === 'new'
+  ))) {
+    facets.add('create_resource');
+  }
+  const contractFields = new Set(
+    (candidate.requiredFields ?? []).flatMap((field) => operationWords(field)),
+  );
+  // Provider intent/procedure prose is not evidence that bytes can be written:
+  // the physical current contract must expose a content-bearing argument.
+  // This is what keeps a stale "create spreadsheet and write rows" intent with
+  // a title-only live schema from claiming the populate half of the clause.
+  if ([...contractFields].some((field) => CONTENT_PAYLOAD_FIELD_TERMS.has(field))) {
+    facets.add('populate_content');
+  }
+  return facets;
+}
+
 function describeRequirements(
   requirements: readonly CapabilityRequirementSegment[],
   candidates: readonly CapabilityCandidate[],
@@ -602,7 +691,7 @@ function describeRequirements(
     // overlap remains advisory even when its effect agrees: one generic action
     // token cannot let a stale memo settle a destination role. Semantic hits
     // populate this key only for known effects and never rewrite unknown roles.
-    const resolvedCapabilities = roleCandidates.filter((candidate) =>
+    const structurallyResolvedCapabilities = roleCandidates.filter((candidate) =>
       candidate.resolutionRoleKeys?.includes(requirement.roleKey)
       // Advertise-tier MCP names are observational. They must not close a
       // role: the live miss was an unattached SEO tool resolving a mixed
@@ -616,11 +705,35 @@ function describeRequirements(
       // parked. A candidate with an unknown/absent effect stays admissible;
       // only a POSITIVE mismatch is disqualifying.
       && effectClassMayCloseRole(candidate.effectClass, requirement.effect));
+    const requiredFacets = requiredEffectfulOperationFacets(requirement);
+    const candidateFacets = new Map(structurallyResolvedCapabilities.map((candidate) => (
+      [candidate, candidateEffectfulOperationFacets(candidate)] as const
+    )));
+    // Candidate retrieval carries neither a sealed common destination nor an
+    // output→input dependency proof. Even a shared account is not enough:
+    // Google Sheets create plus Google Docs insert-text on that principal is
+    // not one executable artifact path. Only one current atomic descriptor may
+    // close every facet here. Multi-operation completion belongs to scoped
+    // discovery + plan binding, where those identities/dependencies are proved.
+    const completeOperationCandidates = structurallyResolvedCapabilities.filter((candidate) => {
+      const covered = candidateFacets.get(candidate) ?? new Set<EffectfulOperationFacet>();
+      return [...requiredFacets].every((facet) => covered.has(facet));
+    });
+    const completeOperationCoverage = requiredFacets.size === 0
+      || completeOperationCandidates.length > 0;
     // A mixed clause is two jobs. Remembered Slack/Sheets/SEO pins must not
     // mark the whole request resolved and spend the only search slot.
     const resolved = requirement.effect === 'mixed'
       ? false
-      : resolvedCapabilities.length > 0;
+      : structurallyResolvedCapabilities.length > 0 && completeOperationCoverage;
+    // `resolvedCapabilities` is an authority-shaped name used by continuity
+    // and prompt projection. Never put a merely partial create/write there:
+    // it remains in the advisory candidate list while this role stays open.
+    const resolvedCapabilities = resolved
+      ? requiredFacets.size === 0
+        ? structurallyResolvedCapabilities
+        : completeOperationCandidates
+      : [];
     return {
       ...requirement,
       resolved,

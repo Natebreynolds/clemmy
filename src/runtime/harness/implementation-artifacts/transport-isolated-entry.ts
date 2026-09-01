@@ -82,6 +82,35 @@ export function registerIsolatedObservation(observation: AttestedTransportObserv
   saveState(state);
 }
 
+/**
+ * Test-contract equivalent of the production Composio connection refresh.
+ *
+ * An isolated test must explicitly register the exact operation/account pair
+ * that its fake remote currently reports.  Preparation then reopens that
+ * remote-owned state immediately before the business reservation.  Missing or
+ * changed pairs fail closed; the isolated artifact never turns test mode into
+ * an implicit all-accounts-connected bypass.
+ */
+export async function prepareAttestedComposioDispatch(input: {
+  operationId: string;
+  accountId: string;
+}): Promise<void> {
+  const operationId = input.operationId.trim();
+  const accountId = input.accountId.trim();
+  const current = operationId && accountId
+    ? observeAttestedTransport({ operationId, accountId })
+    : null;
+  if (
+    !current
+    || current.operationId !== operationId
+    || current.accountId !== accountId
+  ) {
+    throw new Error(
+      `${operationId || 'unknown operation'} sealed connected account ${accountId || 'unknown'} is missing_or_changed`,
+    );
+  }
+}
+
 export function isolatedTransportCalls(): AttestedTransportCall[] {
   return [...loadState().calls];
 }
