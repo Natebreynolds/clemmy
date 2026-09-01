@@ -5198,6 +5198,22 @@ async function runConversationWithinRuntimeConfig(
       sessionId: options.sessionId,
       sourceUserSeq,
     });
+    if (recoveredPreparation.status === 'expired') {
+      // Gate 15: an exact pre-seal owner that has kept failing past the host
+      // age budget is a factual stop, not "please retry" forever. Nothing was
+      // started; the reason is the last exact seal failure. Non-resumable so
+      // restart reconciliation stops re-dispatching this same source — a new
+      // request plans fresh.
+      const heldMinutes = Math.max(1, Math.round(recoveredPreparation.ageMs / 60_000));
+      return {
+        sessionId: options.sessionId,
+        status: 'blocked',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        blockedResumable: false,
+        error: `I retained the accepted plan but could not restore its exact capability bindings after ${heldMinutes} minutes (${recoveredPreparation.reason}). Nothing was started. Send the request again and I will plan it fresh.`,
+      };
+    }
     if (recoveredPreparation.status === 'held') {
       return {
         sessionId: options.sessionId,
