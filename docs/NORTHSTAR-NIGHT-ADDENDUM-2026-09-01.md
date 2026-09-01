@@ -165,6 +165,27 @@ in two weeks a failed run named its own cause.
   (`fixture cold prewrite projection unavailable`, `host_result_receipt_commit_failed`). Evidence and
   file:line map in the scratchpad ring reports (`rings/B.md`).
 
+### Morning (08:00–09:00): authoring audit + workflow self-improvement
+- **Authoring is aligned with the new model.** No authoring file changed tonight; the validator refuses a
+  `deterministic.runner` step at create time (since the 08-30 release cut), so Clem cannot author a
+  workflow she can't run. Its stale "point it at a scripts/ helper" hint now says what to do instead.
+  Your vault: 34 workflows — 22 `prompt:` steps, 9 `call:`, 1 `transform:`, and **4 workflows** with 7
+  raw runner steps (`team-activity-slack-updates`, `monday-salesforce-opportunity-report`,
+  `salesforce-quarterly-to-sheets`, `social-manager-rc-…`). Everything else already runs.
+- **Self-improvement on run (`edc16fdd`).** A workflow whose readiness refuses a legacy script step is
+  no longer parked "migration required": the queue records a durable improvement request and answers
+  `held`; the daemon consumes it like a cron occurrence (system session, `allowedTools ['*']` scope —
+  the run request is the consent — one host turn with `workflow_get`/`read_file`/`tool_search`/
+  `workflow_update`); then **code** proves the rewrite kept the user's intent (name, goal, trigger,
+  resources, inputs, enabled, every `requiresApproval`, every send-destination literal), carries no
+  runner, validates and is ready — applying it with a byte backup and re-queuing the run, or reverting
+  byte-for-byte and saying exactly why. Six-hour cooldown on a failed attempt. Pinned end to end.
+- Two seams found while wiring it: registering `workflow_step_result` as a registry row broke the closed
+  project manifest (fixed: the classifier names the channel explicitly, `1bc74d53`), and the
+  named-workflow shortcut swallowed the first improvement turn because its prompt said the workflow
+  "was asked to run" (fixed: improvement sessions are host-internal, `cc71b172`).
+- Brain switched to `claude_oauth` / `claude-sonnet-5` via the console door for the owner's test.
+
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
   run): **14,125 tests — 14,124 pass, 0 fail, 1 skipped**. An earlier pass at `ebae46b3` had three reds,
