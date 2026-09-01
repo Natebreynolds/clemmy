@@ -1430,7 +1430,7 @@ async function executePlanTask(
         : '';
     const recoveryTool = planAdmissionRecoveryTool(planned.reason, admissibleCapabilities);
     const repair = recoveryTool === 'retry_host'
-      ? 'The host must retry this exact unchanged proposal against fresh internal authority. Do not rediscover, substitute capabilities, or change the plan.'
+      ? 'The host refused its own internal step, not your proposal. retry_host is a host action, not a tool: call plan_task once more with the IDENTICAL arguments. Do not call call_tool, rediscover, substitute capabilities, or change the plan.'
       : recoveryTool === 'stop_factual'
         ? 'State factually that the current policy does not admit the requested effect. Do not retry planning or discovery.'
         : (verifierRepairInstruction(planned.reason)

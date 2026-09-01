@@ -484,6 +484,20 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     ].join(' ');
   }
   if (
+    consequence.recovery === 'retry_host'
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'plan_task'
+  ) {
+    // Live 2026-09-01: the refusal said "recoveryTool: retry_host" and the
+    // model called call_tool({name:'retry_host'}) — the action is host-owned
+    // and the only edge the model walks is the identical plan_task call.
+    return [
+      `BOUNDED AUTO RECOVERY — the host refused its own internal step at consequence stage ${consequence.stage}; your proposal was admitted.`,
+      'Call plan_task exactly once with the IDENTICAL arguments as the refused call. retry_host is not a tool.',
+      'Do not call call_tool, tool_search, a provider, or a business tool, and do not change the plan.',
+    ].join(' ');
+  }
+  if (
     (consequence.stage.startsWith('semantic_admission:')
       || consequence.stage === 'plan_binding:verification_successor_required')
     && consequence.recoveryToolNames.length === 1

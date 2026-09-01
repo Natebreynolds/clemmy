@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import pino from 'pino';
 import type Database from 'better-sqlite3';
 import {
   getProactivityPolicySnapshot,
@@ -38,6 +39,8 @@ import type {
   TurnGraphSurface,
 } from './turn-graph-ir.js';
 
+
+const shadowLogger = pino({ name: 'clementine.graph.turn-graph-shadow' });
 export interface RecordTurnGraphShadowInput {
   identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>;
   surface?: TurnGraphSurface;
@@ -528,10 +531,20 @@ export function recordTurnGraphShadowChecked(
     }).event;
     if (!appended) return { ok: false, reason: 'append_failed' };
     return { ok: true, event: appended };
-  } catch {
+  } catch (error) {
     // Load-bearing blanket catch: this runs inside brain prepare, and a throw
     // here would take the turn down harder than a refusal. Reason construction
-    // above is throw-free by design.
+    // above is throw-free by design. The reason stays in the closed vocabulary;
+    // the cause goes to the log — live 2026-09-01 an ADMITTED one-op plan was
+    // refused `internal_error` with nothing anywhere naming why.
+    shadowLogger.error({
+      sessionId: input.identity.sessionId,
+      sourceUserSeq: input.identity.sourceUserSeq,
+      surface: input.surface,
+      err: error instanceof Error
+        ? { name: error.name, message: error.message.slice(0, 600), stack: error.stack?.split('\n').slice(0, 12).join('\n') }
+        : { message: String(error).slice(0, 600) },
+    }, 'turn graph persist threw; refusing as internal_error');
     return { ok: false, reason: 'internal_error' };
   }
 }
