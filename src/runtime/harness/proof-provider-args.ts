@@ -424,7 +424,7 @@ export function proofProviderRepairKey(input: {
   failures: readonly ProofProviderSchemaFailure[];
 }): string {
   const pairs = [...new Map(
-    input.failures.map((failure) => [`${failure.path} ${failure.code}`, [failure.path, failure.code] as const]),
+    input.failures.map((failure) => [JSON.stringify([failure.path, failure.code]), [failure.path, failure.code] as const]),
   ).values()].sort((left, right) => (
     left[0] === right[0] ? left[1].localeCompare(right[1]) : left[0].localeCompare(right[0])
   ));
