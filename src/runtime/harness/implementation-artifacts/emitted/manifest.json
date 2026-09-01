@@ -843,7 +843,7 @@
           "bytes": 13370
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 68654
+          "bytes": 71421
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
           "bytes": 26949
@@ -3312,7 +3312,7 @@
           "bytes": 13370
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 68654
+          "bytes": 71421
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
           "bytes": 26949
