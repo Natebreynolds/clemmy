@@ -61,6 +61,7 @@ function settledPlanTaskRefusal(
       observer_call_id TEXT,
       execution_kind TEXT NOT NULL,
       outcome_kind TEXT NOT NULL,
+      outcome_detail TEXT,
       recovery_action TEXT NOT NULL,
       business_call INTEGER NOT NULL,
       mutating INTEGER NOT NULL,
@@ -112,7 +113,7 @@ test('the ask-only missing-write refusal parses to a structural tool_search reco
   assert.equal('admissibleCapabilities' in parsed.payload, false);
 
   const projected = projectRefusal('ask-only', { ...ASK_ONLY_MISSING_WRITE });
-  assert.equal(projected.status, 'ok');
+  assert.equal(projected.status, 'ok', JSON.stringify(projected));
   if (projected.status === 'ok') {
     assert.equal(projected.consequence?.stage, 'plan_incomplete:missing_write');
     assert.equal(projected.consequence?.recovery, 'repair_model');
