@@ -322,7 +322,12 @@ test('repeated discovery gets one control-only recovery and no third discovery c
   `).get(session.id, source.seq) as { n: number }).n, 0);
 });
 
-test('a current-card write makes missing-write recovery plan_task-only', async () => {
+// A write already on the card is NOT a repair for a draft missing ITS write:
+// nothing can tell the matching write from an unrelated one, and offering the
+// card's writes as candidates is the "offered greenhouse/airtable" incident
+// (plan-task-account-selection pin ii). The recovery is the same ask-only
+// shape as the empty card: one tool_search for the exact missing write.
+test('a current-card write still gets the ask-only missing-write recovery (one tool_search, no substitutes)', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
 
@@ -370,11 +375,13 @@ test('a current-card write makes missing-write recovery plan_task-only', async (
       }
       const requestText = JSON.stringify(request);
       assert.match(requestText, /plan_incomplete_missing_write/);
-      assert.match(requestText, /cap:local:write_file:create/);
-      assert.match(requestText, /Call plan_task exactly once/);
-      assert.match(requestText, /Do not call tool_search/);
-      assert.ok(surface.includes('plan_task'));
-      assert.equal(surface.includes('tool_search'), false);
+      assert.doesNotMatch(requestText, /admissibleCapabilities/,
+        'the refusal must not advertise card writes as substitutes');
+      assert.match(requestText, /Use tool_search for the exact missing write capability/);
+      assert.match(requestText, /Call tool_search exactly once/);
+      assert.doesNotMatch(requestText, /Do not call tool_search/);
+      assert.deepEqual(surface, ['tool_search'],
+        'the recovery surface offers exactly the search the repair names');
       throw expectedStop;
     },
     getStreamedResponse: modelStream,
@@ -415,7 +422,7 @@ test('a current-card write makes missing-write recovery plan_task-only', async (
   }
   assert.equal(thrown, expectedStop);
   assert.equal(modelCalls, 3);
-  assert.equal(surfaces[2]?.includes('tool_search'), false);
+  assert.deepEqual(surfaces[2], ['tool_search']);
   assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
 });
 
@@ -468,7 +475,8 @@ test('an empty-card missing-write recovery exposes one search, then newly disclo
       if (modelCalls === 3) {
         const requestText = JSON.stringify(request);
         assert.match(requestText, /plan_incomplete_missing_write/);
-        assert.match(requestText, /admissibleCapabilities/);
+        assert.doesNotMatch(requestText, /admissibleCapabilities/,
+          'the ask-only refusal carries no capability list to pick from');
         assert.match(requestText, /Call tool_search exactly once/);
         assert.doesNotMatch(requestText, /Do not repeat discovery/);
         assert.deepEqual(surface, ['tool_search']);

@@ -1216,23 +1216,19 @@ async function executePlanTask(
       capabilities: completenessCapabilities,
     })
   ) {
-    const admissibleCapabilities = planningRefusalRepairCatalog(
-      planning.capabilities.filter((capability) => (
-        capability.effect === 'local_write'
-        || capability.effect === 'external_write'
-        || capability.effect === 'admin'
-      )),
-    );
+    // The write this ask needs is not in the draft. That is a discovery
+    // question about the EXACT missing write, never a pick-from-list: handing
+    // the card's other writes back as candidates is the same substitution
+    // class as offering greenhouse/airtable for an Outlook ask (live
+    // 2026-08-29 seq 98118), because nothing here can tell the matching write
+    // from an unrelated one. One tool_search for the named write, then plan.
     return JSON.stringify({
       ok: false,
       code: 'plan_incomplete_missing_write',
       detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
       requestedEffectScope,
-      admissibleCapabilities,
-      repair: admissibleCapabilities.length > 0
-        ? 'Call plan_task again with the exact already-disclosed write capability that matches the requested destination bound to a local_write, external_write, or admin topology operation. Do not call tool_search again, substitute an unrelated write, or freeze a read-only subset.'
-        : 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
-      recoveryTool: admissibleCapabilities.length > 0 ? 'plan_task' : 'tool_search',
+      repair: 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
+      recoveryTool: 'tool_search',
     });
   }
   const lineage = collectConstructLineageCompleteness(input.draft);
