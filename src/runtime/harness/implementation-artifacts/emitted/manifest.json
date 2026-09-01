@@ -1026,7 +1026,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 24381
+          "bytes": 24628
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -2190,7 +2190,7 @@
           "bytes": 59570
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 27279
+          "bytes": 28203
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -2202,7 +2202,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 298450
+          "bytes": 298692
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3501,7 +3501,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 24381
+          "bytes": 24628
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -4665,7 +4665,7 @@
           "bytes": 59570
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 27279
+          "bytes": 28203
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -4677,7 +4677,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 298450
+          "bytes": 298692
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
