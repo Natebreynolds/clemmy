@@ -102,11 +102,20 @@ test('cold adapter rehydration restores exact proof-argument validation from its
   const refused = entry.validateForegroundPayload!({ wrong_id: 'record-42' });
   assert.equal(refused.ok, false);
   if (refused.ok) return;
-  assert.match(refused.repair, /Allowed top-level fields: "record_key", "include_metadata"/);
-  assert.match(refused.repair, /Remove unknown fields: "wrong_id"/);
-  assert.match(refused.repair, /call the first-class local tool_search control directly/i);
-  assert.match(refused.repair, /do not put a local control name inside a provider execution carrier/i);
-  assert.match(refused.repair, /No provider request was sent/);
+  assert.match(refused.repair, /^\[provider-dispatch:not-started:invalid-args\] FIXTURE_LOOKUP_RECORD arguments did not match its exact current schema\./);
+  // Exact failing pointers replace the old top-level name lists.
+  assert.match(refused.repair, /Failing paths: "\/record_key" \(missing required, expected string\), "\/wrong_id" \(unknown field\)\./);
+  assert.match(refused.repair, /Required shape at "\/": object; required: \[record_key\]; record_key\*: string, include_metadata: boolean\./);
+  // The refusal never sends the model to discovery: the recovery surface the
+  // host derives from it contains only the refused carrier. The single
+  // remaining mention of tool_search is the negative instruction.
+  assert.doesNotMatch(refused.repair, /call the first-class local tool_search/i);
+  assert.doesNotMatch(refused.repair, /do not put a local control name inside a provider execution carrier/i);
+  assert.equal(refused.repair.replace(/do not call tool_search/g, '').includes('tool_search'), false);
+  assert.match(refused.repair, /Retry this same operation exactly once with one corrected JSON object; do not call tool_search or substitute another operation\. No provider request was sent\.$/);
+  // The catalog entry's validation type is the generic foreground shape; the
+  // proof validator's host-authored repair key rides on it structurally.
+  assert.match((refused as { repairKey?: string }).repairKey ?? '', /^[a-f0-9]{64}$/);
   assert.equal(providerBodies, 0);
 
   const corrected = entry.validateForegroundPayload!({ record_key: 'record-42' });

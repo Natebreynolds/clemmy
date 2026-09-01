@@ -15,14 +15,54 @@ const {
   uniqueEnabledWorkflowMatch,
   uniqueWorkflowRunRequest,
 } = await import('../../tools/named-workflow-match.js');
-const { tryHostDispatchNamedWorkflow } = await import('./named-workflow-host-dispatch.js');
+const {
+  acceptedSourceIsWorkflowInternal,
+  tryHostDispatchNamedWorkflow,
+} = await import('./named-workflow-host-dispatch.js');
 const { createSession, appendEvent, resetEventLog } = await import('./eventlog.js');
 const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
 const { satisfyNextScheduledWorkflowOccurrence } = await import('../../execution/workflow-scheduler.js');
+const { renderOutputContractSpec } = await import('../../execution/step-output-verify.js');
 const { CRON_RUNS_DIR, WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
-const { readdirSync } = await import('node:fs');
+const { readdirSync, readFileSync } = await import('node:fs');
 
 const REPLY_TARGET = { type: 'origin_chat' } as const;
+
+function workflowRunFileCount(): number {
+  return existsSync(WORKFLOW_RUNS_DIR)
+    ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json')).length
+    : 0;
+}
+
+/**
+ * The exact accepted text a workflow step turn runs under: the runner's own
+ * header + prompt + the SAME output-contract block the reduce gate verifies
+ * + a learned pin (workflow-runner.ts proseMessage). Its body says "run"
+ * twice ("a mismatch fails the run:", "proven in a prior run of this step")
+ * and its header names the workflow — a unique lexical run request by
+ * construction, which is why every contract-bearing step self-dispatched
+ * (live 2026-08-31: morning-briefing, weekly-review, daily-standup-email,
+ * scorpion, end-of-week).
+ */
+function workflowStepAcceptedText(workflowSlug: string, stepId: string): string {
+  const contractSpec = renderOutputContractSpec({
+    type: 'object',
+    required_keys: ['official_page_url', 'notes'],
+  });
+  const pinSpec = '\n\nLEARNED TOOL PIN (proven in a prior run of this step, last validated 2026-08-30): '
+    + 'call composio_execute_tool slug "PROVIDER_SEARCH". Try this FIRST; if it fails, adapt or '
+    + 'rediscover rather than repeating it blindly.';
+  return `Workflow: ${workflowSlug}\nStep: ${stepId}\n\n`
+    + 'Find the official Facebook page for the client and capture its URL.'
+    + `\n\n${contractSpec}${pinSpec}`;
+}
+
+const STEP_SOURCE_DATA = {
+  workflowName: 'scorpion-facebook-trends',
+  workflowRunId: 'trigger-run-1',
+  stepId: 'find_official_page',
+  attemptId: 'attempt:workflow:trigger-run-1:find_official_page:1',
+} as const;
 
 function seedSlackAndFacebook(): void {
   writeWorkflow('team-activity-slack-updates', {
@@ -345,6 +385,164 @@ test('tryHostDispatchNamedWorkflow: a unique enabled run request queues through 
     ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json'))
     : [];
   assert.equal(runs.length, 1, 'the unique run must land in the shared queue');
+});
+
+test('tryHostDispatchNamedWorkflow: a workflow step\'s own accepted source never self-dispatches', () => {
+  seedSlackAndFacebook();
+  const text = workflowStepAcceptedText('scorpion-facebook-trends', 'find_official_page');
+  // Same text + same catalog as chat: the lexical matcher alone says RUN.
+  // Only the source class differs, and the class is what must decide.
+  assert.equal(
+    uniqueWorkflowRunRequest(text)?.slug,
+    'scorpion-facebook-trends',
+    'setup: the real step text is a unique lexical run request',
+  );
+  const session = createSession({ kind: 'workflow', channel: 'workflow' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    // Exactly what workflow-runner records for a step attempt: no reply
+    // target (today's accidental origin_unbound block).
+    data: { text, ...STEP_SOURCE_DATA },
+  });
+  const result = tryHostDispatchNamedWorkflow({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    userText: text,
+    route: 'act',
+  });
+  assert.deepEqual(result, {
+    status: 'not_applicable',
+    reason: 'accepted_source_is_workflow_internal',
+  }, 'the step continues into its ordinary model loop; no terminal, no block message');
+  assert.equal(workflowRunFileCount(), 0, 'a step never queues a sibling run of its own workflow');
+});
+
+test('tryHostDispatchNamedWorkflow: a bindable workflow-internal source still never queues (load-bearing)', () => {
+  seedSlackAndFacebook();
+  const text = workflowStepAcceptedText('scorpion-facebook-trends', 'find_official_page');
+  // Today's block was the origin_unbound ACCIDENT (step events carry no reply
+  // target). Give the step source a bindable target: without the class
+  // guard this exact source queues a real recursive run of its own workflow.
+  const session = createSession({
+    id: 'workflow:trigger-run-1:find_official_page',
+    kind: 'workflow',
+    channel: 'workflow',
+  });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text,
+      ...STEP_SOURCE_DATA,
+      originReplyTarget: REPLY_TARGET,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(REPLY_TARGET),
+    },
+  });
+  const result = tryHostDispatchNamedWorkflow({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    userText: text,
+    route: 'act',
+  });
+  assert.deepEqual(result, {
+    status: 'not_applicable',
+    reason: 'accepted_source_is_workflow_internal',
+  });
+  assert.equal(workflowRunFileCount(), 0, 'a bindable reply target does not turn a step into a user request');
+});
+
+test('acceptedSourceIsWorkflowInternal: each durable flag decides alone; chat and execution sources stay open', () => {
+  const text = 'run my team activity slack updates workflow';
+  // (1) session kind only.
+  const byKind = createSession({ kind: 'workflow', channel: 'workflow' });
+  const byKindSource = appendEvent({
+    sessionId: byKind.id, turn: 1, role: 'user', type: 'user_input_received', data: { text },
+  });
+  assert.equal(acceptedSourceIsWorkflowInternal(byKind.id, byKindSource.seq), true, 'kind workflow');
+  // (2) the accepted event's run/step identity only (a rebound step session).
+  const byEvent = createSession({ kind: 'chat', channel: 'desktop' });
+  const byEventSource = appendEvent({
+    sessionId: byEvent.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text, workflowRunId: 'trigger-run-9', stepId: 'post' },
+  });
+  assert.equal(acceptedSourceIsWorkflowInternal(byEvent.id, byEventSource.seq), true, 'event ids');
+  // (3) the deterministic step session id only.
+  const byId = createSession({ id: 'workflow:trigger-run-9:post', kind: 'chat', channel: 'desktop' });
+  const byIdSource = appendEvent({
+    sessionId: byId.id, turn: 1, role: 'user', type: 'user_input_received', data: { text },
+  });
+  assert.equal(acceptedSourceIsWorkflowInternal(byId.id, byIdSource.seq), true, 'workflow: prefix');
+  // A later chat turn on a chat session is not workflow-internal because an
+  // EARLIER event carried step ids: the exact accepted event decides.
+  const later = appendEvent({
+    sessionId: byEvent.id, turn: 2, role: 'user', type: 'user_input_received', data: { text },
+  });
+  assert.equal(acceptedSourceIsWorkflowInternal(byEvent.id, later.seq), false, 'exact accepted event only');
+  // Chat and cron/background execution sessions are user-originated.
+  for (const kind of ['chat', 'execution'] as const) {
+    const session = createSession({ kind, channel: kind === 'chat' ? 'desktop' : 'background' });
+    const source = appendEvent({
+      sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text },
+    });
+    assert.equal(acceptedSourceIsWorkflowInternal(session.id, source.seq), false, kind);
+  }
+});
+
+test('tryHostDispatchNamedWorkflow: a cron/background execution session is user-originated and still queues', () => {
+  writeWorkflow('platform-49-slack-channel-review', {
+    name: 'Platform 49 Slack Channel Review',
+    description: 'Business-hours channel review',
+    enabled: true,
+    trigger: { schedule: '0 9 * * 1-5', timezone: 'America/Los_Angeles' },
+    steps: [{ id: 'post', prompt: 'Post the team update.' }],
+  });
+  seedSlackAndFacebook();
+  // Surface→kind map: cron/background surfaces are kind 'execution'. Their
+  // accepted text was authored for a user, so the guard must not exclude it.
+  const session = createSession({ kind: 'execution', channel: 'background' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: {
+      text: 'Can you run my platform 49 flow please now so it catches up',
+      originReplyTarget: REPLY_TARGET,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(REPLY_TARGET),
+    },
+  });
+  const result = tryHostDispatchNamedWorkflow({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    userText: String(source.data.text),
+    route: 'act',
+  });
+  assert.equal(result.status, 'dispatched', JSON.stringify(result));
+  assert.equal(workflowRunFileCount(), 1, 'an execution-kind source keeps the shortcut');
+});
+
+test('plan_task twin: the plan_not_required "call workflow_run" short-circuit consults the same predicate first', () => {
+  // Lane parity (carrier sweep): plan_task carries the same lexical
+  // short-circuit. A step with a populated planning card would otherwise be
+  // told to call workflow_run, which the step surface denies by construction.
+  const src = readFileSync(new URL('../../tools/plan-tools.ts', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('async function executePlanTask'), src.indexOf('export function buildPlanTaskTool'));
+  const guardAt = fn.indexOf('acceptedSourceIsWorkflowInternal(sessionId, sourceUserSeq)');
+  const uniqueAt = fn.indexOf('uniqueWorkflowRunRequest(');
+  const shortCircuitAt = fn.indexOf("code: 'plan_not_required'");
+  assert.ok(guardAt >= 0, 'plan_task consults acceptedSourceIsWorkflowInternal');
+  assert.ok(uniqueAt > guardAt && shortCircuitAt > uniqueAt,
+    'the source-class guard decides before the lexical short-circuit can name workflow_run');
+  assert.match(
+    src,
+    /import \{ acceptedSourceIsWorkflowInternal \} from '\.\.\/runtime\/harness\/named-workflow-host-dispatch\.js'/,
+    'one predicate, imported from the dispatcher, not a second spelling',
+  );
 });
 
 test('tryHostDispatchNamedWorkflow: a counted set into one sheet is not a named workflow', () => {

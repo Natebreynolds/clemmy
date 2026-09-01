@@ -55,6 +55,7 @@ import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
 import { prepareWorkflowStepExternalCatalog } from './workflow-step-external-catalog.js';
 import { recordAuthoredWorkflowWriteAuthority } from '../runtime/harness/authored-workflow-write-authority.js';
+import { HOST_TOOL_DISPOSITION_PROTOCOL } from '../runtime/harness/host-model-result-receipt.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import {
   addNotification,
@@ -4492,6 +4493,7 @@ export const workflowRunnerInternalsForTest = {
   authenticatedWorkflowExecutionRole,
   uniqueCompiledProjectTerminalSink,
   persistWorkflowHarnessHold,
+  rememberProvenWorkflowStepTool,
 };
 
 interface InvocationArtifactReference {
@@ -4842,7 +4844,13 @@ async function runStepViaHarness(
           operationIds: preparedExternalCatalog.operationIds,
         }
       : undefined;
-    if (preparedExternalCatalog.status === 'ready') {
+    // The immutable authored step is the accepted work for its own mutations.
+    // Record the exact receipt whether or not the step names external
+    // operations: a prose step whose only writes are Clementine's registry
+    // ledgers (tasks, goals, spaces) gets an identity-free receipt so the host
+    // can cover those reversible local writes instead of refusing them for
+    // lack of a plan. `none` (read step / authored approval gate) is ordinary.
+    {
       const writeAuthority = recordAuthoredWorkflowWriteAuthority({
         sessionId: realSessionId,
         sourceUserSeq: sourceUserEvent.seq,
@@ -4851,11 +4859,25 @@ async function runStepViaHarness(
         workflowSlug: workflowStorageName,
         stepId: step.id,
         expectedPlanProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
-        catalogIdentities: preparedExternalCatalog.catalogIdentities,
+        catalogIdentities: preparedExternalCatalog.status === 'ready'
+          ? preparedExternalCatalog.catalogIdentities
+          : [],
       });
       if (writeAuthority.status === 'refused') {
-        throw new Error(
-          `workflow step "${step.id}" authored write authority refused:${writeAuthority.reason}`,
+        // An authored EXTERNAL write whose authority cannot be bound must not
+        // reach the model: fail the step loudly. An identity-free receipt is
+        // coverage for the step's own local ledgers only; when it cannot be
+        // bound (no run definition snapshot, legacy run record) the step runs
+        // exactly as it did before receipts existed — local writes fall to the
+        // uncovered consent path and reads/notifications proceed.
+        if (preparedExternalCatalog.status === 'ready') {
+          throw new Error(
+            `workflow step "${step.id}" authored write authority refused:${writeAuthority.reason}`,
+          );
+        }
+        logger.warn(
+          { stepId: step.id, workflowRunId, reason: writeAuthority.reason },
+          'authored step local-write coverage not recorded; local writes fall to uncovered consent',
         );
       }
     }
@@ -5390,35 +5412,7 @@ async function runStepViaHarness(
     // of this step starts with the pin injected instead of re-discovering.
     if (!isItemInvocation && captured.found
       && !(captured.value && typeof captured.value === 'object' && (captured.value as { blocked?: unknown }).blocked === true)) {
-      try {
-        const returned = listHarnessEvents(realSessionId, { types: ['tool_returned'] })
-          .filter((e) => e.data?.tool === 'composio_execute_tool'
-            // Deterministic corrective-header check FIRST (review: prose-based
-            // evidenceLooksFailedOrBlocked let every real composio failure
-            // through — the step pinned a FAILED tool as proven).
-            && !renderedComposioResultLooksFailed(typeof e.data?.result === 'string' ? e.data.result : undefined)
-            && !evidenceLooksFailedOrBlocked(typeof e.data?.result === 'string' ? e.data.result : undefined));
-        const lastOk = returned[returned.length - 1];
-        const callId = lastOk?.data?.callId;
-        if (callId) {
-          const call = listHarnessEvents(realSessionId, { types: ['tool_called'] })
-            .find((e) => e.data?.callId === callId);
-          const rawArgs = typeof call?.data?.arguments === 'string' ? call.data.arguments : undefined;
-          const parsed = rawArgs ? JSON.parse(rawArgs) as { tool_slug?: string; arguments?: string } : undefined;
-          if (parsed?.tool_slug) {
-            rememberToolChoice({
-              intent: workflowStepPinIntent(workflowName, step.id),
-              description: `Proven tool for workflow "${workflowName}" step "${step.id}"`,
-              choice: {
-                kind: 'composio',
-                identifier: parsed.tool_slug,
-                invocationTemplate: stripBakedConnectionId(parsed.arguments?.slice(0, 800)),
-                testEvidence: `step completed with a non-blocked structured result (run session ${realSessionId.slice(0, 40)})`,
-              },
-            });
-          }
-        }
-      } catch { /* pins are an optimization — never fail a step over them */ }
+      rememberProvenWorkflowStepTool({ sessionId: realSessionId, workflowName, stepId: step.id });
     }
 
     // A step is "done" only when the harness reports `completed`. The
@@ -5829,6 +5823,26 @@ export function stepHasLoopProbe(step: WorkflowStepInput): boolean {
   return Boolean(step.loopUntil?.probe?.runner?.trim() && step.loopUntil.until);
 }
 
+/**
+ * Ordinary contract-bearing plain step: eligible for ONE evidence-fed repair
+ * attempt when its output fails the declared contract (goal: a correction with
+ * context, never a dead run). Pure + exported for tests.
+ *  - declares an output contract and no loopUntil (loopUntil owns its own loop)
+ *  - plain LLM step only: not forEach, not deterministic, not an exact `call:`
+ *    node (a re-run would re-execute the provider call, not re-shape output)
+ * The side-effect law is enforced at retry time, not here: a step that already
+ * recorded an irreversible crossing is never re-run (stepIrreversibleCrossingRecorded).
+ */
+export const CONTRACT_REPAIR_MAX_ATTEMPTS = 2;
+
+export function stepContractRepairEnabled(step: WorkflowStepInput): boolean {
+  if (step.loopUntil) return false;
+  if (!step.output) return false;
+  if (step.forEach || step.deterministic) return false;
+  if (step.call?.tool) return false;
+  return true;
+}
+
 /** Clamped loopUntil attempt ceiling (default 3; contract loops 1–5, probe
  *  loops 1–10 — polling external state legitimately needs more passes). */
 export function loopUntilMaxAttempts(step: WorkflowStepInput): number {
@@ -5901,6 +5915,10 @@ export async function runWithContractLoop<T>(
       metrics: { durationMs: number; tokens?: number; toolCalls?: number };
     }) => void;
     beforeRetry?: () => void;
+    /** Optional per-violation veto. A false return propagates the violation
+     *  immediately even when attempts remain (used by the ordinary-step repair
+     *  beat to refuse a re-run after an irreversible crossing). */
+    shouldRetry?: (err: WorkflowContractViolationError) => boolean;
   },
 ): Promise<T> {
   let attemptStep = step;
@@ -5911,6 +5929,7 @@ export async function runWithContractLoop<T>(
       return await run(attemptStep);
     } catch (err) {
       if (!(err instanceof WorkflowContractViolationError) || attempt >= opts.maxAttempts) throw err;
+      if (opts.shouldRetry && !opts.shouldRetry(err)) throw err;
       const endSample = opts.sampleMetrics?.();
       const metrics = {
         durationMs: Date.now() - attemptStartMs,
@@ -5954,6 +5973,71 @@ function workflowBrainFalloverEnabled(): boolean {
  *  the hand-authoring. Never mutates the user's SKILL.md. This is a discovery
  *  and tool-choice hint only: memory never dispatches or supplies an
  *  authoritative result. */
+/** A host disposition marker (refused_pre_dispatch / not_started /
+ *  effect_unknown) is the host telling the model a call did NOT execute. It is
+ *  never evidence of a working tool shape, whatever prose it carries. */
+function resultIsHostDispositionMarker(result: string | undefined): boolean {
+  if (!result) return false;
+  const trimmed = result.trimStart();
+  if (!trimmed.startsWith('{')) return false;
+  try {
+    const decoded = JSON.parse(trimmed) as { protocol?: unknown };
+    return decoded?.protocol === HOST_TOOL_DISPOSITION_PROTOCOL;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fold 3 capture (best-effort, never blocks a step): remember the LAST proven
+ * provider-carrier call of a step that emitted a real (non-blocked) result,
+ * keyed workflow:<name>:<stepId> in the tool-choice store — the next run of
+ * this step starts with the pin injected instead of re-discovering.
+ *
+ * Ever-learning invariant: the template recorded is the CORRECTED invocation
+ * that actually crossed, never a refused or failed attempt. A refused call
+ * returns a host disposition marker, a failed provider call returns the
+ * corrective header, and a gate refusal returns refusal prose — every one of
+ * those is excluded before "last" is chosen.
+ */
+function rememberProvenWorkflowStepTool(input: {
+  sessionId: string;
+  workflowName: string;
+  stepId: string;
+}): void {
+  try {
+    const resultText = (e: { data?: Record<string, unknown> }): string | undefined => (
+      typeof e.data?.result === 'string' ? e.data.result : undefined
+    );
+    const returned = listHarnessEvents(input.sessionId, { types: ['tool_returned'] })
+      .filter((e) => e.data?.tool === 'composio_execute_tool'
+        // Deterministic checks FIRST (review: prose-based
+        // evidenceLooksFailedOrBlocked let every real composio failure
+        // through — the step pinned a FAILED tool as proven).
+        && !resultIsHostDispositionMarker(resultText(e))
+        && !renderedComposioResultLooksFailed(resultText(e))
+        && !evidenceLooksFailedOrBlocked(resultText(e)));
+    const lastOk = returned[returned.length - 1];
+    const callId = lastOk?.data?.callId;
+    if (!callId) return;
+    const call = listHarnessEvents(input.sessionId, { types: ['tool_called'] })
+      .find((e) => e.data?.callId === callId);
+    const rawArgs = typeof call?.data?.arguments === 'string' ? call.data.arguments : undefined;
+    const parsed = rawArgs ? JSON.parse(rawArgs) as { tool_slug?: string; arguments?: string } : undefined;
+    if (!parsed?.tool_slug) return;
+    rememberToolChoice({
+      intent: workflowStepPinIntent(input.workflowName, input.stepId),
+      description: `Proven tool for workflow "${input.workflowName}" step "${input.stepId}"`,
+      choice: {
+        kind: 'composio',
+        identifier: parsed.tool_slug,
+        invocationTemplate: stripBakedConnectionId(parsed.arguments?.slice(0, 800)),
+        testEvidence: `step completed with a non-blocked structured result (run session ${input.sessionId.slice(0, 40)})`,
+      },
+    });
+  } catch { /* pins are an optimization — never fail a step over them */ }
+}
+
 function renderWorkflowToolPin(workflowName: string, stepId: string): string {
   try {
     // EXACT lookup only (review: the fuzzy fallback matched unrelated generic
@@ -6151,10 +6235,25 @@ async function runStepVerifiedAttempt(
     });
 
   // Goal-contract Phase 2: contract loop wraps the transient-retry wrapper —
-  // each contract attempt gets its own transient budget. Ineligible steps
-  // (no loopUntil, no contract, forEach/deterministic, send, unsafe write)
-  // run exactly once: byte-identical to the pre-loopUntil behavior.
-  if (!stepLoopUntilEnabled(step)) return runOnce(step);
+  // each contract attempt gets its own transient budget.
+  //
+  // Ordinary contract-bearing plain steps (no loopUntil) get ONE evidence-fed
+  // repair attempt on the same durable step session: the contract problems
+  // ride back into the prompt (renderLoopRetryEvidence) so the model corrects
+  // the specific gap instead of the run dying on a shape mismatch. The second
+  // failure still raises WorkflowContractViolationError exactly as before. A
+  // step whose session already crossed irreversibly (send / provider write)
+  // is never re-run — the violation propagates on the first failure.
+  // Steps with neither loop nor contract run exactly once, byte-identical to
+  // the pre-loopUntil behavior.
+  if (!stepLoopUntilEnabled(step)) {
+    if (!stepContractRepairEnabled(step)) return runOnce(step);
+    return runWithContractLoop(runOnce, step, {
+      ...contractLoopOptions(step, ctx),
+      maxAttempts: CONTRACT_REPAIR_MAX_ATTEMPTS,
+      shouldRetry: () => !stepIrreversibleCrossingRecorded(ctx.runId, step.id),
+    });
+  }
   // T2.3 (external exit): a declared probe runs AFTER each successful attempt —
   // a deterministic scripts/ helper whose output is verified against `until`.
   // Unsatisfied → throw a contract violation so the SAME loop machinery
@@ -6220,12 +6319,27 @@ async function runStepVerifiedAttempt(
       });
       return output;
     };
+  return runWithContractLoop(runAttempt, step, {
+    ...contractLoopOptions(step, ctx),
+    maxAttempts: loopUntilMaxAttempts(step),
+  });
+}
+
+/**
+ * The one contract-loop option set shared by loopUntil steps and the ordinary
+ * step repair beat: per-attempt STATE records, the `step_loop_retry` event,
+ * and the cancellation check before each re-run. `maxAttempts` is supplied by
+ * the caller (authored loop ceiling vs. the fixed repair ceiling).
+ */
+function contractLoopOptions(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+): Omit<Parameters<typeof runWithContractLoop>[2], 'maxAttempts'> {
   const recordAttempts = attemptRecordsEnabled();
   // STATE pillar: closure tracks the prior attempt's problems so each record
   // reads as a delta. Only allocated when records are on (flag-off ⇒ no I/O).
   let priorProblems: string[] | undefined;
-  return runWithContractLoop(runAttempt, step, {
-    maxAttempts: loopUntilMaxAttempts(step),
+  return {
     // Only sample when recording — the snapshot reads today's usage NDJSON +
     // the step's harness events, which we must not pay for when the flag is off.
     sampleMetrics: recordAttempts ? () => sampleStepAttemptMetrics(step, ctx) : undefined,
@@ -6252,11 +6366,11 @@ async function runStepVerifiedAttempt(
       }
       logger.info(
         { stepId: step.id, attempt, maxAttempts, problems: problems.slice(0, 3) },
-        'workflow step output failed its contract — loopUntil re-running with evidence',
+        'workflow step output failed its contract — re-running with evidence',
       );
     },
     beforeRetry: () => throwIfWorkflowRunCancelled(ctx.runId),
-  });
+  };
 }
 
 /** Best-effort cumulative {tokens,toolCalls} for a loopUntil step's deterministic
@@ -8878,6 +8992,32 @@ function workflowStepHasPhysicalDispatch(runId: string, stepId: string): boolean
 
 export function stepSendAlreadyFired(runId: string, stepId: string): boolean {
   return stepExternalWriteAlreadyClaimed(runId, stepId);
+}
+
+/**
+ * Has this step's session already crossed into the outside world? Two durable
+ * truths, either one is enough: a legacy external_write receipt without a
+ * compensating failure, or a host_v1 provider-execution settlement that was
+ * mutating. Reversible local ledger writes (local_execution) do NOT count —
+ * re-running a step after task/goal bookkeeping is safe; re-running after a
+ * send or provider write is a second crossing. Unreadable truth fails closed
+ * (true = never re-run).
+ */
+export function stepIrreversibleCrossingRecorded(runId: string, stepId: string): boolean {
+  if (stepExternalWriteAlreadyClaimed(runId, stepId)) return true;
+  try {
+    const sessionId = `workflow:${runId}:${stepId}`;
+    return Boolean(openEventLog().prepare(`
+      SELECT 1
+        FROM logical_call_settlements
+       WHERE session_id = ?
+         AND execution_kind = 'provider_execution'
+         AND mutating = 1
+       LIMIT 1
+    `).get(sessionId));
+  } catch {
+    return true;
+  }
 }
 
 /** A send that already crossed cannot be reported as a failed/blocked step

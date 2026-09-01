@@ -651,3 +651,37 @@ test('physical attempts racing on one accepted source converge on the first term
   assert.equal(result.presentation.text, 'First writer text.');
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
 });
+
+test('a blocked terminal persists the host reason and bounded detail instead of the literal "blocked" (say why)', () => {
+  const identity = { sessionId: 'say-why-blocked', turn: 1, attemptId: 'attempt-say-why', sourceUserSeq: 1 } as const;
+  const text = 'I hit a bounded internal host error. Any completed work and retained results remain preserved, and no uncertain external change is pending.';
+  const outcome: TurnOutcome = {
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'blocked',
+    resumable: false,
+    presentation: { kind: 'blocked', text },
+  };
+  const detail = 'catalog_entry_or_manifest_missing:candidates=0:proven=none';
+  const named = completionDataForTurnOutcome(outcome, {
+    metadata: { blockedReason: 'control_no_progress_exhausted', blockedDetail: detail },
+  });
+  assert.equal(named.blockedReason, 'control_no_progress_exhausted');
+  assert.equal(named.blockedDetail, detail);
+  assert.equal(named.reply, text, 'machine metadata never rewrites the user-facing text');
+  assert.equal(named.reason, 'blocked', 'the legacy classifier is unchanged');
+
+  const unnamed = completionDataForTurnOutcome(outcome);
+  assert.equal(unnamed.blockedReason, 'blocked', 'callers that carry no reason keep the compatibility default');
+  assert.equal('blockedDetail' in unnamed, false);
+});
+
+test('an ordinary answer with no refused work and no dispatch still delivers (delivery-truth control)', () => {
+  createSession({ id: 'plain-conversational-answer', kind: 'chat' });
+  const outcome = acceptedAnswer('plain-conversational-answer', 'Here is what I know from our earlier conversation.');
+  const committed = commitTurnOutcome(outcome);
+  assert.equal(committed.presentation.status, 'done');
+  assert.equal(committed.event.data.delivered, true);
+  assert.equal('verificationMissing' in committed.event.data, false);
+});

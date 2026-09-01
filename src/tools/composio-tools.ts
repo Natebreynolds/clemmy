@@ -12,7 +12,8 @@ import {
 import { existsSync, writeFileSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ModelBehaviorError, tool, type Tool } from '@openai/agents';
+import { tool, type Tool } from '@openai/agents';
+import { isSdkToolInputValidationError } from './shared.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
@@ -4412,33 +4413,9 @@ function parseArgumentsJson(value: string | null | undefined): Record<string, un
   return normalized.args;
 }
 
-type SdkToolInputValidationError = ModelBehaviorError & {
-  originalError?: unknown;
-  toolInvocation?: {
-    input?: unknown;
-  };
-};
-
-/**
- * The SDK's InvalidToolInputError is intentionally not exported from its
- * package root. Identify that private subtype by its exported nominal base and
- * the two own fields its constructor assigns, never by constructor/message
- * spelling. This guard is used only at the SDK errorFunction boundary where
- * validation ran before execute.
- */
-function isSdkToolInputValidationError(error: unknown): error is SdkToolInputValidationError {
-  if (!(error instanceof ModelBehaviorError)) return false;
-  if (
-    !Object.prototype.hasOwnProperty.call(error, 'originalError')
-    || !Object.prototype.hasOwnProperty.call(error, 'toolInvocation')
-  ) return false;
-  const invocation = (error as SdkToolInputValidationError).toolInvocation;
-  return Boolean(
-    invocation
-    && typeof invocation === 'object'
-    && Object.prototype.hasOwnProperty.call(invocation, 'input'),
-  );
-}
+// isSdkToolInputValidationError (the nominal detector for the SDK's private
+// InvalidToolInputError) lives in ./shared.js so every tool surface shares
+// one spelling of "validation refused before execute".
 
 /** Keep presentation and authority separate: the model gets repair guidance,
  * while only the nominal result instance proves no provider dispatch began. */

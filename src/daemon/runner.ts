@@ -2491,6 +2491,7 @@ export async function startDaemon(
       || recovered.activated > 0
       || recovered.deliveryRequired > 0
       || recovered.held > 0
+      || recovered.expired > 0
     ) logger.warn(recovered, 'Recovered immutable plan preparation owners on boot');
   } catch (err) {
     logger.warn(
@@ -3253,6 +3254,7 @@ export async function startDaemon(
           || recovered.activated > 0
           || recovered.deliveryRequired > 0
           || recovered.held > 0
+          || recovered.expired > 0
         ) logger.warn(recovered, 'Recovered immutable plan preparation owners');
       } catch (err) {
         logger.warn(

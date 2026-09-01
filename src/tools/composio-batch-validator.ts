@@ -30,6 +30,11 @@
  *   OUTLOOK_BATCH_UPDATE_MESSAGES: Missing fields: {'updates.0.patch', 'updates.1.patch', ...}
  *   → Detected upfront, returns guidance to ensure all items have required structure
  */
+import {
+  collectProviderSchemaFailures,
+  renderBoundedSchemaSubtree,
+  type ProofProviderSchemaFailure,
+} from '../runtime/harness/proof-provider-args.js';
 
 export interface BatchValidationError {
   field: string;
@@ -281,11 +286,92 @@ function repairTemplateArgs(
   const repaired: Record<string, unknown> = { ...args };
   for (const key of missing) {
     const spec = props && isRecordValue(props[key]) ? props[key] as Record<string, unknown> : null;
-    const described = [
-      typeof spec?.type === 'string' ? String(spec.type) : null,
-      typeof spec?.description === 'string' ? String(spec.description).slice(0, 120) : null,
-    ].filter(Boolean).join(' — ');
-    repaired[key] = `<FILL: ${described || 'required by the action schema'}>`;
+    repaired[key] = schemaSkeleton(spec);
+  }
+  return repaired;
+}
+
+const SKELETON_MAX_DEPTH = 3;
+
+/**
+ * Fillable placeholder for one missing schema member. A scalar is the
+ * familiar `<FILL: type — description>` marker; a required OBJECT expands
+ * into its own required children (recursively, bounded) and a required array
+ * of objects into one such item, so the model sees the nested shape it must
+ * author instead of `"<FILL: object — …>"` (live class: a nested
+ * `insert_dimension.range` object rendered as an opaque placeholder and was
+ * guessed wrong on every retry).
+ */
+function schemaSkeleton(spec: Record<string, unknown> | null, depth = 0): unknown {
+  const type = typeof spec?.type === 'string' ? String(spec.type) : '';
+  const properties = spec && isRecordValue(spec.properties) ? spec.properties : null;
+  const required = Array.isArray(spec?.required)
+    ? spec.required.filter((k): k is string => typeof k === 'string')
+    : [];
+  if (type === 'object' && properties && required.length > 0 && depth < SKELETON_MAX_DEPTH) {
+    const skeleton: Record<string, unknown> = {};
+    for (const key of required) {
+      skeleton[key] = schemaSkeleton(isRecordValue(properties[key]) ? properties[key] : null, depth + 1);
+    }
+    return skeleton;
+  }
+  if (type === 'array' && spec && isRecordValue(spec.items) && depth < SKELETON_MAX_DEPTH) {
+    return [schemaSkeleton(spec.items, depth + 1)];
+  }
+  const enumValues = Array.isArray(spec?.enum)
+    ? ` enum[${spec.enum.slice(0, 8).map((candidate) => JSON.stringify(candidate)).join(',')}]`
+    : '';
+  const described = [
+    type ? `${type}${enumValues}` : null,
+    typeof spec?.description === 'string' ? String(spec.description).slice(0, 120) : null,
+  ].filter(Boolean).join(' — ');
+  return `<FILL: ${described || 'required by the action schema'}>`;
+}
+
+/** Schema node at an RFC 6901 pointer, descending `properties` / `items`. */
+function schemaNodeAt(schema: Record<string, unknown>, pointer: string): Record<string, unknown> | null {
+  let node: Record<string, unknown> = schema;
+  for (const raw of pointer.split('/').slice(1)) {
+    const token = raw.replace(/~1/g, '/').replace(/~0/g, '~');
+    const properties = isRecordValue(node.properties) ? node.properties : null;
+    if (properties && isRecordValue(properties[token])) {
+      node = properties[token];
+    } else if (/^\d+$/.test(token) && isRecordValue(node.items)) {
+      node = node.items;
+    } else {
+      return null;
+    }
+  }
+  return node;
+}
+
+/** Deep-cloned args with a skeleton placed at each missing nested pointer;
+ * everything the caller supplied is preserved verbatim. */
+function repairNestedTemplateArgs(
+  args: Record<string, unknown>,
+  missing: readonly ProofProviderSchemaFailure[],
+  schema: Record<string, unknown>,
+): Record<string, unknown> {
+  const repaired = JSON.parse(JSON.stringify(args)) as Record<string, unknown>;
+  for (const failure of missing) {
+    const tokens = failure.path.split('/').slice(1).map((raw) => raw.replace(/~1/g, '/').replace(/~0/g, '~'));
+    if (tokens.length === 0) continue;
+    let cursor: unknown = repaired;
+    for (const token of tokens.slice(0, -1)) {
+      if (Array.isArray(cursor)) {
+        cursor = cursor[Number(token)];
+      } else if (isRecordValue(cursor)) {
+        if (!isRecordValue(cursor[token]) && !Array.isArray(cursor[token])) cursor[token] = {};
+        cursor = cursor[token];
+      } else {
+        cursor = null;
+        break;
+      }
+    }
+    const leaf = tokens[tokens.length - 1]!;
+    const skeleton = schemaSkeleton(schemaNodeAt(schema, failure.path));
+    if (Array.isArray(cursor)) cursor[Number(leaf)] = skeleton;
+    else if (isRecordValue(cursor)) cursor[leaf] = skeleton;
   }
   return repaired;
 }
@@ -391,6 +477,48 @@ export function validateArgsAgainstSchema(
           };
         }
       }
+    }
+
+    // Nested shape: the same two provable rules (missing `required`, keys an
+    // exact closed contract rejects) applied BELOW the top level. A declared
+    // object child that is present but missing its own required members is
+    // a deterministic provider 400; refuse it here with the exact pointers,
+    // the required shape, and a repaired call whose nested gap is a fillable
+    // skeleton — not the top-level-only view that left the model guessing at
+    // `"<FILL: object — …>"`. Types, enums and undeclared keys of open
+    // objects remain the provider's job (fail-open contract above).
+    const nested: ProofProviderSchemaFailure[] = [];
+    collectProviderSchemaFailures(args, schema, '', nested, {
+      maxEntries: 24,
+      maxDepth: 6,
+      policy: 'required_only',
+    });
+    if (nested.length > 0) {
+      const missing = nested.filter((failure) => failure.code === 'missing_required');
+      const pointers = nested.map((failure) => failure.path);
+      const described = nested.map((failure) => (
+        failure.code === 'missing_required'
+          ? `${failure.path} (missing required${failure.expected ? `, expected ${failure.expected}` : ''})`
+          : `${failure.path} (unsupported field)`
+      ));
+      const shape = renderBoundedSchemaSubtree(schema, pointers, { maxDepth: 3, maxFields: 24, maxChars: 900 });
+      return {
+        ...(missing.length === 0 ? { kind: 'unsupported-fields' as const } : {}),
+        field: pointers.join(', '),
+        reason: `Nested argument shape does not match ${toolSlug}'s schema at: ${described.join(', ')}.`,
+        examples: [
+          ...(shape ? [`Required shape at ${shape}.`] : []),
+          ...(missing.length > 0
+            ? [
+                `Repair this exact call — fill the ${missing.length === 1 ? 'marked value' : 'marked values'} and re-send it:\n`
+                + `${JSON.stringify({
+                  tool_slug: toolSlug,
+                  arguments: repairNestedTemplateArgs(args, missing, schema),
+                }, null, 2)}`,
+              ]
+            : [`Remove the unsupported nested field(s) and re-send the same call.`]),
+        ],
+      };
     }
     return null;
   } catch {

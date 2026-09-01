@@ -64,7 +64,7 @@ export const EFFECT_RANK: Record<string, number> = {
 
 export type ForegroundCapabilityPayloadValidation =
   | { ok: true }
-  | { ok: false; repair: string; schemaAvailable: boolean };
+  | { ok: false; repair: string; schemaAvailable: boolean; repairKey?: string };
 
 export interface RegisteredHostCapability {
   capabilityId: string;

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ModelBehaviorError } from '@openai/agents';
 import {
   BASE_DIR as CONFIG_BASE_DIR,
   invalidateRuntimeConfigSnapshot,
@@ -119,6 +120,66 @@ export function invalidArgumentsTextResult(
   }) as InvalidArgumentsTextResult;
   INVALID_ARGUMENTS_TEXT_RESULTS.add(result);
   return result;
+}
+
+export type SdkToolInputValidationError = ModelBehaviorError & {
+  originalError?: unknown;
+  toolInvocation?: {
+    input?: unknown;
+  };
+};
+
+/**
+ * The SDK's InvalidToolInputError is intentionally not exported from its
+ * package root. Identify that private subtype by its exported nominal base and
+ * the two own fields its constructor assigns, never by constructor/message
+ * spelling. This guard is used only at the SDK errorFunction boundary where
+ * validation ran before execute — the one place a tool can still say, with
+ * nominal certainty, that its body never started. Every local, shell, carrier
+ * and provider tool shares this single detector so the settlement kernel never
+ * has to read the laundered prose.
+ */
+export function isSdkToolInputValidationError(error: unknown): error is SdkToolInputValidationError {
+  if (!(error instanceof ModelBehaviorError)) return false;
+  if (
+    !Object.prototype.hasOwnProperty.call(error, 'originalError')
+    || !Object.prototype.hasOwnProperty.call(error, 'toolInvocation')
+  ) return false;
+  const invocation = (error as SdkToolInputValidationError).toolInvocation;
+  return Boolean(
+    invocation
+    && typeof invocation === 'object'
+    && Object.prototype.hasOwnProperty.call(invocation, 'input'),
+  );
+}
+
+/**
+ * Actionable guidance for an input-validation failure on a tool surface. The
+ * SDK default ("Invalid JSON input for tool") names nothing the model can
+ * correct — observed live (proof workspace-build, 2026-07-27): three blind
+ * space_save retries with large payloads, then a silently degraded static
+ * deliverable. Name the violated paths and point at the schema so the next
+ * retry is a corrected retry, not a guess. Lives beside the nominal detector so
+ * every surface renders the same repair text.
+ */
+export function describeInvalidToolInput(error: unknown, toolName: string): string | null {
+  if (!error || typeof error !== 'object') return null;
+  if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
+  const original = (error as { originalError?: unknown }).originalError;
+  const rawIssues = original && typeof original === 'object'
+    ? (original as { issues?: unknown }).issues
+    : undefined;
+  const issues = Array.isArray(rawIssues)
+    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, 5).map((issue) => {
+        const path = Array.isArray(issue.path) && issue.path.length > 0 ? issue.path.join('.') : '(root)';
+        return `${path}: ${String(issue.message ?? 'invalid')}`;
+      })
+    : [];
+  const cause = issues.length > 0
+    ? ` — ${issues.join('; ')}`
+    : ' — the input was not parseable JSON (rebuild the arguments as ONE compact JSON object; escape embedded quotes/newlines once, not twice)';
+  return `The arguments for ${toolName} did not match its schema${cause}. `
+    + `Call tool_search with the exact query "${toolName}" to get the full input schema, then retry once with corrected arguments.`;
 }
 
 export function isInvalidArgumentsTextResult(

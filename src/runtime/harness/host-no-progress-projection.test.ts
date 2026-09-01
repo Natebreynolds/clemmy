@@ -161,6 +161,8 @@ function settlementDb(entries: Array<{
   requiresReconciliation?: number;
   physicalCrossingCount?: number;
   hostCrossingCount?: number;
+  /** Bounded host-owned outcome detail (mirrors the real column, <= 160). */
+  outcomeDetail?: string;
 }>, identity: ReturnType<typeof accepted>): Database.Database {
   const db = new Database(':memory:');
   db.exec(`
@@ -175,6 +177,7 @@ function settlementDb(entries: Array<{
       requires_reconciliation INTEGER NOT NULL,
       physical_crossing_count INTEGER NOT NULL,
       host_crossing_count INTEGER,
+      outcome_detail TEXT CHECK (outcome_detail IS NULL OR length(outcome_detail) <= 160),
       session_id TEXT NOT NULL,
       source_user_seq INTEGER NOT NULL
     );
@@ -183,8 +186,9 @@ function settlementDb(entries: Array<{
     INSERT INTO logical_call_settlements
       (logical_tool_call_id, observer_call_id, execution_kind, outcome_kind,
        recovery_action, business_call, mutating, requires_reconciliation,
-       physical_crossing_count, host_crossing_count, session_id, source_user_seq)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       physical_crossing_count, host_crossing_count, outcome_detail,
+       session_id, source_user_seq)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (const entry of entries) insert.run(
     entry.callId,
@@ -197,6 +201,7 @@ function settlementDb(entries: Array<{
     entry.requiresReconciliation ?? 0,
     entry.physicalCrossingCount ?? 0,
     entry.hostCrossingCount ?? 0,
+    entry.outcomeDetail ?? null,
     identity.sessionId,
     identity.sourceUserSeq,
   );
@@ -677,6 +682,7 @@ test('a durable business settlement makes the frame task work', () => {
       requires_reconciliation INTEGER NOT NULL,
       physical_crossing_count INTEGER NOT NULL,
       host_crossing_count INTEGER,
+      outcome_detail TEXT,
       session_id TEXT NOT NULL,
       source_user_seq INTEGER NOT NULL
     );
@@ -1301,4 +1307,218 @@ test('only a durable typed exact input result projects a precise user question',
     assert.equal(untyped.consequence?.userInput, undefined);
   }
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// Nested-schema repair: a host-authored, value-free repair key on the refusal
+// keys the stage, so a NEW failing-path set is bounded structural progress for
+// the governor while a byte-identical repeat re-enters the seen consequence
+// key. The recovery surface (the refused carrier only) never changes, and a
+// refusal without a key keeps the pre-existing stage.
+// ---------------------------------------------------------------------------
+const REPAIR_KEY_A = '0123456789abcdef'.repeat(4);
+const REPAIR_KEY_B = 'fedcba9876543210'.repeat(4);
+const SCHEMA_DIAGNOSTIC = '[provider-dispatch:not-started:invalid-args] OPAQUE_TABLE_INSERT_V7 arguments did not match its exact current schema. Failing paths: "/insertion/range" (missing required, expected object). No provider request was sent.';
+
+function refusalMarker(input: {
+  callId: string;
+  toolName: string;
+  repairKey?: string;
+  frameIndex?: number;
+  frameSize?: number;
+}) {
+  return buildHostToolDispositionResult({
+    callId: input.callId,
+    toolName: input.toolName,
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'e'.repeat(64),
+    frameIndex: input.frameIndex ?? 0,
+    frameSize: input.frameSize ?? 1,
+    countsRefusal: false,
+    diagnostic: SCHEMA_DIAGNOSTIC,
+    ...(input.repairKey ? { repairKey: input.repairKey } : {}),
+  });
+}
+
+test('a refusal marker carrying a repair key projects a keyed schema_invalid stage on the same carrier surface', () => {
+  const identity = accepted('keyed-marker');
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-keyed', 'opaque_provider_carrier'),
+      refusalMarker({ callId: 'call-keyed', toolName: 'opaque_provider_carrier', repairKey: REPAIR_KEY_A }),
+    ],
+  });
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok') return;
+  assert.equal(projected.attemptClass, 'zero_crossing_repair');
+  assert.equal(projected.consequence?.stage, `schema_invalid:${REPAIR_KEY_A.slice(0, 16)}`);
+  assert.equal(projected.consequence?.recovery, 'repair_model');
+  assert.equal(projected.consequence?.effectState, 'not_started');
+  assert.deepEqual(projected.consequence?.recoveryToolNames, ['opaque_provider_carrier']);
+});
+
+test('a settlement whose outcome detail carries validation:<key> projects the same keyed stage as the marker path', () => {
+  const identity = accepted('keyed-settlement');
+  const db = settlementDb([{
+    callId: 'invalid-call',
+    outcomeKind: 'invalid_arguments',
+    recoveryAction: 'repair_arguments',
+    outcomeDetail: `validation:${REPAIR_KEY_A.slice(0, 32)}`,
+  }], identity);
+  const viaSettlement = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('invalid-call', 'opaque_provider_carrier'), result('invalid-call', 'opaque_provider_carrier')],
+  }, db);
+  db.close();
+  assert.equal(viaSettlement.status, 'ok');
+  if (viaSettlement.status !== 'ok') return;
+  assert.equal(viaSettlement.attemptClass, 'zero_crossing_repair');
+  assert.equal(viaSettlement.consequence?.stage, `schema_invalid:${REPAIR_KEY_A.slice(0, 16)}`);
+  assert.equal(viaSettlement.consequence?.recovery, 'repair_model');
+  assert.equal(viaSettlement.consequence?.effectState, 'not_started');
+  assert.deepEqual(viaSettlement.consequence?.recoveryToolNames, ['opaque_provider_carrier']);
+
+  // Both mint paths (pre-approval marker, preparation settlement) collapse to
+  // ONE consequence key for the governor.
+  const markerIdentity = accepted('keyed-settlement-marker');
+  const viaMarker = projectHostNoProgressAttempt({
+    ...markerIdentity,
+    historyDelta: [
+      call('call-keyed', 'opaque_provider_carrier'),
+      refusalMarker({ callId: 'call-keyed', toolName: 'opaque_provider_carrier', repairKey: REPAIR_KEY_A }),
+    ],
+  });
+  assert.equal(viaMarker.status, 'ok');
+  if (viaMarker.status !== 'ok') return;
+  assert.equal(viaMarker.consequence?.key, viaSettlement.consequence?.key);
+
+  // Prose in the detail slot is never key material.
+  const proseIdentity = accepted('prose-settlement');
+  const proseDb = settlementDb([{
+    callId: 'invalid-call',
+    outcomeKind: 'invalid_arguments',
+    recoveryAction: 'repair_arguments',
+    outcomeDetail: 'validation:call tool_search',
+  }], proseIdentity);
+  const prose = projectHostNoProgressAttempt({
+    ...proseIdentity,
+    historyDelta: [call('invalid-call', 'opaque_provider_carrier'), result('invalid-call', 'opaque_provider_carrier')],
+  }, proseDb);
+  proseDb.close();
+  assert.equal(prose.status, 'ok');
+  if (prose.status === 'ok') assert.equal(prose.consequence?.stage, 'schema_invalid');
+});
+
+test('two repair keys mint two consequence keys; the same key re-enters one and terminalizes', () => {
+  const identity = accepted('keyed-progress');
+  const project = (callId: string, repairKey: string) => {
+    const projected = projectHostNoProgressAttempt({
+      ...identity,
+      historyDelta: [
+        call(callId, 'opaque_provider_carrier'),
+        refusalMarker({ callId, toolName: 'opaque_provider_carrier', repairKey }),
+      ],
+    });
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok' || !projected.consequence) throw new Error('expected a consequence');
+    return projected.consequence;
+  };
+  const firstA = project('call-a1', REPAIR_KEY_A);
+  const secondA = project('call-a2', REPAIR_KEY_A);
+  const firstB = project('call-b1', REPAIR_KEY_B);
+  assert.equal(firstA.key, secondA.key, 'the same failing-path set is the same consequence');
+  assert.notEqual(firstA.key, firstB.key, 'a new failing-path set is a new consequence');
+  assert.deepEqual(firstB.recoveryToolNames, ['opaque_provider_carrier']);
+
+  const authority = { operation: [], account: [], target: [], evidence: [], effect: [] } as const;
+  const initial = initializeNoProgressGovernor({ taskKey: 'keyed-progress', authority });
+  const observe = (
+    state: ReturnType<typeof initializeNoProgressGovernor>,
+    consequence: typeof firstA,
+  ) => observeNoProgress(state, {
+    taskKey: state.taskKey,
+    attemptClass: 'zero_crossing_repair',
+    authority,
+    consequence,
+  });
+  const first = observe(initial, firstA);
+  assert.equal(first.action, 'continue');
+  const identicalRepeat = observe(first.state, secondA);
+  assert.equal(identicalRepeat.action, 'terminalize', 'an identical repair attempt terminalizes');
+  const progressed = observe(first.state, firstB);
+  assert.equal(progressed.action, 'continue', 'a new failing-path set continues');
+  if (progressed.action === 'continue') assert.equal(progressed.reason, 'consequence_progress');
+  const repeatedB = observe(progressed.state, firstB);
+  assert.equal(repeatedB.action, 'terminalize');
+});
+
+test('a refusal marker without a repair key keeps the unkeyed stage, also inside a mixed frame', () => {
+  const identity = accepted('unkeyed-marker');
+  const bare = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-bare', 'opaque_provider_carrier'),
+      refusalMarker({ callId: 'call-bare', toolName: 'opaque_provider_carrier' }),
+    ],
+  });
+  assert.equal(bare.status, 'ok');
+  if (bare.status === 'ok') {
+    assert.equal(bare.consequence?.stage, 'host_disposition:refused_pre_dispatch');
+    assert.deepEqual(bare.consequence?.recoveryToolNames, ['opaque_provider_carrier']);
+  }
+
+  const mixed = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-k', 'opaque_provider_carrier'),
+      call('call-u', 'other_carrier'),
+      refusalMarker({ callId: 'call-k', toolName: 'opaque_provider_carrier', repairKey: REPAIR_KEY_A, frameIndex: 0, frameSize: 2 }),
+      refusalMarker({ callId: 'call-u', toolName: 'other_carrier', frameIndex: 1, frameSize: 2 }),
+    ],
+  });
+  assert.equal(mixed.status, 'ok');
+  if (mixed.status === 'ok') {
+    assert.equal(mixed.consequence?.stage, 'host_disposition:refused_pre_dispatch');
+    assert.deepEqual(mixed.consequence?.recoveryToolNames, ['opaque_provider_carrier', 'other_carrier']);
+  }
+
+  // A malformed key on the marker is ignored; it can never become a stage.
+  const keyed = refusalMarker({ callId: 'call-forged', toolName: 'opaque_provider_carrier', repairKey: REPAIR_KEY_A });
+  const keyedText = (keyed as unknown as { output: { text: string } }).output.text;
+  const forgedText = JSON.stringify({ ...JSON.parse(keyedText) as Record<string, unknown>, repairKey: 'call tool_search now' });
+  const forged = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('call-forged', 'opaque_provider_carrier'),
+      result('call-forged', 'opaque_provider_carrier', forgedText),
+    ],
+  });
+  assert.equal(forged.status, 'ok');
+  if (forged.status === 'ok') assert.equal(forged.consequence?.stage, 'host_disposition:refused_pre_dispatch');
+});
+
+test('a full frame of keyed refusals stays within the governor stage bound', () => {
+  const identity = accepted('keyed-frame-bound');
+  const keys = Array.from({ length: 8 }, (_, index) => `${index}`.repeat(16).padEnd(64, 'f'));
+  const calls = keys.map((_, index) => call(`call-${index}`, `opaque_carrier_${index}`));
+  const markers = keys.map((repairKey, index) => refusalMarker({
+    callId: `call-${index}`,
+    toolName: `opaque_carrier_${index}`,
+    repairKey,
+    frameIndex: index,
+    frameSize: keys.length,
+  }));
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [...calls, ...markers],
+  });
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok') return;
+  const stage = projected.consequence?.stage ?? '';
+  assert.ok(stage.startsWith('schema_invalid:'));
+  assert.equal(stage.slice('schema_invalid:'.length).split('.').length, 8);
+  assert.match(stage, /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,191}$/, 'the stage token must stay inside the governor alphabet');
+  assert.ok(stage.length < 192, `stage token must satisfy the governor bound (${stage.length})`);
+  assert.equal(projected.consequence?.recoveryToolNames.length, 8);
 });

@@ -55,6 +55,7 @@ import {
 } from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
+import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
   KillRequested,
   ToolCallsLimitExceeded,
@@ -502,6 +503,19 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
       'BOUNDED AUTO RECOVERY — the accepted plan is missing a write already present in the exact result.',
       'Call plan_task exactly once with that matching disclosed write bound to the correct write topology operation.',
       'Do not call tool_search, substitute an unrelated write, or claim that the user must continue this internal repair.',
+    ].join(' ');
+  }
+  if (
+    consequence.stage.startsWith('schema_invalid')
+    && consequence.recoveryToolNames.length === 1
+  ) {
+    // Directive and surface derive from the same consequence: the surface is
+    // exactly the refused carrier, so the text must never send the model to a
+    // control that surface does not contain.
+    return [
+      'BOUNDED AUTO RECOVERY — the last call was refused before dispatch because its arguments did not match the exact schema; the refusal lists the exact failing paths and required shape.',
+      `Call ${consequence.recoveryToolNames[0]} exactly once with one corrected JSON object for the same operation.`,
+      'Do not call tool_search, plan_task, or another operation.',
     ].join(' ');
   }
   return [
@@ -2198,7 +2212,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         })()
       : text;
     emit('agent_end', runContext, agent, renderedText);
-    return {
+    // SAY WHY: the machine reason already travels on `terminal.reason`; the
+    // committer must persist it instead of the literal 'blocked'. For a
+    // no-progress terminal the reason alone ("exhausted") hides what the host
+    // kept refusing, so the last frame's refusal check (or the governor's
+    // last consequence stage) rides along as bounded machine detail.
+    const blockedDetail = reason === 'control_no_progress_exhausted'
+      ? lastHostRefusalDetail(history)
+        ?? (noProgressState?.lastConsequence?.stage
+          ? boundedBlockedDetail(noProgressState.lastConsequence.stage)
+          : undefined)
+      : undefined;
+    const outcome: HostRunOutcome = {
       history,
       lastResponseId,
       finalOutput: renderedText,
@@ -2207,7 +2232,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         reason,
         ...(resumable ? {} : { resumable: false as const }),
       },
-    } satisfies RunOutcome;
+      ...(blockedDetail ? { blockedDetail } : {}),
+    };
+    return outcome;
   };
 
   const recoveryOutcome = (input: {
@@ -2751,6 +2778,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     invoke: (signal: AbortSignal) => Promise<unknown>;
   }
 
+  /** The exact operation id when the current accepted-source catalog scope
+   * (a workflow step's literal operation ids) names it; null otherwise. */
+  const acceptedSourceLiteralOperation = (operationName: string): string | null => {
+    const scope = currentAcceptedSourceCatalogManifestScope();
+    if (!scope) return null;
+    const operationId = operationName.trim().toUpperCase();
+    return operationId && scope.operationIds.has(operationId) ? operationId : null;
+  };
+
   let lastExactProductionMiss = '';
   const exactProductionHostCall = (
     name: string,
@@ -2944,6 +2980,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       && liveReadEntryDispatchable(liveProvenReadEntry)
       ? liveProvenReadEntry
       : undefined;
+    // G2 (gate 10): the accepted source literally named this operation (a
+    // workflow step's own catalog scope), yet it is neither in the frozen
+    // snapshot nor a proven live read. That is a host provisioning fault,
+    // not a call the model can correct or substitute; name it so the turn
+    // stops and explains instead of looping through generic refusals until
+    // the no-progress governor terminalizes it as an internal error.
+    if (candidates.length === 0 && !provenReadCandidate) {
+      const literalOperation = acceptedSourceLiteralOperation(effectiveName);
+      if (literalOperation) return miss(literalOperationNotFrozenReason(literalOperation));
+    }
     const dispatchEffect: HostCallAttestation['effect'] | null = provenReadCandidate
       ? 'read'
       : decision.effect === 'unknown'
@@ -3021,12 +3067,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const sourcePurpose = classifyMaterialSourceManifestPurpose(manifest.purpose);
       const validateForegroundPayload = (): InvalidArgumentsPreDispatchResult | null => {
         const validation = catalogEntry.validateForegroundPayload?.(effectiveArgs);
-        return validation && !validation.ok
-          ? new InvalidArgumentsPreDispatchResult(
-              validation.repair,
-              validation.schemaAvailable,
-            )
-          : null;
+        if (!validation || validation.ok) return null;
+        // The proof validator's host-authored, value-free repair key rides
+        // the same nominal carrier so both mint paths (pre-approval marker
+        // and preparation settlement) key repair progress identically.
+        const repairKey = 'repairKey' in validation && typeof validation.repairKey === 'string'
+          ? validation.repairKey
+          : undefined;
+        return new InvalidArgumentsPreDispatchResult(
+          validation.repair,
+          validation.schemaAvailable,
+          repairKey,
+        );
       };
       // Native MCP must cross the local exact carrier for both accepted
       // work_call and direct call_tool. Bypassing call_tool here would skip its
@@ -3039,6 +3091,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           && isPlainOrClementineLocalTool(name, 'call_tool')
         );
       const attestation = { ...common, ...binding, bindingDigest };
+      // Pre-dispatch account preparation is keyed on manifest and port facts,
+      // never on a provider name: this kernel must not learn which service a
+      // manifest adapts. An externally-defined manifest whose port declares
+      // no preflight crossing of its own is prepared through the shipped
+      // attested transport immediately before its business dispatch; a port
+      // that owns admitPreparation/prepareInvocation already performs that
+      // crossing itself, and locally reviewed manifests carry no external
+      // definition at all.
+      const shippedTransportPreparation = Boolean(manifest.externalDefinition)
+        && typeof port.prepareInvocation !== 'function';
       return {
         attestation,
         manifest,
@@ -3053,12 +3115,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? { validateBeforeConsent: validateForegroundPayload }
           : {}),
         ...(!preserveExternalCarrier
-          && (manifest.providerKind === 'composio' || catalogEntry.validateForegroundPayload)
+          && (shippedTransportPreparation || catalogEntry.validateForegroundPayload)
           ? {
               prepareBeforePhysical: async () => {
                 const validation = validateForegroundPayload();
                 if (validation) return validation;
-                if (manifest.providerKind === 'composio') {
+                if (shippedTransportPreparation) {
                   await loadShippedImplementations().prepareComposioDispatch({
                     operationId: manifest.operationId,
                     accountId: manifest.accountId,
@@ -3354,6 +3416,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
         : '';
+      const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
+      if (literalOperation) {
+        return `Tool '${name}' was refused before dispatch because this step names the operation ${literalOperation} but the host did not provision it into this run's frozen catalog. Failed check: ${lastExactProductionMiss}. This is a host provisioning fault, not an argument error: no correction or substitute capability can be dispatched, and no local or external mutation was attempted.`;
+      }
       const miss = lastExactProductionMiss ? ` Failed check: ${lastExactProductionMiss}.` : '';
       return `Tool '${name}' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed.${miss} No local or external mutation was attempted.${repair}`;
     }
@@ -3377,6 +3443,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     argumentsJson: string;
     effect: RuntimeToolEffect;
     hostRefusal?: string;
+    /** A refusal the model cannot repair: the host stops and explains. */
+    hostFault?: HostFaultTerminal;
     settlementRequiresReconciliation?: true;
     committedVerificationHolds?: readonly CommittedMutationVerificationHold[];
   }> => {
@@ -3404,6 +3472,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       tool,
       call.callId,
     );
+    // Read synchronously: sibling reads share a bounded pool, and the exact
+    // miss belongs to the refusal composed on the line above.
+    const literalFaultOperation = canaryRefusal
+      ? literalOperationNotFrozenOperation(lastExactProductionMiss)
+      : null;
+    const hostFault: HostFaultTerminal | undefined = literalFaultOperation
+      ? {
+          reason: literalOperationNotFrozenReason(literalFaultOperation),
+          text: hostLiteralOperationNotFrozenBlockedText(literalFaultOperation),
+        }
+      : undefined;
     const toolCallItem = {
       type: 'function_call' as const,
       callId: call.callId,
@@ -3790,6 +3869,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       argumentsJson: call.argumentsJson,
       effect: admittedEffect,
       ...(hostRefusal ? { hostRefusal } : {}),
+      ...(hostFault ? { hostFault } : {}),
       ...(settlementRequiresReconciliation
         ? { settlementRequiresReconciliation: true as const }
         : {}),
@@ -3963,6 +4043,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     retired?: boolean;
     countsRefusal?: boolean;
     diagnostic?: string;
+    repairKey?: string;
   }): AgentInputItem => {
     return buildHostToolDispositionResult({
       callId: input.call.callId,
@@ -3974,6 +4055,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       countsRefusal: input.countsRefusal,
       retired: input.retired,
       diagnostic: input.diagnostic,
+      repairKey: input.repairKey,
     });
   };
 
@@ -4001,6 +4083,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     returned: ExecutedHostCall[];
     frameDigest: string;
     zeroCrossingRefusal: boolean;
+    /** First host fault in the frame; the runner stops and explains after
+     * the paired refusal is committed to canonical history. */
+    hostFault?: HostFaultTerminal;
     effectUnknown: boolean;
     committedVerificationHolds: CommittedMutationVerificationHold[];
     toolCallsLimit?: ToolCallsLimitExceeded;
@@ -4047,6 +4132,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ? attempt.value.hostRefusal
         : null
     ));
+    const hostFault = attempts.flatMap((attempt) => (
+      attempt?.status === 'returned' && attempt.value.hostFault
+        ? [attempt.value.hostFault]
+        : []
+    ))[0];
     const zeroCrossingRefusal = !effectUnknown
       && (crossings.some((crossing) => crossing === 'zero_crossing')
         || hostRefusals.some((refusal) => refusal !== null));
@@ -4121,6 +4211,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       zeroCrossingRefusal,
       effectUnknown,
       committedVerificationHolds,
+      ...(hostFault ? { hostFault } : {}),
       ...(toolCallsLimit ? { toolCallsLimit } : {}),
       ...(soleDurableContinuation
         ? { durableContinuationPending: soleDurableContinuation }
@@ -4131,7 +4222,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const pairLocallyRefusedFrame = (
     calls: readonly CanonicalHostCall[],
     retired = false,
-    diagnosticsByCallId?: ReadonlyMap<string, string>,
+    // A plain string is the diagnostic alone; the object form also carries
+    // the host-authored repair key of a schema refusal.
+    diagnosticsByCallId?: ReadonlyMap<string, string | { diagnostic: string; repairKey?: string }>,
     countingCallIds?: ReadonlySet<string>,
   ): PairedCallAttempts => {
     const frameDigest = semanticFrameDigest(calls);
@@ -4141,6 +4234,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const countingIndex = explicitCountingIndex < 0 && (countingCallIds?.size ?? 0) > 0
       ? 0
       : explicitCountingIndex;
+    const repairFor = (callId: string): { diagnostic?: string; repairKey?: string } => {
+      const entry = diagnosticsByCallId?.get(callId);
+      if (!entry) return {};
+      if (typeof entry === 'string') return { diagnostic: entry };
+      return {
+        ...(entry.diagnostic ? { diagnostic: entry.diagnostic } : {}),
+        ...(entry.repairKey ? { repairKey: entry.repairKey } : {}),
+      };
+    };
     return {
       frameDigest,
       zeroCrossingRefusal: true,
@@ -4158,9 +4260,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // current capability, not evidence that the capability is absent.
         // The caller disables this marker for that exact recovery class.
         countsRefusal: index === countingIndex,
-        ...(diagnosticsByCallId?.get(call.callId)
-          ? { diagnostic: diagnosticsByCallId.get(call.callId)! }
-          : {}),
+        ...repairFor(call.callId),
       })),
     };
   };
@@ -5392,6 +5492,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       if (paired.toolCallsLimit) propagateToolCallsLimit(paired.toolCallsLimit);
       if (paired.zeroCrossingRefusal) recordZeroCrossingRefusal(paired.frameDigest);
+      if (paired.hostFault) return blockedOutcome(paired.hostFault.text, paired.hostFault.reason, false);
       const finalOutput = !paired.zeroCrossingRefusal
         || terminalBehaviorEligibleMixedResults(paired.returned)
         ? await finalOutputFromToolBehavior(paired.returned)
@@ -6180,6 +6281,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (frame.toolCallsLimit) propagateToolCallsLimit(frame.toolCallsLimit);
       if (frame.zeroCrossingRefusal) {
         recordZeroCrossingRefusal(frame.frameDigest);
+        if (frame.hostFault) return blockedOutcome(frame.hostFault.text, frame.hostFault.reason, false);
         if (terminalBehaviorEligibleMixedResults(frame.returned)) {
           const finalOutput = await finalOutputFromToolBehavior(frame.returned);
           if (finalOutput !== undefined) return await completedOutcome(finalOutput);
@@ -6196,7 +6298,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // has never run.
     const pendingBatch: PendingHostCall[] = [];
     const preparedInBatch: object[] = [];
-    const preApprovalRepairDiagnostics = new Map<string, string>();
+    const preApprovalRepairDiagnostics = new Map<
+      string,
+      { diagnostic: string; repairKey?: string }
+    >();
     const preApprovalTypedRefusals = new Map<
       string,
       'repair_arguments' | 'stop_and_explain'
@@ -6248,7 +6353,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         }
         const schemaRefusal = approvalExactProduction.validateBeforeConsent?.();
         if (schemaRefusal) {
-          preApprovalRepairDiagnostics.set(call.callId, schemaRefusal.output);
+          preApprovalRepairDiagnostics.set(call.callId, {
+            diagnostic: schemaRefusal.output,
+            ...(schemaRefusal.repairKey ? { repairKey: schemaRefusal.repairKey } : {}),
+          });
           preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
           preApprovalRefused = true;
           break;
@@ -6336,7 +6444,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               if (prepared.status !== 'prepared') {
                 if (prepared.status === 'refused') {
                   const diagnostic = boundedHostPreparationRepairDiagnostic(prepared.output);
-                  if (diagnostic) preApprovalRepairDiagnostics.set(call.callId, diagnostic);
+                  if (diagnostic) preApprovalRepairDiagnostics.set(call.callId, { diagnostic });
                   preApprovalTypedRefusals.set(call.callId, prepared.recovery);
                 }
                 return null;
@@ -6505,6 +6613,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (frame.toolCallsLimit) propagateToolCallsLimit(frame.toolCallsLimit);
     if (frame.zeroCrossingRefusal) {
       recordZeroCrossingRefusal(frame.frameDigest);
+      // A host fault is durable in canonical history now; stop and explain
+      // rather than hand the model a refusal it cannot repair.
+      if (frame.hostFault) return blockedOutcome(frame.hostFault.text, frame.hostFault.reason, false);
       if (terminalBehaviorEligibleMixedResults(frame.returned)) {
         const finalOutput = await finalOutputFromToolBehavior(frame.returned);
         if (finalOutput !== undefined) return await completedOutcome(finalOutput);
@@ -6562,3 +6673,99 @@ export const hostRunRunner: RunRunnerFn = async (runner, agent, itemsOrState, op
     await revokeDispatchLeaseBeforeRecovery(lease);
   }
 };
+
+// ---------------------------------------------------------------------------
+// Host terminal reasons and bounded machine detail (SAY WHY; gates 10/11).
+// Declared after the runner so the ring-owned regions above keep their line
+// positions; every use runs after module initialization.
+// ---------------------------------------------------------------------------
+
+/** Machine reason prefix for the host fault where the accepted source (a
+ * workflow step) literally names an operation that the host never provisioned
+ * into this run's frozen catalog. The model cannot repair a provisioning gap,
+ * so the turn stops and explains instead of entering a repair loop that the
+ * no-progress governor would only terminalize as an opaque "internal error".
+ * Live 2026-08-31: one run refused the same literally named read 15 times. */
+export const HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX = 'literal_workflow_operation_not_frozen:';
+
+export function literalOperationNotFrozenReason(operationId: string): string {
+  return `${HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX}${operationId}`;
+}
+
+/** The operation named by a literal-operation host-fault reason, or null. */
+export function literalOperationNotFrozenOperation(reason: string | undefined): string | null {
+  if (!reason || !reason.startsWith(HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX)) return null;
+  const operationId = reason.slice(HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX.length).trim();
+  return operationId || null;
+}
+
+export function hostLiteralOperationNotFrozenBlockedText(operationId: string): string {
+  return `This step names the operation ${boundedVerificationSurface(operationId, 120)}, but the host did not provision it into this run's frozen catalog, so it cannot be called here. I stopped before any external action and nothing was changed. Once that operation is provisioned or its account reconnected, rerun the step.`;
+}
+
+/** Bounded machine detail persisted beside a blocked terminal's reason. */
+export const HOST_BLOCKED_DETAIL_MAX_CHARS = 160;
+
+/** A pre-dispatch refusal the model cannot repair. The runner commits the
+ * paired refusal frame, then stops and explains with this reason/text. */
+interface HostFaultTerminal {
+  reason: string;
+  text: string;
+}
+
+/** A host turn outcome may carry bounded machine detail beside its terminal
+ * reason (for example the last pre-dispatch refusal check that exhausted the
+ * no-progress governor). It rides outside `terminal` so the exact terminal
+ * identity pins stay byte-stable; the conversation reducer persists it as
+ * `blockedDetail` metadata, never as user-facing prose. */
+export type HostRunOutcome = RunOutcome & { blockedDetail?: string };
+
+export function hostBlockedTerminalDetail(outcome: RunOutcome): string | undefined {
+  const detail = (outcome as { blockedDetail?: unknown }).blockedDetail;
+  return typeof detail === 'string' && detail.trim() ? detail : undefined;
+}
+
+function boundedBlockedDetail(value: string): string {
+  return boundedVerificationSurface(value, HOST_BLOCKED_DETAIL_MAX_CHARS);
+}
+
+/** Reduce one host refusal diagnostic to its machine check when it has one:
+ * the canary/binding refusal names `Failed check: <token>.`, frame and plan
+ * control refusals name `before dispatch (<token>)`; a provider schema
+ * refusal already starts with its `[provider-dispatch:...]` class. */
+function hostRefusalDiagnosticDetail(diagnostic: string): string {
+  const failedCheck = /Failed check: (\S+?)\.(?:\s|$)/u.exec(diagnostic);
+  if (failedCheck?.[1]) return failedCheck[1];
+  const frameRefusal = /before dispatch \(([^)]+)\)/u.exec(diagnostic);
+  if (frameRefusal?.[1]) return frameRefusal[1];
+  return diagnostic;
+}
+
+/** The last frame's host refusal, as bounded machine detail. Only the trailing
+ * run of tool results (the most recent frame) is inspected, so an older
+ * refusal can never be reported for a later, refusal-free terminal. */
+export function lastHostRefusalDetail(history: readonly AgentInputItem[]): string | undefined {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index]!;
+    if ((item as { type?: unknown }).type !== 'function_call_result') break;
+    const text = (functionResultText(item) ?? '').trim();
+    if (!text) continue;
+    let diagnostic: string | null = null;
+    if (text.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(text) as { protocol?: unknown; disposition?: unknown; diagnostic?: unknown };
+        if (parsed && parsed.protocol === 'host_tool_disposition_v1') {
+          if (parsed.disposition !== 'refused_pre_dispatch' || typeof parsed.diagnostic !== 'string') continue;
+          diagnostic = parsed.diagnostic;
+        }
+      } catch { /* not a host disposition marker */ }
+    }
+    if (diagnostic === null) {
+      if (!text.startsWith('[provider-dispatch:')) continue;
+      diagnostic = text;
+    }
+    const detail = boundedBlockedDetail(hostRefusalDiagnosticDetail(diagnostic));
+    if (detail) return detail;
+  }
+  return undefined;
+}

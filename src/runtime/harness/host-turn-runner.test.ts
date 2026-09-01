@@ -34,7 +34,10 @@ const {
   committedWriteVerificationHeldText,
   mapHostCallAttemptsWithBarriersInOrder,
   isReturnedPreDispatchHostRefusalSettlement,
+  hostBlockedTerminalDetail,
+  literalOperationNotFrozenReason,
 } = await import('./host-turn-runner.js');
+const catalogScope = await import('./accepted-source-catalog-scope.js');
 const hostRunRunner: typeof productionHostRunRunner = (
   runner,
   agent,
@@ -7816,4 +7819,195 @@ test('a write whose verifier holds is a scheduling barrier: no later sibling wri
   assert.equal(attempts[0]?.status, 'returned');
   assert.equal(attempts[1], undefined,
     'write B has no invocation attempt after write A commits but its verifier holds');
+});
+
+/** One configured generic carrier whose body must never replace the exact
+ * production port, plus an EMPTY frozen catalog: every provider call misses
+ * at the catalog binding. */
+function installEmptyProductionCatalogWithCarrier() {
+  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  productionPorts.clearProductionCapabilityPorts();
+  let outerBodies = 0;
+  const carrier = brackets.wrapToolForHarness({
+    type: 'function',
+    name: 'call_tool',
+    description: 'Invoke one exact schema acquired from the frozen capability catalog.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        args_json: { type: 'string' },
+      },
+      required: ['name', 'args_json'],
+    },
+    needsApproval: async () => false,
+    invoke: async () => {
+      outerBodies += 1;
+      throw new Error('the generic carrier body must not replace the exact production port');
+    },
+  });
+  return { carrier, outerBodies: () => outerBodies };
+}
+
+test('production host stops and names a literally scoped operation the catalog never froze as a host fault (G2)', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('literal-operation-not-frozen');
+    // Opaque: not a provider slug, only shaped like one. The accepted source
+    // (a workflow step) names it; provisioning never froze it.
+    const operationId = 'NIGHT_OPAQUE_FETCH_ROWS';
+    const { carrier, outerBodies } = installEmptyProductionCatalogWithCarrier();
+    const model = stubModel([
+      [toolCall('literal-op-call', 'call_tool', {
+        name: operationId,
+        args_json: JSON.stringify({ limit: 1 }),
+      })],
+      [textMsg('must not be asked to repair a host provisioning fault')],
+    ]);
+    const agent = { model, tools: [carrier] };
+    bindHostCanarySurface(fixture, agent, [carrier]);
+
+    const outcome = await catalogScope.withAcceptedSourceCatalogManifestScope(
+      { manifestIds: ['cap:night:opaque-fetch-rows'], operationIds: [operationId] },
+      () => runProductionHost(fixture, agent),
+    );
+
+    assert.deepEqual(outcome.terminal, {
+      status: 'blocked',
+      reason: literalOperationNotFrozenReason(operationId),
+      resumable: false,
+    });
+    assert.equal(outcome.terminal?.reason, `literal_workflow_operation_not_frozen:${operationId}`);
+    assert.equal(model.calls(), 1, 'a host fault stops before the model is asked to repair it');
+    assert.match(String(outcome.finalOutput), new RegExp(operationId),
+      'the user is told which operation the host could not provision');
+    assert.doesNotMatch(String(outcome.finalOutput), /internal host error|choose another capability/);
+    const history = JSON.stringify(outcome.history);
+    assert.match(history, /host provisioning fault/);
+    assert.match(history, new RegExp(`Failed check: literal_workflow_operation_not_frozen:${operationId}`));
+    assert.doesNotMatch(history, /capability, effect, account, schema, or invoke binding is absent or changed/,
+      'the generic binding refusal (a model repair instruction) is not what the record carries');
+    assert.equal(outerBodies(), 0);
+    assert.equal((eventlog.openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0);
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('a no-progress terminal carries the last host refusal check as bounded blockedDetail (say why)', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('no-progress-blocked-detail');
+    // Not scoped by any accepted source: an ordinary catalog miss the model
+    // repeats verbatim until the governor terminalizes (live 2026-08-31 shape).
+    const operationId = 'NIGHT_OPAQUE_LIST_ROWS';
+    const { carrier, outerBodies } = installEmptyProductionCatalogWithCarrier();
+    const sameCall = (callId: string) => toolCall(callId, 'call_tool', {
+      name: operationId,
+      args_json: JSON.stringify({ limit: 1 }),
+    });
+    const model = stubModel([
+      [sameCall('catalog-miss-1')],
+      [sameCall('catalog-miss-2')],
+      [sameCall('catalog-miss-3')],
+      [textMsg('must not outrun the no-progress governor')],
+    ]);
+    const agent = { model, tools: [carrier] };
+    bindHostCanarySurface(fixture, agent, [carrier]);
+
+    const outcome = await runProductionHost(fixture, agent);
+
+    assert.deepEqual(outcome.terminal, {
+      status: 'blocked',
+      reason: 'control_no_progress_exhausted',
+      resumable: false,
+    }, JSON.stringify(outcome.terminal));
+    assert.equal(
+      hostBlockedTerminalDetail(outcome),
+      'catalog_entry_or_manifest_missing:candidates=0:proven=none',
+    );
+    assert.ok((hostBlockedTerminalDetail(outcome) ?? '').length <= 160);
+    assert.equal(outerBodies(), 0);
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('a done claim after the host refused this source\'s only work before dispatch is held, never delivered (delivery truth)', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('refused-work-done-claim');
+    const { carrier, outerBodies } = installEmptyProductionCatalogWithCarrier();
+    const model = stubModel([
+      [toolCall('refused-work-call', 'call_tool', {
+        name: 'NIGHT_OPAQUE_LIST_EVENTS',
+        args_json: JSON.stringify({ limit: 1 }),
+      })],
+      [textMsg('Your calendar is ready.')],
+    ]);
+    const agent = { model, tools: [carrier] };
+    bindHostCanarySurface(fixture, agent, [carrier]);
+    await runProductionHost(fixture, agent);
+    const db = eventlog.openEventLog();
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM host_model_result_receipts
+       WHERE session_id = ? AND source_user_seq = ? AND disposition = 'refused_pre_dispatch'
+    `).get(fixture.session.id, fixture.source.seq) as { n: number }).n >= 1, true,
+    'the refusal is a durable host receipt for this source');
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+    `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0);
+    assert.equal(outerBodies(), 0);
+
+    // The model's claim, reduced as a completed turn with no contract and no
+    // manifest — the exact shape that was stamped delivered:true live.
+    const identity = { sessionId: fixture.session.id, turn: 1, sourceUserSeq: fixture.source.seq } as const;
+    const committed = commitTurnOutcome({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'done',
+      resumable: false,
+      presentation: { kind: 'answer', text: 'Your calendar is ready.' },
+    });
+    assert.equal(committed.presentation.status, 'blocked', JSON.stringify(committed.event.data));
+    assert.equal(committed.event.data.delivered, false);
+    assert.equal(committed.event.data.reason, 'verification_required');
+    assert.deepEqual(committed.event.data.verificationMissing, ['work_refused_without_business_evidence']);
+    assert.equal(committed.presentation.text.startsWith('Your calendar is ready.'), true,
+      'the model\'s own words are held, never rewritten by the committer');
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
 });

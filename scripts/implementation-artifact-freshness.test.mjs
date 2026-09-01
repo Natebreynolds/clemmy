@@ -56,6 +56,26 @@ test('a disposable emission is source-current and carries checkpoint schema inpu
     assert.equal(verification.status, 0, verification.stderr || verification.stdout);
     assert.equal(JSON.parse(verification.stdout).verifiedCurrent, true);
 
+    // The invoke/reconcile artifacts execute in a packaged extract that has no
+    // node_modules and beside a host that already holds the one event-log /
+    // database instance. Their executable bytes may require Node builtins
+    // only; any other require means the artifact regained the host/storage
+    // graph (2026-08-31: zod, better-sqlite3 and pino through the reviewed
+    // local transport and an inlined Workspace-carrier import). The host
+    // storage carrier reaches the artifact through the bound seam instead.
+    for (const kind of ['invoke', 'reconcile']) {
+      const source = readFileSync(path.join(outDir, manifest.artifacts[kind].file), 'utf8');
+      const externalRequires = [...new Set(source.match(/require\("[^"]+"\)/g) ?? [])]
+        .filter((entry) => !entry.startsWith('require("node:'))
+        .sort();
+      assert.deepEqual(
+        externalRequires,
+        [],
+        `${kind} artifact requires non-builtin modules; it must stay a leaf that calls the bound host carrier`,
+      );
+      assert.match(source, /bindHostLocalWriteCarrier/, `${kind} artifact lost the host local-write carrier seam`);
+    }
+
     for (const relativePath of [
       'src/runtime/harness/schema-version.ts',
       'src/runtime/harness/logical-model-result-projection-receipt.ts',

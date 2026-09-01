@@ -19,6 +19,14 @@ import {
   peekShippedProvenance,
   shippedImplementationDigest,
 } from './shipped-implementation-identity.js';
+import { bindHostLocalWriteCarrier } from './implementation-artifacts/host-local-write-carrier.js';
+import { reviewedLocalStorageCarrier } from './reviewed-local-storage-carrier.js';
+
+// Every port path evaluates this registry, so binding the host's storage
+// carrier here makes "a port exists" imply "its storage carrier is bound" for
+// the host's own adapter instance. The shipped artifacts receive a forwarder
+// to this same binding when loadShippedImplementations loads them.
+bindHostLocalWriteCarrier(reviewedLocalStorageCarrier);
 
 /** Nominal host-owned proof that a fresh definition observation no longer
  * matches the immutable capability selected for this call. Provider prose can

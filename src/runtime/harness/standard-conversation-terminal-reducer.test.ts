@@ -115,3 +115,43 @@ test('an internal no-progress stop cannot become a resumable user continuation',
   assert.equal(outcome.status, 'blocked');
   assert.equal(outcome.resumable, false);
 });
+
+test('a host blocked terminal persists its machine reason and bounded detail, not the literal "blocked" (say why)', () => {
+  const sessionId = 'host-blocked-says-why';
+  const source = acceptedSource(sessionId);
+  const text = 'I hit a bounded internal host error. Any completed work and retained results remain preserved, and no uncertain external change is pending.';
+  const detail = 'catalog_entry_or_manifest_missing:candidates=0:proven=none';
+
+  const reduced = reduceStandardConversationTerminal({
+    sourceUserSeq: source.sourceUserSeq,
+    result: {
+      sessionId,
+      status: 'blocked',
+      steps: 1,
+      lastTurn: source.turn,
+      error: text,
+      blockedResumable: false,
+      blockedReason: 'control_no_progress_exhausted',
+      blockedDetail: detail,
+    },
+  });
+
+  assert.equal(reduced.status, 'blocked');
+  assert.equal(reduced.publicPresentation?.text, text, 'machine metadata never rewrites the user-facing text');
+  const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.ok(terminal);
+  assert.equal(terminal.data.blockedReason, 'control_no_progress_exhausted');
+  assert.equal(terminal.data.blockedDetail, detail);
+  assert.equal(terminal.data.reason, 'blocked', 'the legacy classifier is unchanged');
+
+  // A blocked result that carries no host reason keeps the compatibility default.
+  const plainSessionId = 'host-blocked-without-reason';
+  const plain = acceptedSource(plainSessionId);
+  reduceStandardConversationTerminal({
+    sourceUserSeq: plain.sourceUserSeq,
+    result: { sessionId: plainSessionId, status: 'blocked', steps: 1, lastTurn: plain.turn, error: text },
+  });
+  const plainTerminal = eventlog.listEvents(plainSessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(plainTerminal?.data.blockedReason, 'blocked');
+  assert.equal(plainTerminal && 'blockedDetail' in plainTerminal.data, false);
+});

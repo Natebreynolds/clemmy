@@ -61,6 +61,10 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'steps',
   'missingReply',
   'blockedReason',
+  // Bounded machine detail beside blockedReason (for example the last host
+  // pre-dispatch refusal check that exhausted the no-progress governor).
+  // Metadata only: presentation text never derives from it.
+  'blockedDetail',
   'verificationDetail',
   'verificationMissing',
   'failureDetail',
@@ -301,9 +305,66 @@ export function assessAcceptedSourceDelivery(input: {
           missing: verdict.missing,
         });
       }
+    } else if (
+      !acceptedSourceHasBusinessEvidence(settlementAudit)
+      && sourceRefusedWorkWithoutDispatch(input)
+    ) {
+      // DELIVERY TRUTH WITHOUT A CONTRACT. A refused plan leaves no
+      // expected-work contract and no manifest, so from the contract tables
+      // this turn looks like ordinary conversation — yet the host durably
+      // recorded that it refused this source's work before dispatch and no
+      // provider call ever crossed. A `done` claim after that has nothing to
+      // answer FROM (live: plan_task refused, the fused work_call refused
+      // pre-dispatch, dispatches=0, "Your calendar is ready." stamped
+      // delivered). The gap travels as data; the judge-unavailable policy
+      // holds it and a different-family judge may still choose to disclose.
+      deliveryGap = mergeDeliveryGaps(deliveryGap, {
+        reason: 'the host refused this source\'s planned work before dispatch and no provider call '
+          + 'was made; a completion claim has no business evidence to answer from',
+        missing: ['work_refused_without_business_evidence'],
+      });
     }
   }
   return { settlementAudit, deliveryGap };
+}
+
+function acceptedSourceHasBusinessEvidence(audit: AcceptedSourceSettlementAudit): boolean {
+  return audit.facts.successfulBusinessSettlements > 0
+    || audit.facts.successfulSdkBusinessResults > 0
+    || audit.facts.successfulSdkAuthoringResults > 0
+    || audit.facts.confirmedWrites > 0;
+}
+
+/** The host refused at least one of this source's calls before dispatch (a
+ * durable host disposition receipt or a refused_pre_dispatch settlement) and
+ * no physical dispatch was ever started for the source. Unreadable storage
+ * manufactures neither a hold nor permission to publish. */
+function sourceRefusedWorkWithoutDispatch(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  try {
+    const db = openEventLog();
+    const refused = db.prepare(`
+      SELECT 1 FROM host_model_result_receipts
+       WHERE session_id = ? AND source_user_seq = ? AND disposition = 'refused_pre_dispatch'
+       LIMIT 1
+    `).get(input.sessionId, input.sourceUserSeq) !== undefined
+      || db.prepare(`
+        SELECT 1 FROM logical_call_settlements
+         WHERE session_id = ? AND source_user_seq = ?
+           AND business_call = 1 AND execution_kind = 'refused_pre_dispatch'
+         LIMIT 1
+      `).get(input.sessionId, input.sourceUserSeq) !== undefined;
+    if (!refused) return false;
+    const dispatched = db.prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(input.sessionId, input.sourceUserSeq) as { n: number };
+    return dispatched.n === 0;
+  } catch {
+    return false;
+  }
 }
 
 function publicEvidenceKind(kind: WorkEvidenceRef['kind']): TurnEvidenceKind {

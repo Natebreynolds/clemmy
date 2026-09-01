@@ -271,6 +271,7 @@ import {
 import {
   HostInterruptState,
   HostRecoveryState,
+  hostBlockedTerminalDetail,
   hostRunRunner,
   hostToolCallsLimitCheckpointFor,
 } from './host-turn-runner.js';
@@ -938,6 +939,8 @@ function reduceStandardConversationTerminal(input: {
   let outcome: TurnOutcome;
   let legacyReason: string;
   let failureDetail: string | undefined;
+  let blockedReason: string | undefined;
+  let blockedDetail: string | undefined;
   let transferredToTaskId: string | undefined;
   switch (result.status) {
     case 'dispatched':
@@ -1112,6 +1115,11 @@ function reduceStandardConversationTerminal(input: {
         },
       };
       legacyReason = 'blocked';
+      // SAY WHY: persist the host's machine reason (and bounded detail) as
+      // terminal metadata. Without it every host stop is recorded as the
+      // literal blockedReason 'blocked' and cannot be triaged from data.
+      blockedReason = result.blockedReason;
+      blockedDetail = result.blockedDetail;
       break;
     case 'failed':
       outcome = {
@@ -1147,6 +1155,8 @@ function reduceStandardConversationTerminal(input: {
       ...(result.limitKind ? { limitKind: result.limitKind } : {}),
       ...(transferredToTaskId ? { transferredToTaskId } : {}),
       ...(failureDetail ? { failureDetail } : {}),
+      ...(blockedReason ? { blockedReason } : {}),
+      ...(blockedDetail ? { blockedDetail } : {}),
     },
   });
   return {
@@ -3084,6 +3094,11 @@ export interface RunTurnResult {
   error?: string;
   /** A host-owned factual terminal that has no user-supplied continuation. */
   blockedResumable?: false;
+  /** SAY WHY: the host's machine reason for a blocked terminal (for example
+   * control_no_progress_exhausted) and bounded machine detail (the last host
+   * refusal check). Persisted as terminal metadata, never rendered as prose. */
+  blockedReason?: string;
+  blockedDetail?: string;
   /** How many tool/handoff calls fired during this turn. Used by the
    *  outer loop to detect sub-agent stalls (zero tools + short generic
    *  output = the model punted on the directive). */
@@ -3364,6 +3379,9 @@ export interface RunConversationResult {
   error?: string;
   /** Preserve a host proof that the blocked terminal is not user-resumable. */
   blockedResumable?: false;
+  /** The host's machine reason/detail for a blocked terminal (see RunTurnResult). */
+  blockedReason?: string;
+  blockedDetail?: string;
   /** Nonterminal exact-source ownership retained by a peer or restart
    * reconciler. No public terminal or user-input dependency exists yet. */
   hold?: {
@@ -3506,6 +3524,8 @@ function hostActivationConversationResult(
     ...(lastDecision ? { lastDecision } : {}),
     ...(turnResult.error ? { error: turnResult.error } : {}),
     ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
+    ...(turnResult.blockedReason ? { blockedReason: turnResult.blockedReason } : {}),
+    ...(turnResult.blockedDetail ? { blockedDetail: turnResult.blockedDetail } : {}),
     ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
   };
 }
@@ -5248,6 +5268,23 @@ async function runConversationWithinRuntimeConfig(
       sessionId: options.sessionId,
       sourceUserSeq,
     });
+    if (recoveredPreparation.status === 'expired') {
+      // Gate 15: an exact pre-seal owner that has kept failing past the host
+      // age budget is a factual stop, not "please retry" forever. Nothing was
+      // started; the reason is the last exact seal failure. Non-resumable so
+      // restart reconciliation stops re-dispatching this same source — a new
+      // request plans fresh.
+      const heldMinutes = Math.max(1, Math.round(recoveredPreparation.ageMs / 60_000));
+      return {
+        sessionId: options.sessionId,
+        status: 'blocked',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        blockedResumable: false,
+        blockedReason: 'plan_task_seal_recovery_expired',
+        error: `I retained the accepted plan but could not restore its exact capability bindings after ${heldMinutes} minutes (${recoveredPreparation.reason}). Nothing was started. Send the request again and I will plan it fresh.`,
+      };
+    }
     if (recoveredPreparation.status === 'held') {
       return {
         sessionId: options.sessionId,
@@ -6524,6 +6561,8 @@ async function runConversationCore(
         lastTurn,
         error: turnResult.error,
         ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
+        ...(turnResult.blockedReason ? { blockedReason: turnResult.blockedReason } : {}),
+        ...(turnResult.blockedDetail ? { blockedDetail: turnResult.blockedDetail } : {}),
         ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
         ...(turnResult.hold ? { hold: turnResult.hold } : {}),
       };
@@ -10787,6 +10826,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         error: publicReplyText(outcome.finalOutput, '')
           || 'The host stopped this turn at a durable execution boundary.',
         ...(outcome.terminal.resumable === false ? { blockedResumable: false as const } : {}),
+        ...(outcome.terminal.reason ? { blockedReason: outcome.terminal.reason } : {}),
+        ...(hostBlockedTerminalDetail(outcome)
+          ? { blockedDetail: hostBlockedTerminalDetail(outcome)! }
+          : {}),
         toolCalls: toolCounter.currentCount,
       };
     }
@@ -11553,6 +11596,10 @@ export async function resumePendingApproval(
         error: publicReplyText(outcome.finalOutput, '')
           || 'The host stopped this resumed turn at a durable execution boundary.',
         ...(outcome.terminal.resumable === false ? { blockedResumable: false as const } : {}),
+        ...(outcome.terminal.reason ? { blockedReason: outcome.terminal.reason } : {}),
+        ...(hostBlockedTerminalDetail(outcome)
+          ? { blockedDetail: hostBlockedTerminalDetail(outcome)! }
+          : {}),
         toolCalls: toolCounter.currentCount,
       };
     }
@@ -12787,6 +12834,8 @@ async function runConversationFromResumeCore(opts: {
         lastTurn,
         error: turnResult.error,
         ...(turnResult.blockedResumable === false ? { blockedResumable: false as const } : {}),
+        ...(turnResult.blockedReason ? { blockedReason: turnResult.blockedReason } : {}),
+        ...(turnResult.blockedDetail ? { blockedDetail: turnResult.blockedDetail } : {}),
         ...(turnResult.limitKind ? { limitKind: turnResult.limitKind } : {}),
       };
     }

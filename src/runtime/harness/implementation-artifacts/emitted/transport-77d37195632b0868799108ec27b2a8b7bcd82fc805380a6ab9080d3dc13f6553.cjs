@@ -1900,7 +1900,7 @@ function reviewedLocalToolArgumentsMatch(observed2, args) {
   }
   return true;
 }
-function exactExpectedIdentity(call, observed2) {
+function reviewedLocalExpectedIdentityMatches(call, observed2) {
   const expected = call.expected;
   const manifest = reviewedLocalCapabilityManifest(observed2);
   return Boolean(
@@ -1909,7 +1909,7 @@ function exactExpectedIdentity(call, observed2) {
 }
 function prepareReviewedLocalToolExecution(call) {
   const observed2 = observeReviewedLocalTool(call.operationId);
-  if (!observed2 || !exactExpectedIdentity(call, observed2)) {
+  if (!observed2 || !reviewedLocalExpectedIdentityMatches(call, observed2)) {
     throw new Error("reviewed local execution identity changed before dispatch");
   }
   if (!reviewedLocalToolArgumentsMatch(observed2, call.args)) {
@@ -2421,7 +2421,7 @@ function observeReviewedCliReadTransport(operationId, accountId) {
     return null;
   }
 }
-function exactExpectedIdentity2(call, current) {
+function exactExpectedIdentity(call, current) {
   const expected = call.expected;
   const descriptor = current.descriptor;
   return Boolean(
@@ -2472,7 +2472,7 @@ async function executeReviewedCliRead(call) {
   }
   if (!descriptor) throw new Error("reviewed CLI descriptor is absent, ambiguous, or stale");
   const current = currentTransportIdentity(descriptor);
-  if (!exactExpectedIdentity2(call, current)) {
+  if (!exactExpectedIdentity(call, current)) {
     throw new Error("reviewed CLI execution identity changed before dispatch");
   }
   const argv = compileReviewedCliArgv(descriptor, call.args);

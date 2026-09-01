@@ -223,6 +223,10 @@ export interface AttemptSignals {
   providerReportedError?: boolean;
   /** The callable contract was available to hand back for repair. */
   schemaAvailable?: boolean;
+  /** Host-authored, value-free digest of the exact failing-path set behind an
+   * argument-validation refusal (nominal; hex, 16-64 chars). It rides into
+   * the settlement's `detail` so a durable row can key repair progress. */
+  repairKey?: string;
   /** A bounded structural inspection observed a real envelope contradiction. */
   providerEnvelopeContradicted?: boolean;
   /** The host observed a completed execution that failed, but no narrower
@@ -274,7 +278,15 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   if (signals.policyRefused) return outcome('policy_denial', 'nominal', 'policy');
   if (signals.needsUserInput) return outcome('input_required', 'nominal', 'input');
   if (signals.connectionMissing) return outcome('auth_failure', 'nominal', 'connection');
-  if (signals.argumentValidationFailed) return outcome('invalid_arguments', 'nominal', 'validation');
+  if (signals.argumentValidationFailed) {
+    // The repair key is host-authored and hex-only; anything else stays the
+    // plain `validation` detail so prose can never reach the durable row.
+    const repairKey = typeof signals.repairKey === 'string'
+      && /^[a-f0-9]{16,64}$/.test(signals.repairKey)
+      ? signals.repairKey.slice(0, 32)
+      : null;
+    return outcome('invalid_arguments', 'nominal', repairKey ? `validation:${repairKey}` : 'validation');
+  }
   if (signals.capabilityDefinitionUnavailable) {
     return outcome('unsupported_capability', 'nominal', 'current_definition_unavailable');
   }
