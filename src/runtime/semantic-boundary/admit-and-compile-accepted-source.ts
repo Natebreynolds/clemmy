@@ -3231,7 +3231,18 @@ export async function prepareDurableAcceptedTurnCompile(
     if (!direct.ok) {
       return {
         ok: false,
-        reason: direct.issues.map((issue) => `${issue.code}:${issue.path}`).join('; ') || 'primary model proposal was not admitted',
+        // Keep the validator's own message: it names the repair ("Too big:
+        // expected string to have <=N characters"). Live 2026-09-01 a
+        // converging authoring turn received `schema_too_big:goal.objective`
+        // three times with no limit named, resent an objective that was still
+        // too long, and the loop floor stopped it — an error that does not
+        // name its own fix cannot be repaired (self-healing law).
+        reason: direct.issues.map((issue) => {
+          const message = typeof issue.message === 'string'
+            ? issue.message.replace(/\s+/g, ' ').trim().slice(0, 160)
+            : '';
+          return `${issue.code}:${issue.path}${message ? ` (${message})` : ''}`;
+        }).join('; ') || 'primary model proposal was not admitted',
       };
     }
     admitted = direct;
