@@ -1464,7 +1464,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 47674
+          "bytes": 47668
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -2202,7 +2202,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 298692
+          "bytes": 300637
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3939,7 +3939,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 47674
+          "bytes": 47668
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -4677,7 +4677,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 298692
+          "bytes": 300637
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
