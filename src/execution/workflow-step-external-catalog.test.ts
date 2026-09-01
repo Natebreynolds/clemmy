@@ -610,6 +610,107 @@ test('workflow runner persists the accepted source before exact catalog provisio
   );
 });
 
+test('literal slugs are extracted from backticks, bold, parentheses, list items, and trailing punctuation', async () => {
+  // Authored SKILL bodies are markdown: slugs arrive fenced in backticks,
+  // bolded, parenthesised, namespaced with a colon, and followed by commas or
+  // full stops. Every one of those must reach the exact-operation set, or the
+  // frozen catalog silently lacks an operation the step names — the shape of
+  // a run that refused the same read fifteen times before an opaque terminal.
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const ops = [
+    manifest('SLACK_FETCH_CONVERSATION_HISTORY', 'read'),
+    manifest('SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION', 'read'),
+    manifest('SLACK_RETRIEVE_DETAILED_USER_INFORMATION', 'read'),
+    manifest('GOOGLESHEETS_BATCH_GET', 'read'),
+    manifest('GOOGLESHEETS_INSERT_DIMENSION', 'external_write'),
+    manifest('GOOGLESHEETS_BATCH_UPDATE', 'external_write'),
+  ];
+  const store = createCapabilityManifestStore(ops);
+  const factory = createHostCapabilityCatalogFactory();
+  const crossings = new Map<string, number>();
+  const result = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: [
+      '## step: main',
+      '',
+      '1. PULL — call `SLACK_FETCH_CONVERSATION_HISTORY` (channel + limit 100).',
+      '2. THREADS: for each reply_count>0 use **SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION**.',
+      '3. NAMES. Resolve ids via composio:SLACK_RETRIEVE_DETAILED_USER_INFORMATION; fan out.',
+      '4. BASELINE. GOOGLESHEETS_BATCH_GET, ranges [\'Log!A1:I500\'].',
+      '5. WRITE (GOOGLESHEETS_INSERT_DIMENSION) one row at index 1, then',
+      '   the values with `GOOGLESHEETS_BATCH_UPDATE`.',
+    ].join('\n'),
+    allowedTools: ['*'],
+    acceptedSource: {
+      sessionId: 'workflow:markdown-slugs',
+      sourceUserSeq: 1,
+      acceptedInput: 'immutable workflow source',
+    },
+  }, {
+    manifestStore: store,
+    catalogFactory: factory,
+    provisionExactOperations: async () => {
+      assert.fail('every named operation already has a current manifest; nothing to provision');
+    },
+    revalidate: async () => ({
+      ok: true,
+      definitions: new Map(ops.map((entry) => [entry.operationId.toLowerCase(), revalidated(entry)])),
+    }),
+    refresh: (manifestIds) => {
+      for (const manifestId of manifestIds) {
+        factory.register(registered(store.get(manifestId)!.manifest, crossings));
+      }
+    },
+    ready: () => true,
+  });
+  assert.equal(result.status, 'ready');
+  if (result.status !== 'ready') return;
+  assert.deepEqual(result.operationIds, ops.map((entry) => entry.operationId).sort());
+});
+
+test('a literal slug still absent after provisioning refuses naming that operation — never ready with a subset', async () => {
+  // The failure shape behind fifteen silent refusals: two named reads were
+  // missing, provisioning came back ok having installed only one, and the
+  // step must NOT proceed with the operations it happens to have.
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const present = manifest('SLACK_FETCH_CONVERSATION_HISTORY', 'read');
+  const provisionedRead = manifest('GOOGLESHEETS_BATCH_GET', 'read');
+  const store = createCapabilityManifestStore([present]);
+  let provisionCalls = 0;
+  const result = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: [
+      'Pull with `SLACK_FETCH_CONVERSATION_HISTORY`.',
+      'Resolve authors with `SLACK_RETRIEVE_DETAILED_USER_INFORMATION`.',
+      'Read the tracker with `GOOGLESHEETS_BATCH_GET`.',
+    ].join(' '),
+    allowedTools: ['*'],
+    acceptedSource: {
+      sessionId: 'workflow:partial-provision',
+      sourceUserSeq: 1,
+      acceptedInput: 'immutable workflow source',
+    },
+  }, {
+    manifestStore: store,
+    catalogFactory: createHostCapabilityCatalogFactory(),
+    provisionExactOperations: async ({ operationIds }) => {
+      provisionCalls += 1;
+      assert.deepEqual(operationIds, ['GOOGLESHEETS_BATCH_GET', 'SLACK_RETRIEVE_DETAILED_USER_INFORMATION']);
+      assert.equal(store.install(provisionedRead).ok, true);
+      return { ok: true };
+    },
+    revalidate: async () => {
+      assert.fail('a subset must refuse before revalidation');
+    },
+  });
+  assert.equal(provisionCalls, 1);
+  assert.deepEqual(result, {
+    status: 'refused',
+    reason: 'exact_operation_manifest_missing_after_provision',
+    operationId: 'SLACK_RETRIEVE_DETAILED_USER_INFORMATION',
+  });
+});
+
 test('preflight cannot report ready when exact provisioning returns without installing the manifest', async () => {
   const result = await prepareWorkflowStepExternalCatalog({
     immutablePrompt: 'Use SLACK_RETRIEVE_DETAILED_USER_INFORMATION.',
