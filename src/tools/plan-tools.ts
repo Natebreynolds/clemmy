@@ -86,6 +86,22 @@ import {
 
 const MAX_PREAMBLE_CHARS = 1_000;
 
+/** Admission's own pre-persist refusal for a graph that compiled to a non-act
+ * route (admit-and-compile-accepted-source.ts). plan_task maps it to the same
+ * typed `plan_not_required` the model already knows how to walk, so the
+ * compiler owns the route and the model contract does not change. */
+const NON_ACTION_GRAPH_ADMISSION_REASON = 'plan_task may persist only an admitted action graph';
+
+/** One graph-neutral read needs no graph: call_tool once. Both the shape
+ * short-circuit and the compiler-route refusal return these exact bytes. */
+const GRAPH_NEUTRAL_READ_REFUSAL = Object.freeze({
+  ok: false,
+  code: 'plan_not_required',
+  detail: 'plan_task is only for action work or an exact reviewed Clementine-local read; use a graph-neutral read otherwise.',
+  repair: 'Call call_tool exactly once with the exact graph-neutral read operation and schema already disclosed for this request. Do not call plan_task for this read.',
+  recoveryTool: 'call_tool',
+});
+
 type PlanTaskPreparationTestHooks = {
   afterGraphIntentPersisted?: (identity: {
     sessionId: string;
@@ -1251,12 +1267,27 @@ async function executePlanTask(
       (readBindingCounts.get(binding.operationId) ?? 0) + 1,
     );
   }
-  const readOnlyDraft = input.draft.destination === null
+  // Only the shape that needs no graph is refused before admission: one
+  // once-cardinality read of a single record (coverage 'single' or none) with
+  // no destination and no counted/structured collection contract. Every other
+  // read-only draft — a complete_set, accepted_set, or resolved_operation
+  // read, a counted set — is graph work whose route the compiler owns; a
+  // lexical guess here refused a complete_set calendar read, its sibling
+  // work_call was refused with it, nothing dispatched, and the turn still
+  // published "done" (11788). Admission refuses non-act graphs before any
+  // persist, and that refusal maps to the same typed answer below.
+  const soleOperation = input.draft.topology.operations.length === 1
+    ? input.draft.topology.operations[0]!
+    : null;
+  const graphNeutralReadDraft = input.draft.destination === null
+    && (input.draft.cardinality === null
+      || (input.draft.cardinality.count === 1 && !input.draft.cardinality.locator))
     && input.draft.bindings.length === 1
-    && input.draft.topology.operations.length === 1
-    && input.draft.topology.operations.every((operation) => operation.effect === 'read');
-  const reviewedLocalReadPlan = readOnlyDraft
-    && input.draft.destination === null
+    && soleOperation !== null
+    && soleOperation.effect === 'read'
+    && (soleOperation.coverage === 'single' || soleOperation.coverage === null)
+    && soleOperation.cardinality.kind === 'once';
+  const reviewedLocalReadPlan = graphNeutralReadDraft
     && input.draft.topology.operations.every((operation) => (
       readBindingCounts.get(operation.id) === 1
     ))
@@ -1273,27 +1304,28 @@ async function executePlanTask(
         && local.definition.reversibility === 'read_only'
         && local.definition.descriptor.destinationPosture === null;
     }))).every(Boolean);
-  if (
-    readOnlyDraft
-    && !reviewedLocalReadPlan
-  ) {
-    return JSON.stringify({
-      ok: false,
-      code: 'plan_not_required',
-      detail: 'plan_task is only for action work or an exact reviewed Clementine-local read; use a graph-neutral read otherwise.',
-      repair: 'Call call_tool exactly once with the exact graph-neutral read operation and schema already disclosed for this request. Do not call plan_task for this read.',
-      recoveryTool: 'call_tool',
-    });
+  if (graphNeutralReadDraft && !reviewedLocalReadPlan) {
+    return JSON.stringify(GRAPH_NEUTRAL_READ_REFUSAL);
   }
-  const logical = currentLogicalCall();
-  if (!logical || logical.logicalToolCallId !== logical.logicalToolCallId.trim()) {
-    throw new Error('plan_task lost its exact logical-call identity before graph admission');
-  }
-  const planIdentity = {
-    sessionId,
-    sourceUserSeq,
-    acceptedTaskId: logical.acceptedTaskId,
-    logicalToolCallId: logical.logicalToolCallId,
+  // The exact logical-call identity is needed only once a graph is about to
+  // persist (the immutable seal intent commits in that same transaction) and
+  // again after admission. Requiring it BEFORE admission turned every typed
+  // pre-admission refusal — namespace conflict, plan_not_required, account
+  // selection, missing write — into a thrown Error that the SDK laundered
+  // into "An error occurred while running the tool" (12041). The frame is an
+  // AsyncLocalStorage store, so it is visible inside the synchronous persist
+  // callback of this same async chain.
+  const requirePlanIdentity = (stage: string) => {
+    const logical = currentLogicalCall();
+    if (!logical || logical.logicalToolCallId !== logical.logicalToolCallId.trim()) {
+      throw new Error(`plan_task lost its exact logical-call identity before ${stage}`);
+    }
+    return {
+      sessionId,
+      sourceUserSeq,
+      acceptedTaskId: logical.acceptedTaskId,
+      logicalToolCallId: logical.logicalToolCallId,
+    };
   };
   const deliveryOwner = context.onConversationPreamble
     ? 'carrier_owned' as const
@@ -1308,7 +1340,7 @@ async function executePlanTask(
     onFirstPersistInTransaction: (db, graphEvent) => {
       recordPlanTaskBindingSealIntentInTransaction({
         db,
-        identity: planIdentity,
+        identity: requirePlanIdentity('graph persistence'),
         graphEvent,
         objective,
         operationIds,
@@ -1318,6 +1350,12 @@ async function executePlanTask(
     },
   });
   if (!planned.ok) {
+    // The compiler routed this proposal as non-action work and admission
+    // refused it before any persist: the same graph-neutral answer, from the
+    // route owner rather than from a lexical guess.
+    if (planned.reason === NON_ACTION_GRAPH_ADMISSION_REASON) {
+      return JSON.stringify(GRAPH_NEUTRAL_READ_REFUSAL);
+    }
     // Admission may have promoted an exact same-source staged ref that the
     // initial eight-slot display card withheld. Re-read the opaque authority
     // so repair names the ref the model actually cited instead of sending it
@@ -1363,6 +1401,7 @@ async function executePlanTask(
       recoveryTool,
     });
   }
+  const planIdentity = requirePlanIdentity('binding seal');
   const sealIntent = exactPlanTaskBindingSealIntent({ sessionId, sourceUserSeq });
   if (
     !sealIntent
