@@ -201,17 +201,35 @@ function runnerSourceSnippet(entry: WorkflowEntry, runner: string): { path: stri
   }
 }
 
+/** Legacy scripts are inlined into the prompt (bounded) so the turn spends
+ * zero lookups paging a result handle: live 2026-09-01 a 42 KB script read
+ * through read_file + recall_tool_result was three "no-progress" lookups to
+ * the governor and the turn was terminalized before authoring began. */
+export const WORKFLOW_IMPROVEMENT_INLINE_SOURCE_MAX_BYTES = 96 * 1024;
+
 export function buildWorkflowImprovementPrompt(input: {
   request: WorkflowImprovementRequest;
   entry: WorkflowEntry;
 }): string {
   const { request, entry } = input;
-  const sources = request.runners.map((runner) => {
+  const sources: string[] = [];
+  const inlined: string[] = [];
+  let inlineBudget = WORKFLOW_IMPROVEMENT_INLINE_SOURCE_MAX_BYTES;
+  for (const runner of request.runners) {
     const source = runnerSourceSnippet(entry, runner.runner);
-    return source
-      ? `- step "${runner.stepId}" (${runner.kind}): ${source.path} (${source.bytes.length} bytes; read it with read_file)`
-      : `- step "${runner.stepId}" (${runner.kind}): ${runner.runner} (file not found under the workflow directory — re-author from the step's output contract and the workflow goal)`;
-  });
+    if (!source) {
+      sources.push(`- step "${runner.stepId}" (${runner.kind}): ${runner.runner} (file not found under the workflow directory — re-author from the step's output contract and the workflow goal)`);
+      continue;
+    }
+    const bytes = Buffer.byteLength(source.bytes, 'utf8');
+    if (bytes <= inlineBudget) {
+      inlineBudget -= bytes;
+      sources.push(`- step "${runner.stepId}" (${runner.kind}): ${source.path} (${bytes} bytes; full source included below — do not re-read it)`);
+      inlined.push(`===== BEGIN legacy script for step "${runner.stepId}": ${runner.runner} =====`, source.bytes, `===== END legacy script for step "${runner.stepId}" =====`);
+    } else {
+      sources.push(`- step "${runner.stepId}" (${runner.kind}): ${source.path} (${bytes} bytes; too large to inline — read it with read_file in as few calls as possible)`);
+    }
+  }
   return [
     `Workflow self-improvement: "${request.slug}" (definition file: ${entry.filePath}).`,
     '',
@@ -223,10 +241,11 @@ export function buildWorkflowImprovementPrompt(input: {
     '',
     'Binding rules:',
     '1. Preserve WHAT the workflow does and where it sends: its name, goal and success criteria, trigger/schedule/timezone, resources, enabled flag, every step\'s requiresApproval flag, and every destination (channel ids, recipients, spreadsheet ids). You may only change HOW a step does its work.',
-    '2. First read the current definition with workflow_get (section "full"), then read each legacy script with read_file.',
+    '2. First read the current definition with workflow_get (section "full"). The legacy script source you need is included at the end of this message; do not spend calls re-reading it.',
     '3. Re-author each legacy script step as exact `call` steps for the external reads/writes the script performed — one call step per provider operation, with the exact operation name (use tool_search to find the exact reviewed CLI read or provider action; do not invent names) and the literal arguments the script used — plus a `transform` step or a short prose step for the pure computation/rendering the script did. Keep the same output contract (required_keys / non_empty) that downstream steps consume; if the old step produced several fields, the last new step must produce all of them.',
     '4. Write the improved definition with workflow_update, sending the COMPLETE steps array (it replaces the whole graph). Do not disable the workflow. Do not change its name.',
     '5. End with a 3–6 line plain-language note for the user: which step changed, what it does now, and anything they should glance at.',
+    ...(inlined.length > 0 ? ['', ...inlined] : []),
   ].join('\n');
 }
 
