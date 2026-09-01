@@ -155,7 +155,10 @@ test('CREATE + compute noun is a read; durable creations stay writes', async () 
 test('consequence is derived from the action\'s own verb — invented tools, randomized names', () => {
   // RANDOMIZED so no slug list, provider name, or incident-specific rule can
   // pass this. The verbs are the only thing carrying meaning.
-  const nonce = Math.random().toString(36).slice(2, 8).toUpperCase();
+  // Letters only: actionTokens splits digit→uppercase, so a base36 nonce such
+  // as X5POST tokenizes to a real verb (`POST` → send) and the randomized
+  // app/noun stop being verb-free (flaked once in the 2026-09-01 full suite).
+  const nonce = Math.random().toString(36).replace(/[^a-z]/g, '').padEnd(6, 'q').slice(0, 6).toUpperCase();
   const app = `ZZ${nonce}`;
   const noun = `WIDGET${nonce}`;
 
