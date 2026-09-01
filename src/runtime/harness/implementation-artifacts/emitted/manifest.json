@@ -195,7 +195,7 @@
           "bytes": 13483
         },
         "src/agents/plan-scope.ts": {
-          "bytes": 46986
+          "bytes": 47635
         },
         "src/agents/tool-observability.ts": {
           "bytes": 8049
@@ -1857,7 +1857,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 712142
+          "bytes": 712346
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 143354
@@ -2664,7 +2664,7 @@
           "bytes": 13483
         },
         "src/agents/plan-scope.ts": {
-          "bytes": 46986
+          "bytes": 47635
         },
         "src/agents/tool-observability.ts": {
           "bytes": 8049
@@ -4326,7 +4326,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 712142
+          "bytes": 712346
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 143354
