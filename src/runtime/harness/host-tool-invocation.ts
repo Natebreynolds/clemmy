@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import pino from 'pino';
 import {
   acceptedTaskIdFor,
   withLogicalToolCall,
@@ -150,6 +151,8 @@ export interface HostToolInvocationResult<T> {
   value: T;
   settlement: SettledToolAttempt;
 }
+
+const hostToolInvocationLogger = pino({ name: 'clementine.harness.host-tool-invocation' });
 
 const RECOVERY_EFFECTS = new Set<RuntimeToolEffect>([
   'read',
@@ -1376,7 +1379,9 @@ export async function invokeHostToolCall<T>(
               },
             });
           };
-          const adoptedNestedSettlement = (): SettledToolAttempt => {
+          const adoptedNestedSettlement = (
+            returned?: { value: unknown },
+          ): SettledToolAttempt => {
             const redeemed = redeemDurableLogicalCallSettlementForHost({
               sessionId: input.identity.sessionId,
               sourceUserSeq: input.identity.sourceUserSeq,
@@ -1384,6 +1389,50 @@ export async function invokeHostToolCall<T>(
               logicalToolCallId: modelCallId,
             });
             if (redeemed.status !== 'ok') {
+              // A nested-owned carrier whose INNER call was a host-local
+              // control (no physical crossing was ever reserved under this
+              // call), returned normally, and is bound non-mutating by its
+              // frozen contract has nothing a provider row could contradict:
+              // the host settles the observed result itself. Live 2026-09-01
+              // (platform-49 on GLM): composio_execute_tool carried
+              // composio_search_tools; the search ran locally and returned,
+              // no inner settlement was written, and failing closed here
+              // conflicted the projection receipt, lost the batch's host root
+              // and parked the whole run as "interrupted". Any crossing, any
+              // mutation, or any upgrade of the frozen contract still fails
+              // closed exactly as before.
+              const observedNow = currentHostToolInvocationObservation();
+              // Durable rows, not the in-memory marker: an inner dispatcher
+              // may record its crossing through its own identities without
+              // ever reserving through this wrapper.
+              const durableCrossings = redeemed.status === 'missing' && returned !== undefined
+                ? (openEventLog().prepare(`
+                    SELECT COUNT(*) AS n FROM physical_dispatches
+                     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+                  `).get(
+                    input.identity.sessionId,
+                    input.identity.sourceUserSeq,
+                    modelCallId,
+                  ) as { n: number }).n
+                : -1;
+              if (
+                redeemed.status === 'missing'
+                && returned !== undefined
+                && topCrossing === undefined
+                && durableCrossings === 0
+                && !isMutating
+                && observedNow?.mutating !== true
+                && !(observedNow?.businessCall === true && !frozenBusinessCall)
+              ) {
+                hostToolInvocationLogger.warn({
+                  sessionId: input.identity.sessionId,
+                  sourceUserSeq: input.identity.sourceUserSeq,
+                  callId: modelCallId,
+                  tool: input.identity.toolName,
+                  reason: redeemed.reason,
+                }, 'nested-owned local control returned without its own durable settlement; host settled the non-mutating result');
+                return logicalSettlement({ result: returned.value, resultPresent: true });
+              }
               throw new HostToolInvocationAuthorityError(
                 `nested-owned logical settlement is ${redeemed.status}: ${redeemed.reason}`,
               );
@@ -1601,7 +1650,7 @@ export async function invokeHostToolCall<T>(
                     }
                   }
                   const settlement = input.boundary === 'nested_owned'
-                    ? adoptedNestedSettlement()
+                    ? adoptedNestedSettlement({ value })
                     : logicalSettlement({ result: value, resultPresent: true });
                   if (contract.toolName === 'plan_task') {
                     enforceSettledPlanTaskResult({

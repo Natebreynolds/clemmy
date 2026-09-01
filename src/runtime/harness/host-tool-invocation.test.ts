@@ -1685,6 +1685,40 @@ test('nested wrappers settle once inside and the host adopts that exact durable 
   leases.revokeDispatchLease(task.parentLease);
 });
 
+test('a nested-owned LOCAL control that returns without its own settlement and without any crossing is settled by the host; a mutating one still fails closed', async () => {
+  // Live 2026-09-01 (platform-49 on GLM): composio_execute_tool carried
+  // composio_search_tools; the search ran locally, returned, wrote no inner
+  // settlement and reserved no physical dispatch. Failing closed there
+  // conflicted the projection receipt and parked the run as "interrupted".
+  const task = fixture();
+  const result = await runCall(task, {
+    callId: 'model:nested-local-control',
+    boundary: 'nested_owned',
+    deadlineMs: 200,
+    invoke: async () => ({ successful: true, data: ['local search result'] }),
+  });
+  assert.deepEqual(result.value, { successful: true, data: ['local search result'] });
+  assert.equal(result.settlement.outcome.kind, 'succeeded');
+  assert.ok(
+    rows(task, 'model:nested-local-control').every((row) => row.execution_site === 'host'),
+    'no provider crossing exists; only the host settlement evidence row',
+  );
+  const settled = (eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS count FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, 'model:nested-local-control') as { count: number }).count;
+  assert.equal(settled, 1, 'the host settled the returned non-mutating result durably');
+
+  await assert.rejects(runCall(task, {
+    callId: 'model:nested-local-mutation',
+    boundary: 'nested_owned',
+    effect: 'external_write',
+    deadlineMs: 200,
+    invoke: async () => ({ successful: true, data: ['unsettled write'] }),
+  }), /nested-owned logical settlement is missing/);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('a marked nested provider adapter owns the one threw crossing without a host duplicate', async () => {
   const task = fixture();
   const callId = 'model:nested-provider-threw';
