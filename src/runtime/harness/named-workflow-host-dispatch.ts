@@ -157,6 +157,12 @@ function consumedWorkflowNameCorrection(input: {
  */
 export function acceptedSourceIsWorkflowInternal(sessionId: string, sourceUserSeq: number): boolean {
   if (sessionId.startsWith('workflow:')) return true;
+  // A self-improvement turn (workflow-self-improvement.ts) is host-authored
+  // text ABOUT a workflow that was asked to run; live 2026-09-01 the shortcut
+  // read that as a run request, tried to queue the workflow from a system
+  // session with no report-back target, and ended the turn before a single
+  // authoring call. Host-internal sources never manufacture run authority.
+  if (sessionId.startsWith('workflow-improvement:')) return true;
   if (getSession(sessionId)?.kind === 'workflow') return true;
   const accepted = listEvents(sessionId, {
     sinceSeq: sourceUserSeq - 1,

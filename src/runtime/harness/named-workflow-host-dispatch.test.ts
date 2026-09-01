@@ -420,6 +420,25 @@ test('tryHostDispatchNamedWorkflow: a workflow step\'s own accepted source never
   assert.equal(workflowRunFileCount(), 0, 'a step never queues a sibling run of its own workflow');
 });
 
+test('tryHostDispatchNamedWorkflow: a workflow self-improvement session is host-internal and never queues the workflow it is rewriting', () => {
+  // Live 2026-09-01: the improvement prompt says the workflow "was asked to
+  // run"; the shortcut queued it from the system session, could not bind a
+  // report-back target, and ended the turn before any authoring call.
+  seedSlackAndFacebook();
+  const text = 'Workflow self-improvement: "slack-digest". This saved workflow was asked to run but its readiness check refused it. Run it after the rewrite.';
+  const result = tryHostDispatchNamedWorkflow({
+    sessionId: `workflow-improvement:slack-digest:${Date.now()}`,
+    sourceUserSeq: 1,
+    userText: text,
+    route: 'act',
+  });
+  assert.deepEqual(result, {
+    status: 'not_applicable',
+    reason: 'accepted_source_is_workflow_internal',
+  });
+  assert.equal(workflowRunFileCount(), 0);
+});
+
 test('tryHostDispatchNamedWorkflow: a bindable workflow-internal source still never queues (load-bearing)', () => {
   seedSlackAndFacebook();
   const text = workflowStepAcceptedText('scorpion-facebook-trends', 'find_official_page');
