@@ -5369,7 +5369,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     } catch { /* a broken integration must not blank the whole list */ }
     try {
       const { getSavedClis } = await import('../runtime/saved-clis.js');
-      const { readPersistedHealth } = await import('../integrations/cli-catalog/auth-health.js');
+      const { readPersistedHealth, cliHealthStaleNote } = await import('../integrations/cli-catalog/auth-health.js');
       const health = Object.values(readPersistedHealth());
       for (const command of getSavedClis()) {
         const row = health.find((entry) => entry.command === command);
@@ -5384,7 +5384,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           kind: 'cli',
           state,
           cause: state === 'ok'
-            ? (row?.username ? `Signed in as ${row.username}` : null)
+            ? (row ? (cliHealthStaleNote(row) ?? (row.username ? `Signed in as ${row.username}` : null)) : null)
             : !row
               ? 'Not checked yet'
               : !row.installed

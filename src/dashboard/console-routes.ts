@@ -1532,7 +1532,7 @@ async function workflowCliConnectionCheck(item: WorkflowToolReadinessItem): Prom
   const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
   const entry = CLI_CATALOG.find((candidate) => candidate.command === command);
   if (!entry) return null;
-  const { readPersistedHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  const { readPersistedHealth, cliHealthStaleNote } = await import('../integrations/cli-catalog/auth-health.js');
   const health = readPersistedHealth()[entry.id];
   const installed = health?.installed ?? item.status === 'ready';
   const signedOut = installed && health?.authStatus === 'signed_out';
@@ -1574,7 +1574,7 @@ async function workflowCliConnectionCheck(item: WorkflowToolReadinessItem): Prom
       : `CLI "${command}" is installed but signed out.`,
     evidence: [
       `cli_command:${command}=${installed ? 'installed' : 'missing'}`,
-      ...(health ? [`auth:${health.authStatus}${health.username ? ` (${health.username})` : ''} @ ${health.checkedAt}`] : []),
+      ...(health ? [`auth:${health.authStatus}${health.username ? ` (${health.username})` : ''} @ ${health.checkedAt}${cliHealthStaleNote(health) ? ` — ${cliHealthStaleNote(health)}` : ''}`] : []),
     ],
     nextActions,
   };

@@ -60,7 +60,7 @@ export function registerCliSetupTools(server: McpServer): void {
 }
 
 async function statusAction(): Promise<ReturnType<typeof textResult>> {
-  const { getRosterHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  const { getRosterHealth, cliHealthStaleNote } = await import('../integrations/cli-catalog/auth-health.js');
   const { findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
   const roster = await getRosterHealth();
   if (roster.length === 0) {
@@ -71,7 +71,7 @@ async function statusAction(): Promise<ReturnType<typeof textResult>> {
     .map((h) => {
       const entry = findCatalogEntry(h.id);
       const state = !h.installed ? 'NOT INSTALLED'
-        : h.authStatus === 'ok' ? `signed in${h.username ? ` as ${h.username}` : ''}`
+        : h.authStatus === 'ok' ? `signed in${h.username ? ` as ${h.username}` : ''}${cliHealthStaleNote(h) ? ` (${cliHealthStaleNote(h)})` : ''}`
         : h.authStatus === 'signed_out' ? 'SIGNED OUT'
         : h.authStatus === 'error' ? 'auth check failed'
         : 'installed (auth state unknown)';
