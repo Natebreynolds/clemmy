@@ -376,6 +376,45 @@ test('a revoked manifest is never counted as supplied and is still evicted by th
     'a frozen source whose row was revoked fails closed instead of binding a retired callable');
 });
 
+test('an unchanged manifest whose current observation is refused is still evicted before planning', async () => {
+  const session = eventlog.createSession({ id: 'prime-guard-refused-observation', kind: 'chat' });
+  const { sourceUserSeq } = verifiedReadProof(session.id);
+  // Byte-exact row against an unchanged installed manifest, but NO fresh
+  // independent observation and a provider that now says the operation is gone.
+  const store = manifestStores.createCapabilityManifestStore([manifest]);
+  manifestStores.installCapabilityManifestStore(store);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  factory.register(directShapeRow());
+  const counts = { observe: 0, invoke: 0 };
+  adapters.installProductionCapabilityAdapter(adapters.createProductionCapabilityAdapter({
+    factory,
+    store,
+    observe: {
+      native_mcp: () => {
+        counts.observe += 1;
+        return 'missing';
+      },
+    },
+    invokePorts: () => ({
+      invoke: async () => {
+        counts.invoke += 1;
+        return { data: [] };
+      },
+    }),
+  }));
+
+  const primed = await indexed.registerIndexedCapabilitiesForTurn({
+    sessionId: session.id,
+    sourceUserSeq,
+    objective: REQUEST,
+  });
+  assert.deepEqual(primed.registered, [], 'a refused capability is not planning supply');
+  assert.equal(counts.observe, 1, 'byte-match without a fresh observation must re-observe, exactly as the adapter keep-branch requires');
+  assert.equal(factory.get(CAPABILITY_ID), undefined, 'a refused refresh cannot retain stale callable bytes');
+  assert.equal(counts.invoke, 0);
+});
+
 test('a second session priming the same manifest does not break the first source\'s freeze', async () => {
   const first = eventlog.createSession({ id: 'prime-guard-first-session', kind: 'chat' });
   const { sourceUserSeq } = verifiedReadProof(first.id);

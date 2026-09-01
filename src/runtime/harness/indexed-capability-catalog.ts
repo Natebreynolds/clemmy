@@ -345,6 +345,36 @@ function catalogEntryMatchesInstalledManifest(
   }
 }
 
+/** The same proof the adapter's own keep-branch demands before it reuses a
+ * still-callable row: a FRESH independent observation of exactly this
+ * operation/account whose bytes match the installed manifest. An unchanged
+ * manifest whose provider now refuses the account/operation has no such
+ * observation, and a byte-exact row must not outlive that refusal. */
+function installedManifestHasFreshIndependentObservation(
+  installed: InstalledCapabilityManifest,
+): boolean {
+  const manifest = currentCapabilityManifest(installed.manifest);
+  if (!manifest) return false;
+  let observation: ReturnType<typeof independentlyObserveCapability>;
+  try {
+    observation = independentlyObserveCapability(manifest.operationId, manifest.accountId);
+  } catch {
+    return false;
+  }
+  return Boolean(
+    observation
+    && observation.origin === 'independent'
+    && observationIsFresh(observation)
+    && observationMatchesManifest(manifest, {
+      definitionFingerprint: observation.definitionFingerprint,
+      providerVersion: observation.providerVersion,
+      operationVersion: observation.operationVersion,
+      accountId: observation.accountId,
+      observedAt: observation.observedAt,
+    }).ok,
+  );
+}
+
 export function catalogEntriesForAcceptedSource(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -490,32 +520,23 @@ export async function registerIndexedCapabilitiesForTurn(input: {
   // stays exact; nothing persisted is rewritten. Revoked/superseded manifests
   // are never selected above (they have no current manifest), so they are
   // still evicted by readiness refresh and re-proved at every crossing.
-  // A byte-exact row is kept only while a FRESH independent observation still
-  // backs it (the adapter's own keep-branch predicate). Without one — or after
-  // a refused current observation — the row takes the forget+refresh path, so
-  // a provider that revoked the account/operation evicts the stale callable
-  // bytes before planning instead of being preserved by the manifest match.
+  // Byte-match alone is not enough: an UNCHANGED manifest whose provider now
+  // refuses the account/operation shows up as a missing or stale independent
+  // observation, not as a changed manifest. Keeping such a row would let a
+  // refused capability outlive its refusal, so the skip demands exactly what
+  // the adapter's keep-branch demands — a fresh, independent, manifest-
+  // matching observation (recovery reproof and proof provisioning register
+  // one). Anything less takes forget+refresh, which re-observes and evicts.
   const alreadySupplied = new Set<string>();
   for (const manifestId of manifestIds) {
     const current = factory.get(manifestId);
     const installed = selected.get(manifestId);
-    if (!current || !installed) continue;
-    const manifest = currentCapabilityManifest(installed.manifest);
-    if (!manifest) continue;
-    const priorIndependent = independentlyObserveCapability(manifest.operationId, manifest.accountId);
     if (
-      catalogEntryIsAttested(current)
+      current
+      && installed
+      && catalogEntryIsAttested(current)
       && catalogEntryMatchesInstalledManifest(current, installed)
-      && priorIndependent
-      && priorIndependent.origin === 'independent'
-      && observationIsFresh(priorIndependent)
-      && observationMatchesManifest(manifest, {
-        definitionFingerprint: priorIndependent.definitionFingerprint,
-        providerVersion: priorIndependent.providerVersion,
-        operationVersion: priorIndependent.operationVersion,
-        accountId: priorIndependent.accountId,
-        observedAt: priorIndependent.observedAt,
-      }).ok
+      && installedManifestHasFreshIndependentObservation(installed)
     ) alreadySupplied.add(manifestId);
   }
   // Scoped refresh is essential: a turn nominated these exact manifests, so

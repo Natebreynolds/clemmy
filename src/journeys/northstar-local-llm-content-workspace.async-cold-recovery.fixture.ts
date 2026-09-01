@@ -43,6 +43,11 @@ import { primePrimaryModelPlanningCatalog } from '../runtime/semantic-boundary/a
 import * as composioTools from '../tools/composio-tools.js';
 import * as innerDispatch from '../tools/inner-dispatch.js';
 import * as localRuntimeTools from '../tools/local-runtime-tools.js';
+import {
+  ASYNC_SELECTED_URLS,
+  RAW_HTML_ONLY_HOSTILE_TOKEN,
+  asyncCompletedPages,
+} from './northstar-local-llm-content-workspace.async-pages.fixture.js';
 
 const MARKER = '@@CLEM_NORTHSTAR_ASYNC_COLD_RECOVERY@@';
 const PROMPT = 'Hey Clem can you scape the top recent news about local LLM processing and help me write a content calendar and 5 social post using the marketing skills. Drop all this in a workspace so i can see it.';
@@ -59,15 +64,9 @@ const TITLE = 'Host-Verified Local LLM Content Calendar';
 const MOBILE_LINK = `/m/?tab=spaces&workspace=${SLUG}`;
 const FINAL_REPLY = `Created [${TITLE}](/workspaces/${SLUG}) from three host-verified recent articles, with a three-week calendar and five complete posts. [Open it on mobile](${MOBILE_LINK}).`;
 const SKILL_RULE_MARKER = 'SOURCE-DATED-CALENDAR-ONE-IDEA-PER-POST';
-const RAW_HTML_SENTINEL = 'RAWHTML_ONLY_HOSTILE_SENTINEL_7F3B19D2_NEVER_PROJECT';
-
-const SELECTED_URLS = Object.freeze([
-  'https://research.example.test/local-llm/on-device-inference-benchmark',
-  'https://research.example.test/local-llm/private-assistant-rollout',
-  'https://research.example.test/local-llm/small-model-evaluation',
-  'https://research.example.test/local-llm/archived-device-overview',
-  'https://research.example.test/local-llm/deployment-field-notes',
-]);
+// Shared with the in-process journey so every PID serves identical page bytes.
+const RAW_HTML_SENTINEL = RAW_HTML_ONLY_HOSTILE_TOKEN;
+const SELECTED_URLS = ASYNC_SELECTED_URLS;
 
 type Input = {
   mode: 'resume' | 'replay';
@@ -324,23 +323,6 @@ const GET_OUTPUT = Object.freeze({
   },
 });
 
-function articlePage(url: string, publishedAt: string, body = ''): string {
-  return `<!doctype html><html><head><script type="application/ld+json">${JSON.stringify({
-    '@context': 'https://schema.org', '@type': 'NewsArticle', '@id': url, url,
-    datePublished: publishedAt,
-  })}</script></head><body><article>${body}</article></body></html>`;
-}
-
-function completedPages() {
-  return [
-    { rawHtml: articlePage(SELECTED_URLS[0]!, '2026-08-25'), metadata: { sourceURL: SELECTED_URLS[0], statusCode: 200 } },
-    { rawHtml: '<html><head><meta property="article:published_time" content="2026-08-21T12:00:00Z"></head><body></body></html>', metadata: { sourceURL: SELECTED_URLS[1], statusCode: 200 } },
-    { rawHtml: `<html><body><time itemprop="datePublished" datetime="2026-08-13">2026-08-13</time>${RAW_HTML_SENTINEL}</body></html>`, metadata: { sourceURL: SELECTED_URLS[2], statusCode: 200 } },
-    { rawHtml: articlePage(SELECTED_URLS[3]!, '2026-06-10'), metadata: { sourceURL: SELECTED_URLS[3], statusCode: 200 } },
-    { rawHtml: articlePage('https://unrelated.example.test/not-selected', '2026-08-20'), metadata: { sourceURL: SELECTED_URLS[4], statusCode: 200 } },
-  ];
-}
-
 function toolDefinitions() {
   return [
     { slug: NEWS_OPERATION, name: 'Search', description: 'Performs a web search for a query, scrapes content from the top search results using Firecrawl, and returns web, news, and image results.', toolkit: { slug: 'firecrawl' }, inputParameters: SEARCH_INPUT, outputParameters: SEARCH_OUTPUT, version: VERSION },
@@ -398,7 +380,7 @@ function configureProvider(getCalls: { n: number }): void {
       data: {
         status: 'completed', total: SELECTED_URLS.length, completed: SELECTED_URLS.length,
         creditsUsed: SELECTED_URLS.length, expiresAt: '2026-09-01T00:00:00Z',
-        data: completedPages(),
+        data: asyncCompletedPages(),
       },
     };
   });
