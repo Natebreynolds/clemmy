@@ -5231,6 +5231,7 @@ async function runConversationWithinRuntimeConfig(
         steps: 0,
         lastTurn: acceptedSource.turn,
         blockedResumable: false,
+        blockedReason: 'plan_task_seal_recovery_expired',
         error: `I retained the accepted plan but could not restore its exact capability bindings after ${heldMinutes} minutes (${recoveredPreparation.reason}). Nothing was started. Send the request again and I will plan it fresh.`,
       };
     }
