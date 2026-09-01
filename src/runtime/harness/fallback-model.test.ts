@@ -1183,3 +1183,51 @@ test('a tracing bug is NEVER an auth failure: "No existing trace found" does not
   assert.notEqual(classifyModelError(err).kind, 'model.auth_expired');
   assert.equal(isAuthRecoverableError(err), false, 'tracing errors must not read as credential failures');
 });
+
+test('a silent cooldown never preselects away from the brain the USER pinned (Claude subscription pin)', async () => {
+  // Live 2026-09-01: the user switched the brain to Sonnet 5; an earlier turn's
+  // first-byte timeout had put it in silent cooldown, and the next turn was
+  // preselected onto GLM without ever trying the brain the user asked for.
+  const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
+  reviveDeadBrains();
+  const priorAuth = process.env.AUTH_MODE;
+  const priorClaude = process.env.CLAUDE_MODEL;
+  process.env.AUTH_MODE = 'claude_oauth';
+  process.env.CLAUDE_MODEL = 'pinned-sonnet-test';
+  try {
+    let pinnedMode: 'timeout' | 'ok' = 'timeout';
+    let pinnedCalls = 0;
+    let rescueCalls = 0;
+    const pinned = model({ getResponse: async () => {
+      pinnedCalls += 1;
+      if (pinnedMode === 'ok') return resp('pinned answered');
+      throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'pinned stayed silent' });
+    } });
+    const rescue = model({ getResponse: async () => { rescueCalls += 1; return resp('rescue answered'); } });
+    const chain = () => withModelFallback([target('pinned-sonnet-test', pinned), target('claude:rescue', rescue)]);
+
+    await chain().getResponse(req());
+    await chain().getResponse(req());
+    assert.equal(isBrainSilenced('pinned-sonnet-test'), true, 'two silent failures put the pinned brain in cooldown');
+    assert.equal(rescueCalls, 2);
+
+    pinnedMode = 'ok';
+    // The same cooldown on a NON-pinned brain is still preselected away…
+    process.env.CLAUDE_MODEL = 'some-other-model';
+    const rescuedAgain = await chain().getResponse(req());
+    assert.ok(JSON.stringify(rescuedAgain).includes('rescue answered'));
+    assert.equal(pinnedCalls, 2, 'an un-pinned silenced brain is not tried during its cooldown');
+    assert.equal(rescueCalls, 3);
+
+    // …while the brain the user PINNED is tried, not skipped.
+    process.env.CLAUDE_MODEL = 'pinned-sonnet-test';
+    const res = await chain().getResponse(req());
+    assert.ok(JSON.stringify(res).includes('pinned answered'), 'the pinned brain is TRIED, not skipped, while in cooldown');
+    assert.equal(pinnedCalls, 3);
+    assert.equal(rescueCalls, 3, 'no silent brain steal');
+  } finally {
+    if (priorAuth === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = priorAuth;
+    if (priorClaude === undefined) delete process.env.CLAUDE_MODEL; else process.env.CLAUDE_MODEL = priorClaude;
+    reviveDeadBrains();
+  }
+});

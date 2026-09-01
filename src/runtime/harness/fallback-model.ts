@@ -703,9 +703,24 @@ export function reviveDeadBrains(label?: string): void {
 
 /** The brain the user explicitly pinned as THE brain (Settings → Models).
  *  Auth trouble on it is the user's credential edge, never a silent switch. */
+/** The brain the USER selected as the active brain, by chain label: a BYO pin
+ * (BYO_BRAIN_MODEL_ID), the Claude subscription model when the active auth
+ * mode is claude_oauth, or the Codex primary when it is codex_oauth. Live
+ * 2026-09-01: only the BYO pin counted, so a turn the user explicitly moved
+ * to Sonnet 5 was preselected onto GLM by a silent cooldown. */
 function isUserPinnedBrain(label: string): boolean {
-  const pinned = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
-  return pinned.length > 0 && label === pinned;
+  const byo = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
+  if (byo.length > 0 && label === byo) return true;
+  const authMode = (getRuntimeEnv('AUTH_MODE', '') || '').trim();
+  if (authMode === 'claude_oauth') {
+    const claude = (getRuntimeEnv('CLAUDE_MODEL', '') || '').trim();
+    return claude.length > 0 && label === claude;
+  }
+  if (authMode === 'codex_oauth') {
+    const codex = (getRuntimeEnv('OPENAI_MODEL_PRIMARY', '') || '').trim();
+    return codex.length > 0 && label === codex;
+  }
+  return false;
 }
 
 /** True when this error is the auth class that should stick. */
@@ -775,7 +790,12 @@ export class FallbackModel implements Model {
       // reconnect edge instead of a silent brain steal.
       if (isBrainAuthDead(target.label) && !isUserPinnedBrain(target.label)) return 'preselected-auth-dead';
       if (isBrainRateLimited(target.label)) return 'preselected-rate-limited';
-      if (isBrainSilenced(target.label)) return 'preselected-silent-cooldown';
+      // The same rule for a silent cooldown: the brain the USER pinned is
+      // tried, not skipped — if it stays silent the ordinary first-byte
+      // fallover still switches. Live 2026-09-01: a turn the user explicitly
+      // asked to run on Sonnet 5 was preselected onto GLM because Sonnet had
+      // timed out once earlier in another turn.
+      if (isBrainSilenced(target.label) && !isUserPinnedBrain(target.label)) return 'preselected-silent-cooldown';
       return null;
     };
     const globallyAlive = compatible.filter((target) => exclusionReason(target) === null);
