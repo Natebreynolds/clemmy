@@ -465,7 +465,7 @@
           "bytes": 92077
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
-          "bytes": 23174
+          "bytes": 23898
         },
         "src/runtime/harness/expected-work-universe-seal.ts": {
           "bytes": 17347
@@ -1269,7 +1269,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 79738
+          "bytes": 79825
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -2202,7 +2202,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 297662
+          "bytes": 298450
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2940,7 +2940,7 @@
           "bytes": 92077
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
-          "bytes": 23174
+          "bytes": 23898
         },
         "src/runtime/harness/expected-work-universe-seal.ts": {
           "bytes": 17347
@@ -3744,7 +3744,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 79738
+          "bytes": 79825
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -4677,7 +4677,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 297662
+          "bytes": 298450
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
