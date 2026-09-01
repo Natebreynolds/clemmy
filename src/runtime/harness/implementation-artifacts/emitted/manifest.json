@@ -783,7 +783,7 @@
           "bytes": 10427
         },
         "src/agents/capability-envelope.ts": {
-          "bytes": 8386
+          "bytes": 9244
         },
         "src/runtime/harness/retained-work-terminal.ts": {
           "bytes": 7713
@@ -1266,7 +1266,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 78506
+          "bytes": 78878
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -3252,7 +3252,7 @@
           "bytes": 10427
         },
         "src/agents/capability-envelope.ts": {
-          "bytes": 8386
+          "bytes": 9244
         },
         "src/runtime/harness/retained-work-terminal.ts": {
           "bytes": 7713
@@ -3735,7 +3735,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 78506
+          "bytes": 78878
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739

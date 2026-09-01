@@ -22,14 +22,14 @@ isolated worktrees and were merged in order M → S → P → B → D → H → 
 | 1 | named-workflow shortcut on a workflow's own step | removed for workflow-internal sources (+ plan_task twin) |
 | 2 | schema refusal recommending a control the surface removes | exact failing paths + bounded subtree; retry same op; new failing-path set is progress; `repairKey` threaded through both mint paths; carrier sweep on `composio-batch-validator` |
 | 3 | prose-step reversible local writes → `coverage_missing` | authored-step receipt covers them (same seam as Sheets writes) |
-| 4 | authored external sends | __LC_RESULT__ |
+| 4 | authored external sends | `requiresApproval:false` → the same exact standing grant as writes; `true` → one approval card bound to the immutable step → exact resume once; one send per step attempt; `allowAnySend` deleted (ring LC part 3, 67/67 pins incl. the host acceptance suite) |
 | 5/6 | frozen card / "progressed" refusal | removed; prime extends the card with same-source disclosures |
 | 7 | sole work_call refused (schema fields not mirrored) | mirrored + connection pin |
 | 8 | plan_task throws / lexical read refusal + false done / substitute writes | typed refusals; compiler owns route; ask-only missing-write refusal (contract branch pinned) |
-| 9 | hard-cut `catalog_snapshot_identity_mismatch` | prime guard (byte-match to installed manifest + fresh non-refused observation); journey: __B_RESULT__ |
+| 9 | hard-cut `catalog_snapshot_identity_mismatch` | prime guard (byte-match to installed manifest + fresh non-refused observation) + a ready `continue` checkpoint is taken in the same `runConversation` call instead of waiting for the next recovery tick; journey fixtures share one source for the async S→R→W pages (ring B; catalog + continuation pins 23/23; hard-cut journey in the journeys run below) |
 | 10 | unprovisioned literal op → silent refusals | G0 refuses naming the op; G2 names it as a host fault |
 | 11 | "bounded internal host error", `blockedReason='blocked'` | machine reason + bounded `blockedDetail` persisted |
-| 12 | output-contract hard-fail on ordinary steps | __LC_CONTRACT_RESULT__ |
+| 12 | output-contract hard-fail on ordinary steps | ordinary contract-bearing steps get one evidence-fed repair beat through the existing loopUntil primitive (`maxAttempts: 2`); a second miss still fails `output_contract` |
 | 13 | readiness inventory ≠ executor registries | inventory = registry `localExecution` ∪ reviewed-CLI descriptors |
 | 14 | `sf` probe caches transients as auth errors | last-known-good kept + `staleSince`/`lastProbeError`, logged; surfaces say "checked Xh ago, last probe failed" |
 | 15 | binding-seal "held" forever | age budget (15 min from the intent's `recorded_at`) → one factual, non-resumable terminal; sweeps skip expired |
@@ -42,6 +42,44 @@ isolated worktrees and were merged in order M → S → P → B → D → H → 
 behind `json_valid`). The v3.14 → current two-boot rehearsal runs end to end again: its dependency
 proof now checks that every v3.14.0 package is present at its identical lock entry (extras such as
 `parse5` allowed) instead of demanding lock identity.
+
+### Live findings after the merge (owner's 02:00 PT phone tests + the 02:50 GLM baseline)
+Every one of these was read straight off the new `blockedReason`/`blockedDetail` fields — the first time
+in two weeks a failed run named its own cause.
+- **platform-49 (02:00):** the model needed `sheet_id` and selected a provider READ
+  (`GOOGLESHEETS_GET_SPREADSHEET_INFO`) that the six-operation frozen snapshot never carried →
+  `catalog_entry_or_manifest_missing`. Fix: a **JIT read edge** in `host-turn-runner.ts` — when the exact
+  production miss is a catalog miss for a carried operation, the host provisions that one definition
+  (bounded, once per operation per turn) and re-runs the same exact check; a READ binds through the
+  proven-live-read path, a WRITE still stops at the frozen/authored bar. Hooked where the refusal is
+  composed (`executeCall`), not only at the pre-approval site — the first attempt sat at the wrong site
+  and the pin caught it. Pinned both ways (READ dispatched once, WRITE still refused).
+- **friday-dashboard (02:00):** a structured `call:` step reported `not-connected` for
+  `salesforce_sf_soql_query` although readiness counted it ready — the live catalog only learned
+  reviewed-CLI operations through foreground `tool_search`. Fix: `ensureLiveReadCapabilityForOperation`
+  (`workflow-live-call-compiler.ts`) acquires the saved READ through the attested live-read registry
+  before compiling. Supply only; compile still re-proves candidate/account/effect. Pinned from an empty
+  catalog with a real sealed reviewed-CLI descriptor. `sf` itself was never the problem.
+- **platform-49 GLM baseline #1 (02:50, run `1788256203188-6dbf6b`):** two reads succeeded (Slack history,
+  Sheets batch_get, both retained as result handles), then one model frame carried nine refused
+  siblings; the no-progress projection mapped every refused call into `recoveryToolNames`, the governor
+  constructor threw at its cap of 8, and the runner turned that *projection exception* into a blocked
+  terminal (`control_progress_projection_unavailable`) after 3m40s. Fix: the recovery surface is the set of
+  DISTINCT refused carriers bounded to one exported cap; pinned (nine same-carrier refusals →
+  `['call_tool']`; ten distinct → the cap). Baseline #2 (`1788256808207-d4945e`) is the re-run on the fix.
+- **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
+  root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
+  `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
+  envelope/catalog/binding digests changed and the resumed source was refused as a changed surface
+  (`authority_conflict` → poison). On main this meant any crash-resume of a source whose card grew poisoned
+  that source. Fix: the `plan_task` builder declares `descriptionCarriesTurnState`; such a tool is
+  fingerprinted on name + parameters (the card is turn state the model reads, not the callable
+  contract); ordinary tools keep the full contract. `authority_conflict` no longer occurs in the journey.
+  **Still open in that journey (pre-existing at ring B's tip, not a regression):** subtests 3/5/10 — the
+  resumed boot PID's GET is refused `host_invocation_authority_missing` (no ambient dispatch lease on the
+  boot-recovery invocation path), and two fixture projection receipts are unavailable
+  (`fixture cold prewrite projection unavailable`, `host_result_receipt_commit_failed`). Evidence and
+  file:line map in the scratchpad ring reports (`rings/B.md`).
 
 ### Declared state at the tip
 - Full isolated suite: __SUITE__ (sentinel PERFORMED, no violations).
