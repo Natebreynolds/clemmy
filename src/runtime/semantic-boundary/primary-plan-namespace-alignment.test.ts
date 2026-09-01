@@ -227,6 +227,47 @@ test('plan_task refuses the live-shaped Outlook-plus-Slack plan before publicati
 
   const planTask = buildPlanTaskTool({ planning: primed.planning }) as unknown as Invokable;
   const deliveredPreambles: string[] = [];
+  const graphNeutralOutput = String(await brackets.withHarnessRunContext({
+    ...identity,
+    counter: new brackets.ToolCallsCounter(10),
+    behaviorScopeId: `${identity.sessionId}::graph-neutral-provider-read`,
+  }, () => planTask.invoke(null, JSON.stringify({
+    preamble: 'I’m reading the newest Outlook message now.',
+    draft: {
+      criteria: ['Return only the subject and received time of the newest Outlook Inbox message.'],
+      cardinality: { count: 1, fields: ['subject', 'received_time'] },
+      destination: null,
+      topology: {
+        version: 1,
+        operations: [{
+          id: 'read_latest_outlook_only',
+          effect: 'read',
+          coverage: 'single',
+          dependsOn: [],
+          dataFrom: [],
+          cardinality: { kind: 'once' },
+        }],
+        universes: [],
+      },
+      bindings: [{
+        operationId: 'read_latest_outlook_only',
+        role: 'source',
+        capabilityRef: refs[OUTLOOK_OPERATION],
+        evidence: ['latest_outlook_message'],
+      }],
+      deliverables: [{ id: 'latest_message_only', kind: 'message_subject_received_time' }],
+      evidenceRequirements: ['latest_outlook_message'],
+    },
+  }), { toolCall: { callId: 'plan-graph-neutral-provider-read' } })));
+  assert.deepEqual(JSON.parse(graphNeutralOutput), {
+    ok: false,
+    code: 'plan_not_required',
+    detail: 'plan_task is only for action work or an exact reviewed Clementine-local read; use a graph-neutral read otherwise.',
+    repair: 'Call call_tool exactly once with the exact graph-neutral read operation and schema already disclosed for this request. Do not call plan_task for this read.',
+    recoveryTool: 'call_tool',
+  });
+  assert.equal(eventlog.getTurnGraphEventForSource(identity.sessionId, identity.sourceUserSeq), null,
+    'graph-neutral provider read refusal occurs before graph persistence');
   const callId = 'plan-outlook-with-extra-slack';
   const output = String(await brackets.withHarnessRunContext({
     ...identity,

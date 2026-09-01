@@ -27,6 +27,7 @@ import {
   getRunAttemptBySourceUserSeq,
   getRunAttemptSourceUserEvent,
   isKillRequested,
+  listExactCheckpointRecoverySessions,
   listEvents,
   listSessions,
   openEventLog,
@@ -68,6 +69,7 @@ function enabled(): boolean {
 // Ineligible runs keep today's banner + manual `continue` exactly as-is.
 // Kill-switch CLEMMY_CHAT_AUTO_RESUME=off restores banner-only for all.
 const AUTO_RESUME_MAX_PER_BOOT = 3;
+const EXACT_CHECKPOINT_RESUME_MAX_PER_PASS = 3;
 const AUTO_RESUME_MAX_AGE_MS = 2 * 60 * 60_000;
 
 function autoResumeEnabled(): boolean {
@@ -79,27 +81,75 @@ function autoResumeEnabled(): boolean {
  * before adopting or executing anything; this check only decides that generic
  * restart policy must not turn a bookkeeping state into a user-facing retry
  * terminal merely because the already-landed call was an external write. */
-function checkpointRecoverySourceUserSeq(
+interface CheckpointRecoveryDescriptor {
+  serializedState: string;
+  sourceUserSeq: number;
+  phase: 'admit' | 'finalize' | 'continue';
+  frameCallIds: string[];
+}
+
+function checkpointRecoveryDescriptor(
   session: HarnessSession,
   sessionId: string,
-): number | null {
+): CheckpointRecoveryDescriptor | null {
   const blob = session.loadRecoveryState();
   if (!blob) return null;
   try {
     const parsed = JSON.parse(blob) as Record<string, unknown>;
     const sourceUserSeq = Number(parsed.sourceUserSeq);
+    const phase = parsed.phase === 'admit'
+      || parsed.phase === 'finalize'
+      || parsed.phase === 'continue'
+      ? parsed.phase
+      : null;
+    const frameCallIds = Array.isArray(parsed.frameHistory)
+      ? parsed.frameHistory.flatMap((item) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+          const row = item as Record<string, unknown>;
+          return row.type === 'function_call' && typeof row.callId === 'string' && row.callId.trim()
+            ? [row.callId.trim()]
+            : [];
+        })
+      : [];
     return parsed.__clemHostRecovery === 1
       && parsed.sessionId === sessionId
-      && (parsed.phase === 'admit'
-        || parsed.phase === 'finalize'
-        || parsed.phase === 'continue')
+      && phase !== null
       && Number.isSafeInteger(sourceUserSeq)
       && sourceUserSeq > 0
-      ? sourceUserSeq
+      ? { serializedState: blob, sourceUserSeq, phase, frameCallIds }
       : null;
   } catch {
     return null;
   }
+}
+
+function checkpointRecoverySourceUserSeq(
+  session: HarnessSession,
+  sessionId: string,
+): number | null {
+  return checkpointRecoveryDescriptor(session, sessionId)?.sourceUserSeq ?? null;
+}
+
+/** Remove only the exact checkpoint blob already reconciled by this scan.
+ * JSON-remove preserves every unrelated/newer metadata key, including a new
+ * turn's run marker; comparing the full serialized state prevents an older
+ * terminal from erasing a concurrently replaced recovery owner. */
+function clearExactCheckpointRecoveryState(
+  sessionId: string,
+  serializedState: string,
+): boolean {
+  const result = openEventLog().prepare(`
+    UPDATE sessions
+       SET metadata_json = json_remove(
+             metadata_json,
+             '$.__host_recovery_state',
+             '$.__host_recovery_mcp_scope'
+           ),
+           updated_at = ?
+     WHERE id = ?
+       AND json_extract(metadata_json, '$.__host_recovery_state') = ?
+  `).run(new Date().toISOString(), sessionId, serializedState);
+  return result.changes === 1;
 }
 
 /** Interactive surface reconstructed from the durable session. This local
@@ -514,16 +564,174 @@ export interface RestartRecoveryOptions {
    * remain untouched.
    */
   bootCutoffMs?: number;
+  /**
+   * Exact host checkpoints are durable private continuations, so they cannot
+   * be converted into the generic fourth-run terminal. They still need their
+   * own bounded, fair dispatch page: a large recovery cohort must not fan out
+   * every model/provider continuation on one daemon tick.
+   */
+  exactCheckpointDispatchLimit?: number;
+  /**
+   * Process-local execution fence supplied by the daemon. Selection consults
+   * it before writing either the durable dispatch claim or `run_resumed`, so a
+   * periodic tick cannot manufacture duplicate audit/progress rows while the
+   * exact accepted source is already executing.
+   */
+  isExactCheckpointDispatchInFlight?: (
+    sessionId: string,
+    sourceUserSeq: number,
+  ) => boolean;
+  /** Total restart continuations already executing in this process. New exact
+   * pages consume only the remaining capacity, so repeated ticks cannot turn a
+   * per-pass bound into unbounded concurrent provider/model work. */
+  exactCheckpointDispatchInFlightCount?: () => number;
+  /** Periodic daemon ticks need only the private checkpoint queue. Boot uses
+   * the broader interrupted-chat reconciliation surface. */
+  exactCheckpointsOnly?: boolean;
+  /** Host-owned, no-provider finalizer for a stopped async checkpoint. A held
+   * result preserves HRS/marker; only a durable cancelled/replayed winner lets
+   * the ordinary cancelled terminal close and clear the source. */
+  finalizeExactCheckpointStop?: (input: {
+    sessionId: string;
+    sourceUserSeq: number;
+    ownerLogicalToolCallId: string;
+    runAttemptId: string;
+    turn: number;
+  }) => { status: 'cancelled' | 'replayed' | 'not_applicable' }
+    | { status: 'held'; reason: string };
 }
 
-function listChatSessionsForRecovery(): SessionRow[] {
+function listChatSessionsForRecovery(options: RestartRecoveryOptions): SessionRow[] {
+  if (options.exactCheckpointsOnly) {
+    // SQL ranks the durable queue before applying this fixed bound. Repeated
+    // ticks therefore remain O(1) in historical chat count while global event
+    // claims still rotate cohorts beyond the query window.
+    return listExactCheckpointRecoverySessions(64);
+  }
   const rows: SessionRow[] = [];
   for (let offset = 0; ; offset += CHAT_SCAN_PAGE_SIZE) {
-    const page = listSessions({ kind: 'chat', limit: CHAT_SCAN_PAGE_SIZE, offset });
+    const page = listSessions({
+      kind: 'chat',
+      runInFlightOnly: true,
+      limit: CHAT_SCAN_PAGE_SIZE,
+      offset,
+    });
     rows.push(...page);
     if (page.length < CHAT_SCAN_PAGE_SIZE) break;
   }
   return rows;
+}
+
+interface ExactCheckpointQueueCandidate {
+  row: SessionRow;
+  sourceUserSeq: number;
+  lastDispatchClaimSeq: number | null;
+}
+
+function boundedExactCheckpointDispatchLimit(value: number | undefined): number {
+  if (value === undefined) return EXACT_CHECKPOINT_RESUME_MAX_PER_PASS;
+  if (!Number.isSafeInteger(value)) return EXACT_CHECKPOINT_RESUME_MAX_PER_PASS;
+  return Math.max(0, Math.min(50, value));
+}
+
+function exactCheckpointDispatchInFlightCount(options: RestartRecoveryOptions): number {
+  if (!options.exactCheckpointDispatchInFlightCount) return 0;
+  try {
+    const count = options.exactCheckpointDispatchInFlightCount();
+    return Number.isSafeInteger(count) && count >= 0 ? Math.min(count, 50) : 50;
+  } catch {
+    return 50;
+  }
+}
+
+/** Newest durable claim for this exact accepted source. Event seq is global,
+ * so sorting by it rotates a failed/rejected owner behind never-attempted and
+ * older owners across both daemon ticks and fresh processes. Legacy claims did
+ * not carry sourceUserSeq; they remain a conservative claim for the session's
+ * still-current exact checkpoint. */
+function lastExactCheckpointDispatchClaimSeq(
+  sessionId: string,
+  sourceUserSeq: number,
+): number | null {
+  const claims = listEvents(sessionId, {
+    types: ['restart_recovery_decision'],
+    desc: true,
+    limit: 128,
+  }).filter((event) => {
+    if (event.data.exactCheckpointRecovery !== true || event.data.autoResume !== true) {
+      return false;
+    }
+    const claimedSource = positiveEventSeq(event.data.sourceUserSeq);
+    return claimedSource === null || claimedSource === sourceUserSeq;
+  });
+  return claims.at(-1)?.seq ?? null;
+}
+
+/**
+ * Select one bounded durable page of exact checkpoint owners before the main
+ * recovery loop has any public/audit side effects. Owners outside the page, or
+ * already running in this process, remain completely inert: no generic
+ * `boot_cap` terminal, marker clear, decision event, or duplicate progress row.
+ */
+function selectedRestartRecoveryRows(
+  rows: SessionRow[],
+  dispatchResume: ResumeDispatcher | undefined,
+  options: RestartRecoveryOptions,
+): SessionRow[] {
+  const exactCandidates: ExactCheckpointQueueCandidate[] = [];
+  const exactSessionIds = new Set<string>();
+
+  for (const row of rows) {
+    try {
+      const session = HarnessSession.load(row.id);
+      if (!session) continue;
+      const since = session.runInFlightSince();
+      if (!since) continue;
+      if (options.bootCutoffMs !== undefined) {
+        const sinceMs = Date.parse(since);
+        if (!Number.isFinite(sinceMs) || sinceMs >= options.bootCutoffMs) continue;
+      }
+      const sourceUserSeq = checkpointRecoverySourceUserSeq(session, row.id);
+      if (sourceUserSeq === null) continue;
+      exactSessionIds.add(row.id);
+
+      // No dispatcher means there is no honest exact continuation owner in
+      // this caller. Preserve the checkpoint rather than converting it into a
+      // generic manual terminal.
+      if (!dispatchResume) continue;
+      if (options.isExactCheckpointDispatchInFlight?.(row.id, sourceUserSeq)) {
+        continue;
+      }
+      exactCandidates.push({
+        row,
+        sourceUserSeq,
+        lastDispatchClaimSeq: lastExactCheckpointDispatchClaimSeq(row.id, sourceUserSeq),
+      });
+    } catch {
+      // Failure to rank an exact owner cannot authorize an unbounded dispatch.
+      // If its private state was readable enough to identify above, it remains
+      // excluded for this pass and is retried by the next boot/tick.
+      exactSessionIds.add(row.id);
+    }
+  }
+
+  exactCandidates.sort((left, right) => {
+    const leftSeq = left.lastDispatchClaimSeq ?? -1;
+    const rightSeq = right.lastDispatchClaimSeq ?? -1;
+    if (leftSeq !== rightSeq) return leftSeq - rightSeq;
+    const created = left.row.createdAt.localeCompare(right.row.createdAt);
+    return created !== 0 ? created : left.row.id.localeCompare(right.row.id);
+  });
+  const selectedExactIds = new Set(
+    exactCandidates
+      .slice(0, Math.max(
+        0,
+        boundedExactCheckpointDispatchLimit(options.exactCheckpointDispatchLimit)
+          - exactCheckpointDispatchInFlightCount(options),
+      ))
+      .map((candidate) => candidate.row.id),
+  );
+  return rows.filter((row) => !exactSessionIds.has(row.id) || selectedExactIds.has(row.id));
 }
 
 function buildReplayPrimer(sessionId: string, inFlightSince: string): string {
@@ -755,14 +963,17 @@ export function recoverInterruptedChatRuns(
 
   let rows;
   try {
-    rows = listChatSessionsForRecovery();
+    rows = listChatSessionsForRecovery(options);
   } catch {
     return { enabled: true, scanned: 0, recovered: 0, notified: 0, records: [] };
   }
+  const scanned = rows.length;
+  rows = selectedRestartRecoveryRows(rows, dispatchResume, options);
 
   let recovered = 0;
   let notified = 0;
-  let autoResumes = 0;
+  let genericAutoResumes = 0;
+  let exactCheckpointResumes = 0;
   const records: RestartRecoveryRecord[] = [];
   for (const row of rows) {
     let sess: HarnessSession | null = null;
@@ -901,6 +1112,14 @@ export function recoverInterruptedChatRuns(
         record.errors.push('marker_clear: failed');
       }
       try {
+        const checkpoint = checkpointRecoveryDescriptor(sess, row.id);
+        if (recoveryIdentity && checkpoint?.sourceUserSeq === recoveryIdentity.sourceUserSeq) {
+          clearExactCheckpointRecoveryState(row.id, checkpoint.serializedState);
+        }
+      } catch (err) {
+        record.errors.push(`checkpoint_clear: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      try {
         appendEvent({
           sessionId: row.id,
           turn: 0,
@@ -929,16 +1148,76 @@ export function recoverInterruptedChatRuns(
     // recovery state is published or a manual terminal is committed.
     const ageMs = now() - Date.parse(since);
     const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
-    const checkpointRecoverySource = checkpointRecoverySourceUserSeq(sess, row.id);
+    const checkpointRecovery = checkpointRecoveryDescriptor(sess, row.id);
+    const checkpointRecoverySource = checkpointRecovery?.sourceUserSeq ?? null;
     const exactCheckpointRecovery = Boolean(
       recoveryIdentity
       && acceptedInput !== null
       && checkpointRecoverySource === recoveryIdentity.sourceUserSeq,
     );
+    if (exactCheckpointRecovery && userStopped && checkpointRecovery?.phase !== 'continue') {
+      record.autoResumeSkipped = 'user_stopped';
+      if (
+        checkpointRecovery?.frameCallIds.length !== 1
+        || !interruptedAttempt?.attemptId
+        || !options.finalizeExactCheckpointStop
+      ) {
+        record.errors.push('exact checkpoint Stop finalizer is unavailable');
+        records.push(record);
+        continue;
+      }
+      try {
+        const finalized = options.finalizeExactCheckpointStop({
+          sessionId: row.id,
+          sourceUserSeq: recoveryIdentity!.sourceUserSeq,
+          ownerLogicalToolCallId: checkpointRecovery.frameCallIds[0]!,
+          runAttemptId: interruptedAttempt.attemptId,
+          turn: recoveryIdentity!.turn,
+        });
+        if (finalized.status === 'held') {
+          record.errors.push(`exact checkpoint Stop finalizer held: ${finalized.reason}`);
+          records.push(record);
+          continue;
+        }
+        // `not_applicable` is an exact negative: this is a different host
+        // checkpoint kind, so the ordinary cancelled terminal remains its
+        // authority. cancelled/replayed means the async R owner is already
+        // receipt-backed and safe for the same terminal path.
+      } catch (err) {
+        record.errors.push(`exact checkpoint Stop finalizer failed: ${err instanceof Error ? err.message : String(err)}`);
+        records.push(record);
+        continue;
+      }
+    }
+    if (
+      exactCheckpointRecovery
+      && !userStopped
+      && exactCheckpointDispatchInFlightCount(options)
+        >= boundedExactCheckpointDispatchLimit(options.exactCheckpointDispatchLimit)
+    ) {
+      // Capacity can change after the SQL page was selected (for example, an
+      // earlier generic restart dispatch in this same scan began running).
+      // Defer without an audit/progress row rather than exceeding the global
+      // ceiling or publishing a generic terminal for this private owner.
+      continue;
+    }
     if (!recoveryIdentity || acceptedInput === null) record.autoResumeSkipped = 'identity_missing';
     else if (!dispatchResume) record.autoResumeSkipped = 'no_dispatcher';
-    else if (autoResumes >= AUTO_RESUME_MAX_PER_BOOT) record.autoResumeSkipped = 'boot_cap';
-    else if (!exactCheckpointRecovery && userStopped) record.autoResumeSkipped = 'user_stopped';
+    // Stop authority belongs to the exact accepted source and outranks every
+    // private checkpoint phase. In particular, an async read parked between
+    // GET attempts may not issue another provider read (or later write) after
+    // the user cancelled it.
+    else if (userStopped) record.autoResumeSkipped = 'user_stopped';
+    // Exact private HostRecoveryState has already been admitted and owns no
+    // model-selected retry. Applying the generic fan-out cap to it terminalized
+    // the fourth crash-safe continuation and erased its only owner. Keep the cap
+    // for speculative/general chat resumes; exact checkpoint pages are bounded
+    // by their own durable claim cursors and must remain proactively retryable.
+    else if (!exactCheckpointRecovery && (
+      genericAutoResumes >= AUTO_RESUME_MAX_PER_BOOT
+      || exactCheckpointDispatchInFlightCount(options)
+        >= boundedExactCheckpointDispatchLimit(options.exactCheckpointDispatchLimit)
+    )) record.autoResumeSkipped = 'boot_cap';
     else if (!exactCheckpointRecovery && !autoResumeEnabled()) record.autoResumeSkipped = 'disabled';
     else if (!exactCheckpointRecovery && (!Number.isFinite(ageMs) || ageMs > AUTO_RESUME_MAX_AGE_MS)) record.autoResumeSkipped = 'too_old';
     else if (!exactCheckpointRecovery
@@ -968,6 +1247,7 @@ export function recoverInterruptedChatRuns(
         role: 'system',
         type: 'restart_recovery_decision',
         data: {
+          phase: willAutoResume && exactCheckpointRecovery ? 'dispatch_claimed' : 'policy_decided',
           interruptedAt: since,
           ageMs: Number.isFinite(ageMs) ? ageMs : null,
           eligible: willAutoResume,
@@ -976,12 +1256,20 @@ export function recoverInterruptedChatRuns(
           userStopped,
           interruptedAttemptId: interruptedAttempt?.attemptId ?? null,
           interruptedRunId: interruptedAttempt?.runId ?? null,
+          sourceUserSeq: recoveryIdentity?.sourceUserSeq ?? null,
           externalWritesSinceInterrupt,
           exactCheckpointRecovery,
           writeCheckFailed: externalWritesSinceInterrupt === null,
           hasDispatcher: !!dispatchResume,
           bootCap: AUTO_RESUME_MAX_PER_BOOT,
-          bootResumeOrdinal: willAutoResume ? autoResumes + 1 : null,
+          exactCheckpointDispatchLimit: boundedExactCheckpointDispatchLimit(
+            options.exactCheckpointDispatchLimit,
+          ),
+          bootResumeOrdinal: willAutoResume
+            ? exactCheckpointRecovery
+              ? exactCheckpointResumes + 1
+              : genericAutoResumes + 1
+            : null,
           replayPrepared: record.replayPrepared,
           replayPrimerChanged: record.replayPrimerChanged,
           snapshotItemsBefore: record.snapshotItemsBefore,
@@ -996,6 +1284,14 @@ export function recoverInterruptedChatRuns(
       record.decisionRecorded = true;
     } catch (err) {
       record.errors.push(`decision_event: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // For an exact checkpoint this decision row is the durable fairness claim.
+    // If it could not be persisted, do not emit progress or dispatch from a
+    // live-only selection that another process cannot observe.
+    if (exactCheckpointRecovery && willAutoResume && !record.decisionRecorded) {
+      records.push(record);
+      continue;
     }
 
     // Commit user-facing text only for an honest terminal. Automatic recovery
@@ -1054,6 +1350,7 @@ export function recoverInterruptedChatRuns(
               ? 'restart_checkpoint_recovery'
               : 'restart_auto_resume',
             interruptedAt: since,
+            sourceUserSeq: recoveryIdentity?.sourceUserSeq ?? null,
             autoResume: true,
           },
         });
@@ -1131,6 +1428,15 @@ export function recoverInterruptedChatRuns(
       } catch (err) {
         record.errors.push(`kill_cleanup: ${err instanceof Error ? err.message : String(err)}`);
       }
+      try {
+        if (
+          exactCheckpointRecovery
+          && recoveryIdentity
+          && checkpointRecovery?.sourceUserSeq === recoveryIdentity.sourceUserSeq
+        ) clearExactCheckpointRecoveryState(row.id, checkpointRecovery.serializedState);
+      } catch (err) {
+        record.errors.push(`checkpoint_clear: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     // Keep the original marker armed across dispatch. The resumed runtime owns
@@ -1140,7 +1446,8 @@ export function recoverInterruptedChatRuns(
     // commits the manual continue terminal only when no unactivated workflow
     // admission still owns this exact source.
     if (willAutoResume && dispatchResume && recoveryIdentity && acceptedInput !== null) {
-      autoResumes += 1;
+      if (exactCheckpointRecovery) exactCheckpointResumes += 1;
+      else genericAutoResumes += 1;
       record.autoResumed = true;
       const sessionId = row.id;
       void dispatchResume({
@@ -1164,6 +1471,7 @@ export function recoverInterruptedChatRuns(
               error: error instanceof Error ? error.message : String(error),
               interruptedAttemptId: interruptedAttempt?.attemptId ?? null,
               interruptedRunId: interruptedAttempt?.runId ?? null,
+              sourceUserSeq: recoveryIdentity.sourceUserSeq,
             },
           });
         } catch { /* diagnostics are private and best-effort */ }
@@ -1270,7 +1578,7 @@ export function recoverInterruptedChatRuns(
     records.push(record);
   }
 
-  return { enabled: true, scanned: rows.length, recovered, notified, records };
+  return { enabled: true, scanned, recovered, notified, records };
 }
 
 /**

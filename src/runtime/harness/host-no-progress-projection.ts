@@ -16,6 +16,7 @@ import type {
   NoProgressAttemptClass,
 } from './no-progress-governor.js';
 import { createNoProgressConsequence } from './no-progress-governor.js';
+import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 
 /**
  * Exact, same-source projection for the pure no-progress reducer.
@@ -62,6 +63,40 @@ function nonEmptyString(value: unknown): string | null {
 function record(value: unknown): UnknownRow | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as UnknownRow
+    : null;
+}
+
+const PLAN_REPAIR_CAPABILITY_ID = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const PLAN_REPAIR_WRITE_EFFECTS = new Set(['local_write', 'external_write', 'admin']);
+
+function exactRecordKeys(value: UnknownRow, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return keys.length === wanted.length
+    && keys.every((key, index) => key === wanted[index]);
+}
+
+function exactAdvertisedWriteRepairs(value: unknown): readonly UnknownRow[] | null {
+  if (!Array.isArray(value) || value.length > 8) return null;
+  const repairs: UnknownRow[] = [];
+  for (const candidate of value) {
+    const row = record(candidate);
+    if (
+      !row
+      || !exactRecordKeys(row, ['capabilityRef', 'effect', 'purpose'])
+      || typeof row.capabilityRef !== 'string'
+      || !PLAN_REPAIR_CAPABILITY_ID.test(row.capabilityRef)
+      || typeof row.effect !== 'string'
+      || !PLAN_REPAIR_WRITE_EFFECTS.has(row.effect)
+      || typeof row.purpose !== 'string'
+      || !row.purpose.trim()
+      || row.purpose !== row.purpose.trim()
+      || Buffer.byteLength(row.purpose, 'utf8') > 1_000
+    ) return null;
+    repairs.push(row);
+  }
+  return new Set(repairs.map((row) => row.capabilityRef)).size === repairs.length
+    ? repairs
     : null;
 }
 
@@ -135,6 +170,20 @@ function eventCapabilityTokens(
       // accepted work contract/binding rows below.
       if (citable) {
         tokens.operation.add(token('operation', 'citable_discovery_available', ['available']));
+      }
+      // A typed missing-write refusal can expose tool_search only when the
+      // current card has no write. The first exact same-source write found by
+      // that search is a genuinely new effect authority class, not another
+      // sibling candidate. Give that one class its own bounded token so the
+      // runner can leave recovery-only mode and present plan_task. Further
+      // write discoveries collapse to this same token.
+      const citableWrite = capabilities.some((candidate) => {
+        const row = record(candidate);
+        return nonEmptyString(row?.capabilityRef) !== null
+          && row?.effectClass === 'write';
+      });
+      if (citableWrite) {
+        tokens.effect.add(token('effect', 'citable_discovery_effect', ['write']));
       }
       continue;
     }
@@ -597,6 +646,12 @@ function controlConsequence(input: {
   ) return null;
   const payload = parsedResultRecord(input.resultText);
   if (!payload || payload.ok !== false) return null;
+  const planRefusal = input.call.name === 'plan_task'
+    ? parseExactPlanTaskRefusal(payload)
+    : null;
+  // plan_task control routing consumes the same exact closed union as durable
+  // settlement. Raw JSON code/prose is never independent recovery authority.
+  if (input.call.name === 'plan_task' && !planRefusal) return null;
   if (
     input.settlement.outcome_kind === 'input_required'
     && input.settlement.recovery_action === 'ask_user'
@@ -625,6 +680,9 @@ function controlConsequence(input: {
     payload.code === 'plan_incomplete_missing_write'
     || payload.code === 'plan_incomplete_data_lineage'
   ) {
+    const advertisedWriteRepairs = payload.code === 'plan_incomplete_missing_write'
+      ? exactAdvertisedWriteRepairs(payload.admissibleCapabilities)
+      : null;
     return createNoProgressConsequence({
       // Missing a write and missing its payload edge are distinct, finite plan
       // repairs. Keeping them distinct lets the model advance through both in
@@ -634,18 +692,81 @@ function controlConsequence(input: {
         : 'plan_incomplete:data_lineage',
       recovery: 'repair_model',
       effectState: 'not_started',
-      recoveryToolNames: [input.call.name],
+      // A current card write makes this a plan-only repair. When the exact
+      // closed refusal says the bounded card has no write at all, one search
+      // is the only operation that can create a new plan path. Old durable
+      // payloads did not carry this field and retain their historical
+      // plan_task-only recovery semantics.
+      recoveryToolNames: planRefusal?.recoveryTool === 'tool_search'
+        ? ['tool_search']
+        : planRefusal?.recoveryTool === 'plan_task'
+          ? ['plan_task']
+          : payload.code === 'plan_incomplete_missing_write'
+            && advertisedWriteRepairs?.length === 0
+            ? ['tool_search']
+            : [input.call.name],
     });
   }
   if (payload.code === 'plan_not_admitted') {
-    const prefix = stablePlanDetailPrefix(payload.detail);
+    const prefix = planRefusal?.structural && typeof payload.reasonCode === 'string'
+      ? payload.reasonCode
+      : stablePlanDetailPrefix(payload.detail);
+    const recoveryTool = planRefusal?.recoveryTool;
     return createNoProgressConsequence({
       stage: `semantic_admission:${prefix}`,
-      recovery: hostExecuted && HOST_OWNED_PLAN_DETAIL_PREFIXES.has(prefix)
-        ? 'retry_host'
-        : 'repair_model',
+      recovery: recoveryTool === 'stop_factual'
+        ? 'stop_factual'
+        : recoveryTool === 'retry_host'
+          || (hostExecuted && HOST_OWNED_PLAN_DETAIL_PREFIXES.has(prefix))
+          ? 'retry_host'
+          : 'repair_model',
+      effectState: recoveryTool === 'stop_factual' ? 'known_terminal' : 'not_started',
+      recoveryToolNames: recoveryTool === 'stop_factual'
+        ? []
+        : recoveryTool === 'tool_search'
+          ? ['tool_search']
+          : ['plan_task'],
+    });
+  }
+  if (payload.code === 'plan_not_required') {
+    const uniqueWorkflow = typeof payload.workflowName === 'string' && payload.workflowName.trim();
+    const recoveryTool = planRefusal?.recoveryTool
+      ?? (uniqueWorkflow ? 'workflow_run' : null);
+    if (recoveryTool !== 'call_tool' && recoveryTool !== 'workflow_run') return null;
+    return createNoProgressConsequence({
+      stage: recoveryTool === 'workflow_run'
+        ? 'plan_not_required:unique_workflow'
+        : 'plan_not_required:graph_neutral',
+      recovery: 'repair_model',
       effectState: 'not_started',
-      recoveryToolNames: [input.call.name],
+      recoveryToolNames: [recoveryTool],
+    });
+  }
+  if (payload.code === 'verification_successor_required') {
+    const recoveryTool = planRefusal?.recoveryTool;
+    if (recoveryTool === 'stop_factual') {
+      return createNoProgressConsequence({
+        stage: 'plan_binding:verification_successor_required',
+        recovery: 'stop_factual',
+        effectState: 'known_terminal',
+        recoveryToolNames: [],
+      });
+    }
+    if (recoveryTool !== 'plan_task' && recoveryTool !== 'tool_search') return null;
+    return createNoProgressConsequence({
+      stage: 'plan_binding:verification_successor_required',
+      recovery: 'repair_model',
+      effectState: 'not_started',
+      recoveryToolNames: [recoveryTool],
+    });
+  }
+  if (payload.code === 'plan_binding_not_sealed') {
+    if (planRefusal?.recoveryTool !== 'stop_factual') return null;
+    return createNoProgressConsequence({
+      stage: 'plan_binding:not_sealed',
+      recovery: 'stop_factual',
+      effectState: 'known_terminal',
+      recoveryToolNames: [],
     });
   }
   return null;

@@ -527,7 +527,7 @@ test('v69 backfills exact ready structured projections without copying their pay
     assert.equal(JSON.stringify(row).includes('backfill-secret-marker'), false,
       'backfill copied projection payload into metadata');
     const version = raw.prepare(`SELECT MAX(version) AS version FROM schema_version`).get() as { version: number };
-    assert.equal(version.version, 70, 'the v69 replay continues through the current append-only tail');
+    assert.equal(version.version, 73, 'the v69 replay continues through the current append-only tail');
     assert.deepEqual(raw.pragma('foreign_key_check'), []);
     assert.deepEqual(raw.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
   } finally {

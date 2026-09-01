@@ -299,6 +299,53 @@ test('checks every semantic relation without granting execution authority', () =
   }
 });
 
+test('free-text slots cannot encode a visible option label or ordinal as a value', () => {
+  const openQuestion = {
+    questionId: 'question-visible-shortcuts',
+    goalId: activeGoal.goalId,
+    goalRevision: activeGoal.baseRevision,
+    slotKey: 'workflow-correction',
+    question: 'Which workflow did you mean?',
+    options: [
+      { optionId: 'opt-1', label: 'Show me its definition', metaAction: 'explain' as const },
+      { optionId: 'opt-2', label: 'Skip' },
+    ],
+    allowFreeText: true,
+  };
+  for (const value of [
+    'Skip', 'opt-2', '2', 'two', 'option 2', 'choice two',
+    'the second one', 'second option', 'Show me its definition',
+  ]) {
+    const result = validateTurnSemanticProposalV1(proposal({
+      relation: 'answer_open_slot',
+      targetGoal: activeGoal,
+      goal: null,
+      work: null,
+      slotAnswers: [{
+        kind: 'value',
+        questionId: openQuestion.questionId,
+        slotKey: openQuestion.slotKey,
+        value,
+      }],
+    }), host({ openQuestions: [openQuestion] }));
+    assert.equal(result.ok, false, value);
+    assert.ok(issueCodes(result).includes('visible_option_encoded_as_value'), value);
+  }
+  const correction = validateTurnSemanticProposalV1(proposal({
+    relation: 'answer_open_slot',
+    targetGoal: activeGoal,
+    goal: null,
+    work: null,
+    slotAnswers: [{
+      kind: 'value',
+      questionId: openQuestion.questionId,
+      slotKey: openQuestion.slotKey,
+      value: 'Sorry, platform 49',
+    }],
+  }), host({ openQuestions: [openQuestion] }));
+  assert.equal(correction.ok, true, issueCodes(correction).join(','));
+});
+
 test('new_goal with clarifying open-slots and no work is legal conversation, not illegal work', () => {
   const result = validateTurnSemanticProposalV1(proposal({
     work: null,

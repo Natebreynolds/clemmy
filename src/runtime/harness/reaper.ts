@@ -37,6 +37,7 @@ import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { reapSettledAuthorityPayloads } from './dispatch-ledger.js';
 import { openEventLog } from './eventlog.js';
+import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
 import {
   reconcileRevokedHostToolInvocations,
   type HostToolInvocationRecoverySweep,
@@ -104,6 +105,13 @@ const productionRecoverySeam: RecoverySweepSeam = {
            AND lease.accepted_task_id IS NOT NULL
            AND lease.logical_tool_call_id IS NOT NULL
            AND call.state = 'open'
+           AND NOT EXISTS (
+             SELECT 1 FROM ${ASYNC_READ_REFINEMENT_INTENTS_TABLE} async_owner
+              WHERE async_owner.session_id = lease.session_id
+                AND async_owner.source_user_seq = lease.source_user_seq
+                AND async_owner.accepted_task_id = lease.accepted_task_id
+                AND async_owner.start_logical_tool_call_id = lease.logical_tool_call_id
+           )
       `).get() as { n: number } | undefined;
       return row?.n ?? 0;
     } catch {

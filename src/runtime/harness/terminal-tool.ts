@@ -184,3 +184,96 @@ export function parseAwaitingUserInputFinalOutput(value: unknown): string | null
   const text = value.slice(AWAITING_USER_INPUT_FINAL_OUTPUT_PREFIX.length + 1).trim();
   return text || null;
 }
+
+/**
+ * A bounded async-read refinement can end without satisfying its accepted
+ * research requirement. The work_call result is then a host-authored scope
+ * gate, not model prose and not verified read evidence. Recognize only the
+ * exact local carrier plus the exact protocol/option tuple so an arbitrary
+ * provider result cannot stop a turn or manufacture an awaiting-input card.
+ */
+const ASYNC_READ_REFINEMENT_TERMINAL_PROTOCOL =
+  'clementine.async_read_refinement_terminal.v1' as const;
+
+const ASYNC_READ_REFINEMENT_OPTIONS = [
+  'Retry a materially different query within the same 30-day window',
+  'Change the content brief',
+  'Pause this task without creating a Workspace',
+] as const;
+
+const ASYNC_READ_REFINEMENT_TERMINAL_KINDS: ReadonlySet<string> = new Set([
+  'insufficient_evidence',
+  'provider_failed',
+  'provider_cancelled',
+  'deadline_exhausted',
+  'attempts_exhausted',
+]);
+
+export interface AsyncReadRefinementAwaitingInputPresentation {
+  readonly protocol: typeof ASYNC_READ_REFINEMENT_TERMINAL_PROTOCOL;
+  readonly terminalKind: string;
+  readonly reason: string;
+  readonly question: string;
+  readonly options: readonly string[];
+}
+
+function exactAsyncReadRefinementGate(value: unknown): {
+  terminalKind: string;
+  reason: string;
+} | null {
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    if (!parsed.trim() || parsed.length > 8_192) return null;
+    try { parsed = JSON.parse(parsed) as unknown; } catch { return null; }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const row = parsed as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  if (JSON.stringify(keys) !== JSON.stringify([
+    'options',
+    'protocol',
+    'reason',
+    'status',
+    'terminalKind',
+  ])) return null;
+  if (
+    row.protocol !== ASYNC_READ_REFINEMENT_TERMINAL_PROTOCOL
+    || row.status !== 'needs_scope'
+    || typeof row.terminalKind !== 'string'
+    || !ASYNC_READ_REFINEMENT_TERMINAL_KINDS.has(row.terminalKind)
+    || typeof row.reason !== 'string'
+    || row.reason !== row.reason.trim()
+    || row.reason.length < 12
+    || row.reason.length > 300
+    || /[\u0000-\u001f\u007f]/u.test(row.reason)
+    || !Array.isArray(row.options)
+    || row.options.length !== ASYNC_READ_REFINEMENT_OPTIONS.length
+    || row.options.some((option, index) => option !== ASYNC_READ_REFINEMENT_OPTIONS[index])
+  ) return null;
+  return { terminalKind: row.terminalKind, reason: row.reason };
+}
+
+/** Structural decoder only. Callers MUST reprove the exact durable async
+ * intent/terminal receipt/logical settlement before using this to halt. */
+export function parseAsyncReadRefinementTerminalResult(
+  rawName: string | null | undefined,
+  output: unknown,
+): AsyncReadRefinementAwaitingInputPresentation | null {
+  if (typeof rawName !== 'string' || bareTerminalToolName(rawName) !== 'work_call') return null;
+  const gate = exactAsyncReadRefinementGate(output);
+  if (!gate) return null;
+  const question = [
+    gate.reason,
+    '',
+    'How would you like me to proceed?',
+    '',
+    ...ASYNC_READ_REFINEMENT_OPTIONS.map((option, index) => `${index + 1}. ${option}`),
+  ].join('\n');
+  return {
+    protocol: ASYNC_READ_REFINEMENT_TERMINAL_PROTOCOL,
+    terminalKind: gate.terminalKind,
+    reason: gate.reason,
+    question,
+    options: ASYNC_READ_REFINEMENT_OPTIONS,
+  };
+}

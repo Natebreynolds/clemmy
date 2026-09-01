@@ -7,7 +7,13 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { digestToolOutput, countDominantArray, dominantListCount } from './tool-output-digest.js';
+import {
+  compactStructuredJsonToolOutput,
+  countDominantArray,
+  digestToolOutput,
+  dominantListCount,
+  resolveDominantArray,
+} from './tool-output-digest.js';
 
 const accounts = Array.from({ length: 37 }, (_, i) => ({
   Id: `fixture-account-${i}`,
@@ -34,6 +40,61 @@ test('JSON array digest reports the true total, field list, and recovery path', 
   assert.match(digest, /Fields: .*Website/);
   assert.match(digest, /tool_output_query \{"call_id":"call_x1"/);
   assert.match(digest, /recall_tool_result \{"call_id":"call_x1"\}/);
+});
+
+test('an oversized first array record is never admitted raw as a fake complete record', () => {
+  const first = { id: 'huge', markdown: 'w'.repeat(300_000) };
+  const digest = digestToolOutput(JSON.stringify([first, { id: 'later', title: 'Useful row' }]), {
+    maxChars: 2_000,
+    toolName: 'search',
+    callId: 'call_huge_first',
+  });
+  const body = digest.slice(0, digest.indexOf('\n[digest:'));
+  assert.deepEqual(JSON.parse(body), []);
+  assert.match(digest, /Showing the first 0 COMPLETE records/);
+  assert.ok(digest.length < 2_000, `digest escaped its budget: ${digest.length}`);
+});
+
+test('structured JSON projection is bounded, parseable, and fair to later news siblings', () => {
+  const news = Array.from({ length: 5 }, (_, index) => ({
+    title: `Local model release ${index}`,
+    url: `https://news.example/article-${index}`,
+    date: `2026-08-${String(20 + index).padStart(2, '0')}`,
+    snippet: `Finding ${index} explains a substantive new local inference improvement for private on-device workloads.`,
+    publisher: 'News Example',
+  }));
+  const payload = JSON.stringify({
+    data: {
+      data: {
+        web: [{ title: 'Huge web result', url: 'https://web.example/huge', markdown: 'w'.repeat(300_000) }],
+        news,
+        images: [],
+      },
+      successful: true,
+      error: null,
+      logId: 'log-fixture',
+    },
+    successful: true,
+    error: null,
+  });
+  const receipt = `[exact-output-receipt:v1 nonce=11111111-1111-4111-8111-111111111111 sha256=${'a'.repeat(64)}]`;
+  const compact = compactStructuredJsonToolOutput(payload, {
+    maxChars: 20_000,
+    toolName: 'composio_execute_tool',
+    callId: 'call_firecrawl',
+    exactOutputReceipt: receipt,
+  });
+  assert.ok(compact);
+  assert.ok(compact.length <= 20_000, `projection escaped its budget: ${compact.length}`);
+  const parsed = JSON.parse(compact) as {
+    data: { data: { web: Array<{ markdown: string }>; news: typeof news } };
+    __clementine: { receipt: string };
+  };
+  assert.deepEqual(parsed.data.data.news, news, 'all five bounded news records remain exact');
+  assert.ok(parsed.data.data.web[0]!.markdown.length < 20_000, 'the huge web field is clipped');
+  assert.equal(parsed.__clementine.receipt, receipt);
+  assert.deepEqual(countDominantArray(parsed), { key: 'news', count: 5 });
+  assert.deepEqual(resolveDominantArray(parsed), { rows: news, path: 'data.data.news' });
 });
 
 test('JSON object: shows real CONTENT of nested arrays, not just array(N) shape', () => {

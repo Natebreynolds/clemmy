@@ -83,6 +83,94 @@ test('an exact output receipt remains valid when trusted provider annotations fo
   }), full);
 });
 
+test('large Firecrawl envelopes stay <=20k, retain exact news tuples, and redeem raw bytes', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const nonce = '33333333-3333-4333-8333-333333333333';
+  const news = Array.from({ length: 5 }, (_, index) => ({
+    title: `Local model release ${index}`,
+    url: `https://news.example/article-${index}`,
+    date: `2026-08-${String(20 + index).padStart(2, '0')}`,
+    snippet: `Finding ${index} explains a substantive new local inference improvement for private on-device workloads.`,
+    publisher: 'News Example',
+  }));
+  const full = JSON.stringify({
+    data: {
+      data: {
+        web: [{ title: 'Huge web result', url: 'https://web.example/huge', markdown: 'w'.repeat(300_000) }],
+        news,
+        images: [],
+      },
+      successful: true,
+      error: null,
+      logId: 'firecrawl-log-fixture',
+    },
+    successful: true,
+    error: null,
+  });
+  const visible = withToolOutputContext({
+    sessionId: sess.id,
+    callId: 'call-firecrawl-large',
+    toolName: 'composio_execute_tool',
+    settlementNonce: nonce,
+  }, () => formatRecallableToolText(full, { maxChars: 20_000 }));
+
+  assert.ok(visible.length <= 20_000, `model-visible result escaped its cap: ${visible.length}`);
+  const projected = JSON.parse(visible) as {
+    data: { data: { web: Array<{ markdown: string }>; news: typeof news } };
+    __clementine: { receipt: string };
+  };
+  assert.deepEqual(projected.data.data.news, news, 'later news rows survive the huge first web row exactly');
+  assert.ok(projected.data.data.web[0]!.markdown.length < 20_000);
+  assert.match(projected.__clementine.receipt, /exact-output-receipt:v1/);
+  assert.equal(getToolOutputForInvocation(sess.id, 'call-firecrawl-large', nonce)?.output, full,
+    'the lossless side store retains the exact raw provider bytes');
+  assert.equal(exactToolOutputForInvocation({
+    sessionId: sess.id,
+    callId: 'call-firecrawl-large',
+    toolName: 'composio_execute_tool',
+    compactResult: visible,
+    settlementNonce: nonce,
+  }), full, 'the embedded JSON receipt still redeems the exact raw output');
+
+  const { proveWorkspaceSocialSourceEvidence } = await import('./host-local-workspace-derivation.js');
+  const selected = news.slice(0, 3);
+  const proof = proveWorkspaceSocialSourceEvidence({
+    rawPayload: full,
+    projectedPayload: {
+      type: 'text',
+      text: `${visible}\n\n[account-route] selectedAccount=fixture-firecrawl`,
+    },
+    selectedRecordIds: selected.map((row) => row.url),
+    contract: {
+      operationId: 'research',
+      recordsPointer: '/news',
+      minDistinctRecords: 3,
+      titlePointer: '/title',
+      urlPointer: '/url',
+      publishedDatePointer: '/date',
+      findingPointers: ['/snippet', '/description', '/content', '/markdown'],
+      publisherPointer: '/publisher',
+      maxAgeDays: 30,
+      asOf: '2026-08-31T12:00:00.000Z',
+    },
+    workspaceArgs: {
+      initial_data_json: JSON.stringify({
+        posts: selected.map((row) => ({
+          body: `A substantive authored post grounded in ${row.title} and its exact research finding.`,
+          citations: [{
+            url: row.url,
+            title: row.title,
+            publishedAt: row.date,
+            publisher: row.publisher,
+          }],
+        })),
+      }),
+    },
+  });
+  assert.equal(proof.ok, true, 'typed Workspace proof can parse the compact model projection');
+});
+
 test('exact invocation resolution ignores stale larger call-id output and nonce-less rewrites', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -127,6 +215,32 @@ test('exact invocation resolution ignores stale larger call-id output and nonce-
   }), final);
 });
 
+test('exact non-JSON output obeys even a budget smaller than receipt overhead', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const full = `plain-provider-output ${'x'.repeat(2_000)}`;
+  for (const maxChars of [50, 100, 120, 150, 180, 200]) {
+    const nonce = `44444444-4444-4444-8444-${String(maxChars).padStart(12, '0')}`;
+    const callId = `small-budget-${maxChars}`;
+    const visible = withToolOutputContext({
+      sessionId: sess.id,
+      callId,
+      toolName: 'plain_provider_read',
+      settlementNonce: nonce,
+    }, () => formatRecallableToolText(full, { maxChars }));
+    assert.ok(visible.length <= maxChars, `${maxChars}-char budget produced ${visible.length} chars`);
+    const resolved = exactToolOutputForInvocation({
+      sessionId: sess.id,
+      callId,
+      toolName: 'plain_provider_read',
+      compactResult: visible,
+      settlementNonce: nonce,
+    });
+    if (/exact-output-receipt:v1/u.test(visible)) assert.equal(resolved, full);
+    else assert.equal(resolved, visible, 'an omitted receipt must fail closed instead of redeeming raw bytes');
+  }
+});
+
 test('clip footer reports the TRUE record count + that recall returns ALL (acme 44→4 fix)', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
@@ -164,6 +278,7 @@ test('textResult uses active tool-output context for MCP-style local tools', asy
 
 test('formatRecallableToolText falls back to plain truncation without call context', () => {
   const visible = formatRecallableToolText('x'.repeat(1000), { maxChars: 50 });
+  assert.ok(visible.length <= 50);
   assert.match(visible, /truncated/);
   assert.doesNotMatch(visible, /recall_tool_result/);
 });
@@ -198,6 +313,7 @@ test('formatRecallableToolText prepends the id index when a large resource-list 
   const text = JSON.stringify({ data: { tables } });
   assert.ok(text.length > 2000);
   const out = formatRecallableToolText(text, { maxChars: 1500 });
+  assert.ok(out.length <= 1500, `detached resource projection escaped its cap: ${out.length}`);
   assert.match(out, /IDs available in this result/);
   assert.match(out, /tbl0 = Table 0/);
   assert.match(out, /tbl7 = Table 7/); // survives even though the body is clipped

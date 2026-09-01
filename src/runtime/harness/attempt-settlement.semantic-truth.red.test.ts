@@ -75,6 +75,7 @@ function admitReturnedHostCrossing(input: {
   logicalToolCallId: string;
   tool: string;
   args: unknown;
+  providerExecution?: boolean;
 }) {
   const started = dispatch.beginPhysicalDispatch({
     identity: {
@@ -88,7 +89,7 @@ function admitReturnedHostCrossing(input: {
     tool: input.tool,
     args: input.args,
     relation: 'primary',
-    executionSite: 'host',
+    ...(input.providerExecution === true ? {} : { executionSite: 'host' as const }),
   });
   assert.equal(started.status, 'inserted');
   if (started.status !== 'inserted') throw new Error('host crossing was not admitted');
@@ -237,6 +238,115 @@ test('an ordinary local string result still settles succeeded with host evidence
   assert.equal(settled.outcome.kind, 'succeeded',
     'unmarked local returns keep their host-execution evidence; the fix must not orphan local reads');
   assert.equal(settled.outcome.detail, 'host_execution');
+});
+
+test('the exact completed capability-adapter carrier settles its nested provider acknowledgement', () => {
+  // Live Platform 49, 2026-08-31: both Slack and Sheets returned this exact
+  // host-adapter shape with successful:true. Settlement sampled only the outer
+  // object, mislabeled both reads unknown, then the workflow audit reported
+  // "2 business call failure(s)" even though both physical rows returned.
+  const task = accept('completed provider adapter carrier');
+  const callId = 'logical:completed-provider-adapter-carrier';
+  admitReturnedHostCrossing({
+    task,
+    logicalToolCallId: callId,
+    tool: 'slack_fetch_conversation_history',
+    args: { channel: 'C-EXACT', limit: 100 },
+    providerExecution: true,
+  });
+  const settled = settlement.settleToolAttempt({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    turn: task.turn,
+    lane: 'byo',
+    toolName: 'slack_fetch_conversation_history',
+    callId,
+    args: { channel: 'C-EXACT', limit: 100 },
+    mutating: false,
+    businessCall: true,
+    result: {
+      result: {
+        data: { ok: true, messages: [{ ts: '1', text: 'returned row' }] },
+        error: null,
+        successful: true,
+        logId: 'log_exact_success',
+      },
+      complete: true,
+    },
+  });
+
+  assert.equal(settled.outcome.kind, 'succeeded');
+  assert.equal(settled.outcome.evidence, 'structured');
+  assert.equal(settled.outcome.detail, 'envelope');
+  assert.ok(settled.resultHandleId, 'the successful returned read retains redeemable evidence');
+  assert.equal(successHandleCount(task), 1);
+});
+
+test('only the exact completed carrier can lift a nested provider verdict', () => {
+  const cases: Array<{ label: string; result: unknown; detail?: string }> = [
+    {
+      label: 'provider-declared-failure',
+      result: { result: { successful: false, error: null }, complete: true },
+      detail: 'envelope_failure',
+    },
+    {
+      label: 'contradicted-provider-success',
+      result: {
+        result: { successful: true, error: { code: 'provider_failed' }, data: { rows: [1] } },
+        complete: true,
+      },
+      detail: 'provider_envelope_contradiction',
+    },
+    {
+      label: 'nested-mcp-error',
+      result: { result: { successful: true, isError: true, data: { rows: [1] } }, complete: true },
+      detail: 'mcp_is_error',
+    },
+    {
+      label: 'coverage-without-acknowledgement',
+      result: { result: { records: [{ id: 'row-1' }] }, complete: true },
+    },
+    {
+      label: 'incomplete-carrier',
+      result: { result: { successful: true, data: { rows: [1] } }, complete: false },
+    },
+    {
+      label: 'unrecognized-carrier-metadata',
+      result: {
+        result: { successful: true, data: { rows: [1] } },
+        complete: true,
+        providerControlled: true,
+      },
+    },
+  ];
+
+  for (const item of cases) {
+    const task = accept(`closed carrier ${item.label}`);
+    const callId = `logical:closed-carrier:${item.label}`;
+    admitReturnedHostCrossing({
+      task,
+      logicalToolCallId: callId,
+      tool: 'fixture_provider_read',
+      args: { label: item.label },
+      providerExecution: true,
+    });
+    const settled = settlement.settleToolAttempt({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      turn: task.turn,
+      lane: 'byo',
+      toolName: 'fixture_provider_read',
+      callId,
+      args: { label: item.label },
+      mutating: false,
+      businessCall: true,
+      result: item.result,
+    });
+    assert.equal(settled.outcome.kind, 'unknown', item.label);
+    if (item.detail) assert.equal(settled.outcome.detail, item.detail, item.label);
+    assert.equal(settled.resultHandleId, undefined, item.label);
+    assert.equal(successHandleCount(task), 0, item.label);
+  }
 });
 
 test('a provider-confirmed NOT FOUND answers a read (empty result) and fails a write', () => {

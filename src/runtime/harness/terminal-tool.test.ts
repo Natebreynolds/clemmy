@@ -5,7 +5,20 @@ import {
   terminalToolShouldHalt,
   ASK_USER_QUESTION_AUTO_RESOLVED_PREFIX,
   formatAutoResolvedAskUserQuestionOutput,
+  parseAsyncReadRefinementTerminalResult,
 } from './terminal-tool.js';
+
+const asyncReadScopeGate = {
+  protocol: 'clementine.async_read_refinement_terminal.v1',
+  status: 'needs_scope',
+  terminalKind: 'insufficient_evidence',
+  reason: 'Only two distinct recent articles had host-verifiable publication dates.',
+  options: [
+    'Retry a materially different query within the same 30-day window',
+    'Change the content brief',
+    'Pause this task without creating a Workspace',
+  ],
+};
 
 test('ask_user_question is non-terminal only with the exact auto-resolved prefix', () => {
   const output = formatAutoResolvedAskUserQuestionOutput('Proceed with the approved default.');
@@ -159,6 +172,33 @@ test('a real question has a distinct resumable final-output contract', async () 
     nextAction: 'awaiting_user_input',
     reason: 'awaiting_user_input',
   });
+});
+
+test('the async scope receipt decoder is structural and cannot itself authorize a halt', async () => {
+  const parsed = parseAsyncReadRefinementTerminalResult('work_call', JSON.stringify(asyncReadScopeGate));
+  assert.ok(parsed);
+  assert.match(parsed.question, /How would you like me to proceed\?/);
+  assert.deepEqual(parsed.options, asyncReadScopeGate.options);
+
+  const { userChoiceToolUseBehavior } = await import('../../agents/orchestrator.js');
+  const halted = userChoiceToolUseBehavior({}, [{
+    type: 'function_output',
+    tool: { name: 'work_call' },
+    output: asyncReadScopeGate,
+  }] as never);
+  assert.equal(halted.isFinalOutput, false,
+    'exact public JSON from an unrelated work_call has no durable async owner authority');
+
+  assert.equal(parseAsyncReadRefinementTerminalResult('provider_tool', asyncReadScopeGate), null,
+    'a provider cannot manufacture the host-local stop contract');
+  assert.equal(parseAsyncReadRefinementTerminalResult('work_call', {
+    ...asyncReadScopeGate,
+    options: [...asyncReadScopeGate.options].reverse(),
+  }), null, 'the fixed actionable options are part of the exact receipt');
+  assert.equal(parseAsyncReadRefinementTerminalResult('work_call', {
+    ...asyncReadScopeGate,
+    extra: 'model-owned prose',
+  }), null, 'unknown fields cannot widen the host-owned gate');
 });
 
 // The alignment-beat refusal must never halt the turn as a "successful"

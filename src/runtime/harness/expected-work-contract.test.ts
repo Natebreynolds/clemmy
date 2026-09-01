@@ -490,8 +490,8 @@ test('a finite accepted-input batch is distinct from per-item and whole-source c
   assert.equal(wrongCoverage.ok, false, 'a finite caller set must not claim whole-source exhaustion');
 });
 
-test('structured action proposals cannot mint host-only resolved-operation coverage', () => {
-  const task = accept('Read the two requested ranges and email me the summary.');
+test('structured action proposals admit only an unconstrained resolved-operation root read', () => {
+  const task = accept('Run one bounded current-news lookup and save one grounded report.');
   const proposed: contracts.ExpectedWorkProposalV1 = {
     version: 1,
     operations: [
@@ -514,8 +514,46 @@ test('structured action proposals cannot mint host-only resolved-operation cover
     universes: [],
   };
   const result = contracts.freezeActionExpectedWorkContract({ ...task, proposal: proposed });
-  assert.equal(result.status, 'invalid');
-  assert.match(result.status === 'invalid' ? result.reason : '', /resolved_operation|host-only/i);
+  assert.equal(result.status, 'fixed', result.status === 'fixed' ? '' : result.reason);
+
+  const dependentTask = accept('Resolve a locator, search it, and save one grounded report.');
+  const dependent: contracts.ExpectedWorkProposalV1 = {
+    version: 1,
+    operations: [
+      {
+        id: 'locator', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [],
+        cardinality: { kind: 'once' },
+      },
+      {
+        id: 'source', effect: 'read', coverage: 'resolved_operation', dependsOn: ['locator'], dataFrom: [],
+        cardinality: { kind: 'once' },
+      },
+      {
+        id: 'save', effect: 'local_write', dependsOn: ['source'], dataFrom: ['source'],
+        cardinality: { kind: 'once' },
+      },
+    ],
+    universes: [],
+  };
+  const refused = contracts.freezeActionExpectedWorkContract({ ...dependentTask, proposal: dependent });
+  assert.equal(refused.status, 'invalid');
+  assert.match(refused.status === 'invalid' ? refused.reason : '', /resolved_operation|root read/i);
+
+  const completedBatchTask = accept('Resolve candidate URLs, finish their exact bounded read batch, and save one grounded report.');
+  const completedBatch = contracts.freezeActionExpectedWorkContract({
+    ...completedBatchTask,
+    proposal: {
+      ...dependent,
+      operations: dependent.operations.map((operation) => operation.id === 'source'
+        ? { ...operation, coverage: 'complete_set' as const }
+        : operation),
+    },
+  });
+  assert.equal(
+    completedBatch.status,
+    'fixed',
+    completedBatch.status === 'fixed' ? '' : completedBatch.reason,
+  );
 });
 
 test('a smaller second action proposal poisons authority and cannot shrink the first winner', () => {

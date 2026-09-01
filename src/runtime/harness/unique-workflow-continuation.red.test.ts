@@ -18,15 +18,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
-const INVOKE = new URL('./host-tool-invocation.ts', import.meta.url);
+const CONTRACT = new URL('./plan-task-result-contract.ts', import.meta.url);
 const HOST = new URL('./host-turn-runner.ts', import.meta.url);
 const PLAN = new URL('../../tools/plan-tools.ts', import.meta.url);
 
 test('NEGATIVE: unique-run plan_not_required is a closed settled refusal', () => {
-  const src = readFileSync(INVOKE, 'utf8');
+  const src = readFileSync(CONTRACT, 'utf8');
   const block = src.slice(
     src.indexOf("payload.code === 'plan_not_required'"),
-    src.indexOf("return 'settled_refusal';", src.indexOf("payload.code === 'plan_not_required'")) + 30,
+    src.indexOf("payload.code === 'plan_incomplete_missing_write'"),
   );
   assert.match(block, /workflowName/);
   assert.match(block, /repair/);
@@ -137,4 +137,17 @@ test('NEGATIVE: unique-run is host-dispatched before the model loop', () => {
   const loopAt = src.indexOf('for (let stepIndex = currentHostStepIndex;');
   assert.ok(dispatchAt >= 0 && loopAt > dispatchAt, 'host dispatch must precede the model loop');
   assert.match(src, /uniqueDispatch\.status === 'dispatched'/);
+});
+
+test('NEGATIVE: a prepared unique-run cannot fall through a swallowed projection failure', () => {
+  const src = readFileSync(HOST, 'utf8');
+  const owner = src.slice(
+    src.indexOf('if (hostProduction && !resumedHostState && !resumedRecoveryState)'),
+    src.indexOf('let remainingPreContentStallRetries'),
+  );
+  const probeCatch = owner.indexOf('} catch {');
+  const dispatch = owner.indexOf('tryHostDispatchNamedWorkflow');
+  const completion = owner.indexOf('return await completedOutcome(uniqueDispatch.message)');
+  assert.ok(probeCatch >= 0 && dispatch > probeCatch && completion > dispatch,
+    'only accepted-source identity probing may be swallowed; queue + projection stay outside');
 });

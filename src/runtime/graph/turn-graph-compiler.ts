@@ -590,6 +590,7 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     capabilityRole?: string;
     cardinality?: number;
     requiredFields?: string[];
+    structuredCollectionLocator?: TurnGraphNode['structuredCollectionLocator'];
     edgeWhen?: TurnGraphEdge['when'];
     connectPrior?: boolean;
   }): TurnGraphNode => {
@@ -608,6 +609,9 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
       ...(opts.capabilityRole ? { capabilityRole: opts.capabilityRole } : {}),
       ...(opts.cardinality !== undefined ? { cardinality: opts.cardinality } : {}),
       ...(opts.requiredFields ? { requiredFields: opts.requiredFields } : {}),
+      ...(opts.structuredCollectionLocator
+        ? { structuredCollectionLocator: { ...opts.structuredCollectionLocator } }
+        : {}),
     };
     nodes.push(node);
     if (prior && opts.connectPrior !== false) {
@@ -701,6 +705,23 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
     if (typed && boundOperations && boundOperations.length > 0) {
       const headerPrior = nodes.at(-1) ?? null;
       const byId = new Map<string, TurnGraphNode>();
+      const structuredWriteCandidates = typed.construct === 'collect_then_construct'
+        && typed.collection
+        && (typed.destinations?.length ?? (typed.destination ? 1 : 0)) === 1
+        ? boundOperations.filter((operation) => (
+            operation.requestedEffect === 'local_write'
+            || operation.requestedEffect === 'external_write'
+            || operation.requestedEffect === 'admin'
+          ))
+        : [];
+      const preferredStructuredWrites = structuredWriteCandidates.filter((operation) => (
+        operation.role === 'destination' || operation.role === 'create'
+      ));
+      const structuredWriteOwner = preferredStructuredWrites.length === 1
+        ? preferredStructuredWrites[0]
+        : structuredWriteCandidates.length === 1
+          ? structuredWriteCandidates[0]
+          : undefined;
       for (const operation of boundOperations) {
         const requested = operation.requestedEffect;
         const write = requested === 'external_write'
@@ -768,6 +789,15 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
                 idempotency: 'not_required',
                 receipt: 'evidence_ref',
               };
+        // A collect-then-construct cardinality describes the structured
+        // deliverable when there is one exact destination write. Attaching it
+        // to the upstream search conflates "five authored posts" with "five
+        // search hits" and lets a four-item Workspace terminalize. Collection
+        // reads keep the historical role-based projection only when no unique
+        // structured destination owns the accepted collection contract.
+        const ownsStructuredCollection = structuredWriteOwner
+          ? operation.id === structuredWriteOwner.id
+          : operation.role === 'collection';
         const node = addNode({
           id: operation.id,
           kind,
@@ -787,8 +817,11 @@ export function compileTurnGraph(input: CompileTurnGraphInput): CompileTurnGraph
                 }],
               }
             : {}),
-          cardinality: operation.role === 'collection' ? typed.collection?.count : undefined,
-          requiredFields: operation.role === 'collection' ? typed.collection?.projection : undefined,
+          cardinality: ownsStructuredCollection ? typed.collection?.count : undefined,
+          requiredFields: ownsStructuredCollection ? typed.collection?.projection : undefined,
+          structuredCollectionLocator: ownsStructuredCollection
+            ? typed.collection?.locator
+            : undefined,
           connectPrior: false,
         });
         byId.set(operation.id, node);

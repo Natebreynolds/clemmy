@@ -45,7 +45,11 @@ import {
   verifierLogicalCallId,
   type MutationVerificationRecipeV1,
 } from './mutation-verification-contract.js';
-import { parseHostLocalWriteCommitFacts } from './host-local-write-commit.js';
+import {
+  parseHostLocalWriteCommitFacts,
+  proveHostLocalWorkspaceStructuredCollection,
+} from './host-local-write-commit.js';
+import { proveHostLocalWorkspaceDerivation } from './host-local-workspace-derivation.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
 import { parseCapabilityManifestOperationSemantics } from './capability-manifest.js';
 import {
@@ -1533,19 +1537,75 @@ function verifyHostSealedWriteReceipt(input: {
     ? parseHostLocalWriteCommitFacts(createResult.raw)
     : null;
   if (localCommit) {
-    if (
-      !['commit', 'readback'].includes(receipt.kind)
-      || localCommit.createdId !== receipt.created_id
-      || localCommit.handle !== receipt.handle
-      || localCommit.receipt !== receipt.provider_receipt
-      || localCommit.contentDigest !== receipt.intended_digest
-      || localCommit.contentDigest !== receipt.observed_digest
-      || createResult.row.handle_physical_dispatch_id !== receipt.physical_dispatch_id
-    ) {
+    const baseMatches = localCommit.createdId === receipt.created_id
+      && localCommit.handle === receipt.handle
+      && localCommit.receipt === receipt.provider_receipt
+      && localCommit.contentDigest === receipt.intended_digest
+      && localCommit.contentDigest === receipt.observed_digest
+      && createResult.row.handle_physical_dispatch_id === receipt.physical_dispatch_id;
+    if (!baseMatches) {
       return {
         ok: false,
         status: 'conflict',
         reason: 'local authoring commit receipt does not match its exact returned host result',
+      };
+    }
+    if (receipt.kind === 'derivation') {
+      const derivation = proveHostLocalWorkspaceDerivation({
+        db: input.db,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: input.acceptedTaskId,
+        writeLogicalToolCallId: receipt.logical_tool_call_id,
+        resolveSuccessfulResult(logicalToolCallId) {
+          const result = exactSuccessfulResult({
+            db: input.db,
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: input.acceptedTaskId,
+            logicalToolCallId,
+          });
+          return result.ok
+            ? {
+                ok: true,
+                rawPayload: result.raw,
+                toolName: result.row.logical_tool_name,
+                executionSite: result.row.dispatch_execution_site ?? '',
+              }
+            : { ok: false, reason: result.reason };
+        },
+      });
+      if (derivation.status !== 'verified' || derivation.bundleDigest !== localCommit.contentDigest) {
+        return {
+          ok: false,
+          status: 'conflict',
+          reason: derivation.status === 'verified'
+            ? 'compound Workspace derivation digest changed before terminal publication'
+            : `compound Workspace derivation no longer redeems: ${derivation.reason}`,
+        };
+      }
+      if (input.node.cardinality !== undefined && input.node.structuredCollectionLocator) {
+        const collection = proveHostLocalWorkspaceStructuredCollection({
+          result: createResult.raw,
+          count: input.node.cardinality,
+          requiredFields: input.node.requiredFields ?? [],
+          locator: input.node.structuredCollectionLocator,
+        });
+        if (!collection) {
+          return {
+            ok: false,
+            status: 'conflict',
+            reason: 'compound Workspace structured deliverable no longer matches its frozen count and fields',
+          };
+        }
+      }
+      return { ok: true };
+    }
+    if (!['commit', 'readback'].includes(receipt.kind)) {
+      return {
+        ok: false,
+        status: 'conflict',
+        reason: 'local authoring commit cannot satisfy this receipt kind',
       };
     }
     return { ok: true };

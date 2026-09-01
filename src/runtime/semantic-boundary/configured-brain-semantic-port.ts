@@ -50,7 +50,9 @@ const SYSTEM = [
   'Requested effects are requests. Criterion ids are opaque.',
   'Copy an exact supplied capabilityRef for every operation, including host_only.',
   'Do not invent a capability id that is not in host.capabilityIds.',
-  'If an open question is present, answer it with an exact visible option or leave it ambiguous.',
+  'If an open question is present, bind every answer to its exact questionId, slotKey, goal revision, and visible optionId.',
+  'A visible Q) Explain the rationale or B) Customize audience, channels, voice, or cadence choice is a meta-choice: return answer_open_slot with kind meta, its exact visible optionId, and action explain or customize; it keeps the content slot open.',
+  'Never infer a meta action from answer prose or question/slot identity alone. Otherwise select an exact visible option, provide allowed free text, or leave it ambiguous.',
 ].join(' ');
 
 const JUDGE_SYSTEM = [

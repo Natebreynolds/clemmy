@@ -58,7 +58,12 @@ import {
 } from './mutation-verification-proof.js';
 import { mutationVerificationReceiptId } from './mutation-verification-contract.js';
 import { registeredToolSideEffect } from '../../tools/tool-registry.js';
-import { parseHostLocalWriteCommitFacts } from './host-local-write-commit.js';
+import {
+  hostLocalWriteCommitResultIsProven,
+  parseHostLocalWriteCommitFacts,
+  proveHostLocalWorkspaceStructuredCollection,
+} from './host-local-write-commit.js';
+import { proveHostLocalWorkspaceDerivation } from './host-local-workspace-derivation.js';
 
 export const EVIDENCE_RECEIPT_EVENT = 'evidence_receipt' as const;
 
@@ -1428,16 +1433,74 @@ function redeemHostWriteReceiptFacts(input: {
     ? parseHostLocalWriteCommitFacts(created.value.rawPayload)
     : null;
   if (localCommit) {
-    if (
+    const baseMatches = (
       localCommit.createdId !== input.createdId
       || localCommit.handle !== input.handle
       || localCommit.receipt !== input.providerReceipt
       || localCommit.contentDigest !== input.intendedDigest
       || localCommit.contentDigest !== input.observedDigest
       || created.value.physicalDispatchId !== input.physicalDispatchId
-      || !['commit', 'readback'].includes(input.kind)
-    ) {
+    ) === false;
+    if (!baseMatches) {
       return { ok: false, reason: 'local authoring commit receipt no longer matches its durable proof facts' };
+    }
+    if (input.kind === 'derivation') {
+      const sources = verifyManifestDerivationSources({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        manifestId: input.manifestId,
+        nodeId: input.nodeId,
+      });
+      if (!sources.ok) return sources;
+      const derivation = proveHostLocalWorkspaceDerivation({
+        db,
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: input.acceptedTaskId,
+        writeLogicalToolCallId: input.logicalToolCallId,
+        resolveSuccessfulResult(logicalToolCallId) {
+          const result = redeemSuccessfulSettlementResultForHost({
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: input.acceptedTaskId,
+            logicalToolCallId,
+          });
+          return result.status === 'ok'
+            ? {
+                ok: true,
+                rawPayload: result.value.rawPayload,
+                toolName: result.value.toolName,
+                executionSite: result.value.executionSite,
+              }
+            : { ok: false, reason: result.reason };
+        },
+      });
+      if (
+        derivation.status !== 'verified'
+        || derivation.bundleDigest !== localCommit.contentDigest
+      ) {
+        return {
+          ok: false,
+          reason: derivation.status === 'verified'
+            ? 'compound Workspace derivation digest changed'
+            : `compound Workspace derivation no longer redeems: ${derivation.reason}`,
+        };
+      }
+      if (node?.cardinality !== undefined && node.structuredCollectionLocator) {
+        const collection = proveHostLocalWorkspaceStructuredCollection({
+          result: created.value.rawPayload,
+          count: node.cardinality,
+          requiredFields: node.requiredFields ?? [],
+          locator: node.structuredCollectionLocator,
+        });
+        if (!collection) {
+          return { ok: false, reason: 'compound Workspace structured cardinality no longer redeems' };
+        }
+      }
+      return { ok: true };
+    }
+    if (!['commit', 'readback'].includes(input.kind)) {
+      return { ok: false, reason: 'local authoring commit cannot satisfy this receipt kind' };
     }
     return { ok: true };
   }
@@ -1690,6 +1753,7 @@ export function issueHostWriteEvidenceForManifestNode(input: {
         && node.resolvedTool === created.value.toolName
         && created.value.executionSite === 'host'
         && registeredToolSideEffect(created.value.toolName) === 'write'
+        && hostLocalWriteCommitResultIsProven(created.value.rawPayload)
         ? parseHostLocalWriteCommitFacts(created.value.rawPayload)
         : null;
       const exactContentDigest = frozenVerification.status === 'verified'
@@ -1769,6 +1833,54 @@ export function issueHostWriteEvidenceForManifestNode(input: {
           };
         } else if (atomic?.ok) {
           intendedDigest = atomic.facts.intendedDigest;
+        } else if (localCommit) {
+          const derivation = proveHostLocalWorkspaceDerivation({
+            db,
+            sessionId: input.sessionId,
+            sourceUserSeq: input.sourceUserSeq,
+            acceptedTaskId: manifestState.authority.accepted_task_id,
+            writeLogicalToolCallId: logicalToolCallId,
+            resolveSuccessfulResult(candidateLogicalToolCallId) {
+              const result = redeemSuccessfulSettlementResultForHost({
+                sessionId: input.sessionId,
+                sourceUserSeq: input.sourceUserSeq,
+                acceptedTaskId: manifestState.authority.accepted_task_id,
+                logicalToolCallId: candidateLogicalToolCallId,
+              });
+              return result.status === 'ok'
+                ? {
+                    ok: true,
+                    rawPayload: result.value.rawPayload,
+                    toolName: result.value.toolName,
+                    executionSite: result.value.executionSite,
+                  }
+                : { ok: false, reason: result.reason };
+            },
+          });
+          if (derivation.status !== 'verified') {
+            return {
+              status: 'refused',
+              reason: `write derivation is not host-sealed: ${derivation.reason}`,
+            };
+          }
+          if (node.cardinality !== undefined && node.structuredCollectionLocator) {
+            const collection = proveHostLocalWorkspaceStructuredCollection({
+              result: created.value.rawPayload,
+              count: node.cardinality,
+              requiredFields: node.requiredFields ?? [],
+              locator: node.structuredCollectionLocator,
+            });
+            if (!collection) {
+              return {
+                status: 'refused',
+                reason: 'write structured deliverable does not match its frozen count and fields',
+              };
+            }
+          }
+          intendedDigest = derivation.bundleDigest;
+          if (!readback || readback.digest !== intendedDigest) {
+            return { status: 'refused', reason: 'Workspace derivation and compound readback differ' };
+          }
         } else {
           if (!readback) {
             return { status: 'refused', reason: 'write derivation lacks an exact readback content digest' };

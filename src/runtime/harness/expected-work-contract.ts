@@ -498,8 +498,22 @@ export function validateActionProposalForGraph(
   ) {
     errors.push('an action graph cannot be weakened to read-only work');
   }
-  if (proposal.operations.some((operation) => operation.coverage === 'resolved_operation')) {
-    errors.push('resolved_operation coverage is host-only and unavailable to structured action proposals');
+  for (const operation of proposal.operations.filter((candidate) => (
+    candidate.coverage === 'resolved_operation'
+  ))) {
+    const graphNode = graph.nodes.find((node) => node.id === operation.id);
+    if (
+      operation.effect !== 'read'
+      || operation.cardinality.kind !== 'once'
+      || operation.dependsOn.length !== 0
+      || operation.dataFrom.length !== 0
+      || (graphNode?.cardinality !== undefined && graphNode.cardinality > 1)
+      || (graphNode?.requiredFields?.length ?? 0) > 0
+    ) {
+      errors.push(
+        'resolved_operation coverage is limited to one unconstrained once-cardinality root read',
+      );
+    }
   }
   if (
     graph.classification.externalEffectRequested

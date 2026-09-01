@@ -82,11 +82,12 @@ export const WorkTopologyMemberSchema = z.string().min(1).max(256).regex(MEMBER_
 export const WorkTopologyEffectSchema = z.enum([
   'read', 'compute', 'local_write', 'external_write', 'admin',
 ]);
-/** Model-facing coverage. `resolved_operation` is host-only and is refused
- * by expected-work admission; advertising it here made every workflow start
- * spend a plan_task on a coverage that cannot be cited. */
+/** Model-facing coverage. `resolved_operation` is the truthful shape for one
+ * bounded, once-cardinality root lookup that promises a grounded result but
+ * not provider-wide exhaustion. Expected-work admission separately refuses it
+ * for finite/set/count-constrained or dependent reads. */
 export const WorkTopologyModelCoverageSchema = z.enum([
-  'single', 'accepted_set', 'complete_set',
+  'single', 'accepted_set', 'complete_set', 'resolved_operation',
 ]);
 export const WorkTopologyCoverageSchema = z.enum([
   'single', 'accepted_set', 'complete_set', 'resolved_operation',
@@ -337,6 +338,7 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
         (raw.coverage === 'accepted_set' && cardinality.kind !== 'set')
         || (cardinality.kind === 'set' && raw.coverage !== 'accepted_set')
         || (raw.coverage === 'complete_set' && cardinality.kind !== 'once')
+        || (raw.coverage === 'resolved_operation' && cardinality.kind !== 'once')
         || (cardinality.kind === 'each' && raw.coverage !== 'single')
       )
     ) {

@@ -333,4 +333,14 @@ test('accepted-request effect, not capability spelling, owns the initial plannin
     ),
     'read',
   );
+  assert.equal(
+    planningEffectCeilingForAcceptedRequest([
+      'Read the Slack channel and compare it with the current tracker.',
+      'READ-ONLY IN SLACK — never post, reply, react, or DM. The only writes are to the Google Sheet.',
+      'WRITE — insert new rows, update changed rows, and refresh the daily digest.',
+      'REPORT — notify Nate on every run, including when nothing changed.',
+    ].join('\n')),
+    'external_write',
+    'a resource-scoped read-only clause cannot narrow a compound workflow to a read-only planning card',
+  );
 });

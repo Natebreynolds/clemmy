@@ -64,7 +64,7 @@ export interface SemanticProjectionV1 {
   /** Typed goal/work copied from the hash-bound proposal. Effects are requests. */
   goal?: {
     construct: AcceptedGoalConstruct;
-    collection?: { count: number; projection: string[] };
+    collection?: AcceptedGoalV1['collection'];
     destinations?: AcceptedGoalV1['destinations'];
     destination?: AcceptedGoalV1['destination'];
     requestedEffect: RuntimeToolEffect | 'none';
@@ -78,6 +78,7 @@ export interface SemanticProjectionV1 {
     evidenceRequirements: string[];
   };
   slotAnswer?: SlotAnswerV1;
+  metaAction?: 'explain' | 'customize';
   parkPriorGoal: boolean;
 }
 
@@ -87,16 +88,35 @@ export type SemanticProjectionResult =
 
 function goalFromWork(
   proposal: ContextCheckedTurnSemanticProposalV1['proposal'],
+  acceptedAt?: string,
 ): SemanticProjectionV1['goal'] | undefined {
   const work = proposal.work;
   const draft = proposal.goal;
   if (!work || !draft) return undefined;
   const topology = work.topology ? validateWorkTopology(work.topology) : null;
   if (topology && !topology.ok) return undefined;
+  const acceptedAsOf = acceptedAt && !Number.isNaN(new Date(acceptedAt).valueOf()) ? acceptedAt : '';
+  if (work.cardinality?.locator && !acceptedAsOf) return undefined;
   return {
     construct: work.construct,
     ...(work.cardinality
-      ? { collection: { count: work.cardinality.count, projection: [...work.cardinality.fields] } }
+      ? {
+          collection: {
+            count: work.cardinality.count,
+            projection: [...work.cardinality.fields],
+            ...(work.cardinality.locator
+              ? {
+                  locator: {
+                    ...work.cardinality.locator,
+                    sourceEvidence: {
+                      ...work.cardinality.locator.sourceEvidence,
+                      asOf: acceptedAsOf,
+                    },
+                  },
+                }
+              : {}),
+          },
+        }
       : {}),
     ...(() => {
       const destinations = workDestinationsOf(work);
@@ -133,7 +153,7 @@ export function projectCheckedSemantics(
     return { ok: false, reason: 'semantics are not a host-checked in-process envelope' };
   }
   const { proposal, source } = checked;
-  const goal = goalFromWork(proposal);
+  const goal = goalFromWork(proposal, checked.source.acceptedAt);
 
   switch (proposal.relation) {
     case 'conversation':
@@ -182,18 +202,21 @@ export function projectCheckedSemantics(
           parkPriorGoal: false,
         },
       };
-    case 'answer_open_slot':
+    case 'answer_open_slot': {
+      const answer = proposal.slotAnswers[0];
       return {
         ok: true,
         projection: {
-          kind: 'settle_slot',
+          kind: answer?.kind === 'meta' ? 'keep_slot_open' : 'settle_slot',
           source,
           relation: proposal.relation,
           targetGoal: proposal.targetGoal,
-          slotAnswer: proposal.slotAnswers[0],
+          slotAnswer: answer,
+          ...(answer?.kind === 'meta' ? { metaAction: answer.action } : {}),
           parkPriorGoal: false,
         },
       };
+    }
     case 'amend_goal':
       return {
         ok: true,

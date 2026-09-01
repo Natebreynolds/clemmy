@@ -84,6 +84,19 @@ export interface AutoApprovalEntry {
   summary: string;
 }
 
+/** Durable pointer to one append-only, source-bound workflow write receipt.
+ * The pointer grants nothing by itself: the host reopens the receipt, run
+ * definition, active attempt, catalog binding, and exact accepted model batch
+ * before evaluating consent. */
+export interface AuthoredWorkflowWriteAuthorityScopeV1 {
+  version: 1;
+  authorityDigest: string;
+  sourceUserSeq: number;
+  attemptId: string;
+  workflowRunId: string;
+  stepId: string;
+}
+
 export interface PlanScope {
   sessionId: string;
   planProposalId: string;
@@ -128,6 +141,7 @@ export interface PlanScope {
    *  than the 2026-07-09 Hole-2 wildcard (un-authored lanes): it exists only
    *  where a human wrote "this step sends" and turned the workflow on. */
   allowAnySend?: boolean;
+  authoredWorkflowWriteAuthority?: AuthoredWorkflowWriteAuthorityScopeV1;
   openedAt: string;
   expiresAt: string;
   /** Audit trail of auto-approved calls inside this scope. */
@@ -307,6 +321,84 @@ export function getPlanScope(sessionId: string): PlanScope | null {
     return { ...scope, closedAt: new Date().toISOString(), closedReason: 'expired' };
   }
   return scope;
+}
+
+export function installAuthoredWorkflowWriteAuthorityScope(input: {
+  sessionId: string;
+  expectedPlanProposalId: string;
+  authority: AuthoredWorkflowWriteAuthorityScopeV1;
+}): boolean {
+  const authority = input.authority as Partial<AuthoredWorkflowWriteAuthorityScopeV1>;
+  if (
+    typeof input.sessionId !== 'string'
+    || !input.sessionId.trim()
+    || typeof input.expectedPlanProposalId !== 'string'
+    || !input.expectedPlanProposalId.trim()
+    || authority.version !== 1
+    || typeof authority.authorityDigest !== 'string'
+    || !/^[a-f0-9]{64}$/.test(authority.authorityDigest)
+    || !Number.isSafeInteger(authority.sourceUserSeq)
+    || Number(authority.sourceUserSeq) <= 0
+    || typeof authority.attemptId !== 'string'
+    || !authority.attemptId.trim()
+    || typeof authority.workflowRunId !== 'string'
+    || !authority.workflowRunId.trim()
+    || typeof authority.stepId !== 'string'
+    || !authority.stepId.trim()
+  ) return false;
+  return withScopesStateMutation(() => {
+    const file = readAll();
+    const scope = file.scopes[input.sessionId];
+    const expiresAt = Date.parse(scope?.expiresAt ?? '');
+    if (
+      !scope
+      || scope.closedAt
+      || scope.goalScoped
+      || scope.planProposalId !== input.expectedPlanProposalId
+      || !Number.isFinite(expiresAt)
+      || expiresAt <= Date.now()
+    ) return false;
+    const existing = scope.authoredWorkflowWriteAuthority;
+    if (existing && (
+      existing.version !== input.authority.version
+      || existing.authorityDigest !== input.authority.authorityDigest
+      || existing.sourceUserSeq !== input.authority.sourceUserSeq
+      || existing.attemptId !== input.authority.attemptId
+      || existing.workflowRunId !== input.authority.workflowRunId
+      || existing.stepId !== input.authority.stepId
+    )) return false;
+    scope.authoredWorkflowWriteAuthority = { ...input.authority };
+    file.scopes[input.sessionId] = scope;
+    writeAll(file);
+    return true;
+  });
+}
+
+export function readAuthoredWorkflowWriteAuthorityScope(
+  sessionId: string,
+): AuthoredWorkflowWriteAuthorityScopeV1 | null {
+  const scope = getPlanScope(sessionId);
+  if (!scope || scope.closedAt || scope.goalScoped) return null;
+  const expiresAt = Date.parse(scope.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
+  const value = scope.authoredWorkflowWriteAuthority as
+    | Partial<AuthoredWorkflowWriteAuthorityScopeV1>
+    | undefined;
+  if (
+    !value
+    || value.version !== 1
+    || typeof value.authorityDigest !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.authorityDigest)
+    || !Number.isSafeInteger(value.sourceUserSeq)
+    || Number(value.sourceUserSeq) <= 0
+    || typeof value.attemptId !== 'string'
+    || !value.attemptId.trim()
+    || typeof value.workflowRunId !== 'string'
+    || !value.workflowRunId.trim()
+    || typeof value.stepId !== 'string'
+    || !value.stepId.trim()
+  ) return null;
+  return { ...(value as AuthoredWorkflowWriteAuthorityScopeV1) };
 }
 
 export function closePlanScope(sessionId: string, reason: string = 'closed'): PlanScope | null {

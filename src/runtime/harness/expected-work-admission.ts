@@ -85,6 +85,7 @@ import {
   type SealedNodeBinding,
 } from './host-capability-catalog-factory.js';
 import { proveFrozenMutationVerification } from './mutation-verification-proof.js';
+import { expectsHostLocalWorkspaceCompoundCommit } from './host-local-write-commit.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
   /** RFC 6901 pointer into the normalized inner tool arguments. */
@@ -133,6 +134,7 @@ export type ExpectedWorkAdmissionFailureKind =
   | 'work_cardinality_mismatch'
   | 'work_universe_unsealed'
   | 'work_source_witness_missing'
+  | 'work_source_selection_invalid'
   | 'work_already_satisfied'
   | 'work_evidence_incomplete'
   | 'work_effect_already_executed'
@@ -1498,6 +1500,20 @@ function hostSealedContentContractForAdmission(input: {
     && operation.cardinality.kind === 'once'
     && operation.dependsOn.includes(input.operation.id)
   ));
+  if (
+    readbacks.length === 0
+    && input.operation.effect === 'local_write'
+    && expectsHostLocalWorkspaceCompoundCommit({
+      toolName: sealedCreate.logicalToolName,
+      args: input.evidenceArgs,
+    })
+  ) {
+    // The successful local result must still pass the post-write compound
+    // descriptor re-open before evidence/terminal publication. Admission only
+    // recognizes that this exact one-call tool supplies its own readback; it
+    // does not fabricate a success receipt or relax any other create.
+    return null;
+  }
   if (readbacks.length !== 1) {
     return { ok: false, reason: 'generated artifact requires one exact declared create successor readback' };
   }
@@ -2299,6 +2315,14 @@ export function admitExpectedWorkInvocation(input: {
    * binding before using it. A pure `none` graph capability is represented as
    * compute evidence because it executes work without granting a mutation. */
   hostSealedEffect?: Exclude<RuntimeToolEffect, 'unknown'>;
+  /** Synchronous durable-continuation owner written in the SAME IMMEDIATE
+   * transaction as this expected-work binding. It must perform no I/O beyond
+   * the supplied DB transaction and must be idempotent for replay. */
+  recordContinuationInTransaction?: (input: {
+    db: Database.Database;
+    binding: ExpectedWorkCallBinding;
+    argumentDigest: string;
+  }) => void;
 }): ExpectedWorkInvocationAdmission {
   const loaded = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
   let contract: AcceptedTaskWorkContractV1;
@@ -2500,7 +2524,15 @@ export function admitExpectedWorkInvocation(input: {
           && binding.universeItemId === (input.universeItemId ?? undefined)
           && String(existing.tool_name) === logicalContract.toolName
           && String(existing.argument_digest) === logicalContract.argumentDigest
-        ) return { status: 'replayed', binding: generatedArtifactContractForBinding(db, binding), contract };
+        ) {
+          const replayed = generatedArtifactContractForBinding(db, binding);
+          input.recordContinuationInTransaction?.({
+            db,
+            binding: replayed,
+            argumentDigest: logicalContract.argumentDigest,
+          });
+          return { status: 'replayed', binding: replayed, contract };
+        }
         return refusedWithPlan('work_contract_conflict', 'logical call already owns a different work binding');
       }
 
@@ -2839,6 +2871,11 @@ export function admitExpectedWorkInvocation(input: {
           ? { generatedArtifactContentContract: generatedArtifactContract.contentContract }
           : {}),
       };
+      input.recordContinuationInTransaction?.({
+        db,
+        binding,
+        argumentDigest: logicalContract.argumentDigest,
+      });
       return { status: 'bound', binding, contract };
     });
     const result = tx.immediate();

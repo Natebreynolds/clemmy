@@ -42,6 +42,7 @@ const {
   HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT,
   HostInterruptState,
   HostRecoveryState,
+  hostNoProgressRecoveryDirective,
   hostRunRunner,
 } = await import('./host-turn-runner.js');
 const {
@@ -102,6 +103,34 @@ function throwingRunner(): EventEmitter {
   return runner;
 }
 
+function readOnlyFileDraft(capabilityRef: string) {
+  return {
+    criteria: ['Read the source before creating the requested output file.'],
+    cardinality: null,
+    destination: null,
+    topology: {
+      version: 1,
+      operations: [{
+        id: 'read_source',
+        effect: 'read',
+        coverage: 'single',
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' },
+      }],
+      universes: [],
+    },
+    bindings: [{
+      operationId: 'read_source',
+      role: 'source',
+      capabilityRef,
+      evidence: ['tool_result'],
+    }],
+    deliverables: [{ id: 'source_evidence', kind: 'evidence' }],
+    evidenceRequirements: ['tool_result'],
+  };
+}
+
 test('approval-resume state preserves a spent no-progress retry and exact history cursor', () => {
   const initial = initializeNoProgressGovernor({
     taskKey: 'accepted-task:resume-pin',
@@ -139,6 +168,37 @@ test('approval-resume state preserves a spent no-progress retry and exact histor
     () => HostInterruptState.fromString(JSON.stringify(forged)),
     /invalid no-progress checkpoint/i,
   );
+});
+
+test('structural plan surfaces carry branch-specific one-call directives', () => {
+  const authority = { operation: [], account: [], target: [], evidence: [], effect: [] } as const;
+  const directive = (stage: string, tool: string) => {
+    const initial = initializeNoProgressGovernor({ taskKey: `directive:${stage}`, authority });
+    const decision = observeNoProgress(initial, {
+      taskKey: initial.taskKey,
+      attemptClass: 'plan_admission',
+      authority,
+      consequence: createNoProgressConsequence({
+        stage,
+        recovery: 'repair_model',
+        effectState: 'not_started',
+        recoveryToolNames: [tool],
+      }),
+    });
+    return hostNoProgressRecoveryDirective(decision.state);
+  };
+  const graphNeutral = directive('plan_not_required:graph_neutral', 'call_tool');
+  assert.match(graphNeutral, /Call call_tool exactly once/);
+  assert.match(graphNeutral, /Do not call plan_task, tool_search/);
+  const workflow = directive('plan_not_required:unique_workflow', 'workflow_run');
+  assert.match(workflow, /Call workflow_run exactly once/);
+  assert.match(workflow, /Do not call plan_task, workflow_get, tool_search/);
+  const search = directive('semantic_admission:capability_not_disclosed', 'tool_search');
+  assert.match(search, /Call tool_search exactly once/);
+  assert.match(search, /Do not call plan_task until that search returns/);
+  const plan = directive('semantic_admission:write_not_aligned', 'plan_task');
+  assert.match(plan, /Call plan_task exactly once/);
+  assert.match(plan, /Do not rediscover/);
 });
 
 test('repeated discovery gets one control-only recovery and no third discovery crossing', async () => {
@@ -260,6 +320,212 @@ test('repeated discovery gets one control-only recovery and no third discovery c
      WHERE session_id = ? AND source_user_seq = ?
        AND logical_tool_call_id = 'discover-3'
   `).get(session.id, source.seq) as { n: number }).n, 0);
+});
+
+test('a current-card write makes missing-write recovery plan_task-only', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+
+  const prompt = 'Read a source file, then create one new output file from it.';
+  const session = eventlog.createSession({ id: 'host-missing-write-card-repair', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: prompt },
+  });
+  const primed = await semanticPlanning.primePrimaryModelPlanningCatalog({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+
+  const surfaces: string[][] = [];
+  let modelCalls = 0;
+  const expectedStop = new Error('expected stop after observing plan-only recovery surface');
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      modelCalls += 1;
+      const surface = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
+      surfaces.push(surface);
+      if (modelCalls === 1) {
+        return {
+          responseId: 'card-repair-search',
+          output: [functionCall('card-repair-search', 'tool_search', {
+            query: 'write_file', role_key: null, limit: 1,
+          })],
+        };
+      }
+      if (modelCalls === 2) {
+        assert.ok(surface.includes('plan_task'));
+        return {
+          responseId: 'card-repair-incomplete-plan',
+          output: [functionCall('card-repair-incomplete-plan', 'plan_task', {
+            preamble: 'I’ll read the source and create the output now.',
+            draft: readOnlyFileDraft('cap:local:write_file:create'),
+          })],
+        };
+      }
+      const requestText = JSON.stringify(request);
+      assert.match(requestText, /plan_incomplete_missing_write/);
+      assert.match(requestText, /cap:local:write_file:create/);
+      assert.match(requestText, /Call plan_task exactly once/);
+      assert.match(requestText, /Do not call tool_search/);
+      assert.ok(surface.includes('plan_task'));
+      assert.equal(surface.includes('tool_search'), false);
+      throw expectedStop;
+    },
+    getStreamedResponse: modelStream,
+  };
+  const agent = await buildOrchestratorAgent({
+    userInput: prompt,
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    hostFreshPlanning: primed.planning,
+    allowedToolNames: ['write_file', 'tool_search'],
+    allowToolJit: true,
+    mcpToolScope: {
+      authority: 'none', reason: 'isolated local recovery regression',
+      allowedServerSlugs: [], toolPatterns: [], maxTools: 0,
+    },
+    model: model as never,
+  });
+  let thrown: unknown;
+  try {
+    await brackets.withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      counter: new brackets.ToolCallsCounter(6),
+      behaviorScopeId: `${session.id}::turn:1`,
+    }, () => hostRunRunner(
+      throwingRunner() as never,
+      agent as never,
+      [{ role: 'user', content: prompt }] as never,
+      {
+        maxTurns: 5,
+        hostTurnEngine: 'host_v1',
+        context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+      } as never,
+    ));
+  } catch (error) {
+    thrown = error;
+  }
+  assert.equal(thrown, expectedStop);
+  assert.equal(modelCalls, 3);
+  assert.equal(surfaces[2]?.includes('tool_search'), false);
+  assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
+});
+
+test('an empty-card missing-write recovery exposes one search, then newly disclosed write reaches plan_task', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+
+  const prompt = 'Read a source file, then create one new output file from it.';
+  const session = eventlog.createSession({ id: 'host-missing-write-search-repair', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: prompt },
+  });
+  const primed = await semanticPlanning.primePrimaryModelPlanningCatalog({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+
+  const surfaces: string[][] = [];
+  let modelCalls = 0;
+  const expectedStop = new Error('expected stop after newly disclosed write reached plan_task');
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      modelCalls += 1;
+      const surface = (request.tools ?? []).map((entry) => entry.name ?? '').filter(Boolean);
+      surfaces.push(surface);
+      if (modelCalls === 1) {
+        return {
+          responseId: 'search-repair-read-search',
+          output: [functionCall('search-repair-read-search', 'tool_search', {
+            query: 'user_profile_read', role_key: null, limit: 1,
+          })],
+        };
+      }
+      if (modelCalls === 2) {
+        assert.ok(surface.includes('plan_task'));
+        return {
+          responseId: 'search-repair-incomplete-plan',
+          output: [functionCall('search-repair-incomplete-plan', 'plan_task', {
+            preamble: 'I’ll read the source and create the output now.',
+            draft: readOnlyFileDraft('cap:local:user_profile_read:read'),
+          })],
+        };
+      }
+      if (modelCalls === 3) {
+        const requestText = JSON.stringify(request);
+        assert.match(requestText, /plan_incomplete_missing_write/);
+        assert.match(requestText, /admissibleCapabilities/);
+        assert.match(requestText, /Call tool_search exactly once/);
+        assert.doesNotMatch(requestText, /Do not repeat discovery/);
+        assert.deepEqual(surface, ['tool_search']);
+        return {
+          responseId: 'search-repair-write-search',
+          output: [functionCall('search-repair-write-search', 'tool_search', {
+            query: 'write_file', role_key: null, limit: 1,
+          })],
+        };
+      }
+      if (modelCalls === 4) {
+        assert.ok(surface.includes('plan_task'), 'new authority restores the ordinary planning surface');
+        throw expectedStop;
+      }
+      throw new Error(`unexpected extra model call ${modelCalls}`);
+    },
+    getStreamedResponse: modelStream,
+  };
+  const agent = await buildOrchestratorAgent({
+    userInput: prompt,
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    hostFreshPlanning: primed.planning,
+    allowedToolNames: ['user_profile_read', 'write_file', 'tool_search'],
+    allowToolJit: true,
+    mcpToolScope: {
+      authority: 'none', reason: 'isolated local recovery regression',
+      allowedServerSlugs: [], toolPatterns: [], maxTools: 0,
+    },
+    model: model as never,
+  });
+  let thrown: unknown;
+  try {
+    await brackets.withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      turn: 1,
+      counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${session.id}::turn:1`,
+    }, () => hostRunRunner(
+      throwingRunner() as never,
+      agent as never,
+      [{ role: 'user', content: prompt }] as never,
+      {
+        maxTurns: 7,
+        hostTurnEngine: 'host_v1',
+        context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+      } as never,
+    ));
+  } catch (error) {
+    thrown = error;
+  }
+  assert.equal(thrown, expectedStop);
+  assert.equal(modelCalls, 4);
+  assert.deepEqual(surfaces[2], ['tool_search']);
+  assert.ok(surfaces[3]?.includes('plan_task'));
+  assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
 });
 
 test('a host-only materialization gap transfers privately to HostRecoveryState without another model call', async () => {

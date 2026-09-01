@@ -125,6 +125,59 @@ test('raw payload is stored once and redeems byte-exact after close and reopen',
   assert.equal(count.count, 1, 'replay must not duplicate the one raw payload copy');
 });
 
+test('host-only batch getter retains exact raw HTML but publishes no generic projection copy', () => {
+  const task = accept('batch getter raw html confinement');
+  const authority = returnedCall({
+    task,
+    logicalToolCallId: 'logical-batch-getter-host-only',
+    physicalDispatchId: 'physical-batch-getter-host-only',
+    toolName: 'FIRECRAWL_BATCH_SCRAPE_GET',
+    args: { id: 'batch-job-1' },
+  });
+  const hostileToken = 'HOSTILE_RAW_HTML_TOKEN_NEVER_PROJECT';
+  const payload = {
+    successful: true,
+    data: {
+      status: 'completed',
+      data: [{
+        rawHtml: `<script>${hostileToken}</script>`,
+        metadata: {
+          sourceURL: 'https://example.com/article',
+          statusCode: 200,
+        },
+      }],
+    },
+    logId: 'batch-getter-log-1',
+  };
+  const handle = results.toResultHandle(payload, { authority });
+  const row = eventlog.openEventLog().prepare(`
+    SELECT raw_payload_json, projected_records_json, envelope_meta_json,
+           record_path, record_count, completeness, status_code
+      FROM durable_result_handles WHERE handle_id = ?
+  `).get(handle.handle) as {
+    raw_payload_json: string;
+    projected_records_json: string;
+    envelope_meta_json: string | null;
+    record_path: string | null;
+    record_count: number;
+    completeness: string;
+    status_code: number | null;
+  };
+  assert.match(row.raw_payload_json, new RegExp(hostileToken));
+  assert.equal(row.projected_records_json, '[]');
+  assert.equal(row.envelope_meta_json, null);
+  assert.equal(row.record_path, null);
+  assert.equal(row.record_count, 0);
+  assert.equal(row.completeness, 'unknown');
+  assert.equal(row.status_code, null);
+  assert.deepEqual(handle.projectedRecords, []);
+  assert.equal(handle.envelopeMeta, null);
+  assert.deepEqual(results.redeemRawResult(handle.rawLocation!, authority), {
+    status: 'ok',
+    value: payload,
+  });
+});
+
 test('immutable storage rejects ordinary tampering and redemption detects damaged bytes', () => {
   const task = accept('integrity');
   const authority = returnedCall({

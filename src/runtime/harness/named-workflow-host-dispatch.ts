@@ -9,13 +9,24 @@
  * dispatching; the host owns this dispatch.
  */
 import type { TurnGraphRoute } from '../graph/turn-graph-ir.js';
+import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import {
   validateExistingWorkflowAuthority,
   type ExistingWorkflowAuthorityV1,
 } from './existing-workflow-authority.js';
 import { listEvents } from './eventlog.js';
-import { uniqueWorkflowRunRequest } from '../../tools/named-workflow-match.js';
+import {
+  requestsWorkflowExecution,
+  uniqueEnabledWorkflowMatch,
+  uniqueWorkflowRunRequest,
+  type UniqueEnabledWorkflowMatch,
+} from '../../tools/named-workflow-match.js';
 import { admitNamedWorkflowRunFromAcceptedSource } from '../../tools/admit-named-workflow-run.js';
+import {
+  rehydrateConsumedClarificationContext,
+  SEMANTIC_CLARIFICATION_RESOLVER_VERSION,
+} from './task-continuity-runtime.js';
+import { admittedOpenSlotValueFromLastInterpretation } from '../semantic-boundary/interpret-accepted-source.js';
 
 export type NamedWorkflowHostDispatchResult =
   | { status: 'dispatched'; workflowName: string; runId: string; message: string }
@@ -37,6 +48,96 @@ function priorAcceptedSourceTexts(sessionId: string, sourceUserSeq: number): str
   }
 }
 
+const WORKFLOW_CORRECTION_FILLER = new Set([
+  'actually', 'correction', 'flow', 'i', 'is', 'it', 'meant', 'mean', 'my',
+  'one', 'sorry', 'that', 'the', 'workflow', 'yes',
+]);
+
+function workflowCorrectionTokens(value: string): string[] {
+  return value.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/** B may correct only identity. Any cancellation, management, inspection, or
+ * compound action in B must go through ordinary fresh-turn semantics rather
+ * than borrowing the parent's RUN imperative. */
+function isPureWorkflowIdentityCorrection(
+  value: string,
+  match: UniqueEnabledWorkflowMatch,
+): boolean {
+  const text = value.trim();
+  if (
+    !text
+    || text.length > 160
+    || /\b(?:do\s+not|don['’]?t|never|not|stop|cancel|skip|leave|forget|delete|disable|enable|edit|update|reschedule|rename|archive|pause|inspect|show|view|read|get|definition|instead|but|also)\b/iu.test(text)
+  ) return false;
+  const identity = new Set(workflowCorrectionTokens(`${match.slug} ${match.name}`));
+  const tokens = workflowCorrectionTokens(text);
+  return tokens.length > 0
+    && tokens.some((token) => identity.has(token))
+    && tokens.every((token) => identity.has(token) || WORKFLOW_CORRECTION_FILLER.has(token));
+}
+
+/**
+ * A free-text clarification answer supplies only the corrected resource
+ * identity. It can never manufacture RUN authority: that must already be
+ * present in the exact durable parent request, and the exact open question
+ * must name the same unique workflow. Rehydrating the consumed packet also
+ * proves this is the checked A/Q/B continuation for the current accepted
+ * source rather than an unrelated phrase or a caller-constructed context.
+ */
+function consumedWorkflowNameCorrection(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  userText: string;
+}): UniqueEnabledWorkflowMatch | null {
+  const consumed = readConsumedTaskContinuityPacket({
+    sessionId: input.sessionId,
+    consumingSourceUserSeq: input.sourceUserSeq,
+  });
+  if (
+    consumed.status !== 'consumed'
+    || consumed.packet.pause.kind !== 'clarification'
+    || consumed.resolution.resolverVersion !== SEMANTIC_CLARIFICATION_RESOLVER_VERSION
+    || consumed.resolution.disposition !== 'provided'
+    || consumed.resolution.selectedOption !== undefined
+  ) return null;
+  const admittedAnswer = admittedOpenSlotValueFromLastInterpretation(
+    input.sessionId,
+    input.sourceUserSeq,
+  );
+  const openSlot = consumed.packet.pause.slot;
+  if (
+    !admittedAnswer
+    || !openSlot
+    || admittedAnswer.goalId !== openSlot.goalId
+    || admittedAnswer.baseRevision !== openSlot.revision
+    || admittedAnswer.questionId !== openSlot.questionId
+    || admittedAnswer.slotKey !== openSlot.slotKey
+    || admittedAnswer.value !== input.userText
+  ) return null;
+  const continuation = rehydrateConsumedClarificationContext({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    answer: input.userText,
+  });
+  if (
+    !continuation
+    || continuation.disposition !== 'provided'
+    || continuation.selectedOption !== undefined
+    || continuation.answer !== input.userText
+    || !requestsWorkflowExecution(continuation.parentInput)
+  ) return null;
+  const corrected = uniqueEnabledWorkflowMatch(continuation.answer);
+  const namedByQuestion = uniqueEnabledWorkflowMatch(continuation.question);
+  if (
+    !corrected
+    || !namedByQuestion
+    || corrected.slug !== namedByQuestion.slug
+    || !isPureWorkflowIdentityCorrection(continuation.answer, corrected)
+  ) return null;
+  return corrected;
+}
+
 export function tryHostDispatchNamedWorkflow(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -50,7 +151,7 @@ export function tryHostDispatchNamedWorkflow(input: {
   const unique = uniqueWorkflowRunRequest(
     input.userText,
     priorAcceptedSourceTexts(input.sessionId, input.sourceUserSeq),
-  );
+  ) ?? consumedWorkflowNameCorrection(input);
   if (unique) {
     const admitted = admitNamedWorkflowRunFromAcceptedSource({
       workflowName: unique.name,

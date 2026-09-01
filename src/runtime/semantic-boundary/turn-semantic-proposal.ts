@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import type { StrategicMetaAction } from '../../memory/strategic-option-intent.js';
 import {
   ActionWorkTopologySchema,
   ActionWorkTopologyBaseSchema,
@@ -152,6 +153,35 @@ const proposedSemanticWorkV1BaseSchema = z.object({
   cardinality: z.object({
     count: z.number().int().min(1).max(10_000),
     fields: z.array(opaqueIdSchema).max(32),
+    locator: z.object({
+      contract: z.literal('workspace_social_posts_v1'),
+      collectionPointer: z.literal('/posts'),
+      visibleMirrorPointer: z.literal('/_mobile/records/items'),
+      calendarPointer: z.literal('/calendar'),
+      calendarRequiredFields: z.tuple([
+        z.literal('date'),
+        z.literal('channel'),
+        z.literal('theme'),
+      ]),
+      sourceEvidence: z.object({
+        operationId: opaqueIdSchema,
+        recordsPointer: z.enum(['/news', '/web', '/results', '/items', '/records']),
+        minDistinctRecords: z.literal(3),
+        titlePointer: z.enum(['/title', '/name', '/headline']),
+        urlPointer: z.enum(['/url', '/link', '/href']),
+        publishedDatePointer: z.enum([
+          '/date', '/publishedAt', '/published_at', '/publishedDate', '/published_date',
+        ]),
+        findingPointers: z.tuple([
+          z.literal('/snippet'),
+          z.literal('/description'),
+          z.literal('/content'),
+          z.literal('/markdown'),
+        ]),
+        publisherPointer: z.enum(['/publisher', '/source', '/siteName', '/site_name']),
+        maxAgeDays: z.number().int().min(1).max(30),
+      }).strict(),
+    }).strict().nullish(),
   }).strict().nullable(),
   /**
    * Canonical sink list. Empty/omitted/null means no destination.
@@ -284,6 +314,8 @@ export const ProposedSemanticWorkV1Schema = proposedSemanticWorkV1BaseSchema.sup
   }
 });
 
+export type MetaSlotActionV1 = StrategicMetaAction;
+
 const slotAnswerSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('option'),
@@ -296,6 +328,14 @@ const slotAnswerSchema = z.discriminatedUnion('kind', [
     questionId: opaqueIdSchema,
     slotKey: opaqueIdSchema,
     value: nonBlankString(MAX_SLOT_VALUE_CHARS),
+  }).strict(),
+  z.object({
+    kind: z.literal('meta'),
+    questionId: opaqueIdSchema,
+    slotKey: opaqueIdSchema,
+    /** Exact id of the current host-visible option. */
+    optionId: opaqueIdSchema,
+    action: z.enum(['explain', 'customize']),
   }).strict(),
 ]);
 
@@ -387,7 +427,12 @@ export interface OpenQuestionViewV1 {
   slotKey: string;
   /** Exact delivered wording. */
   question: string;
-  options: ReadonlyArray<{ optionId: string; label: string }>;
+  options: ReadonlyArray<{
+    optionId: string;
+    label: string;
+    /** Host-sealed when the exact visible ask is durably published. */
+    metaAction?: MetaSlotActionV1;
+  }>;
   allowFreeText: boolean;
 }
 
@@ -398,6 +443,8 @@ export interface TurnSemanticHostViewV1 {
     sourceUserSeq: number;
     inputHash: string;
     audienceHash: string;
+    /** Immutable accepted-source timestamp. Models never emit this field. */
+    acceptedAt?: string;
   };
   /** SHA-256 of the independently loaded host policy snapshot. */
   policyRevision: string;
@@ -917,6 +964,14 @@ function validateSlotAnswers(
   host: TurnSemanticHostViewV1,
   issues: TurnSemanticValidationIssue[],
 ): void {
+  const normalizedVisibleAnswer = (value: string): string => value
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/\s+/gu, ' ')
+    .replace(/[.!]+$/gu, '')
+    .trim();
+  const ordinals = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth'];
+  const numberWords = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'];
   const answerKeys = proposal.slotAnswers.map((answer) => `${answer.questionId}:${answer.slotKey}`);
   for (const key of repeated(answerKeys)) {
     issue(issues, 'duplicate_slot_answer', 'slotAnswers', `duplicate slot answer: ${key}`);
@@ -938,13 +993,26 @@ function validateSlotAnswers(
       );
       continue;
     }
-    if (answer.kind === 'option' && !question.options.some((option) => option.optionId === answer.optionId)) {
+    if ((answer.kind === 'option' || answer.kind === 'meta')
+      && !question.options.some((option) => option.optionId === answer.optionId)) {
       issue(
         issues,
         'hidden_option',
         `slotAnswers.${index}.optionId`,
         'selected option was not visible on the matched question',
       );
+    }
+    if (answer.kind === 'meta') {
+      const visible = question.options.find((option) => option.optionId === answer.optionId);
+      const intendedAction = visible?.metaAction ?? null;
+      if (visible && intendedAction !== answer.action) {
+        issue(
+          issues,
+          'meta_action_mismatch',
+          `slotAnswers.${index}.action`,
+          'meta action must match the exact host-visible option label',
+        );
+      }
     }
     if (answer.kind === 'value' && !question.allowFreeText) {
       issue(
@@ -953,6 +1021,41 @@ function validateSlotAnswers(
         `slotAnswers.${index}.value`,
         'matched question does not allow a free-text value',
       );
+    }
+    if (answer.kind === 'value' && question.allowFreeText) {
+      const value = normalizedVisibleAnswer(answer.value);
+      const visibleOption = question.options.find((option, optionIndex) => {
+        const ordinal = ordinals[optionIndex];
+        const numberWord = numberWords[optionIndex];
+        const optionNumber = optionIndex + 1;
+        return value === normalizedVisibleAnswer(option.label)
+          || value === normalizedVisibleAnswer(option.optionId)
+          || value === String(optionNumber)
+          || value === `option ${optionNumber}`
+          || value === `choice ${optionNumber}`
+          || (numberWord !== undefined && (
+            value === numberWord
+            || value === `option ${numberWord}`
+            || value === `choice ${numberWord}`
+          ))
+          || (ordinal !== undefined && (
+            value === ordinal
+            || value === `the ${ordinal}`
+            || value === `the ${ordinal} one`
+            || value === `${ordinal} option`
+            || value === `${ordinal} choice`
+            || value === `the ${ordinal} option`
+            || value === `the ${ordinal} choice`
+          ));
+      });
+      if (visibleOption) {
+        issue(
+          issues,
+          'visible_option_encoded_as_value',
+          `slotAnswers.${index}.value`,
+          'a visible option must be selected by its exact option id, not encoded as free text',
+        );
+      }
     }
   }
 }
@@ -1019,7 +1122,14 @@ function validateHostView(host: TurnSemanticHostViewV1): TurnSemanticValidationI
       );
     }
     for (const option of question.options) {
-      if (!validOpaqueHostId(option.optionId) || typeof option.label !== 'string' || !/\S/.test(option.label)) {
+      if (
+        !validOpaqueHostId(option.optionId)
+        || typeof option.label !== 'string'
+        || !/\S/.test(option.label)
+        || (option.metaAction !== undefined
+          && option.metaAction !== 'explain'
+          && option.metaAction !== 'customize')
+      ) {
         issue(issues, 'host_invalid_option', `host.openQuestions.${index}.options`, 'host option is invalid');
       }
     }

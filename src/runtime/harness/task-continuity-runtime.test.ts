@@ -120,7 +120,10 @@ test('typed clarification terminal creates a bounded exact-source packet only af
   assert.equal(packet.status, 'available');
   if (packet.status === 'available') {
     assert.equal(packet.packet.originatingSourceUserSeq, source.seq);
-    assert.deepEqual(packet.packet.pause.options, [], 'hidden awaiting options are not durable answer authority');
+    assert.deepEqual(packet.packet.pause.options, ['Work calendar', 'Personal calendar'],
+      'the exact publicly delivered options are durable answer identity');
+    assert.equal(packet.packet.pause.optionIntents, undefined,
+      'ordinary visible options do not acquire strategic meta behavior');
     assert.deepEqual(packet.packet.capabilities.map((row) => row.identifier), ['calendar_list_events']);
     assert.ok(packet.packet.capabilities.every((row) => row.resourceRefs.length === 0));
   }

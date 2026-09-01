@@ -25,6 +25,7 @@ const {
   resetEventLog,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
+const { HostRecoveryState } = await import('./host-turn-runner.js');
 const {
   clearRunInFlightAfterTerminal,
   recoverInterruptedChatRuns,
@@ -59,6 +60,43 @@ function interruptedChatSession(): string {
   });
   markRunInFlight(sess.id, true); // never cleared = killed mid-run
   return sess.id;
+}
+
+function interruptedExactCheckpointSession(label: string): {
+  sessionId: string;
+  sourceUserSeq: number;
+  attempt: ReturnType<typeof beginRunAttempt>;
+} {
+  const sess = HarnessSession.create({ kind: 'chat', title: `exact checkpoint ${label}` });
+  const attempt = beginRunAttempt(sess.id, { runId: `restart-exact:${label}:${sess.id}` });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: `Resume exact checkpoint ${label}.` },
+  });
+  const state = new HostRecoveryState(
+    sess.id,
+    source.seq,
+    'admit',
+    [],
+    [{
+      type: 'function_call',
+      callId: `exact-call-${label}`,
+      name: 'work_call',
+      arguments: '{}',
+    }] as never,
+    [],
+    undefined,
+    undefined,
+    'host_v1',
+    undefined,
+    0,
+  );
+  const serialized = state.toString();
+  assert.equal(HostRecoveryState.fromString(serialized).sourceUserSeq, source.seq);
+  sess.saveRecoveryState(serialized);
+  markRunInFlight(sess.id, true);
+  return { sessionId: sess.id, sourceUserSeq: source.seq, attempt };
 }
 
 function interruptedPreparedWorkflowSession(since: string): {
@@ -551,6 +589,228 @@ test('boot cap: only the first 3 eligible runs auto-resume; the rest keep the ba
   assert.equal(summary.records.filter((r) => r.autoResumeSkipped === 'boot_cap').length, 2);
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(dispatched.length, 3);
+});
+
+test('exact checkpoint recovery uses bounded durable fair pages and retries a failure without starving later owners', async () => {
+  const fixtures = Array.from({ length: 12 }, (_unused, index) =>
+    interruptedExactCheckpointSession(String(index + 1)));
+  const dispatchCounts = new Map<string, number>();
+  let firstFailedSessionId: string | null = null;
+  const dispatcher = async (restart: RestartResumeDispatch): Promise<void> => {
+    dispatchCounts.set(restart.sessionId, (dispatchCounts.get(restart.sessionId) ?? 0) + 1);
+    if (firstFailedSessionId === null) {
+      firstFailedSessionId = restart.sessionId;
+      throw new Error('fixture exact checkpoint dispatch failed once');
+    }
+  };
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    const summary = recoverInterruptedChatRuns(Date.now, dispatcher, {
+      exactCheckpointDispatchLimit: 3,
+    });
+    assert.equal(summary.scanned, 12);
+    assert.equal(summary.records.filter((record) => record.autoResumed).length, 3);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  assert.equal(dispatchCounts.size, 12, 'four bounded pages eventually visit every exact owner');
+  assert.ok([...dispatchCounts.values()].every((count) => count === 1));
+  for (const fixture of fixtures) {
+    assert.equal(
+      listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length,
+      0,
+      'checkpoint page deferral and dispatch rejection never publish a generic terminal',
+    );
+    assert.ok(HarnessSession.load(fixture.sessionId)?.loadRecoveryState());
+  }
+
+  // The rejected first owner remains retryable, but only after every later
+  // never-attempted owner received a turn. Its new claim then moves it to the
+  // back again instead of monopolizing every tick.
+  assert.ok(firstFailedSessionId);
+  for (let pass = 0; pass < 4 && dispatchCounts.get(firstFailedSessionId!) === 1; pass += 1) {
+    recoverInterruptedChatRuns(Date.now, dispatcher, { exactCheckpointDispatchLimit: 3 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(dispatchCounts.get(firstFailedSessionId!), 2, 'failed exact owner is retried durably');
+  assert.ok(fixtures.every((fixture) => (dispatchCounts.get(fixture.sessionId) ?? 0) >= 1));
+  assert.ok(
+    listEvents(firstFailedSessionId!, { types: ['restart_recovery_decision'] })
+      .filter((event) => event.data.phase === 'dispatch_claimed').length >= 2,
+    'retry advances the exact owner\'s global durable claim sequence',
+  );
+});
+
+test('an exact checkpoint already executing is inert on repeated ticks before any duplicate audit or progress event', async () => {
+  const fixture = interruptedExactCheckpointSession('in-flight');
+  const inFlight = new Set<string>();
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let dispatches = 0;
+  const key = `${fixture.sessionId}:${fixture.sourceUserSeq}`;
+  const dispatcher = async (restart: RestartResumeDispatch): Promise<void> => {
+    dispatches += 1;
+    inFlight.add(`${restart.sessionId}:${restart.sourceUserSeq}`);
+    try {
+      await blocked;
+    } finally {
+      inFlight.delete(`${restart.sessionId}:${restart.sourceUserSeq}`);
+    }
+  };
+  const options = {
+    exactCheckpointDispatchLimit: 1,
+    isExactCheckpointDispatchInFlight: (sessionId: string, sourceUserSeq: number) =>
+      inFlight.has(`${sessionId}:${sourceUserSeq}`),
+    exactCheckpointDispatchInFlightCount: () => inFlight.size,
+  };
+
+  const first = recoverInterruptedChatRuns(Date.now, dispatcher, options);
+  assert.equal(first.records.filter((record) => record.autoResumed).length, 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(dispatches, 1);
+  assert.equal(inFlight.has(key), true);
+  const decisionsBefore = listEvents(fixture.sessionId, { types: ['restart_recovery_decision'] }).length;
+  const progressBefore = listEvents(fixture.sessionId, { types: ['run_resumed'] }).length;
+
+  const repeated = recoverInterruptedChatRuns(Date.now, dispatcher, options);
+  assert.equal(repeated.recovered, 0);
+  assert.equal(repeated.records.length, 0);
+  assert.equal(dispatches, 1);
+  assert.equal(
+    listEvents(fixture.sessionId, { types: ['restart_recovery_decision'] }).length,
+    decisionsBefore,
+  );
+  assert.equal(listEvents(fixture.sessionId, { types: ['run_resumed'] }).length, progressBefore);
+
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(inFlight.has(key), false);
+});
+
+test('repeated ticks enforce one global exact-checkpoint concurrency ceiling instead of launching a new page each time', async () => {
+  const fixtures = Array.from({ length: 12 }, (_unused, index) =>
+    interruptedExactCheckpointSession(`concurrent-${index + 1}`));
+  const active = new Set<string>();
+  const dispatched = new Set<string>();
+  let maxConcurrent = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const dispatcher = async (restart: RestartResumeDispatch): Promise<void> => {
+    const key = `${restart.sessionId}:${restart.sourceUserSeq}`;
+    active.add(key);
+    dispatched.add(restart.sessionId);
+    maxConcurrent = Math.max(maxConcurrent, active.size);
+    try {
+      await blocked;
+    } finally {
+      active.delete(key);
+    }
+  };
+  const options = {
+    exactCheckpointsOnly: true,
+    exactCheckpointDispatchLimit: 3,
+    isExactCheckpointDispatchInFlight: (sessionId: string, sourceUserSeq: number) =>
+      active.has(`${sessionId}:${sourceUserSeq}`),
+    exactCheckpointDispatchInFlightCount: () => active.size,
+  };
+
+  recoverInterruptedChatRuns(Date.now, dispatcher, options);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(active.size, 3);
+  assert.equal(dispatched.size, 3);
+  for (let tick = 0; tick < 4; tick += 1) {
+    const repeated = recoverInterruptedChatRuns(Date.now, dispatcher, options);
+    assert.equal(repeated.recovered, 0);
+  }
+  assert.equal(active.size, 3);
+  assert.equal(dispatched.size, 3, 'blocked first page prevents later ticks from amplifying concurrency');
+  assert.equal(maxConcurrent, 3);
+
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(active.size, 0);
+  recoverInterruptedChatRuns(Date.now, dispatcher, options);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(dispatched.size, 6, 'capacity release advances the next fair cohort');
+  assert.ok(fixtures.every((fixture) =>
+    listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length === 0));
+});
+
+test('periodic exact recovery queries only durable checkpoint owners, not inert chat history', async () => {
+  for (let index = 0; index < 120; index += 1) {
+    HarnessSession.create({ kind: 'chat', title: `inert historical chat ${index + 1}` });
+  }
+  const fixtures = Array.from({ length: 4 }, (_unused, index) =>
+    interruptedExactCheckpointSession(`bounded-scan-${index + 1}`));
+  const dispatched: string[] = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart.sessionId);
+  }, {
+    exactCheckpointsOnly: true,
+    exactCheckpointDispatchLimit: 2,
+    exactCheckpointDispatchInFlightCount: () => 0,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(summary.scanned, 4, '120 inert chats never enter the periodic recovery candidate set');
+  assert.equal(summary.records.filter((record) => record.autoResumed).length, 2);
+  assert.equal(dispatched.length, 2);
+  assert.ok(dispatched.every((sessionId) => fixtures.some((fixture) => fixture.sessionId === sessionId)));
+});
+
+test('a user Stop waits for its exact async finalizer, then closes the checkpoint without restart dispatch', async () => {
+  const fixture = interruptedExactCheckpointSession('stopped');
+  requestKill(fixture.sessionId, 'user stopped exact recovery', fixture.attempt);
+  const dispatched: RestartResumeDispatch[] = [];
+  const held = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart);
+  }, {
+    exactCheckpointDispatchLimit: 1,
+    finalizeExactCheckpointStop: () => ({ status: 'held', reason: 'fixture cancellation receipt unavailable' }),
+  });
+
+  assert.deepEqual(dispatched, []);
+  assert.equal(held.records[0]?.autoResumeSkipped, 'user_stopped');
+  assert.ok(HarnessSession.load(fixture.sessionId)?.loadRecoveryState());
+  assert.ok(HarnessSession.load(fixture.sessionId)?.runInFlightSince());
+  assert.equal(listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length, 0);
+
+  const finalized: Array<{ sessionId: string; sourceUserSeq: number; callId: string; runAttemptId: string }> = [];
+  const summary = recoverInterruptedChatRuns(Date.now, async (restart) => {
+    dispatched.push(restart);
+  }, {
+    exactCheckpointDispatchLimit: 1,
+    finalizeExactCheckpointStop: (input) => {
+      finalized.push({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        callId: input.ownerLogicalToolCallId,
+        runAttemptId: input.runAttemptId,
+      });
+      return { status: 'cancelled' };
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(dispatched, []);
+  assert.deepEqual(finalized, [{
+    sessionId: fixture.sessionId,
+    sourceUserSeq: fixture.sourceUserSeq,
+    callId: 'exact-call-stopped',
+    runAttemptId: fixture.attempt.attemptId,
+  }]);
+  assert.equal(summary.records[0]?.autoResumeSkipped, 'user_stopped');
+  assert.equal(summary.records[0]?.autoResumed, false);
+  assert.equal(HarnessSession.load(fixture.sessionId)?.loadRecoveryState(), null);
+  assert.equal(
+    HarnessSession.load(fixture.sessionId)?.runInFlightSince(),
+    null,
+    JSON.stringify(summary.records[0]),
+  );
+  assert.equal(listEvents(fixture.sessionId, { types: ['run_resumed'] }).length, 0);
+  const terminal = listEvents(fixture.sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.equal(terminal?.data.presentation?.status, 'cancelled');
+  assert.equal(terminal?.data.presentation?.kind, 'stopped');
 });
 
 test('a FAILED dispatch falls back to the manual banner + a notification', async () => {

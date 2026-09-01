@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import type Database from 'better-sqlite3';
 import {
   getProactivityPolicySnapshot,
   type ProactivityPolicySnapshot,
@@ -55,6 +56,9 @@ export interface RecordTurnGraphShadowInput {
   graph?: TurnGraphIR;
   /** Unforgeable binding from the durable semantic compiler. */
   persistenceTicket?: DurableAcceptedTurnGraphPersistenceTicket;
+  /** Host-only write-once companion. Used by plan_task to make its recovery
+   * owner atomic with the first admitted graph row. */
+  onFirstPersistInTransaction?: (db: Database.Database, event: EventRow) => void;
 }
 
 interface TaskContinuationLineage {
@@ -222,7 +226,7 @@ function acceptedText(event: EventRow): string {
   return displayText || text;
 }
 
-function graphSemanticText(
+export function graphSemanticText(
   sourceText: string,
   identity: RecordTurnGraphShadowInput['identity'],
   context?: TaskContinuationContext,
@@ -373,6 +377,12 @@ export function recordTurnGraphShadowChecked(
     const lineage = verifiedContinuation
       ? continuationLineageFor(input.identity.sessionId, verifiedContinuation)
       : undefined;
+    const text = graphSemanticText(
+      sourceText,
+      identity,
+      verifiedContinuation ?? undefined,
+      source,
+    );
     const graphId = `turn-graph:v1:${input.identity.sourceUserSeq}`;
     const durablePersistence = input.graph && input.persistenceTicket
       ? inspectDurableAcceptedTurnGraphPersistenceTicket({
@@ -412,7 +422,7 @@ export function recordTurnGraphShadowChecked(
           graph: input.graph,
           identity,
           graphId,
-          sourceText,
+          sourceText: text,
         })) return { ok: false, reason: 'prior_source_mismatch' };
         if (durablePersistence) {
           if (
@@ -431,12 +441,6 @@ export function recordTurnGraphShadowChecked(
       return { ok: true, event: prior };
     }
 
-    const text = graphSemanticText(
-      sourceText,
-      identity,
-      verifiedContinuation ?? undefined,
-      source,
-    );
     const policy = isGraphPolicy(input.policy)
       ? input.policy
       : snapshotTurnGraphPolicy(input.policy ?? getProactivityPolicySnapshot());
@@ -451,7 +455,11 @@ export function recordTurnGraphShadowChecked(
             graph: input.graph,
             identity,
             graphId,
-            sourceText,
+            // The semantic compiler hashes the verified continuation capsule,
+            // not the bare answer B. Persistence must validate against those
+            // same canonical bytes or every fresh admitted A/Q/B graph is
+            // rejected before its first write.
+            sourceText: text,
           })
             ? validateTurnGraph(input.graph)
             : {
@@ -514,6 +522,9 @@ export function recordTurnGraphShadowChecked(
         ...(lineage ? { taskContinuationLineage: lineage } : {}),
         graph,
       },
+      ...(input.onFirstPersistInTransaction
+        ? { onFirstPersistInTransaction: input.onFirstPersistInTransaction }
+        : {}),
     }).event;
     if (!appended) return { ok: false, reason: 'append_failed' };
     return { ok: true, event: appended };

@@ -147,6 +147,25 @@ export interface TurnGraphNode {
   capabilityRole?: string;
   cardinality?: number;
   requiredFields?: string[];
+  structuredCollectionLocator?: {
+    contract: 'workspace_social_posts_v1';
+    collectionPointer: '/posts';
+    visibleMirrorPointer: '/_mobile/records/items';
+    calendarPointer: '/calendar';
+    calendarRequiredFields: ['date', 'channel', 'theme'];
+    sourceEvidence: {
+      operationId: string;
+      recordsPointer: string;
+      minDistinctRecords: number;
+      titlePointer: string;
+      urlPointer: string;
+      publishedDatePointer: string;
+      findingPointers: [string, string, string, string];
+      publisherPointer: string;
+      maxAgeDays: number;
+      asOf: string;
+    };
+  };
   /**
    * The runtime-topology CONTRACT for a planner node (Clem 4 G5a).
    *
@@ -244,6 +263,25 @@ export interface TurnGraphIR {
         projection: string[];
         completeness?: 'count' | 'exhaust';
         identityFields?: string[];
+        locator?: {
+          contract: 'workspace_social_posts_v1';
+          collectionPointer: '/posts';
+          visibleMirrorPointer: '/_mobile/records/items';
+          calendarPointer: '/calendar';
+          calendarRequiredFields: ['date', 'channel', 'theme'];
+          sourceEvidence: {
+            operationId: string;
+            recordsPointer: string;
+            minDistinctRecords: number;
+            titlePointer: string;
+            urlPointer: string;
+            publishedDatePointer: string;
+            findingPointers: [string, string, string, string];
+            publisherPointer: string;
+            maxAgeDays: number;
+            asOf: string;
+          };
+        };
       };
       evidenceRequirements?: readonly string[];
       destinations?: Array<{

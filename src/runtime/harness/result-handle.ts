@@ -280,6 +280,33 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
   return derivePureResultHandleFactsFromRaw(result);
 }
 
+const RAW_HTML_HOST_ONLY_GETTER = 'FIRECRAWL_BATCH_SCRAPE_GET';
+
+/** The async date-verification getter is a host-only evidence carrier. Its
+ * exact bytes remain redeemable from the authoritative raw handle, but its
+ * page HTML must not be copied into generic projection/envelope columns that
+ * are eligible for model/history/evidence publication. */
+function durableProjectionFacts(
+  result: unknown,
+  input: { scopeKind: ScopeKind; toolName: string },
+): RawResultHandleFacts {
+  const facts = derivePureResultHandleFactsFromRaw(result);
+  if (
+    input.scopeKind !== 'authoritative'
+    || input.toolName.trim().toUpperCase() !== RAW_HTML_HOST_ONLY_GETTER
+  ) return facts;
+  return {
+    success: facts.success,
+    recordPath: null,
+    recordCount: 0,
+    envelopeMeta: null,
+    completeness: 'unknown',
+    projectedRecords: [],
+    statusCode: null,
+    cursor: null,
+  };
+}
+
 // ── Scope and persistence ───────────────────────────────────────────────────
 
 interface DurableScope {
@@ -478,7 +505,10 @@ function persistResultHandleInTransaction(
   const replayableResult = encoded.rawJson === null
     ? result
     : JSON.parse(encoded.rawJson) as unknown;
-  const inspected = deriveResultHandleFactsFromRaw(replayableResult);
+  const inspected = durableProjectionFacts(replayableResult, {
+    scopeKind: scope.kind,
+    toolName: scope.toolName,
+  });
   const cursorBytes = inspected.cursor === null ? null : Buffer.from(inspected.cursor, 'utf8');
   if (cursorBytes && cursorBytes.byteLength > RESULT_CURSOR_MAX_BYTES) {
     encoded = {
@@ -816,7 +846,10 @@ function matchingRawFacts(
   row: SettledResultRow,
   rawPayload: unknown,
 ): RawResultHandleFacts | null {
-  const facts = derivePureResultHandleFactsFromRaw(rawPayload);
+  const facts = durableProjectionFacts(rawPayload, {
+    scopeKind: row.scope_kind,
+    toolName: row.tool_name,
+  });
   const cursorBytes = facts.cursor === null ? null : Buffer.from(facts.cursor, 'utf8');
   if (cursorBytes && cursorBytes.byteLength > RESULT_CURSOR_MAX_BYTES) return null;
   const cursorDigest = cursorBytes ? sha256(cursorBytes) : null;

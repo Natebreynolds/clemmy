@@ -962,6 +962,21 @@ function settledNonSuccessProjectionDisposition(input: {
       && settlement.physical_crossing_count === 0
       && settlement.host_crossing_count === 0;
     if (exactPreDispatchClosure) return 'ready';
+    // A returned nested local validator crosses the one in-process carrier
+    // before it can discover a create-only collision or other argument error.
+    // Its nominal attempt outcome has already settled as invalid_arguments;
+    // this exact immutable shape is still a zero-provider argument repair, not
+    // a body/effect replay. `not_started` and `user_rejected` never enter this
+    // lane, and any second host/provider crossing remains closed.
+    if (
+      input.hostClass === 'refused_pre_dispatch'
+      && settlement.outcome_kind === 'invalid_arguments'
+      && settlement.execution_kind === 'refused_pre_dispatch'
+      && settlement.physical_crossing_count === 0
+      && settlement.host_crossing_count === 1
+      && settlement.requires_reconciliation === 0
+      && settlement.recovery_action === 'repair_arguments'
+    ) return 'ready';
     // The host's replan marker also closes one narrow post-entry failure:
     // a declared non-business read/compute whose immutable settlement says
     // no provider bytes crossed, no mutation is possible, and the recovery

@@ -64,6 +64,29 @@ export interface ObligationManifestNode {
   operationId: string;
   operationMode: OperationEvidenceMode;
   contentCommitMode?: 'documented_atomic_input';
+  /** Frozen structured-deliverable contract copied from the exact executable
+   * graph node. Optional for legacy/non-collection nodes. */
+  cardinality?: number;
+  requiredFields?: string[];
+  structuredCollectionLocator?: {
+    contract: 'workspace_social_posts_v1';
+    collectionPointer: '/posts';
+    visibleMirrorPointer: '/_mobile/records/items';
+    calendarPointer: '/calendar';
+    calendarRequiredFields: ['date', 'channel', 'theme'];
+    sourceEvidence: {
+      operationId: string;
+      recordsPointer: string;
+      minDistinctRecords: number;
+      titlePointer: string;
+      urlPointer: string;
+      publishedDatePointer: string;
+      findingPointers: [string, string, string, string];
+      publisherPointer: string;
+      maxAgeDays: number;
+      asOf: string;
+    };
+  };
   obligations: EvidenceObligation[];
 }
 
@@ -286,6 +309,17 @@ export function compileObligationManifest(input: {
       operationId: operation.operationId,
       operationMode: evidenceContract.mode,
       ...(contentCommitMode ? { contentCommitMode } : {}),
+      ...(Number.isSafeInteger(executableNode.cardinality)
+        && (executableNode.cardinality ?? 0) > 0
+        ? { cardinality: executableNode.cardinality }
+        : {}),
+      ...(Array.isArray(executableNode.requiredFields)
+        && executableNode.requiredFields.length > 0
+        ? { requiredFields: [...executableNode.requiredFields] }
+        : {}),
+      ...(executableNode.structuredCollectionLocator
+        ? { structuredCollectionLocator: { ...executableNode.structuredCollectionLocator } }
+        : {}),
       obligations,
     });
   }

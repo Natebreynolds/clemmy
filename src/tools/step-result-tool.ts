@@ -65,6 +65,13 @@ export function clearStepContract(sessionId: string): void {
   contractRefusals.delete(sessionId);
 }
 
+/** Loop-side completion fence. The workflow runner owns registration and
+ * cleanup; conversation machinery may only ask whether this exact session is
+ * still required to emit through the structural result channel. */
+export function hasRegisteredStepContract(sessionId: string): boolean {
+  return Boolean(sessionId) && stepContracts.has(sessionId);
+}
+
 /** Validate a submission against the registered contract. Returns null to
  *  ACCEPT, or the refusal message to send back to the model. */
 function contractRefusal(sessionId: string, value: unknown): { refusal: string } | { accept: unknown } {

@@ -10,6 +10,7 @@ export function snapshotFromAcceptedSource(input: {
   sessionId: string;
   sourceUserSeq: number;
   acceptedText: string;
+  acceptedAt?: string;
   audienceKey: string;
   userId: string;
   conversationKey: string;
@@ -21,8 +22,10 @@ export function snapshotFromAcceptedSource(input: {
   parentGraph?: TurnGraphIR | null;
   recentTurns?: ReadonlyArray<{ who: 'user' | 'assistant'; text: string }>;
   packet?: {
+    kind: 'clarification' | 'approval' | 'recovery';
     question: string;
     options: ReadonlyArray<string | { optionId: string; label: string }>;
+    optionIntents?: ReadonlyArray<{ optionIndex: number; action: 'explain' | 'customize' }>;
     originatingSourceUserSeq: number;
     goalId?: string;
     revision?: number;
@@ -48,7 +51,12 @@ export function snapshotFromAcceptedSource(input: {
       slotKey: awaitInput.slotId,
       question: awaitInput.deliveredQuestion,
       options: awaitInput.visibleOptions.map((option) => ({ ...option })),
-      allowFreeText: awaitInput.visibleOptions.length === 0,
+      // An await_input node is an ordinary semantic clarification. Its public
+      // renderer explicitly tells the user that the visible choices are only
+      // shortcuts and that they may answer in their own words. Preserve that
+      // contract here: a value answer can settle the slot as `provided`, but
+      // it still cannot acquire any option id or option-specific meta action.
+      allowFreeText: true,
     });
   } else if (input.packet) {
     const goalId = input.packet.goalId ?? `goal:${input.sessionId}:${input.packet.originatingSourceUserSeq}`;
@@ -64,18 +72,25 @@ export function snapshotFromAcceptedSource(input: {
       goalRevision: revision,
       slotKey: input.packet.slotKey ?? 'reply',
       question: input.packet.question,
-      options: input.packet.options.map((option, index) => (
-        typeof option === 'string'
+      options: input.packet.options.map((option, index) => {
+        const visible = typeof option === 'string'
           ? { optionId: `opt-${index + 1}`, label: option }
-          : option
-      )),
-      allowFreeText: input.packet.options.length === 0,
+          : option;
+        const metaAction = input.packet?.optionIntents
+          ?.find((intent) => intent.optionIndex === index)?.action;
+        return { ...visible, ...(metaAction ? { metaAction } : {}) };
+      }),
+      // Approval/recovery controls remain exact-option-only. Ordinary
+      // clarification packets match the delivered "in your own words"
+      // contract even when they also expose bounded visible shortcuts.
+      allowFreeText: input.packet.kind === 'clarification',
     });
   }
   return {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     acceptedText: input.acceptedText,
+    ...(input.acceptedAt ? { acceptedAt: input.acceptedAt } : {}),
     audienceKey: input.audienceKey,
     userId: input.userId,
     conversationKey: input.conversationKey,

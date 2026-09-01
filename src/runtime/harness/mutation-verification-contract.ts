@@ -770,6 +770,22 @@ export function verifierLogicalCallId(input: {
   return `verify:${input.ownerRequirementId}:${digest.slice(0, 32)}`;
 }
 
+/** A bounded verifier retry is a new read-only logical generation, never a new
+ * mutation owner. Ordinal zero preserves the original protocol id; later ids
+ * are deterministic and task-salted by that immutable base. */
+export function verifierLogicalCallAttemptId(baseLogicalCallId: string, ordinal: number): string {
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
+    throw new Error('verifier attempt ordinal is invalid');
+  }
+  if (ordinal === 0) return baseLogicalCallId;
+  const digest = mutationVerificationDigest({
+    version: 1,
+    baseLogicalCallId,
+    ordinal,
+  });
+  return `verify-retry:${ordinal}:${digest.slice(0, 32)}`;
+}
+
 export function verificationTargetDigest(resourceId: string): string {
   return mutationVerificationDigest({ version: 1, kind: 'resource_id', resourceId });
 }

@@ -14,6 +14,7 @@ export interface DurableSemanticSnapshotV1 {
   sessionId: string;
   sourceUserSeq: number;
   acceptedText: string;
+  acceptedAt?: string;
   /** Mandatory audience identity. Session id is not a fallback. */
   audienceKey: string;
   userId: string;
@@ -59,6 +60,7 @@ export function buildTurnSemanticHostViewV1(
       sourceUserSeq: snapshot.sourceUserSeq,
       inputHash: sha256(snapshot.acceptedText),
       audienceHash: audienceHashOf(snapshot),
+      ...(snapshot.acceptedAt ? { acceptedAt: snapshot.acceptedAt } : {}),
     },
     policyRevision: snapshot.policyRevision,
     resumableGoals: snapshot.resumableGoals ? [...snapshot.resumableGoals] : [],

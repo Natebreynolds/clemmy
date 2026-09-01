@@ -76,12 +76,14 @@ export interface AdmittedClampedSemanticsV1 {
   revision?: number;
   openSlot?: TurnGraphAwaitInput;
   slotAnswer?: {
-    kind: 'option' | 'value';
+    kind: 'option' | 'value' | 'meta';
     questionId: string;
     slotKey: string;
     optionId?: string;
     value?: string;
+    action?: 'explain' | 'customize';
   };
+  metaAction?: 'explain' | 'customize';
   operations?: ReadonlyArray<{
     id: string;
     role: string;

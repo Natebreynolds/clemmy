@@ -4,8 +4,12 @@
  * text or constructed authority.
  */
 import { createHash } from 'node:crypto';
+import type Database from 'better-sqlite3';
 import { getRuntimeEnv } from '../../config.js';
-import { peekTaskContinuityPacket } from '../../memory/task-continuity.js';
+import {
+  peekTaskContinuityPacket,
+  readConsumedTaskContinuityPacket,
+} from '../../memory/task-continuity.js';
 import { getProactivityPolicySnapshot } from '../../agents/proactivity-policy.js';
 import {
   admitTurnSemantics,
@@ -43,6 +47,7 @@ import {
   isCurrentCallableCatalogEntry,
   type RegisteredHostCapability,
 } from '../harness/host-capability-catalog-factory.js';
+import { currentAcceptedSourceCatalogManifestScope } from '../harness/accepted-source-catalog-scope.js';
 import {
   type HostCapabilityDescriptorV1,
   type TurnSemanticProposalV1,
@@ -59,9 +64,14 @@ import { synthesizeConstructOperations } from './host-bind-operations.js';
 import {
   recordTurnGraphShadow,
   recordTurnGraphShadowChecked,
+  graphSemanticText,
   sessionHasPriorRetrieveOrAct,
   turnGraphFromShadowEvent,
 } from '../graph/turn-graph-shadow.js';
+import {
+  rehydrateConsumedClarificationContext,
+  verifyDurableClarificationContext,
+} from '../harness/task-continuity-runtime.js';
 import { classifyMessageIntent, refersToUserOrHostedWorld } from '../../assistant/message-intent.js';
 import {
   markAdmissionCapabilityResolutionSuperseded,
@@ -117,7 +127,16 @@ import { snapshotTurnGraphPolicy, validateTurnGraph } from '../graph/turn-graph-
 import type { CompileTurnGraphResult, TurnGraphSurface } from '../graph/turn-graph-ir.js';
 import type { TurnIdentity } from '../harness/turn-outcome.js';
 import type { TaskContinuationContext } from '../../types.js';
-import { appendEvent, getSession, getTurnGraphEventForSource, listEvents, type EventRow } from '../harness/eventlog.js';
+import {
+  appendEvent,
+  getSession,
+  getTurnGraphEventForSource,
+  listEvents,
+  readPrimaryModelPlanningCardSnapshot,
+  recordPrimaryModelPlanningCardSnapshotOnce,
+  type EventRow,
+  type PrimaryModelPlanningCardSnapshotRead,
+} from '../harness/eventlog.js';
 import { pullRecentTurnsForHarnessHistory } from '../harness/session-transcript.js';
 import pino from 'pino';
 
@@ -773,6 +792,66 @@ export function snapshotPrimaryModelPlanningContext(
     effectCeiling: catalog.effectCeiling,
     withheld: Object.freeze(catalog.withheld.map((entry) => Object.freeze({ ...entry }))),
   });
+}
+
+/**
+ * Reopen only exact refs selected by the model from this accepted source's
+ * private foreground-search staging ledger.
+ *
+ * The bounded planning card is a display surface, not the full same-source
+ * disclosure ledger. A later tool_search can therefore return an exact ref
+ * that remains staged when the eight-slot card is full. Plan completeness may
+ * inspect that descriptor so it does not falsely call a selected write
+ * "missing" before admission gets its existing chance to promote and
+ * revalidate the selected staged ref. This snapshot grants, publishes, and
+ * executes nothing; invented or cross-source refs are simply absent.
+ */
+export function snapshotPrimaryModelSelectedStagedPlanningDescriptors(input: {
+  authority: PrimaryModelPlanningCatalogAuthorityV1;
+  identity: Readonly<{ sessionId: string; sourceUserSeq: number }>;
+  selectedRefs: ReadonlySet<string>;
+}): readonly HostCapabilityDescriptorV1[] {
+  if (
+    !input.authority
+    || input.authority.scope !== PRIMARY_MODEL_PLANNING_CATALOG_SCOPE
+    || !input.identity
+    || typeof input.identity.sessionId !== 'string'
+    || !input.identity.sessionId
+    || !Number.isSafeInteger(input.identity.sourceUserSeq)
+    || input.identity.sourceUserSeq <= 0
+    || !(input.selectedRefs instanceof Set)
+    || input.selectedRefs.size > 32
+    || [...input.selectedRefs].some((ref) => (
+      typeof ref !== 'string'
+      || !ref.startsWith('cap:')
+      || ref !== ref.trim()
+    ))
+  ) return Object.freeze([]);
+  const catalog = primaryModelPlanningCatalogs.get(input.authority as object);
+  if (
+    !catalog
+    || catalog.sessionId !== input.identity.sessionId
+    || catalog.sourceUserSeq !== input.identity.sourceUserSeq
+    || catalog.digest !== sha256(JSON.stringify(catalog.capabilities))
+  ) return Object.freeze([]);
+  const selected = [...input.selectedRefs]
+    .map((ref) => catalog.stagedById.get(ref))
+    .filter((entry): entry is StagedPrimaryModelPlanningCapabilityV1 => Boolean(entry))
+    .filter((entry) => (
+      input.selectedRefs.has(entry.descriptor.id)
+      && entry.accountIdentity === entry.descriptor.accountScope
+    ))
+    .map((entry) => Object.freeze({
+      ...entry.descriptor,
+      acceptedInputKinds: Object.freeze([...entry.descriptor.acceptedInputKinds]),
+      producedOutputKinds: Object.freeze([...entry.descriptor.producedOutputKinds]),
+      applicableDeliverableKinds: Object.freeze([...entry.descriptor.applicableDeliverableKinds]),
+      evidenceKinds: Object.freeze([...entry.descriptor.evidenceKinds]),
+      ...(entry.descriptor.advisoryRoles
+        ? { advisoryRoles: Object.freeze([...entry.descriptor.advisoryRoles]) }
+        : {}),
+    }));
+  return Object.freeze(selected);
 }
 
 export interface PrimaryModelPlanningReadCapabilityV1 {
@@ -1479,15 +1558,25 @@ async function durablePlanningDisclosures(input: {
           && legacyProviderInputSchemaDigest(row) === match.providerDefinition.providerInputSchemaDigest
           ? match.providerDefinition
           : null;
+        const exactProviderDefinition = providerDefinition ?? upgradedLegacyDefinition;
         if (
           row.capabilityRef !== match.descriptor.id
           || row.manifestDigest !== match.descriptor.manifestDigest
           || !identityMatches
           || !stagedProviderDefinitionsEqual(
-            providerDefinition ?? upgradedLegacyDefinition,
+            exactProviderDefinition,
             match.providerDefinition,
           )
         ) continue;
+        stagedById.set(match.descriptor.id, {
+          descriptor: match.descriptor,
+          identifier: match.identifier,
+          providerKind: match.providerKind,
+          accountIdentity: registeredAccountIdentity,
+          ...(exactProviderDefinition
+            ? { providerDefinition: exactProviderDefinition }
+            : {}),
+        });
         out.set(match.descriptor.id, match.descriptor);
         continue;
       }
@@ -1539,9 +1628,181 @@ async function durablePlanningDisclosures(input: {
   return { descriptors: [...out.values()], stagedById };
 }
 
+interface DurableInitialPlanningCardV1 {
+  readonly version: 1;
+  readonly objectiveDigest: string;
+  readonly effectCeiling: HostCapabilityDescriptorV1['effect'];
+  readonly capabilities: readonly HostCapabilityDescriptorV1[];
+  readonly withheld: readonly PlanningCardWithheldV1[];
+  readonly cardDigest: string;
+}
+
+const PLANNING_DESCRIPTOR_REQUIRED_KEYS = [
+  'acceptedInputKinds',
+  'accountScope',
+  'applicableDeliverableKinds',
+  'deliverableKind',
+  'destinationPosture',
+  'effect',
+  'evidenceKinds',
+  'handleRequired',
+  'id',
+  'inputShape',
+  'manifestDigest',
+  'outputKind',
+  'outputShape',
+  'producedOutputKinds',
+  'purpose',
+  'readbackRequired',
+] as const;
+
+function exactPlanningDescriptorSnapshot(value: unknown): HostCapabilityDescriptorV1 | null {
+  const parsed = replayedPlanningDescriptor(value);
+  if (!parsed || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  const allowed = row.advisoryRoles === undefined
+    ? [...PLANNING_DESCRIPTOR_REQUIRED_KEYS]
+    : [...PLANNING_DESCRIPTOR_REQUIRED_KEYS, 'advisoryRoles'];
+  if (keys.join('\0') !== allowed.sort().join('\0')) return null;
+  // Preserve the exact serialized property order that contributed to the
+  // original model-surface digest. The closed parser above proves every value;
+  // freezing prevents later staging from mutating those persisted bytes.
+  for (const key of [
+    'acceptedInputKinds',
+    'producedOutputKinds',
+    'applicableDeliverableKinds',
+    'evidenceKinds',
+    'advisoryRoles',
+  ]) {
+    if (Array.isArray(row[key])) Object.freeze(row[key]);
+  }
+  return Object.freeze(row as unknown as HostCapabilityDescriptorV1);
+}
+
+function exactPlanningWithheldSnapshot(value: unknown): PlanningCardWithheldV1 | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (
+    Object.keys(row).sort().join('\0') !== 'effect\0id\0reason'
+    || typeof row.id !== 'string'
+    || !row.id
+    || row.id !== row.id.trim()
+    || !Object.prototype.hasOwnProperty.call(PLANNING_EFFECT_RANK, String(row.effect))
+    || typeof row.reason !== 'string'
+    || !row.reason
+    || row.reason.length > 128
+  ) return null;
+  return Object.freeze({
+    id: row.id,
+    effect: row.effect as HostCapabilityDescriptorV1['effect'],
+    reason: row.reason,
+  });
+}
+
+function initialPlanningCardSnapshotJson(input: {
+  objective: string;
+  effectCeiling: HostCapabilityDescriptorV1['effect'];
+  capabilities: readonly HostCapabilityDescriptorV1[];
+  withheld: readonly PlanningCardWithheldV1[];
+}): string {
+  return JSON.stringify({
+    version: 1,
+    objectiveDigest: sha256(input.objective),
+    effectCeiling: input.effectCeiling,
+    capabilities: input.capabilities,
+    withheld: input.withheld,
+    cardDigest: sha256(JSON.stringify(input.capabilities)),
+  } satisfies DurableInitialPlanningCardV1);
+}
+
+function parseDurableInitialPlanningCard(input: {
+  snapshot: Extract<PrimaryModelPlanningCardSnapshotRead, { status: 'ready' }>;
+  objective: string;
+  currentById: ReadonlyMap<string, HostCapabilityDescriptorV1>;
+}): { ok: true; card: DurableInitialPlanningCardV1 } | { ok: false; reason: string } {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(input.snapshot.snapshotJson) as unknown;
+  } catch {
+    return { ok: false, reason: 'durable initial planning card payload is malformed' };
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    return { ok: false, reason: 'durable initial planning card payload is malformed' };
+  }
+  const row = decoded as Record<string, unknown>;
+  if (
+    Object.keys(row).sort().join('\0')
+      !== 'capabilities\0cardDigest\0effectCeiling\0objectiveDigest\0version\0withheld'
+    || row.version !== 1
+    || typeof row.objectiveDigest !== 'string'
+    || row.objectiveDigest !== sha256(input.objective)
+    || !Object.prototype.hasOwnProperty.call(PLANNING_EFFECT_RANK, String(row.effectCeiling))
+    || typeof row.cardDigest !== 'string'
+    || !PLANNING_IDENTITY_DIGEST.test(row.cardDigest)
+    || row.cardDigest !== row.cardDigest.toLowerCase()
+    || !Array.isArray(row.capabilities)
+    || row.capabilities.length > FRESH_PLANNING_CARD_LIMIT
+    || !Array.isArray(row.withheld)
+    || row.withheld.length > 64
+  ) return { ok: false, reason: 'durable initial planning card identity is invalid' };
+  const capabilities = row.capabilities.map(exactPlanningDescriptorSnapshot);
+  const withheld = row.withheld.map(exactPlanningWithheldSnapshot);
+  if (capabilities.some((entry) => !entry) || withheld.some((entry) => !entry)) {
+    return { ok: false, reason: 'durable initial planning card shape is invalid' };
+  }
+  const exactCapabilities = capabilities as HostCapabilityDescriptorV1[];
+  const exactWithheld = withheld as PlanningCardWithheldV1[];
+  const capabilityIds = new Set(exactCapabilities.map((descriptor) => descriptor.id));
+  const withheldIds = new Set(exactWithheld.map((entry) => entry.id));
+  if (
+    capabilityIds.size !== exactCapabilities.length
+    || withheldIds.size !== exactWithheld.length
+    || exactWithheld.some((entry) => capabilityIds.has(entry.id))
+    || Buffer.byteLength(JSON.stringify(exactCapabilities), 'utf8') > FRESH_PLANNING_CARD_BYTES
+    || row.cardDigest !== sha256(JSON.stringify(exactCapabilities))
+    || row.effectCeiling !== planningEffectCeilingForAcceptedRequest(input.objective)
+  ) return { ok: false, reason: 'durable initial planning card digest or bounds are invalid' };
+
+  for (const descriptor of exactCapabilities) {
+    const current = input.currentById.get(descriptor.id);
+    if (!current || JSON.stringify(current) !== JSON.stringify(descriptor)) {
+      return {
+        ok: false,
+        reason: `durable initial planning card capability drifted: ${descriptor.id}`,
+      };
+    }
+  }
+  // Withheld rows grant nothing, but the exact originally-withheld identity
+  // must still exist with the same effect. New live rows are intentionally
+  // ignored: a same-source tool_search disclosure may extend staged authority,
+  // never rewrite the model surface that was already admitted.
+  for (const entry of exactWithheld) {
+    const current = input.currentById.get(entry.id);
+    if (!current || current.effect !== entry.effect) {
+      return {
+        ok: false,
+        reason: `durable initial planning card withheld capability drifted: ${entry.id}`,
+      };
+    }
+  }
+  return {
+    ok: true,
+    card: Object.freeze({
+      version: 1,
+      objectiveDigest: row.objectiveDigest,
+      effectCeiling: row.effectCeiling as HostCapabilityDescriptorV1['effect'],
+      capabilities: Object.freeze(exactCapabilities),
+      withheld: Object.freeze(exactWithheld),
+      cardDigest: row.cardDigest,
+    }),
+  };
+}
+
 /** Zero-model catalog preparation for the initial foreground model surface.
- * This is enumeration/ranking only: the accepted-source snapshot is frozen by
- * plan_task after any foreground tool_search disclosure, never before it. */
+ * This is enumeration/ranking only. The exact bounded display card is frozen
+ * here before the first model request; later foreground tool_search results
+ * may extend same-source staging but never rewrite that initial surface. */
 export async function primePrimaryModelPlanningCatalog(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -1553,11 +1814,58 @@ export async function primePrimaryModelPlanningCatalog(input: {
   }).find((event) => event.seq === input.sourceUserSeq);
   const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText.trim() : '';
   const eventText = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
-  const objective = display || eventText;
-  if (!objective) return { ok: false, reason: 'durable accepted source is missing' };
+  const sourceText = display || eventText;
+  if (!sourceText || !accepted) return { ok: false, reason: 'durable accepted source is missing' };
+  let durableContinuation: TaskContinuationContext | null;
+  try {
+    const consumed = readConsumedTaskContinuityPacket({
+      sessionId: input.sessionId,
+      consumingSourceUserSeq: input.sourceUserSeq,
+    });
+    durableContinuation = rehydrateConsumedClarificationContext({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      answer: sourceText,
+    });
+    if (
+      (consumed.status === 'consumed' && !durableContinuation)
+      || (consumed.status !== 'consumed' && consumed.status !== 'none')
+    ) {
+      return { ok: false, reason: 'durable accepted-source continuation is malformed or ambiguous' };
+    }
+    if (!durableContinuation) {
+      const pending = peekTaskContinuityPacket({ sessionId: input.sessionId });
+      if (pending.status !== 'none') {
+        return { ok: false, reason: 'durable accepted-source continuation is unresolved' };
+      }
+    }
+  } catch {
+    return { ok: false, reason: 'durable accepted-source continuation is unreadable' };
+  }
+  const objective = graphSemanticText(
+    sourceText,
+    {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      turn: accepted.turn,
+    },
+    durableContinuation ?? undefined,
+    accepted,
+  );
+  const durableInitialCard = readPrimaryModelPlanningCardSnapshot({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  if (durableInitialCard.status === 'conflict' || durableInitialCard.status === 'storage_error') {
+    return {
+      ok: false,
+      reason: `durable initial planning card is unavailable: ${durableInitialCard.reason}`,
+    };
+  }
   let indexedDescriptors: HostCapabilityDescriptorV1[] = [];
   let indexedRegisteredIds = new Set<string>();
   let indexedLocalDefinitions: AuthorizedLocalPlanningDefinitionV1[] = [];
+  const catalogManifestScope = currentAcceptedSourceCatalogManifestScope();
   try {
     const indexed = await registerIndexedCapabilitiesForTurn({
       sessionId: input.sessionId,
@@ -1571,7 +1879,14 @@ export async function primePrimaryModelPlanningCatalog(input: {
     indexedDescriptors = hostDescriptorsFromCapabilityIndex(objective);
     indexedLocalDefinitions = [];
   }
-  const catalogEntries = peekHostCapabilityCatalogFactory()?.snapshot() ?? [];
+  const catalogEntries = (peekHostCapabilityCatalogFactory()?.snapshot() ?? []).filter((entry) => (
+    !catalogManifestScope
+    || (entry.providerKind ?? entry.manifest?.providerKind) !== 'composio'
+    || catalogManifestScope.manifestIds.has(entry.manifest?.manifestId ?? entry.capabilityId)
+    || catalogManifestScope.operationIds.has(
+      (entry.manifest?.operationId ?? entry.toolName).toUpperCase(),
+    )
+  ));
   const catalogDescriptors = catalogEntries.flatMap((entry) => {
     const descriptor = hostDescriptorFromRegistered(entry);
     if (!descriptor) return [];
@@ -1665,15 +1980,42 @@ export async function primePrimaryModelPlanningCatalog(input: {
     preferredLiveIds: new Set(replayed.descriptors.map((descriptor) => descriptor.id)),
     effectCeiling: ranked.effectCeiling,
   });
-  const capabilities = covered.capabilities.map((descriptor) => Object.freeze({ ...descriptor }));
-  const digest = sha256(JSON.stringify(capabilities));
+  const proposedCapabilities = covered.capabilities.map((descriptor) => Object.freeze({ ...descriptor }));
+  const installedInitialCard = durableInitialCard.status === 'ready'
+    ? durableInitialCard
+    : recordPrimaryModelPlanningCardSnapshotOnce({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        snapshotJson: initialPlanningCardSnapshotJson({
+          objective,
+          effectCeiling: covered.effectCeiling,
+          capabilities: proposedCapabilities,
+          withheld: covered.withheld,
+        }),
+      });
+  if (installedInitialCard.status !== 'ready') {
+    return {
+      ok: false,
+      reason: installedInitialCard.status === 'missing'
+        ? 'durable initial planning card disappeared during installation'
+        : `durable initial planning card is unavailable: ${installedInitialCard.reason}`,
+    };
+  }
+  const reopenedInitialCard = parseDurableInitialPlanningCard({
+    snapshot: installedInitialCard,
+    objective,
+    currentById: livePlanningById,
+  });
+  if (!reopenedInitialCard.ok) return reopenedInitialCard;
+  const capabilities = [...reopenedInitialCard.card.capabilities];
+  const digest = reopenedInitialCard.card.cardDigest;
   const authority = Object.freeze({ scope: PRIMARY_MODEL_PLANNING_CATALOG_SCOPE });
   primaryModelPlanningCatalogs.set(authority, {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     objective,
-    effectCeiling: covered.effectCeiling,
-    withheld: covered.withheld,
+    effectCeiling: reopenedInitialCard.card.effectCeiling,
+    withheld: [...reopenedInitialCard.card.withheld],
     capabilities,
     liveCapabilities: catalogDescriptors.map((descriptor) => Object.freeze({ ...descriptor })),
     disclosureByName,
@@ -2176,12 +2518,29 @@ export async function prepareDurableAcceptedTurnCompile(
       identity: { ...input.identity, turn: accepted.turn },
     };
   }
+  const verifiedContinuation = input.verifiedTaskContinuation && accepted
+    ? verifyDurableClarificationContext({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        answer: durableText,
+        context: input.verifiedTaskContinuation,
+      })
+    : undefined;
+  if (input.verifiedTaskContinuation && !verifiedContinuation) {
+    return { ok: false, reason: 'continuation_unverified' };
+  }
+  const acceptedSemanticText = graphSemanticText(
+    durableText,
+    input.identity,
+    verifiedContinuation ?? undefined,
+    accepted,
+  );
 
   // Conversation is the same kernel with catalog/planner skipped — not a
   // second action loop. Only a high-confidence closed-world greeting skips
   // admission. Every other live source participates. A checker that cannot
   // admit a typed plan withholds typed authority; dispatch keeps tools.
-  if (conversationShortCircuit(input.identity, durableText)) {
+  if (conversationShortCircuit(input.identity, acceptedSemanticText)) {
     recordSemanticParticipation(
       input.identity.sessionId,
       input.identity.sourceUserSeq,
@@ -2244,11 +2603,11 @@ export async function prepareDurableAcceptedTurnCompile(
         const indexed = await registerIndexedCapabilitiesForTurn({
           sessionId: input.identity.sessionId,
           sourceUserSeq: input.identity.sourceUserSeq,
-          objective: durableText,
+          objective: acceptedSemanticText,
         });
         descriptors = indexed.descriptors;
       } catch {
-        descriptors = hostDescriptorsFromCapabilityIndex(durableText);
+        descriptors = hostDescriptorsFromCapabilityIndex(acceptedSemanticText);
       }
       completedIndexDescriptors = descriptors;
       return descriptors;
@@ -2280,7 +2639,7 @@ export async function prepareDurableAcceptedTurnCompile(
       // the deadline. Only an index leg that itself missed the absolute bound
       // falls back to a same-tick local read.
       indexDescriptors = completedIndexDescriptors
-        ?? hostDescriptorsFromCapabilityIndex(durableText);
+        ?? hostDescriptorsFromCapabilityIndex(acceptedSemanticText);
       // The turn proceeds on the index-only catalog; the abandoned leg must
       // not land its authoritative resolution for this source later (observed
       // live +64s after disclosure — a stale-authority write for a decision
@@ -2365,7 +2724,7 @@ export async function prepareDurableAcceptedTurnCompile(
       });
     }
     const namespaceConflict = explicitCapabilityNamespaceConflict({
-      acceptedText: durableText,
+      acceptedText: acceptedSemanticText,
       namespaceInventory: listRegisteredToolkitNamespaces(),
       selectedNamespaceIds: selectedComposioRefs
         .map((entry) => (
@@ -2731,7 +3090,7 @@ export async function prepareDurableAcceptedTurnCompile(
           resolution: capabilityResolutionOutcome,
           count: capabilities.length,
           ceiling: primaryPlanningCatalog?.effectCeiling
-            ?? planningEffectCeilingForAcceptedRequest(durableText),
+            ?? planningEffectCeilingForAcceptedRequest(acceptedSemanticText),
           withheld: primaryPlanningCatalog?.withheld ?? [],
           frozenCatalogAdvisories,
           capabilities: capabilities.map((descriptor) => ({
@@ -2749,8 +3108,10 @@ export async function prepareDurableAcceptedTurnCompile(
   const continuity = peekTaskContinuityPacket({ sessionId: input.identity.sessionId });
   const packet = continuity.status === 'available'
     ? {
+        kind: continuity.packet.pause.kind,
         question: continuity.packet.pause.question,
         options: continuity.packet.pause.options,
+        optionIntents: continuity.packet.pause.optionIntents,
         originatingSourceUserSeq: continuity.packet.originatingSourceUserSeq,
         goalId: continuity.packet.pause.slot?.goalId,
         revision: continuity.packet.pause.slot?.revision,
@@ -2764,11 +3125,17 @@ export async function prepareDurableAcceptedTurnCompile(
     8,
     input.identity.sourceUserSeq,
   ).map((turn) => ({ who: turn.who, text: turn.text }));
+  const acceptedSourceEvent = listEvents(input.identity.sessionId, {
+    sinceSeq: input.identity.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === input.identity.sourceUserSeq);
 
   const snapshot = snapshotFromAcceptedSource({
     sessionId: input.identity.sessionId,
     sourceUserSeq: input.identity.sourceUserSeq,
-    acceptedText: durableText,
+    acceptedText: acceptedSemanticText,
+    ...(acceptedSourceEvent ? { acceptedAt: acceptedSourceEvent.createdAt } : {}),
     audienceKey,
     userId,
     conversationKey,
@@ -3005,7 +3372,7 @@ export async function prepareDurableAcceptedTurnCompile(
     semanticProvenanceDigest,
     ...(destinationBinding ? { destinationBinding } : {}),
     authority,
-    acceptedText: durableText,
+    acceptedText: acceptedSemanticText,
     sessionKind: session.kind,
     policy,
   };
@@ -3097,6 +3464,8 @@ export async function admitAndCompilePrimaryModelProposal(input: {
   allowedToolNames?: readonly string[];
   excludedToolNames?: readonly string[];
   verifiedTaskContinuation?: TaskContinuationContext;
+  /** The first graph and the host recovery owner must commit together. */
+  onFirstPersistInTransaction?: (db: Database.Database, event: EventRow) => void;
 }): Promise<AdmitAndCompileAcceptedSourceResult> {
   const compiled = await compilePrimaryModelAcceptedTurnGraph(
     input,
@@ -3115,6 +3484,9 @@ export async function admitAndCompilePrimaryModelProposal(input: {
     verifiedTaskContinuation: input.verifiedTaskContinuation,
     graph: compiled.compiled.graph,
     persistenceTicket: compiled.persistenceTicket,
+    ...(input.onFirstPersistInTransaction
+      ? { onFirstPersistInTransaction: input.onFirstPersistInTransaction }
+      : {}),
   });
   // The refusal names itself. "admitted graph persist failed" with no reason is
   // what made the 2026-08-25 step deaths (an ADMITTED plan refused against a

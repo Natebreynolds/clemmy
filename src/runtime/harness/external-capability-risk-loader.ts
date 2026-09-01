@@ -1114,11 +1114,21 @@ function sealedSemanticForManifest(
     && manifest.externalDefinition.behaviorHints.destructive === false
     && manifest.idempotency.required === true
     && manifest.reconciliation.supported === true;
+  const positivelyBoundedOrdinaryWrite = semantic.reversibility === 'ordinary_non_destructive'
+    && manifest.effect === 'external_write'
+    && (
+      manifest.destination?.posture === 'create_new'
+      || manifest.destination?.posture === 'named_existing'
+    )
+    && manifest.externalDefinition?.behaviorHints.readOnly === false
+    && manifest.externalDefinition.behaviorHints.destructive === false;
   const reversibility = semantic.reversibility === 'irreversible'
     ? 'irreversible' as const
     : positivelyBoundedReversibleCreate
       ? 'reversible' as const
-      : 'unknown' as const;
+      : positivelyBoundedOrdinaryWrite
+        ? 'ordinary_non_destructive' as const
+        : 'unknown' as const;
   return {
     sourceDigest: sha256(closedCanonicalJson({
       domain: 'sealed-external-operation-semantic',

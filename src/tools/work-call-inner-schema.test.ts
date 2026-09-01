@@ -123,6 +123,34 @@ test('host-planned work_call JSON schema is the execution envelope, not the auth
   assert.equal(lifted.proposal, null);
   assert.equal(lifted.universe_selector, null);
   assert.equal(lifted.seal_amendment, null);
+  assert.equal(lifted.source_call_ids, null);
+  assert.equal(lifted.source_record_ids, null);
+  assert.equal('source_call_ids' in (planned.properties ?? {}), true,
+    'dependent host-planned writes can name the exact prior result projection they used');
+  assert.equal(HostPlannedWorkCallInputSchema.safeParse({
+    requirement_id: 'write_workspace',
+    source_call_ids: ['usable-search-result'],
+    source_record_ids: ['https://example.test/source'],
+    name: 'space_save',
+    args_json: '{"slug":"workspace"}',
+  }).success, true);
+  for (const source_call_ids of [[], ['first-result', 'second-result']]) {
+    assert.equal(HostPlannedWorkCallInputSchema.safeParse({
+      requirement_id: 'write_workspace',
+      source_call_ids,
+      name: 'space_save',
+      args_json: '{"slug":"workspace"}',
+    }).success, false, 'the schema refuses zero or plural source nominations before local I/O');
+  }
+  for (const source_record_ids of [[], ['duplicate', 'duplicate']]) {
+    assert.equal(HostPlannedWorkCallInputSchema.safeParse({
+      requirement_id: 'write_workspace',
+      source_call_ids: ['usable-search-result'],
+      source_record_ids,
+      name: 'space_save',
+      args_json: '{"slug":"workspace"}',
+    }).success, false, 'empty or duplicate structured source identities are refused before local I/O');
+  }
 
   // Live 2026-08-29, sess-mob-481c… source 100106: GLM emitted the
   // nullable once-only slot as the JSON string "null" three times. Every

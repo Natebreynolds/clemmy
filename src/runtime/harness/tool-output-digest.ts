@@ -34,7 +34,46 @@ function tryParse(text: string): unknown {
 
 // Well-known keys that hold the "rows" of a list/records result, across
 // composio/Airtable/Sheets/Gmail/etc. Used to report the TRUE item count.
-const DOMINANT_LIST_KEYS = ['records', 'items', 'results', 'rows', 'data', 'value', 'entries', 'messages', 'files', 'matches', 'documents'];
+const DOMINANT_LIST_KEYS = [
+  'records', 'items', 'results', 'rows', 'data', 'value', 'entries',
+  'messages', 'files', 'matches', 'documents',
+  // Search providers commonly split one response into sibling result sets.
+  // These must participate in the same bounded-query path: a large `web`
+  // record must not hide a later, more useful `news` array.
+  'news', 'web', 'images',
+];
+
+interface DominantArrayLocation {
+  key: string;
+  rows: unknown[];
+  path: string;
+}
+
+function dominantArrayLocation(value: unknown): DominantArrayLocation | null {
+  if (Array.isArray(value)) return { key: 'items', rows: value, path: '' };
+  if (!value || typeof value !== 'object') return null;
+
+  let best: DominantArrayLocation | null = null;
+  const visit = (node: unknown, path: string, depth: number): void => {
+    if (depth > 5 || !node || typeof node !== 'object' || Array.isArray(node)) return;
+    const record = node as Record<string, unknown>;
+    for (const key of DOMINANT_LIST_KEYS) {
+      const candidate = record[key];
+      if (Array.isArray(candidate) && (!best || candidate.length > best.rows.length)) {
+        best = { key, rows: candidate, path: path ? `${path}.${key}` : key };
+      }
+    }
+    // Provider envelopes are commonly nested as data -> data. Walk bounded
+    // object carriers, but never descend into record arrays or arbitrary depth.
+    for (const [key, child] of Object.entries(record)) {
+      if (child && typeof child === 'object' && !Array.isArray(child)) {
+        visit(child, path ? `${path}.${key}` : key, depth + 1);
+      }
+    }
+  };
+  visit(value, '', 0);
+  return best;
+}
 
 /** Find the dominant list inside a parsed tool result — a records/items/results
  *  array, possibly nested one level under `data` (the composio/Airtable shape
@@ -43,19 +82,8 @@ const DOMINANT_LIST_KEYS = ['records', 'items', 'results', 'rows', 'data', 'valu
  *  of them — instead of a char count that reads like "there may be more pages"
  *  and invites hallucinated pagination. */
 export function countDominantArray(value: unknown): { key: string; count: number } | null {
-  if (Array.isArray(value)) return { key: 'items', count: value.length };
-  if (!value || typeof value !== 'object') return null;
-  const obj = value as Record<string, unknown>;
-  let best: { key: string; count: number } | null = null;
-  const consider = (key: string, v: unknown): void => {
-    if (Array.isArray(v) && (!best || v.length > best.count)) best = { key, count: v.length };
-  };
-  for (const k of DOMINANT_LIST_KEYS) consider(k, obj[k]);
-  const data = obj.data;
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
-    for (const k of DOMINANT_LIST_KEYS) consider(k, (data as Record<string, unknown>)[k]);
-  }
-  return best;
+  const located = dominantArrayLocation(value);
+  return located ? { key: located.key, count: located.rows.length } : null;
 }
 
 /** Parse text then count the dominant list — for callers that only hold the raw
@@ -69,14 +97,211 @@ export function dominantListCount(text: string): { key: string; count: number } 
  *  `{ data: { value: [...] } }`. Returns the rows plus the dotted path so a
  *  query engine can operate on the records directly and NAME where they live. */
 export function resolveDominantArray(value: unknown): { rows: unknown[]; path: string } | null {
-  const dom = countDominantArray(value);
-  if (!dom || dom.count === 0) return null;
-  if (Array.isArray(value)) return { rows: value, path: '' };
-  const obj = value as Record<string, unknown>;
-  if (Array.isArray(obj[dom.key])) return { rows: obj[dom.key] as unknown[], path: dom.key };
-  const data = obj.data;
-  if (data && typeof data === 'object' && Array.isArray((data as Record<string, unknown>)[dom.key])) {
-    return { rows: (data as Record<string, unknown>)[dom.key] as unknown[], path: `data.${dom.key}` };
+  const located = dominantArrayLocation(value);
+  return located && located.rows.length > 0
+    ? { rows: located.rows, path: located.path }
+    : null;
+}
+
+const STRUCTURED_PROJECTION_META_KEY = '__clementine';
+const MAX_STRUCTURED_PROJECTION_KEYS = 64;
+const MAX_STRUCTURED_PROJECTION_ITEMS = 64;
+const MIN_JSON_VALUE_CHARS = 4; // `null`
+
+interface StructuredProjectionStats {
+  clippedStrings: number;
+  omittedArrayItems: number;
+  omittedObjectKeys: number;
+}
+
+export interface StructuredJsonToolOutputOptions extends DigestOptions {
+  /** Exact host-minted receipt string. It is embedded inside the JSON rather
+   * than appended as prose so the projection remains parseable. */
+  exactOutputReceipt: string;
+  resourceIndex?: string;
+}
+
+function jsonChars(value: unknown): number {
+  return JSON.stringify(value).length;
+}
+
+function projectionKeyPriority(key: string): number {
+  const priority = [
+    'data', 'successful', 'success', 'error',
+    'news', 'records', 'items', 'results', 'rows', 'value', 'entries',
+    'url', 'title', 'date', 'publishedAt', 'publishedDate', 'publisher',
+    'snippet', 'description', 'content', 'markdown',
+    'web', 'images', 'logId',
+  ];
+  const index = priority.indexOf(key);
+  return index < 0 ? priority.length : index;
+}
+
+function allocateJsonBudgets(sizes: number[], available: number): number[] {
+  const budgets = new Array<number>(sizes.length).fill(0);
+  let remaining = available;
+  let active = sizes.map((_, index) => index);
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length);
+    const satisfied = active.filter((index) => sizes[index]! <= share);
+    if (satisfied.length === 0) {
+      for (let position = 0; position < active.length; position += 1) {
+        const index = active[position]!;
+        const extra = position < (remaining % active.length) ? 1 : 0;
+        budgets[index] = share + extra;
+      }
+      break;
+    }
+    const satisfiedSet = new Set(satisfied);
+    for (const index of satisfied) {
+      budgets[index] = sizes[index]!;
+      remaining -= sizes[index]!;
+    }
+    active = active.filter((index) => !satisfiedSet.has(index));
+  }
+  return budgets;
+}
+
+function compactJsonString(value: string, budget: number, stats: StructuredProjectionStats): unknown {
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= budget) return value;
+  if (budget < MIN_JSON_VALUE_CHARS) return null;
+
+  const marker = `…[${value.length} chars total]`;
+  let low = 0;
+  let high = value.length;
+  let best: string | null = null;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = `${value.slice(0, middle)}${marker}`;
+    if (JSON.stringify(candidate).length <= budget) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  stats.clippedStrings += 1;
+  return best ?? null;
+}
+
+function compactJsonValue(
+  value: unknown,
+  budget: number,
+  stats: StructuredProjectionStats,
+  depth = 0,
+): unknown {
+  if (budget < MIN_JSON_VALUE_CHARS || depth > 12) return null;
+  const fullSize = jsonChars(value);
+  if (fullSize <= budget) return value;
+  if (typeof value === 'string') return compactJsonString(value, budget, stats);
+  if (value === null || typeof value !== 'object') return null;
+
+  if (Array.isArray(value)) {
+    const maximum = Math.min(value.length, MAX_STRUCTURED_PROJECTION_ITEMS);
+    let shown = maximum;
+    while (shown > 0) {
+      const overhead = 2 + Math.max(0, shown - 1);
+      if (overhead + (shown * MIN_JSON_VALUE_CHARS) <= budget) break;
+      shown -= 1;
+    }
+    stats.omittedArrayItems += value.length - shown;
+    if (shown === 0) return [];
+    const overhead = 2 + Math.max(0, shown - 1);
+    const sizes = value.slice(0, shown).map(jsonChars);
+    const budgets = allocateJsonBudgets(sizes, budget - overhead);
+    return value.slice(0, shown).map((entry, index) => (
+      compactJsonValue(entry, budgets[index]!, stats, depth + 1)
+    ));
+  }
+
+  const record = value as Record<string, unknown>;
+  const originalKeys = Object.keys(record);
+  let keys = originalKeys
+    .map((key, index) => ({ key, index, priority: projectionKeyPriority(key) }))
+    .sort((left, right) => left.priority - right.priority || left.index - right.index)
+    .slice(0, MAX_STRUCTURED_PROJECTION_KEYS)
+    .map(({ key }) => key);
+  while (keys.length > 0) {
+    const overhead = 2
+      + Math.max(0, keys.length - 1)
+      + keys.reduce((sum, key) => sum + JSON.stringify(key).length + 1, 0);
+    if (overhead + (keys.length * MIN_JSON_VALUE_CHARS) <= budget) break;
+    keys = keys.slice(0, -1);
+  }
+  stats.omittedObjectKeys += originalKeys.length - keys.length;
+  if (keys.length === 0) return {};
+  const overhead = 2
+    + Math.max(0, keys.length - 1)
+    + keys.reduce((sum, key) => sum + JSON.stringify(key).length + 1, 0);
+  const sizes = keys.map((key) => jsonChars(record[key]));
+  const budgets = allocateJsonBudgets(sizes, budget - overhead);
+  const compact: Record<string, unknown> = {};
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index]!;
+    compact[key] = compactJsonValue(record[key], budgets[index]!, stats, depth + 1);
+  }
+  return compact;
+}
+
+/**
+ * Build a bounded, parseable JSON projection for an oversized JSON object.
+ * Sibling objects/arrays receive fair budgets, so one early huge scrape cannot
+ * starve later result sets. The exact-output receipt lives inside a reserved
+ * host metadata property: downstream typed JSON proof can still parse the
+ * provider envelope while exact raw redemption continues to use the receipt.
+ */
+export function compactStructuredJsonToolOutput(
+  text: string,
+  options: StructuredJsonToolOutputOptions,
+): string | null {
+  const parsed = tryParse(text);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (Object.hasOwn(parsed, STRUCTURED_PROJECTION_META_KEY)) return null;
+
+  const maxChars = options.maxChars ?? 4000;
+  const callId = options.callId ?? null;
+  const fullMetadata = {
+    kind: 'structured_projection_v1',
+    truncated: true,
+    rawChars: text.length,
+    recovery: callId ? {
+      tool_output_query: { call_id: callId, limit: 50 },
+      recall_tool_result: { call_id: callId },
+    } : undefined,
+    resourceIndex: options.resourceIndex || undefined,
+    receipt: options.exactOutputReceipt,
+  };
+  const metadataCandidates: Array<Record<string, unknown>> = [
+    fullMetadata,
+    { kind: 'structured_projection_v1', receipt: options.exactOutputReceipt },
+    { receipt: options.exactOutputReceipt },
+  ];
+
+  for (const metadataBase of metadataCandidates) {
+    let payloadBudget = maxChars
+      - JSON.stringify(STRUCTURED_PROJECTION_META_KEY).length
+      - JSON.stringify(metadataBase).length
+      - 4; // root braces, colon, and comma
+    if (payloadBudget < 2) continue;
+    for (let attempt = 0; attempt < 12 && payloadBudget >= 2; attempt += 1) {
+      const stats: StructuredProjectionStats = {
+        clippedStrings: 0,
+        omittedArrayItems: 0,
+        omittedObjectKeys: 0,
+      };
+      const projected = compactJsonValue(parsed, payloadBudget, stats);
+      if (!projected || typeof projected !== 'object' || Array.isArray(projected)) break;
+      const metadata = metadataBase === fullMetadata
+        ? { ...metadataBase, projection: stats }
+        : metadataBase;
+      const output = JSON.stringify({
+        ...(projected as Record<string, unknown>),
+        [STRUCTURED_PROJECTION_META_KEY]: metadata,
+      });
+      if (output.length <= maxChars) return output;
+      payloadBudget -= output.length - maxChars + 8;
+    }
   }
   return null;
 }
@@ -156,7 +381,9 @@ function digestArray(arr: unknown[], totalChars: number, maxChars: number, toolN
   let used = 2; // for the enclosing []
   for (const el of arr) {
     const s = JSON.stringify(el);
-    if (used + s.length + 1 > budget && shown.length > 0) break;
+    // Never admit an oversized first record raw. Showing zero complete rows is
+    // truthful; ballooning a 300KB first row through a 20KB budget is not.
+    if (used + s.length + 1 > budget) break;
     shown.push(el);
     used += s.length + 1;
   }
@@ -194,7 +421,7 @@ function renderValue(v: unknown, budget: number, depth: number): string {
     let used = 2;
     for (const el of v) {
       const s = JSON.stringify(el);
-      if (used + s.length + 2 > budget && shown.length > 0) break;
+      if (used + s.length + 2 > budget) break;
       shown.push(el);
       used += s.length + 2;
       if (shown.length >= 25) break;
@@ -336,7 +563,7 @@ function fitStringList(values: string[], maxChars: number): { shown: string[]; o
   let used = 2; // []
   for (const value of values) {
     const serialized = JSON.stringify(value);
-    if (used + serialized.length + 1 > maxChars && shown.length > 0) break;
+    if (used + serialized.length + 1 > maxChars) break;
     shown.push(value);
     used += serialized.length + 1;
   }

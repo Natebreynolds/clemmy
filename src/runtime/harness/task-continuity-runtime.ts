@@ -51,6 +51,11 @@ import {
 } from './turn-outcome.js';
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import {
+  ambiguousOpenSlotTargetFromLastInterpretation,
+  typedClassificationFromLastInterpretation,
+  type TypedClarificationClassificationV1,
+} from '../semantic-boundary/interpret-accepted-source.js';
+import {
   materiallyVariantSourceStrategyDecision,
   materialSourceReplacementBindingIsCompatible,
   PREFLIGHT_ALIGNMENT_SOURCE,
@@ -77,6 +82,167 @@ export const CLARIFICATION_RESOLVER_VERSION = 'clarification-resolver-v2' as con
  * columns already freeze resolverVersion, so this needs no schema widening. */
 export const SEMANTIC_CLARIFICATION_RESOLVER_VERSION =
   'clarification-resolver-v3-semantic-projection' as const;
+
+/**
+ * Fresh host turns do not persist a graph before their model loop, but an
+ * answer to a durable open question still needs the checked semantic boundary.
+ * Run the production interpreter/admission half without minting graph call
+ * authority; the host loop remains the one execution owner.
+ */
+export async function prepareCheckedHostClarificationAnswer(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+  surface: import('../graph/turn-graph-ir.js').TurnGraphSurface;
+}): Promise<'absent' | 'admitted' | 'blocked'> {
+  const packet = peekTaskContinuityPacket({ sessionId: input.sessionId });
+  if (packet.status !== 'available') return 'absent';
+  const { prepareDurableAcceptedTurnCompile } = await import(
+    '../semantic-boundary/admit-and-compile-accepted-source.js'
+  );
+  const prepared = await prepareDurableAcceptedTurnCompile({
+    identity: {
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      turn: input.turn,
+    },
+    surface: input.surface,
+  });
+  return prepared.ok ? 'admitted' : 'blocked';
+}
+
+export interface UnresolvedClarificationReofferV1 {
+  readonly version: 1;
+  readonly sessionId: string;
+  readonly sourceUserSeq: number;
+  readonly parentPacketId: string;
+  readonly rootSourceUserSeq: number;
+  readonly question: string;
+  readonly options: readonly string[];
+  readonly slot?: TaskContinuityPacket['pause']['slot'];
+  readonly capabilities: readonly Readonly<
+    Omit<TaskContinuityCapabilityEvidence, 'resourceRefs'>
+    & { resourceRefs: readonly string[] }
+  >[];
+  readonly expiresAt: string;
+  readonly replay: boolean;
+}
+
+/**
+ * Prepare the exact public reoffer for an answer that did not settle its open
+ * clarification. This is deliberately narrower than the normal successor
+ * path: only a still-open ordinary clarification and its adjacent accepted
+ * human source qualify. Approval/recovery controls and ambiguous/malformed
+ * rows never become a conversational reask.
+ */
+export function unresolvedClarificationReofferForAcceptedSource(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): UnresolvedClarificationReofferV1 | null {
+  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
+  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
+  const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
+  if (!typed || !('keepOpen' in typed) || typed.metaAction !== undefined) return null;
+  const ambiguous = ambiguousOpenSlotTargetFromLastInterpretation(
+    input.sessionId,
+    input.sourceUserSeq,
+  );
+  const openSlot = current.packet.pause.slot;
+  if (
+    !ambiguous
+    || !openSlot
+    || (
+      ambiguous.target !== null
+      && (
+        ambiguous.target.goalId !== openSlot.goalId
+        || ambiguous.target.baseRevision !== openSlot.revision
+      )
+    )
+  ) return null;
+  const source = realAcceptedSource(input.sessionId, input.sourceUserSeq);
+  if (!source) return null;
+  const packet = current.packet;
+  const replay = packet.originatingSourceUserSeq === input.sourceUserSeq;
+  if (
+    !replay
+    && !nextRealSourceIs({
+      sessionId: input.sessionId,
+      originatingSourceUserSeq: packet.originatingSourceUserSeq,
+      consumingSourceUserSeq: input.sourceUserSeq,
+    })
+  ) return null;
+  return Object.freeze({
+    version: 1,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    parentPacketId: packet.packetId,
+    rootSourceUserSeq: packet.rootSourceUserSeq ?? packet.originatingSourceUserSeq,
+    question: packet.pause.question,
+    options: Object.freeze([...packet.pause.options]),
+    ...(packet.pause.slot ? { slot: Object.freeze({ ...packet.pause.slot }) } : {}),
+    capabilities: Object.freeze(packet.capabilities.map((row) => Object.freeze({
+      ...row,
+      resourceRefs: Object.freeze([...row.resourceRefs]),
+    }))),
+    expiresAt: packet.expiresAt,
+    replay,
+  });
+}
+
+/** Complete the checked reoffer after its exact public ask + needs-input
+ * terminal are durable. The store atomically supersedes the parent while
+ * preserving root lineage; replay of the already-created successor is inert. */
+export function finalizeUnresolvedClarificationReoffer(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  parentPacketId: string;
+  awaitingEventId: string;
+  terminalEventId: string;
+}): TaskContinuityPacket | null {
+  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
+  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
+  if (current.packet.originatingSourceUserSeq === input.sourceUserSeq) {
+    return current.packet.parentPacketId === input.parentPacketId
+      ? current.packet
+      : null;
+  }
+  if (current.packet.packetId !== input.parentPacketId) return null;
+  // Re-derive every successor byte from the exact still-open parent. The
+  // exported preparation is a display projection only and is never accepted
+  // back as authority by this writer.
+  const prepared = unresolvedClarificationReofferForAcceptedSource({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  if (!prepared || prepared.parentPacketId !== input.parentPacketId || prepared.replay) return null;
+  try {
+    return createTaskContinuityPacket({
+      sessionId: input.sessionId,
+      originatingSourceUserSeq: input.sourceUserSeq,
+      lineage: {
+        rootSourceUserSeq: prepared.rootSourceUserSeq,
+        parentPacketId: prepared.parentPacketId,
+      },
+      pause: {
+        kind: 'clarification',
+        question: prepared.question,
+        options: [...prepared.options],
+        ...(prepared.slot ? { slot: { ...prepared.slot } } : {}),
+      },
+      capabilities: prepared.capabilities.map((row) => ({
+        ...row,
+        resourceRefs: [...row.resourceRefs],
+      })),
+      publicDeliveryBinding: {
+        awaitingEventId: input.awaitingEventId,
+        terminalEventId: input.terminalEventId,
+      },
+      expiresAt: prepared.expiresAt,
+    });
+  } catch {
+    return null;
+  }
+}
 
 const NON_CLARIFICATION_SOURCES = new Set([
   'offer_background',
@@ -372,11 +538,13 @@ export function persistCommittedClarificationContinuity(input: {
     || !deliveredQuestion
     || question.toLowerCase() !== deliveredQuestion.toLowerCase()
   ) return null;
-  // PresentationEvent currently carries only the terminal question text. Until
-  // a future terminal contract binds rendered controls byte-for-byte, internal
-  // awaiting options are hidden implementation data and confer no ordinal or
-  // exact-option authority on the reply.
-  const options: string[] = [];
+  // The awaiting row was emitted by the accepted host tool call and the exact
+  // paired terminal proves which question was publicly committed. Persist its
+  // bounded controls so a later semantic answer can bind an exact visible
+  // option id. The store reopens both event ids before accepting these bytes.
+  const options = (Array.isArray(awaiting.data.options) ? awaiting.data.options : [])
+    .map((option) => normalized(option))
+    .filter(Boolean);
   const current = peekTaskContinuityPacket({ sessionId: source.sessionId });
   // The schema normally makes this impossible. If storage was copied or its
   // uniqueness invariant was damaged, never let a newly committed question
@@ -390,27 +558,118 @@ export function persistCommittedClarificationContinuity(input: {
     && current.packet.pause.options.length === options.length
     && current.packet.pause.options.every((option, index) => option === options[index])
   ) return current.packet;
+  if (current.status === 'available' && current.packet.originatingSourceUserSeq === source.seq) {
+    // One accepted source cannot publish two different open questions. Replay
+    // of the same exact ask returned above; a variant is an integrity hold.
+    return null;
+  }
   const graph = turnGraphFromShadowEvent(getTurnGraphEventForSource(source.sessionId, source.seq));
   const awaitInput = graph ? awaitInputFromGraph(graph) : undefined;
-  const packetInput = awaitInput
-    ? continuityPacketFromAwaitInput({
+  const typed = typedClassificationFromLastInterpretation(source.sessionId, source.seq);
+  const meta = current.status === 'available'
+    ? exactMetaChoiceForPacket(typed, current.packet)
+    : null;
+  if (current.status === 'available' && !meta) {
+    // A later accepted source may replace an open packet only through a checked
+    // exact visible meta choice. Arbitrary prose/question identity is not a
+    // packet-successor authority.
+    return null;
+  }
+  const rootSourceUserSeq = current.status === 'available'
+    ? current.packet.rootSourceUserSeq ?? current.packet.originatingSourceUserSeq
+    : source.seq;
+  const inheritedSlot = current.status === 'available'
+    ? current.packet.pause.slot
+    : undefined;
+  if (meta && current.status === 'available' && !inheritedSlot) return null;
+  const packetInput = meta && current.status === 'available' && inheritedSlot
+    ? {
         sessionId: source.sessionId,
         originatingSourceUserSeq: source.seq,
-        awaitInput,
-      })
-    : {
-        sessionId: source.sessionId,
-        originatingSourceUserSeq: source.seq,
-        pause: { kind: 'clarification' as const, question, options },
-      };
+        lineage: {
+          rootSourceUserSeq,
+          parentPacketId: current.packet.packetId,
+        },
+        pause: {
+          kind: 'clarification' as const,
+          question,
+          options,
+          slot: meta.action === 'explain'
+            ? { ...inheritedSlot }
+            : {
+                goalId: inheritedSlot.goalId,
+                revision: inheritedSlot.revision,
+                questionId: `question:${source.seq}:customize`,
+                slotKey: 'strategy-customization',
+                ...(inheritedSlot.predecessorRefs
+                  ? { predecessorRefs: [...inheritedSlot.predecessorRefs] }
+                  : {}),
+              },
+        },
+      }
+    : awaitInput
+      ? {
+          ...continuityPacketFromAwaitInput({
+            sessionId: source.sessionId,
+            originatingSourceUserSeq: source.seq,
+            awaitInput,
+          }),
+          // The actual delivered controls win over an internal graph copy; the
+          // store binds them to awaiting+terminal below.
+          pause: {
+            ...continuityPacketFromAwaitInput({
+              sessionId: source.sessionId,
+              originatingSourceUserSeq: source.seq,
+              awaitInput,
+            }).pause,
+            question,
+            options,
+          },
+        }
+      : {
+          sessionId: source.sessionId,
+          originatingSourceUserSeq: source.seq,
+          pause: {
+            kind: 'clarification' as const,
+            question,
+            options,
+            slot: {
+              goalId: `goal:${source.sessionId}:${source.seq}`,
+              revision: 0,
+              questionId: `question:${source.seq}`,
+              slotKey: 'reply',
+            },
+          },
+        };
   return createTaskContinuityPacket({
     ...packetInput,
+    publicDeliveryBinding: {
+      awaitingEventId: awaiting.id,
+      terminalEventId: terminalEvent.id,
+    },
     capabilities: capabilityEvidenceForSource({
       sessionId: source.sessionId,
       sourceUserSeq: source.seq,
       terminalSeq: terminalEvent.seq,
     }),
   });
+}
+
+function exactMetaChoiceForPacket(
+  typed: TypedClarificationClassificationV1 | undefined,
+  packet: TaskContinuityPacket,
+): { action: 'explain' | 'customize'; optionId: string } | null {
+  if (!typed || !('keepOpen' in typed) || !typed.metaAction
+    || !typed.questionId || !typed.slotKey || !typed.optionId) return null;
+  const slot = packet.pause.slot;
+  if (!slot || typed.questionId !== slot.questionId || typed.slotKey !== slot.slotKey) return null;
+  const optionIndexMatch = /^opt-([1-9][0-9]*)$/.exec(typed.optionId);
+  const optionIndex = optionIndexMatch ? Number(optionIndexMatch[1]) - 1 : -1;
+  if (optionIndex < 0 || optionIndex >= packet.pause.options.length) return null;
+  const intent = packet.pause.optionIntents
+    ?.find((candidate) => candidate.optionIndex === optionIndex);
+  if (!intent || intent.action !== typed.metaAction) return null;
+  return { action: typed.metaAction, optionId: typed.optionId };
 }
 
 export interface ClarificationAnswerClassification {
@@ -711,7 +970,9 @@ function clarificationContextFromPacket(input: {
     input.packet.sessionId !== input.sessionId
     || input.packet.pause.kind !== 'clarification'
   ) return null;
-  const parent = realAcceptedSource(input.sessionId, input.packet.originatingSourceUserSeq);
+  const rootSourceUserSeq = input.packet.rootSourceUserSeq
+    ?? input.packet.originatingSourceUserSeq;
+  const parent = realAcceptedSource(input.sessionId, rootSourceUserSeq);
   const parentInput = normalized(parent?.data.text);
   if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
   const classification: ClarificationAnswerClassification = {
@@ -752,7 +1013,7 @@ function clarificationContextFromPacket(input: {
   if (!retrievalQuery) return null;
   return {
     packetId: input.packet.packetId,
-    parentSourceUserSeq: input.packet.originatingSourceUserSeq,
+    parentSourceUserSeq: rootSourceUserSeq,
     consumingSourceUserSeq: input.sourceUserSeq,
     parentInput,
     question: input.packet.pause.question,
@@ -831,7 +1092,7 @@ function consumeContinuationContext(input: {
   answer: string;
   /** Typed slot disposition from a checked semantic projection. When present
    *  the phrase classifier is not consulted. */
-  typedClassification?: ClarificationAnswerClassification | { keepOpen: true };
+  typedClassification?: ClarificationAnswerClassification | TypedClarificationClassificationV1;
 }): TaskContinuationContext | null {
   const lookup = peekTaskContinuityPacket({ sessionId: input.sessionId });
   if (lookup.status !== 'available') {
@@ -883,9 +1144,11 @@ function consumeContinuationContext(input: {
     }
     return null;
   }
+  const rootSourceUserSeq = packet.rootSourceUserSeq
+    ?? packet.originatingSourceUserSeq;
   const parentInput = normalized(realAcceptedSource(
     input.sessionId,
-    packet.originatingSourceUserSeq,
+    rootSourceUserSeq,
   )?.data.text);
   if (!parentInput || parentInput.length > MAX_CLARIFICATION_PARENT_CHARS) return null;
   const resolution = frozenResolutionFor({
@@ -909,6 +1172,45 @@ function consumeContinuationContext(input: {
     packet: consumed.packet,
     frozenResolution: consumed.resolution,
   });
+}
+
+function verifiedMetaContinuationInput(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  typed: TypedClarificationClassificationV1;
+}): string | null {
+  if (!('keepOpen' in input.typed) || !input.typed.metaAction) return null;
+  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
+  if (current.status !== 'available') return null;
+  const meta = exactMetaChoiceForPacket(input.typed, current.packet);
+  if (!meta || !nextRealSourceIs({
+    sessionId: input.sessionId,
+    originatingSourceUserSeq: current.packet.originatingSourceUserSeq,
+    consumingSourceUserSeq: input.sourceUserSeq,
+  })) return null;
+  const rootSourceUserSeq = current.packet.rootSourceUserSeq
+    ?? current.packet.originatingSourceUserSeq;
+  const root = realAcceptedSource(input.sessionId, rootSourceUserSeq);
+  const rootInput = normalized(root?.data.text);
+  const optionIndex = Number(meta.optionId.slice('opt-'.length)) - 1;
+  const label = current.packet.pause.options[optionIndex];
+  if (!rootInput || !label) return null;
+  const directive = meta.action === 'explain'
+    ? 'Explain the rationale for the current recommendation, then reoffer the same exact visible options. Do not research, plan, or write yet.'
+    : 'Ask one bundled free-text question for audience, channels, voice, and cadence. Preserve the root task and do not research, plan, or write until those details arrive.';
+  return [
+    '[task-continuation-meta:v1]',
+    '[root-task]',
+    rootInput,
+    '[current-question]',
+    current.packet.pause.question,
+    '[selected-visible-option]',
+    `${meta.optionId}: ${label}`,
+    '[meta-action]',
+    meta.action,
+    '[host-directive]',
+    directive,
+  ].join('\n');
 }
 
 function accountEvidenceStillFits(row: TaskContinuityCapabilityEvidence): boolean {
@@ -1112,7 +1414,10 @@ export function inspectDurableMaterialSourceContinuation(input: {
   });
   if (
     !context
-    || context.parentSourceUserSeq !== consumed.packet.originatingSourceUserSeq
+    || context.parentSourceUserSeq !== (
+      consumed.packet.rootSourceUserSeq
+      ?? consumed.packet.originatingSourceUserSeq
+    )
     || context.consumingSourceUserSeq !== input.sourceUserSeq
     || normalized(context.question) !== normalized(consumed.packet.pause.question)
   ) {
@@ -1121,7 +1426,10 @@ export function inspectDurableMaterialSourceContinuation(input: {
   const parent = realAcceptedSource(input.sessionId, context.parentSourceUserSeq);
   if (
     !parent
-    || parent.id !== consumed.packet.originatingSourceEventId
+    || parent.id !== (
+      consumed.packet.rootSourceEventId
+      ?? consumed.packet.originatingSourceEventId
+    )
     || parent.sessionId !== input.sessionId
   ) {
     return { status: 'refused', reason: 'consumed_lineage_invalid' };
@@ -1709,7 +2017,7 @@ export async function enrichAcceptedRequestWithTaskContinuity(
   sourceUserSeq: number,
   options: {
     continuationOnly?: boolean;
-    typedClassification?: ClarificationAnswerClassification | { keepOpen: true };
+    typedClassification?: ClarificationAnswerClassification | TypedClarificationClassificationV1;
     /** The bridge uses this only for the pre-resolution A/Q/B inspection. It
      * consumes/rehydrates the exact packet but performs no candidate/schema
      * lookup, so corrupt material-source lineage can stop at zero selector I/O. */
@@ -1734,6 +2042,21 @@ export async function enrichAcceptedRequestWithTaskContinuity(
       ...safe
     } = request;
     return safe;
+  }
+  if (options.typedClassification && 'keepOpen' in options.typedClassification) {
+    const metaInput = verifiedMetaContinuationInput({
+      sessionId: request.sessionId,
+      sourceUserSeq,
+      typed: options.typedClassification,
+    });
+    const {
+      semanticTaskInput: _semantic,
+      taskContinuation: _context,
+      ...safe
+    } = request;
+    return metaInput
+      ? { ...safe, semanticTaskInput: metaInput, taskContinuationResolved: true }
+      : { ...safe, taskContinuationResolved: true };
   }
   const context = consumeContinuationContext({
     sessionId: request.sessionId,

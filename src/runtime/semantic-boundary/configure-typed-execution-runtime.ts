@@ -161,7 +161,9 @@ function evaluateCatalogReadiness(
       forget: [],
     };
   }
-  const refusals = [...carried];
+  const refusals = scope
+    ? carried.filter((entry) => entry.manifestId === '*' || scope.has(entry.manifestId))
+    : [...carried];
   const forget: string[] = [];
   const required = requiredCurrentManifests(scope);
   if (required.length === 0) {
@@ -235,8 +237,8 @@ export function refreshTypedExecutionReadiness(requiredManifestIds?: readonly st
   if (!scope) {
     lastCatalogRefusals = [];
     catalogReady = false;
+    lastInstallRefusals = [];
   }
-  lastInstallRefusals = [];
   if (process.env.CLEMENTINE_PRODUCTION_CATALOG === '0') {
     lastCatalogRefusals = [{ manifestId: '*', reason: 'production_catalog_disabled' }];
     peekHostCapabilityCatalogFactory()?.clear();
@@ -249,7 +251,27 @@ export function refreshTypedExecutionReadiness(requiredManifestIds?: readonly st
   // it must see the same scope evaluateCatalogReadiness uses below, or a
   // scoped call here still collaterally forgets unrelated stale manifests
   // through this second, separate mechanism.
-  lastInstallRefusals = [...installed.refused, ...adapter.refresh(scope).refused];
+  const refreshedInstallRefusals = [...installed.refused, ...adapter.refresh(scope).refused];
+  if (scope) {
+    // A scoped refresh replaces only this scope's carried failures. Preserve
+    // independently failed manifests for their own future calls, but replace
+    // wildcard state with the current refresh's wildcard state so a stale
+    // historical `empty_catalog` cannot poison a newly materialized entry.
+    const combined = [
+      ...lastInstallRefusals.filter((entry) => (
+        entry.manifestId !== '*' && !scope.has(entry.manifestId)
+      )),
+      ...refreshedInstallRefusals.filter((entry) => (
+        entry.manifestId === '*' || scope.has(entry.manifestId)
+      )),
+    ];
+    lastInstallRefusals = [...new Map(combined.map((entry) => [
+      `${entry.manifestId}:${entry.reason}`,
+      entry,
+    ])).values()];
+  } else {
+    lastInstallRefusals = refreshedInstallRefusals;
+  }
   reconstructShippedPortsForDurableSuccessors();
   // Quarantine is existence-based (does a current, non-placeholder manifest
   // still back this factory entry at all?), never freshness-based, so running

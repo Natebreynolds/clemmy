@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { isKillRequested, appendEvent, getSession, listEvents, resolveToolOutputForAuthority, type KillRequestTarget } from './eventlog.js';
-import type { ConversationPreambleDeliveryCallback } from '../../types.js';
+import type { ConversationPreambleDeliveryCallback, TaskContinuationContext } from '../../types.js';
 import { effectiveTurnObjective } from './turn-control.js';
 import {
   copyHostPlanningReadCapabilityResolver,
@@ -1188,6 +1188,9 @@ export interface HarnessRunContext {
   /** Exact accepted user event for this attempt. Deterministic preflight gates
    * must not consult whichever session input happens to be newest. */
   sourceUserSeq?: number;
+  /** Verified A/Q/B continuation authority. Planning on answer B uses the
+   * original accepted objective A while retaining B as the consuming source. */
+  taskContinuation?: TaskContinuationContext;
   /** Fresh host plan_task publishes its model-authored conversational preamble
    * through the same awaited transport edge as structural preflight. */
   onConversationPreamble?: ConversationPreambleDeliveryCallback;

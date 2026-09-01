@@ -47,6 +47,7 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'claude_local_permission_claimed',
   'cross_session_prefix',
   'agent_context_packet',
+  'primary_model_planning_card_snapshot',
   'async_work_dispatch_prepared',
   'async_work_dispatch_batch_closed',
   'turn_memory_primer',

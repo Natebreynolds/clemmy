@@ -1350,10 +1350,124 @@ export async function interpretAcceptedSource(input: {
   return work;
 }
 
+export type TypedClarificationClassificationV1 =
+  | { disposition: 'selected' | 'provided'; selectedOption?: string }
+  | {
+      keepOpen: true;
+      metaAction?: 'explain' | 'customize';
+      questionId?: string;
+      slotKey?: string;
+      optionId?: string;
+    };
+
+/** Exact persisted relation identity for the one unresolved-slot reoffer
+ * owner. A generic keepOpen projection also covers a legitimately new goal
+ * with its own questions, so callers cloning the prior Q must require this
+ * narrower admitted `ambiguous` record and its original goal revision. */
+export function ambiguousOpenSlotTargetFromLastInterpretation(
+  sessionId: string,
+  sourceUserSeq: number,
+): { target: { goalId: string; baseRevision: number } | null } | null {
+  const persisted = readPersistedInterpretation(sessionId, sourceUserSeq);
+  if (
+    !persisted
+    || persisted.validationOutcome !== 'admitted'
+    || !persisted.raw
+    || typeof persisted.raw !== 'object'
+    || Array.isArray(persisted.raw)
+  ) return null;
+  const raw = persisted.raw as Record<string, unknown>;
+  const target = raw.targetGoal;
+  if (
+    raw.relation !== 'ambiguous'
+    || raw.goal !== null
+    || raw.work !== null
+    || !Array.isArray(raw.slotAnswers)
+    || raw.slotAnswers.length !== 0
+  ) return null;
+  // A legal ambiguous interpretation may be unable to nominate a goal at all
+  // (the exact live workflow-name correction did this). Absence carries no
+  // goal authority; when the model does nominate one, bind it exactly below.
+  if (target === null) return { target: null };
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return null;
+  const goalId = (target as Record<string, unknown>).goalId;
+  const baseRevision = (target as Record<string, unknown>).baseRevision;
+  return typeof goalId === 'string'
+    && goalId.length > 0
+    && Number.isSafeInteger(baseRevision)
+    && Number(baseRevision) >= 0
+    ? { target: { goalId, baseRevision: Number(baseRevision) } }
+    : null;
+}
+
+/** Exact admitted semantic witness for a caller that needs to act on a
+ * free-text open-slot answer. A consumed continuity row is a replay store,
+ * not authority by itself; callers must bind it back to this claim-linked
+ * interpretation before treating the answer as an executable correction. */
+export function admittedOpenSlotValueFromLastInterpretation(
+  sessionId: string,
+  sourceUserSeq: number,
+): {
+  goalId: string;
+  baseRevision: number;
+  questionId: string;
+  slotKey: string;
+  value: string;
+} | null {
+  const persisted = readPersistedInterpretation(sessionId, sourceUserSeq);
+  if (
+    !persisted
+    || persisted.validationOutcome !== 'admitted'
+    || !persisted.raw
+    || typeof persisted.raw !== 'object'
+    || Array.isArray(persisted.raw)
+  ) return null;
+  const raw = persisted.raw as Record<string, unknown>;
+  const target = raw.targetGoal;
+  const answers = raw.slotAnswers;
+  if (
+    raw.relation !== 'answer_open_slot'
+    || raw.goal !== null
+    || raw.work !== null
+    || !target
+    || typeof target !== 'object'
+    || Array.isArray(target)
+    || !Array.isArray(answers)
+    || answers.length !== 1
+  ) return null;
+  const answer = answers[0];
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) return null;
+  const goalId = (target as Record<string, unknown>).goalId;
+  const baseRevision = (target as Record<string, unknown>).baseRevision;
+  const fields = answer as Record<string, unknown>;
+  const questionId = fields.questionId;
+  const slotKey = fields.slotKey;
+  const value = fields.value;
+  return fields.kind === 'value'
+    && typeof goalId === 'string'
+    && goalId.length > 0
+    && Number.isSafeInteger(baseRevision)
+    && Number(baseRevision) >= 0
+    && typeof questionId === 'string'
+    && questionId.length > 0
+    && typeof slotKey === 'string'
+    && slotKey.length > 0
+    && typeof value === 'string'
+    && value.length > 0
+    ? {
+        goalId,
+        baseRevision: Number(baseRevision),
+        questionId,
+        slotKey,
+        value,
+      }
+    : null;
+}
+
 export function typedClassificationFromLastInterpretation(
   sessionId: string,
   sourceUserSeq: number,
-): { disposition: 'selected' | 'provided'; selectedOption?: string } | { keepOpen: true } | undefined {
+): TypedClarificationClassificationV1 | undefined {
   const persisted = readPersistedInterpretation(sessionId, sourceUserSeq);
   if (!persisted) return undefined;
   if (persisted.validationOutcome !== 'admitted' || !persisted.raw || typeof persisted.raw !== 'object') {
@@ -1363,7 +1477,13 @@ export function typedClassificationFromLastInterpretation(
     relation?: string;
     work?: unknown;
     goal?: { openSlots?: unknown[] } | null;
-    slotAnswers?: Array<{ kind?: string; optionId?: string }>;
+    slotAnswers?: Array<{
+      kind?: string;
+      questionId?: string;
+      slotKey?: string;
+      optionId?: string;
+      action?: string;
+    }>;
   };
   if (raw.relation === 'ambiguous') return { keepOpen: true };
   if (
@@ -1376,6 +1496,21 @@ export function typedClassificationFromLastInterpretation(
   }
   if (raw.relation === 'answer_open_slot') {
     const answer = raw.slotAnswers?.[0];
+    if (
+      answer?.kind === 'meta'
+      && (answer.action === 'explain' || answer.action === 'customize')
+      && answer.questionId
+      && answer.slotKey
+      && answer.optionId
+    ) {
+      return {
+        keepOpen: true,
+        metaAction: answer.action,
+        questionId: answer.questionId,
+        slotKey: answer.slotKey,
+        optionId: answer.optionId,
+      };
+    }
     if (answer?.kind === 'option' && answer.optionId) {
       return { disposition: 'selected', selectedOption: answer.optionId };
     }

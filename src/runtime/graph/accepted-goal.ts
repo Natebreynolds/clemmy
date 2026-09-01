@@ -25,6 +25,27 @@ export interface AcceptedGoalCollection {
   completeness?: 'count' | 'exhaust';
   /** Fields that define one unique record. Distinct from the full projection. */
   identityFields?: string[];
+  /** Exact host-recognized structured artifact locations. The named contract
+   * owns their interpretation; arbitrary matching arrays grant no proof. */
+  locator?: {
+    contract: 'workspace_social_posts_v1';
+    collectionPointer: '/posts';
+    visibleMirrorPointer: '/_mobile/records/items';
+    calendarPointer: '/calendar';
+    calendarRequiredFields: ['date', 'channel', 'theme'];
+    sourceEvidence: {
+      operationId: string;
+      recordsPointer: string;
+      minDistinctRecords: number;
+      titlePointer: string;
+      urlPointer: string;
+      publishedDatePointer: string;
+      findingPointers: [string, string, string, string];
+      publisherPointer: string;
+      maxAgeDays: number;
+      asOf: string;
+    };
+  };
 }
 
 export interface AcceptedGoalDestination {

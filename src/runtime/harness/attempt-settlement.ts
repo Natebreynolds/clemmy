@@ -451,6 +451,30 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 /**
+ * Production capability adapters return provider reads through this exact,
+ * host-owned carrier. The provider envelope is one level below the carrier:
+ *
+ *   { result: { successful, error, data, ... }, complete: true }
+ *
+ * Keep the recognition deliberately closed. `complete:true` is coverage, not
+ * success, and an arbitrary business payload containing `result.successful`
+ * must not be able to mint a successful settlement. Whole-wrapper
+ * contradiction inspection still runs below before any success is retained.
+ */
+function completedAdapterProviderEnvelope(
+  envelope: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const keys = Object.keys(envelope);
+  if (
+    envelope.complete !== true
+    || keys.length !== 2
+    || !Object.prototype.hasOwnProperty.call(envelope, 'complete')
+    || !Object.prototype.hasOwnProperty.call(envelope, 'result')
+  ) return null;
+  return record(envelope.result);
+}
+
+/**
  * Pull machine-readable facts out of a returned envelope.
  *
  * Only fields that carry their own meaning are read — a boolean that says
@@ -469,25 +493,35 @@ function signalsFromResult(result: unknown): AttemptSignals {
   }
 
   const signals: AttemptSignals = { ...typed };
-  const successful = envelope.successful ?? envelope.success ?? envelope.ok;
+  const structuralEnvelope = completedAdapterProviderEnvelope(envelope) ?? envelope;
+  const successful = structuralEnvelope.successful
+    ?? structuralEnvelope.success
+    ?? structuralEnvelope.ok;
   if (typeof successful === 'boolean') signals.envelopeSuccessful = successful;
-  if (typeof envelope.isError === 'boolean') signals.providerReportedError = envelope.isError;
+  if (typeof structuralEnvelope.isError === 'boolean') {
+    signals.providerReportedError = structuralEnvelope.isError;
+  }
 
   // Providers routinely nest the transport status under the payload. A 400
   // reported that way is still a repairable argument error, not a dead
   // capability — reading only the top level turned every one of them into
   // "this tool cannot do that" and sent the task hunting for a replacement.
-  const nested = record(envelope.data) ?? record(envelope.error) ?? null;
+  const nested = record(structuralEnvelope.data) ?? record(structuralEnvelope.error) ?? null;
   const status = numericStatus(
-    envelope.status ?? envelope.statusCode ?? envelope.status_code
+    structuralEnvelope.status ?? structuralEnvelope.statusCode ?? structuralEnvelope.status_code
     ?? nested?.status ?? nested?.statusCode ?? nested?.status_code,
   );
   if (status !== undefined) signals.httpStatus = status;
 
-  const code = envelope.error_code ?? envelope.errorCode ?? envelope.code;
+  const code = structuralEnvelope.error_code
+    ?? structuralEnvelope.errorCode
+    ?? structuralEnvelope.code;
   if (typeof code === 'string' || typeof code === 'number') signals.envelopeErrorCode = code;
 
-  const data = envelope.data ?? envelope.result ?? envelope.items ?? envelope.results;
+  const data = structuralEnvelope.data
+    ?? structuralEnvelope.result
+    ?? structuralEnvelope.items
+    ?? structuralEnvelope.results;
   if (Array.isArray(data) && data.length === 0) signals.emptyResult = true;
   else if (record(data) && Object.keys(record(data)!).length === 0) signals.emptyResult = true;
 

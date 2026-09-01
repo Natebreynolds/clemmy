@@ -1,4 +1,5 @@
 import type { Runner } from '@openai/agents';
+import { randomUUID } from 'node:crypto';
 import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
@@ -22,6 +23,7 @@ import {
   settledReadRepeatReplayDisposition,
   stripSettledReadHarnessAdvisory,
 } from './settled-read-repeat.js';
+import { satisfyObservedConnectionDependencyForContinuation } from './dependency-request.js';
 
 /**
  * RunHooks → event log writer.
@@ -527,16 +529,21 @@ export function attachEventLogHooks(
     // A same-source settled-read replay carries the ORIGINAL call's bounded
     // bytes for model recovery. It is not a new provider result and therefore
     // must never mint a second authoritative tool_outputs row or reflection.
+    let connectionObservationNonce: string | undefined;
     if (physicalAttemptAuthoritative
       && callId
       && authorityResultStr !== null
       && !settledReadReplay) {
       try {
+        connectionObservationNonce = effectiveToolTail(tool?.name ?? '') === 'tool_search'
+          ? randomUUID()
+          : undefined;
         writeToolOutput({
           sessionId,
           callId,
           tool: tool?.name ?? null,
           output: authorityResultStr,
+          ...(connectionObservationNonce ? { invocationNonce: connectionObservationNonce } : {}),
         });
       } catch {
         // Best-effort: a tool_outputs write failure must never block
@@ -587,8 +594,9 @@ export function attachEventLogHooks(
       }
     }
     if (key) callIdToWorkerItem.delete(key);
+    let returnedEvent: EventRow | null = null;
     try {
-      appendEvent({
+      returnedEvent = appendEvent({
         sessionId,
         turn: getTurn(runContext),
         role: agent?.name ?? 'agent',
@@ -602,6 +610,10 @@ export function attachEventLogHooks(
           accounting: 'top_level',
           topologyRole,
           effect: accounting.effect,
+          ...(connectionObservationNonce ? { invocationNonce: connectionObservationNonce } : {}),
+          ...(effectiveToolTail(tool?.name ?? '') === 'tool_search'
+            ? { ok: pairedAdmittedStart && toolOutputLooksSuccessful(resultStr) }
+            : {}),
           ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
           ...(pairedAdmittedStart
@@ -629,6 +641,18 @@ export function attachEventLogHooks(
       });
     } catch {
       // see onToolStart
+    }
+    if (
+      returnedEvent
+      && callId
+      && typeof sourceAttribution.sourceUserSeq === 'number'
+      && effectiveToolTail(tool?.name ?? '') === 'tool_search'
+    ) {
+      satisfyObservedConnectionDependencyForContinuation({
+        sessionId,
+        sourceUserSeq: sourceAttribution.sourceUserSeq,
+        returnedEventId: returnedEvent.id,
+      });
     }
     if (key) {
       activeToolCallKeys.delete(key);

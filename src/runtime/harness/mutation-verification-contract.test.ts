@@ -19,6 +19,7 @@ import {
   deriveMutationVerificationRecipe,
   projectMutationVerificationIntent,
   projectReadbackVerificationResult,
+  verifierLogicalCallAttemptId,
   type MutationVerificationRecipeV1,
 } from './mutation-verification-contract.js';
 import {
@@ -407,4 +408,20 @@ test('the node-binding digest covers the complete frozen recipe', () => {
     verifierStaticArgs: { ranges: ['A9:A9'] },
   };
   assert.notEqual(bindingDigestOf({ ...body, verification: tampered }), original);
+});
+
+test('verifier retries are bounded deterministic read generations, never new mutation owners', () => {
+  const base = `verify:create_sheet:${'a'.repeat(32)}`;
+  assert.equal(verifierLogicalCallAttemptId(base, 0), base,
+    'attempt zero preserves the frozen recipe identity');
+  const firstRetry = verifierLogicalCallAttemptId(base, 1);
+  const secondRetry = verifierLogicalCallAttemptId(base, 2);
+  assert.match(firstRetry, /^verify-retry:1:[a-f0-9]{32}$/);
+  assert.match(secondRetry, /^verify-retry:2:[a-f0-9]{32}$/);
+  assert.equal(verifierLogicalCallAttemptId(base, 1), firstRetry,
+    'restart derives the same verifier-only generation');
+  assert.notEqual(firstRetry, secondRetry);
+  assert.notEqual(firstRetry, base);
+  assert.throws(() => verifierLogicalCallAttemptId(base, -1), /ordinal is invalid/);
+  assert.throws(() => verifierLogicalCallAttemptId(base, 1.5), /ordinal is invalid/);
 });

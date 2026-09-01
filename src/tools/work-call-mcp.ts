@@ -47,6 +47,7 @@ const EXPECTED_WORK_REFUSAL_KINDS = new Set([
   'work_cardinality_mismatch',
   'work_universe_unsealed',
   'work_source_witness_missing',
+  'work_source_selection_invalid',
   'work_already_satisfied',
   'work_evidence_incomplete',
   'work_effect_already_executed',

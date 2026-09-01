@@ -79,6 +79,22 @@ import {
 import { settleResolvedCarrierRefusal } from '../runtime/harness/resolved-carrier-refusal.js';
 import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
 import {
+  prepareAsyncReadRefinementIntentBeforeAdmission,
+  recordAsyncReadRefinementIntent,
+  type PreparedAsyncReadRefinementIntentV1,
+} from '../runtime/harness/async-read-refinement-store.js';
+import {
+  AsyncReadRefinementAuthorityError,
+  executeAsyncReadRefinement,
+} from '../runtime/harness/async-read-refinement-executor.js';
+import {
+  HostDurableContinuationPendingError,
+  isHostDurableContinuationPendingError,
+} from '../runtime/harness/host-durable-continuation.js';
+import { currentDispatchLease } from '../runtime/harness/dispatch-lease.js';
+import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import { validateHostLocalWorkspaceSourceBeforeDispatch } from '../runtime/harness/host-local-workspace-derivation.js';
+import {
   classifyRuntimeToolEffect,
   unwrapRuntimeEffectiveToolIdentity,
 } from '../runtime/harness/tool-effect.js';
@@ -168,6 +184,14 @@ export const WorkCallInputSchema = z.object({
   }).strict().nullable().optional().describe(
     'ONE correction to a source-derived universe\'s memberIdPointer, allowed only after a seal refusal named the record\'s actual keys and only before any member is bound. The frozen proposal itself never changes.',
   ),
+  source_call_ids: z.array(IdSchema).length(1).nullable().optional().describe(
+    'For a dependent read refinement or write, provide exactly one model-visible function call id naming the settled source result actually used. Use null only when the frozen requirement has no source dependency. This id nominates an existing projection receipt only; it grants no dispatch authority.',
+  ),
+  source_record_ids: z.array(z.string().min(1).max(2_048)).min(1).max(64)
+    .refine((values) => new Set(values).size === values.length, 'source record ids must be unique')
+    .nullable().optional().describe(
+      'When the frozen read refinement or structured deliverable has a typed source-evidence contract, name the exact source record identities selected from the nominated result. For recent-article evidence these are canonical source URLs. Otherwise use JSON null.',
+    ),
   name: z.string().min(1).describe('Exact reachable inner tool name returned by tool_search/catalog.'),
   args_json: z.string().describe('JSON object string matching the inner tool schema.'),
 }).strict();
@@ -184,6 +208,8 @@ export const HostPlannedWorkCallInputSchema = z.object({
   universe_item_id: WorkCallInputSchema.shape.universe_item_id.optional(),
   universe_selector: WorkCallInputSchema.shape.universe_selector.optional(),
   seal_amendment: WorkCallInputSchema.shape.seal_amendment,
+  source_call_ids: WorkCallInputSchema.shape.source_call_ids,
+  source_record_ids: WorkCallInputSchema.shape.source_record_ids,
   name: WorkCallInputSchema.shape.name,
   args_json: WorkCallInputSchema.shape.args_json,
 }).strict();
@@ -228,6 +254,8 @@ export function workCallInputFromHostPlan(input: HostPlannedWorkCallInput): Work
     universe_item_id: input.universe_item_id ?? null,
     universe_selector: input.universe_selector ?? null,
     seal_amendment: input.seal_amendment ?? null,
+    source_call_ids: input.source_call_ids ?? null,
+    source_record_ids: input.source_record_ids ?? null,
     name: input.name,
     args_json: input.args_json,
   };
@@ -474,6 +502,8 @@ export function isReadComputeSemanticRefusal(
     case 'work_universe_unsealed':
     case 'work_source_witness_missing':
       return true;
+    case 'work_source_selection_invalid':
+      return false;
     case 'work_contract_conflict':
       // Only the candidate proposal disagrees. A persisted binding collision
       // (`logical call already owns a different work binding`) is durable
@@ -1109,6 +1139,8 @@ function repairLineFor(kind: ExpectedWorkAdmissionFailureKind): string {
       return 'This requirement has used its one attempt and one repair. Do not retry it. Use landed data from `plan` / `result`, continue the next open requirement, or reply with the precise blocker.';
     case 'work_universe_unsealed':
       return 'The source universe is not sealed. If the detail names the record keys, the member id pointer in the proposal does not match the source: re-issue this same work_call with seal_amendment { universe_id, member_id_pointer } set to the correct pointer — allowed ONCE, before any member is bound.';
+    case 'work_source_selection_invalid':
+      return 'No provider start or write body ran. Retry this same open requirement with source_call_ids naming exactly one result present in current accepted model history and source_record_ids naming enough exact usable records from it. When result.canonicalRecordIds is present, copy that exact bounded list into both source_record_ids and the inner batch urls. If that result cannot satisfy the frozen typed evidence detail, run one materially different bounded read, then nominate that new result and its exact records.';
     case 'work_requirement_unknown':
     case 'work_effect_mismatch':
     case 'work_cardinality_mismatch':
@@ -1126,7 +1158,8 @@ function repairableWorkInvocationShape(
     || kind === 'work_binding_required'
     || kind === 'work_requirement_unknown'
     || kind === 'work_effect_mismatch'
-    || kind === 'work_cardinality_mismatch';
+    || kind === 'work_cardinality_mismatch'
+    || kind === 'work_source_selection_invalid';
 }
 
 function refusalResult(
@@ -1147,7 +1180,7 @@ function refusalResult(
   );
 }
 
-export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'aroundResolvedDispatch' | 'resolvedRefusalLane' | 'modelVisibility'> {
+export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'aroundResolvedDispatch' | 'propagateInvocationError' | 'resolvedRefusalLane' | 'modelVisibility'> {
   /** Adapter attribution only; admission and recovery remain provider-neutral. */
   settlementLane?: SettleToolAttemptInput['lane'];
   /** Host-frozen contract for this exact accepted source, when one exists. */
@@ -1247,6 +1280,11 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   const dispatcher = buildCallTool({
     ...dispatcherOptions,
     resolvedRefusalLane: settlementLane,
+    // `executeAsyncReadRefinement` owns a private, durable continuation. Its
+    // pending signal must cross both SDK FunctionTool wrappers unchanged so
+    // the host keeps R open and schedules getter-only recovery; serializing it
+    // here would fabricate a tool result and trigger nested-settlement adoption.
+    propagateInvocationError: isHostDurableContinuationPendingError,
     aroundResolvedDispatch: async (resolved, dispatch) => {
       const frame = workCallStorage.getStore();
       const refuse = (
@@ -1403,6 +1441,101 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         return withUnboundWorkRequirement(frame.input.requirement_id, () =>
           withSourceRequirementIfKnown(sourceRequirement, dispatch));
       }
+      const preAdmissionOperation = sourceContract?.operations.find((operation) => (
+        operation.id === cardinalityBoundInput.requirement_id
+      ));
+      const effectiveTarget = unwrapRuntimeEffectiveToolIdentity(
+        resolved.targetName,
+        resolved.targetArgs,
+      );
+      let preparedAsyncRead: PreparedAsyncReadRefinementIntentV1 | null = null;
+      if (
+        sourceContract
+        && effectiveTarget.toolName === 'FIRECRAWL_BATCH_SCRAPE'
+      ) {
+        const prepared = prepareAsyncReadRefinementIntentBeforeAdmission({
+          db: openEventLog(),
+          sessionId: resolved.sessionId,
+          sourceUserSeq: resolved.sourceUserSeq as number,
+          acceptedTaskId: sourceContract.acceptedTaskId,
+          startLogicalToolCallId: resolved.logicalToolCallId,
+          requirementId: cardinalityBoundInput.requirement_id,
+          declaredSourceCallIds: cardinalityBoundInput.source_call_ids,
+          declaredSourceRecordIds: cardinalityBoundInput.source_record_ids,
+          providerOperationId: effectiveTarget.toolName,
+          providerArguments: effectiveTarget.args,
+        });
+        if (prepared.status === 'refused') {
+          frame.refusalKind = 'work_source_selection_invalid';
+          return refuse(
+            frame.refusalKind,
+            prepared.reason,
+            prepared.canonicalRecordIds
+              ? { result: { canonicalRecordIds: prepared.canonicalRecordIds } }
+              : undefined,
+          );
+        }
+        if (prepared.status !== 'prepared') {
+          frame.refusalKind = 'work_authority_unavailable';
+          return refuse(frame.refusalKind, 'batch scrape has no exact durable async-read continuation');
+        }
+        const lease = currentDispatchLease();
+        if (
+          !lease
+          || lease.sessionId !== resolved.sessionId
+          || lease.sourceUserSeq !== resolved.sourceUserSeq
+          || lease.acceptedTaskId !== sourceContract.acceptedTaskId
+          || lease.logicalToolCallId !== resolved.logicalToolCallId
+        ) {
+          frame.refusalKind = 'work_authority_unavailable';
+          return refuse(frame.refusalKind, 'batch scrape continuation has no exact host-owned call lease');
+        }
+        preparedAsyncRead = prepared.intent;
+      }
+      if (
+        resolved.targetName === 'space_save'
+        && resolvedRuntimeEffect === 'local_write'
+        && (preAdmissionOperation?.dataFrom.length ?? 0) > 0
+      ) {
+        // Source nomination lives on the outer work_call carrier, while the
+        // expected-work binding intentionally seals the resolved inner
+        // space_save contract. Prove the outer nomination BEFORE consuming a
+        // requirement attempt: otherwise a zero-crossing bad nomination and
+        // its corrected retry have byte-identical inner args, so the generic
+        // identical-repair guard would strand a repair the host explicitly
+        // requested.
+        const source = validateHostLocalWorkspaceSourceBeforeDispatch({
+          db: openEventLog(),
+          sessionId: resolved.sessionId,
+          sourceUserSeq: resolved.sourceUserSeq as number,
+          acceptedTaskId: sourceContract!.acceptedTaskId,
+          writeLogicalToolCallId: resolved.logicalToolCallId,
+          writeRequirementId: cardinalityBoundInput.requirement_id,
+          declaredSourceCallIds: cardinalityBoundInput.source_call_ids,
+          declaredSourceRecordIds: cardinalityBoundInput.source_record_ids,
+          writeArgs: resolved.targetArgs,
+          resolveSuccessfulResult(logicalToolCallId) {
+            const result = redeemSuccessfulSettlementResultForHost({
+              sessionId: resolved.sessionId,
+              sourceUserSeq: resolved.sourceUserSeq as number,
+              acceptedTaskId: sourceContract!.acceptedTaskId,
+              logicalToolCallId,
+            });
+            return result.status === 'ok'
+              ? {
+                  ok: true,
+                  rawPayload: result.value.rawPayload,
+                  toolName: result.value.toolName,
+                  executionSite: result.value.executionSite,
+                }
+              : { ok: false, reason: result.reason };
+          },
+        });
+        if (source.status !== 'verified') {
+          frame.refusalKind = 'work_source_selection_invalid';
+          return refuse(frame.refusalKind, source.reason);
+        }
+      }
       const admission = admitExpectedWorkInvocation({
         sessionId: resolved.sessionId,
         sourceUserSeq: resolved.sourceUserSeq as number,
@@ -1425,6 +1558,22 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         ...(resolved.evidenceArgs !== undefined ? { evidenceArgs: resolved.evidenceArgs } : {}),
         ...(resolved.evidenceInputSchema !== undefined
           ? { evidenceInputSchema: resolved.evidenceInputSchema }
+          : {}),
+        ...(preparedAsyncRead
+          ? {
+              recordContinuationInTransaction: ({ db, argumentDigest }: {
+                db: ReturnType<typeof openEventLog>;
+                binding: ExpectedWorkCallBinding;
+                argumentDigest: string;
+              }) => {
+                const recorded = recordAsyncReadRefinementIntent({
+                  intent: preparedAsyncRead!,
+                  startArgumentDigest: argumentDigest,
+                  db,
+                });
+                if (recorded.status === 'refused') throw new Error(recorded.reason);
+              },
+            }
           : {}),
       });
       if (admission.status === 'refused') {
@@ -1593,6 +1742,42 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         };
         return resolvedDispatchPreparedWithoutExecution();
       }
+      if (preparedAsyncRead) {
+        const lease = currentDispatchLease();
+        if (!lease) throw new AsyncReadRefinementAuthorityError('async owner call lease disappeared after admission');
+        return withExpectedWorkBinding(admission.binding, () =>
+          withSourceRequirementIfKnown(sourceRequirement, async () => {
+            const result = await executeAsyncReadRefinement({
+              sessionId: resolved.sessionId,
+              sourceUserSeq: resolved.sourceUserSeq as number,
+              acceptedTaskId: admission.contract.acceptedTaskId,
+              ownerLogicalToolCallId: resolved.logicalToolCallId!,
+              parentLease: lease,
+              ...(resolved.turn === undefined ? {} : { turn: resolved.turn }),
+              callerSignal: currentToolAbortSignal(),
+            });
+            if (result.status === 'terminal') {
+              // The immutable async owner has exhausted its bounded protocol
+              // and settled R as host-completed while explicitly continuing
+              // the research requirement. Return only the compact host-owned
+              // scope gate; raw getter bytes remain confined to child handles.
+              return result.gate;
+            }
+            if (result.status !== 'completed') {
+              if (result.status === 'pending' || result.status === 'held') {
+                throw new HostDurableContinuationPendingError(
+                  'async_read_refinement',
+                  resolved.logicalToolCallId!,
+                  result.reason,
+                );
+              }
+              throw new AsyncReadRefinementAuthorityError(result.status === 'not_applicable'
+                ? 'durable async owner disappeared after admission'
+                : result.reason);
+            }
+            return result.evidence;
+          }));
+      }
       return withExpectedWorkBinding(admission.binding, () =>
         withSourceRequirementIfKnown(sourceRequirement, dispatch));
     },
@@ -1662,6 +1847,12 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       return hostPlanningReady ? Boolean(await hostPlanningReady()) : true;
     },
     errorFunction: (_context, error) => {
+      // This is a private host scheduler signal, not a model-visible tool
+      // failure. Let the outer host invocation retain the exact open R call;
+      // converting it into the ordinary work_call refusal string makes the
+      // nested carrier try to adopt a settlement that intentionally does not
+      // exist yet.
+      if (error instanceof HostDurableContinuationPendingError) throw error;
       const detail = error instanceof Error ? error.message : String(error);
       return refusalResult('work_contract_invalid', detail) as unknown as string;
     },

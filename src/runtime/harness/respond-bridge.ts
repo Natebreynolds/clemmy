@@ -44,6 +44,7 @@ import {
   enrichAcceptedRequestWithTaskContinuity,
   inspectDurableMaterialSourceContinuation,
   mergeTurnCapabilityCandidates,
+  prepareCheckedHostClarificationAnswer,
   prepareMaterialSourceVariantRecovery,
 } from './task-continuity-runtime.js';
 import {
@@ -1404,6 +1405,14 @@ export async function respondViaHarness(
   // Caller-supplied semantic context is stripped when no valid packet exists.
   const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
   const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
+  if (hostOwnsTurn) {
+    await prepareCheckedHostClarificationAnswer({
+      sessionId: request.sessionId,
+      sourceUserSeq: sourceUserEvent.seq,
+      turn: sourceUserEvent.turn,
+      surface,
+    });
+  }
   const typedClassification = semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
     ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
     : undefined;
@@ -1412,6 +1421,16 @@ export async function respondViaHarness(
     ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
     typedClassification,
   });
+  // Keep the literal Q/B user item byte-exact. The exact durable packet and
+  // admitted visible option may mint one transient system steer; caller-
+  // supplied semantic context was stripped/rebuilt at the boundary above.
+  const verifiedMetaContinuationSteer = typedClassification
+    && 'keepOpen' in typedClassification
+    && typedClassification.metaAction
+    && request.taskContinuationResolved === true
+    && request.semanticTaskInput?.startsWith('[task-continuation-meta:v1]\n')
+    ? request.semanticTaskInput
+    : undefined;
   if (hostOwnsTurn) {
     const materialSource = inspectDurableMaterialSourceContinuation({
       sessionId,
@@ -1726,6 +1745,9 @@ export async function respondViaHarness(
       sessionId,
       input: request.message,
       ...(request.semanticTaskInput ? { semanticTaskInput: request.semanticTaskInput } : {}),
+      ...(verifiedMetaContinuationSteer
+        ? { continuationSteer: verifiedMetaContinuationSteer }
+        : {}),
       ...(request.taskContinuation ? { taskContinuation: request.taskContinuation } : {}),
       ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
       sourceUserSeq: sourceUserEvent.seq,

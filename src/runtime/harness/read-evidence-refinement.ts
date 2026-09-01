@@ -14,11 +14,10 @@
  *     entire exact finite universe, without pretending it exhausts the
  *     provider's whole source.
  *
- * `resolved_operation` deliberately remains unknown. Generic JSON Schema
- * cannot distinguish a record identifier from a parent/filter identifier,
- * nor an array of requested keys from an array-valued search filter. Schema
- * and args therefore VERIFY an already-frozen finite universe; they never
- * invent semantic coverage from field names, descriptions, or result prose.
+ * `resolved_operation` is one bounded operation observation. It deliberately
+ * promises neither point identity nor source exhaustion: generic JSON Schema
+ * cannot distinguish a record identifier from a filter. Schema and args still
+ * never invent finite-universe or complete-source coverage.
  */
 import { createHash } from 'node:crypto';
 
@@ -90,6 +89,12 @@ export type PreDispatchReadEvidenceDecision =
       requiresExhaustion: false;
       basis: 'accepted_input_member' | 'sealed_source_member';
       proof: FiniteReadStructuralProof;
+    }
+  | {
+      status: 'authoritative';
+      mode: 'collection_read';
+      requiresExhaustion: false;
+      basis: 'expected_resolved_operation';
     }
   | {
       status: 'authoritative';
@@ -406,7 +411,15 @@ export function refinePreDispatchReadEvidence(
     }
 
     if (operation.coverage === 'resolved_operation') {
-      return unknown('resolved_operation_has_no_immutable_read_shape');
+      if (operation.cardinality.kind !== 'once') {
+        return unknown('coverage_cardinality_mismatch');
+      }
+      return {
+        status: 'authoritative',
+        mode: 'collection_read',
+        requiresExhaustion: false,
+        basis: 'expected_resolved_operation',
+      };
     }
 
     if (operation.coverage === 'single' && operation.cardinality.kind === 'once') {

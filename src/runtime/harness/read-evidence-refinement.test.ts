@@ -98,7 +98,7 @@ test('provider schema bounds and caller-supplied counts never refine complete-se
   });
 });
 
-test('resolved-operation coverage cannot infer point or collection semantics from generic schema shape', () => {
+test('resolved-operation coverage proves one bounded observation without inferring exhaustion', () => {
   for (const input of [
     {
       inputSchema: { type: 'object', properties: { opaque: { type: 'string' } } },
@@ -114,10 +114,10 @@ test('resolved-operation coverage cannot infer point or collection semantics fro
     },
   ]) {
     assert.deepEqual(decide(input), {
-      status: 'unknown',
-      mode: 'unknown_read',
-      requiresExhaustion: true,
-      reason: 'resolved_operation_has_no_immutable_read_shape',
+      status: 'authoritative',
+      mode: 'collection_read',
+      requiresExhaustion: false,
+      basis: 'expected_resolved_operation',
     });
   }
 });

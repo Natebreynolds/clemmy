@@ -228,3 +228,31 @@ test('failed or malformed recovery delivery stays inactive and retryable', async
   assert.equal(malformed.activationAttempts, 0);
   assert.equal(malformed.providerCalls, 0);
 });
+
+test('restart presentation ownership auto-recovers durable lanes and holds carrier-owned lanes', async () => {
+  const durable = __test__.restartDeliveryForOwner('durable_conversation', undefined);
+  assert.ok(durable, 'desktop/mobile/API durable conversation has a restart-safe delivery port');
+  assert.deepEqual(await durable(REQUEST), {
+    status: 'delivered',
+    receipt: {
+      version: 1,
+      deliveryKey: REQUEST.deliveryKey,
+      eventId: REQUEST.eventId,
+      eventDigest: REQUEST.eventDigest,
+      surface: 'channel_message',
+      target: 'durable_conversation',
+    },
+  });
+
+  assert.equal(
+    __test__.restartDeliveryForOwner('carrier_owned', undefined),
+    undefined,
+    'a missing channel callback never silently substitutes the durable conversation lane',
+  );
+  assert.deepEqual(await __test__.recoverPlanTaskActivationFromPorts({
+    winner: () => ({ status: 'held' as const }),
+    deliveryRequest: () => REQUEST,
+    recordDelivery: () => { throw new Error('held recovery cannot record delivery'); },
+    activate: () => { throw new Error('held recovery cannot activate'); },
+  }), { status: 'delivery_required' });
+});

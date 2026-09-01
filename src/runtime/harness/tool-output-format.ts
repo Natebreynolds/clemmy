@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
 import { getToolOutputContext } from './tool-output-context.js';
-import { digestToolOutput } from './tool-output-digest.js';
+import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
@@ -107,9 +107,10 @@ export function exactToolOutputForInvocation(input: {
 
 export function truncateToolText(text: string, maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS): string {
   if (text.length <= maxChars) return text;
-  const head = text.slice(0, maxChars);
-  const dropped = text.length - maxChars;
-  return `${head}\n\n…[truncated — ${dropped.toLocaleString()} of ${text.length.toLocaleString()} chars omitted; re-call with a narrower scope (offset/limit, filter, specific query) if you need the rest]`;
+  const marker = `…[truncated — ${text.length.toLocaleString()} total chars]`;
+  if (marker.length >= maxChars) return marker.slice(0, Math.max(0, maxChars));
+  const headLength = Math.max(0, maxChars - marker.length - 2);
+  return `${text.slice(0, headLength)}\n\n${marker}`;
 }
 
 // Keys whose array value is a list of ADDRESSABLE resources the model targets
@@ -238,7 +239,34 @@ export function formatRecallableToolText(
   const withIndex = (body: string): string => (idIndex ? `${idIndex}\n\n${body}` : body);
 
   if (!sessionId || !callId || persistenceFailed) {
-    return withIndex(truncateToolText(densifyMarkdownForModelHead(text), maxChars));
+    const dense = densifyMarkdownForModelHead(text);
+    if (!idIndex) return truncateToolText(dense, maxChars);
+    const boundedIndex = truncateToolText(idIndex, Math.max(1, Math.floor(maxChars * 0.5)));
+    const bodyBudget = Math.max(1, maxChars - boundedIndex.length - 2);
+    return `${boundedIndex}\n\n${truncateToolText(dense, bodyBudget)}`;
+  }
+
+  const settlementNonce = active?.settlementNonce;
+  const exactReceipt = settlementNonce
+    ? `[exact-output-receipt:v1 nonce=${settlementNonce} sha256=${exactOutputSha256(text)}]`
+    : null;
+
+  // Keep oversized structured results as structured data. The old digest was
+  // intentionally human-readable prose, but that made downstream typed source
+  // proof impossible: JSON.parse could not recover `/news` after a huge sibling
+  // `web[0].markdown`, and appending the exact-output receipt made it invalid
+  // JSON even when the visible rows survived. Embed the host receipt inside a
+  // reserved JSON property and budget siblings fairly; exact raw bytes remain
+  // losslessly parked above and are still redeemed by nonce + digest.
+  if (exactReceipt) {
+    const structured = compactStructuredJsonToolOutput(text, {
+      maxChars,
+      toolName,
+      callId,
+      exactOutputReceipt: exactReceipt,
+      resourceIndex: idIndex || undefined,
+    });
+    if (structured) return structured;
   }
 
   // Full payload is now parked in tool_outputs (above). Replace the raw
@@ -248,9 +276,33 @@ export function formatRecallableToolText(
   // The head is computed from the DENSIFIED view for scrape-shaped payloads
   // (raw storage above is untouched) so the clipped budget carries content,
   // not image links and nav junk.
-  const compact = withIndex(digestToolOutput(densifyMarkdownForModelHead(text), { maxChars, toolName, callId }));
-  const settlementNonce = active?.settlementNonce;
-  return settlementNonce
-    ? `${compact}\n[exact-output-receipt:v1 nonce=${settlementNonce} sha256=${exactOutputSha256(text)}]`
-    : compact;
+  if (exactReceipt && exactReceipt.length > maxChars) {
+    // A caller-selected budget smaller than the non-forgeable receipt cannot
+    // carry both truth and content. Stay bounded and fail closed: without the
+    // complete receipt, exactToolOutputForInvocation will not redeem raw bytes.
+    return '…[truncated_tool_output: exact receipt exceeds configured budget]'
+      .slice(0, Math.max(0, maxChars));
+  }
+  const receiptReserve = exactReceipt ? exactReceipt.length + 1 : 0;
+  const compactBudget = Math.max(200, maxChars - receiptReserve);
+  let compact = withIndex(digestToolOutput(densifyMarkdownForModelHead(text), {
+    maxChars: compactBudget,
+    toolName,
+    callId,
+  }));
+  if (exactReceipt && compact.length > maxChars - receiptReserve) {
+    // Defensive absolute cap for non-JSON and root-array fallbacks. Preserve
+    // the exact receipt and a bounded raw-recovery instruction; never slice the
+    // receipt itself. Structure-aware object output takes the JSON path above.
+    const bodyLimit = Math.max(0, maxChars - receiptReserve);
+    const recovery = `Full output: recall_tool_result ${JSON.stringify({ call_id: callId })}`;
+    if (bodyLimit === 0) compact = '';
+    else if (recovery.length <= bodyLimit) {
+      const available = Math.max(0, bodyLimit - recovery.length - 1);
+      compact = available > 0 ? `${compact.slice(0, available)}\n${recovery}` : recovery;
+    } else {
+      compact = truncateToolText(recovery, bodyLimit);
+    }
+  }
+  return exactReceipt ? (compact ? `${compact}\n${exactReceipt}` : exactReceipt) : compact;
 }

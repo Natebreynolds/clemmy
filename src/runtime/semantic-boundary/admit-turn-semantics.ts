@@ -254,13 +254,18 @@ function clampProjection(
       : (projection.targetGoal?.baseRevision
         ?? (projection.kind === 'mint_goal' ? 0 : inheritedGoal?.baseRevision)),
     ...(openSlotFromHost(host, projection) ? { openSlot: openSlotFromHost(host, projection) } : {}),
+    ...(projection.metaAction ? { metaAction: projection.metaAction } : {}),
     ...(slot
       ? {
           slotAnswer: {
             kind: slot.kind,
             questionId: slot.questionId,
             slotKey: slot.slotKey,
-            ...(slot.kind === 'option' ? { optionId: slot.optionId } : { value: slot.value }),
+            ...(slot.kind === 'option'
+              ? { optionId: slot.optionId }
+              : slot.kind === 'value'
+                ? { value: slot.value }
+                : { optionId: slot.optionId, action: slot.action }),
           },
         }
       : {}),

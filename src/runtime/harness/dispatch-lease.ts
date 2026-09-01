@@ -261,6 +261,33 @@ export function revokeDispatchLease(lease: DispatchLeaseRef | undefined): void {
   `).run(new Date().toISOString(), lease.scopeId, lease.sessionId, lease.leaseId);
 }
 
+export const DURABLE_HOST_CONTINUATION_PENDING_REVOCATION =
+  'durable_host_continuation_pending' as const;
+
+/** Fence one generation while leaving its logical call to an exact durable
+ * continuation owner. Generic revoked-call recovery must not terminalize it. */
+export async function revokeDispatchLeaseForDurableHostContinuation(
+  lease: DispatchLeaseRef,
+): Promise<void> {
+  await withExternalWriteAdmissionLock(
+    externalWriteAdmissionKey(lease.sessionId),
+    async () => {
+      openEventLog().prepare(`
+        UPDATE run_dispatch_leases
+           SET revoked_at = COALESCE(revoked_at, ?),
+               revocation_reason = COALESCE(revocation_reason, ?)
+         WHERE scope_id = ? AND session_id = ? AND lease_id = ?
+      `).run(
+        new Date().toISOString(),
+        DURABLE_HOST_CONTINUATION_PENDING_REVOCATION,
+        lease.scopeId,
+        lease.sessionId,
+        lease.leaseId,
+      );
+    },
+  );
+}
+
 export const TERMINAL_RUN_ATTEMPT_BOOT_REVOCATION_REASON =
   'terminal_run_attempt_at_daemon_boot' as const;
 

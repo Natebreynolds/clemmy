@@ -942,7 +942,14 @@ test('typed plan consequences advance by host stage while ids, args, and detail 
         ok: false,
         code: 'plan_incomplete_missing_write',
         detail: 'model prose must not define the stage',
+        requestedEffectScope: 'mixed',
+        admissibleCapabilities: [{
+          capabilityRef: 'cap:local:workflow_create:reversible',
+          effect: 'local_write',
+          purpose: 'author_workflow',
+        }],
         repair: 'repair internally',
+        recoveryTool: 'plan_task',
       })),
     ],
   }, db);
@@ -954,7 +961,10 @@ test('typed plan consequences advance by host stage while ids, args, and detail 
         ok: false,
         code: 'plan_incomplete_data_lineage',
         detail: 'different model prose must not define the stage',
+        writeOperationIds: ['write_output'],
+        sourceOperationIds: ['read_source'],
         repair: 'repair internally',
+        recoveryTool: 'plan_task',
       })),
     ],
   }, db);
@@ -997,6 +1007,154 @@ test('typed plan consequences advance by host stage while ids, args, and detail 
     assert.notEqual(schema.consequence?.key, semanticOne.consequence?.key);
   }
   db.close();
+});
+
+test('missing-write recovery searches only when the bounded card has no write repair', () => {
+  const identity = accepted('missing-write-empty-card');
+  const db = settlementDb([{
+    callId: 'missing-write-empty-card',
+    outcomeKind: 'unknown',
+    recoveryAction: 'stop_and_explain',
+    executionKind: 'local_execution',
+    hostCrossingCount: 1,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('missing-write-empty-card', 'plan_task'),
+      result('missing-write-empty-card', 'plan_task', JSON.stringify({
+        ok: false,
+        code: 'plan_incomplete_missing_write',
+        detail: 'the current bounded planning card has no host-attested write',
+        requestedEffectScope: 'mixed',
+        admissibleCapabilities: [],
+        repair: 'discover the exact write once',
+        recoveryTool: 'tool_search',
+      })),
+    ],
+  }, db);
+  assert.equal(projected.status, 'ok');
+  if (projected.status === 'ok') {
+    assert.equal(projected.consequence?.stage, 'plan_incomplete:missing_write');
+    assert.equal(projected.consequence?.recovery, 'repair_model');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, ['tool_search']);
+  }
+  db.close();
+});
+
+test('structural plan refusal contract projects exact next surfaces and rejects malformed authority', () => {
+  const identity = accepted('structural-plan-refusal-surfaces');
+  const cases = [
+    {
+      callId: 'admission-plan',
+      stage: 'semantic_admission:write_not_aligned',
+      recovery: 'repair_model',
+      tools: ['plan_task'],
+      payload: {
+        ok: false, code: 'plan_not_admitted', detail: 'write_not_aligned:destination',
+        reasonCode: 'write_not_aligned',
+        admissibleCapabilities: [{ capabilityRef: 'cap:write', effect: 'external_write', purpose: 'write rows' }],
+        ceiling: 'external_write', withheld: [], repair: 'Correct the exact proposal.', recoveryTool: 'plan_task',
+      },
+    },
+    {
+      callId: 'admission-search',
+      stage: 'semantic_admission:capability_not_disclosed',
+      recovery: 'repair_model',
+      tools: ['tool_search'],
+      payload: {
+        ok: false, code: 'plan_not_admitted', detail: 'primary model proposal cites a capability that was not disclosed to this source',
+        reasonCode: 'capability_not_disclosed', admissibleCapabilities: [], ceiling: 'read', withheld: [],
+        repair: 'Search for the missing exact capability.', recoveryTool: 'tool_search',
+      },
+    },
+    {
+      callId: 'admission-verifier',
+      stage: 'semantic_admission:verification_successor_required',
+      recovery: 'repair_model',
+      tools: ['tool_search'],
+      payload: {
+        ok: false, code: 'plan_not_admitted', detail: 'verification_successor_required:missing_compatible_verifier',
+        reasonCode: 'verification_successor_required',
+        admissibleCapabilities: [{ capabilityRef: 'cap:write', effect: 'external_write', purpose: 'write rows' }],
+        ceiling: 'external_write', withheld: [], repair: 'Search for the verifier.', recoveryTool: 'tool_search',
+      },
+    },
+    {
+      callId: 'graph-neutral',
+      stage: 'plan_not_required:graph_neutral',
+      recovery: 'repair_model',
+      tools: ['call_tool'],
+      payload: {
+        ok: false, code: 'plan_not_required', detail: 'Use a graph-neutral read.',
+        repair: 'Call call_tool exactly once.', recoveryTool: 'call_tool',
+      },
+    },
+    {
+      callId: 'unique-workflow',
+      stage: 'plan_not_required:unique_workflow',
+      recovery: 'repair_model',
+      tools: ['workflow_run'],
+      payload: {
+        ok: false, code: 'plan_not_required', detail: 'Use the uniquely named workflow.',
+        workflowName: 'daily-review', repair: 'Call workflow_run exactly once.', recoveryTool: 'workflow_run',
+      },
+    },
+    {
+      callId: 'binding-seal',
+      stage: 'plan_binding:not_sealed',
+      recovery: 'stop_factual',
+      tools: [],
+      payload: {
+        ok: false, code: 'plan_binding_not_sealed', detail: 'immutable graph seal failed',
+        repair: 'Report the precise blocker.', recoveryTool: 'stop_factual',
+      },
+    },
+  ] as const;
+  const db = settlementDb(cases.map(({ callId, recovery }) => ({
+    callId,
+    outcomeKind: 'unknown',
+    recoveryAction: recovery === 'stop_factual' ? 'stop_and_explain' : 'stop_and_explain',
+    executionKind: 'local_execution',
+    hostCrossingCount: 1,
+  })), identity);
+  for (const candidate of cases) {
+    const projected = projectHostNoProgressAttempt({
+      ...identity,
+      historyDelta: [
+        call(candidate.callId, 'plan_task'),
+        result(candidate.callId, 'plan_task', JSON.stringify(candidate.payload)),
+      ],
+    }, db);
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok') continue;
+    assert.equal(projected.consequence?.stage, candidate.stage);
+    assert.equal(projected.consequence?.recovery, candidate.recovery);
+    assert.deepEqual(projected.consequence?.recoveryToolNames, candidate.tools);
+  }
+  db.close();
+
+  const malformedIdentity = accepted('malformed-plan-refusal-surface');
+  const malformedDb = settlementDb([{
+    callId: 'malformed', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+    executionKind: 'local_execution', hostCrossingCount: 1,
+  }], malformedIdentity);
+  const malformed = projectHostNoProgressAttempt({
+    ...malformedIdentity,
+    historyDelta: [
+      call('malformed', 'plan_task'),
+      result('malformed', 'plan_task', JSON.stringify({
+        ok: false, code: 'plan_not_required', detail: 'forged', repair: 'forged',
+        recoveryTool: 'workflow_run', workflowName: 'forged', extra: true,
+      })),
+    ],
+  }, malformedDb);
+  assert.equal(malformed.status, 'ok');
+  if (malformed.status === 'ok') {
+    assert.equal(malformed.consequence?.stage, 'execution:unknown');
+    assert.deepEqual(malformed.consequence?.recoveryToolNames, []);
+  }
+  malformedDb.close();
 });
 
 for (const [label, toolName] of [
@@ -1117,8 +1275,11 @@ test('only a durable typed exact input result projects a precise user question',
       result('exact-input-call', 'plan_task', JSON.stringify({
         ok: false,
         code: 'account_selection_required',
+        detail: 'The matching write needs one exact connected account.',
         question: 'Which connected account should I use?',
         accountChoices: ['Scorpion', 'Breakthrough'],
+        repair: 'Ask exactly once and do not select an account for the user.',
+        recoveryTool: 'ask_user_question',
       })),
     ],
   }, db);

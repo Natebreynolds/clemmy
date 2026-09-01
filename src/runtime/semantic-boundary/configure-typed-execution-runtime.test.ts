@@ -611,6 +611,44 @@ test('scoped readiness refresh never forgets an unrelated stale entry outside it
     'the residue is still correctly refused for a call that actually needs it — scoping never launders staleness');
 });
 
+test('one scoped refresh refusal cannot poison an unrelated ready capability', () => {
+  resetRuntime();
+  configureTypedExecutionRuntime();
+  const store = peekCapabilityManifestStore();
+  assert.ok(store);
+  const factory = peekHostCapabilityCatalogFactory();
+  assert.ok(factory);
+
+  const readyB = provisionedReadManifest('cap:scoped-ready-b:v1');
+  assert.equal(store.install(readyB).ok, true);
+  observeAndRegister(readyB);
+  refreshTypedExecutionReadiness([readyB.manifestId]);
+  assert.equal(typedExecutionCatalogReady([readyB.manifestId]), true);
+  const exactB = factory.get(readyB.manifestId);
+  assert.ok(exactB);
+
+  // A fails only AFTER B is already live. The next B readiness read must not
+  // need a compensating B refresh, and A's refusal must not mutate B's exact
+  // factory entry as a side effect.
+  const failedA = provisionedReadManifest('cap:scoped-failed-a:v1');
+  assert.equal(store.install(failedA).ok, true);
+  refreshTypedExecutionReadiness([failedA.manifestId]);
+  assert.equal(typedExecutionCatalogReady([failedA.manifestId]), false);
+
+  assert.equal(
+    typedExecutionCatalogReady([readyB.manifestId]),
+    true,
+    'A-scoped carried refusals must be invisible to an already-ready B without refreshing B',
+  );
+  assert.equal(factory.get(readyB.manifestId), exactB,
+    'a failed A refresh must not replace or forget B in the shared catalog factory');
+  assert.equal(
+    typedExecutionCatalogReady([failedA.manifestId]),
+    false,
+    'isolating B must not launder A into readiness',
+  );
+});
+
 /**
  * Direction pins for the same scoping change: narrowing WHO readiness
  * inspects must never narrow WHAT it demands from the thing actually asked

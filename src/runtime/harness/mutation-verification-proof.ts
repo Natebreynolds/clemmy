@@ -14,6 +14,7 @@ import {
   setVerificationPointer,
   verificationTargetDigest,
   verifierLogicalCallId,
+  verifierLogicalCallAttemptId,
   type CanonicalRangeValuesV1,
   type MutationVerificationRecipeV1,
 } from './mutation-verification-contract.js';
@@ -53,6 +54,8 @@ export interface VerifiedFrozenMutationVerificationV1
   verifierResultHandleId: string;
   verifierResultSha256: string;
 }
+
+export const MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS = 3;
 
 export type FrozenMutationVerificationPreparation =
   | { status: 'prepared'; verification: PreparedFrozenMutationVerificationV1 }
@@ -309,65 +312,76 @@ export function proveFrozenMutationVerification(input: {
     proof.verifierArgs,
   );
   if (!logicalContract) return { status: 'unverified', reason: 'verifier logical contract is unsafe' };
-  const hostBinding = loadHostCallCapabilityBinding({
-    db: openEventLog(),
-    sessionId: input.sessionId,
-    sourceUserSeq: input.sourceUserSeq,
-    logicalToolCallId: proof.verifierLogicalCallId,
-  });
-  if (
-    hostBinding.status !== 'ok'
-    || hostBinding.binding.acceptedTaskId !== proof.recipe.acceptedTaskId
-    || hostBinding.binding.toolName !== logicalContract.toolName
-    || hostBinding.binding.effectiveArgumentDigest !== logicalContract.argumentDigest
-    || hostBinding.binding.effect !== 'read'
-    || hostBinding.binding.bindingKind !== 'catalog_manifest'
-    || hostBinding.binding.capabilityId !== proof.recipe.verifier.capabilityId
-    || hostBinding.binding.schemaFingerprint !== proof.recipe.verifier.schemaDigest
-    || hostBinding.binding.accountId !== proof.recipe.verifier.account
-    || hostBinding.binding.invokePortId !== proof.recipe.verifier.invokePortId
-    || hostBinding.binding.operationId !== proof.recipe.verifier.operationId
-    || hostBinding.binding.manifestId !== proof.recipe.verifier.manifestId
-    || hostBinding.binding.manifestDigest !== proof.recipe.verifier.manifestDigest
-  ) return { status: 'unverified', reason: 'verifier capability receipt is missing or changed' };
-  const redeemed = redeemSuccessfulSettlementResultForHost({
-    sessionId: input.sessionId,
-    sourceUserSeq: input.sourceUserSeq,
-    acceptedTaskId: proof.recipe.acceptedTaskId,
-    logicalToolCallId: proof.verifierLogicalCallId,
-  });
-  if (redeemed.status !== 'ok') {
-    return { status: 'unverified', reason: `verifier result is ${redeemed.status}: ${redeemed.reason}` };
+  let lastReason = 'verifier capability receipt is missing or changed';
+  for (let ordinal = 0; ordinal < MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS; ordinal += 1) {
+    const logicalCallId = verifierLogicalCallAttemptId(proof.verifierLogicalCallId, ordinal);
+    const hostBinding = loadHostCallCapabilityBinding({
+      db: openEventLog(),
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      logicalToolCallId: logicalCallId,
+    });
+    if (
+      hostBinding.status !== 'ok'
+      || hostBinding.binding.acceptedTaskId !== proof.recipe.acceptedTaskId
+      || hostBinding.binding.toolName !== logicalContract.toolName
+      || hostBinding.binding.effectiveArgumentDigest !== logicalContract.argumentDigest
+      || hostBinding.binding.effect !== 'read'
+      || hostBinding.binding.bindingKind !== 'catalog_manifest'
+      || hostBinding.binding.capabilityId !== proof.recipe.verifier.capabilityId
+      || hostBinding.binding.schemaFingerprint !== proof.recipe.verifier.schemaDigest
+      || hostBinding.binding.accountId !== proof.recipe.verifier.account
+      || hostBinding.binding.invokePortId !== proof.recipe.verifier.invokePortId
+      || hostBinding.binding.operationId !== proof.recipe.verifier.operationId
+      || hostBinding.binding.manifestId !== proof.recipe.verifier.manifestId
+      || hostBinding.binding.manifestDigest !== proof.recipe.verifier.manifestDigest
+    ) continue;
+    const redeemed = redeemSuccessfulSettlementResultForHost({
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: proof.recipe.acceptedTaskId,
+      logicalToolCallId: logicalCallId,
+    });
+    if (redeemed.status !== 'ok') {
+      lastReason = `verifier result is ${redeemed.status}: ${redeemed.reason}`;
+      continue;
+    }
+    if (redeemed.value.toolName !== logicalContract.toolName) {
+      lastReason = 'verifier result belongs to a different operation';
+      continue;
+    }
+    const projected = projectReadbackVerificationResult({
+      contract: proof.recipe.verifierContract,
+      providerArguments: proof.verifierArgs,
+      authoritativeResult: exactProviderDataPayload(redeemed.value.rawPayload),
+      requireContent: proof.recipe.proof === 'exact_content_v1',
+      providerAcknowledged: exactProviderDataEnvelopeAcknowledged(redeemed.value.rawPayload),
+    });
+    if (!projected.ok) {
+      lastReason = projected.reason;
+      continue;
+    }
+    if (projected.resourceId !== proof.resourceId) {
+      lastReason = 'verified resource id changed during re-proof';
+      continue;
+    }
+    if (
+      proof.recipe.proof === 'exact_content_v1'
+      && !exactVerificationContentMatches(proof.expectedContent, projected.observedContent)
+    ) {
+      lastReason = 'readback content does not equal the exact mutation intent';
+      continue;
+    }
+    return {
+      status: 'verified',
+      ...proof,
+      verifierLogicalCallId: logicalCallId,
+      verifierPhysicalDispatchId: redeemed.value.physicalDispatchId,
+      verifierResultHandleId: redeemed.value.resultHandleId,
+      verifierResultSha256: redeemed.value.rawPayloadSha256,
+    };
   }
-  if (redeemed.value.toolName !== logicalContract.toolName) {
-    return { status: 'unverified', reason: 'verifier result belongs to a different operation' };
-  }
-  const projected = projectReadbackVerificationResult({
-    contract: proof.recipe.verifierContract,
-    providerArguments: proof.verifierArgs,
-    authoritativeResult: exactProviderDataPayload(redeemed.value.rawPayload),
-    requireContent: proof.recipe.proof === 'exact_content_v1',
-    providerAcknowledged: exactProviderDataEnvelopeAcknowledged(redeemed.value.rawPayload),
-  });
-  if (!projected.ok) return { status: 'unverified', reason: projected.reason };
-  if (projected.resourceId !== proof.resourceId) {
-    return { status: 'unverified', reason: 'verified resource id changed during re-proof' };
-  }
-  if (
-    proof.recipe.proof === 'exact_content_v1'
-    && !exactVerificationContentMatches(proof.expectedContent, projected.observedContent)
-  ) return { status: 'unverified', reason: 'readback content does not equal the exact mutation intent' };
-  if (proof.recipe.proof === 'resource_identity_v1' && projected.observedContent !== null) {
-    // Extra provider content is harmless, but identity proof remains identity
-    // proof; it never gets promoted into content authority.
-  }
-  return {
-    status: 'verified',
-    ...proof,
-    verifierPhysicalDispatchId: redeemed.value.physicalDispatchId,
-    verifierResultHandleId: redeemed.value.resultHandleId,
-    verifierResultSha256: redeemed.value.rawPayloadSha256,
-  };
+  return { status: 'unverified', reason: lastReason };
 }
 
 /**
