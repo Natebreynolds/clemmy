@@ -57,8 +57,10 @@ import { registerSessionTools } from './session-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerVaultTools } from './vault-tools.js';
 import {
+  describeInvalidToolInput,
   ensureToolDirectories,
   isInvalidArgumentsTextResult,
+  isSdkToolInputValidationError,
   textResult,
 } from './shared.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
@@ -310,46 +312,51 @@ function captureLocalTools(): CapturedLocalTool[] {
   return captured;
 }
 
+// The repair-text renderer moved beside the nominal SDK detector in ./shared.js
+// so the shell, carrier and provider surfaces render the identical guidance;
+// re-exported here for the existing local-surface callers.
+export { describeInvalidToolInput };
+
 /**
- * Actionable guidance for an input-validation failure on the local tool
- * surface. The SDK default ("Invalid JSON input for tool") names nothing the
- * model can correct — observed live (proof workspace-build, 2026-07-27): three
- * blind space_save retries with large payloads, then a silently degraded
- * static deliverable. Name the violated paths and point at the schema so the
- * next retry is a corrected retry, not a guess.
+ * The SDK returns an errorFunction's value AS the tool result, so this is the
+ * only boundary where "validation refused before execute" can keep its
+ * identity. A plain string here loses it: the bracket wrapper derives no typed
+ * signal, and the host settles the laundered text as a returned local
+ * execution — `succeeded`, with a host crossing and a result handle (live
+ * 2026-08-31 end-of-day: task_list priority:"null" → 'succeeded'/'nominal').
+ * The nominal carrier keeps the identical model-facing bytes and lets every
+ * lane settle invalid_arguments/refused_pre_dispatch without reading prose.
  */
-export function describeInvalidToolInput(error: unknown, toolName: string): string | null {
-  if (!error || typeof error !== 'object') return null;
-  if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
-  const original = (error as { originalError?: unknown }).originalError;
-  const rawIssues = original && typeof original === 'object'
-    ? (original as { issues?: unknown }).issues
-    : undefined;
-  const issues = Array.isArray(rawIssues)
-    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, 5).map((issue) => {
-        const path = Array.isArray(issue.path) && issue.path.length > 0 ? issue.path.join('.') : '(root)';
-        return `${path}: ${String(issue.message ?? 'invalid')}`;
-      })
-    : [];
-  const cause = issues.length > 0
-    ? ` — ${issues.join('; ')}`
-    : ' — the input was not parseable JSON (rebuild the arguments as ONE compact JSON object; escape embedded quotes/newlines once, not twice)';
-  return `The arguments for ${toolName} did not match its schema${cause}. `
-    + `Call tool_search with the exact query "${toolName}" to get the full input schema, then retry once with corrected arguments.`;
+/** The SDK types errorFunction as string-returning but forwards its value to
+ * the model/wrapper unchanged; the composio and work_call surfaces return the
+ * same nominal carrier through the same cast. */
+type SdkStringErrorFunction = (runContext: unknown, error: unknown) => Promise<string>;
+
+function invalidLocalToolInputResult(
+  error: unknown,
+  text: string,
+): string | InvalidArgumentsPreDispatchResult {
+  return isSdkToolInputValidationError(error)
+    ? new InvalidArgumentsPreDispatchResult(text)
+    : text;
 }
 
 /** Error handler for every local runtime tool. Non-input errors keep the exact
  * SDK default text (downstream failure detection keys on that prefix);
- * input-validation errors append schema guidance, and memory_remember keeps
- * its narrow required-prefix recovery. */
+ * input-validation errors append schema guidance and ride the nominal
+ * invalid-arguments carrier (same bytes in `.output`), and memory_remember
+ * keeps its narrow required-prefix recovery. */
 export function buildLocalToolErrorFunction(
   localTool: CapturedLocalTool,
-): (runContext: unknown, error: unknown) => Promise<string> {
-  return async (runContext: unknown, error: unknown): Promise<string> => {
+): (runContext: unknown, error: unknown) => Promise<string | InvalidArgumentsPreDispatchResult> {
+  return async (runContext: unknown, error: unknown): Promise<string | InvalidArgumentsPreDispatchResult> => {
     if (localTool.name === 'memory_remember') {
       const recovered = recoverMemoryRememberRequiredPrefix(error);
       if (!recovered) {
-        return 'memory_remember input was invalid. Retry once with only the required kind and content fields; omit optional graph annotations.';
+        return invalidLocalToolInputResult(
+          error,
+          'memory_remember input was invalid. Retry once with only the required kind and content fields; omit optional graph annotations.',
+        );
       }
       const details = error && typeof error === 'object'
         ? (error as { toolInvocation?: { details?: unknown } }).toolInvocation?.details
@@ -365,7 +372,7 @@ export function buildLocalToolErrorFunction(
     const details = error instanceof Error ? error.toString() : String(error);
     const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
     const guidance = describeInvalidToolInput(error, localTool.name);
-    return guidance ? `${base}\n${guidance}` : base;
+    return invalidLocalToolInputResult(error, guidance ? `${base}\n${guidance}` : base);
   };
 }
 
@@ -388,7 +395,7 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
     // Input-validation failures return the violated paths + a tool_search
     // pointer (see buildLocalToolErrorFunction); execution errors keep the
     // SDK's default text; memory_remember keeps its required-prefix recovery.
-    errorFunction: buildLocalToolErrorFunction(localTool),
+    errorFunction: buildLocalToolErrorFunction(localTool) as unknown as SdkStringErrorFunction,
   });
 }
 
@@ -423,13 +430,30 @@ function localToolToDeferredDispatchTool(localTool: CapturedLocalTool): Tool<Run
       isDestructive: () => Boolean(localTool.approvalRequired),
     }),
     execute: async (input, runContext, details) => {
-      const parsed = canonicalParameters.parse(input) as Record<string, unknown>;
+      const parsed = canonicalParameters.safeParse(input);
+      if (!parsed.success) {
+        // The envelope schema above admits any object, so the canonical
+        // deferred schema is this lane's real validation boundary. A thrown
+        // ZodError would reach errorFunction without the SDK's nominal class
+        // and be laundered into an execution-error string; refuse here with
+        // the same carrier and the same bytes the first-class lane returns.
+        const guidance = describeInvalidToolInput(
+          { name: 'InvalidToolInputError', originalError: parsed.error },
+          localTool.name,
+        );
+        return new InvalidArgumentsPreDispatchResult(
+          'An error occurred while running the tool. Please try again. '
+          + 'Error: InvalidToolInputError: Invalid JSON input for tool'
+          + (guidance ? `\n${guidance}` : ''),
+        );
+      }
+      const canonical = parsed.data as Record<string, unknown>;
       return withToolOutputContext(
         toolOutputContextFromSdk(localTool.name, runContext, details),
-        async () => resultToText(await localTool.handler(parsed)),
+        async () => resultToText(await localTool.handler(canonical)),
       );
     },
-    errorFunction: buildLocalToolErrorFunction(localTool),
+    errorFunction: buildLocalToolErrorFunction(localTool) as unknown as SdkStringErrorFunction,
   });
 }
 

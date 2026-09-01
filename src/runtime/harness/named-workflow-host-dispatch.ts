@@ -14,7 +14,7 @@ import {
   validateExistingWorkflowAuthority,
   type ExistingWorkflowAuthorityV1,
 } from './existing-workflow-authority.js';
-import { listEvents } from './eventlog.js';
+import { getSession, listEvents } from './eventlog.js';
 import {
   requestsWorkflowExecution,
   uniqueEnabledWorkflowMatch,
@@ -138,6 +138,35 @@ function consumedWorkflowNameCorrection(input: {
   return corrected;
 }
 
+/**
+ * Is this accepted source a workflow's OWN step, rather than someone asking
+ * for a workflow?
+ *
+ * A step's model turn runs on the same host engine as chat, and its accepted
+ * source is the runner's own step message: "Workflow: <name>\nStep: <id>" over
+ * a prompt that legitimately says "run" (the output-contract line, a learned
+ * pin) and names the workflow itself. That text is the step's WORK. Reading it
+ * as a request queued a sibling run of the same workflow — or, when the reply
+ * target could not bind, ended the step with the block message as its output
+ * (live 2026-08-31: five of eight enabled workflows). The class is durable on
+ * the source, so it is decided there and never from the text: the step
+ * session is kind 'workflow' and carries the deterministic `workflow:` id,
+ * and the exact accepted event carries the run/step identity the runner wrote.
+ * Chat and the cron/background 'execution' surfaces stay open — their
+ * accepted text was authored for a user.
+ */
+export function acceptedSourceIsWorkflowInternal(sessionId: string, sourceUserSeq: number): boolean {
+  if (sessionId.startsWith('workflow:')) return true;
+  if (getSession(sessionId)?.kind === 'workflow') return true;
+  const accepted = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === sourceUserSeq);
+  return typeof accepted?.data.workflowRunId === 'string'
+    || typeof accepted?.data.stepId === 'string';
+}
+
 export function tryHostDispatchNamedWorkflow(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -147,6 +176,11 @@ export function tryHostDispatchNamedWorkflow(input: {
 }): NamedWorkflowHostDispatchResult {
   if (input.route === 'retrieve' || input.route === 'direct_reply') {
     return { status: 'not_applicable', reason: 'compiled_route_is_not_act' };
+  }
+  // Decided before any lexical match or clarification correction: a step's
+  // own text can never manufacture RUN authority over its own workflow.
+  if (acceptedSourceIsWorkflowInternal(input.sessionId, input.sourceUserSeq)) {
+    return { status: 'not_applicable', reason: 'accepted_source_is_workflow_internal' };
   }
   const unique = uniqueWorkflowRunRequest(
     input.userText,
