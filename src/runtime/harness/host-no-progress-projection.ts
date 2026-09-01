@@ -494,24 +494,61 @@ function functionResultText(item: unknown): string | null {
   return null;
 }
 
-function refusedPreDispatch(item: unknown): boolean {
+/** Host-authored repair keys are hex digests (or a bounded prefix of one);
+ * anything else on the marker is ignored, never a stage input. */
+const REPAIR_KEY_RE = /^[a-f0-9]{16,64}$/;
+
+interface RefusedPreDispatchMarker {
+  repairKey?: string;
+}
+
+/** Read the exact host disposition marker for a pre-dispatch refusal. Only
+ * protocol, disposition, and the host-authored `repairKey` participate; the
+ * free-text diagnostic is never an input. */
+function refusedPreDispatchMarker(item: unknown): RefusedPreDispatchMarker | null {
   const text = functionResultText(item);
-  if (!text) return false;
+  if (!text) return null;
   try {
     const parsed = record(JSON.parse(text));
-    return parsed?.protocol === HOST_TOOL_DISPOSITION_PROTOCOL
-      && parsed.disposition === 'refused_pre_dispatch';
+    if (
+      parsed?.protocol !== HOST_TOOL_DISPOSITION_PROTOCOL
+      || parsed.disposition !== 'refused_pre_dispatch'
+    ) return null;
+    return typeof parsed.repairKey === 'string' && REPAIR_KEY_RE.test(parsed.repairKey)
+      ? { repairKey: parsed.repairKey }
+      : {};
   } catch {
-    return false;
+    return null;
   }
 }
 
-function refusedPreDispatchCallIds(history: readonly unknown[]): Set<string> {
-  return new Set(history.flatMap((item) => {
-    if (!refusedPreDispatch(item)) return [];
+function refusedPreDispatch(item: unknown): boolean {
+  return refusedPreDispatchMarker(item) !== null;
+}
+
+function refusedPreDispatchMarkersByCallId(
+  history: readonly unknown[],
+): Map<string, RefusedPreDispatchMarker> {
+  const markers = new Map<string, RefusedPreDispatchMarker>();
+  for (const item of history) {
+    const marker = refusedPreDispatchMarker(item);
+    if (!marker) continue;
     const callId = nonEmptyString(record(item)?.callId);
-    return callId ? [callId] : [];
-  }));
+    if (callId) markers.set(callId, marker);
+  }
+  return markers;
+}
+
+/**
+ * Stage for a pre-dispatch schema refusal keyed on the host-authored repair
+ * material. A NEW failing-path set is a new stage (bounded structural
+ * progress for the governor); a byte-identical repeat re-enters the seen key.
+ * Bounded: at most 8 distinct 16-char prefixes joined with '.' (< 192 chars
+ * and inside the governor's stage-token alphabet `[A-Za-z0-9:._/-]`).
+ */
+function schemaInvalidStage(repairKeys: readonly string[]): string {
+  const prefixes = [...new Set(repairKeys.map((key) => key.slice(0, 16)))].sort().slice(0, 8);
+  return `schema_invalid:${prefixes.join('.')}`;
 }
 
 interface HistoryCall {
@@ -562,6 +599,9 @@ interface NoProgressSettlementRow extends UnknownRow {
   requires_reconciliation: number;
   physical_crossing_count: number;
   host_crossing_count: number | null;
+  /** Bounded host-owned outcome detail; `validation:<hex>` carries the
+   * repair key for a schema refusal settled on the preparation path. */
+  outcome_detail: string | null;
 }
 
 function callForSettlement(
@@ -798,11 +838,17 @@ function settlementConsequence(input: {
     && (settlement.host_crossing_count ?? 0) === 0;
   const effectState = notStarted ? 'not_started' : 'known_terminal';
   switch (settlement.outcome_kind) {
-    case 'invalid_arguments':
+    case 'invalid_arguments': {
+      // A host-authored repair key in the bounded outcome detail keys the
+      // stage on the failing-path set; without one the stage is unchanged.
+      const repairKey = /^validation:([a-f0-9]{16,64})$/.exec(settlement.outcome_detail ?? '')?.[1];
       return createNoProgressConsequence({
-        stage: 'schema_invalid', recovery: 'repair_model', effectState,
+        stage: repairKey ? schemaInvalidStage([repairKey]) : 'schema_invalid',
+        recovery: 'repair_model',
+        effectState,
         recoveryToolNames: [call.name],
       });
+    }
     case 'transient':
       return createNoProgressConsequence({
         stage: 'execution:transient',
@@ -863,7 +909,8 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
       SELECT logical_tool_call_id, observer_call_id, execution_kind,
              outcome_kind, recovery_action, business_call, mutating,
              requires_reconciliation, physical_crossing_count,
-             COALESCE(host_crossing_count, 0) AS host_crossing_count
+             COALESCE(host_crossing_count, 0) AS host_crossing_count,
+             outcome_detail
         FROM logical_call_settlements
        WHERE session_id = ? AND source_user_seq = ?
     `, [identity.sessionId, identity.sourceUserSeq]);
@@ -917,17 +964,25 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
     ))) return { status: 'ok', attemptClass: 'task_work' };
 
     if (input.historyDelta.some(refusedPreDispatch)) {
-      const refusedCallIds = refusedPreDispatchCallIds(input.historyDelta);
+      const refusedMarkers = refusedPreDispatchMarkersByCallId(input.historyDelta);
+      const refusedCalls = calls.filter((call) => refusedMarkers.has(call.callId));
+      const repairKeys = refusedCalls.map((call) => refusedMarkers.get(call.callId)?.repairKey);
+      // Every refused call carrying a host-authored repair key means the
+      // frame was refused for its argument shape; key the stage on that
+      // material so a genuinely new repair registers as progress while the
+      // recovery surface (the refused carriers only) is unchanged.
+      const schemaKeyed = refusedCalls.length > 0
+        && repairKeys.every((key): key is string => typeof key === 'string');
       return {
         status: 'ok',
         attemptClass: 'zero_crossing_repair',
         consequence: createNoProgressConsequence({
-          stage: 'host_disposition:refused_pre_dispatch',
+          stage: schemaKeyed
+            ? schemaInvalidStage(repairKeys as string[])
+            : 'host_disposition:refused_pre_dispatch',
           recovery: 'repair_model',
           effectState: 'not_started',
-          recoveryToolNames: calls
-            .filter((call) => refusedCallIds.has(call.callId))
-            .map((call) => call.name),
+          recoveryToolNames: refusedCalls.map((call) => call.name),
         }),
       };
     }

@@ -32,6 +32,11 @@ export interface HostToolDispositionOutput {
   /** Exact host-authored repair detail. It is sealed by digest in the receipt,
    * never duplicated into the receipt row itself. */
   diagnostic?: string;
+  /** Host-authored, value-free digest of the exact failing-path set behind a
+   * pre-dispatch argument refusal (hex, 16-64 chars). Sealed by digest like
+   * `diagnostic`; the no-progress projection reads it to key repair progress
+   * without parsing prose. */
+  repairKey?: string;
 }
 
 export type CanonicalHostModelResultClass =
@@ -99,6 +104,8 @@ interface CanonicalHostResultDescriptor {
 }
 
 const SHA256 = /^[a-f0-9]{64}$/;
+/** Host-authored repair keys are hex digests (or a bounded prefix of one). */
+const REPAIR_KEY = /^[a-f0-9]{16,64}$/;
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
@@ -167,6 +174,7 @@ export function buildHostToolDispositionResult(input: {
   countsRefusal?: boolean;
   retired?: boolean;
   diagnostic?: string;
+  repairKey?: string;
 }): AgentInputItem {
   const unknown = input.disposition === 'effect_unknown';
   const retry = unknown || input.retired === true ? 'do_not_retry' : 'replan';
@@ -182,6 +190,7 @@ export function buildHostToolDispositionResult(input: {
     requiresReconciliation: unknown,
     message: dispositionMessage(input.disposition, retry),
     ...(input.diagnostic ? { diagnostic: input.diagnostic } : {}),
+    ...(input.repairKey ? { repairKey: input.repairKey } : {}),
   };
   return textResultItem(input.callId, input.toolName, output);
 }
@@ -260,6 +269,8 @@ export function describeCanonicalHostModelResult(
     || (marker.countsRefusal !== undefined && marker.countsRefusal !== true)
     || (marker.diagnostic !== undefined
       && (typeof marker.diagnostic !== 'string' || !marker.diagnostic))
+    || (marker.repairKey !== undefined
+      && (typeof marker.repairKey !== 'string' || !REPAIR_KEY.test(marker.repairKey)))
     || (marker.disposition === 'not_started'
       && (marker.retry !== 'replan' || marker.countsRefusal !== undefined))
   ) return null;
@@ -273,6 +284,7 @@ export function describeCanonicalHostModelResult(
     countsRefusal: marker.countsRefusal === true,
     retired: marker.retry === 'do_not_retry',
     ...(typeof marker.diagnostic === 'string' ? { diagnostic: marker.diagnostic } : {}),
+    ...(typeof marker.repairKey === 'string' ? { repairKey: marker.repairKey } : {}),
   });
   if (!exactItemMatches(item, rebuilt)) return null;
   const outputBytes = canonicalModelResultOutputBytes(item);
@@ -341,6 +353,7 @@ export function canonicalHostModelResultClass(
     || marker.retry !== 'do_not_retry'
     || marker.requiresReconciliation !== true
     || marker.diagnostic !== undefined
+    || marker.repairKey !== undefined
   ) return null;
   const rebuilt = buildHostToolDispositionResult({
     callId,

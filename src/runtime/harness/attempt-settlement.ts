@@ -73,6 +73,11 @@ export class InvalidArgumentsPreDispatchResult extends ExternalWritePreDispatchR
   constructor(
     output: string,
     readonly schemaAvailable = true,
+    /** Host-authored, value-free digest of the exact failing-path set (when
+     * the refusing validator computed one). Both pre-dispatch mint paths
+     * carry it so the no-progress projection can tell a new repair attempt
+     * from a byte-identical repeat without reading prose. */
+    readonly repairKey?: string,
   ) {
     super(output, 'invalid_arguments');
   }
@@ -86,6 +91,7 @@ export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
       preDispatch: true,
       argumentValidationFailed: true,
       schemaAvailable: result.schemaAvailable,
+      ...(result.repairKey ? { repairKey: result.repairKey } : {}),
     };
   }
   // A locally constructed policy refusal may return corrective bytes to the
