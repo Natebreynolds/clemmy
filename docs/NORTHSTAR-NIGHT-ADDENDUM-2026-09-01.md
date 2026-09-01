@@ -229,7 +229,12 @@ in two weeks a failed run named its own cause.
   parts, which matched neither the actionable nor the private-activity classifier — 150 s of "silence"
   while the model wrote arguments — and the turn fell to a rate-limited Codex, then GLM, whose frame was
   refused (`host_control_requires_direct_first_class_call`). Tool-input parts now classify as actionable
-  output (`fallback-model.ts`; classifier + chain pins). Attempt 15 runs on all of it.
+  output (`fallback-model.ts`; classifier + chain pins); (15) NO host gate fired — Sonnet ran the whole
+  turn, then wrote `CONTINUE: … ready to submit … via one workflow_update call next turn` and the run
+  completed as a successful answer with nothing written. The host lane runs one turn per source and
+  reduces it to a terminal, so the rubric's "more tool calls next turn" had no next turn. The runner now
+  keeps the same turn open for a bare CONTINUE marker (bounded, 3), the rubric says so, and the two
+  pins cover it. Attempt 16 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
