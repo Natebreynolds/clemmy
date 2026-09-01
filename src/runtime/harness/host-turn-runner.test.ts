@@ -7954,3 +7954,60 @@ test('a no-progress terminal carries the last host refusal check as bounded bloc
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
   }
 });
+
+test('a done claim after the host refused this source\'s only work before dispatch is held, never delivered (delivery truth)', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('refused-work-done-claim');
+    const { carrier, outerBodies } = installEmptyProductionCatalogWithCarrier();
+    const model = stubModel([
+      [toolCall('refused-work-call', 'call_tool', {
+        name: 'NIGHT_OPAQUE_LIST_EVENTS',
+        args_json: JSON.stringify({ limit: 1 }),
+      })],
+      [textMsg('Your calendar is ready.')],
+    ]);
+    const agent = { model, tools: [carrier] };
+    bindHostCanarySurface(fixture, agent, [carrier]);
+    await runProductionHost(fixture, agent);
+    const db = eventlog.openEventLog();
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM host_model_result_receipts
+       WHERE session_id = ? AND source_user_seq = ? AND disposition = 'refused_pre_dispatch'
+    `).get(fixture.session.id, fixture.source.seq) as { n: number }).n >= 1, true,
+    'the refusal is a durable host receipt for this source');
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+    `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0);
+    assert.equal(outerBodies(), 0);
+
+    // The model's claim, reduced as a completed turn with no contract and no
+    // manifest — the exact shape that was stamped delivered:true live.
+    const identity = { sessionId: fixture.session.id, turn: 1, sourceUserSeq: fixture.source.seq } as const;
+    const committed = commitTurnOutcome({
+      version: 2,
+      id: turnOutcomeId(identity),
+      identity,
+      status: 'done',
+      resumable: false,
+      presentation: { kind: 'answer', text: 'Your calendar is ready.' },
+    });
+    assert.equal(committed.presentation.status, 'blocked', JSON.stringify(committed.event.data));
+    assert.equal(committed.event.data.delivered, false);
+    assert.equal(committed.event.data.reason, 'verification_required');
+    assert.deepEqual(committed.event.data.verificationMissing, ['work_refused_without_business_evidence']);
+    assert.equal(committed.presentation.text.startsWith('Your calendar is ready.'), true,
+      'the model\'s own words are held, never rewritten by the committer');
+  } finally {
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) {
+      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    }
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});

@@ -676,3 +676,12 @@ test('a blocked terminal persists the host reason and bounded detail instead of 
   assert.equal(unnamed.blockedReason, 'blocked', 'callers that carry no reason keep the compatibility default');
   assert.equal('blockedDetail' in unnamed, false);
 });
+
+test('an ordinary answer with no refused work and no dispatch still delivers (delivery-truth control)', () => {
+  createSession({ id: 'plain-conversational-answer', kind: 'chat' });
+  const outcome = acceptedAnswer('plain-conversational-answer', 'Here is what I know from our earlier conversation.');
+  const committed = commitTurnOutcome(outcome);
+  assert.equal(committed.presentation.status, 'done');
+  assert.equal(committed.event.data.delivered, true);
+  assert.equal('verificationMissing' in committed.event.data, false);
+});
