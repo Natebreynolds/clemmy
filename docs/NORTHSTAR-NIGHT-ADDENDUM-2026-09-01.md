@@ -139,6 +139,18 @@ in two weeks a failed run named its own cause.
   Baseline #7 (`1788272392212-08d201`) is the end-to-end proof. Note: #6 already appended today's digest
   row to the real sheet; the workflow's own reconcile-against-log logic is what should keep #7 from
   duplicating it.
+- **platform-49 GLM baseline #7 (07:20, run `1788272392212-08d201`, 5½ minutes — the fastest run of the
+  night):** reads, JIT, `insert_dimension` ✔, `batch_update` ×2 ✔ again. Blocked `tool_effect_uncertain`
+  on `space_refresh`, which this time the model invoked *through* `call_tool` (in #6 it called it
+  directly and it succeeded). Two seams, both recorded for the next wave: (1) `space_refresh`'s own
+  kernel reads were refused "workflow call independent live observation differs from its plan"
+  (`accepted-turn-call-authority.ts:3888`) — the
+  Space's saved call plan pins an observation identity that the turn's fresh JIT observations no longer
+  match; a static pre-proof on a read, which should re-observe and re-plan, never fail. (2) The outer
+  carrier's `adoptedNestedSettlement` threw "conflicts with the frozen invocation contract" because the
+  inner settled `mutating:false` (`unknown / execution_failed`, zero crossings) against a `local_write`
+  contract — so a failed, no-effect refresh was reported as an uncertain mutation. Fix order: (2) adopt
+  a zero-crossing failed inner as `execution_failed` (repairable), then (1) drift → re-observe.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
