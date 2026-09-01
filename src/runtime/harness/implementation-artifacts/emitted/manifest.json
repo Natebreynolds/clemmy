@@ -1227,7 +1227,7 @@
           "bytes": 6354
         },
         "src/runtime/harness/named-workflow-host-dispatch.ts": {
-          "bytes": 9645
+          "bytes": 10094
         },
         "src/memory/account-alias-store.ts": {
           "bytes": 7927
@@ -3702,7 +3702,7 @@
           "bytes": 6354
         },
         "src/runtime/harness/named-workflow-host-dispatch.ts": {
-          "bytes": 9645
+          "bytes": 10094
         },
         "src/memory/account-alias-store.ts": {
           "bytes": 7927
