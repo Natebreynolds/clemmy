@@ -1799,10 +1799,62 @@ function parseDurableInitialPlanningCard(input: {
   };
 }
 
+/** The one bounded repack rule for same-source disclosures, shared by the
+ * in-process foreground tool_search lane and a re-prime that replays this
+ * source's durable disclosures (a resumed source in another process must see
+ * the same card the model was already shown). The admitted card is the base
+ * and the advisory ordering; disclosed rows are preferred so unrelated live
+ * rows cannot displace them; only disclosed writes may lift the ceiling (an
+ * unrelated factory write must not turn a read ask into a write card); every
+ * slot/byte bound still applies; the digest is bound to the returned rows. */
+function repackPlanningCardWithSameSourceDisclosures(input: {
+  objective: string;
+  card: {
+    capabilities: readonly HostCapabilityDescriptorV1[];
+    effectCeiling: HostCapabilityDescriptorV1['effect'];
+  };
+  liveCapabilities: readonly HostCapabilityDescriptorV1[];
+  disclosed: readonly HostCapabilityDescriptorV1[];
+}): {
+  capabilities: HostCapabilityDescriptorV1[];
+  withheld: PlanningCardWithheldV1[];
+  effectCeiling: HostCapabilityDescriptorV1['effect'];
+  digest: string;
+} {
+  const live = new Map<string, HostCapabilityDescriptorV1>();
+  for (const descriptor of input.liveCapabilities) live.set(descriptor.id, descriptor);
+  for (const descriptor of input.card.capabilities) live.set(descriptor.id, descriptor);
+  for (const descriptor of input.disclosed) live.set(descriptor.id, descriptor);
+  let effectCeiling = input.card.effectCeiling;
+  for (const descriptor of input.disclosed) {
+    if (planningEffectRank(descriptor.effect) > planningEffectRank(effectCeiling)) {
+      effectCeiling = descriptor.effect;
+    }
+  }
+  const preferred = new Set([
+    ...input.card.capabilities.map((descriptor) => descriptor.id),
+    ...input.disclosed.map((descriptor) => descriptor.id),
+  ]);
+  const covered = rankedLivePlanningDescriptors({
+    objective: input.objective,
+    live: [...live.values()],
+    advisory: input.card.capabilities,
+    preferredLiveIds: preferred,
+    effectCeiling,
+  });
+  return {
+    capabilities: covered.capabilities,
+    withheld: covered.withheld,
+    effectCeiling: covered.effectCeiling,
+    digest: sha256(JSON.stringify(covered.capabilities)),
+  };
+}
+
 /** Zero-model catalog preparation for the initial foreground model surface.
  * This is enumeration/ranking only. The exact bounded display card is frozen
  * here before the first model request; later foreground tool_search results
- * may extend same-source staging but never rewrite that initial surface. */
+ * extend it only through this source's own disclosures (the same repack rule
+ * the in-process lane applies) and never rewrite the frozen initial rows. */
 export async function primePrimaryModelPlanningCatalog(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -2007,20 +2059,37 @@ export async function primePrimaryModelPlanningCatalog(input: {
     currentById: livePlanningById,
   });
   if (!reopenedInitialCard.ok) return reopenedInitialCard;
-  const capabilities = [...reopenedInitialCard.card.capabilities];
-  const digest = reopenedInitialCard.card.cardDigest;
+  // New LIVE factory rows never repack the frozen initial card. This source's
+  // own durable tool_search disclosures are the one lawful extension: the
+  // in-process lane already grew the card the model saw, so a re-prime (a
+  // resumed source in another process) must reach that same card instead of
+  // reopening the pre-disclosure surface and hiding every disclosed ref.
+  const frozenIds = new Set(reopenedInitialCard.card.capabilities.map((descriptor) => descriptor.id));
+  const card = replayed.descriptors.some((descriptor) => !frozenIds.has(descriptor.id))
+    ? repackPlanningCardWithSameSourceDisclosures({
+        objective,
+        card: reopenedInitialCard.card,
+        liveCapabilities: catalogDescriptors,
+        disclosed: replayed.descriptors,
+      })
+    : {
+        capabilities: [...reopenedInitialCard.card.capabilities],
+        withheld: [...reopenedInitialCard.card.withheld],
+        effectCeiling: reopenedInitialCard.card.effectCeiling,
+        digest: reopenedInitialCard.card.cardDigest,
+      };
   const authority = Object.freeze({ scope: PRIMARY_MODEL_PLANNING_CATALOG_SCOPE });
   primaryModelPlanningCatalogs.set(authority, {
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     objective,
-    effectCeiling: reopenedInitialCard.card.effectCeiling,
-    withheld: [...reopenedInitialCard.card.withheld],
-    capabilities,
+    effectCeiling: card.effectCeiling,
+    withheld: card.withheld,
+    capabilities: card.capabilities,
     liveCapabilities: catalogDescriptors.map((descriptor) => Object.freeze({ ...descriptor })),
     disclosureByName,
     stagedById: replayed.stagedById,
-    digest,
+    digest: card.digest,
   });
   const planning = snapshotPrimaryModelPlanningContext(authority);
   if (!planning) return { ok: false, reason: 'host planning catalog snapshot was not installed' };
@@ -2373,33 +2442,16 @@ export async function disclosePrimaryModelPlanningCapabilities(input: {
       type: 'capability_discovered',
       data: { sourceUserSeq: catalog.sourceUserSeq, capabilities: newlyDisclosed },
     });
-    const live = new Map<string, HostCapabilityDescriptorV1>();
-    for (const descriptor of catalog.liveCapabilities) live.set(descriptor.id, descriptor);
-    for (const descriptor of allowed.values()) live.set(descriptor.id, descriptor);
-    // Only disclosed-this-turn writes may lift the ceiling. An unrelated
-    // factory write must not turn a read ask into a write card.
-    let effectCeiling = catalog.effectCeiling;
-    for (const row of newlyDisclosed) {
-      const effect = row.descriptor?.effect;
-      if (effect && planningEffectRank(effect) > planningEffectRank(effectCeiling)) {
-        effectCeiling = effect;
-      }
-    }
-    const preferred = new Set([
-      ...catalog.capabilities.map((descriptor) => descriptor.id),
-      ...newlyDisclosed.map((row) => row.capabilityRef),
-    ]);
-    const covered = rankedLivePlanningDescriptors({
+    const repacked = repackPlanningCardWithSameSourceDisclosures({
       objective: catalog.objective,
-      live: [...live.values()],
-      advisory: catalog.capabilities,
-      preferredLiveIds: preferred,
-      effectCeiling,
+      card: { capabilities: catalog.capabilities, effectCeiling: catalog.effectCeiling },
+      liveCapabilities: catalog.liveCapabilities,
+      disclosed: newlyDisclosed.flatMap((row) => (row.descriptor ? [row.descriptor] : [])),
     });
-    catalog.effectCeiling = covered.effectCeiling;
-    catalog.withheld = covered.withheld;
-    catalog.capabilities = covered.capabilities;
-    catalog.digest = sha256(JSON.stringify(catalog.capabilities));
+    catalog.effectCeiling = repacked.effectCeiling;
+    catalog.withheld = repacked.withheld;
+    catalog.capabilities = repacked.capabilities;
+    catalog.digest = repacked.digest;
   }
   return Object.freeze({ ...refs });
 }
