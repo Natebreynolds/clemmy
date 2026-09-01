@@ -15,7 +15,7 @@ import type {
   NoProgressConsequence,
   NoProgressAttemptClass,
 } from './no-progress-governor.js';
-import { createNoProgressConsequence } from './no-progress-governor.js';
+import { NO_PROGRESS_RECOVERY_TOOL_NAME_CAP, createNoProgressConsequence } from './no-progress-governor.js';
 import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 
 /**
@@ -973,6 +973,14 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
       // recovery surface (the refused carriers only) is unchanged.
       const schemaKeyed = refusedCalls.length > 0
         && repairKeys.every((key): key is string => typeof key === 'string');
+      // The recovery surface is the set of DISTINCT refused carriers, bounded
+      // to the governor's cap. Live 2026-09-01: one frame carried nine refused
+      // call_tool siblings; mapping every call (duplicates included) exceeded
+      // the cap, the governor constructor threw, and a projection exception
+      // became a blocked run after two successful reads. A repair surface is
+      // never wider than the distinct names anyway.
+      const refusedCarrierNames = [...new Set(refusedCalls.map((call) => call.name))]
+        .slice(0, NO_PROGRESS_RECOVERY_TOOL_NAME_CAP);
       return {
         status: 'ok',
         attemptClass: 'zero_crossing_repair',
@@ -982,7 +990,7 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
             : 'host_disposition:refused_pre_dispatch',
           recovery: 'repair_model',
           effectState: 'not_started',
-          recoveryToolNames: refusedCalls.map((call) => call.name),
+          recoveryToolNames: refusedCarrierNames,
         }),
       };
     }

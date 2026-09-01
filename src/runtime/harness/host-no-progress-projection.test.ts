@@ -19,6 +19,7 @@ const {
 } = eventlog;
 const { buildHostToolDispositionResult } = await import('./host-model-result-receipt.js');
 const {
+  NO_PROGRESS_RECOVERY_TOOL_NAME_CAP,
   initializeNoProgressGovernor,
   observeNoProgress,
 } = await import('./no-progress-governor.js');
@@ -649,6 +650,56 @@ test('host disposition result outranks varied call names as zero-crossing repair
   if (projected.status === 'ok') {
     assert.equal(projected.attemptClass, 'zero_crossing_repair');
     assert.equal(projected.consequence?.stage, 'host_disposition:refused_pre_dispatch');
+  }
+});
+
+test('a frame of many refused siblings projects a bounded, distinct recovery surface instead of throwing', () => {
+  // Live 2026-09-01 (platform-49 on GLM): one frame carried nine refused
+  // call_tool siblings; mapping every refused call into recoveryToolNames
+  // exceeded the governor cap, the constructor threw, and the projection
+  // exception became a blocked run after two successful reads.
+  const identity = accepted('many-refused-siblings');
+  const sameCarrier = Array.from({ length: 9 }, (_, index) => `call-same-${index}`);
+  const projectedSame = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: sameCarrier.flatMap((callId, index) => [
+      call(callId, 'call_tool'),
+      buildHostToolDispositionResult({
+        callId,
+        toolName: 'call_tool',
+        disposition: 'refused_pre_dispatch',
+        frameDigest: 'a'.repeat(64),
+        frameIndex: index,
+        frameSize: sameCarrier.length,
+        countsRefusal: true,
+      }),
+    ]),
+  });
+  assert.equal(projectedSame.status, 'ok');
+  if (projectedSame.status === 'ok') {
+    assert.equal(projectedSame.attemptClass, 'zero_crossing_repair');
+    assert.deepEqual(projectedSame.consequence?.recoveryToolNames, ['call_tool']);
+  }
+
+  const distinct = Array.from({ length: 10 }, (_, index) => `carrier_${index}`);
+  const projectedDistinct = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: distinct.flatMap((toolName, index) => [
+      call(`call-distinct-${index}`, toolName),
+      buildHostToolDispositionResult({
+        callId: `call-distinct-${index}`,
+        toolName,
+        disposition: 'refused_pre_dispatch',
+        frameDigest: 'b'.repeat(64),
+        frameIndex: index,
+        frameSize: distinct.length,
+        countsRefusal: true,
+      }),
+    ]),
+  });
+  assert.equal(projectedDistinct.status, 'ok');
+  if (projectedDistinct.status === 'ok') {
+    assert.equal(projectedDistinct.consequence?.recoveryToolNames.length, NO_PROGRESS_RECOVERY_TOOL_NAME_CAP);
   }
 });
 

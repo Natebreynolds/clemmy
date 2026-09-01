@@ -74,9 +74,12 @@ function normalizedBoundedText(value: string, label: string, max: number): strin
   return normalized;
 }
 
+/** Upper bound on the distinct carriers one recovery surface may name. */
+export const NO_PROGRESS_RECOVERY_TOOL_NAME_CAP = 8;
+
 function normalizedRecoveryToolNames(values: readonly string[] | undefined): readonly string[] {
   if (values === undefined) return Object.freeze([]);
-  if (!Array.isArray(values) || values.length > 8) {
+  if (!Array.isArray(values) || values.length > NO_PROGRESS_RECOVERY_TOOL_NAME_CAP) {
     throw new Error('NoProgressGovernor recovery tool names must be an array of at most 8 entries.');
   }
   return Object.freeze([...new Set(values.map((value) => (
