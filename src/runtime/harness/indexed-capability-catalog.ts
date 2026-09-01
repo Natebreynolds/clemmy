@@ -29,7 +29,14 @@ import {
   type CapabilityManifestStore,
   type InstalledCapabilityManifest,
 } from './capability-manifest-store.js';
-import { peekProductionCapabilityAdapter } from './production-capability-adapter.js';
+import {
+  observationMatchesManifest,
+  peekProductionCapabilityAdapter,
+} from './production-capability-adapter.js';
+import {
+  independentlyObserveCapability,
+  observationIsFresh,
+} from './independent-capability-observation.js';
 import {
   capabilityManifestDigest,
   currentCapabilityManifest,
@@ -483,15 +490,32 @@ export async function registerIndexedCapabilitiesForTurn(input: {
   // stays exact; nothing persisted is rewritten. Revoked/superseded manifests
   // are never selected above (they have no current manifest), so they are
   // still evicted by readiness refresh and re-proved at every crossing.
+  // A byte-exact row is kept only while a FRESH independent observation still
+  // backs it (the adapter's own keep-branch predicate). Without one — or after
+  // a refused current observation — the row takes the forget+refresh path, so
+  // a provider that revoked the account/operation evicts the stale callable
+  // bytes before planning instead of being preserved by the manifest match.
   const alreadySupplied = new Set<string>();
   for (const manifestId of manifestIds) {
     const current = factory.get(manifestId);
     const installed = selected.get(manifestId);
+    if (!current || !installed) continue;
+    const manifest = currentCapabilityManifest(installed.manifest);
+    if (!manifest) continue;
+    const priorIndependent = independentlyObserveCapability(manifest.operationId, manifest.accountId);
     if (
-      current
-      && installed
-      && catalogEntryIsAttested(current)
+      catalogEntryIsAttested(current)
       && catalogEntryMatchesInstalledManifest(current, installed)
+      && priorIndependent
+      && priorIndependent.origin === 'independent'
+      && observationIsFresh(priorIndependent)
+      && observationMatchesManifest(manifest, {
+        definitionFingerprint: priorIndependent.definitionFingerprint,
+        providerVersion: priorIndependent.providerVersion,
+        operationVersion: priorIndependent.operationVersion,
+        accountId: priorIndependent.accountId,
+        observedAt: priorIndependent.observedAt,
+      }).ok
     ) alreadySupplied.add(manifestId);
   }
   // Scoped refresh is essential: a turn nominated these exact manifests, so

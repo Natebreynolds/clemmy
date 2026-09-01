@@ -265,6 +265,7 @@ import {
 } from '../memory/workflow-node-invocation-plan.js';
 import {
   compileLiveCatalogWorkflowCallPlan,
+  ensureLiveReadCapabilityForOperation,
   type WorkflowCapabilityAccountCandidateV1,
   type WorkflowCapabilityAccountChoiceSetV1,
   type WorkflowCapabilityAccountSelectionV1,
@@ -3104,6 +3105,24 @@ async function executeWorkflowCallNode(
       && ctx.capabilityResume.stepId === step.id
       && ctx.capabilityResume.tool === call.tool
     ) ? ctx.capabilityResume.accountSelection : undefined;
+    // A saved READ operation with no durable manifest yet (reviewed CLI or
+    // configured MCP) is acquired through the same attested carrier path a
+    // foreground disclosure uses, so a scheduled call step is never reported
+    // "not connected" for an operation the host can serve. Supply only; the
+    // compiler below still re-proves candidate, account and effect.
+    const acquisition = await ensureLiveReadCapabilityForOperation({
+      ownerId: ctx.workflowSlug,
+      nodeId: step.id,
+      operationId: call.tool,
+      expectedEffect: structuredCallSideEffectClass(step),
+      deadlineAt: Date.now() + 30_000,
+    });
+    if (acquisition.status !== 'present') {
+      logger.info(
+        { workflow: ctx.workflowSlug, stepId: step.id, tool: call.tool, acquisition },
+        'workflow call step live read acquisition',
+      );
+    }
     const compiled = compileLiveCatalogWorkflowCallPlan({
       ownerId: ctx.workflowSlug,
       nodeId: step.id,

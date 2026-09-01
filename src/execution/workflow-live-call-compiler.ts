@@ -197,6 +197,60 @@ function revalidateCurrentOperationCatalog(operationId: string): void {
   }
 }
 
+/**
+ * Acquire a saved READ operation that has no durable manifest yet.
+ *
+ * A structured `call:` step names an exact operation the workflow author
+ * chose (a reviewed CLI read such as a SOQL query, or a configured MCP read).
+ * Readiness already counts those operations as present because the carriers
+ * can dispatch them, but the live catalog only learns a carrier's operation
+ * when something acquires it — chat does that through tool_search; a
+ * scheduled call step never did, so the compiler reported `not-connected`
+ * for an operation the host could serve (Friday dashboard, 2026-09-01).
+ *
+ * This is supply, never authority: the exact-operation nomination must match
+ * a currently attested carrier definition, the materializer installs the same
+ * trusted manifest/port it would for a foreground disclosure, and the
+ * compiler below still re-proves candidates, accounts and effect. Only reads
+ * are acquired here; writes keep their authored/reviewed paths.
+ */
+export async function ensureLiveReadCapabilityForOperation(input: {
+  ownerId: string;
+  nodeId: string;
+  operationId: string;
+  expectedEffect: LiveCallExpectedEffect;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+}): Promise<{ status: 'present' | 'acquired' | 'unavailable'; detail?: string }> {
+  if (input.expectedEffect !== 'read') return { status: 'present' };
+  const factory = peekHostCapabilityCatalogFactory();
+  if (!factory) return { status: 'unavailable', detail: 'no live host capability catalog is installed' };
+  if (currentOperationCandidates(factory, input.operationId).length > 0) return { status: 'present' };
+  revalidateCurrentOperationCatalog(input.operationId);
+  if (currentOperationCandidates(factory, input.operationId).length > 0) return { status: 'present' };
+  const { createProductionLiveReadAcquisitionRegistry } = await import(
+    '../runtime/harness/production-live-read-acquisition-registry.js'
+  );
+  const requirementId = `workflow-call:${exactWorkflowCallIdOrDigest(`${input.ownerId}\0${input.nodeId}\0${input.operationId}`)}`;
+  try {
+    const acquired = await createProductionLiveReadAcquisitionRegistry().acquire(
+      { requirementId, objective: input.operationId, effect: 'read' },
+      {
+        ...(input.signal ? { signal: input.signal } : {}),
+        ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+      },
+    );
+    if (acquired.status !== 'installed') {
+      return { status: 'unavailable', detail: `${acquired.reason}: ${acquired.detail}` };
+    }
+  } catch (error) {
+    return { status: 'unavailable', detail: error instanceof Error ? error.message : String(error) };
+  }
+  return currentOperationCandidates(factory, input.operationId).length > 0
+    ? { status: 'acquired' }
+    : { status: 'unavailable', detail: 'the acquired capability did not become a current catalog candidate' };
+}
+
 export function compileLiveCatalogWorkflowCallPlan(input: {
   /** Stable semantic owner, such as a workflow or Workspace id. */
   ownerId: string;
