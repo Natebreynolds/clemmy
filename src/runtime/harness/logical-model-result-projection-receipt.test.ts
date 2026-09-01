@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import type { AgentInputItem } from '@openai/agents';
 import Database from 'better-sqlite3';
 import type { LogicalModelResultProjectionReceiptRow } from './logical-model-result-projection-receipt.js';
+import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-logical-projection-receipt-'));
 process.env.CLEMENTINE_HOME = HOME;
@@ -527,7 +528,7 @@ test('v69 backfills exact ready structured projections without copying their pay
     assert.equal(JSON.stringify(row).includes('backfill-secret-marker'), false,
       'backfill copied projection payload into metadata');
     const version = raw.prepare(`SELECT MAX(version) AS version FROM schema_version`).get() as { version: number };
-    assert.equal(version.version, 73, 'the v69 replay continues through the current append-only tail');
+    assert.equal(version.version, HARNESS_SCHEMA_VERSION, 'the v69 replay continues through the current append-only tail');
     assert.deepEqual(raw.pragma('foreign_key_check'), []);
     assert.deepEqual(raw.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
   } finally {
