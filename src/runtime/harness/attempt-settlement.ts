@@ -549,6 +549,15 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
     signals.preDispatch = true;
     signals.policyRefused = true;
   }
+  // The shipped invoke adapter refuses BEFORE any provider request when the
+  // sealed manifest, binding, or call authority does not line up. That is a
+  // not-started refusal by construction (live 2026-09-01: it settled as an
+  // uncertain mutation and parked a run for a call that never left the
+  // process). The class name is the nominal marker, as for shell denials.
+  if (signals.errorName === 'ProviderPreDispatchRefusalError') {
+    signals.preDispatch = true;
+    signals.policyRefused = true;
+  }
   if (thrown instanceof CurrentCapabilityDefinitionUnavailableError) {
     signals.capabilityDefinitionUnavailable = true;
   }

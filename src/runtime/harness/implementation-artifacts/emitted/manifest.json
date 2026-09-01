@@ -2,8 +2,8 @@
   "version": 3,
   "artifacts": {
     "invoke": {
-      "file": "invoke-7fddc5ac08e371ae8780b8cb32777c36488a4f7941676a77a19511ed7ad0681b.cjs",
-      "sha256": "7fddc5ac08e371ae8780b8cb32777c36488a4f7941676a77a19511ed7ad0681b",
+      "file": "invoke-f6104b3c5609f60caa41bae2c0db9eea3c94f21db08bc5a7638f7811fe0bb2b0.cjs",
+      "sha256": "f6104b3c5609f60caa41bae2c0db9eea3c94f21db08bc5a7638f7811fe0bb2b0",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/invoke-support.ts": {
           "bytes": 159
@@ -546,7 +546,7 @@
           "bytes": 4717
         },
         "src/runtime/harness/attempt-settlement.ts": {
-          "bytes": 50362
+          "bytes": 50874
         },
         "src/runtime/harness/callable-surface.ts": {
           "bytes": 6949
@@ -1155,13 +1155,13 @@
           "bytes": 11799
         },
         "src/runtime/harness/graph-node-capability.ts": {
-          "bytes": 5440
+          "bytes": 5718
         },
         "src/integrations/composio/selected-definition-revalidation.ts": {
           "bytes": 15702
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
-          "bytes": 41197
+          "bytes": 41391
         },
         "src/runtime/harness/firecrawl-batch-scrape-schema-contract.ts": {
           "bytes": 3029
@@ -2174,6 +2174,9 @@
         "src/runtime/harness/host-model-frame-policy.ts": {
           "bytes": 11267
         },
+        "src/runtime/harness/authored-call-authority.ts": {
+          "bytes": 4009
+        },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3115
         },
@@ -2196,7 +2199,7 @@
           "bytes": 38322
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 295651
+          "bytes": 297662
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2463,7 +2466,7 @@
           "bytes": 30694
         },
         "src/runtime/harness/production-capability-adapters.ts": {
-          "bytes": 39107
+          "bytes": 39826
         },
         "src/runtime/harness/implementation-artifacts/invoke-entry.ts": {
           "bytes": 408
@@ -3015,7 +3018,7 @@
           "bytes": 4717
         },
         "src/runtime/harness/attempt-settlement.ts": {
-          "bytes": 50362
+          "bytes": 50874
         },
         "src/runtime/harness/callable-surface.ts": {
           "bytes": 6949
@@ -3624,13 +3627,13 @@
           "bytes": 11799
         },
         "src/runtime/harness/graph-node-capability.ts": {
-          "bytes": 5440
+          "bytes": 5718
         },
         "src/integrations/composio/selected-definition-revalidation.ts": {
           "bytes": 15702
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
-          "bytes": 41197
+          "bytes": 41391
         },
         "src/runtime/harness/firecrawl-batch-scrape-schema-contract.ts": {
           "bytes": 3029
@@ -4643,6 +4646,9 @@
         "src/runtime/harness/host-model-frame-policy.ts": {
           "bytes": 11267
         },
+        "src/runtime/harness/authored-call-authority.ts": {
+          "bytes": 4009
+        },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3115
         },
@@ -4665,7 +4671,7 @@
           "bytes": 38322
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 295651
+          "bytes": 297662
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4932,7 +4938,7 @@
           "bytes": 30694
         },
         "src/runtime/harness/production-capability-adapters.ts": {
-          "bytes": 39107
+          "bytes": 39826
         },
         "src/runtime/harness/implementation-artifacts/reconcile-entry.ts": {
           "bytes": 423
@@ -5075,5 +5081,5 @@
       }
     }
   },
-  "manifestDigest": "51b1deccf34588400a46994e5cd5c727a4954e373982b6c0d0e16751d19d6e99"
+  "manifestDigest": "cbbbfd9ada1d2586272b311b3aa106bc0b406dda0b659ba182dfe33afced83bf"
 }

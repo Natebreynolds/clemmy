@@ -527,6 +527,46 @@ test('opaque current external write crosses its exact sealed port once without p
   });
 });
 
+test('a host-granted authored write carries call authority the adapter accepts; without any authority the refusal is typed not-started', async () => {
+  // Live 2026-09-01 (platform-49 run 23695e): the consented authored write
+  // reached this adapter with no authority (only the construct lane minted
+  // one), the plain Error settled as an uncertain mutation, and the run was
+  // parked for a call that never left the process.
+  const { mintAuthoredCallAuthority } = await import('./authored-call-authority.js');
+  const manifest = opaqueExternalWriteManifest();
+  const canonicalArgs = { spreadsheet_id: 'sheet-q7x9', insert_dimension: { range: { sheet_id: 0, dimension: 'ROWS' } } };
+  const calls: Array<{ operationId: string; args: Record<string, unknown>; accountId: string }> = [];
+  installProductionTransport(async (call) => {
+    calls.push(call);
+    return { ok: true };
+  });
+  const authority = mintAuthoredCallAuthority({
+    manifest,
+    canonicalArgs,
+    grant: {
+      coverageContractId: 'authored-workflow:' + 'd'.repeat(64),
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      acceptedTaskId: identity.acceptedTaskId,
+      logicalCallId: 'call-authored-write',
+    },
+  });
+  const invocation = opaqueWriteInvocation(manifest, canonicalArgs);
+  const result = await invokeForSealedManifest(manifest)({ ...invocation, authority: authority as never });
+  assert.deepEqual(result, { ok: true });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]?.args, canonicalArgs, 'the schema-validated arguments cross, not a digest');
+  assert.equal(calls[0]?.accountId, manifest.accountId);
+
+  await assert.rejects(
+    () => invokeForSealedManifest(manifest)({ ...invocation, authority: undefined }),
+    (error: unknown) => error instanceof Error
+      && error.name === 'ProviderPreDispatchRefusalError'
+      && /requires current call authority/.test(error.message),
+  );
+  assert.equal(calls.length, 1, 'a pre-dispatch refusal never reaches the transport');
+});
+
 test('opaque external write refuses stale manifests and identity drift before transport', async () => {
   const current = opaqueExternalWriteManifest();
   const canonicalArgs = { q7: 'sealed-value' };

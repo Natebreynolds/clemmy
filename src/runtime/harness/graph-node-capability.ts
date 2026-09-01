@@ -19,7 +19,12 @@ export interface GraphNodeCapabilityInvoke {
     envelope?: GraphNodeInvocationEnvelopeV1;
     identity: { sessionId: string; sourceUserSeq: number; acceptedTaskId: string };
     binding: BoundNodeCapability;
-    authority?: import('./resolved-call-authority.js').ResolvedCallAuthorityV1;
+    /** Sealed construct-lane authority, or the host's authority for a write
+     * it granted on an authored workflow step. The adapter verifies the same
+     * manifest-identity fields on both. */
+    authority?:
+      | import('./resolved-call-authority.js').ResolvedCallAuthorityV1
+      | import('./authored-call-authority.js').AuthoredCallAuthorityV1;
   }): Promise<unknown>;
 }
 

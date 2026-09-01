@@ -190,6 +190,7 @@ import {
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
 import { evaluateAuthoredWorkflowMutationConsent } from './authored-workflow-write-authority.js';
+import { mintAuthoredCallAuthority } from './authored-call-authority.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
 import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
 import {
@@ -1788,6 +1789,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     entries: readonly RegisteredHostCapability[];
   } | null = null;
   const nestedCallAdmissions = new Map<string, object>();
+  // Writes the authored-consent evaluator decided `proceed` for, by logical
+  // call id. The port invoke mints the adapter's call authority from this
+  // grant plus the exact manifest and the schema-validated arguments.
+  const authoredCallGrants = new Map<string, { coverageContractId: string }>();
   const freshPlanControlConfigured = (): boolean => {
     const controls = [...configuredToolRefs].filter((tool) => (
       tool.name === 'plan_task'
@@ -3147,6 +3152,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               }
             }
           : async () => port.invoke({
+              // A write the authored-consent evaluator granted carries the
+              // host's call authority: the exact manifest bound above plus the
+              // arguments this turn schema-validated. Reads and ungranted
+              // calls pass none, exactly as before.
+              ...(authoredCallGrants.has(logicalToolCallId)
+                ? {
+                    authority: mintAuthoredCallAuthority({
+                      manifest,
+                      canonicalArgs: effectiveArgs,
+                      grant: {
+                        coverageContractId: authoredCallGrants.get(logicalToolCallId)!.coverageContractId,
+                        sessionId: identity.sessionId,
+                        sourceUserSeq: identity.sourceUserSeq,
+                        acceptedTaskId,
+                        logicalCallId: logicalToolCallId,
+                      },
+                    }),
+                  }
+                : {}),
               nodeId: logicalToolCallId,
               role: 'foreground',
               payload: effectiveArgs,
@@ -6554,6 +6578,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             needs = false;
             if (consent.nestedAdmission) {
               nestedCallAdmissions.set(call.callId, consent.nestedAdmission);
+            }
+            // An authored-step grant is the write's consent; the port invoke
+            // mints the adapter's call authority from it (see
+            // authored-call-authority.ts) so a consented generic external
+            // write no longer dies inside the shipped adapter.
+            if (
+              authoredWorkflowConsent
+              && consent === authoredWorkflowConsent
+              && authoredWorkflowConsent.status === 'decided'
+              && authoredWorkflowConsent.coverage
+            ) {
+              authoredCallGrants.set(call.callId, {
+                coverageContractId: authoredWorkflowConsent.coverage.contractId,
+              });
             }
             break;
           case 'needs_user':

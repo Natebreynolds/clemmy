@@ -180,6 +180,35 @@ test('the nominal invalid-input carrier settles identically on every lane: inval
   }
 });
 
+test('a ProviderPreDispatchRefusalError thrown by the invoke adapter settles a MUTATION as refused before dispatch, never uncertain', () => {
+  // Live 2026-09-01 (platform-49 run 23695e): the shipped adapter threw a
+  // plain Error before any provider request; the mutating call settled
+  // uncertain_write and the run was parked for a call that never left the
+  // process. The class name is the nominal not-started marker.
+  const task = accept('adapter pre-dispatch refusal');
+  const callId = 'logical:adapter-refusal:byo';
+  admit(task, callId);
+  const thrown = new Error('generic external write requires current call authority');
+  thrown.name = 'ProviderPreDispatchRefusalError';
+  const result = settlement.settleToolAttempt({
+    ...task,
+    lane: 'byo',
+    toolName: 'task_list',
+    callId,
+    args: LIVE_ARGS,
+    mutating: true,
+    businessCall: true,
+    thrown,
+  });
+  assert.notEqual(result.outcome.kind, 'uncertain_write', 'nothing left the process');
+  assert.equal(result.outcome.directive.action !== 'reconcile_then_decide', true);
+  assert.equal(result.creditedProgress, false);
+  assert.equal(result.resultHandleId, undefined);
+  const row = durableRow(task, callId);
+  assert.equal(row.execution_kind, 'refused_pre_dispatch');
+  assert.equal(row.physical_crossing_count, 0);
+});
+
 test('NEGATIVE control: the same bytes as a bare string still settle succeeded on byo (why the fix is at the producer)', () => {
   const task = accept('bare string');
   const callId = 'logical:invalid-input:bare-string';

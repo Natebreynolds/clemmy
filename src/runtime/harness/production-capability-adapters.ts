@@ -387,6 +387,20 @@ export function observeComposioIndependently(
   }
 }
 
+/**
+ * A refusal this adapter raises BEFORE any provider request — sealed manifest,
+ * binding, or call authority did not line up. The host settles it by class
+ * name as a not-started, policy-refused attempt (attempt-settlement.ts), never
+ * as an uncertain mutation: nothing left the process. Live 2026-09-01 the
+ * plain Error here settled `uncertain_write` and parked a whole run.
+ */
+export class ProviderPreDispatchRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderPreDispatchRefusalError';
+  }
+}
+
 function refuseRoleSwitch(role: string, sealedPurpose: string): void {
   if (role === 'readback' && sealedPurpose === 'locate_source') {
     throw new Error('source capability refuses readback role before transport');
@@ -715,10 +729,10 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
       const current = currentCapabilityManifest(manifest);
       const digest = current ? capabilityManifestDigest(current) : '';
       if (!current || current.effect !== 'external_write' || current.providerKind !== 'composio') {
-        throw new Error('generic external write requires a current sealed manifest');
+        throw new ProviderPreDispatchRefusalError('generic external write requires a current sealed manifest');
       }
       if (!authority) {
-        throw new Error('generic external write requires current call authority');
+        throw new ProviderPreDispatchRefusalError('generic external write requires current call authority');
       }
       if (
         authority.manifestId !== current.manifestId
@@ -733,7 +747,7 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
         || authority.argumentCompiler.version !== current.argumentCompiler.version
         || authority.invokePortId !== current.invokePortId
       ) {
-        throw new Error('generic external write authority does not match the current sealed manifest port');
+        throw new ProviderPreDispatchRefusalError('generic external write authority does not match the current sealed manifest port');
       }
       if (
         binding.manifestDigest !== digest
@@ -744,15 +758,15 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
         || binding.effect !== current.effect
         || binding.providerKind !== current.providerKind
       ) {
-        throw new Error('generic external write binding does not match the current sealed manifest');
+        throw new ProviderPreDispatchRefusalError('generic external write binding does not match the current sealed manifest');
       }
       const compiled = authority.canonicalArgs;
       if (!compiled || typeof compiled !== 'object' || Array.isArray(compiled)) {
-        throw new Error('generic external write requires canonical object arguments');
+        throw new ProviderPreDispatchRefusalError('generic external write requires canonical object arguments');
       }
       return executeSealed(current.operationId, compiled, current.accountId, expectedTransport());
     }
-    throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
+    throw new ProviderPreDispatchRefusalError(`no sealed invoke for exact operation ${sealed.operationId}`);
   };
 }
 

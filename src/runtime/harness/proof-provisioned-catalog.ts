@@ -734,6 +734,9 @@ export async function registerProofProvisionedCapabilities(identity: {
           try {
             authorityOwnsPayload = Boolean(
               authority
+              // Only the sealed construct-lane authority owns a proof payload;
+              // an authored-step authority carries no graph node.
+              && 'acceptedSource' in authority
               && authority.acceptedSource.sessionId === identity.sessionId
               && authority.acceptedSource.sourceUserSeq === identity.sourceUserSeq
               && authority.acceptedTaskId === identity.acceptedTaskId

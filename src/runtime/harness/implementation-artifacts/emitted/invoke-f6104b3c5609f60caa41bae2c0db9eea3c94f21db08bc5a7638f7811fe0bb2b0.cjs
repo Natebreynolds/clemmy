@@ -1409,27 +1409,27 @@ function invokeForSealedManifest(manifest) {
       const current = currentCapabilityManifest(manifest);
       const digest = current ? capabilityManifestDigest(current) : "";
       if (!current || current.effect !== "external_write" || current.providerKind !== "composio") {
-        throw new Error("generic external write requires a current sealed manifest");
+        throw new ProviderPreDispatchRefusalError("generic external write requires a current sealed manifest");
       }
       if (!authority) {
-        throw new Error("generic external write requires current call authority");
+        throw new ProviderPreDispatchRefusalError("generic external write requires current call authority");
       }
       if (authority.manifestId !== current.manifestId || authority.manifestDigest !== digest || authority.providerKind !== current.providerKind || authority.providerIdentity !== current.providerIdentity || authority.operationVersion !== current.operationVersion || authority.liveProviderVersion !== current.providerVersion || authority.liveFingerprint !== current.definitionFingerprint || authority.resolvedEffect !== current.effect || authority.argumentCompiler.id !== current.argumentCompiler.id || authority.argumentCompiler.version !== current.argumentCompiler.version || authority.invokePortId !== current.invokePortId) {
-        throw new Error("generic external write authority does not match the current sealed manifest port");
+        throw new ProviderPreDispatchRefusalError("generic external write authority does not match the current sealed manifest port");
       }
       if (binding.manifestDigest !== digest || binding.toolName !== current.operationId || binding.schemaVersion !== current.operationVersion || binding.schemaDigest !== current.definitionFingerprint || binding.account !== current.accountId || binding.effect !== current.effect || binding.providerKind !== current.providerKind) {
-        throw new Error("generic external write binding does not match the current sealed manifest");
+        throw new ProviderPreDispatchRefusalError("generic external write binding does not match the current sealed manifest");
       }
       const compiled = authority.canonicalArgs;
       if (!compiled || typeof compiled !== "object" || Array.isArray(compiled)) {
-        throw new Error("generic external write requires canonical object arguments");
+        throw new ProviderPreDispatchRefusalError("generic external write requires canonical object arguments");
       }
       return executeSealed(current.operationId, compiled, current.accountId, expectedTransport());
     }
-    throw new Error(`no sealed invoke for exact operation ${sealed.operationId}`);
+    throw new ProviderPreDispatchRefusalError(`no sealed invoke for exact operation ${sealed.operationId}`);
   };
 }
-var SHEET_CREATE, SHEET_READBACK, BETA_PROVIDER_OPERATIONS, installedTransport;
+var SHEET_CREATE, SHEET_READBACK, BETA_PROVIDER_OPERATIONS, installedTransport, ProviderPreDispatchRefusalError;
 var init_production_capability_adapters = __esm({
   "src/runtime/harness/production-capability-adapters.ts"() {
     "use strict";
@@ -1451,6 +1451,12 @@ var init_production_capability_adapters = __esm({
       calendar: "GOOGLECALENDAR_CREATE_EVENT"
     };
     installedTransport = null;
+    ProviderPreDispatchRefusalError = class extends Error {
+      constructor(message) {
+        super(message);
+        this.name = "ProviderPreDispatchRefusalError";
+      }
+    };
   }
 });
 
