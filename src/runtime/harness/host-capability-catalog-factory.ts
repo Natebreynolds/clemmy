@@ -6,6 +6,7 @@
  * A missing or incomplete binding cannot authorize dispatch.
  */
 import { createHash } from 'node:crypto';
+import pino from 'pino';
 import { openEventLog } from './eventlog.js';
 import { canonicalLogicalToolName } from './logical-call-contract.js';
 import {
@@ -719,6 +720,51 @@ function frozenResultFrom(
   return { ok: true, digest, catalog: frozen.catalog(), entries };
 }
 
+const logger = pino({ name: 'clementine-next.host-capability-catalog-factory' });
+const IDENTITY_MISMATCH_LOG_CAP = 256;
+const loggedIdentityMismatches = new Set<string>();
+
+/**
+ * Diagnostic only — never changes the refusal. Equality stays byte-exact; this
+ * names WHICH identity component drifted for one persisted capabilityId so a
+ * registration-path drift (a row rebuilt in a different shape) is legible
+ * instead of an opaque `identity_mismatch`. Deduplicated per
+ * (capabilityId, persisted bytes, live bytes) and capped, because peek runs
+ * from pre-model preparation on every turn.
+ */
+function logCatalogSnapshotIdentityMismatch(
+  persisted: CanonicalCatalogIdentityV1,
+  liveIdentities: readonly LiveCatalogIdentity[],
+): void {
+  try {
+    const live = liveIdentities.find((item) => item.identity.capabilityId === persisted.capabilityId);
+    const persistedDigest = sha256(JSON.stringify(persisted));
+    const liveDigest = live ? sha256(JSON.stringify(live.identity)) : null;
+    const key = `${persisted.capabilityId}|${persistedDigest}|${liveDigest ?? (liveIdentities.length === 0 ? 'empty' : 'missing')}`;
+    if (loggedIdentityMismatches.has(key)) return;
+    if (loggedIdentityMismatches.size >= IDENTITY_MISMATCH_LOG_CAP) loggedIdentityMismatches.clear();
+    loggedIdentityMismatches.add(key);
+    const persistedRecord = persisted as unknown as Record<string, unknown>;
+    const liveRecord = live ? (live.identity as unknown as Record<string, unknown>) : null;
+    const changedKeys = liveRecord
+      ? [...new Set([...Object.keys(persistedRecord), ...Object.keys(liveRecord)])]
+        .filter((k) => JSON.stringify(persistedRecord[k]) !== JSON.stringify(liveRecord[k]))
+      : null;
+    logger.warn({
+      capabilityId: persisted.capabilityId,
+      liveMissing: !live,
+      liveCount: liveIdentities.length,
+      persistedKeys: Object.keys(persistedRecord),
+      liveKeys: liveRecord ? Object.keys(liveRecord) : null,
+      changedKeys,
+      persistedDigest,
+      liveDigest,
+    }, 'catalog_snapshot_identity_mismatch');
+  } catch {
+    // A diagnostic must never turn a refusal into a throw.
+  }
+}
+
 /** Reconstruct one persisted snapshot row against the live factory, or say
  * exactly why it cannot be trusted. Shared by replay, peek, and the
  * plan-admission absorb below so every reader applies identical checks. */
@@ -741,7 +787,10 @@ function reconstructPersistedSnapshot(
   const items: LiveCatalogIdentity[] = [];
   for (const identity of persisted) {
     const match = liveIdentities.find((item) => catalogIdentitiesEqual(item.identity, identity));
-    if (!match) return { ok: false, reason: 'identity_mismatch' };
+    if (!match) {
+      logCatalogSnapshotIdentityMismatch(identity, liveIdentities);
+      return { ok: false, reason: 'identity_mismatch' };
+    }
     if (
       identity.invokePortId
       && match.entry.manifest?.invokePortId

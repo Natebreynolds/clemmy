@@ -10,6 +10,7 @@
 import { createHash } from 'node:crypto';
 import { realpathSync, statSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import pino from 'pino';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { digestSchema } from '../../tools/tool-contract-store.js';
@@ -43,6 +44,8 @@ import {
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
 import { createProofProviderForegroundPayloadValidator } from './proof-provider-args.js';
+
+const logger = pino({ name: 'clementine-next.production-capability-adapter' });
 
 export interface LiveCapabilityObservation {
   definitionFingerprint: string;
@@ -435,6 +438,11 @@ export function createProductionCapabilityAdapter(input: {
             registered += 1;
             continue;
           }
+          logger.debug({
+            manifestId: current.manifestId,
+            hadPriorRow: Boolean(already),
+            hadSourceSchemaFingerprint: Boolean(already?.sourceSchemaFingerprint),
+          }, 'capability_adapter_refresh_forget_missing_ports');
           refused.push({ manifestId: current.manifestId, reason: 'missing' });
           factory.forget(current.manifestId);
           continue;
@@ -486,6 +494,12 @@ export function createProductionCapabilityAdapter(input: {
           continue;
         }
         try {
+          logger.debug({
+            manifestId: current.manifestId,
+            shape: 'adapter',
+            hadPriorRow: Boolean(already),
+            hadSourceSchemaFingerprint: Boolean(already?.sourceSchemaFingerprint),
+          }, 'capability_adapter_refresh_register');
           factory.register(registeredCapabilityFromManifest({
             manifest: current,
             observation: matched.observation,

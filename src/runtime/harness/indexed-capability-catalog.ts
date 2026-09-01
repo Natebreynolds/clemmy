@@ -7,6 +7,7 @@
  * a fresh observation, and live revalidation.
  */
 import { createHash } from 'node:crypto';
+import pino from 'pino';
 import {
   searchCapabilityOperations,
   type CapabilityOperationHit,
@@ -47,6 +48,7 @@ import type { AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capab
 import type { VerifiedWriteCapabilityRecordV1 } from '../../memory/verified-write-capability-store.js';
 
 const INDEX_SHORTLIST = 24;
+const logger = pino({ name: 'clementine-next.indexed-capability-catalog' });
 
 type VerifiedWriteResolver = (
   objective: string,
@@ -460,23 +462,55 @@ export async function registerIndexedCapabilitiesForTurn(input: {
     selected.set(matches[0]!.manifest.manifestId, matches[0]!);
   }
   const manifestIds = new Set(selected.keys());
+  logger.debug({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    manifestIds: [...manifestIds],
+    present: [...manifestIds].filter((manifestId) => Boolean(factory.get(manifestId))),
+  }, 'indexed_catalog_prime_selected');
   if (manifestIds.size === 0) return { registered: [], descriptors, localDefinitions };
 
+  // Cross-turn supply must prove the catalog identity was rebuilt from the
+  // installed manifest rather than accept stale account/schema/port bytes. A
+  // live row that already matches the installed manifest byte-for-byte IS
+  // that proof, so it is kept exactly as registered. Forgetting it and letting
+  // the adapter re-register the same manifest rebuilt the row in a different
+  // registration shape (optional identity keys differ between the direct
+  // proof-provisioned registration and the adapter's), and any snapshot
+  // frozen against the original bytes — a resumed source whose recovery had
+  // just rehydrated them, or another session sharing this process — then
+  // refused with identity_mismatch (hard-cut resume, 2026-08-31). Equality
+  // stays exact; nothing persisted is rewritten. Revoked/superseded manifests
+  // are never selected above (they have no current manifest), so they are
+  // still evicted by readiness refresh and re-proved at every crossing.
+  const alreadySupplied = new Set<string>();
+  for (const manifestId of manifestIds) {
+    const current = factory.get(manifestId);
+    const installed = selected.get(manifestId);
+    if (
+      current
+      && installed
+      && catalogEntryIsAttested(current)
+      && catalogEntryMatchesInstalledManifest(current, installed)
+    ) alreadySupplied.add(manifestId);
+  }
   // Scoped refresh is essential: a turn nominated these exact manifests, so
   // unrelated stale catalog entries cannot be forgotten as collateral work.
-  // Forget the selected cache rows first: the adapter's normal hot path may
-  // reuse a still-callable row after a fresh observation, but cross-turn supply
-  // must prove the catalog identity itself was rebuilt from the installed
-  // manifest rather than accepting stale account/schema/port bytes.
-  for (const manifestId of manifestIds) factory.forget(manifestId);
-  let refreshed: ReturnType<typeof adapter.refresh>;
-  try {
-    refreshed = adapter.refresh(manifestIds);
-  } catch {
-    return { registered: [], descriptors, localDefinitions };
+  // Only rows that are absent or drift from the installed manifest are
+  // forgotten first, so the adapter cannot reuse their stale bytes.
+  const rebuild = new Set([...manifestIds].filter((manifestId) => !alreadySupplied.has(manifestId)));
+  for (const manifestId of rebuild) factory.forget(manifestId);
+  let refreshed: ReturnType<typeof adapter.refresh> = { registered: 0, refused: [] };
+  if (rebuild.size > 0) {
+    try {
+      refreshed = adapter.refresh(rebuild);
+    } catch {
+      return { registered: [...alreadySupplied], descriptors, localDefinitions };
+    }
   }
   const refused = new Set(refreshed.refused.map((entry) => entry.manifestId));
   const registered = [...manifestIds].filter((manifestId) => {
+    if (alreadySupplied.has(manifestId)) return true;
     const current = factory.get(manifestId);
     const installed = selected.get(manifestId);
     return Boolean(
