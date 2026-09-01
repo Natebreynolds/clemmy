@@ -7,6 +7,7 @@ import {
   exactOrderedLiteralListSchema,
   type HostCapabilityDescriptorV1,
   type TurnSemanticProposalV1,
+  boundedSemanticObjective,
 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
@@ -1039,7 +1040,9 @@ function proposalFromDraft(input: {
     relation: 'new_goal',
     targetGoal: null,
     goal: {
-      objective: input.objective,
+      // Host-composed from the accepted source; bounded to the proposal
+      // schema so a long source cannot make every draft inadmissible.
+      objective: boundedSemanticObjective(input.objective),
       criteria: input.draft.criteria.map((statement, index) => ({
         id: `criterion_${index + 1}`,
         statement,

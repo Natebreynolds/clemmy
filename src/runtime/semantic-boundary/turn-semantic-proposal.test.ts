@@ -1045,3 +1045,39 @@ test('shownGroundingDescriptors resolves a definition-qualified ref to its shown
   });
   assert.equal(refused.ok, false, 'an unshown base never resolves via its qualifier');
 });
+
+// --- host-composed objective bound (live 2026-09-01: schema_too_big:goal.objective) ---
+{
+  const tsp = await import('./turn-semantic-proposal.js');
+  const nodeFs = await import('node:fs');
+  const nodePath = await import('node:path');
+  test('a long accepted source projects to a bounded objective that still admits; short text is untouched', () => {
+    const short = 'Post the weekly Salesforce activity summary to Slack.';
+    assert.equal(tsp.boundedSemanticObjective(short), short);
+    const word = 'activity ';
+    const long = `Rewrite the workflow. ${word.repeat(9000)}END-OF-SOURCE`;
+    assert.ok(long.length > tsp.MAX_SEMANTIC_OBJECTIVE_CHARS);
+    const bounded = tsp.boundedSemanticObjective(long);
+    assert.ok(bounded.length <= tsp.MAX_SEMANTIC_OBJECTIVE_CHARS, `bounded length ${bounded.length}`);
+    assert.ok(bounded.length >= Math.floor(tsp.MAX_SEMANTIC_OBJECTIVE_CHARS * 0.8), 'keeps most of the budget');
+    assert.ok(bounded.startsWith('Rewrite the workflow. activity'), 'head is the source head');
+    assert.match(bounded, /\+\d+ chars omitted from this projection/);
+    assert.doesNotMatch(bounded, /END-OF-SOURCE/);
+    const omitted = Number(/\+(\d+) chars omitted/.exec(bounded)![1]);
+    const marker = bounded.slice(bounded.lastIndexOf(' […accepted source continues'));
+    assert.equal(omitted, long.length - (bounded.length - marker.length), 'the marker names exactly what was cut');
+    assert.equal(bounded.slice(0, bounded.length - marker.length).at(-1) !== ' ', true, 'cut lands on a word boundary');
+    // The bounded text is admissible where the raw source was not.
+    const objective = (tsp.TurnSemanticProposalV1Schema.shape.goal as unknown as { unwrap(): { shape: { objective: { safeParse(v: unknown): { success: boolean } } } } });
+    const goalSchema = typeof objective.unwrap === 'function' ? objective.unwrap() : (objective as unknown as { shape: { objective: { safeParse(v: unknown): { success: boolean } } } });
+    assert.equal(goalSchema.shape.objective.safeParse(long).success, false);
+    assert.equal(goalSchema.shape.objective.safeParse(bounded).success, true);
+  });
+  test('plan_task composes the proposal objective through the bound (connection pin)', () => {
+    const source = nodeFs.readFileSync(nodePath.resolve('src/tools/plan-tools.ts'), 'utf8');
+    const start = source.indexOf('function proposalFromDraft(');
+    assert.ok(start > 0);
+    const body = source.slice(start, source.indexOf('\n}\n', start));
+    assert.match(body, /objective: boundedSemanticObjective\(input\.objective\)/);
+  });
+}

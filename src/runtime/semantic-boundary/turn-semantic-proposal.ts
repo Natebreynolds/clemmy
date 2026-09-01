@@ -22,7 +22,34 @@ const CONTEXT_CHECKED_SEMANTICS_SCOPE = 'semantics_only_no_execution_authority' 
 const CHECKED_TURN_SEMANTICS: unique symbol = Symbol('checked-turn-semantics');
 const checkedSemanticEnvelopes = new WeakSet<object>();
 
-const MAX_OBJECTIVE_CHARS = 8_000;
+export const MAX_SEMANTIC_OBJECTIVE_CHARS = 8_000;
+const MAX_OBJECTIVE_CHARS = MAX_SEMANTIC_OBJECTIVE_CHARS;
+
+/**
+ * The host composes `goal.objective` from the accepted source text; the model
+ * never authors it. A long accepted source (a pasted document, a system
+ * authoring brief with the artifact inlined) must still admit: the source
+ * event remains the turn's authority by digest, and the objective is its
+ * bounded semantic projection. Live 2026-09-01 a 51 KB authoring brief made
+ * every plan_task fail `schema_too_big:goal.objective` — an error nothing the
+ * model could draft would repair — and the loop floor stopped a converging
+ * turn. Cut at whitespace inside the budget and name what was omitted.
+ */
+export function boundedSemanticObjective(text: string): string {
+  if (text.length <= MAX_OBJECTIVE_CHARS) return text;
+  const marker = (omitted: number) => ` […accepted source continues: +${omitted} chars omitted from this projection; the full text remains the turn's authority]`;
+  let budget = MAX_OBJECTIVE_CHARS - marker(text.length).length;
+  let head = text.slice(0, budget);
+  const cut = head.search(/\s\S*$/);
+  if (cut >= Math.floor(budget * 0.8)) head = head.slice(0, cut);
+  head = head.trimEnd();
+  let suffix = marker(text.length - head.length);
+  while (head.length + suffix.length > MAX_OBJECTIVE_CHARS) {
+    head = head.slice(0, head.length - (head.length + suffix.length - MAX_OBJECTIVE_CHARS)).trimEnd();
+    suffix = marker(text.length - head.length);
+  }
+  return `${head}${suffix}`;
+}
 const MAX_CRITERIA = 64;
 const MAX_CRITERION_CHARS = 2_000;
 const MAX_OPEN_SLOTS = 8;
