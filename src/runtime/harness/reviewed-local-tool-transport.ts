@@ -395,8 +395,13 @@ export type PreparedReviewedLocalToolExecution =
       args: WorkspaceSetDataArguments;
     };
 
-function exactExpectedIdentity(
-  call: AttestedTransportCall,
+/**
+ * Does a sealed transport expectation name exactly this current reviewed
+ * observation? Shared by the transport leaf and the host storage carrier so
+ * both crossings apply one identity bar before any execution or probe.
+ */
+export function reviewedLocalExpectedIdentityMatches(
+  call: Pick<AttestedTransportCall, 'accountId' | 'expected'>,
   observed: ReviewedLocalToolObservation,
 ): boolean {
   const expected = call.expected;
@@ -430,7 +435,7 @@ export function prepareReviewedLocalToolExecution(
   call: AttestedTransportCall,
 ): PreparedReviewedLocalToolExecution {
   const observed = observeReviewedLocalTool(call.operationId);
-  if (!observed || !exactExpectedIdentity(call, observed)) {
+  if (!observed || !reviewedLocalExpectedIdentityMatches(call, observed)) {
     throw new Error('reviewed local execution identity changed before dispatch');
   }
   if (!reviewedLocalToolArgumentsMatch(observed, call.args)) {

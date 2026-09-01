@@ -27,11 +27,7 @@ import {
   requireAttestedTransport,
   type AttestedTransportCall,
 } from './implementation-artifacts/attested-transport.js';
-import {
-  observeReviewedLocalTool,
-  prepareReviewedLocalToolExecution,
-  reviewedLocalCapabilityManifest,
-} from './reviewed-local-tool-transport.js';
+import { peekHostLocalWriteCarrier } from './implementation-artifacts/host-local-write-carrier.js';
 
 export const SHEET_CREATE = 'GOOGLESHEETS_SHEET_FROM_JSON';
 export const SHEET_READBACK = 'GOOGLESHEETS_BATCH_GET';
@@ -659,10 +655,13 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
     // Reviewed Clementine-local mutations use the same immutable port and
-    // logical/physical workflow kernel as external calls. The attested local
-    // carrier revalidates the exact captured schema, registry execution
-    // contract, safe-mode arguments, and manifest identity before invoking the
-    // handler. No local tool name is interpreted here.
+    // logical/physical workflow kernel as external calls. The carrier that
+    // executes them — the attested transport leaf for file-system writes, or
+    // the host storage adapter the host bound for durable Workspace writes —
+    // revalidates the exact captured schema, registry execution contract,
+    // safe-mode arguments, and manifest identity before invoking the handler.
+    // No local tool name is interpreted here, and this artifact never imports
+    // host storage: the host binds its carrier beside the attested transport.
     if (sealed.providerKind === 'local_registry' && sealed.effect === 'local_write') {
       const compiled = authority?.canonicalArgs ?? (
         payload && typeof payload === 'object' && !Array.isArray(payload)
@@ -670,20 +669,17 @@ export function invokeForSealedManifest(manifest: CapabilityManifestV1): GraphNo
           : null
       );
       if (!compiled) throw new Error('reviewed local invoke requires canonical object arguments');
-      const prepared = prepareReviewedLocalToolExecution({
+      const hostStorage = peekHostLocalWriteCarrier()?.select({
         operationId: sealed.operationId,
-        args: compiled,
         accountId,
-        expected: expectedTransport(),
-      });
-      if (prepared.adapter === 'workspace_dataset_v1') {
-        // Lazy by design: SpaceStore's host-local commit proof imports this
-        // production adapter. A static Workspace carrier edge here would
-        // re-enter store/finalization while their defaults are still in TDZ.
-        // The literal import remains bundled into the shipped invoke artifact,
-        // so its executable bytes are still content-addressed and attested.
-        const carrier = await import('../../spaces/workspace-set-data-carrier.js');
-        return carrier.executeReviewedWorkspaceSetData(prepared.args);
+      }) ?? null;
+      if (hostStorage) {
+        return hostStorage.execute({
+          operationId: sealed.operationId,
+          args: compiled,
+          accountId,
+          expected: expectedTransport(),
+        });
       }
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
@@ -787,13 +783,7 @@ export function reconcileForSealedManifest(manifest: CapabilityManifestV1): Grap
   const operationId = manifest.operationId === BETA_PROVIDER_OPERATIONS.create
     ? SHEET_RECONCILE
     : manifest.operationId;
-  const reviewedLocal = manifest.providerKind === 'local_registry'
-    ? observeReviewedLocalTool(manifest.operationId)
-    : null;
-  const reviewedManifest = reviewedLocal ? reviewedLocalCapabilityManifest(reviewedLocal) : null;
-  const workspaceDatasetReconcile = reviewedLocal?.execution.adapter === 'workspace_dataset_v1'
-    && reviewedManifest !== null
-    && capabilityManifestDigest(reviewedManifest) === capabilityManifestDigest(manifest);
+  const expectedTransport = () => Object.freeze(attestedExpectationForManifest(manifest));
   return async ({ artifactId, intendedDigest }) => {
     if (
       !supported
@@ -804,12 +794,27 @@ export function reconcileForSealedManifest(manifest: CapabilityManifestV1): Grap
     }
     const id = artifactId?.trim() || '';
     if (!id || looksLikeContentDigest(id)) return { exists: false };
-    if (workspaceDatasetReconcile) {
-      // See the invoke-side note above. Reconcile is already async and keeps
-      // this storage module cold until an exact Workspace artifact is probed.
-      const carrier = await import('../../spaces/workspace-set-data-carrier.js');
-      const recovered = carrier.reconcileWorkspaceDatasetArtifact(id);
-      if (!recovered.exists || recovered.contentDigest !== intendedDigest) return { exists: false };
+    // Same boundary as the invoke side: a reviewed local write whose storage
+    // the host owns is probed through the host-bound carrier, which re-checks
+    // the sealed manifest identity before touching storage. Everything else
+    // reconciles through the attested transport.
+    const hostStorage = manifest.providerKind === 'local_registry' && manifest.effect === 'local_write'
+      ? peekHostLocalWriteCarrier()?.select({ operationId: manifest.operationId, accountId }) ?? null
+      : null;
+    if (hostStorage) {
+      const recovered = await hostStorage.reconcile({
+        artifactId: id,
+        accountId,
+        operationId: manifest.operationId,
+        expected: expectedTransport(),
+      });
+      if (
+        !recovered.exists
+        || recovered.artifactId !== id
+        || !recovered.handle
+        || !recovered.receipt
+        || recovered.contentDigest !== intendedDigest
+      ) return { exists: false };
       return {
         exists: true,
         id: recovered.artifactId,
