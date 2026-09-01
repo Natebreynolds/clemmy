@@ -781,7 +781,16 @@ export class FallbackModel implements Model {
     const globallyAlive = compatible.filter((target) => exclusionReason(target) === null);
     const runAlive = globallyAlive.filter((t) => !this.opts.runSilencedLabels?.has(t.label));
     let chain: FallbackTarget[];
-    if (runAlive.length > 0) chain = runAlive;
+    // Brains that went silent earlier in THIS run are demoted behind the
+    // run-alive ones, never dropped: a globally alive brain is still a brain.
+    // Live 2026-09-01 (platform-49 on GLM, run 4efef7): the pinned brain was
+    // in silent cooldown, the Claude rescue had gone silent once in the run,
+    // so the chain shrank to [codex] — whose weekly quota was exhausted — and a
+    // 17-minute step with 27 settled reads died on that single 429 while a
+    // brain that had carried the previous turns sat unused.
+    if (runAlive.length > 0) {
+      chain = [...runAlive, ...globallyAlive.filter((t) => !runAlive.includes(t))];
+    }
     // If every compatible lane failed in this run, probe again rather than
     // manufacturing a zero-brain chain. The last failure remains authoritative.
     else chain = globallyAlive.length > 0 ? globallyAlive : compatible;

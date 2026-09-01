@@ -975,6 +975,36 @@ test('silent cooldown: a successful retry clears prior silent-failure history', 
   }
 });
 
+test('a brain silenced earlier in the run is demoted to the chain tail, never dropped: it still rescues when every run-alive brain fails', async () => {
+  // Live 2026-09-01 (platform-49 on GLM, run 4efef7): the pinned brain was in
+  // silent cooldown and the Claude rescue had gone silent once earlier in the
+  // run, so the live chain shrank to [codex] whose weekly quota was exhausted.
+  // A 17-minute step with 27 settled reads died on that one 429 while the
+  // brain that had carried the previous turns sat unused.
+  const runSilencedLabels = new Set<string>(['demoted-rescue']);
+  let primaryCalls = 0, quotaCalls = 0, demotedCalls = 0;
+  const primary = model({ getResponse: async () => {
+    primaryCalls += 1;
+    throw new BoundaryError({ kind: 'model.transport_timeout', retryable: true, userMessage: '', operatorMessage: 'primary stayed silent' });
+  } });
+  const quotaExhausted = model({ getResponse: async () => {
+    quotaCalls += 1;
+    throw new BoundaryError({ kind: 'model.rate_limited', retryable: true, userMessage: '', operatorMessage: 'usage limit reached' });
+  } });
+  const demoted = model({ getResponse: async () => {
+    demotedCalls += 1;
+    return resp('rescued by the demoted brain');
+  } });
+  const res = await withModelFallback(
+    [target('tail-primary', primary), target('tail-quota', quotaExhausted), target('demoted-rescue', demoted)],
+    { runSilencedLabels, falloverOn429: true },
+  ).getResponse(req());
+  assert.ok(JSON.stringify(res).includes('rescued by the demoted brain'));
+  assert.equal(primaryCalls, 1);
+  assert.equal(quotaCalls, 1);
+  assert.equal(demotedCalls, 1, 'the run-silenced brain is tried last, not never');
+});
+
 test('silent cooldown: when EVERY brain is silenced, the full chain is still probed', async () => {
   const { reviveDeadBrains, isBrainSilenced } = await import('./fallback-model.js');
   reviveDeadBrains();
