@@ -5,7 +5,9 @@ import Database from 'better-sqlite3';
 import {
   PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
   PLAN_TASK_ACTIVATION_RECEIPT_INSERT_TRIGGER,
+  PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE,
   createHostPlannedResolutionCoexistenceSchema,
+  createPlanTaskPreparationCheckpointSchema,
   refreshPlanTaskActivationReceiptInsertTrigger,
 } from './host-planned-resolution-coexistence.js';
 
@@ -351,6 +353,35 @@ function insertReceipt(db: Database.Database): void {
   );
 }
 
+function insertCheckpoint(
+  db: Database.Database,
+  deliveryOwner: 'durable_conversation' | 'carrier_owned' = 'carrier_owned',
+): void {
+  db.prepare(`
+    INSERT INTO ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       checkpoint_version, plan_argument_digest, graph_event_id, graph_id,
+       graph_hash, contract_id, preamble_event_id, preamble_event_digest,
+       delivery_key, delivery_owner, recorded_at)
+    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    IDS.session,
+    IDS.sourceSeq,
+    IDS.acceptedTask,
+    IDS.logical,
+    IDS.argumentDigest,
+    IDS.graphEvent,
+    IDS.graph,
+    IDS.graphHash,
+    IDS.contract,
+    IDS.preamble,
+    IDS.preambleDigest,
+    IDS.deliveryKey,
+    deliveryOwner,
+    '2026-08-30T00:00:00.000Z',
+  );
+}
+
 test('settled exact plan receipt inserts on restart and can cross the activation CAS', () => {
   const db = seedPlan({ state: 'settled' });
   try {
@@ -441,6 +472,50 @@ test('v57 refresh helper replaces the installed trigger idempotently', () => {
     assert.match(trigger.sql, /call\.state = 'settled'/);
     assert.match(trigger.sql, /json_extract\(json_extract\(result\.raw_payload_json/);
     insertReceipt(db);
+  } finally {
+    db.close();
+  }
+});
+
+test('v71 checkpoint lets an interrupted host-only plan bind its exact later receipt', () => {
+  const db = seedPlan({ state: 'settled' });
+  try {
+    db.prepare(`UPDATE logical_tool_calls SET outcome_kind = 'unknown'`).run();
+    db.prepare(`UPDATE logical_call_settlements SET outcome_kind = 'unknown'`).run();
+    db.prepare(`UPDATE physical_dispatches SET state = 'unknown'`).run();
+    db.prepare(`UPDATE logical_call_settlement_crossings SET terminal_state = 'unknown'`).run();
+    createPlanTaskPreparationCheckpointSchema(db);
+
+    assert.throws(
+      () => insertReceipt(db),
+      /plan_task receipt requires exact host/,
+      'an interrupted settlement alone cannot acquire delivery authority',
+    );
+    insertCheckpoint(db);
+    insertReceipt(db);
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE}
+    `).get() as { n: number }).n, 1);
+    assert.equal((db.prepare(`
+      SELECT outcome_kind FROM logical_call_settlements
+    `).get() as { outcome_kind: string }).outcome_kind, 'unknown', 'recovery never fabricates success');
+  } finally {
+    db.close();
+  }
+});
+
+test('v71 presentation owner prevents a carrier receipt from substituting for the durable lane', () => {
+  const db = seedPlan({ state: 'open' });
+  try {
+    createPlanTaskPreparationCheckpointSchema(db);
+    insertCheckpoint(db, 'durable_conversation');
+    assert.throws(
+      () => insertReceipt(db),
+      /plan_task receipt requires exact host/,
+    );
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE}
+    `).get() as { n: number }).n, 0);
   } finally {
     db.close();
   }

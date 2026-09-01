@@ -9,8 +9,15 @@
 import type Database from 'better-sqlite3';
 
 export const PLAN_TASK_ACTIVATION_RECEIPTS_TABLE = 'plan_task_activation_receipts' as const;
+export const PLAN_TASK_BINDING_SEAL_INTENTS_TABLE =
+  'plan_task_binding_seal_intents' as const;
+export const PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE =
+  'plan_task_preparation_checkpoints' as const;
+export const PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE =
+  'plan_task_binding_seal_recovery_cursor' as const;
 
 export type HostPlannedResolutionProofPhase = 'insert' | 'existing';
+export type HostPlannedResolutionProofProtocol = 'legacy_success' | 'checkpoint_v71';
 
 /** One SQL predicate is embedded by the schema trigger and queried by every
  * runtime verifier. `resolutionRef` is an internal SQL alias (`NEW` or `r`),
@@ -18,6 +25,7 @@ export type HostPlannedResolutionProofPhase = 'insert' | 'existing';
 export function hostPlannedResolutionProofSql(
   resolutionRef: 'NEW' | 'r',
   phase: HostPlannedResolutionProofPhase,
+  protocol: HostPlannedResolutionProofProtocol = 'checkpoint_v71',
 ): string {
   const rootPhase = phase === 'insert'
     ? "root.state = 'open'"
@@ -25,6 +33,95 @@ export function hostPlannedResolutionProofSql(
   const taskPhase = phase === 'insert'
     ? "task.state != 'conflict'"
     : "task.state IN ('armed','manifested_verifying','terminal','conflict')";
+  const checkpointJoin = protocol === 'checkpoint_v71'
+    ? `JOIN ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE} checkpoint
+        ON checkpoint.session_id = receipt.session_id
+       AND checkpoint.source_user_seq = receipt.source_user_seq
+       AND checkpoint.accepted_task_id = receipt.accepted_task_id
+       AND checkpoint.logical_tool_call_id = receipt.logical_tool_call_id`
+    : '';
+  const legacySettlementJoins = protocol === 'legacy_success'
+    ? `JOIN logical_call_settlements settlement
+        ON settlement.session_id = call.session_id
+       AND settlement.source_user_seq = call.source_user_seq
+       AND settlement.logical_tool_call_id = call.logical_tool_call_id
+      JOIN durable_result_handles result
+        ON result.handle_id = settlement.result_handle_id
+       AND result.session_id = call.session_id
+       AND result.source_user_seq = call.source_user_seq
+       AND result.accepted_task_id = call.accepted_task_id
+       AND result.logical_tool_call_id = call.logical_tool_call_id
+       AND result.tool_name = call.tool_name
+       AND result.argument_digest = call.argument_digest
+      JOIN physical_dispatches physical
+        ON physical.session_id = result.session_id
+       AND physical.source_user_seq = result.source_user_seq
+       AND physical.logical_tool_call_id = result.logical_tool_call_id
+       AND physical.physical_dispatch_id = result.physical_dispatch_id
+      JOIN logical_call_settlement_crossings crossing
+        ON crossing.session_id = result.session_id
+       AND crossing.source_user_seq = result.source_user_seq
+       AND crossing.logical_tool_call_id = result.logical_tool_call_id
+       AND crossing.physical_dispatch_id = result.physical_dispatch_id`
+    : '';
+  const settlementProof = protocol === 'legacy_success'
+    ? `AND call.state = 'settled'
+       AND call.outcome_kind = 'succeeded'
+       AND call.settlement_event_id = settlement.settlement_event_id
+       AND settlement.protocol_version = 1
+       AND settlement.execution_kind = 'local_execution'
+       AND settlement.outcome_kind = 'succeeded'
+       AND settlement.business_call = 0
+       AND settlement.mutating = 0
+       AND settlement.requirement_id IS NULL
+       AND settlement.physical_crossing_count = 0
+       AND settlement.host_crossing_count = 1
+       AND settlement.crossing_authority_version = 2
+       AND result.scope_kind = 'authoritative'
+       AND result.success = 1
+       AND result.rejection_reason IS NULL
+       AND result.raw_payload_json IS NOT NULL
+       AND result.raw_payload_sha256 IS NOT NULL
+       AND json_valid(result.raw_payload_json)
+       AND json_type(result.raw_payload_json, '$') = 'text'
+       AND json_valid(json_extract(result.raw_payload_json, '$'))
+       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.ok') = 1
+       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.acceptedTaskId') = root.accepted_task_id
+       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.graphId') = task.graph_id
+       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.graphHash') = task.graph_hash
+       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.contractId') = contract.contract_id
+       AND physical.accepted_task_id = root.accepted_task_id
+       AND physical.tool_name = 'plan_task'
+       AND physical.argument_digest = call.argument_digest
+       AND physical.state = 'returned'
+       AND physical.execution_site = 'host'
+       AND crossing.ordinal = physical.ordinal
+       AND crossing.tool_name = physical.tool_name
+       AND crossing.argument_digest = physical.argument_digest
+       AND crossing.terminal_state = 'returned'
+       AND crossing.execution_site = 'host'
+       AND (SELECT COUNT(*)
+              FROM logical_call_settlement_crossings crossing_count
+             WHERE crossing_count.session_id = call.session_id
+               AND crossing_count.source_user_seq = call.source_user_seq
+               AND crossing_count.logical_tool_call_id = call.logical_tool_call_id) = 1`
+    : `AND checkpoint.checkpoint_version = 1
+       AND checkpoint.plan_argument_digest = call.argument_digest
+       AND checkpoint.graph_event_id = task.graph_event_id
+       AND checkpoint.graph_id = task.graph_id
+       AND checkpoint.graph_hash = task.graph_hash
+       AND checkpoint.contract_id = contract.contract_id
+       AND checkpoint.preamble_event_id = receipt.preamble_event_id
+       AND checkpoint.preamble_event_digest = receipt.preamble_event_digest
+       AND checkpoint.delivery_key = receipt.delivery_key
+       AND (
+         (checkpoint.delivery_owner = 'durable_conversation'
+           AND receipt.transport_target = 'durable_conversation')
+         OR
+         (checkpoint.delivery_owner IN ('carrier_owned','legacy_unknown')
+           AND receipt.transport_target != 'durable_conversation')
+       )
+       AND ${checkpointBackedSettledPlanTaskProofSql()}`;
   return `EXISTS (
     SELECT 1
       FROM accepted_turn_call_authorities root
@@ -48,6 +145,7 @@ export function hostPlannedResolutionProofSql(
        AND receipt.graph_id = task.graph_id
        AND receipt.graph_hash = task.graph_hash
        AND receipt.contract_id = contract.contract_id
+      ${checkpointJoin}
       JOIN events source
         ON source.session_id = root.session_id
        AND source.seq = root.source_user_seq
@@ -67,28 +165,7 @@ export function hostPlannedResolutionProofSql(
        AND call.accepted_task_id = root.accepted_task_id
        AND call.logical_tool_call_id = receipt.logical_tool_call_id
        AND call.argument_digest = receipt.plan_argument_digest
-      JOIN logical_call_settlements settlement
-        ON settlement.session_id = call.session_id
-       AND settlement.source_user_seq = call.source_user_seq
-       AND settlement.logical_tool_call_id = call.logical_tool_call_id
-      JOIN durable_result_handles result
-        ON result.handle_id = settlement.result_handle_id
-       AND result.session_id = call.session_id
-       AND result.source_user_seq = call.source_user_seq
-       AND result.accepted_task_id = call.accepted_task_id
-       AND result.logical_tool_call_id = call.logical_tool_call_id
-       AND result.tool_name = call.tool_name
-       AND result.argument_digest = call.argument_digest
-      JOIN physical_dispatches physical
-        ON physical.session_id = result.session_id
-       AND physical.source_user_seq = result.source_user_seq
-       AND physical.logical_tool_call_id = result.logical_tool_call_id
-       AND physical.physical_dispatch_id = result.physical_dispatch_id
-      JOIN logical_call_settlement_crossings crossing
-        ON crossing.session_id = result.session_id
-       AND crossing.source_user_seq = result.source_user_seq
-       AND crossing.logical_tool_call_id = result.logical_tool_call_id
-       AND crossing.physical_dispatch_id = result.physical_dispatch_id
+      ${legacySettlementJoins}
      WHERE root.session_id = ${resolutionRef}.session_id
        AND root.source_user_seq = ${resolutionRef}.source_user_seq
        AND root.accepted_task_id = ${resolutionRef}.accepted_task_id
@@ -175,55 +252,119 @@ export function hostPlannedResolutionProofSql(
               WHERE transport_field.key NOT IN ('version','deliveryKey','eventId','eventDigest','surface','target')
            )
        AND call.tool_name = 'plan_task'
-       AND call.state = 'settled'
-       AND call.outcome_kind = 'succeeded'
-       AND call.settlement_event_id = settlement.settlement_event_id
-       AND settlement.protocol_version = 1
-       AND settlement.execution_kind = 'local_execution'
-       AND settlement.outcome_kind = 'succeeded'
-       AND settlement.business_call = 0
-       AND settlement.mutating = 0
-       AND settlement.requirement_id IS NULL
-       AND settlement.physical_crossing_count = 0
-       AND settlement.host_crossing_count = 1
-       AND settlement.crossing_authority_version = 2
-       AND result.scope_kind = 'authoritative'
-       AND result.success = 1
-       AND result.rejection_reason IS NULL
-       AND result.raw_payload_json IS NOT NULL
-       AND result.raw_payload_sha256 IS NOT NULL
-       AND json_valid(result.raw_payload_json)
-       AND json_type(result.raw_payload_json, '$') = 'text'
-       AND json_valid(json_extract(result.raw_payload_json, '$'))
-       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.ok') = 1
-       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.acceptedTaskId') = root.accepted_task_id
-       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.graphId') = task.graph_id
-       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.graphHash') = task.graph_hash
-       AND json_extract(json_extract(result.raw_payload_json, '$'), '$.contractId') = contract.contract_id
-       AND physical.accepted_task_id = root.accepted_task_id
-       AND physical.tool_name = 'plan_task'
-       AND physical.argument_digest = call.argument_digest
-       AND physical.state = 'returned'
-       AND physical.execution_site = 'host'
-       AND crossing.ordinal = physical.ordinal
-       AND crossing.tool_name = physical.tool_name
-       AND crossing.argument_digest = physical.argument_digest
-       AND crossing.terminal_state = 'returned'
-       AND crossing.execution_site = 'host'
+       ${settlementProof}
        AND (SELECT COUNT(*)
               FROM ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE} receipt_count
              WHERE receipt_count.session_id = root.session_id
                AND receipt_count.source_user_seq = root.source_user_seq) = 1
-       AND (SELECT COUNT(*)
-              FROM logical_call_settlement_crossings crossing_count
-             WHERE crossing_count.session_id = call.session_id
-               AND crossing_count.source_user_seq = call.source_user_seq
-               AND crossing_count.logical_tool_call_id = call.logical_tool_call_id) = 1
   )`;
 }
 
 export const PLAN_TASK_ACTIVATION_RECEIPT_INSERT_TRIGGER =
   'trg_plan_task_activation_receipt_exact_insert' as const;
+export const PLAN_TASK_PREPARATION_CHECKPOINT_INSERT_TRIGGER =
+  'trg_plan_task_preparation_checkpoint_exact_insert' as const;
+export const PLAN_TASK_BINDING_SEAL_INTENT_INSERT_TRIGGER =
+  'trg_plan_task_binding_seal_intent_exact_insert' as const;
+
+/**
+ * A checkpoint-backed plan call may have settled non-successfully only after
+ * all semantic work was already frozen and the preamble checkpoint committed.
+ * Prove that this was still one host-local, nonbusiness, nonmutating control
+ * crossing. A normal `succeeded` settlement retains the stronger redeemed
+ * ok:true result proof; an interrupted/transport-failed settlement never gets
+ * rewritten or laundered into success.
+ */
+function checkpointBackedSettledPlanTaskProofSql(): string {
+  return `(call.state = 'settled'
+    AND EXISTS (
+      SELECT 1
+        FROM logical_call_settlements settlement
+        JOIN physical_dispatches physical
+          ON physical.session_id = settlement.session_id
+         AND physical.source_user_seq = settlement.source_user_seq
+         AND physical.logical_tool_call_id = settlement.logical_tool_call_id
+        JOIN logical_call_settlement_crossings crossing
+          ON crossing.session_id = physical.session_id
+         AND crossing.source_user_seq = physical.source_user_seq
+         AND crossing.logical_tool_call_id = physical.logical_tool_call_id
+         AND crossing.physical_dispatch_id = physical.physical_dispatch_id
+       WHERE settlement.session_id = call.session_id
+         AND settlement.source_user_seq = call.source_user_seq
+         AND settlement.logical_tool_call_id = call.logical_tool_call_id
+         AND call.settlement_event_id = settlement.settlement_event_id
+         AND call.outcome_kind = settlement.outcome_kind
+         AND settlement.protocol_version = 1
+         AND settlement.execution_kind = 'local_execution'
+         AND settlement.business_call = 0
+         AND settlement.mutating = 0
+         AND settlement.requirement_id IS NULL
+         AND settlement.physical_crossing_count = 0
+         AND settlement.host_crossing_count = 1
+         AND settlement.crossing_authority_version = 2
+         AND settlement.outcome_kind != 'uncertain_write'
+         AND physical.accepted_task_id = call.accepted_task_id
+         AND physical.tool_name = 'plan_task'
+         AND physical.argument_digest = call.argument_digest
+         AND physical.state IN ('returned','threw','timed_out','cancelled','unknown')
+         AND physical.execution_site = 'host'
+         AND crossing.ordinal = physical.ordinal
+         AND crossing.tool_name = physical.tool_name
+         AND crossing.argument_digest = physical.argument_digest
+         AND crossing.terminal_state = physical.state
+         AND crossing.execution_site = 'host'
+         AND (SELECT COUNT(*)
+                FROM logical_call_settlements settlement_count
+               WHERE settlement_count.session_id = call.session_id
+                 AND settlement_count.source_user_seq = call.source_user_seq
+                 AND settlement_count.logical_tool_call_id = call.logical_tool_call_id) = 1
+         AND (SELECT COUNT(*)
+                FROM logical_call_settlement_crossings crossing_count
+               WHERE crossing_count.session_id = call.session_id
+                 AND crossing_count.source_user_seq = call.source_user_seq
+                 AND crossing_count.logical_tool_call_id = call.logical_tool_call_id) = 1
+         AND (SELECT COUNT(*)
+                FROM physical_dispatches physical_count
+               WHERE physical_count.session_id = call.session_id
+                 AND physical_count.source_user_seq = call.source_user_seq
+                 AND physical_count.logical_tool_call_id = call.logical_tool_call_id) = 1
+         AND (
+           settlement.outcome_kind != 'succeeded'
+           OR EXISTS (
+             SELECT 1
+               FROM durable_result_handles result
+              WHERE result.handle_id = settlement.result_handle_id
+                AND result.session_id = call.session_id
+                AND result.source_user_seq = call.source_user_seq
+                AND result.accepted_task_id = call.accepted_task_id
+                AND result.logical_tool_call_id = call.logical_tool_call_id
+                AND result.physical_dispatch_id = physical.physical_dispatch_id
+                AND result.tool_name = call.tool_name
+                AND result.argument_digest = call.argument_digest
+                AND result.scope_kind = 'authoritative'
+                AND result.success = 1
+                AND result.rejection_reason IS NULL
+                AND result.raw_payload_json IS NOT NULL
+                AND result.raw_payload_sha256 IS NOT NULL
+                AND json_valid(result.raw_payload_json)
+                AND json_type(result.raw_payload_json, '$') = 'text'
+                AND json_valid(json_extract(result.raw_payload_json, '$'))
+                AND json_type(json_extract(result.raw_payload_json, '$'), '$') = 'object'
+                AND json_extract(json_extract(result.raw_payload_json, '$'), '$.ok') = 1
+                AND json_extract(json_extract(result.raw_payload_json, '$'), '$.acceptedTaskId') = root.accepted_task_id
+                AND json_extract(json_extract(result.raw_payload_json, '$'), '$.graphId') = task.graph_id
+                AND json_extract(json_extract(result.raw_payload_json, '$'), '$.graphHash') = task.graph_hash
+                AND json_extract(json_extract(result.raw_payload_json, '$'), '$.contractId') = contract.contract_id
+                AND (SELECT COUNT(*)
+                       FROM durable_result_handles result_count
+                      WHERE result_count.scope_kind = 'authoritative'
+                        AND result_count.session_id = call.session_id
+                        AND result_count.source_user_seq = call.source_user_seq
+                        AND result_count.logical_tool_call_id = call.logical_tool_call_id) = 1
+           )
+         )
+    ))`;
+}
 
 /** A delivery receipt is normally recorded while plan_task is still open. A
  * restart may instead find the exact local control already settled. That
@@ -317,7 +458,40 @@ function planTaskReceiptCallStateProofSql(): string {
   ))`;
 }
 
-function planTaskActivationReceiptInsertTriggerSql(ifNotExists: boolean): string {
+function planTaskActivationReceiptInsertTriggerSql(
+  ifNotExists: boolean,
+  checkpointBacked = false,
+): string {
+  const checkpointJoin = checkpointBacked
+    ? `JOIN ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE} checkpoint
+          ON checkpoint.session_id = root.session_id
+         AND checkpoint.source_user_seq = root.source_user_seq
+         AND checkpoint.accepted_task_id = root.accepted_task_id
+         AND checkpoint.logical_tool_call_id = NEW.logical_tool_call_id`
+    : '';
+  const checkpointProof = checkpointBacked
+    ? `AND checkpoint.checkpoint_version = 1
+         AND checkpoint.plan_argument_digest = NEW.plan_argument_digest
+         AND checkpoint.graph_event_id = NEW.graph_event_id
+         AND checkpoint.graph_id = NEW.graph_id
+         AND checkpoint.graph_hash = NEW.graph_hash
+         AND checkpoint.contract_id = NEW.contract_id
+         AND checkpoint.preamble_event_id = NEW.preamble_event_id
+         AND checkpoint.preamble_event_digest = NEW.preamble_event_digest
+         AND checkpoint.delivery_key = NEW.delivery_key
+         AND (
+           (checkpoint.delivery_owner = 'durable_conversation'
+             AND NEW.delivery_status = 'delivered'
+             AND NEW.delivery_reason IS NULL
+             AND NEW.transport_target = 'durable_conversation')
+           OR
+           (checkpoint.delivery_owner IN ('carrier_owned','legacy_unknown')
+             AND NEW.transport_target != 'durable_conversation')
+         )`
+    : '';
+  const callStateProof = checkpointBacked
+    ? `(call.state = 'open' OR ${checkpointBackedSettledPlanTaskProofSql()})`
+    : planTaskReceiptCallStateProofSql();
   return `CREATE TRIGGER ${ifNotExists ? 'IF NOT EXISTS ' : ''}${PLAN_TASK_ACTIVATION_RECEIPT_INSERT_TRIGGER}
     BEFORE INSERT ON ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE}
     WHEN NOT EXISTS (
@@ -332,6 +506,7 @@ function planTaskActivationReceiptInsertTriggerSql(ifNotExists: boolean): string
          AND contract.source_user_seq = task.source_user_seq
          AND contract.accepted_task_id = task.accepted_task_id
          AND contract.contract_id = task.work_contract_id
+        ${checkpointJoin}
         JOIN logical_tool_calls call
           ON call.session_id = root.session_id
          AND call.source_user_seq = root.source_user_seq
@@ -370,9 +545,10 @@ function planTaskActivationReceiptInsertTriggerSql(ifNotExists: boolean): string
          AND contract.graph_event_id = NEW.graph_event_id
          AND contract.graph_id = NEW.graph_id
          AND contract.graph_hash = NEW.graph_hash
+         ${checkpointProof}
          AND call.tool_name = 'plan_task'
          AND call.argument_digest = NEW.plan_argument_digest
-         AND ${planTaskReceiptCallStateProofSql()}
+         AND ${callStateProof}
          AND source.role = 'user'
          AND source.type = 'user_input_received'
          AND source.turn = root.source_turn
@@ -449,6 +625,19 @@ export function refreshPlanTaskActivationReceiptInsertTrigger(db: Database.Datab
   `);
 }
 
+/** v71 wall: the immutable pre-delivery checkpoint is the only authority that
+ * lets a host-only interrupted settlement later acquire its exact delivery
+ * receipt. The legacy v57 refresher above remains byte-stable for historical
+ * migration rehearsal. */
+export function refreshCheckpointBackedPlanTaskActivationReceiptInsertTrigger(
+  db: Database.Database,
+): void {
+  db.exec(`
+    DROP TRIGGER IF EXISTS ${PLAN_TASK_ACTIVATION_RECEIPT_INSERT_TRIGGER};
+    ${planTaskActivationReceiptInsertTriggerSql(false, true)}
+  `);
+}
+
 /** Create the normalized immutable receipt and its insertion-time integrity
  * wall. The preamble delivery event remains the public/audit mirror; this row
  * is the compact relational evidence consumed by later DB-only predicates. */
@@ -503,6 +692,281 @@ export function createHostPlannedResolutionCoexistenceSchema(db: Database.Databa
     END;
   `);
   refreshPlanTaskActivationReceiptInsertTrigger(db);
+}
+
+function planTaskPreparationCheckpointInsertTriggerSql(ifNotExists: boolean): string {
+  return `CREATE TRIGGER ${ifNotExists ? 'IF NOT EXISTS ' : ''}${PLAN_TASK_PREPARATION_CHECKPOINT_INSERT_TRIGGER}
+    BEFORE INSERT ON ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
+    WHEN NOT EXISTS (
+      SELECT 1
+        FROM accepted_turn_call_authorities root
+        JOIN accepted_task_authority task
+          ON task.session_id = root.session_id
+         AND task.source_user_seq = root.source_user_seq
+         AND task.accepted_task_id = root.accepted_task_id
+        JOIN accepted_task_work_contracts contract
+          ON contract.session_id = task.session_id
+         AND contract.source_user_seq = task.source_user_seq
+         AND contract.accepted_task_id = task.accepted_task_id
+         AND contract.contract_id = task.work_contract_id
+        JOIN ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE} intent
+          ON intent.session_id = root.session_id
+         AND intent.source_user_seq = root.source_user_seq
+         AND intent.accepted_task_id = root.accepted_task_id
+         AND intent.logical_tool_call_id = NEW.logical_tool_call_id
+        JOIN logical_tool_calls call
+          ON call.session_id = root.session_id
+         AND call.source_user_seq = root.source_user_seq
+         AND call.accepted_task_id = root.accepted_task_id
+         AND call.logical_tool_call_id = NEW.logical_tool_call_id
+        JOIN events source
+          ON source.session_id = root.session_id
+         AND source.seq = root.source_user_seq
+         AND source.id = root.source_event_id
+        JOIN events graph
+          ON graph.session_id = root.session_id
+         AND graph.id = task.graph_event_id
+        JOIN events preamble
+          ON preamble.session_id = root.session_id
+         AND preamble.id = NEW.preamble_event_id
+       WHERE root.session_id = NEW.session_id
+         AND root.source_user_seq = NEW.source_user_seq
+         AND root.accepted_task_id = NEW.accepted_task_id
+         AND root.authority_kind = 'host_v1'
+         AND root.engine_version = 'host_v1'
+         AND (
+           root.state = 'open'
+           OR (task.expected_work_required = 1 AND root.state IN ('closed','conflict'))
+         )
+         AND root.graph_event_id IS NULL
+         AND root.graph_hash IS NULL
+         AND task.authority_protocol = 1
+         AND (task.state != 'conflict' OR task.expected_work_required = 1)
+         AND task.expected_work_required IN (0, 1)
+         AND task.graph_event_id = NEW.graph_event_id
+         AND task.graph_id = NEW.graph_id
+         AND task.graph_hash = NEW.graph_hash
+         AND task.work_contract_id = NEW.contract_id
+         AND contract.contract_version = 1
+         AND contract.planner_source = 'structured_model'
+         AND contract.graph_event_id = NEW.graph_event_id
+         AND contract.graph_id = NEW.graph_id
+         AND contract.graph_hash = NEW.graph_hash
+         AND intent.intent_version = 1
+         AND intent.plan_argument_digest = NEW.plan_argument_digest
+         AND intent.graph_event_id = NEW.graph_event_id
+         AND intent.graph_id = NEW.graph_id
+         AND intent.graph_hash = NEW.graph_hash
+         AND intent.contract_id = NEW.contract_id
+         AND intent.preamble_text = json_extract(preamble.data_json, '$.text')
+         AND intent.delivery_owner = NEW.delivery_owner
+         AND call.tool_name = 'plan_task'
+         AND call.argument_digest = NEW.plan_argument_digest
+         AND (call.state = 'open' OR ${checkpointBackedSettledPlanTaskProofSql()})
+         AND source.role = 'user'
+         AND source.type = 'user_input_received'
+         AND source.turn = root.source_turn
+         AND graph.role = 'system'
+         AND graph.type = 'turn_graph_compiled'
+         AND graph.parent_event_id = source.id
+         AND graph.turn = source.turn
+         AND json_extract(graph.data_json, '$.route') = 'act'
+         AND json_extract(graph.data_json, '$.sourceUserSeq') = root.source_user_seq
+         AND json_extract(graph.data_json, '$.graphId') = NEW.graph_id
+         AND json_extract(graph.data_json, '$.graphHash') = NEW.graph_hash
+         AND preamble.role = 'Clem'
+         AND preamble.type = 'conversation_preamble'
+         AND preamble.parent_event_id = source.id
+         AND preamble.turn = source.turn
+         AND json_extract(preamble.data_json, '$.version') = 1
+         AND json_extract(preamble.data_json, '$.kind') = 'pre_execution'
+         AND json_extract(preamble.data_json, '$.sourceUserSeq') = root.source_user_seq
+         AND json_type(preamble.data_json, '$.text') = 'text'
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'plan_task checkpoint requires exact host, graph, contract, call, and preamble authority');
+    END;`;
+}
+
+function planTaskBindingSealIntentInsertTriggerSql(ifNotExists: boolean): string {
+  return `CREATE TRIGGER ${ifNotExists ? 'IF NOT EXISTS ' : ''}${PLAN_TASK_BINDING_SEAL_INTENT_INSERT_TRIGGER}
+    BEFORE INSERT ON ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+    WHEN NOT EXISTS (
+      SELECT 1
+        FROM accepted_turn_call_authorities root
+        JOIN logical_tool_calls call
+          ON call.session_id = root.session_id
+         AND call.source_user_seq = root.source_user_seq
+         AND call.accepted_task_id = root.accepted_task_id
+         AND call.logical_tool_call_id = NEW.logical_tool_call_id
+        JOIN events source
+          ON source.session_id = root.session_id
+         AND source.seq = root.source_user_seq
+         AND source.id = root.source_event_id
+        JOIN events graph
+          ON graph.session_id = root.session_id
+         AND graph.id = NEW.graph_event_id
+       WHERE root.session_id = NEW.session_id
+         AND root.source_user_seq = NEW.source_user_seq
+         AND root.accepted_task_id = NEW.accepted_task_id
+         AND root.authority_protocol = 1
+         AND root.authority_kind = 'host_v1'
+         AND root.engine_version = 'host_v1'
+         AND root.surface_version = 'configured_harness_capability_surface_v1'
+         AND root.state IN ('open','closed','conflict')
+         AND root.graph_event_id IS NULL
+         AND root.graph_hash IS NULL
+         AND call.tool_name = 'plan_task'
+         AND call.argument_digest = NEW.plan_argument_digest
+         AND source.role = 'user'
+         AND source.type = 'user_input_received'
+         AND source.turn = root.source_turn
+         AND graph.role = 'system'
+         AND graph.type = 'turn_graph_compiled'
+         AND graph.parent_event_id = source.id
+         AND graph.turn = source.turn
+         AND json_extract(graph.data_json, '$.sourceUserSeq') = root.source_user_seq
+         AND json_extract(graph.data_json, '$.route') = 'act'
+         AND json_extract(graph.data_json, '$.graphId') = NEW.graph_id
+         AND json_extract(graph.data_json, '$.graphHash') = NEW.graph_hash
+         AND (
+           NEW.intent_origin = 'legacy_backfill'
+           OR (
+             call.state = 'open'
+             AND json_extract(graph.data_json, '$.graph.graphId') = NEW.graph_id
+             AND json_extract(graph.data_json, '$.graph.compiler.graphHash') = NEW.graph_hash
+             AND json_extract(graph.data_json, '$.graph.source.inputHash') = NEW.semantic_input_digest
+             AND json_type(graph.data_json, '$.graph.workTopology.topology.operations') = 'array'
+             AND json_array_length(NEW.operation_ids_json) =
+                 json_array_length(graph.data_json, '$.graph.workTopology.topology.operations')
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(NEW.operation_ids_json) requested
+                WHERE json_type(NEW.operation_ids_json, '$[' || requested.key || ']') != 'text'
+                   OR NOT EXISTS (
+                     SELECT 1
+                       FROM json_each(graph.data_json, '$.graph.workTopology.topology.operations') operation
+                      WHERE json_extract(operation.value, '$.id') = requested.value
+                   )
+             )
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM json_each(graph.data_json, '$.graph.workTopology.topology.operations') operation
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM json_each(NEW.operation_ids_json) requested
+                   WHERE requested.value = json_extract(operation.value, '$.id')
+                )
+             )
+             AND (SELECT COUNT(DISTINCT value) FROM json_each(NEW.operation_ids_json)) =
+                 json_array_length(NEW.operation_ids_json)
+           )
+         )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'plan_task binding-seal intent requires exact host call and admitted graph authority');
+    END;`;
+}
+
+/** Install the v71 pre-delivery checkpoint and strengthen the activation
+ * receipt wall. Callers may backfill legacy rows in the same migration
+ * transaction after this returns; existing receipt rows are never rewritten. */
+export function createPlanTaskPreparationCheckpointSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE} (
+      session_id             TEXT NOT NULL,
+      source_user_seq        INTEGER NOT NULL CHECK (source_user_seq > 0),
+      accepted_task_id       TEXT NOT NULL,
+      logical_tool_call_id   TEXT NOT NULL,
+      intent_version         INTEGER NOT NULL CHECK (intent_version = 1),
+      intent_origin          TEXT NOT NULL CHECK (intent_origin IN ('current','legacy_backfill')),
+      plan_argument_digest   TEXT NOT NULL CHECK (length(plan_argument_digest) = 64),
+      graph_event_id         TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+      graph_id               TEXT NOT NULL,
+      graph_hash             TEXT NOT NULL CHECK (length(graph_hash) = 64),
+      contract_id            TEXT NOT NULL CHECK (contract_id GLOB 'expected-work:v1:*'),
+      objective_text         TEXT NOT NULL CHECK (length(objective_text) BETWEEN 1 AND 16000),
+      objective_digest       TEXT NOT NULL CHECK (length(objective_digest) = 64),
+      semantic_input_digest  TEXT NOT NULL CHECK (length(semantic_input_digest) = 64),
+      operation_ids_json     TEXT NOT NULL CHECK (json_valid(operation_ids_json) AND json_type(operation_ids_json) = 'array'),
+      operation_ids_digest   TEXT NOT NULL CHECK (length(operation_ids_digest) = 64),
+      preamble_text          TEXT NOT NULL CHECK (length(preamble_text) BETWEEN 1 AND 1000),
+      preamble_text_digest   TEXT NOT NULL CHECK (length(preamble_text_digest) = 64),
+      delivery_owner         TEXT NOT NULL CHECK (delivery_owner IN ('durable_conversation','carrier_owned','legacy_unknown')),
+      recorded_at            TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq),
+      UNIQUE (session_id, source_user_seq, logical_tool_call_id),
+      FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+        REFERENCES logical_tool_calls(session_id, source_user_seq, logical_tool_call_id)
+        ON DELETE CASCADE
+    );
+
+    CREATE TRIGGER IF NOT EXISTS trg_plan_task_binding_seal_intent_update_immutable
+    BEFORE UPDATE ON ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+    BEGIN
+      SELECT RAISE(ABORT, 'plan_task binding-seal intents are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_plan_task_binding_seal_intent_delete_immutable
+    BEFORE DELETE ON ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+    WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'plan_task binding-seal intents are immutable');
+    END;
+
+    CREATE TABLE IF NOT EXISTS ${PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE} (
+      cursor_key             INTEGER PRIMARY KEY CHECK (cursor_key = 1),
+      cursor_recorded_at     TEXT NOT NULL,
+      cursor_session_id      TEXT NOT NULL,
+      cursor_source_user_seq INTEGER NOT NULL CHECK (cursor_source_user_seq > 0),
+      updated_at             TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE} (
+      session_id             TEXT NOT NULL,
+      source_user_seq        INTEGER NOT NULL CHECK (source_user_seq > 0),
+      accepted_task_id       TEXT NOT NULL,
+      logical_tool_call_id   TEXT NOT NULL,
+      checkpoint_version     INTEGER NOT NULL CHECK (checkpoint_version = 1),
+      plan_argument_digest   TEXT NOT NULL CHECK (length(plan_argument_digest) = 64),
+      graph_event_id         TEXT NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+      graph_id               TEXT NOT NULL,
+      graph_hash             TEXT NOT NULL CHECK (length(graph_hash) = 64),
+      contract_id            TEXT NOT NULL,
+      preamble_event_id      TEXT NOT NULL UNIQUE REFERENCES events(id) ON DELETE RESTRICT,
+      preamble_event_digest  TEXT NOT NULL CHECK (length(preamble_event_digest) = 64),
+      delivery_key           TEXT NOT NULL UNIQUE,
+      delivery_owner         TEXT NOT NULL CHECK (delivery_owner IN ('durable_conversation','carrier_owned','legacy_unknown')),
+      recorded_at            TEXT NOT NULL,
+      PRIMARY KEY (session_id, source_user_seq),
+      UNIQUE (session_id, source_user_seq, logical_tool_call_id),
+      FOREIGN KEY (session_id, source_user_seq, logical_tool_call_id)
+        REFERENCES logical_tool_calls(session_id, source_user_seq, logical_tool_call_id)
+        ON DELETE CASCADE,
+      FOREIGN KEY (session_id, source_user_seq)
+        REFERENCES accepted_task_work_contracts(session_id, source_user_seq)
+        ON DELETE CASCADE,
+      FOREIGN KEY (contract_id)
+        REFERENCES accepted_task_work_contracts(contract_id)
+        ON DELETE RESTRICT
+    );
+
+    CREATE TRIGGER IF NOT EXISTS trg_plan_task_preparation_checkpoint_update_immutable
+    BEFORE UPDATE ON ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
+    BEGIN
+      SELECT RAISE(ABORT, 'plan_task preparation checkpoints are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_plan_task_preparation_checkpoint_delete_immutable
+    BEFORE DELETE ON ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
+    WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'plan_task preparation checkpoints are immutable');
+    END;
+  `);
+  db.exec(`
+    DROP TRIGGER IF EXISTS ${PLAN_TASK_BINDING_SEAL_INTENT_INSERT_TRIGGER};
+    ${planTaskBindingSealIntentInsertTriggerSql(false)}
+    DROP TRIGGER IF EXISTS ${PLAN_TASK_PREPARATION_CHECKPOINT_INSERT_TRIGGER};
+    ${planTaskPreparationCheckpointInsertTriggerSql(false)}
+  `);
+  refreshCheckpointBackedPlanTaskActivationReceiptInsertTrigger(db);
 }
 
 export function proveHostPlannedResolutionCoexistenceInTransaction(input: {

@@ -534,6 +534,17 @@ export const EVENT_TYPES = [
   // {sourceUserSeq, capabilities[{kind,identifier,effectClass,
   // schemaFingerprint?}]}.
   'capability_discovered',
+  // Immutable, source-bound copy of the exact bounded planning card installed
+  // before the first foreground model request. Recovery reopens these exact
+  // bytes and revalidates every named live definition; it never rebuilds the
+  // displayed card from capabilities discovered later in the same turn.
+  'primary_model_planning_card_snapshot',
+  // Exact source-bound authority installed by the workflow runner after it
+  // reopens the immutable run definition and revalidates every authored
+  // external catalog binding. This grants only ordinary, non-destructive
+  // writes for the named step; direct-call consent reopens and revalidates the
+  // complete receipt before use.
+  'authored_workflow_write_authority',
   // The capability catalog the planner was ACTUALLY shown for one turn — the
   // post-truncation union of all three contributors, each descriptor tagged
   // with which leg supplied it, plus whether resolution completed or hit its
@@ -729,6 +740,10 @@ export interface ListSessionsOptions {
   status?: SessionStatus | SessionStatus[] | 'any';
   channel?: string | string[];
   updatedAfter?: string;
+  /** Internal recovery index: select only sessions with a durable chat
+   * run-in-flight marker. This prevents periodic recovery from walking every
+   * historical chat merely to discover that it has no owner. */
+  runInFlightOnly?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -1119,6 +1134,9 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
     clauses.push('updated_at >= ?');
     params.push(options.updatedAfter);
   }
+  if (options.runInFlightOnly) {
+    clauses.push("json_type(metadata_json, '$.__run_in_flight') IS NOT NULL");
+  }
   let sql = 'SELECT * FROM sessions';
   if (clauses.length > 0) {
     sql += ` WHERE ${clauses.join(' AND ')}`;
@@ -1132,6 +1150,55 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
   params.push(limit);
   params.push(offset);
   const rows = db.prepare(sql).all(...params) as RawSessionRow[];
+  return rows.map(rowToSession);
+}
+
+/**
+ * Bounded durable queue read for private host checkpoint recovery. Ranking is
+ * performed in SQLite from the newest global dispatch-claim seq, so a failed
+ * owner rotates behind never-attempted/older owners without loading every chat
+ * or issuing one history query per inert session on every daemon tick.
+ */
+export function listExactCheckpointRecoverySessions(limit = 64): SessionRow[] {
+  const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(limit, 256)) : 64;
+  const db = openEventLog();
+  const rows = db.prepare(`
+    WITH checkpoint_sessions AS (
+      SELECT sessions.*,
+             CASE
+               WHEN json_valid(json_extract(metadata_json, '$.__host_recovery_state'))
+               THEN CAST(json_extract(
+                 json_extract(metadata_json, '$.__host_recovery_state'),
+                 '$.sourceUserSeq'
+               ) AS INTEGER)
+               ELSE NULL
+             END AS recovery_source_user_seq
+        FROM sessions
+       WHERE kind = 'chat'
+         AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
+         AND json_type(metadata_json, '$.__host_recovery_state') = 'text'
+    )
+    SELECT checkpoint_sessions.*
+      FROM checkpoint_sessions
+     WHERE recovery_source_user_seq IS NOT NULL
+       AND recovery_source_user_seq > 0
+     ORDER BY COALESCE((
+       SELECT MAX(events.seq)
+         FROM events
+        WHERE events.session_id = checkpoint_sessions.id
+          AND events.type = 'restart_recovery_decision'
+          AND json_extract(events.data_json, '$.exactCheckpointRecovery') = 1
+          AND json_extract(events.data_json, '$.autoResume') = 1
+          AND (
+            json_type(events.data_json, '$.sourceUserSeq') IS NULL
+            OR CAST(json_extract(events.data_json, '$.sourceUserSeq') AS INTEGER)
+               = checkpoint_sessions.recovery_source_user_seq
+          )
+     ), -1) ASC,
+     checkpoint_sessions.created_at ASC,
+     checkpoint_sessions.id ASC
+     LIMIT ?
+  `).all(boundedLimit) as RawSessionRow[];
   return rows.map(rowToSession);
 }
 
@@ -1292,6 +1359,280 @@ export function insertInternalEventInTransaction(
   db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
   const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   return rowToEvent(row);
+}
+
+const PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_VERSION = 1 as const;
+const PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_MAX_BYTES = 64 * 1024;
+const LOWER_HEX_DIGEST = /^[a-f0-9]{64}$/;
+
+export type PrimaryModelPlanningCardSnapshotRead =
+  | {
+      status: 'ready';
+      event: EventRow;
+      sourceEventDigest: string;
+      snapshotJson: string;
+      snapshotDigest: string;
+    }
+  | { status: 'missing' }
+  | { status: 'conflict' | 'storage_error'; reason: string };
+
+function primaryModelPlanningCardSnapshotEventId(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceEventDigest: string;
+}): string {
+  const identity = createHash('sha256').update(JSON.stringify({
+    version: PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_VERSION,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    sourceEventDigest: input.sourceEventDigest,
+  }), 'utf8').digest('hex');
+  return `primary-planning-card:v1:${identity}`;
+}
+
+function primaryModelPlanningCardSnapshotSource(
+  db: Database.Database,
+  sessionId: string,
+  sourceUserSeq: number,
+): { row: RawEventRow; digest: string } | null {
+  const row = db.prepare(`
+    SELECT * FROM events
+     WHERE session_id = ? AND seq = ?
+       AND role = 'user' AND type = 'user_input_received'
+     LIMIT 1
+  `).get(sessionId, sourceUserSeq) as RawEventRow | undefined;
+  if (!row) return null;
+  return {
+    row,
+    digest: acceptedTurnSourceEventDigest({
+      id: row.id,
+      sessionId: row.session_id,
+      seq: row.seq,
+      turn: row.turn,
+      role: row.role,
+      type: row.type,
+      parentEventId: row.parent_event_id,
+      dataJson: row.data_json,
+      createdAt: row.created_at,
+    }),
+  };
+}
+
+function readPrimaryModelPlanningCardSnapshotInTransaction(
+  db: Database.Database,
+  sessionId: string,
+  sourceUserSeq: number,
+): PrimaryModelPlanningCardSnapshotRead {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) {
+    return { status: 'conflict', reason: 'planning-card source identity is invalid' };
+  }
+  const source = primaryModelPlanningCardSnapshotSource(db, sessionId, sourceUserSeq);
+  if (!source) return { status: 'conflict', reason: 'planning-card accepted source is missing' };
+  const eventId = primaryModelPlanningCardSnapshotEventId({
+    sessionId,
+    sourceUserSeq,
+    sourceEventDigest: source.digest,
+  });
+  const rows = db.prepare(`
+    SELECT * FROM events
+     WHERE session_id = ?
+       AND type = 'primary_model_planning_card_snapshot'
+       AND (id = ? OR parent_event_id = ?)
+     ORDER BY seq
+  `).all(sessionId, eventId, source.row.id) as RawEventRow[];
+  if (rows.length === 0) return { status: 'missing' };
+  if (rows.length !== 1) {
+    return { status: 'conflict', reason: 'planning-card snapshot is duplicated or ambiguously owned' };
+  }
+  const row = rows[0]!;
+  let data: unknown;
+  try {
+    data = JSON.parse(row.data_json) as unknown;
+  } catch {
+    return { status: 'conflict', reason: 'planning-card snapshot envelope is malformed' };
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { status: 'conflict', reason: 'planning-card snapshot envelope is malformed' };
+  }
+  const envelope = data as Record<string, unknown>;
+  const snapshotJson = typeof envelope.snapshotJson === 'string' ? envelope.snapshotJson : '';
+  const snapshotDigest = typeof envelope.snapshotDigest === 'string'
+    ? envelope.snapshotDigest.trim().toLowerCase()
+    : '';
+  const exactEnvelopeKeys = [
+    'snapshotDigest',
+    'snapshotJson',
+    'sourceEventDigest',
+    'sourceEventId',
+    'sourceUserSeq',
+    'version',
+  ];
+  const snapshotBytes = Buffer.byteLength(snapshotJson, 'utf8');
+  if (
+    row.id !== eventId
+    || row.session_id !== sessionId
+    || row.turn !== source.row.turn
+    || row.role !== 'system'
+    || row.type !== 'primary_model_planning_card_snapshot'
+    || row.parent_event_id !== source.row.id
+    || envelope.version !== PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_VERSION
+    || envelope.sourceUserSeq !== sourceUserSeq
+    || envelope.sourceEventId !== source.row.id
+    || envelope.sourceEventDigest !== source.digest
+    || Object.keys(envelope).sort().join('\0') !== exactEnvelopeKeys.join('\0')
+    || snapshotBytes < 2
+    || snapshotBytes > PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_MAX_BYTES
+    || !LOWER_HEX_DIGEST.test(snapshotDigest)
+    || createHash('sha256').update(snapshotJson, 'utf8').digest('hex') !== snapshotDigest
+  ) {
+    return { status: 'conflict', reason: 'planning-card snapshot lost its exact source or content identity' };
+  }
+  try {
+    const decoded = JSON.parse(snapshotJson) as unknown;
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+      return { status: 'conflict', reason: 'planning-card snapshot payload is malformed' };
+    }
+  } catch {
+    return { status: 'conflict', reason: 'planning-card snapshot payload is malformed' };
+  }
+  return {
+    status: 'ready',
+    event: rowToEvent(row),
+    sourceEventDigest: source.digest,
+    snapshotJson,
+    snapshotDigest,
+  };
+}
+
+/** Reopen the exact initial planning card for one accepted source. The event
+ * is private presentation data and carries no execution authority. */
+export function readPrimaryModelPlanningCardSnapshot(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): PrimaryModelPlanningCardSnapshotRead {
+  try {
+    return readPrimaryModelPlanningCardSnapshotInTransaction(
+      openEventLog(),
+      input.sessionId,
+      input.sourceUserSeq,
+    );
+  } catch (error) {
+    return {
+      status: 'storage_error',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240),
+    };
+  }
+}
+
+/** Install exactly one initial card before a host call authority or model batch
+ * can exist. A racing process adopts the already-committed exact bytes; an
+ * older/progressed source with no snapshot stays held instead of being
+ * restamped from today's catalog. */
+export function recordPrimaryModelPlanningCardSnapshotOnce(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  snapshotJson: string;
+}): PrimaryModelPlanningCardSnapshotRead {
+  if (
+    typeof input.snapshotJson !== 'string'
+    || Buffer.byteLength(input.snapshotJson, 'utf8') < 2
+    || Buffer.byteLength(input.snapshotJson, 'utf8') > PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_MAX_BYTES
+  ) return { status: 'conflict', reason: 'planning-card snapshot payload is out of bounds' };
+  try {
+    const decoded = JSON.parse(input.snapshotJson) as unknown;
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+      return { status: 'conflict', reason: 'planning-card snapshot payload is malformed' };
+    }
+  } catch {
+    return { status: 'conflict', reason: 'planning-card snapshot payload is malformed' };
+  }
+  try {
+    const db = openEventLog();
+    const write = db.transaction((): PrimaryModelPlanningCardSnapshotRead => {
+      const existing = readPrimaryModelPlanningCardSnapshotInTransaction(
+        db,
+        input.sessionId,
+        input.sourceUserSeq,
+      );
+      if (existing.status !== 'missing') return existing;
+      const source = primaryModelPlanningCardSnapshotSource(
+        db,
+        input.sessionId,
+        input.sourceUserSeq,
+      );
+      if (!source) return { status: 'conflict', reason: 'planning-card accepted source is missing' };
+
+      const progressed = db.prepare(`
+        SELECT 1 AS progressed
+          FROM accepted_turn_call_authorities
+         WHERE session_id = ? AND source_user_seq = ?
+        UNION ALL
+        SELECT 1
+          FROM accepted_model_batch_admissions
+         WHERE session_id = ? AND source_user_seq = ?
+        UNION ALL
+        SELECT 1
+          FROM events
+         WHERE session_id = ?
+           AND (
+             (type = 'turn_graph_compiled' AND parent_event_id = ?)
+             OR (
+               type = 'capability_discovered'
+               AND json_valid(data_json)
+               AND json_extract(data_json, '$.sourceUserSeq') = ?
+             )
+           )
+         LIMIT 1
+      `).get(
+        input.sessionId,
+        input.sourceUserSeq,
+        input.sessionId,
+        input.sourceUserSeq,
+        input.sessionId,
+        source.row.id,
+        input.sourceUserSeq,
+      ) as { progressed: number } | undefined;
+      if (progressed) {
+        return {
+          status: 'conflict',
+          reason: 'planning-card snapshot is missing after this accepted source already progressed',
+        };
+      }
+
+      const snapshotDigest = createHash('sha256').update(input.snapshotJson, 'utf8').digest('hex');
+      const eventId = primaryModelPlanningCardSnapshotEventId({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        sourceEventDigest: source.digest,
+      });
+      const dataJson = JSON.stringify({
+        version: PRIMARY_MODEL_PLANNING_CARD_SNAPSHOT_VERSION,
+        sourceUserSeq: input.sourceUserSeq,
+        sourceEventId: source.row.id,
+        sourceEventDigest: source.digest,
+        snapshotJson: input.snapshotJson,
+        snapshotDigest,
+      });
+      const now = nowIso();
+      db.prepare(`
+        INSERT INTO events
+          (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+        VALUES (?, ?, ?, 'system', 'primary_model_planning_card_snapshot', ?, ?, ?)
+      `).run(eventId, input.sessionId, source.row.turn, source.row.id, dataJson, now);
+      db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+      return readPrimaryModelPlanningCardSnapshotInTransaction(
+        db,
+        input.sessionId,
+        input.sourceUserSeq,
+      );
+    });
+    return write.immediate();
+  } catch (error) {
+    return {
+      status: 'storage_error',
+      reason: String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240),
+    };
+  }
 }
 
 /** Publish a domain event only AFTER its authority transaction has committed. */
@@ -3156,6 +3497,11 @@ export function appendTurnGraphEventOnce(input: {
   turn: number;
   sourceUserSeq: number;
   data: Record<string, unknown>;
+  /** Optional plan-control companion written in the same IMMEDIATE
+   * transaction as a newly inserted graph. If it throws, neither row commits.
+   * It is deliberately not invoked for an existing graph: a later caller may
+   * not claim an owner for a historical write-once orphan. */
+  onFirstPersistInTransaction?: (db: Database.Database, event: EventRow) => void;
 }): { event: EventRow; inserted: boolean } {
   if (!input.sessionId || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) {
     throw new Error('turn graph requires an accepted sourceUserSeq');
@@ -3217,6 +3563,7 @@ export function appendTurnGraphEventOnce(input: {
     );
     db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
     const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    input.onFirstPersistInTransaction?.(db, rowToEvent(row));
     return { row, inserted: true };
   });
 

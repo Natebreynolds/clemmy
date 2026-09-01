@@ -51,6 +51,7 @@ const EXCLUDED_EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   'tool_returned',
   'claude_local_permission_admitted',
   'claude_local_permission_claimed',
+  'primary_model_planning_card_snapshot',
   'stream_token',
   'heartbeat',
   'memory_signals_captured',

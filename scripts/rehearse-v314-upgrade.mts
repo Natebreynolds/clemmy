@@ -1523,7 +1523,7 @@ function buildChecks(
     'session_id:sessions.id:CASCADE',
   ].sort();
   add('schema_v70_amendments_have_exact_retention_cascade_and_keep_standalone_immutability',
-    currentSchemas.harness === 70
+    currentSchemas.harness === 73
       && firstHarness?.schemaVersions?.includes(70) === true
       && stable(amendmentCascadeShape) === stable(expectedAmendmentCascadeShape)
       && firstHarnessTriggers.has('trg_expected_work_universe_amendment_update_immutable')

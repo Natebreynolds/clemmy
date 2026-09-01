@@ -2,10 +2,25 @@ import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
 import {
+  PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
+  PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE,
+  PLAN_TASK_BINDING_SEAL_INTENTS_TABLE,
+  PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE,
+  createPlanTaskPreparationCheckpointSchema,
   createHostPlannedResolutionCoexistenceSchema,
   hostPlannedResolutionProofSql,
   refreshPlanTaskActivationReceiptInsertTrigger,
 } from './host-planned-resolution-coexistence.js';
+import {
+  ASYNC_READ_REFINEMENT_COMPLETION_RECEIPTS_TABLE,
+  ASYNC_READ_REFINEMENT_INTENTS_TABLE,
+  ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE,
+  ASYNC_READ_REFINEMENT_START_RECEIPTS_TABLE,
+  ASYNC_READ_REFINEMENT_TERMINAL_RECEIPTS_TABLE,
+  createAsyncReadRefinementSchema,
+  createAsyncReadRefinementTerminalRecoverySchema,
+  createAsyncReadRefinementTerminalRecoverySchemaV72,
+} from './async-read-refinement-schema.js';
 
 /**
  * Schema-only harness migration authority. Keep this module free of model,
@@ -2557,6 +2572,376 @@ function rebuildExpectedWorkUniverseAmendmentCascade(db: Database.Database): voi
     );
   }
   verify();
+}
+
+function v71PreambleAddress(input: {
+  seq: number;
+  id: string;
+  session_id: string;
+  turn: number;
+  role: string;
+  type: string;
+  parent_event_id: string | null;
+  data_json: string;
+  created_at: string;
+}): { eventDigest: string; deliveryKey: string } | null {
+  let raw: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(input.data_json) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    raw = parsed as Record<string, unknown>;
+  } catch { return null; }
+  if (Object.keys(raw).some((key) => ![
+    'version', 'kind', 'sourceUserSeq', 'text', 'intentKey',
+  ].includes(key))) return null;
+  const sourceUserSeq = raw.sourceUserSeq;
+  const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+  const intentKey = raw.intentKey === undefined
+    ? undefined
+    : typeof raw.intentKey === 'string' ? raw.intentKey.trim() : '';
+  if (
+    input.role !== 'Clem'
+    || input.type !== 'conversation_preamble'
+    || !input.parent_event_id
+    || raw.version !== 1
+    || raw.kind !== 'pre_execution'
+    || !Number.isSafeInteger(sourceUserSeq)
+    || Number(sourceUserSeq) <= 0
+    || !text
+    || text.length > 8_000
+    || text.includes('\0')
+    || (intentKey !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(intentKey))
+  ) return null;
+  const data = {
+    version: 1,
+    kind: 'pre_execution',
+    sourceUserSeq: Number(sourceUserSeq),
+    text,
+    ...(intentKey ? { intentKey } : {}),
+  };
+  const eventDigest = createHash('sha256').update(JSON.stringify({
+    version: 1,
+    seq: input.seq,
+    id: input.id,
+    sessionId: input.session_id,
+    turn: input.turn,
+    role: input.role,
+    type: input.type,
+    parentEventId: input.parent_event_id,
+    data,
+    createdAt: input.created_at,
+  }), 'utf8').digest('hex');
+  return {
+    eventDigest,
+    deliveryKey: `preamble-delivery:v1:${createHash('sha256')
+      .update(JSON.stringify({ version: 1, eventId: input.id, eventDigest }), 'utf8')
+      .digest('hex')}`,
+  };
+}
+
+/** Upgrade both v70 crash windows without guessing. Existing activation
+ * receipts name their exact owner directly. A no-receipt orphan is promoted
+ * only when the preamble timestamp intersects exactly one plan call lifetime;
+ * ambiguous historical sources remain checkpoint-free and therefore held. */
+function backfillPlanTaskPreparationCheckpointsV71(db: Database.Database): void {
+  db.exec(`
+    INSERT INTO ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       intent_version, intent_origin, plan_argument_digest, graph_event_id,
+       graph_id, graph_hash, contract_id, objective_text, objective_digest,
+       semantic_input_digest, operation_ids_json, operation_ids_digest,
+       preamble_text, preamble_text_digest, delivery_owner, recorded_at)
+    SELECT receipt.session_id, receipt.source_user_seq, receipt.accepted_task_id,
+           receipt.logical_tool_call_id, 1, 'legacy_backfill',
+           receipt.plan_argument_digest, receipt.graph_event_id,
+           receipt.graph_id, receipt.graph_hash, receipt.contract_id,
+           COALESCE(NULLIF(trim(json_extract(source.data_json, '$.displayText')), ''),
+                    NULLIF(trim(json_extract(source.data_json, '$.text')), ''),
+                    'legacy-v70'),
+           COALESCE(json_extract(graph.data_json, '$.graph.source.inputHash'), receipt.graph_hash),
+           COALESCE(json_extract(graph.data_json, '$.graph.source.inputHash'), receipt.graph_hash),
+           COALESCE((SELECT json_group_array(json_extract(operation.value, '$.id'))
+              FROM json_each(contract.contract_json, '$.operations') operation), '[]'),
+           receipt.graph_hash,
+           json_extract(preamble.data_json, '$.text'), receipt.graph_hash,
+           CASE receipt.transport_target
+             WHEN 'durable_conversation' THEN 'durable_conversation'
+             ELSE 'carrier_owned'
+           END,
+           receipt.recorded_at
+      FROM ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE} receipt
+      JOIN accepted_task_work_contracts contract
+        ON contract.session_id = receipt.session_id
+       AND contract.source_user_seq = receipt.source_user_seq
+       AND contract.contract_id = receipt.contract_id
+      JOIN events graph ON graph.id = receipt.graph_event_id
+      JOIN events source
+        ON source.session_id = receipt.session_id
+       AND source.seq = receipt.source_user_seq
+      JOIN events preamble ON preamble.id = receipt.preamble_event_id
+     WHERE NOT EXISTS (
+       SELECT 1 FROM ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE} intent
+        WHERE intent.session_id = receipt.session_id
+          AND intent.source_user_seq = receipt.source_user_seq
+     );
+
+    INSERT INTO ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       checkpoint_version, plan_argument_digest, graph_event_id, graph_id,
+       graph_hash, contract_id, preamble_event_id, preamble_event_digest,
+       delivery_key, delivery_owner, recorded_at)
+    SELECT receipt.session_id, receipt.source_user_seq, receipt.accepted_task_id,
+           receipt.logical_tool_call_id, 1, receipt.plan_argument_digest,
+           receipt.graph_event_id, receipt.graph_id, receipt.graph_hash,
+           receipt.contract_id, receipt.preamble_event_id,
+           receipt.preamble_event_digest, receipt.delivery_key,
+           CASE receipt.transport_target
+             WHEN 'durable_conversation' THEN 'durable_conversation'
+             ELSE 'carrier_owned'
+           END,
+           receipt.recorded_at
+      FROM ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE} receipt
+     WHERE NOT EXISTS (
+       SELECT 1 FROM ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE} checkpoint
+        WHERE checkpoint.session_id = receipt.session_id
+          AND checkpoint.source_user_seq = receipt.source_user_seq
+     );
+  `);
+
+  type Candidate = {
+    session_id: string;
+    source_user_seq: number;
+    accepted_task_id: string;
+    logical_tool_call_id: string;
+    argument_digest: string;
+    graph_event_id: string;
+    graph_id: string;
+    graph_hash: string;
+    contract_id: string;
+    objective_text: string;
+    semantic_input_digest: string;
+    operation_ids_json: string;
+    preamble_text: string;
+    seq: number;
+    id: string;
+    turn: number;
+    role: string;
+    type: string;
+    parent_event_id: string | null;
+    data_json: string;
+    created_at: string;
+  };
+  const candidates = db.prepare(`
+    SELECT root.session_id, root.source_user_seq, root.accepted_task_id,
+           call.logical_tool_call_id, call.argument_digest,
+           task.graph_event_id, task.graph_id, task.graph_hash,
+           contract.contract_id,
+           COALESCE(NULLIF(trim(json_extract(source.data_json, '$.displayText')), ''),
+                    NULLIF(trim(json_extract(source.data_json, '$.text')), ''),
+                    'legacy-v70') AS objective_text,
+           COALESCE(json_extract(graph.data_json, '$.graph.source.inputHash'), task.graph_hash)
+             AS semantic_input_digest,
+           COALESCE((SELECT json_group_array(json_extract(operation.value, '$.id'))
+              FROM json_each(contract.contract_json, '$.operations') operation), '[]')
+             AS operation_ids_json,
+           json_extract(preamble.data_json, '$.text') AS preamble_text,
+           preamble.seq, preamble.id, preamble.turn, preamble.role,
+           preamble.type, preamble.parent_event_id, preamble.data_json,
+           preamble.created_at
+      FROM accepted_turn_call_authorities root
+      JOIN accepted_task_authority task
+        ON task.session_id = root.session_id
+       AND task.source_user_seq = root.source_user_seq
+       AND task.accepted_task_id = root.accepted_task_id
+      JOIN accepted_task_work_contracts contract
+        ON contract.session_id = task.session_id
+       AND contract.source_user_seq = task.source_user_seq
+       AND contract.accepted_task_id = task.accepted_task_id
+       AND contract.contract_id = task.work_contract_id
+      JOIN events source
+        ON source.session_id = root.session_id
+       AND source.seq = root.source_user_seq
+       AND source.id = root.source_event_id
+      JOIN events graph
+        ON graph.session_id = root.session_id
+       AND graph.id = task.graph_event_id
+      JOIN events preamble
+        ON preamble.session_id = source.session_id
+       AND preamble.parent_event_id = source.id
+       AND preamble.turn = source.turn
+       AND preamble.role = 'Clem'
+       AND preamble.type = 'conversation_preamble'
+      JOIN logical_tool_calls call
+        ON call.session_id = root.session_id
+       AND call.source_user_seq = root.source_user_seq
+       AND call.accepted_task_id = root.accepted_task_id
+       AND call.tool_name = 'plan_task'
+       AND call.opened_at <= preamble.created_at
+       AND (call.settled_at IS NULL OR call.settled_at >= preamble.created_at)
+     WHERE root.authority_kind = 'host_v1'
+       AND root.engine_version = 'host_v1'
+       AND root.state = 'open'
+       AND task.state != 'conflict'
+       AND task.expected_work_required = 0
+       AND contract.contract_version = 1
+       AND contract.planner_source = 'structured_model'
+       AND NOT EXISTS (
+         SELECT 1 FROM ${PLAN_TASK_ACTIVATION_RECEIPTS_TABLE} receipt
+          WHERE receipt.session_id = root.session_id
+            AND receipt.source_user_seq = root.source_user_seq
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE} checkpoint
+          WHERE checkpoint.session_id = root.session_id
+            AND checkpoint.source_user_seq = root.source_user_seq
+       )
+     ORDER BY root.session_id, root.source_user_seq, call.opened_at, call.logical_tool_call_id
+  `).all() as Candidate[];
+  const bySource = new Map<string, Candidate[]>();
+  for (const candidate of candidates) {
+    const key = `${candidate.session_id}\0${candidate.source_user_seq}`;
+    const grouped = bySource.get(key) ?? [];
+    grouped.push(candidate);
+    bySource.set(key, grouped);
+  }
+  const insert = db.prepare(`
+    INSERT INTO ${PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       checkpoint_version, plan_argument_digest, graph_event_id, graph_id,
+       graph_hash, contract_id, preamble_event_id, preamble_event_digest,
+       delivery_key, delivery_owner, recorded_at)
+    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy_unknown', ?)
+  `);
+  const insertIntent = db.prepare(`
+    INSERT INTO ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       intent_version, intent_origin, plan_argument_digest, graph_event_id,
+       graph_id, graph_hash, contract_id, objective_text, objective_digest,
+       semantic_input_digest, operation_ids_json, operation_ids_digest,
+       preamble_text, preamble_text_digest, delivery_owner, recorded_at)
+    VALUES (?, ?, ?, ?, 1, 'legacy_backfill', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy_unknown', ?)
+  `);
+  for (const grouped of bySource.values()) {
+    if (grouped.length !== 1) continue;
+    const candidate = grouped[0]!;
+    const address = v71PreambleAddress(candidate);
+    if (!address) continue;
+    insertIntent.run(
+      candidate.session_id,
+      candidate.source_user_seq,
+      candidate.accepted_task_id,
+      candidate.logical_tool_call_id,
+      candidate.argument_digest,
+      candidate.graph_event_id,
+      candidate.graph_id,
+      candidate.graph_hash,
+      candidate.contract_id,
+      candidate.objective_text,
+      candidate.semantic_input_digest,
+      candidate.semantic_input_digest,
+      candidate.operation_ids_json,
+      candidate.graph_hash,
+      candidate.preamble_text,
+      candidate.graph_hash,
+      candidate.created_at,
+    );
+    insert.run(
+      candidate.session_id,
+      candidate.source_user_seq,
+      candidate.accepted_task_id,
+      candidate.logical_tool_call_id,
+      candidate.argument_digest,
+      candidate.graph_event_id,
+      candidate.graph_id,
+      candidate.graph_hash,
+      candidate.contract_id,
+      candidate.id,
+      address.eventDigest,
+      address.deliveryKey,
+      candidate.created_at,
+    );
+  }
+}
+
+/** Re-author the two historical graph-continuation walls with the v71
+ * checkpoint-backed settlement proof. Historical migration rehearsal keeps
+ * using the legacy success-only predicate until this migration is reached. */
+function refreshCheckpointBackedPlanContinuationTriggersV71(db: Database.Database): void {
+  db.exec(`
+    DROP TRIGGER IF EXISTS trg_accepted_task_resolution_excludes_host_root;
+    CREATE TRIGGER trg_accepted_task_resolution_excludes_host_root
+    BEFORE INSERT ON accepted_task_resolutions
+    WHEN EXISTS (
+      SELECT 1 FROM accepted_turn_call_authorities a
+       WHERE a.session_id = NEW.session_id
+         AND a.source_user_seq = NEW.source_user_seq
+         AND a.authority_kind != 'turn_graph'
+    ) AND NOT ${hostPlannedResolutionProofSql('NEW', 'insert')}
+    BEGIN
+      SELECT RAISE(ABORT, 'graph resolution cannot replace non-graph call authority');
+    END;
+
+    DROP TRIGGER IF EXISTS trg_accepted_model_batch_admission_chain;
+    CREATE TRIGGER trg_accepted_model_batch_admission_chain
+    BEFORE INSERT ON accepted_model_batch_admissions
+    WHEN NOT (
+      (
+        NEW.batch_ordinal = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM accepted_model_batch_admissions prior
+           WHERE prior.session_id = NEW.session_id
+             AND prior.source_user_seq = NEW.source_user_seq
+        )
+      )
+      OR
+      EXISTS (
+        SELECT 1
+          FROM accepted_model_batch_checkpoints prior
+         WHERE prior.session_id = NEW.session_id
+           AND prior.source_user_seq = NEW.source_user_seq
+           AND prior.batch_ordinal = NEW.batch_ordinal - 1
+           AND prior.history_digest = NEW.pre_history_digest
+           AND prior.last_response_id IS NEW.previous_response_id
+           AND prior.authority_digest = NEW.authority_digest
+           AND (
+             (
+               prior.graph_event_id IS NEW.graph_event_id
+               AND prior.graph_hash IS NEW.graph_hash
+               AND prior.work_contract_id IS NEW.work_contract_id
+             )
+             OR
+             (
+               prior.graph_event_id IS NULL
+               AND prior.graph_hash IS NULL
+               AND prior.work_contract_id IS NULL
+               AND NEW.graph_event_id IS NOT NULL
+               AND NEW.graph_hash IS NOT NULL
+               AND NEW.work_contract_id IS NOT NULL
+               AND EXISTS (
+                 SELECT 1
+                   FROM accepted_task_resolutions r
+                   JOIN accepted_task_work_contracts contract
+                     ON contract.session_id = r.session_id
+                    AND contract.source_user_seq = r.source_user_seq
+                    AND contract.accepted_task_id = r.accepted_task_id
+                    AND contract.graph_event_id = r.graph_event_id
+                    AND contract.graph_hash = r.graph_hash
+                  WHERE r.session_id = NEW.session_id
+                    AND r.source_user_seq = NEW.source_user_seq
+                    AND r.accepted_task_id = NEW.accepted_task_id
+                    AND r.graph_event_id = NEW.graph_event_id
+                    AND r.graph_hash = NEW.graph_hash
+                    AND contract.contract_id = NEW.work_contract_id
+                    AND ${hostPlannedResolutionProofSql('r', 'existing')}
+               )
+             )
+           )
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'model batch admission requires the exact prior balanced checkpoint');
+    END;
+  `);
 }
 
 const MIGRATIONS: EventLogMigration[] = [
@@ -7001,7 +7386,7 @@ const MIGRATIONS: EventLogMigration[] = [
            WHERE a.session_id = NEW.session_id
              AND a.source_user_seq = NEW.source_user_seq
              AND a.authority_kind != 'turn_graph'
-        ) AND NOT ${hostPlannedResolutionProofSql('NEW', 'insert')}
+        ) AND NOT ${hostPlannedResolutionProofSql('NEW', 'insert', 'legacy_success')}
         BEGIN
           SELECT RAISE(ABORT, 'graph resolution cannot replace non-graph call authority');
         END;
@@ -7352,7 +7737,7 @@ const MIGRATIONS: EventLogMigration[] = [
                         AND r.graph_event_id = NEW.graph_event_id
                         AND r.graph_hash = NEW.graph_hash
                         AND contract.contract_id = NEW.work_contract_id
-                        AND ${hostPlannedResolutionProofSql('r', 'existing')}
+                        AND ${hostPlannedResolutionProofSql('r', 'existing', 'legacy_success')}
                    )
                  )
                )
@@ -10530,6 +10915,141 @@ const MIGRATIONS: EventLogMigration[] = [
     sql: '',
     foreignKeysOff: true,
     backfill: rebuildExpectedWorkUniverseAmendmentCascade,
+  },
+  {
+    /** Close both plan_task post-persist crash windows. The immutable
+     * preparation checkpoint names the exact plan call, graph, contract,
+     * preamble content address, and presentation owner before delivery. */
+    version: 71,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        'accepted_turn_call_authorities',
+        'accepted_task_authority',
+        'accepted_task_work_contracts',
+        'accepted_task_resolutions',
+        'accepted_model_batch_admissions',
+        'accepted_model_batch_checkpoints',
+        'logical_tool_calls',
+        'logical_call_settlements',
+        'logical_call_settlement_crossings',
+        'physical_dispatches',
+        'durable_result_handles',
+        PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
+      ]) {
+        if (!tables.has(prerequisite)) throw new Error(`schema v71 prerequisite missing: ${prerequisite}`);
+      }
+      createPlanTaskPreparationCheckpointSchema(db);
+      createAsyncReadRefinementSchema(db);
+      backfillPlanTaskPreparationCheckpointsV71(db);
+      refreshCheckpointBackedPlanContinuationTriggersV71(db);
+
+      const relevantTables = foreignKeyClosure(db, [
+        PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE,
+        PLAN_TASK_BINDING_SEAL_INTENTS_TABLE,
+        PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE,
+        PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
+        ASYNC_READ_REFINEMENT_INTENTS_TABLE,
+        ASYNC_READ_REFINEMENT_START_RECEIPTS_TABLE,
+        ASYNC_READ_REFINEMENT_COMPLETION_RECEIPTS_TABLE,
+      ]);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((violation) => relevantTables.has(violation.table));
+      if (violations.length > 0) {
+        throw new Error(
+          `schema v71 foreign-key check failed for ${violations.length} plan preparation row(s)`,
+        );
+      }
+    },
+  },
+  {
+    /** Add the mutually-exclusive terminal outcome and the durable paged crash
+     * claimant after the v71 async owner shipped. This must remain its own
+     * migration: developer homes may already have recorded v71. */
+    version: 72,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        ASYNC_READ_REFINEMENT_INTENTS_TABLE,
+        ASYNC_READ_REFINEMENT_START_RECEIPTS_TABLE,
+        ASYNC_READ_REFINEMENT_COMPLETION_RECEIPTS_TABLE,
+      ]) {
+        if (!tables.has(prerequisite)) throw new Error(`schema v72 prerequisite missing: ${prerequisite}`);
+      }
+      createAsyncReadRefinementTerminalRecoverySchemaV72(db);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_sessions_chat_run_in_flight_updated
+          ON sessions(updated_at, id)
+          WHERE kind = 'chat'
+            AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL;
+      `);
+      const relevantTables = foreignKeyClosure(db, [
+        ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE,
+        ASYNC_READ_REFINEMENT_TERMINAL_RECEIPTS_TABLE,
+      ]);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((violation) => relevantTables.has(violation.table));
+      if (violations.length > 0) {
+        throw new Error(
+          `schema v72 foreign-key check failed for ${violations.length} async refinement terminal row(s)`,
+        );
+      }
+    },
+  },
+  {
+    /** Normalize stamped v71/v72 development candidates. v73 is intentionally
+     * additive even though the release is not final: a running daemon may have
+     * already recorded either earlier version and numbered migrations never
+     * rewrite history. */
+    version: 73,
+    sql: '',
+    backfill: (db) => {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+          .map((row) => row.name),
+      );
+      if (!tables.has('sessions') || !tables.has('events')) return;
+      for (const prerequisite of [
+        ASYNC_READ_REFINEMENT_INTENTS_TABLE,
+        ASYNC_READ_REFINEMENT_START_RECEIPTS_TABLE,
+        ASYNC_READ_REFINEMENT_COMPLETION_RECEIPTS_TABLE,
+      ]) {
+        if (!tables.has(prerequisite)) throw new Error(`schema v73 prerequisite missing: ${prerequisite}`);
+      }
+      createPlanTaskPreparationCheckpointSchema(db);
+      createAsyncReadRefinementSchema(db);
+      createAsyncReadRefinementTerminalRecoverySchema(db);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_sessions_chat_run_in_flight_updated
+          ON sessions(updated_at, id)
+          WHERE kind = 'chat'
+            AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL;
+      `);
+      const relevantTables = foreignKeyClosure(db, [
+        PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE,
+        PLAN_TASK_BINDING_SEAL_INTENTS_TABLE,
+        PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE,
+        ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE,
+        ASYNC_READ_REFINEMENT_TERMINAL_RECEIPTS_TABLE,
+      ]);
+      const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+        .filter((violation) => relevantTables.has(violation.table));
+      if (violations.length > 0) {
+        throw new Error(
+          `schema v73 foreign-key check failed for ${violations.length} recovery authority row(s)`,
+        );
+      }
+    },
   },
 ];
 
