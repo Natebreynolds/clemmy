@@ -270,8 +270,8 @@ test('version-matched curated release notes publish when present and other versi
   const currentNotes = existsSync(v316ReleaseNotesPath) ? readFileSync(v316ReleaseNotesPath, 'utf-8') : '';
   assert.match(notes, /^# Clementine 3\.0\.0/m);
   assert.match(currentNotes, /^# v3\.16\.0/m);
-  assert.match(harnessSchemaVersionText, /HARNESS_SCHEMA_VERSION\s*=\s*73\s*;/);
-  assert.match(currentNotes, /schema v73/i);
+  assert.match(harnessSchemaVersionText, /HARNESS_SCHEMA_VERSION\s*=\s*74\s*;/);
+  assert.match(currentNotes, /schema v74/i);
   assert.match(currentNotes, /logical_model_result_projection_receipts/);
   assert.match(currentNotes, /metadata-only/i);
   assert.match(notes, /long-horizon/i);

@@ -147,6 +147,7 @@ function clearExactCheckpointRecoveryState(
            ),
            updated_at = ?
      WHERE id = ?
+       AND json_valid(metadata_json)
        AND json_extract(metadata_json, '$.__host_recovery_state') = ?
   `).run(new Date().toISOString(), sessionId, serializedState);
   return result.changes === 1;
@@ -328,6 +329,7 @@ export function clearRunInFlightAfterTerminal(
          FROM sessions
         WHERE id = ?
           AND kind = 'chat'
+          AND json_valid(metadata_json)
           AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
         LIMIT 1`,
     ).get(sessionId);
@@ -393,6 +395,7 @@ function clearExactRunInFlightOwner(
               updated_at = ?
         WHERE id = ?
           AND kind = 'chat'
+          AND json_valid(metadata_json)
           AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
           AND (
             (
@@ -426,6 +429,7 @@ function clearExactRunInFlightOwner(
               updated_at = ?
         WHERE id = ?
           AND kind = 'chat'
+          AND json_valid(metadata_json)
           AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
           AND EXISTS (
             SELECT 1
@@ -464,6 +468,7 @@ function clearExactRunInFlightOwner(
               updated_at = ?
         WHERE id = ?
           AND kind = 'chat'
+          AND json_valid(metadata_json)
           AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
           AND (
             (
@@ -487,6 +492,7 @@ function clearExactRunInFlightOwner(
             updated_at = ?
       WHERE id = ?
         AND kind = 'chat'
+        AND json_valid(metadata_json)
         AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
         AND json_type(metadata_json, '$.__run_in_flight_owner') IS NULL
         AND NOT EXISTS (

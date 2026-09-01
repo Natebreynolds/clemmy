@@ -1135,7 +1135,9 @@ export function listSessions(options: ListSessionsOptions = {}): SessionRow[] {
     params.push(options.updatedAfter);
   }
   if (options.runInFlightOnly) {
-    clauses.push("json_type(metadata_json, '$.__run_in_flight') IS NOT NULL");
+    // json_type raises on malformed JSON; one corrupt legacy row must not
+    // abort the whole interrupted-chat scan (mirrors the data_json guard).
+    clauses.push("json_valid(metadata_json) AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL");
   }
   let sql = 'SELECT * FROM sessions';
   if (clauses.length > 0) {
@@ -1175,6 +1177,7 @@ export function listExactCheckpointRecoverySessions(limit = 64): SessionRow[] {
              END AS recovery_source_user_seq
         FROM sessions
        WHERE kind = 'chat'
+         AND json_valid(metadata_json)
          AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL
          AND json_type(metadata_json, '$.__host_recovery_state') = 'text'
     )

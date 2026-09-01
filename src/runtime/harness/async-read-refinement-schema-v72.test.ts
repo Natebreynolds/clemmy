@@ -113,7 +113,7 @@ test('v71 to v72 adds the historical terminal owner and v73 normalizes Stop auth
       .includes('cancellation_run_attempt_id'));
 
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 73);
+    assert.equal(version(db), 74);
     assert.ok(columnNames(db, asyncSchema.ASYNC_READ_REFINEMENT_TERMINAL_RECEIPTS_TABLE)
       .includes('cancellation_run_attempt_id'));
     exerciseTerminalOutcomeAuthority(db, 'plain');
@@ -172,7 +172,7 @@ test('v73 upgrades the earlier v71 terminal-table candidate without assuming a c
       )
     `);
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 73);
+    assert.equal(version(db), 74);
     assert.ok(object(db, asyncSchema.ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE));
     assert.ok(object(db, 'trg_async_read_refinement_completion_excludes_terminal'));
     assert.ok(object(db, 'trg_async_read_refinement_terminal_excludes_completion'));
@@ -202,7 +202,7 @@ test('v73 restores recovery structures missing from an already-stamped v72 home'
     assert.equal(object(db, 'plan_task_binding_seal_recovery_cursor'), undefined);
 
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 73);
+    assert.equal(version(db), 74);
     assert.ok(object(db, 'plan_task_binding_seal_recovery_cursor'));
     assert.ok(object(db, asyncSchema.ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE));
     assert.ok(object(db, 'idx_sessions_chat_run_in_flight_updated'));

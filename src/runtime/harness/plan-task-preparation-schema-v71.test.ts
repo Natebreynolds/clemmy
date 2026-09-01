@@ -279,7 +279,7 @@ test('v70 through current backfills exact v71 receipts, retains legacy ambiguity
     schema.applyHarnessMigrations(db);
     assert.equal((db.prepare(`SELECT MAX(version) AS version FROM schema_version`).get() as {
       version: number;
-    }).version, 73);
+    }).version, 74);
     assert.deepEqual(db.prepare(`
       SELECT logical_tool_call_id, delivery_owner
         FROM ${coexistence.PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
