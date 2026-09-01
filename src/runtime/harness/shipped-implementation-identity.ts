@@ -16,6 +16,11 @@ import type {
   AttestedTransport,
   AttestedTransportCall,
 } from './implementation-artifacts/attested-transport.js';
+import {
+  forwardingHostLocalWriteCarrier,
+  peekHostLocalWriteCarrier,
+  type HostLocalWriteCarrier,
+} from './implementation-artifacts/host-local-write-carrier.js';
 
 export type ShippedImplementationKind = 'invoke' | 'reconcile' | 'observer' | 'transport' | 'transportIsolated';
 
@@ -355,10 +360,12 @@ export function loadShippedImplementations(): ShippedImplementations {
   const invoke = requireArtifact<{
     invokeForSealedManifest: ShippedImplementations['invokeForSealedManifest'];
     bindAttestedTransport: (transport: AttestedTransport) => void;
+    bindHostLocalWriteCarrier?: (carrier: HostLocalWriteCarrier | null) => void;
   }>('invoke', verified.digests.invoke, root);
   const reconcile = requireArtifact<{
     reconcileForSealedManifest: ShippedImplementations['reconcileForSealedManifest'];
     bindAttestedTransport: (transport: AttestedTransport) => void;
+    bindHostLocalWriteCarrier?: (carrier: HostLocalWriteCarrier | null) => void;
   }>('reconcile', verified.digests.reconcile, root);
   const observer = requireArtifact<{
     applyIndependentObserver: ShippedImplementations['applyIndependentObserver'];
@@ -374,6 +381,18 @@ export function loadShippedImplementations(): ShippedImplementations {
     || typeof observer.observeIndependently !== 'function') {
     throw new Error('shipped implementation artifacts are not executable');
   }
+  // Reviewed local writes whose storage the host owns reach it through this
+  // seam, never through an import: the artifacts are separate module
+  // instances, and a bundled copy of the host's storage graph would be a
+  // second event-log/database instance. The forwarder resolves the host's
+  // binding at call time, so the artifact always sees the current carrier.
+  if (typeof invoke.bindHostLocalWriteCarrier !== 'function'
+    || typeof reconcile.bindHostLocalWriteCarrier !== 'function') {
+    throw new Error('shipped invoke/reconcile artifacts lack the host local-write carrier seam');
+  }
+  const hostLocalWriteCarrier = forwardingHostLocalWriteCarrier(peekHostLocalWriteCarrier);
+  invoke.bindHostLocalWriteCarrier(hostLocalWriteCarrier);
+  reconcile.bindHostLocalWriteCarrier(hostLocalWriteCarrier);
   const generation = verified.manifestDigest;
   const invokeFactory = invoke.invokeForSealedManifest;
   const reconcileFactory = reconcile.reconcileForSealedManifest;
