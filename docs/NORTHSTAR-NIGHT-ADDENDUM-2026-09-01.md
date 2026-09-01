@@ -133,7 +133,18 @@ in two weeks a failed run named its own cause.
 
 ### Declared state at the tip
 - Full isolated suite: __SUITE__ (sentinel PERFORMED, no violations).
-- Journeys: __JOURNEYS__.
+- Journeys (`npm run journeys` at `ebae46b3`, daemon stopped): **156/171**. The 15 reds split cleanly:
+  3 are the hard-cut journey seams recorded above (`host_invocation_authority_missing` + two fixture
+  projection receipts), and 12 are **pre-existing wave debt, not regressions** — the same five files
+  (`plan-task-live-surface.regression`, `progressive-discovery-large-catalog.competitive.red`,
+  `provider-neutral-no-random-gate.acceptance`, `restaurant-sheet-model-surface.competitive.red`,
+  `restaurant-sheet-natural-request.integration`) had **15** reds at the wave base K9 `6d77e7fa` (the
+  tree exactly as handed over, before any ring) and have 12 at the tip; bisected by running the files
+  at K9, at ring B's tip `0cd63045`, and at HEAD in throwaway worktrees. Their content: outbound-draft
+  approval flow (3 subtests), "verified capability memory never grants authority", the cold
+  Discord read+create loop, the 16 KiB model-visible-surface and 70 % warm-cache competitive ceilings
+  (surface measured 21.7 KiB), the 10K-catalog permutation gate, and a `work_call` continuation after
+  an accepted read plan. These are the next wave's list, in that order.
 - Packaged gates (`build`, `test:packed-candidate`, `test:packaged-upgrade`, `rehearse:upgrade:v314`): __PACKAGED__.
 - Known follow-ups (not defects hidden): per-row `WHERE id=? AND json_type(metadata_json…)` arm/clear
   statements in `eventlog.ts` (same class as gate 17, fails only its own row); `workspace_social_posts_v1`
