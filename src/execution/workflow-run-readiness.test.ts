@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { WorkflowDefinition, WorkflowResourceBinding } from '../memory/workflow-store.js';
@@ -25,6 +25,7 @@ const {
   renderWorkflowRunReadinessMessage,
   renderWorkflowVisualContract,
 } = await import('./workflow-run-readiness.js');
+const { provisionReviewedCliReadDescriptor } = await import('../runtime/harness/reviewed-cli-read-config.js');
 type ReadinessItem = Parameters<typeof partitionWorkflowReadiness>[0][number];
 
 test.after(() => {
@@ -384,4 +385,85 @@ test('Salesforce readiness is local-only and does not mutate the binding', () =>
   assert.equal(readiness.ok, true);
   assert.equal(readiness.warnings[0]?.name, 'sf:salesforce_org');
   assert.equal(JSON.stringify(resource), before);
+});
+
+// ── Inventory = the executor's own registries ───────────────────────────────
+// Certification said READY while the execution plan called the very same call
+// steps "missing": readiness was reading the CLI-lane registry projection, not
+// the registries the workflow call carrier dispatches from. The connection
+// pinned here is "what the carrier can dispatch == what readiness counts as
+// present" for BOTH carriers: a reviewed-CLI read descriptor (durable file)
+// and a registry tool with a reviewed in-process execution contract.
+
+test('reviewed CLI read operations and reviewed-local registry tools are ready in the inventory', async () => {
+  const executable = path.join(TMP_HOME, 'reviewed-cli-readiness-bin');
+  writeFileSync(executable, `#!${process.execPath}\nprocess.stdout.write('{}');\n`, 'utf8');
+  chmodSync(executable, 0o700);
+  await provisionReviewedCliReadDescriptor({
+    version: 1,
+    descriptorId: 'salesforce-soql-readiness',
+    operationId: 'salesforce_sf_soql_query',
+    displayName: 'SOQL query',
+    description: 'Run a read-only SOQL query against the default org.',
+    effect: 'read',
+    accountId: 'reviewed_cli:host',
+    executablePath: executable,
+    argvPrefix: ['data', 'query', '--json'],
+    arguments: [{ name: 'query', kind: 'option', token: '--query', valueType: 'string', required: true }],
+    limits: { timeoutMs: 2_000, maxStdoutBytes: 16_384, maxStderrBytes: 4_096, maxArgumentBytes: 4_096 },
+  });
+
+  const inventory = buildWorkflowReadinessInventory();
+  assert.ok(inventory.availableTools?.includes('salesforce_sf_soql_query'),
+    'a sealed reviewed-CLI read descriptor is a dispatchable operation, so it is present');
+  assert.ok(inventory.availableTools?.includes('space_set_data'),
+    'a registry tool with localExecution is dispatched by the call carrier regardless of lane, so it is present');
+
+  const def: WorkflowDefinition = {
+    name: 'crm-dashboard-refresh-shape',
+    description: 'Query the CRM and commit the dataset to a workspace.',
+    enabled: true,
+    trigger: { type: 'manual' },
+    steps: [
+      {
+        id: 'query',
+        prompt: 'Query open opportunities.',
+        sideEffect: 'read',
+        call: { tool: 'salesforce_sf_soql_query', args: { query: 'SELECT Id FROM Opportunity' } },
+      },
+      {
+        id: 'publish',
+        prompt: 'Commit the dataset.',
+        sideEffect: 'write',
+        dependsOn: ['query'],
+        call: { tool: 'space_set_data', args: { slug: 'crm-dashboard', source: 'open', data_json: '{{steps.query.output}}' } },
+      },
+    ],
+  };
+  const readiness = checkWorkflowRunReadiness(def, 'crm-dashboard-refresh-shape');
+  const byName = new Map(readiness.plan.toolReadiness.items.map((item) => [item.name, item]));
+  assert.equal(byName.get('salesforce_sf_soql_query')?.status, 'ready');
+  assert.deepEqual(byName.get('salesforce_sf_soql_query')?.sources, ['step_call']);
+  assert.equal(byName.get('space_set_data')?.status, 'ready');
+  assert.deepEqual(byName.get('space_set_data')?.sources, ['step_call']);
+  assert.equal(readiness.plan.toolReadiness.missingCount, 0);
+  assert.equal(readiness.plan.toolReadiness.ready, true);
+  assert.equal(readiness.plan.visualContract.checks.find((check) => check.kind === 'tool_readiness')?.status, 'pass');
+  assert.equal(readiness.ok, true);
+  assert.deepEqual(readiness.blockers, []);
+  assert.deepEqual(readiness.warnings, []);
+});
+
+test('a malformed reviewed-CLI descriptor registry contributes nothing and never fails the preflight', () => {
+  const file = path.join(TMP_HOME, 'state', 'reviewed-cli-read-descriptors.json');
+  const original = readFileSync(file, 'utf8');
+  try {
+    writeFileSync(file, '{not json', 'utf8');
+    const inventory = buildWorkflowReadinessInventory();
+    assert.equal(inventory.availableTools?.includes('salesforce_sf_soql_query'), false);
+    assert.ok(inventory.availableTools?.includes('space_set_data'),
+      'the registry-derived names do not depend on the descriptor file');
+  } finally {
+    writeFileSync(file, original, 'utf8');
+  }
 });

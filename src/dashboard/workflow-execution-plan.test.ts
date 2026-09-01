@@ -209,6 +209,39 @@ test('buildWorkflowExecutionPlan preflights inherited tools, missing skills/scri
     && fix.actions?.some((action) => action.kind === 'install_skill')));
 });
 
+test('a step_call operation present in availableTools is ready even when its name is not CLI-shaped', () => {
+  // Call-step operations carry no lane prefix: a reviewed-CLI read id or a
+  // registry tool with a reviewed in-process contract falls through every
+  // classifier regex to kind 'tool'. Readiness for that kind is a catalog
+  // membership check, so an inventory that lists the name must report ready
+  // (evidence tool_catalog) — never 'missing' because the name looks unusual.
+  const plan = buildWorkflowExecutionPlan([
+    { id: 'query_crm', prompt: 'Query the CRM.', call: { tool: 'crm_soql_query', args: { query: 'SELECT Id FROM Account' } } },
+    { id: 'publish', prompt: 'Commit the dataset.', dependsOn: ['query_crm'], call: { tool: 'space_set_data', args: { slug: 'crm' } } },
+    { id: 'absent', prompt: 'Call something the inventory lacks.', dependsOn: ['publish'], call: { tool: 'crm_bulk_export' } },
+  ], {
+    readiness: {
+      availableTools: ['read_file', 'crm_soql_query', 'space_set_data'],
+      availableClis: ['gh'],
+      installedSkills: [],
+      workflowScripts: [],
+      mcpServers: [],
+    },
+  });
+
+  const readinessByName = new Map(plan.toolReadiness.items.map((item) => [item.name, item]));
+  for (const name of ['crm_soql_query', 'space_set_data']) {
+    const item = readinessByName.get(name);
+    assert.equal(item?.kind, 'tool', `${name} is not cli/mcp/composio/local-shaped`);
+    assert.equal(item?.status, 'ready');
+    assert.deepEqual(item?.sources, ['step_call']);
+    assert.ok(item?.evidence?.some((entry) => entry.kind === 'tool_catalog' && entry.status === 'ready'));
+  }
+  assert.equal(readinessByName.get('crm_bulk_export')?.status, 'missing');
+  assert.equal(plan.toolReadiness.missingCount, 1);
+  assert.equal(plan.toolReadiness.readyCount, 2);
+});
+
 test('buildWorkflowExecutionPlan preflights workflow and step local project requirements', () => {
   const plan = buildWorkflowExecutionPlan([
     { id: 'inspect_repo', prompt: 'Inspect the default repo.' },

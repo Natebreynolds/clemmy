@@ -508,6 +508,16 @@ export function deriveCatalogNames(): Set<string> {
   return names((d) => d.lanes.includes('cli'));
 }
 
+/**
+ * Registry tools that carry a reviewed in-process execution contract. The
+ * workflow call carrier dispatches these directly through their adapter no
+ * matter which lanes they advertise, so any readiness view of "what a call
+ * step can reach" must count them as present. Derived, never listed.
+ */
+export function deriveReviewedLocalNames(): Set<string> {
+  return names((d) => d.localExecution != null);
+}
+
 /** orchestrator.ts deduped discoveryTools (the live-chat surface). */
 export function deriveOrchestratorDiscoveryNames(): Set<string> {
   return names((d) => d.lanes.includes('orchestrator'));
