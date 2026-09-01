@@ -208,7 +208,13 @@ in two weeks a failed run named its own cause.
   refused `schema_too_big:goal.objective (<=8000)` — the objective is host-composed from the accepted
   source (a 51 KB brief), nothing the model drafts can shrink it, and a pasted document in chat hits the
   same wall. `boundedSemanticObjective()` projects the source into the budget (whitespace cut + a marker
-  naming the omitted count; the source event stays the authority). Attempt 11 runs on all of it.
+  naming the omitted count; the source event stays the authority); (11) past both, the model modeled
+  the WORKFLOW's six SOQL reads as its own plan (universes, invented `host:*` refs) and was refused
+  `coverage and cardinality describe different read sets` twice → loop floor. The brief's own gate-5
+  hint ("keep every plan_task field short") had nudged it toward `plan_task` at all; a reversible local
+  write is a direct call. The brief now asks for one direct `workflow_update` and forbids planning or
+  running the workflow's own operations in that session; the topology refusal names its valid pairs.
+  Attempt 12 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
