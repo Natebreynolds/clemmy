@@ -342,7 +342,9 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
         || (cardinality.kind === 'each' && raw.coverage !== 'single')
       )
     ) {
-      errors.push(`${label}.coverage and cardinality describe different read sets`);
+      // Name the fix (self-healing law): live 2026-09-01 a turn resent this
+      // shape twice with a different guess each time and the loop floor stopped it.
+      errors.push(`${label}.coverage and cardinality describe different read sets (valid pairs: coverage single with cardinality once or each; complete_set with once; resolved_operation with once; accepted_set with set)`);
     }
     if (cardinality.kind !== 'once' && cardinality.kind !== 'each' && cardinality.kind !== 'set') continue;
     operations.push({

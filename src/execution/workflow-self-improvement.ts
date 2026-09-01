@@ -266,7 +266,7 @@ export function buildWorkflowImprovementPrompt(input: {
       ? '2. The current definition and the legacy script source are both included at the end of this message. Do not spend calls on workflow_get or read_file for them; start with the rewrite.'
       : '2. First read the current definition with workflow_get (section "full", one call). The legacy script source you need is included at the end of this message; do not spend calls re-reading it.',
     '3. Re-author each legacy script step as exact `call` steps for the external reads/writes the script performed — one call step per provider operation, with the exact operation name (use tool_search to find the exact reviewed CLI read or provider action; do not invent names) and the literal arguments the script used — plus a `transform` step or a short prose step for the pure computation/rendering the script did. Keep the same output contract (required_keys / non_empty) that downstream steps consume; if the old step produced several fields, the last new step must produce all of them.',
-    '4. Write the improved definition with workflow_update, sending the COMPLETE steps array (it replaces the whole graph). Do not disable the workflow. Do not change its name.',
+    '4. Save the improved definition with ONE workflow_update call carrying the COMPLETE steps array (it replaces the whole graph). It is a reversible local write: call it directly (via work_call with the exact capabilityRef tool_search returns, when it is not on your tool list). Do not call plan_task, and do not run or plan the workflow\'s own reads/sends in this session — the runner executes those on the next scheduled run. Do not disable the workflow. Do not change its name.',
     '5. End with a 3–6 line plain-language note for the user: which step changed, what it does now, and anything they should glance at.',
     '6. Do not ask the user questions and do not stop at a proposal — nobody is in this session. Where the script did something exact steps cannot express (runtime-built queries, a local state file, a delta against a previous run), choose the option that preserves the MOST of the original behavior, drop only what cannot be expressed, and say exactly what was dropped in the final note; the user can steer from that note afterwards.',
     '',
@@ -274,7 +274,6 @@ export function buildWorkflowImprovementPrompt(input: {
     '- exact provider read/write:  { id, prompt: "", side_effect: read|write|send, call: { tool: <exact operation name from tool_search>, args: { ...literal arguments } }, output: { type: object, required_keys: [stdout], non_empty: [stdout] } }',
     '- pure computation/rendering: { id, prompt: "<what to compute from the named prior steps, and the exact JSON object to return>", dependsOn: [<step ids>], side_effect: read, output: { type: object, required_keys: [...], non_empty: [...] } }',
     '- the existing send step stays as it is (same allowedTools, same destination, same output contract).',
-    'Keep every plan_task field short: objective and criteria are one sentence each; evidence strings are bare tokens (letters, digits, :._/-, ≤128 chars).',
     ...(inlined.length > 0 ? ['', ...inlined] : []),
   ].join('\n');
 }
