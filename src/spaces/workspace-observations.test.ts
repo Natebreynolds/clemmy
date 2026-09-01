@@ -1391,6 +1391,47 @@ test('legacy data.json bootstrap is deterministic, excludes _meta, and becomes t
   }
 });
 
+test('static_snapshot bootstrap retains one stable document baseline instead of per-key legacy sources', () => {
+  const temp = mkdtempSync(path.join(os.tmpdir(), 'clemmy-static-snapshot-bootstrap-'));
+  const rootDir = path.join(temp, 'workspace');
+  mkdirSync(rootDir, { recursive: true });
+  const db = openTestDb(rootDir);
+  const document = {
+    calendar: [{ day: 'Monday' }],
+    posts: Array.from({ length: 5 }, (_, index) => ({ id: index + 1 })),
+    citations: [{ url: 'https://example.com/source' }],
+    _mobile: { records: { items: [{ primary: 'Post 1', body: 'Full copy' }] } },
+  };
+  writeFileSync(path.join(rootDir, 'data.json'), JSON.stringify(document), 'utf8');
+  writeFileSync(path.join(rootDir, 'space.json'), JSON.stringify({
+    id: 'temporal-room',
+    title: 'Temporal Room',
+    status: 'active',
+    contentMode: 'static_snapshot',
+  }), 'utf8');
+  try {
+    assert.deepEqual(
+      bootstrapWorkspaceObservationHistory('temporal-room', { db, rootDir }),
+      { ok: true, imported: 1, skipped: 0 },
+    );
+    const observations = listWorkspaceDatasetObservations('temporal-room', { db, limit: 100 });
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].sourceKey, '$document');
+    assert.equal(observations[0].projectionMode, 'document');
+    assert.deepEqual(getWorkspaceObservationDocument('temporal-room', observations[0].id, db), document);
+    assert.deepEqual(
+      bootstrapWorkspaceObservationHistory('temporal-room', { db, rootDir }),
+      { ok: true, imported: 0, skipped: 0 },
+      'restart is idempotent once the document owner exists',
+    );
+    assert.equal(listWorkspaceDatasetObservations('temporal-room', { db, limit: 100 }).length, 1);
+    assert.equal(readFileSync(path.join(rootDir, 'data.json'), 'utf8'), JSON.stringify(document));
+  } finally {
+    db.close();
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test('legacy bootstrap keeps document semantics and malformed/oversize files cannot mutate storage', () => {
   const rootDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-observations-bootstrap-safe-'));
   const db = openTestDb(rootDir);

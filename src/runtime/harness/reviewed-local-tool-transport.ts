@@ -31,6 +31,11 @@ import {
 import {
   inspectArtifactBundleArtifactId,
 } from '../../tools/artifact-bundle-core.js';
+import {
+  prepareWorkspaceSetData,
+  WORKSPACE_SET_DATA_TOOL_PARAMETERS,
+  type WorkspaceSetDataArguments,
+} from '../../spaces/workspace-set-data-contract.js';
 import type { AuthorizedLocalPlanningDefinitionV1 } from './local-planning-capability.js';
 import type {
   AttestedTransportCall,
@@ -71,9 +76,17 @@ function validExecutionContract(value: unknown): value is ReviewedLocalExecution
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const contract = value as Partial<ReviewedLocalExecutionContractV1>;
   return contract.version === 1
-    && contract.adapter === 'artifact_bundle_v1'
     && contract.idempotency === 'content_addressed'
-    && contract.reconciliation === 'artifact_bundle_v1';
+    && (
+      (
+        contract.adapter === 'artifact_bundle_v1'
+        && contract.reconciliation === 'artifact_bundle_v1'
+      )
+      || (
+        contract.adapter === 'workspace_dataset_v1'
+        && contract.reconciliation === 'workspace_dataset_v1'
+      )
+    );
 }
 
 function safeToken(value: string): string | null {
@@ -238,13 +251,16 @@ function deriveReviewedLocalDefinition(input: {
   });
 }
 
-function currentArtifactBundleSchema(): Record<string, unknown> | null {
+function currentReviewedLocalSchema(
+  execution: ReviewedLocalExecutionContractV1,
+): Record<string, unknown> | null {
   // work_call is the physical carrier for reviewed local mutations. Match its
   // current strict deferred schema bytes (Zod's 2020-12 projection), not the
   // separate first-class provider projection used by direct model calling.
-  const deferredParameters = z.strictObject(
-    normalizeShapeForDeferredJson(ARTIFACT_BUNDLE_TOOL_PARAMETERS),
-  );
+  const parametersShape = execution.adapter === 'artifact_bundle_v1'
+    ? ARTIFACT_BUNDLE_TOOL_PARAMETERS
+    : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
+  const deferredParameters = z.strictObject(normalizeShapeForDeferredJson(parametersShape));
   const parameters = z.toJSONSchema(deferredParameters);
   const schema = relaxJsonSchemaForDeferred(parameters);
   return isRecord(schema) ? schema : null;
@@ -258,7 +274,7 @@ export function observeReviewedLocalTool(
   if (!name || name !== operationId) return null;
   const declaration = exactDeclaration(name);
   if (!declaration || !validExecutionContract(declaration.localExecution)) return null;
-  const schema = currentArtifactBundleSchema();
+  const schema = currentReviewedLocalSchema(declaration.localExecution);
   if (!schema) return null;
   const definition = deriveReviewedLocalDefinition({ declaration, schema });
   if (!definition || definition.accountIdentity !== REVIEWED_LOCAL_ACCOUNT) return null;
@@ -339,8 +355,18 @@ export function reviewedLocalToolArgumentsMatch(
   observed: ReviewedLocalToolObservation,
   args: Record<string, unknown>,
 ): boolean {
-  const parsed = z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
-  if (!parsed.success) return false;
+  if (observed.execution.adapter === 'artifact_bundle_v1') {
+    const parsed = z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
+    if (!parsed.success) return false;
+  } else if (observed.execution.adapter === 'workspace_dataset_v1') {
+    try {
+      prepareWorkspaceSetData(args);
+    } catch {
+      return false;
+    }
+  } else {
+    return false;
+  }
   const safeMode = observed.definition.safeMode;
   if (!safeMode) return true;
   const nullEquivalent = new Set(safeMode.nullEquivalentToRequired ?? []);
@@ -352,6 +378,22 @@ export function reviewedLocalToolArgumentsMatch(
   }
   return true;
 }
+
+export type PreparedReviewedLocalToolExecution =
+  | {
+      observed: ReviewedLocalToolObservation;
+      adapter: 'artifact_bundle_v1';
+      args: {
+        bundle_id: string;
+        mode: 'content_addressed';
+        files: Array<{ path: string; content: string }>;
+      };
+    }
+  | {
+      observed: ReviewedLocalToolObservation;
+      adapter: 'workspace_dataset_v1';
+      args: WorkspaceSetDataArguments;
+    };
 
 function exactExpectedIdentity(
   call: AttestedTransportCall,
@@ -379,9 +421,14 @@ function exactExpectedIdentity(
   );
 }
 
-export async function executeReviewedLocalTool(
+/**
+ * Revalidate current registry/schema/manifest identity and close arguments.
+ * Host-owned storage adapters call this before their first storage lookup;
+ * the storage-free transport leaf uses the same function before execution.
+ */
+export function prepareReviewedLocalToolExecution(
   call: AttestedTransportCall,
-): Promise<unknown> {
+): PreparedReviewedLocalToolExecution {
   const observed = observeReviewedLocalTool(call.operationId);
   if (!observed || !exactExpectedIdentity(call, observed)) {
     throw new Error('reviewed local execution identity changed before dispatch');
@@ -389,8 +436,30 @@ export async function executeReviewedLocalTool(
   if (!reviewedLocalToolArgumentsMatch(observed, call.args)) {
     throw new Error('reviewed local execution arguments exceed the declared safe mode');
   }
-  const parsed = z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args);
-  return executeArtifactBundleSave(parsed);
+  if (observed.execution.adapter === 'artifact_bundle_v1') {
+    return {
+      observed,
+      adapter: observed.execution.adapter,
+      args: z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args),
+    };
+  }
+  return {
+    observed,
+    adapter: observed.execution.adapter,
+    args: prepareWorkspaceSetData(call.args).args,
+  };
+}
+
+export async function executeReviewedLocalTool(
+  call: AttestedTransportCall,
+): Promise<unknown> {
+  const prepared = prepareReviewedLocalToolExecution(call);
+  if (prepared.adapter === 'artifact_bundle_v1') {
+    return executeArtifactBundleSave(prepared.args);
+  }
+  // Workspace persistence belongs to the shipped host invoke carrier. Keeping
+  // native DB bindings out of this leaf preserves the transport-only closure.
+  throw new Error('reviewed Workspace dataset execution requires the host storage carrier');
 }
 
 export async function reconcileReviewedLocalTool(input: {

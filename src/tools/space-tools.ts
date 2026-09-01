@@ -12,29 +12,29 @@
  * registerWorkflowScheduleTools.
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
   spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, mergeSpaceContract,
+  SPACE_INITIAL_DATA_MAX_BYTES,
   type SpaceDataSource, type SpaceAction, type SpaceRecord,
 } from '../spaces/store.js';
 import { prepareSpaceForWrite } from '../spaces/space-enforce.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import { runSpaceCreationSmoke } from '../spaces/space-smoke.js';
 import { refreshSpaceData } from '../spaces/runner.js';
-import { readData, listNotes, listAudit, appendNote, appendAudit } from '../spaces/data-store.js';
+import { readData, listNotes, listAudit, appendNote } from '../spaces/data-store.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import {
   bootstrapWorkspaceObservationHistory,
-  commitWorkspaceObservationBatch,
   indexWorkspaceRecord,
   openWorkspaceDb,
 } from '../spaces/workspace-db.js';
@@ -53,7 +53,17 @@ import {
   evaluateSpaceActionV3AutoConsent,
 } from '../spaces/space-action-v3-authority.js';
 import { redactSensitiveText } from '../runtime/security.js';
-import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
+import {
+  HOST_LOCAL_WORKSPACE_COMMIT_BASENAME,
+  hostLocalWriteCommitResultIsProven,
+  withHostLocalWriteCommitFromFile,
+} from '../runtime/harness/host-local-write-commit.js';
+import {
+  WORKSPACE_SET_DATA_TOOL_PARAMETERS,
+  WorkspaceSetDataContractError,
+} from '../spaces/workspace-set-data-contract.js';
+import { executeManualWorkspaceSetData } from '../spaces/workspace-set-data-carrier.js';
+import { WorkspaceSetDataExecutionError } from '../spaces/workspace-set-data-executor.js';
 
 // Re-exported for back-compat (space-tools.test.ts imports it from here); the
 // canonical definition now lives in the shared leaf so workflow_get can reuse it.
@@ -404,6 +414,34 @@ function renderViewForRead(
   return out.join('\n');
 }
 
+function renderSpaceSaveResult(input: {
+  verb: 'Created' | 'Updated';
+  record: SpaceRecord;
+  slug: string;
+  contractListsDropped: boolean;
+  advisories: string;
+  smokeNote: string;
+  gapQuestions: string;
+}): string {
+  const dsNote = input.record.dataSources.length > 0
+    ? ` ${input.record.dataSources.length} data source${input.record.dataSources.length === 1 ? '' : 's'} declared.`
+    : '';
+  const contractNote = input.record.contract
+    ? ` Operating contract pinned: "${input.record.contract.objective}".`
+    : input.contractListsDropped
+      ? ' Operating contract NOT saved: success criteria/invariants need an objective — re-save with objective to pin them.'
+      : ' Operating contract is not pinned yet; preserve the user\'s stated purpose on the next substantive save.';
+  const mobileLink = `[Open on mobile](/m/?tab=spaces&workspace=${input.slug})`;
+  return `${input.verb} workspace "${input.record.title}" (${input.slug}) — status ${input.record.status}. `
+    + `Open it at /workspaces/${input.slug} in the desktop, or ${mobileLink}.${dsNote}`
+    + `${contractNote} The view is versioned (v${input.record.version}) — prior versions are revertible.`
+    + `${input.advisories}${input.smokeNote}${input.gapQuestions}`;
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  try { return JSON.stringify(left) === JSON.stringify(right); } catch { return false; }
+}
+
 export function registerSpaceTools(server: McpServer): void {
   server.tool(
     'space_save',
@@ -419,6 +457,7 @@ export function registerSpaceTools(server: McpServer): void {
       'Compatibility: an already-installed runner-backed data source may retain the same source id + filename. Its first refresh requests one time-bounded human approval bound to the runner entrypoint hash + schedule; entrypoint edits invalidate that grant. Helpers, packages, CLIs, local files, auth state, and network services remain live outside the digest, so this is not a read-only sandbox. Prefer migrating it to read-only Composio. Executable ACTION runners remain per-invocation approval-gated under the same pinned-entrypoint boundary.',
       'PROACTIVE WAKE (optional): a scheduled read-only source can be paired with threshold re-engagement guidance; the scheduler dedups a persistent condition so it does not ping on every refresh.',
       'PHONE VIEW (recommended): the authored HTML view is loopback-only and never reaches the phone, so the mobile app otherwise has to GUESS what matters by sniffing the JSON — and it cannot recover a number your view computes but the data does not contain. Write a `_mobile` key into the dataset so the phone shows what you would have shown: `_mobile: { headline: [{label, value}], breakdowns: [{label, entries:[{label, value}]}], records: { label, total, items: [{primary, fields:[{label, value}]}] } }`. Values are display strings you already computed — pre-format money and dates, keep labels short enough for a 390px screen, and cap it at roughly 6 tiles and 40 records. Every part is optional and a missing or malformed block simply falls back to inference, so it can never make a workspace worse. Prioritise: the two or three numbers someone would want standing in a parking lot, then the rows they would scan. DURABILITY: refresh rebuilds the dataset from each source runner’s output, so a `_mobile` block written directly into the data file is WIPED on the next refresh. Put the `_mobile` block INSIDE the runner’s emitted result instead (the phone reads it one level down, e.g. `weekly._mobile`) — then every refresh re-authors the layout and it can never go stale. A user asking for a “mobile layout” means THIS — rewriting the HTML view changes nothing on their phone.',
+      `ONE-OFF MOBILE CONTENT: when this is a new static report/calendar whose complete content is already in hand, pass initial_data_json in THIS SAME call instead of planning a second space_set_data mutation. It is a create-only, full JSON document capped at ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes and cannot be combined with data_sources. Include top-level _mobile. For long authored copy, each _mobile record may add body (up to 4,000 characters) and links: [{label,url}] (http(s) only), alongside short fields. The single commit makes the view, data, and phone handoff restart-safe together.`,
       'OPERATING CONTRACT: persist the Workspace\'s user-owned objective, concrete success criteria, and semantic invariants (things later edits/refreshes must never drift). This is a compact north star, not a procedure or an extra judge. Omit fields on later saves to preserve them.',
       'Changing a Composio data source auto-refreshes on save and reports the row count. Editing an installed legacy runner requests fresh pinned-entrypoint approval and leaves the Workspace active with its prior dataset until approved.',
       'Returns the workspace URL and a summary. The prior view is snapshotted for one-click revert.',
@@ -431,6 +470,7 @@ export function registerSpaceTools(server: McpServer): void {
       invariants: z.array(z.string().min(1).max(500)).max(12).nullish().describe('Optional user/product rules that later edits must never violate, e.g. "Salesforce remains read-only" or "Never publish without approval". An explicit [] clears; omit to preserve.'),
       view_html: z.string().min(1).max(SPACE_INLINE_VIEW_MAX_BYTES).nullish().describe(`Preferred for ordinary views: complete self-contained HTML, at most ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes. Mutually exclusive with view_path; omit both to update only metadata on an existing Workspace.`),
       view_path: z.string().max(1000).nullish().describe(`Legacy / oversized compatibility: path to an already-authored HTML file inside ${BASE_DIR}. Mutually exclusive with view_html; omit both to update only metadata on an existing Workspace.`),
+      initial_data_json: z.string().min(1).max(SPACE_INITIAL_DATA_MAX_BYTES).nullish().describe(`Create-only complete JSON document for a one-off static Workspace, maximum ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes. Include top-level _mobile so the substantive content is visible on the phone. Cannot be combined with data_sources; exact retry of the same committed create is idempotent.`),
       data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh.'),
       actions: z.array(actionShape).nullish().describe('Optional declared ACTIONS the view can trigger server-side (e.g. send an email via an Outlook Composio tool). The view POSTs {actionId, args} to /api/console/spaces/<slug>/action; credentials resolve server-side. Build the buttons/forms for these into the view.'),
       reengage_triggers: z.array(z.enum(['note', 'ask', 'threshold'])).nullish().describe('Which in-workspace events should wake you to reason: "note" (user left a note), "ask" (user asked in the workspace chat), "threshold" (data crossed a limit).'),
@@ -438,13 +478,38 @@ export function registerSpaceTools(server: McpServer): void {
       origin_session_id: z.string().max(200).nullish().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
     },
     async ({
-      slug, title, objective, success_criteria, invariants, view_html, view_path, data_sources, actions,
+      slug, title, objective, success_criteria, invariants, view_html, view_path, initial_data_json, data_sources, actions,
       reengage_triggers, reengage_guidance, origin_session_id,
     }) => {
       if (!isValidSpaceSlug(slug)) {
-        return textResult(`Error: "${slug}" is not a valid workspace slug. Use lowercase kebab-case, 2-63 chars (e.g. "sf-daily-report").`);
+        return invalidArgumentsTextResult(`Error: "${slug}" is not a valid workspace slug. Use lowercase kebab-case, 2-63 chars (e.g. "sf-daily-report").`);
       }
       const existing = spaceStore.get(slug);
+      let initialData: Record<string, unknown> | undefined;
+      let initialDataText: string | null = null;
+      if (initial_data_json != null) {
+        if (!initial_data_json.trim()) {
+          return invalidArgumentsTextResult('Error: initial_data_json must contain a JSON object. No Workspace changes were saved.');
+        }
+        if (Buffer.byteLength(initial_data_json, 'utf8') > SPACE_INITIAL_DATA_MAX_BYTES) {
+          return invalidArgumentsTextResult(
+            `Error: initial_data_json is over the ${SPACE_INITIAL_DATA_MAX_BYTES}-byte limit. No Workspace changes were saved.`,
+          );
+        }
+        try {
+          const parsed = JSON.parse(initial_data_json) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return invalidArgumentsTextResult('Error: initial_data_json must be one complete JSON object. No Workspace changes were saved.');
+          }
+          initialData = parsed as Record<string, unknown>;
+          initialDataText = JSON.stringify(initialData);
+        } catch (error) {
+          return invalidArgumentsTextResult(`Error: initial_data_json is not valid JSON: ${(error as Error).message}. No Workspace changes were saved.`);
+        }
+      }
+      if (initialData && (data_sources?.length ?? 0) > 0) {
+        return invalidArgumentsTextResult('Error: initial_data_json is a static snapshot and cannot be combined with data_sources. No Workspace changes were saved.');
+      }
       const inlineView = typeof view_html === 'string' && view_html.trim().length > 0
         ? view_html
         : null;
@@ -452,19 +517,19 @@ export function registerSpaceTools(server: McpServer): void {
         ? view_path.trim()
         : null;
       if (inlineView !== null && viewPath !== null) {
-        return textResult('Error: pass exactly one of view_html or view_path, never both. No Workspace changes were saved.');
+        return invalidArgumentsTextResult('Error: pass exactly one of view_html or view_path, never both. No Workspace changes were saved.');
       }
       if (typeof view_html === 'string' && inlineView === null) {
-        return textResult('Error: view_html must contain non-blank HTML. No Workspace changes were saved.');
+        return invalidArgumentsTextResult('Error: view_html must contain non-blank HTML. No Workspace changes were saved.');
       }
       if (inlineView !== null && Buffer.byteLength(inlineView, 'utf8') > SPACE_INLINE_VIEW_MAX_BYTES) {
-        return textResult(
+        return invalidArgumentsTextResult(
           `Error: view_html is over the ${SPACE_INLINE_VIEW_MAX_BYTES}-byte inline limit. No Workspace changes were saved. `
           + 'Use view_path only for an already-authored oversized compatibility file.',
         );
       }
       if (!existing && inlineView === null && viewPath === null) {
-        return textResult('Error: view_html or view_path is required when creating a new Workspace. No Workspace was saved.');
+        return invalidArgumentsTextResult('Error: view_html or view_path is required when creating a new Workspace. No Workspace was saved.');
       }
       if (existing?.manifestErrors && existing.manifestErrors.length > 0) {
         const needsSources = existing.manifestErrors.some((e) => /^Data source /.test(e));
@@ -473,7 +538,7 @@ export function registerSpaceTools(server: McpServer): void {
         if (needsSources && data_sources == null) missing.push('data_sources');
         if (needsActions && actions == null) missing.push('actions');
         if (missing.length > 0) {
-          return textResult(
+          return invalidArgumentsTextResult(
             `Workspace "${slug}" was NOT saved — its existing manifest has invalid fields. `
             + `Pass corrected ${missing.join(' and ')} to space_save so I do not silently drop the broken values:\n- ${existing.manifestErrors.join('\n- ')}`,
           );
@@ -488,7 +553,7 @@ export function registerSpaceTools(server: McpServer): void {
         authoredView = { ok: true, content: inlineView, resolved: null };
       } else if (viewPath !== null) {
         const read = readAgentOwnedFile(viewPath);
-        if (!read.ok) return textResult(`Error: ${read.error}`);
+        if (!read.ok) return invalidArgumentsTextResult(`Error: ${read.error}`);
         authoredView = read;
       }
 
@@ -508,7 +573,7 @@ export function registerSpaceTools(server: McpServer): void {
         }
       }
       if (parseErrors.length > 0) {
-        return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${parseErrors.join('\n- ')}`);
+        return invalidArgumentsTextResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${parseErrors.join('\n- ')}`);
       }
       const prep = prepareSpaceForWrite({
         slug,
@@ -519,7 +584,7 @@ export function registerSpaceTools(server: McpServer): void {
         existingDataSources: existing?.dataSources,
       });
       if (!prep.ok) {
-        return textResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
+        return invalidArgumentsTextResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${prep.errors.join('\n- ')}`);
       }
 
       // Code/runtime gaps are Clementine's responsibility, not questions for
@@ -558,9 +623,107 @@ export function registerSpaceTools(server: McpServer): void {
       const implementationGaps = analyzeSpaceGaps(prospective, candidateView, [])
         .filter((gap) => gap.resolution === 'fix');
       if (implementationGaps.length > 0) {
-        return textResult(
+        return invalidArgumentsTextResult(
           `Workspace "${slug}" was NOT saved — its view has implementation gaps.${renderSpaceGapQuestions(implementationGaps)}`,
         );
+      }
+
+      const ambientSession = getToolOutputContext()?.sessionId;
+      const reengage = (reengage_triggers && reengage_triggers.length > 0)
+        ? { triggers: reengage_triggers, guidance: reengage_guidance?.trim() || undefined }
+        : undefined;
+      const desiredOriginSession = (
+        origin_session_id?.trim() || ambientSession || existing?.originSessionId
+      ) ?? undefined;
+
+      // `initial_data_json` is create-only, with one narrow exception: an
+      // exact replay after the first call committed but its result was lost.
+      // Rejoin that artifact without touching its view/data/version. Any
+      // collision with different bytes or semantics fails before runner/file
+      // installation, so retry can never overwrite user-owned content.
+      if (existing && initialData && initialDataText !== null) {
+        let installedView: string | null = null;
+        let installedData: string | null = null;
+        try { installedView = readFileSync(resolveInSpace(slug, existing.viewEntry), 'utf8'); } catch { /* mismatch */ }
+        try { installedData = readFileSync(resolveInSpace(slug, 'data.json'), 'utf8'); } catch { /* mismatch */ }
+        const exactReplay = existing.status === 'active'
+          && existing.contentMode === 'static_snapshot'
+          && existing.viewEntry === 'view/index.html'
+          && existing.version === 1
+          && existing.revisions.length === 0
+          && existing.title === title.trim()
+          && existing.dataSources.length === 0
+          && sameJson(existing.actions, prep.actions)
+          && sameJson(existing.contract, contract)
+          && sameJson(existing.reengage, reengage ?? existing.reengage)
+          && existing.originSessionId === desiredOriginSession
+          && installedView === authoredView?.content
+          && installedData === initialDataText;
+        if (!exactReplay) {
+          return invalidArgumentsTextResult(
+            `Workspace "${slug}" already exists and does not exactly match this static create. `
+            + 'Nothing was changed. Use a new slug, or omit initial_data_json and make an explicit update.',
+          );
+        }
+        // Reconstruct a missing/corrupt private proof carrier only while the
+        // slug lock revalidates the exact manifest/view/data generation. This
+        // is receipt self-healing, never a content update or overwrite.
+        const receipt = spaceStore.repairStaticSnapshotCommitReceipt({
+          id: slug,
+          title,
+          status: 'active',
+          contract,
+          viewEntry: 'view/index.html',
+          viewContent: authoredView?.content,
+          initialData,
+          dataSources: [],
+          actions: prep.actions,
+          reengage: reengage ?? existing.reengage,
+          originSessionId: desiredOriginSession,
+        });
+        if (!receipt.ok) {
+          return invalidArgumentsTextResult(
+            `Workspace "${slug}" matches the requested content, but its compound commit proof could not be repaired: `
+            + `${safeWorkspaceObservationError(receipt.reason)}. Nothing was changed; use a new slug or inspect the Workspace.`,
+          );
+        }
+        const replayGaps = analyzeSpaceGaps(existing, installedView ?? '', []);
+        const replayAdvisories = (prep.repairs.length > 0 || prep.warnings.length > 0)
+          ? `\n\nHeads up (the workspace was saved):\n- ${[...prep.repairs, ...prep.warnings].join('\n- ')}`
+          : '';
+        const replayResult = renderSpaceSaveResult({
+          verb: 'Created',
+          record: existing,
+          slug,
+          contractListsDropped:
+            !existing.contract && ((success_criteria?.length ?? 0) > 0 || (invariants?.length ?? 0) > 0),
+          advisories: replayAdvisories,
+          smokeNote: '',
+          gapQuestions: renderSpaceGapQuestions(replayGaps),
+        });
+        try {
+          const replayed = withHostLocalWriteCommitFromFile({
+            createdId: slug,
+            committedPath: receipt.receiptPath,
+            result: replayResult,
+          });
+          if (!hostLocalWriteCommitResultIsProven(replayed)) {
+            return invalidArgumentsTextResult(
+              `Workspace "${slug}" matches the requested content, but its reconstructed compound proof did not remain valid. `
+              + 'Nothing was changed; use a new slug or inspect the Workspace.',
+            );
+          }
+          // Idempotent on normal result replay; after proof recovery this also
+          // imports the one document-mode baseline, never decomposing
+          // top-level content keys.
+          prepareWorkspaceObservationStore(existing);
+          return textResult(replayed);
+        } catch (error) {
+          return invalidArgumentsTextResult(
+            `Workspace "${slug}" matches the requested content, but its commit proof could not be recovered: `
+            + safeWorkspaceObservationError(error),
+          );
+        }
       }
 
       // Install newly-authored runners only after every source path and manifest
@@ -595,11 +758,6 @@ export function registerSpaceTools(server: McpServer): void {
         }
       }
 
-      const ambientSession = getToolOutputContext()?.sessionId;
-      const reengage = (reengage_triggers && reengage_triggers.length > 0)
-        ? { triggers: reengage_triggers, guidance: reengage_guidance?.trim() || undefined }
-        : undefined;
-
       let record = spaceStore.save({
         id: slug,
         title,
@@ -611,9 +769,16 @@ export function registerSpaceTools(server: McpServer): void {
         ...(authoredView?.ok ? { viewContent: authoredView.content } : {}),
         dataSources: prep.dataSources,
         actions: prep.actions,
+        ...(initialData ? { initialData } : {}),
         reengage: reengage ?? existing?.reengage,
-        originSessionId: (origin_session_id?.trim() || ambientSession || existing?.originSessionId) ?? undefined,
+        originSessionId: desiredOriginSession,
       });
+      if (initialData) {
+        // The file document is already durable/visible. Seed temporal history
+        // now when possible; daemon startup repeats this idempotently if a
+        // process stops at this seam.
+        prepareWorkspaceObservationStore(record);
+      }
 
       // Creation smoke (mirror of the workflow read-only creation test): run each
       // data source once to confirm it returns real data, and verify each
@@ -641,9 +806,6 @@ export function registerSpaceTools(server: McpServer): void {
       }
 
       const verb = existing ? 'Updated' : 'Created';
-      const dsNote = record.dataSources.length > 0
-        ? ` ${record.dataSources.length} data source${record.dataSources.length === 1 ? '' : 's'} declared.`
-        : '';
       const advisories = (prep.repairs.length > 0 || prep.warnings.length > 0 || runnerInstallRepairs.length > 0)
         ? `\n\nHeads up (the workspace was saved):\n- ${[...prep.repairs, ...prep.warnings, ...runnerInstallRepairs].join('\n- ')}`
         : '';
@@ -697,17 +859,33 @@ export function registerSpaceTools(server: McpServer): void {
       const gapQuestions = renderSpaceGapQuestions(gaps);
       const contractListsDropped =
         !record.contract && ((success_criteria?.length ?? 0) > 0 || (invariants?.length ?? 0) > 0);
-      const contractNote = record.contract
-        ? ` Operating contract pinned: "${record.contract.objective}".`
-        : contractListsDropped
-          ? ' Operating contract NOT saved: success criteria/invariants need an objective — re-save with objective to pin them.'
-          : ' Operating contract is not pinned yet; preserve the user\'s stated purpose on the next substantive save.';
-      const result = `${verb} workspace "${record.title}" (${slug}) — status ${record.status}. Open it at /workspaces/${slug} in the desktop.${dsNote}`
-        + `${contractNote} The view is versioned (v${record.version}) — prior versions are revertible.${advisories}${smokeNote}${gapQuestions}`;
+      const result = renderSpaceSaveResult({
+        verb,
+        record,
+        slug,
+        contractListsDropped,
+        advisories,
+        smokeNote,
+        gapQuestions,
+      });
+      if (initialData) {
+        const committed = withHostLocalWriteCommitFromFile({
+          createdId: slug,
+          committedPath: resolveInSpace(slug, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME),
+          result,
+        });
+        if (!hostLocalWriteCommitResultIsProven(committed)) {
+          return textResult(
+            `Workspace "${slug}" was created, but one of its committed components changed before delivery proof. `
+            + 'No completion receipt was issued; inspect the current Workspace before retrying.',
+          );
+        }
+        return textResult(committed);
+      }
       return textResult(withHostLocalWriteCommitFromFile({
-        createdId: slug,
-        committedPath: resolveInSpace(slug, record.viewEntry),
-        result,
+          createdId: slug,
+          committedPath: resolveInSpace(slug, record.viewEntry),
+          result,
       }));
     },
   );
@@ -1455,55 +1633,42 @@ export function registerSpaceTools(server: McpServer): void {
       'Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id — the sanctioned path for a one-off fix (e.g. correcting one bad row) where you already know the right value. Use this INSTEAD of a /tmp scrub script.',
       'For the normal case, use a provably read-only Composio source and space_refresh. An installed legacy runner may still refresh under its pinned-entrypoint compatibility grant. This tool bypasses either backend and is stamped "manual", so a later scheduled refresh can overwrite it; reserve it for fixes and inline results.',
     ].join('\n'),
-    {
-      slug: z.string().min(2).max(63).describe('The workspace slug.'),
-      source_id: z.string().min(1).max(120).describe('The data source id to write under (the key the view reads at data["<source_id>"]).'),
-      data_json: z.string().min(1).max(5_000_000).describe('The dataset as a JSON string (an array of rows, or an object). Replaces the current value for this source_id.'),
-    },
+    WORKSPACE_SET_DATA_TOOL_PARAMETERS,
     async ({ slug, source_id, data_json }) => {
-      if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
-      const rec = spaceStore.get(slug);
-      if (!rec) return textResult(`No workspace named "${slug}".`);
-      if (rec.status !== 'active') return textResult(`Workspace "${slug}" is ${rec.status}; data writes are disabled until it is active.`);
-      const sid = source_id.trim();
-      if (sid === '_meta') return textResult('Error: "_meta" is a reserved key (it tracks per-source provenance). Use the data source id your view reads, e.g. data["deals"].');
-      let parsed: unknown;
-      try { parsed = JSON.parse(data_json); }
-      catch (err) { return textResult(`Error: data_json is not valid JSON: ${(err as Error).message}`); }
-      const observationStore = prepareWorkspaceObservationStore(rec);
-      if (!observationStore.ok) {
-        return textResult(`Could not save data for "${slug}": ${safeWorkspaceObservationError(observationStore.error)}`);
-      }
-      let bytes: number;
       try {
-        const committed = commitWorkspaceObservationBatch({
-          db: observationStore.db,
-          workspaceId: rec.id,
-          observations: [{
-            sourceKey: sid,
-            refreshId: randomUUID(),
-            cause: 'manual',
-            status: 'ok',
-            data: parsed,
-            provenance: { adapter: 'manual', initiatedBy: 'model' },
-          }],
+        const committed = await executeManualWorkspaceSetData({
+          slug,
+          source_id,
+          data_json,
         });
-        bytes = committed.projection.bytes;
-        try {
-          const { finalizeWorkspaceObservationCommit } = await import(
-            '../spaces/workspace-observation-finalize.js'
-          );
-          await finalizeWorkspaceObservationCommit(rec.id, committed);
-        } catch {
-          // The observation + data.json projection are already durable.
-          // Memory/retention finalization is deliberately best-effort.
-        }
+        const n = committed.rows;
+        return textResult(
+          `Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${committed.sourceId}" `
+          + `(${committed.bytes} bytes, marked manual). The open Workspace auto-refreshes.`,
+        );
       } catch (err) {
+        if (err instanceof WorkspaceSetDataContractError) {
+          if (err.code === 'invalid_slug') {
+            return invalidArgumentsTextResult(`Error: invalid workspace slug "${slug}".`);
+          }
+          if (err.code === 'reserved_source') {
+            return invalidArgumentsTextResult(
+              'Error: "_meta" is a reserved key (it tracks per-source provenance). '
+              + 'Use the data source id your view reads, e.g. data["deals"].',
+            );
+          }
+          if (err.code === 'invalid_json') {
+            return invalidArgumentsTextResult(`Error: ${err.message}`);
+          }
+          return invalidArgumentsTextResult(`Error: ${err.message}.`);
+        }
+        if (err instanceof WorkspaceSetDataExecutionError) {
+          if (err.code === 'workspace_not_found' || err.code === 'workspace_not_active') {
+            return textResult(err.message);
+          }
+        }
         return textResult(`Could not save data for "${slug}": ${safeWorkspaceObservationError(err)}`);
       }
-      appendAudit(slug, { method: 'SET_DATA', path: `/set_data/${sid}`, outcome: 'ok', bytes });
-      const n = countRows(parsed);
-      return textResult(`Saved ${n == null ? 'data' : `${n} row${n === 1 ? '' : 's'}`} under "${sid}" (${bytes} bytes, marked manual). The open Workspace auto-refreshes.`);
     },
   );
 

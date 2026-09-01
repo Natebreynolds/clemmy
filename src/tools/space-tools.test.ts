@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, statSync, unlinkSync, utimesSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -20,11 +20,16 @@ const {
   SPACE_INLINE_VIEW_MAX_BYTES,
 } = await import('./space-tools.js');
 const store = await import('../spaces/store.js');
+const workspaceIndex = await import('../spaces/workspace-db.js');
 const { spaceActionNeedsApproval } = await import('../spaces/space-action-gate.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
 const capabilityCatalog = await import('../runtime/harness/host-capability-catalog-factory.js');
 const capabilityManifest = await import('../runtime/harness/capability-manifest.js');
-const { parseHostLocalWriteCommitFacts } = await import('../runtime/harness/host-local-write-commit.js');
+const {
+  hostLocalWriteCommitResultIsProven,
+  parseHostLocalWriteCommitFacts,
+} = await import('../runtime/harness/host-local-write-commit.js');
+const { isInvalidArgumentsTextResult } = await import('./shared.js');
 
 async function withCurrentReadOperations<T>(
   operationIds: readonly string[],
@@ -134,8 +139,12 @@ test('space_save creates a workspace, installs the view, returns the URL', async
 });
 
 test('space_save rejects an invalid slug and a missing view on create', async () => {
-  assert.match(text(await tools.space_save({ slug: 'Bad Slug', title: 'x', view_path: null })), /not a valid workspace slug/);
-  assert.match(text(await tools.space_save({ slug: 'newone', title: 'x', view_path: null })), /view_html or view_path is required/);
+  const invalidSlug = await tools.space_save({ slug: 'Bad Slug', title: 'x', view_path: null });
+  const missingView = await tools.space_save({ slug: 'newone', title: 'x', view_path: null });
+  assert.match(text(invalidSlug), /not a valid workspace slug/);
+  assert.match(text(missingView), /view_html or view_path is required/);
+  assert.equal(isInvalidArgumentsTextResult(invalidSlug), true);
+  assert.equal(isInvalidArgumentsTextResult(missingView), true);
   assert.equal(store.spaceStore.get('newone'), undefined);
 });
 
@@ -164,6 +173,156 @@ test('space_save inline create is one authoritative commit and later inline save
   assert.equal(rec?.revisions.length, 1);
   assert.equal(readFileSync(store.resolveInSpace('inline-view', 'view/index.html'), 'utf-8'), secondView);
   assert.equal(readFileSync(store.resolveInSpace('inline-view', rec!.revisions[0].file), 'utf-8'), firstView);
+});
+
+test('space_save atomically creates a mobile-visible static snapshot and exact replay is a no-op', async () => {
+  const slug = 'local-llm-calendar';
+  const view = '<html><body><h1>Local LLM calendar</h1></body></html>';
+  const document = {
+    calendar: [{ day: 'Monday', theme: 'Private inference' }],
+    posts: Array.from({ length: 5 }, (_, index) => ({ id: index + 1, body: `Full post ${index + 1}` })),
+    citations: [{ title: 'Primary source', url: 'https://example.com/local-llm' }],
+    _mobile: {
+      headline: [{ label: 'Posts', value: '5' }],
+      records: {
+        label: 'Calendar and posts',
+        total: 5,
+        items: Array.from({ length: 5 }, (_, index) => ({
+          primary: `Post ${index + 1}`,
+          body: `Full post ${index + 1}`,
+          links: [{ label: 'Primary source', url: 'https://example.com/local-llm' }],
+        })),
+      },
+    },
+  };
+  const args = {
+    slug,
+    title: 'Local LLM Calendar',
+    objective: 'Turn current local LLM news into a useful content calendar.',
+    success_criteria: ['Exactly five sourced social posts are visible on mobile'],
+    invariants: ['Keep citations attached to the claims they support'],
+    view_html: view,
+    initial_data_json: JSON.stringify(document),
+  };
+  const first = text(await tools.space_save(args));
+  assert.match(first, /Created workspace "Local LLM Calendar"/);
+  assert.match(first, /\[Open on mobile\]\(\/m\/\?tab=spaces&workspace=local-llm-calendar\)/);
+  assert.equal(store.spaceStore.get(slug)?.contentMode, 'static_snapshot');
+  assert.deepEqual(JSON.parse(readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8')), document);
+  const commit = parseHostLocalWriteCommitFacts(first);
+  assert.ok(commit);
+  assert.match(commit.handle, /\.clementine-workspace-commit\.json$/);
+  assert.equal(hostLocalWriteCommitResultIsProven(first), true);
+
+  const watched = ['space.json', 'view/index.html', 'data.json', '.clementine-workspace-commit.json'];
+  const before = watched.map((file) => statSync(store.resolveInSpace(slug, file)).mtimeNs);
+  const replay = text(await tools.space_save(args));
+  const after = watched.map((file) => statSync(store.resolveInSpace(slug, file)).mtimeNs);
+  assert.equal(replay, first, 'post-result-loss replay returns the same proven success bytes');
+  assert.deepEqual(after, before, 'exact replay does not rewrite any Workspace component');
+  assert.equal(store.spaceStore.get(slug)?.version, 1);
+
+  const receiptPath = store.resolveInSpace(slug, '.clementine-workspace-commit.json');
+  const substantiveBeforeRepair = watched.slice(0, 3)
+    .map((file) => statSync(store.resolveInSpace(slug, file)).mtimeNs);
+  unlinkSync(receiptPath);
+  const repairedReceiptReplay = text(await tools.space_save(args));
+  assert.equal(repairedReceiptReplay, first,
+    'an exact replay deterministically self-heals a missing private proof carrier');
+  assert.equal(hostLocalWriteCommitResultIsProven(repairedReceiptReplay), true);
+  assert.deepEqual(
+    watched.slice(0, 3).map((file) => statSync(store.resolveInSpace(slug, file)).mtimeNs),
+    substantiveBeforeRepair,
+    'receipt self-healing never rewrites manifest, view, or data bytes',
+  );
+
+  const dataBeforeCollision = readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8');
+  const collisionResult = await tools.space_save({
+    ...args,
+    initial_data_json: JSON.stringify({ ...document, posts: [{ id: 999, body: 'different' }] }),
+  });
+  const collision = text(collisionResult);
+  assert.match(collision, /already exists and does not exactly match/);
+  assert.equal(isInvalidArgumentsTextResult(collisionResult), true);
+  assert.equal(parseHostLocalWriteCommitFacts(collision), null);
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8'), dataBeforeCollision);
+  assert.equal(store.spaceStore.get(slug)?.version, 1);
+
+  assert.equal(
+    workspaceIndex.listWorkspaceDatasetObservations(slug, { limit: 10 }).length,
+    1,
+    'the static snapshot starts with one document-mode temporal baseline',
+  );
+  workspaceIndex.openWorkspaceDb().prepare('DELETE FROM workspaces WHERE id = ?').run(slug);
+  workspaceIndex.closeWorkspaceDb();
+  const beforeIndexRepair = watched.map((file) => statSync(store.resolveInSpace(slug, file)).mtimeNs);
+  const repairedReplay = text(await tools.space_save(args));
+  const afterIndexRepair = watched.map((file) => statSync(store.resolveInSpace(slug, file)).mtimeNs);
+  assert.equal(repairedReplay, first, 'retry rejoins the same proven result after index/observation loss');
+  assert.deepEqual(afterIndexRepair, beforeIndexRepair, 'index recovery never rewrites committed Workspace files');
+  assert.equal(store.spaceStore.get(slug)?.version, 1);
+  const repairedObservations = workspaceIndex.listWorkspaceDatasetObservations(slug, { limit: 10 });
+  assert.equal(repairedObservations.length, 1);
+  assert.equal(repairedObservations[0]?.sourceKey, '$document');
+  assert.equal(repairedObservations[0]?.projectionMode, 'document');
+
+  writeFileSync(store.resolveInSpace(slug, 'data.json'), '{"corrupt":true}', 'utf8');
+  assert.equal(hostLocalWriteCommitResultIsProven(first), false, 'data corruption invalidates the compound delivery proof');
+});
+
+test('space_save converges an interrupted pre-manifest static create without a version bump', async () => {
+  const slug = 'snapshot-proof-recovery';
+  const view = '<html><body><h1>Recovered</h1></body></html>';
+  const document = { _mobile: { records: { items: [{ primary: 'One', body: 'Complete body' }] } } };
+  mkdirSync(path.dirname(store.resolveInSpace(slug, 'view/index.html')), { recursive: true });
+  writeFileSync(store.resolveInSpace(slug, 'view/index.html'), '<html>partial generation</html>', 'utf8');
+  writeFileSync(store.resolveInSpace(slug, 'data.json'), '{"partial":true}', 'utf8');
+  assert.equal(store.spaceStore.get(slug), undefined, 'without the manifest the partial generation is invisible');
+  const result = text(await tools.space_save({
+    slug,
+    title: 'Snapshot Proof Recovery',
+    view_html: view,
+    initial_data_json: JSON.stringify(document),
+  }));
+  assert.equal(hostLocalWriteCommitResultIsProven(result), true);
+  assert.equal(store.spaceStore.get(slug)?.version, 1);
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'view/index.html'), 'utf8'), view);
+});
+
+test('space_save refuses a mixed post-lock generation before issuing delivery proof', async () => {
+  const slug = 'snapshot-post-lock-race';
+  const args = {
+    slug,
+    title: 'Snapshot Post Lock Race',
+    view_html: '<html><body>intended</body></html>',
+    initial_data_json: JSON.stringify({
+      _mobile: { records: { items: [{ primary: 'Intended', body: 'Intended body' }] } },
+    }),
+  };
+  const mutableStore = store.spaceStore as typeof store.spaceStore;
+  const originalSave = mutableStore.save.bind(mutableStore);
+  mutableStore.save = ((input) => {
+    const record = originalSave(input);
+    // Simulate a second authorized data writer landing after save releases its
+    // slug lock but before space_save stamps the public result.
+    writeFileSync(store.resolveInSpace(slug, 'data.json'), JSON.stringify({ racer: true }), 'utf8');
+    return record;
+  }) as typeof mutableStore.save;
+  let raced: string;
+  try {
+    raced = text(await tools.space_save(args));
+  } finally {
+    mutableStore.save = originalSave;
+  }
+  assert.match(raced, /changed before delivery proof/);
+  assert.equal(parseHostLocalWriteCommitFacts(raced), null, 'a mixed generation never advertises completion evidence');
+  assert.deepEqual(JSON.parse(readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8')), { racer: true });
+  assert.equal(store.spaceStore.get(slug)?.version, 1);
+
+  const retry = text(await tools.space_save(args));
+  assert.match(retry, /already exists and does not exactly match/);
+  assert.deepEqual(JSON.parse(readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8')), { racer: true });
+  assert.equal(store.spaceStore.get(slug)?.version, 1);
 });
 
 test('space_save refuses conflicting, blank, and oversized inline view inputs before commit', async () => {

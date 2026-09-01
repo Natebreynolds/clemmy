@@ -735,7 +735,28 @@ export function bootstrapWorkspaceObservationHistory(
   }
 
   const candidates: WorkspaceObservationCommitItem[] = [];
-  if (isJsonObject(document)) {
+  // A space_save initial_data_json commit is an authored DOCUMENT, not a bag
+  // of refresh-source identities. Its manifest is the durable discriminator:
+  // importing each top-level calendar/posts/citations/_mobile key separately
+  // would add fake source metadata and churn the document on every restart.
+  let staticSnapshot = false;
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(rootDir, 'space.json'), 'utf8')) as Record<string, unknown>;
+    staticSnapshot = manifest?.contentMode === 'static_snapshot';
+  } catch { /* ordinary legacy import below */ }
+  if (staticSnapshot) {
+    const sourceKey = '$document';
+    const canonical = canonicalizeJson(document);
+    candidates.push({
+      sourceKey,
+      refreshId: legacyRefreshId(workspaceId, sourceKey, canonical.contentHash),
+      cause: 'legacy_import',
+      projectionMode: 'document',
+      status: 'ok',
+      data: document,
+      observedAt: fileTimestamp(file),
+    });
+  } else if (isJsonObject(document)) {
     for (const [sourceKey, data] of Object.entries(document)) {
       if (sourceKey === '_meta') continue;
       const canonical = canonicalizeJson(data);

@@ -44,6 +44,8 @@ const writeLearning = await import('./verified-write-capability-learning.js');
 const writeCapabilityStore = await import('../../memory/verified-write-capability-store.js');
 const obligationStore = await import('./obligation-store.js');
 const terminalProof = await import('./terminal-publication-proof.js');
+const evidenceReceipts = await import('./evidence-receipts.js');
+const localWriteCommit = await import('./host-local-write-commit.js');
 const store = await import('../../spaces/store.js');
 const workspaceDb = await import('../../spaces/workspace-db.js');
 const dataStore = await import('../../spaces/data-store.js');
@@ -212,6 +214,16 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
   assert.equal(workCallTools.isHostPlanRequiredWorkCall(workCall), true);
 
   const html = '<html><body><h1>Inline Proof</h1><p>One authoritative save.</p></body></html>';
+  const initialData = {
+    _mobile: {
+      records: {
+        items: [{
+          primary: 'One complete authored artifact',
+          body: 'This full body is committed with the view and manifest.',
+        }],
+      },
+    },
+  };
   const planArgs = {
     preamble: 'I’ll create the requested Workspace now.',
     draft: {
@@ -248,6 +260,7 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     invariants: null,
     view_html: html,
     view_path: null,
+    initial_data_json: JSON.stringify(initialData),
     data_sources: null,
     actions: null,
     reengage_triggers: null,
@@ -341,6 +354,7 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     readFileSync(store.resolveInSpace('inline-proof', 'view/index.html'), 'utf8'),
     html,
   );
+  assert.deepEqual(dataStore.readData('inline-proof'), initialData);
 
   assert.equal(
     physical.filter((row) => row.tool_name === 'space_save' && row.state === 'returned').length,
@@ -385,13 +399,19 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
   const viewFile = store.resolveInSpace('inline-proof', 'view/index.html');
   const notesFile = store.resolveInSpace('inline-proof', 'notes.jsonl');
   const expectedViewDigest = fileDigest(viewFile);
+  const commitFile = store.resolveInSpace(
+    'inline-proof',
+    localWriteCommit.HOST_LOCAL_WORKSPACE_COMMIT_BASENAME,
+  );
+  const expectedCommitDigest = fileDigest(commitFile);
   const writeReceipts = db.prepare(`
-    SELECT kind, obligation, created_id, handle, provider_receipt,
+    SELECT receipt_id, kind, obligation, created_id, handle, provider_receipt,
            intended_digest, observed_digest
       FROM host_write_receipts
      WHERE session_id = ? AND source_user_seq = ?
      ORDER BY obligation
   `).all(session.id, source.seq) as Array<{
+    receipt_id: string;
     kind: string;
     obligation: string;
     created_id: string;
@@ -402,9 +422,9 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
   }>;
   assert.deepEqual(writeReceipts.map((row) => ({
     kind: row.kind,
-    obligation: row.obligation,
-    createdId: row.created_id,
-    handle: row.handle,
+      obligation: row.obligation,
+      createdId: row.created_id,
+      handle: row.handle,
     intendedDigest: row.intended_digest,
     observedDigest: row.observed_digest,
   })), [
@@ -412,17 +432,17 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
       kind: 'commit',
       obligation: 'commit_effect',
       createdId: 'inline-proof',
-      handle: 'spaces/inline-proof/view/index.html',
-      intendedDigest: expectedViewDigest,
-      observedDigest: expectedViewDigest,
+      handle: `spaces/inline-proof/${localWriteCommit.HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`,
+      intendedDigest: expectedCommitDigest,
+      observedDigest: expectedCommitDigest,
     },
     {
       kind: 'readback',
       obligation: 'verify_committed_readback',
       createdId: 'inline-proof',
-      handle: 'spaces/inline-proof/view/index.html',
-      intendedDigest: expectedViewDigest,
-      observedDigest: expectedViewDigest,
+      handle: `spaces/inline-proof/${localWriteCommit.HOST_LOCAL_WORKSPACE_COMMIT_BASENAME}`,
+      intendedDigest: expectedCommitDigest,
+      observedDigest: expectedCommitDigest,
     },
   ]);
   assert.ok(writeReceipts.every((row) => (
@@ -512,6 +532,35 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     learnedRecord.recordId,
     'the capability-only record survives a store-handle restart',
   );
+
+  const originalResult = resultText('save-inline-workspace');
+  assert.equal(localWriteCommit.hostLocalWriteCommitResultIsProven(originalResult), true);
+  assert.deepEqual(dataStore.writeData('inline-proof', {
+    ...initialData,
+    laterLegitimateEdit: true,
+  }), { ok: true, bytes: Buffer.byteLength(JSON.stringify({
+    ...initialData,
+    laterLegitimateEdit: true,
+  }), 'utf8') });
+  assert.equal(
+    localWriteCommit.hostLocalWriteCommitResultIsProven(originalResult),
+    false,
+    'the compound receipt is a current-byte proof only until its durable issuance boundary',
+  );
+  assert.deepEqual(
+    exactProof(),
+    { ok: true },
+    'a later legitimate Workspace edit cannot retroactively erase the already-settled terminal proof',
+  );
+  for (const receipt of writeReceipts) {
+    assert.equal(
+      evidenceReceipts.redeemEvidenceReceipt(session.id, receipt.receipt_id, {
+        sourceUserSeq: source.seq,
+      }).ok,
+      true,
+      'historical redemption compares the immutable issued facts, not the Workspace current generation',
+    );
+  }
 
   const approvalsBefore = db.prepare(`
     SELECT approval_id, status, resolution, consumed_at, resend_consumed_at

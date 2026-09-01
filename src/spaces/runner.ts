@@ -33,7 +33,7 @@ import {
   authorizeInstalledDataRunner,
   registerRunnerTrustRefreshHandler,
 } from './space-data-runner-trust.js';
-import { acquireSpaceReadAuthority } from './space-read-authority.js';
+import { prepareAndAcquireSpaceReadAuthority } from './space-read-authority.js';
 
 export interface RunSourceOk { ok: true; data: unknown }
 export interface RunSourceErr {
@@ -478,9 +478,8 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
       && source.composioSlug?.trim()
       && !source.runner?.trim()
       && !source.cliArgv?.length
-      && !workspaceDataSourceSafetyError(source)
     ) {
-      const minted = acquireSpaceReadAuthority({
+      const minted = await prepareAndAcquireSpaceReadAuthority({
         slug,
         sourceId: source.id,
         toolSlug: source.composioSlug.trim(),

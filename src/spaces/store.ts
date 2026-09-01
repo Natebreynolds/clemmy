@@ -32,6 +32,12 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { purgeWorkspaceObservationMemory } from '../memory/workspace-observation-bridge.js';
 import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
+import {
+  HOST_LOCAL_WORKSPACE_COMMIT_BASENAME,
+  hostLocalWriteCommitResultIsProven,
+  withHostLocalWriteCommitFromFile,
+  writeHostLocalWorkspaceCommitDocument,
+} from '../runtime/harness/host-local-write-commit.js';
 import { deleteWorkspaceIndex, indexWorkspaceRecord, reindexWorkspaceRecords } from './workspace-db.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
@@ -306,6 +312,15 @@ export interface SpaceContract {
 }
 
 export type SpaceStatus = 'active' | 'paused' | 'archived';
+export type SpaceContentMode = 'static_snapshot';
+
+/**
+ * One-off authored content can travel with the Workspace definition so the
+ * phone never observes a committed view with an empty data plane. Keep this
+ * deliberately below the general data-store ceiling: it rides a model tool
+ * call and is meant for bounded reports/calendars, not bulk datasets.
+ */
+export const SPACE_INITIAL_DATA_MAX_BYTES = 256 * 1024;
 
 export interface SpaceRecord {
   id: string;
@@ -330,6 +345,9 @@ export interface SpaceRecord {
   recipe?: string;
   /** How this workspace behaves on the phone. Absent = decide by content. */
   mobile?: SpaceMobilePrefs;
+  /** Explicitly distinguishes a complete one-off snapshot from a broken
+   * dynamic Workspace whose data source was never installed. */
+  contentMode?: SpaceContentMode;
   /** Non-persisted diagnostics from normalizing a hand-written space.json. */
   manifestErrors?: string[];
 }
@@ -626,6 +644,7 @@ function normalizeManifest(raw: unknown, slug: string, fallbackTime: string): Sp
       && typeof (m.mobile as { show?: unknown }).show === 'boolean'
       ? { show: (m.mobile as { show: boolean }).show }
       : undefined,
+    contentMode: m.contentMode === 'static_snapshot' ? 'static_snapshot' : undefined,
   };
   manifestErrors.push(...workspaceIdentityErrors(rec.dataSources, rec.actions));
   if (manifestErrors.length > 0) rec.manifestErrors = manifestErrors;
@@ -866,6 +885,13 @@ export interface SaveSpaceInput {
   focusId?: number | null;
   recipe?: string;
   mobile?: SpaceMobilePrefs;
+  /** Create-only complete JSON document. It is atomically installed before
+   * the manifest visibility barrier, so a listed Workspace can never expose
+   * the new view without its matching initial phone/data content. */
+  initialData?: Record<string, unknown>;
+  /** Test-only race seam after all hidden component writes and before the
+   * manifest visibility barrier. Production callers must omit it. */
+  beforeInitialManifestVisibility?: () => void;
 }
 
 export interface CreateSpaceIfAbsentResult {
@@ -873,8 +899,96 @@ export interface CreateSpaceIfAbsentResult {
   record?: SpaceRecord;
 }
 
+export type RepairStaticSnapshotCommitReceiptResult =
+  | { ok: true; record: SpaceRecord; receiptPath: string; repaired: boolean }
+  | { ok: false; reason: string };
+
 function workspaceMutationLockPath(slug: string): string {
   return path.join(SPACES_DIR, `.workspace-${slug}`);
+}
+
+function sameStoredJson(left: unknown, right: unknown): boolean {
+  try { return JSON.stringify(left) === JSON.stringify(right); } catch { return false; }
+}
+
+function repairStaticSnapshotCommitReceiptUnlocked(
+  input: SaveSpaceInput,
+): RepairStaticSnapshotCommitReceiptResult {
+  const existing = readManifest(input.id);
+  if (
+    !existing
+    || input.initialData === undefined
+    || input.viewContent === undefined
+    || existing.status !== 'active'
+    || existing.contentMode !== 'static_snapshot'
+    || existing.viewEntry !== (input.viewEntry ?? 'view/index.html')
+    || existing.version !== 1
+    || existing.revisions.length !== 0
+    || existing.title !== (input.title.trim().slice(0, 200) || input.id)
+    || existing.dataSources.length !== 0
+    || !sameStoredJson(existing.actions, input.actions ?? [])
+    || !sameStoredJson(existing.contract, input.contract)
+    || !sameStoredJson(existing.reengage, input.reengage)
+    || existing.originSessionId !== input.originSessionId
+  ) {
+    return { ok: false, reason: 'the visible Workspace no longer matches the exact static create contract' };
+  }
+  let dataText: string;
+  try {
+    if (!input.initialData || typeof input.initialData !== 'object' || Array.isArray(input.initialData)) {
+      return { ok: false, reason: 'the requested static dataset is not one JSON object' };
+    }
+    dataText = JSON.stringify(input.initialData);
+  } catch {
+    return { ok: false, reason: 'the requested static dataset is not canonically serializable' };
+  }
+  const manifestFile = manifestPath(input.id);
+  const viewFile = resolveInSpace(input.id, existing.viewEntry);
+  const dataFile = resolveInSpace(input.id, 'data.json');
+  const receiptFile = resolveInSpace(input.id, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME);
+  const manifestText = JSON.stringify(persistableRecord(existing), null, 2);
+  try {
+    if (
+      readFileSync(manifestFile, 'utf8') !== manifestText
+      || readFileSync(viewFile, 'utf8') !== input.viewContent
+      || readFileSync(dataFile, 'utf8') !== dataText
+    ) {
+      return { ok: false, reason: 'the Workspace manifest, view, or data bytes changed' };
+    }
+    if (existsSync(receiptFile)) {
+      const current = withHostLocalWriteCommitFromFile({
+        createdId: input.id,
+        committedPath: receiptFile,
+        result: 'Workspace compound commit generation check.',
+      });
+      if (hostLocalWriteCommitResultIsProven(current)) {
+        return { ok: true, record: existing, receiptPath: receiptFile, repaired: false };
+      }
+    }
+    writeHostLocalWorkspaceCommitDocument({
+      createdId: input.id,
+      receiptPath: receiptFile,
+      manifest: { path: manifestFile, bytes: manifestText },
+      view: { path: viewFile, bytes: input.viewContent },
+      data: { path: dataFile, bytes: dataText },
+    });
+    const repaired = withHostLocalWriteCommitFromFile({
+      createdId: input.id,
+      committedPath: receiptFile,
+      result: 'Workspace compound commit generation check.',
+    });
+    if (!hostLocalWriteCommitResultIsProven(repaired)) {
+      rmSync(receiptFile, { force: true });
+      return { ok: false, reason: 'the reconstructed compound receipt did not re-prove the exact generation' };
+    }
+    return { ok: true, record: existing, receiptPath: receiptFile, repaired: true };
+  } catch (error) {
+    try { rmSync(`${receiptFile}.${process.pid}.tmp`, { force: true }); } catch { /* exact staging cleanup only */ }
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : 'the compound receipt could not be reconstructed',
+    };
+  }
 }
 
 function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
@@ -884,6 +998,9 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
   const dir = resolveSpaceDir(input.id);
   const now = new Date().toISOString();
   const existing = readManifest(input.id);
+  if (existing && input.initialData !== undefined) {
+    throw new Error('initialData is create-only; update an existing Workspace through its data source or space_set_data');
+  }
   const missingFixes = missingManifestFixes(
     existing?.manifestErrors,
     input.dataSources !== undefined,
@@ -894,6 +1011,27 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
   }
   const dataSources = input.dataSources ?? existing?.dataSources ?? [];
   const actions = input.actions ?? existing?.actions ?? [];
+  if (input.initialData !== undefined && dataSources.length > 0) {
+    throw new Error('initialData is for a static snapshot and cannot be combined with data sources');
+  }
+  if (input.initialData !== undefined && input.viewContent === undefined) {
+    throw new Error('initialData requires viewContent so view and phone data share one create commit');
+  }
+  let initialDataText: string | null = null;
+  if (input.initialData !== undefined) {
+    if (!input.initialData || typeof input.initialData !== 'object' || Array.isArray(input.initialData)) {
+      throw new Error('initialData must be a JSON object');
+    }
+    try {
+      initialDataText = JSON.stringify(input.initialData);
+    } catch (error) {
+      throw new Error(`initialData is not JSON-serializable: ${(error as Error).message}`);
+    }
+    const initialBytes = Buffer.byteLength(initialDataText, 'utf8');
+    if (initialBytes > SPACE_INITIAL_DATA_MAX_BYTES) {
+      throw new Error(`initialData exceeds ${SPACE_INITIAL_DATA_MAX_BYTES} byte cap (${initialBytes} bytes)`);
+    }
+  }
   assertValidWorkspaceIdentities(dataSources, actions);
   assertValidDeclaredRunners(input.dataSources, input.actions);
   const viewEntry = input.viewEntry ?? existing?.viewEntry ?? 'view/index.html';
@@ -918,6 +1056,13 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
       atomicWrite(viewFile, input.viewContent);
     }
   }
+  // Data lands before the manifest. The manifest is the Workspace's visibility
+  // barrier (list/get/mobile all require it), so every crash point is safe:
+  // before it, partial create files are invisible and exact retry converges;
+  // after it, the initial phone document is already atomically readable.
+  if (initialDataText !== null) {
+    atomicWrite(resolveInSpace(input.id, 'data.json'), initialDataText);
+  }
   const record: SpaceRecord = {
     id: input.id,
     title: input.title.trim().slice(0, 200) || input.id,
@@ -937,9 +1082,54 @@ function saveSpaceUnlocked(input: SaveSpaceInput): SpaceRecord {
     lastRefreshedAt: existing?.lastRefreshedAt,
     recipe: input.recipe ?? existing?.recipe,
     mobile: input.mobile ?? existing?.mobile,
+    // Installing a real source turns a former snapshot into a dynamic
+    // Workspace automatically; source removal never invents snapshot status.
+    contentMode: dataSources.length > 0
+      ? undefined
+      : input.initialData !== undefined
+        ? 'static_snapshot'
+        : existing?.contentMode,
   };
   ensureDir(dir);
-  atomicWrite(manifestPath(input.id), JSON.stringify(persistableRecord(record), null, 2));
+  const manifestFile = manifestPath(input.id);
+  const manifestText = JSON.stringify(persistableRecord(record), null, 2);
+  if (initialDataText !== null) {
+    const viewFile = resolveInSpace(input.id, viewEntry);
+    const dataFile = resolveInSpace(input.id, 'data.json');
+    const receiptFile = resolveInSpace(input.id, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME);
+    writeHostLocalWorkspaceCommitDocument({
+      createdId: input.id,
+      receiptPath: receiptFile,
+      manifest: { path: manifestFile, bytes: manifestText },
+      view: { path: viewFile, bytes: input.viewContent! },
+      data: { path: dataFile, bytes: initialDataText },
+    });
+    input.beforeInitialManifestVisibility?.();
+    // Authorized Workspace writers cannot see the create until the manifest
+    // lands. This final generation check also fails an injected/raw writer
+    // race closed rather than publishing a mixed compound revision.
+    if (
+      readFileSync(viewFile, 'utf8') !== input.viewContent
+      || readFileSync(dataFile, 'utf8') !== initialDataText
+    ) {
+      throw new Error('initial Workspace components changed before the manifest visibility barrier');
+    }
+  }
+  atomicWrite(manifestFile, manifestText);
+  if (initialDataText !== null) {
+    const receiptFile = resolveInSpace(input.id, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME);
+    const proof = withHostLocalWriteCommitFromFile({
+      createdId: input.id,
+      committedPath: receiptFile,
+      result: 'Workspace compound commit generation check.',
+    });
+    if (!hostLocalWriteCommitResultIsProven(proof)) {
+      // Initial creates have no prior manifest. Removing only this just-written
+      // barrier keeps the partial generation invisible and exactly retryable.
+      try { rmSync(manifestFile, { force: true }); } catch { /* preserve failure */ }
+      throw new Error('initial Workspace compound commit failed generation verification');
+    }
+  }
   indexWorkspaceRecord(record, {
     eventType: existing ? 'workspace_file_changed' : 'workspace_created',
     actor: 'space-store',
@@ -1060,6 +1250,22 @@ export class SpaceStore {
     return withFileLockSyncStrict(workspaceMutationLockPath(input.id), () => saveSpaceUnlocked(input));
   }
 
+  /** Reconstruct only the content-addressed proof carrier for an otherwise
+   * byte-exact static create. The slug lock and full manifest/view/data
+   * comparison make this a self-heal, never an update or overwrite. */
+  repairStaticSnapshotCommitReceipt(
+    input: SaveSpaceInput,
+  ): RepairStaticSnapshotCommitReceiptResult {
+    if (!isValidSpaceSlug(input.id)) {
+      return { ok: false, reason: 'invalid Workspace slug' };
+    }
+    ensureDir(SPACES_DIR);
+    return withFileLockSyncStrict(
+      workspaceMutationLockPath(input.id),
+      () => repairStaticSnapshotCommitReceiptUnlocked(input),
+    );
+  }
+
   /** Snapshot V1 and atomically publish/index one complete V2 view revision. */
   commitViewRevision(slug: string, nextView: string): SpaceRecord {
     if (!isValidSpaceSlug(slug)) throw new Error(`invalid workspace slug: ${slug}`);
@@ -1110,6 +1316,9 @@ export class SpaceStore {
       id: existing.id,
       createdAt: existing.createdAt,
       updatedAt: new Date().toISOString(),
+      contentMode: (patch.dataSources ?? existing.dataSources).length > 0
+        ? undefined
+        : patch.contentMode ?? existing.contentMode,
     };
     delete record.manifestErrors;
     atomicWrite(manifestPath(slug), JSON.stringify(persistableRecord(record), null, 2));

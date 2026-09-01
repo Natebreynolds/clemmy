@@ -3,7 +3,7 @@
  */
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { RunContext } from '@openai/agents';
 
 const TEST_HOME = '/tmp/clemmy-test-local-tools';
@@ -117,6 +117,69 @@ test('local runtime preserves file_query argument refusal as a nominal invalid-a
     'the model-facing corrective text remains unchanged');
 });
 
+test('space_save collision is a no-effect invalid-arguments result and a new slug can commit once', async () => {
+  const spaceSave = getLocalRuntimeTools()
+    .find((candidate) => (candidate as { name?: string }).name === 'space_save');
+  assert.ok(spaceSave && spaceSave.type === 'function');
+  const store = await import('../spaces/store.js');
+  const context = new RunContext({ sessionId: 'local-space-save-collision-repair' });
+  const base = {
+    title: 'Local LLM Content Calendar',
+    objective: 'Create a cited calendar and five posts.',
+    success_criteria: ['Exactly five posts'],
+    invariants: ['Keep source citations'],
+    view_html: '<html><body><h1>Local LLM calendar</h1></body></html>',
+    view_path: null,
+    data_sources: null,
+    actions: null,
+    reengage_triggers: null,
+    reengage_guidance: null,
+    origin_session_id: null,
+  };
+  const occupiedData = JSON.stringify({ posts: [{ id: 'existing' }] });
+  const intendedData = JSON.stringify({
+    posts: Array.from({ length: 5 }, (_, index) => ({ id: index + 1, body: `Post ${index + 1}` })),
+  });
+
+  const setup = await spaceSave.invoke(context, JSON.stringify({
+    ...base,
+    slug: 'occupied-content-calendar',
+    initial_data_json: occupiedData,
+  }));
+  assert.match(String(setup), /Created workspace/);
+  const occupiedBefore = readFileSync(store.resolveInSpace('occupied-content-calendar', 'data.json'), 'utf8');
+
+  const collision = await spaceSave.invoke(context, JSON.stringify({
+    ...base,
+    slug: 'occupied-content-calendar',
+    initial_data_json: intendedData,
+  }));
+  assert.ok(collision instanceof InvalidArgumentsPreDispatchResult,
+    'an existing-slug mismatch must never be flattened into a successful local write');
+  assert.deepEqual(attemptSignalsFromTypedResult(collision), {
+    preDispatch: true,
+    argumentValidationFailed: true,
+    schemaAvailable: true,
+  });
+  assert.equal(
+    readFileSync(store.resolveInSpace('occupied-content-calendar', 'data.json'), 'utf8'),
+    occupiedBefore,
+    'the collided destination remains byte-identical',
+  );
+
+  const repaired = await spaceSave.invoke(context, JSON.stringify({
+    ...base,
+    slug: 'local-llm-content-calendar-retry',
+    initial_data_json: intendedData,
+  }));
+  assert.match(String(repaired), /Created workspace/);
+  assert.equal(store.spaceStore.get('local-llm-content-calendar-retry')?.version, 1);
+  assert.equal(
+    readFileSync(store.resolveInSpace('local-llm-content-calendar-retry', 'data.json'), 'utf8'),
+    intendedData,
+  );
+});
+
 test('scoped tool_search tells the model to dispatch deferred tools through call_tool', async () => {
   const search = buildScopedLocalToolSearch(new Set(['write_file']));
   const output = await search.invoke(
@@ -127,6 +190,79 @@ test('scoped tool_search tells the model to dispatch deferred tools through call
   assert.ok(payload.schemas?.write_file, 'the exact deferred tool schema is returned');
   assert.match(String(payload.hint), /call_tool\(name, args_json\)/);
   assert.doesNotMatch(String(payload.hint), /available on this turn's active surface/);
+});
+
+test('scoped planning-control lookup stays local and never discloses provider catalog noise', async () => {
+  let providerSearches = 0;
+  const search = buildScopedLocalToolSearch(
+    new Set(['space_save', 'workflow_run']),
+    'work_call',
+    undefined,
+    [{
+      kind: 'authorized_composio',
+      search: async () => {
+        providerSearches += 1;
+        return [
+          { name: 'AIRTABLE_CREATE_BASE', summary: 'irrelevant table provider row', carrier: 'work_call' },
+          { name: 'APIFY_RUN_ACTOR', summary: 'irrelevant actor provider row', carrier: 'work_call' },
+        ];
+      },
+    }],
+  );
+  const output = await search.invoke(
+    new RunContext({ sessionId: 'scoped-structural-planning-lookup' }),
+    JSON.stringify({
+      query: 'create a plan for multi-step dependent work and execute work calls',
+      role_key: null,
+      limit: 5,
+    }),
+  );
+  const payload = JSON.parse(String(output)) as {
+    kind?: string;
+    results?: Array<{ name?: string }>;
+    hint?: string;
+  };
+
+  assert.equal(providerSearches, 0, 'host structural controls never spend a provider discovery crossing');
+  assert.equal(payload.kind, 'host_structural_control_lookup_v1');
+  assert.deepEqual(payload.results?.map((row) => row.name), ['plan_task', 'work_call']);
+  assert.doesNotMatch(String(output), /AIRTABLE|APIFY/);
+  assert.match(String(payload.hint), /host-local control/i);
+  assert.match(String(payload.hint), /not.*capabilityRef/i);
+  assert.ok(Buffer.byteLength(String(output), 'utf8') <= 2_048, 'the structural answer stays bounded');
+});
+
+test('ordinary planning prose cannot bypass scoped discovery', async () => {
+  let providerSearches = 0;
+  const search = buildScopedLocalToolSearch(
+    new Set<string>(),
+    'work_call',
+    undefined,
+    [{
+      kind: 'authorized_composio',
+      search: async () => {
+        providerSearches += 1;
+        return [{
+          name: 'SALESFORCE_QUERY_OPPORTUNITIES',
+          summary: 'Read Salesforce opportunities.',
+          schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+          carrier: 'work_call',
+        }];
+      },
+    }],
+  );
+  const output = await search.invoke(
+    new RunContext({ sessionId: 'ordinary-content-plan-lookup' }),
+    JSON.stringify({
+      query: 'create a multi-step sales plan for the open opportunities',
+      role_key: 'clause-0:read',
+      limit: 1,
+    }),
+  );
+
+  assert.equal(providerSearches, 1, 'non-control intent still reaches ordinary scoped discovery');
+  assert.match(String(output), /SALESFORCE_QUERY_OPPORTUNITIES/);
+  assert.doesNotMatch(String(output), /host_structural_control_lookup_v1/);
 });
 
 before(() => {

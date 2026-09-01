@@ -25,9 +25,12 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 
 const eventlog = await import('../runtime/harness/eventlog.js');
 const manifests = await import('../runtime/harness/capability-manifest.js');
+const manifestStores = await import('../runtime/harness/capability-manifest-store.js');
 const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const observations = await import('../runtime/harness/independent-capability-observation.js');
 const ports = await import('../runtime/harness/production-capability-ports.js');
+const externalCatalog = await import('../execution/workflow-step-external-catalog.js');
+const readAuthority = await import('./space-read-authority.js');
 const runner = await import('./runner.js');
 const store = await import('./store.js');
 
@@ -35,6 +38,7 @@ const OPERATION = 'SALESFORCE_GET_CONTACTS';
 
 test.after(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
+  manifestStores.installCapabilityManifestStore(null);
   observations.clearIndependentCapabilityObservations();
   ports.clearProductionCapabilityPorts();
   eventlog.closeEventLog();
@@ -42,6 +46,85 @@ test.after(() => {
 });
 
 const digest = (label: string): string => createHash('sha256').update(label, 'utf8').digest('hex');
+
+function coldComposioReadCapability(operationId: string, bodies: Map<string, number>) {
+  const inputSchemaDigest = digest(`input:${operationId}`);
+  const exactManifest = manifests.attachSemanticContract({
+    version: 1,
+    manifestId: `manifest.space.cold.${operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'composio.test',
+    providerVersion: 'composio-runtime-v1',
+    operationVersion: 'v20260831_00',
+    definitionFingerprint: digest(`definition:${operationId}`),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: inputSchemaDigest,
+      semanticName: operationId,
+      behaviorHints: {
+        readOnly: true,
+        destructive: false,
+        idempotent: true,
+        openWorld: false,
+      },
+    },
+    effect: 'read',
+    accountId: `account.space.${operationId}`,
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: 'read_bounded_records',
+    acceptedInputKinds: ['scope'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'host.test', issuedAt: '2026-08-31T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['source'],
+  });
+  assert.equal(ports.registerFixtureCapabilityPort(
+    ports.productionPortIdentityFromManifest(exactManifest),
+    {
+      invoke: async () => {
+        bodies.set(operationId, (bodies.get(operationId) ?? 0) + 1);
+        return { data: { records: [{ operationId }] }, successful: true };
+      },
+    },
+  ).ok, true);
+  const entry: catalogs.RegisteredHostCapability = {
+    capabilityId: exactManifest.manifestId,
+    toolName: exactManifest.operationId,
+    schemaVersion: exactManifest.operationVersion,
+    schemaDigest: exactManifest.definitionFingerprint,
+    effect: exactManifest.effect,
+    account: exactManifest.accountId,
+    manifestDigest: manifests.capabilityManifestDigest(exactManifest),
+    providerKind: exactManifest.providerKind,
+    providerInputSchemaDigest: inputSchemaDigest,
+    liveFingerprint: exactManifest.definitionFingerprint,
+    manifest: exactManifest,
+    invoke: async () => {
+      throw new Error('catalog invoke must not own the workspace crossing');
+    },
+  };
+  return {
+    manifest: exactManifest,
+    entry,
+    definition: {
+      identifier: operationId,
+      schemaDigest: inputSchemaDigest,
+      accountIdentity: exactManifest.accountId,
+      definitionFingerprint: exactManifest.definitionFingerprint,
+      outputSchemaDigest: null,
+      providerOperationVersion: exactManifest.operationVersion,
+      invokePortId: exactManifest.invokePortId,
+      schema: { type: 'object' },
+      fingerprint: digest(`source-schema:${operationId}`),
+      outputSchema: null,
+    },
+  };
+}
 
 function installReadCapability(operationId: string): { portBodies: () => number } {
   const exactManifest = manifests.attachSemanticContract({
@@ -139,6 +222,90 @@ test('a composio-read Workspace refresh mints shared durable read authority and 
     assert.equal(second[0]?.ok, true, `second refresh refused: ${second[0]?.error ?? ''}`);
     assert.equal(capability.portBodies(), 2, 'each refresh redeems its own activation');
   } finally {
+    store.spaceStore.archive(slug);
+  }
+});
+
+test('a cold two-source Workspace refresh prepares each exact read before minting authority', async () => {
+  const slug = 'authority-cold-two-source';
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  observations.clearIndependentCapabilityObservations();
+  ports.clearProductionCapabilityPorts();
+  const bodies = new Map<string, number>();
+  const sheet = coldComposioReadCapability('GOOGLESHEETS_BATCH_GET', bodies);
+  const slack = coldComposioReadCapability('SLACK_FETCH_CONVERSATION_HISTORY', bodies);
+  const exactByOperation = new Map([
+    [sheet.manifest.operationId, sheet],
+    [slack.manifest.operationId, slack],
+  ]);
+  const manifestStore = manifestStores.createCapabilityManifestStore();
+  const installedSheet = manifestStore.install(sheet.manifest);
+  assert.equal(installedSheet.ok, true, `sheet manifest refused: ${JSON.stringify(installedSheet)}`);
+  const installedSlack = manifestStore.install(slack.manifest);
+  assert.equal(installedSlack.ok, true, `slack manifest refused: ${JSON.stringify(installedSlack)}`);
+  manifestStores.installCapabilityManifestStore(manifestStore);
+  const factory = catalogs.peekHostCapabilityCatalogFactory()!;
+  assert.equal(factory.get(sheet.manifest.manifestId), undefined);
+  assert.equal(factory.get(slack.manifest.manifestId), undefined);
+  const preparedOperations: string[] = [];
+  readAuthority._setExactSpaceReadCatalogPreparerForTests((input) => (
+    externalCatalog.prepareWorkflowStepExternalCatalog(input, {
+      manifestStore,
+      catalogFactory: factory,
+      revalidate: async (selections) => {
+        assert.equal(selections.length, 1);
+        const operationId = selections[0]!.identifier;
+        const exact = exactByOperation.get(operationId);
+        assert.ok(exact, operationId);
+        preparedOperations.push(operationId);
+        return {
+          ok: true,
+          definitions: new Map([[operationId.toLowerCase(), exact!.definition]]),
+        };
+      },
+      refresh: (manifestIds) => {
+        assert.equal(manifestIds.length, 1);
+        const exact = [...exactByOperation.values()].find(
+          (candidate) => candidate.manifest.manifestId === manifestIds[0],
+        );
+        assert.ok(exact);
+        factory.register(exact!.entry);
+      },
+      ready: (manifestIds) => manifestIds.every((id) => Boolean(factory.get(id))),
+    })
+  ));
+  store.spaceStore.save({
+    id: slug,
+    title: 'Cold exact two-source refresh',
+    dataSources: [
+      {
+        id: 'sheet_log',
+        composioSlug: sheet.manifest.operationId,
+        composioArgs: { spreadsheet_id: 'sheet-1', ranges: ['Log!A1:I500'] },
+      },
+      {
+        id: 'slack_feed',
+        composioSlug: slack.manifest.operationId,
+        composioArgs: { channel: 'C-PLATFORM-49', limit: 50 },
+      },
+    ],
+  });
+  try {
+    const result = await runner.refreshSpaceData(slug, undefined, { cause: 'manual' });
+    assert.equal(result[0]?.ok, true, `sheet refresh refused: ${result[0]?.error ?? ''}`);
+    assert.equal(result[1]?.ok, true, `slack refresh refused: ${result[1]?.error ?? ''}`);
+    assert.deepEqual(result.map((row) => ({ sourceId: row.sourceId, ok: row.ok })), [
+      { sourceId: 'sheet_log', ok: true },
+      { sourceId: 'slack_feed', ok: true },
+    ]);
+    assert.deepEqual(preparedOperations.sort(), [
+      'GOOGLESHEETS_BATCH_GET',
+      'SLACK_FETCH_CONVERSATION_HISTORY',
+    ]);
+    assert.equal(bodies.get('GOOGLESHEETS_BATCH_GET'), 1);
+    assert.equal(bodies.get('SLACK_FETCH_CONVERSATION_HISTORY'), 1);
+  } finally {
+    readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
     store.spaceStore.archive(slug);
   }
 });

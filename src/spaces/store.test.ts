@@ -17,6 +17,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -29,6 +30,7 @@ const data = await import('./data-store.js');
 const workspaceDb = await import('./workspace-db.js');
 const memoryDb = await import('../memory/db.js');
 const temporalMemory = await import('../memory/temporal-memory.js');
+const localCommit = await import('../runtime/harness/host-local-write-commit.js');
 
 test('isValidSpaceSlug accepts kebab, rejects traversal/space/caps', () => {
   assert.equal(store.isValidSpaceSlug('sf-daily-report'), true);
@@ -76,6 +78,108 @@ test('save creates a manifest; get + list read it back; idempotent update', () =
 
   const list = store.spaceStore.list();
   assert.equal(list.filter((s) => s.id === 'demo').length, 1);
+});
+
+test('initial static data is visible with its manifest, retries orphaned pre-manifest files, and transitions on real sources', () => {
+  const slug = 'static-snapshot-store';
+  const dir = store.resolveSpaceDir(slug);
+  mkdirSync(path.join(dir, 'view'), { recursive: true });
+  // Simulate a process stop before the manifest visibility barrier. These
+  // files are not a Workspace yet and exact create safely converges over them.
+  writeFileSync(path.join(dir, 'view', 'index.html'), '<html>partial</html>', 'utf8');
+  writeFileSync(path.join(dir, 'data.json'), '{"partial":true}', 'utf8');
+  assert.equal(store.spaceStore.get(slug), undefined);
+
+  const document = { posts: [{ id: 1 }], _mobile: { records: { items: [{ primary: 'Post 1' }] } } };
+  const created = store.spaceStore.save({
+    id: slug,
+    title: 'Static Snapshot',
+    viewContent: '<html>complete</html>',
+    initialData: document,
+  });
+  assert.equal(created.contentMode, 'static_snapshot');
+  assert.deepEqual(data.readData(slug), document);
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'view/index.html'), 'utf8'), '<html>complete</html>');
+
+  assert.throws(() => store.spaceStore.save({
+    id: slug,
+    title: 'Collision',
+    initialData: { different: true },
+  }), /initialData is create-only/);
+  assert.deepEqual(data.readData(slug), document);
+
+  const dynamic = store.spaceStore.save({
+    id: slug,
+    title: 'Static Snapshot',
+    dataSources: [{ id: 'news', composioSlug: 'NEWS_SEARCH' }],
+  });
+  assert.equal(dynamic.contentMode, undefined, 'a real source clears the static snapshot contract');
+  assert.equal(store.spaceStore.get(slug)?.contentMode, undefined);
+});
+
+test('a competing component writer before the manifest barrier fails closed and exact retry converges', () => {
+  const slug = 'static-snapshot-race';
+  const intended = { posts: [{ id: 1 }], _mobile: { records: { items: [{ primary: 'Post 1' }] } } };
+  assert.throws(() => store.spaceStore.save({
+    id: slug,
+    title: 'Static Race',
+    viewContent: '<html>intended</html>',
+    initialData: intended,
+    beforeInitialManifestVisibility: () => {
+      writeFileSync(store.resolveInSpace(slug, 'data.json'), '{"racer":true}', 'utf8');
+    },
+  }), /components changed before the manifest visibility barrier/);
+  assert.equal(store.spaceStore.get(slug), undefined, 'mixed bytes never cross the visibility barrier');
+
+  const retried = store.spaceStore.save({
+    id: slug,
+    title: 'Static Race',
+    viewContent: '<html>intended</html>',
+    initialData: intended,
+  });
+  assert.equal(retried.version, 1);
+  assert.equal(retried.contentMode, 'static_snapshot');
+  assert.deepEqual(data.readData(slug), intended);
+});
+
+test('static receipt repair is exact, idempotent, and never blesses changed component bytes', () => {
+  const slug = 'static-receipt-repair';
+  const viewContent = '<html><body>Five posts</body></html>';
+  const initialData = { posts: Array.from({ length: 5 }, (_, index) => ({ id: index + 1 })) };
+  const input = {
+    id: slug,
+    title: 'Static Receipt Repair',
+    viewContent,
+    initialData,
+    dataSources: [],
+    actions: [],
+  };
+  store.spaceStore.save(input);
+  const receiptPath = store.resolveInSpace(slug, localCommit.HOST_LOCAL_WORKSPACE_COMMIT_BASENAME);
+  writeFileSync(receiptPath, '{"corrupt":true}', 'utf8');
+
+  const repaired = store.spaceStore.repairStaticSnapshotCommitReceipt(input);
+  assert.equal(repaired.ok, true, repaired.ok ? '' : repaired.reason);
+  if (!repaired.ok) return;
+  assert.equal(repaired.repaired, true);
+  const proven = localCommit.withHostLocalWriteCommitFromFile({
+    createdId: slug,
+    committedPath: repaired.receiptPath,
+    result: 'repaired',
+  });
+  assert.equal(localCommit.hostLocalWriteCommitResultIsProven(proven), true);
+  const idempotent = store.spaceStore.repairStaticSnapshotCommitReceipt(input);
+  assert.equal(idempotent.ok && idempotent.repaired, false,
+    'a valid proof carrier is preserved without rewrite');
+
+  rmSync(receiptPath, { force: true });
+  const tamperedData = '{"posts":[{"id":"tampered"}]}';
+  writeFileSync(store.resolveInSpace(slug, 'data.json'), tamperedData, 'utf8');
+  const refused = store.spaceStore.repairStaticSnapshotCommitReceipt(input);
+  assert.equal(refused.ok, false, 'component drift can never be normalized into a new receipt');
+  assert.equal(existsSync(receiptPath), false);
+  assert.equal(readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8'), tamperedData,
+    'failed repair never overwrites the divergent component');
 });
 
 test('mergeSpaceContract is bounded, deduplicated, and supports explicit list clearing', () => {
