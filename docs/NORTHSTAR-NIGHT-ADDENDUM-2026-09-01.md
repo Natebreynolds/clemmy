@@ -117,6 +117,18 @@ in two weeks a failed run named its own cause.
   `work_call`), so the model takes the construct lane instead of hitting a dead end. Either way the
   pre-body authority throw in the adapter should become a typed *not-started* refusal so it can never
   read as an uncertain mutation.
+- **06:59 — the fork is resolved as option (a) (`41371175`), per the owner's rule that saving and
+  enabling a workflow is the consent for its authored writes.** When the authored-consent evaluator
+  decides `proceed`, the host records the grant by logical call id and the port invoke mints
+  `AuthoredCallAuthorityV1` (`authored-call-authority.ts`): exactly the manifest-identity fields the
+  shipped adapter verifies plus the arguments this turn schema-validated as `canonicalArgs` — nothing
+  from model text. Reads and ungranted calls pass no authority; the construct lane is untouched. The
+  adapter's pre-body refusals are now `ProviderPreDispatchRefusalError`, which settlement reads by class
+  name as not-started — a mutation refused there can never settle `uncertain_write`. Invoke artifact
+  re-emitted. Pinned at the adapter and the settlement; pin debt: a `runProductionHost` pin observing
+  the authority on the port. Baseline #6 (`1788271157248-5b1e0b`) is the live connection proof. The
+  suite/packaged declarations below were taken at `a6248874`/`1c3e1177`; this commit was verified with
+  focused suites (host 218, adapters, settlement lanes, artifact leaf closure) only.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
