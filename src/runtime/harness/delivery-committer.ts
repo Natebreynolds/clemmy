@@ -61,6 +61,10 @@ const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
   'steps',
   'missingReply',
   'blockedReason',
+  // Bounded machine detail beside blockedReason (for example the last host
+  // pre-dispatch refusal check that exhausted the no-progress governor).
+  // Metadata only: presentation text never derives from it.
+  'blockedDetail',
   'verificationDetail',
   'verificationMissing',
   'failureDetail',

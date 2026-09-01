@@ -169,3 +169,49 @@ test('proposal-free read/compute is ordinary without a graph while mutation and 
     reason: 'fresh_plan_already_activated',
   });
 });
+
+test('sole once-mutation stays eligible when strict materialization injects null lineage keys (8810)', () => {
+  // Strict schema materialization emits every required+nullable key of the
+  // host-planned work_call transport as JSON null before this policy runs.
+  // Live 2026-08-31: two new lineage keys arrived as nulls, the field mirror
+  // lacked them, and every sole Workspace write was refused
+  // host_planned_work_call_requires_plan_sibling until the governor
+  // terminalized the turn.
+  const materialized = (overrides: Record<string, unknown> = {}): HostModelFrameCall => work({
+    callId: 'save',
+    effectiveName: 'space_save',
+    effect: 'local_write',
+    argumentsValue: {
+      requirement_id: 'cap:local:space_save:reversible',
+      universe_item_id: null,
+      universe_selector: null,
+      seal_amendment: null,
+      source_call_ids: null,
+      source_record_ids: null,
+      name: 'space_save',
+      args_json: '{"slug":"proof","title":"Proof"}',
+      ...overrides,
+    },
+  });
+  assert.deepEqual(
+    classifyHostModelFrame({ calls: [materialized()], planActivated: false, allowFreshPlanReadFusion: true }),
+    {
+      kind: 'host_owned_single_action_plan',
+      call: materialized(),
+      requirementId: 'cap:local:space_save:reversible',
+      effect: 'local_write',
+    },
+  );
+  // Non-null lineage means the call depends on settled work; the sole-action
+  // lane never compiles a dependent write.
+  for (const lineage of [
+    { source_call_ids: ['call_1'] },
+    { source_record_ids: ['https://example.test/a'] },
+  ]) {
+    assert.deepEqual(
+      classifyHostModelFrame({ calls: [materialized(lineage)], planActivated: false, allowFreshPlanReadFusion: true }),
+      { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' },
+      JSON.stringify(lineage),
+    );
+  }
+});
