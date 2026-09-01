@@ -148,6 +148,8 @@ export interface V314UpgradeRehearsalReport {
     tagLockSha256: string;
     currentLockSha256: string;
     normalizedLockGraphEqual: boolean;
+    tagGraphCovered: boolean;
+    extraPackages: string[];
   };
   paths: {
     rehearsalRoot: string;
@@ -311,10 +313,43 @@ export function normalizedInstalledPackageGraph(lock: unknown): unknown {
   return copy;
 }
 
+/**
+ * The exact-tag execution proof: every package the v3.14.0 lock resolved must be
+ * present in the current lock at the IDENTICAL entry (version, resolved,
+ * integrity, dependency edges). Packages the current tree added since the tag
+ * do not change Node resolution for the tag's own requires (lock entries are
+ * path-keyed), so they are reported but do not fail the proof. A changed or
+ * missing tag package does fail it.
+ */
+export function installedPackageGraphCoversTag(tagLock: unknown, currentLock: unknown): {
+  covered: boolean;
+  missingPackages: string[];
+  changedPackages: string[];
+  extraPackages: string[];
+} {
+  const tag = normalizedInstalledPackageGraph(tagLock) as { packages?: Record<string, unknown> };
+  const current = normalizedInstalledPackageGraph(currentLock) as { packages?: Record<string, unknown> };
+  const tagPackages = tag.packages ?? {};
+  const currentPackages = current.packages ?? {};
+  const missingPackages = Object.keys(tagPackages).filter((key) => !(key in currentPackages)).sort();
+  const changedPackages = Object.keys(tagPackages)
+    .filter((key) => key in currentPackages && stable(tagPackages[key]) !== stable(currentPackages[key]))
+    .sort();
+  const extraPackages = Object.keys(currentPackages).filter((key) => !(key in tagPackages)).sort();
+  return {
+    covered: missingPackages.length === 0 && changedPackages.length === 0,
+    missingPackages,
+    changedPackages,
+    extraPackages,
+  };
+}
+
 function verifyReleaseCheckout(checkout: string): {
   tagLockSha256: string;
   currentLockSha256: string;
   normalizedLockGraphEqual: boolean;
+  tagGraphCovered: boolean;
+  extraPackages: string[];
 } {
   const commit = run('git', ['rev-parse', `${V314_RELEASE.commit}^{commit}`]).stdout.trim();
   const tree = run('git', ['rev-parse', `${V314_RELEASE.commit}^{tree}`]).stdout.trim();
@@ -332,15 +367,20 @@ function verifyReleaseCheckout(checkout: string): {
   const currentLock = JSON.parse(readFileSync(currentLockPath, 'utf8')) as unknown;
   const normalizedLockGraphEqual = stable(normalizedInstalledPackageGraph(tagLock))
     === stable(normalizedInstalledPackageGraph(currentLock));
-  if (!normalizedLockGraphEqual) {
+  const coverage = installedPackageGraphCoversTag(tagLock, currentLock);
+  if (!coverage.covered) {
     throw new Error(
-      'The installed dependency graph no longer matches v3.14.0; refusing to call current node_modules an exact-tag execution dependency set.',
+      'The installed dependency graph no longer covers v3.14.0 exactly '
+      + `(missing: ${coverage.missingPackages.join(', ') || 'none'}; changed: ${coverage.changedPackages.join(', ') || 'none'}); `
+      + 'refusing to call current node_modules an exact-tag execution dependency set.',
     );
   }
   return {
     tagLockSha256: sha256File(tagLockPath),
     currentLockSha256: sha256File(currentLockPath),
     normalizedLockGraphEqual,
+    tagGraphCovered: coverage.covered,
+    extraPackages: coverage.extraPackages,
   };
 }
 

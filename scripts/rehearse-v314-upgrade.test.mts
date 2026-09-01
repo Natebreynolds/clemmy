@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import {
   SCHEMA_V69_MODEL_RESULT_PROJECTION_RECEIPT_COLUMNS,
   V314_RELEASE,
+  installedPackageGraphCoversTag,
   normalizedInstalledPackageGraph,
   runV314UpgradeRehearsal,
 } from './rehearse-v314-upgrade.mts';
@@ -72,6 +73,34 @@ test('dependency proof ignores only root request metadata, never installed packa
   );
 });
 
+test('dependency proof covers the tag graph: extras are allowed, changed or missing tag packages are not', () => {
+  const tag = {
+    name: 'clemmy', version: '3.14.0',
+    packages: {
+      '': { name: 'clemmy', version: '3.14.0' },
+      'node_modules/a': { version: '1.0.0', resolved: 'https://r/a-1.0.0.tgz', integrity: 'sha512-a' },
+      'node_modules/b': { version: '2.0.0', resolved: 'https://r/b-2.0.0.tgz', integrity: 'sha512-b', dependencies: { a: '^1.0.0' } },
+    },
+  };
+  const superset = structuredClone(tag) as typeof tag & { packages: Record<string, unknown> };
+  superset.version = '3.16.0';
+  superset.packages['node_modules/c'] = { version: '9.9.9', resolved: 'https://r/c-9.9.9.tgz', integrity: 'sha512-c' };
+  const covered = installedPackageGraphCoversTag(tag, superset);
+  assert.deepEqual(covered, { covered: true, missingPackages: [], changedPackages: [], extraPackages: ['node_modules/c'] });
+
+  const changed = structuredClone(tag) as typeof tag & { packages: Record<string, { version: string }> };
+  changed.packages['node_modules/a'].version = '1.0.1';
+  const drift = installedPackageGraphCoversTag(tag, changed);
+  assert.equal(drift.covered, false);
+  assert.deepEqual(drift.changedPackages, ['node_modules/a']);
+
+  const missing = structuredClone(tag) as typeof tag & { packages: Record<string, unknown> };
+  delete missing.packages['node_modules/b'];
+  const gone = installedPackageGraphCoversTag(tag, missing);
+  assert.equal(gone.covered, false);
+  assert.deepEqual(gone.missingPackages, ['node_modules/b']);
+});
+
 test('v3.14.0 release provenance is pinned to the published peeled commit and tree', () => {
   assert.deepEqual(V314_RELEASE, {
     tag: 'v3.14.0',
@@ -133,7 +162,9 @@ test('exact v3.14 APIs seed a disposable home and current store boots migrate it
     assert.equal(report.ok, true, JSON.stringify(report.checks.filter((check) => !check.ok), null, 2));
     assert.equal(report.checks.length, 18);
     assert.equal(report.checks.every((check) => check.ok), true);
-    assert.equal(report.dependencyProof.normalizedLockGraphEqual, true);
+    assert.equal(report.dependencyProof.tagGraphCovered, true, 'every v3.14.0 package must be present at its exact entry');
+    assert.equal(typeof report.dependencyProof.normalizedLockGraphEqual, 'boolean');
+    assert.ok(Array.isArray(report.dependencyProof.extraPackages));
     assert.equal(existsSync(report.paths.immutableSnapshot), true, 'rollback snapshot remains recoverable');
     assert.equal(existsSync(report.paths.migratedHome), true);
     assert.equal(existsSync(report.paths.report), true);
