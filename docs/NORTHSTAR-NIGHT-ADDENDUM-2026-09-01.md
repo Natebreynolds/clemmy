@@ -75,7 +75,20 @@ in two weeks a failed run named its own cause.
   clock; every write after minute 16 hit `plan_scope_missing_or_changed`. Fix: `openPlanScope` gains
   `attemptBound` — a workflow step's scope lives until the runner closes it on `workflow-step-finished`,
   with no TTL and no 1h ceiling (consent semantics unchanged; cron keeps its TTL because it preserves held
-  scopes). Pinned. Baseline #3 (`1788258688680-d341f5`) is the re-run on that fix.
+  scopes). Pinned.
+- **platform-49 GLM baseline #3 (03:31, run `1788258688680-d341f5`):** 23 reads again, then the model called
+  `composio_search_tools` *through* `composio_execute_tool`. That carrier is `nested_owned` (the host
+  adopts the inner call's own durable settlement); the local search ran and returned but wrote none, so
+  invocation authority failed closed mid-invocation (`nested-owned logical settlement is missing`), the
+  projection receipt conflicted (`tool differs from its logical identity`), the accepted batch lost its
+  host root, recovery re-entered ~40 times in 18 s, and the runner parked the run as "interrupted mid-run
+  — not re-run" (a dead end for a `sideEffect: write` step). Fix: when the redeemed settlement is
+  missing, the inner returned normally, no physical dispatch exists for the logical call (durable rows,
+  not just the wrapper's marker), and the frozen contract is non-mutating, the host settles the observed
+  result itself; any crossing, mutation, or contract upgrade still fails closed (the row-less provider
+  adapter and crossed-inner pins stay green). Note: refusing broker-carried local names pre-dispatch was
+  tried and rejected — the host deliberately reroutes `tool_slug: tool_search` through the sealed
+  acquisition surface (pinned). Baseline #4 (`1788260460200-4efef7`) is the re-run on that fix.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
