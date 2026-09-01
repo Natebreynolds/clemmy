@@ -132,7 +132,11 @@ in two weeks a failed run named its own cause.
   file:line map in the scratchpad ring reports (`rings/B.md`).
 
 ### Declared state at the tip
-- Full isolated suite: __SUITE__ (sentinel PERFORMED, no violations).
+- Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
+  run): **14,125 tests — 14,124 pass, 0 fail, 1 skipped**. An earlier pass at `ebae46b3` had three reds,
+  all test-side and fixed since: two `plan-task-result-contract` pins whose miniature settlement table
+  lacked the `outcome_detail` column the projection now reads, and one randomized `slug-effect` pin
+  whose base36 nonce could tokenize to a real verb (`X5POST` → `POST`).
 - Journeys (`npm run journeys` at `ebae46b3`, daemon stopped): **156/171**. The 15 reds split cleanly:
   3 are the hard-cut journey seams recorded above (`host_invocation_authority_missing` + two fixture
   projection receipts), and 12 are **pre-existing wave debt, not regressions** — the same five files
@@ -145,7 +149,12 @@ in two weeks a failed run named its own cause.
   Discord read+create loop, the 16 KiB model-visible-surface and 70 % warm-cache competitive ceilings
   (surface measured 21.7 KiB), the 10K-catalog permutation gate, and a `work_call` continuation after
   an accepted read plan. These are the next wave's list, in that order.
-- Packaged gates (`build`, `test:packed-candidate`, `test:packaged-upgrade`, `rehearse:upgrade:v314`): __PACKAGED__.
+- Packaged gates: `build` PASS, `test:packed-candidate` PASS, `test:packaged-upgrade` **21/21 PASS** (at
+  `1c3e1177`; it was red at `ebae46b3` because the shipped builtin skill seeded on first boot,
+  `skills/technical-content-marketing/SKILL.md`, was unknown to the closed first-boot categorizer — now a
+  `deterministic_boot_seed` whose list is pinned equal to the package's `builtin-skills/` directory),
+  `rehearse:upgrade:v314` PASS, `test:release-assets` PASS, `test:release-closure` PASS, `test:measurement`
+  PASS, `proof:selftest` PASS, `tsc --noEmit` PASS. Billed evals (`bench:gates`, `eval:*`) not run.
 - Known follow-ups (not defects hidden): per-row `WHERE id=? AND json_type(metadata_json…)` arm/clear
   statements in `eventlog.ts` (same class as gate 17, fails only its own row); `workspace_social_posts_v1`
   literals in the semantic kernel; `space_refresh` sheet range `Log!A1:N500` vs the 9-column trim;
