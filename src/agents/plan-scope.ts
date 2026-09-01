@@ -131,16 +131,6 @@ export interface PlanScope {
    * law: a send the user didn't pre-bless always waits).
    */
   allowedSends?: string[];
-  /** AUTHORED-SEND CONSENT (owner rule, 2026-07-24: "workflows never need
-   *  approval unless it's a human-in-the-loop step that's authored"). Set
-   *  ONLY by the workflow runner for a step the AUTHOR declared
-   *  `sideEffect: 'send'` WITHOUT `requiresApproval`, on a run of a saved
-   *  workflow the user launched or enabled+scheduled. Within this step's
-   *  TTL-bound scope, sends auto-approve without slug enumeration — the
-   *  authoring + save + enable/run chain IS the consent. This is narrower
-   *  than the 2026-07-09 Hole-2 wildcard (un-authored lanes): it exists only
-   *  where a human wrote "this step sends" and turned the workflow on. */
-  allowAnySend?: boolean;
   authoredWorkflowWriteAuthority?: AuthoredWorkflowWriteAuthorityScopeV1;
   openedAt: string;
   expiresAt: string;
@@ -246,16 +236,6 @@ export interface OpenPlanScopeInput {
   goalScoped?: { goalId: string };
   /** Sends the plan enumerated + the user blessed (goal-scoped only). */
   allowedSends?: string[];
-  /** AUTHORED-SEND CONSENT (owner rule, 2026-07-24: "workflows never need
-   *  approval unless it's a human-in-the-loop step that's authored"). Set
-   *  ONLY by the workflow runner for a step the AUTHOR declared
-   *  `sideEffect: 'send'` WITHOUT `requiresApproval`, on a run of a saved
-   *  workflow the user launched or enabled+scheduled. Within this step's
-   *  TTL-bound scope, sends auto-approve without slug enumeration — the
-   *  authoring + save + enable/run chain IS the consent. This is narrower
-   *  than the 2026-07-09 Hole-2 wildcard (un-authored lanes): it exists only
-   *  where a human wrote "this step sends" and turned the workflow on. */
-  allowAnySend?: boolean;
 }
 
 export const DEFAULT_SCOPE_ALLOWED_TOOLS = ['run_shell_command', 'write_file'];
@@ -282,7 +262,6 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
       : undefined,
     goalScoped: input.goalScoped,
     allowedSends: input.allowedSends && input.allowedSends.length > 0 ? input.allowedSends : undefined,
-    allowAnySend: input.allowAnySend === true ? true : undefined,
     openedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + ttl).toISOString(),
     autoApprovals: [],
@@ -516,11 +495,12 @@ export function isAutoApprovedByScope(
   // THE SEND LOCK — only IRREVERSIBLE sends (email/call/post), not reversible
   // network writes (a sheet/record create still auto-approves under a scope).
   if (isIrreversibleSendAction(semanticTool, semanticArgs, kindHint)) {
-    // Authored-send consent: the workflow author declared this step SENDS and
-    // the user saved + launched/enabled it — the only human-in-the-loop gates
-    // in a workflow are steps AUTHORED `requiresApproval` (owner rule,
-    // 2026-07-24). Scope is step-TTL-bound and set only by the runner.
-    if (scope.allowAnySend === true) return true;
+    // Authored-send consent (owner rule, 2026-07-24: the only human-in-the-
+    // loop gates in a workflow are steps AUTHORED `requiresApproval`) is NOT a
+    // scope flag. It lives in the exact authored-step receipt/grant the host
+    // evaluates per call (authored-workflow-write-authority.ts): bound to the
+    // accepted source, batch occurrence, arguments, destination, account and
+    // schema, once per step attempt. A TTL-wide scope can never wave a send.
     const slug = extractComposioSlug(semanticArgs);
     const sends = scope.allowedSends ?? [];
     // The SLUG is the real action for a composio send — auto-approve only when

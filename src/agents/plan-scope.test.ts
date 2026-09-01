@@ -550,24 +550,28 @@ test('grant-at-card: no verifiable recipient → no grant (fail-closed)', () => 
 });
 
 // Authored-send consent (owner rule, 2026-07-24: "workflows never need
-// approval unless it's a human-in-the-loop step that's authored"). The flag
-// is set only by the workflow runner for authored sideEffect:'send' steps;
-// without it, the 2026-07-09 wildcard send lock stands untouched.
-test('allowAnySend: an authored send step scope auto-approves sends; the wildcard lock holds everywhere else', () => {
+// approval unless it's a human-in-the-loop step that's authored") is NOT a
+// scope flag any more. It lives in the exact authored-step receipt/grant the
+// host evaluates per call (authored-workflow-write-authority.ts). A workflow
+// step scope — wildcard or not, whatever a caller tries to smuggle in — never
+// auto-approves an irreversible send; the 2026-07-09 wildcard send lock holds
+// for every scope.
+test('a workflow step scope never auto-approves an irreversible send; a smuggled allowAnySend input is inert', () => {
   const sendArgs = { tool_slug: 'SLACK_SEND_MESSAGE', arguments: '{"channel":"C1","markdown_text":"update"}' };
 
-  openPlanScope({
+  const smuggled = openPlanScope({
     sessionId: 'wf-authored-send',
     planProposalId: 'workflow:test:send-step',
     approvedPlanObjective: 'Approved workflow step post_slack',
     ttlMs: 60_000,
     allowedTools: ['*'],
-    allowAnySend: true,
-  });
+    ...({ allowAnySend: true } as Record<string, unknown>),
+  } as Parameters<typeof openPlanScope>[0]);
+  assert.equal('allowAnySend' in smuggled, false, 'the scope carries no send-wide flag');
   assert.equal(
     isAutoApprovedByScope('wf-authored-send', 'composio_execute_tool', sendArgs, 'send'),
-    true,
-    'authored send step sends without parking',
+    false,
+    'an authored send step scope does not wave a send; the exact receipt/grant owns that decision',
   );
 
   openPlanScope({
@@ -580,7 +584,7 @@ test('allowAnySend: an authored send step scope auto-approves sends; the wildcar
   assert.equal(
     isAutoApprovedByScope('wf-plain-wildcard', 'composio_execute_tool', sendArgs, 'send'),
     false,
-    'without the authored flag, a wildcard scope still never auto-approves a send',
+    'a wildcard scope never auto-approves a send',
   );
 });
 
