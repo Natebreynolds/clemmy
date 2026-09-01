@@ -24,6 +24,9 @@ const {
   finishRunAttempt,
   getLatestRunAttempt,
   listEvents,
+  listExactCheckpointRecoverySessions,
+  listSessions,
+  openEventLog,
   recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
@@ -211,6 +214,54 @@ function armAcceptedInterruptedTurn(
   session.setRunInFlight(since);
   return { attempt, source };
 }
+
+test('a corrupt legacy sessions.metadata_json row neither blocks its own updates nor aborts the recovery scans', () => {
+  // 8531 class: v72/v73 created idx_sessions_chat_run_in_flight_updated with an
+  // unguarded json_type(metadata_json, …) predicate. SQLite evaluates a partial
+  // index WHERE on EVERY sessions write, so one malformed legacy row raised
+  // SQLITE_ERROR "malformed JSON" on every UPDATE of that row and aborted the
+  // per-tick exact-checkpoint scan. v74 recreates the index behind json_valid;
+  // the recovery read/clear paths guard the same predicate.
+  const corrupt = HarnessSession.create({ kind: 'chat', title: 'corrupt legacy metadata' });
+  const interrupted = HarnessSession.create({ kind: 'chat', title: 'healthy interrupted checkpoint' });
+  const { source } = armAcceptedInterruptedTurn(interrupted, new Date().toISOString());
+  interrupted.saveRecoveryState(JSON.stringify({
+    __clemHostRecovery: 1,
+    sessionId: interrupted.id,
+    sourceUserSeq: source.seq,
+    phase: 'admit',
+    frameHistory: [],
+  }));
+  const db = openEventLog();
+  db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run('{not-json', corrupt.id);
+
+  assert.doesNotThrow(
+    () => db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('still writable', corrupt.id),
+    'the partial-index predicate must not raise on the corrupt row',
+  );
+  const runInFlight = listSessions({ kind: 'chat', runInFlightOnly: true, limit: 500 });
+  assert.ok(runInFlight.some((row) => row.id === interrupted.id), 'the healthy interrupted chat is still listed');
+  assert.ok(!runInFlight.some((row) => row.id === corrupt.id), 'a malformed row is not an in-flight owner');
+  const exact = listExactCheckpointRecoverySessions(64);
+  assert.ok(exact.some((row) => row.id === interrupted.id), 'the per-tick exact-checkpoint scan survives the corrupt row');
+  assert.ok(!exact.some((row) => row.id === corrupt.id));
+  assert.equal(clearRunInFlightAfterTerminal(corrupt.id), false, 'a corrupt row is not an owner to clear');
+  assert.equal(clearRunInFlightAfterTerminal(corrupt.id, 'attempt-x', 1), false);
+  assert.doesNotThrow(() => recoverInterruptedChatRuns(() => Date.now(), undefined, { exactCheckpointsOnly: true }));
+  assert.doesNotThrow(() => reportInterruptedChatRuns(() => Date.now()));
+  assert.equal(
+    (db.prepare('SELECT metadata_json FROM sessions WHERE id = ?').get(corrupt.id) as { metadata_json: string }).metadata_json,
+    '{not-json',
+    'malformed legacy bytes stay untouched',
+  );
+  // Exact checkpoints are preserved by both scans above (no dispatcher), so
+  // release this fixture's marker: later tests in this shared home count
+  // interrupted chats by construction. The corrupt row deliberately stays.
+  const healthy = HarnessSession.load(interrupted.id)!;
+  healthy.clearRecoveryState();
+  healthy.clearRunInFlight();
+  assert.equal(HarnessSession.load(interrupted.id)?.runInFlightSince(), null);
+});
 
 test('marker round-trip: set then clear', () => {
   const s = HarnessSession.create({ kind: 'chat', title: 't' });

@@ -99,6 +99,43 @@ function interruptedExactCheckpointSession(label: string): {
   return { sessionId: sess.id, sourceUserSeq: source.seq, attempt };
 }
 
+/** The durable HostRecoveryState names a source the in-flight attempt does not
+ * own (N+1 vs N). listExactCheckpointRecoverySessions still lists it; it is
+ * not an exact checkpoint for the recovery decision. */
+function interruptedStaleCheckpointSession(label: string): {
+  sessionId: string;
+  sourceUserSeq: number;
+} {
+  const sess = HarnessSession.create({ kind: 'chat', title: `stale checkpoint ${label}` });
+  const attempt = beginRunAttempt(sess.id, { runId: `restart-stale:${label}:${sess.id}` });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: `Resume stale checkpoint ${label}.` },
+  });
+  const state = new HostRecoveryState(
+    sess.id,
+    source.seq + 1,
+    'admit',
+    [],
+    [{
+      type: 'function_call',
+      callId: `stale-call-${label}`,
+      name: 'work_call',
+      arguments: '{}',
+    }] as never,
+    [],
+    undefined,
+    undefined,
+    'host_v1',
+    undefined,
+    0,
+  );
+  sess.saveRecoveryState(state.toString());
+  markRunInFlight(sess.id, true);
+  return { sessionId: sess.id, sourceUserSeq: source.seq };
+}
+
 function interruptedPreparedWorkflowSession(since: string): {
   sessionId: string;
   sourceUserSeq: number;
@@ -734,6 +771,49 @@ test('repeated ticks enforce one global exact-checkpoint concurrency ceiling ins
   assert.equal(dispatched.size, 6, 'capacity release advances the next fair cohort');
   assert.ok(fixtures.every((fixture) =>
     listEvents(fixture.sessionId, { types: ['conversation_completed'] }).length === 0));
+});
+
+test('a periodic tick never takes the generic auto-resume branch for a listed session that is not an exact checkpoint', async () => {
+  // exactCheckpointsOnly narrows only the session LIST. Without an explicit
+  // skip, a listed session whose HRS source differs from its in-flight identity
+  // fell through to the generic branch, whose per-call cap resets every tick
+  // and whose marker stays armed across dispatch: a duplicate-turn hazard the
+  // boot path never had.
+  const exact = interruptedExactCheckpointSession('tick-exact');
+  const stale = interruptedStaleCheckpointSession('tick-stale');
+  const dispatched: string[] = [];
+  const dispatcher = async (restart: RestartResumeDispatch): Promise<void> => {
+    dispatched.push(restart.sessionId);
+  };
+  const options = {
+    exactCheckpointsOnly: true,
+    exactCheckpointDispatchLimit: 3,
+    exactCheckpointDispatchInFlightCount: () => 0,
+  };
+  for (let tick = 0; tick < 3; tick += 1) {
+    const summary = recoverInterruptedChatRuns(Date.now, dispatcher, options);
+    const staleRecord = summary.records.find((record) => record.sessionId === stale.sessionId);
+    assert.ok(staleRecord, `tick ${tick}: the listed stale session is still visited`);
+    assert.equal(staleRecord.autoResumed, false);
+    assert.equal(staleRecord.autoResumeSkipped, 'not_exact_checkpoint');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(dispatched.length >= 1, 'the exact checkpoint still dispatches on the tick path');
+  assert.ok(dispatched.every((sessionId) => sessionId === exact.sessionId),
+    'only the exact checkpoint is dispatched by periodic ticks');
+  assert.equal(listEvents(stale.sessionId, { types: ['conversation_completed'] }).length, 0,
+    'a tick publishes no generic terminal for the skipped session');
+  assert.ok(HarnessSession.load(stale.sessionId)?.runInFlightSince(), 'the marker stays armed for boot');
+  assert.ok(HarnessSession.load(stale.sessionId)?.loadRecoveryState());
+
+  // Boot path unchanged: the same session takes the ordinary decision there.
+  const boot = recoverInterruptedChatRuns(Date.now, dispatcher);
+  const bootRecord = boot.records.find((record) => record.sessionId === stale.sessionId);
+  assert.ok(bootRecord);
+  assert.notEqual(bootRecord.autoResumeSkipped, 'not_exact_checkpoint');
+  assert.equal(bootRecord.autoResumed, true, 'boot still auto-resumes the fresh, write-free interrupted chat');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(dispatched.includes(stale.sessionId));
 });
 
 test('periodic exact recovery queries only durable checkpoint owners, not inert chat history', async () => {

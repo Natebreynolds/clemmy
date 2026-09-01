@@ -11051,6 +11051,25 @@ const MIGRATIONS: EventLogMigration[] = [
       }
     },
   },
+  {
+    /** v72 and v73 both created idx_sessions_chat_run_in_flight_updated with
+     * an unguarded json_type(metadata_json, …) predicate. SQLite evaluates a
+     * partial-index WHERE on every sessions write, so one corrupt legacy
+     * metadata_json row raised SQLITE_ERROR "malformed JSON" on every UPDATE
+     * of that row and aborted the per-tick exact checkpoint recovery scan.
+     * Numbered migrations never rewrite history: homes already stamped 72/73
+     * carry the unguarded index, so v74 drops and recreates it behind
+     * json_valid. No row is rewritten and no model or provider call runs. */
+    version: 74,
+    sql: `
+      DROP INDEX IF EXISTS idx_sessions_chat_run_in_flight_updated;
+      CREATE INDEX IF NOT EXISTS idx_sessions_chat_run_in_flight_updated
+        ON sessions(updated_at, id)
+        WHERE kind = 'chat'
+          AND json_valid(metadata_json)
+          AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL;
+    `,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

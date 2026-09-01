@@ -5,18 +5,22 @@
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import { RunContext } from '@openai/agents';
 
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-primary-card-recovery-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+process.env.EMBEDDINGS_DISABLED = 'true';
 process.env.CLEMMY_UNIFIED_RECALL = 'off';
 process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
 process.env.CLEMMY_SEMANTIC_RECALL = 'off';
+mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
+writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'machine-primary-card-recovery\n', 'utf8');
 
 const eventlog = await import('../harness/eventlog.js');
 const catalogs = await import('../harness/host-capability-catalog-factory.js');
@@ -24,6 +28,7 @@ const manifests = await import('../harness/capability-manifest.js');
 const continuityStore = await import('../../memory/task-continuity.js');
 const continuityRuntime = await import('../harness/task-continuity-runtime.js');
 const semantic = await import('./admit-and-compile-accepted-source.js');
+const { buildScopedLocalToolSearch } = await import('../../tools/local-runtime-tools.js');
 
 const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
 const SNAPSHOT_TYPE = 'primary_model_planning_card_snapshot' as const;
@@ -144,6 +149,83 @@ test('same-source recovery reopens the exact initial card after new live capabil
     'one immutable initial card survives repeated/fresh-store priming');
 });
 
+test('a re-prime reaches the same card the in-process same-source disclosure already showed the model', async () => {
+  // 9061/9064 class: the frozen initial card replaced the merged card on
+  // re-prime, so every same-source tool_search disclosure (all cap:local:*
+  // refs) vanished for a resumed source and work_call/plan_task lost their
+  // surface. The frozen card stays the base; this source's own durable
+  // disclosures extend it under the one repack rule both lanes share.
+  const factory = resetFixture();
+  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const session = eventlog.createSession({ id: 'primary-card-same-source-disclosure', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Read my current local user profile.' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  const frozenIds = primed.planning.capabilities.map((entry) => entry.id);
+  const ref = 'cap:local:user_profile_read:read';
+  assert.equal(frozenIds.includes(ref), false, 'the local ref is not on the pre-disclosure card');
+
+  const search = buildScopedLocalToolSearch(
+    new Set(['user_profile_read']),
+    'work_call',
+    undefined,
+    undefined,
+    (candidates) => semantic.disclosePrimaryModelPlanningCapabilities({
+      authority: primed.planning.authority,
+      candidates,
+    }),
+  );
+  const output = await search.invoke(
+    new RunContext({ sessionId: session.id }),
+    JSON.stringify({ query: 'user_profile_read', role_key: null, limit: 8 }),
+  );
+  const disclosed = JSON.parse(String(output)) as { results: Array<{ capabilityRef?: string }> };
+  assert.equal(disclosed.results[0]?.capabilityRef, ref);
+  const inProcess = semantic.snapshotPrimaryModelPlanningContext(primed.planning.authority);
+  assert.ok(inProcess);
+  assert.ok(inProcess.capabilities.some((entry) => entry.id === ref), 'the in-process lane shows the disclosed ref');
+  assert.equal(inProcess.digest, sha256(JSON.stringify(inProcess.capabilities)));
+
+  eventlog.closeEventLog();
+  const rePrimed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(rePrimed.ok, true, rePrimed.ok ? '' : rePrimed.reason);
+  if (!rePrimed.ok) return;
+  assert.equal(
+    rePrimed.planning.capabilities.find((entry) => entry.id === ref)?.effect,
+    'read',
+    'a same-source durable disclosure survives the re-prime with its effect',
+  );
+  assert.equal(
+    rePrimed.planning.digest,
+    sha256(JSON.stringify(rePrimed.planning.capabilities)),
+    'the digest is bound to exactly the returned rows',
+  );
+  assert.deepEqual(
+    rePrimed.planning.capabilities.map((entry) => entry.id),
+    inProcess.capabilities.map((entry) => entry.id),
+    'lane parity: the re-prime reaches the card the model was already shown',
+  );
+  assert.equal(rePrimed.planning.digest, inProcess.digest);
+  assert.equal(rePrimed.planning.effectCeiling, inProcess.effectCeiling);
+  for (const id of frozenIds) {
+    assert.ok(rePrimed.planning.capabilities.some((entry) => entry.id === id), `frozen row ${id} is kept`);
+  }
+
+  const snapshots = eventlog.listEvents(session.id, { types: [SNAPSHOT_TYPE] });
+  assert.equal(snapshots.length, 1, 'the frozen initial card is never restamped');
+  const payload = JSON.parse(String(snapshots[0]!.data.snapshotJson)) as { capabilities: Array<{ id: string }> };
+  assert.deepEqual(payload.capabilities.map((entry) => entry.id), frozenIds,
+    'the durable initial card still records the pre-disclosure surface');
+});
+
 test('a one-byte A continuation freezes and ranks against the durable parent Q/A/B objective', async () => {
   const factory = resetFixture();
   for (const prefix of ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF', 'GGG', 'HHH', 'III']) {
@@ -204,7 +286,11 @@ test('a one-byte A continuation freezes and ranks against the durable parent Q/A
     'the immutable surface is bound to the same canonical Q/A/B semantic text as graph compilation');
 });
 
-test('missing snapshot after same-source progress is held instead of minted from a changed catalog', async () => {
+test('a progressed source without a snapshot installs its card late, exactly once, and reuses it', async () => {
+  // 8740 class: the card is private presentation data with no execution
+  // authority (eventlog.ts recordPrimaryModelPlanningCardSnapshotOnce), so
+  // refusing to prime a source that progressed before any card existed made
+  // every legacy/in-flight source unresumable. Late install is the outcome.
   const factory = resetFixture();
   registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
   const { session, source } = freshSource('missing');
@@ -216,13 +302,24 @@ test('missing snapshot after same-source progress is held instead of minted from
     data: { sourceUserSeq: source.seq, capabilities: [] },
   });
 
-  const replay = await semantic.primePrimaryModelPlanningCatalog({
+  const late = await semantic.primePrimaryModelPlanningCatalog({
     sessionId: session.id,
     sourceUserSeq: source.seq,
   });
-  assert.equal(replay.ok, false);
-  if (!replay.ok) assert.match(replay.reason, /snapshot is missing after this accepted source already progressed/);
-  assert.equal(eventlog.listEvents(session.id, { types: [SNAPSHOT_TYPE] }).length, 0);
+  assert.equal(late.ok, true, late.ok ? '' : late.reason);
+  if (!late.ok) return;
+  assert.deepEqual(late.planning.capabilities.map((entry) => entry.id), ['cap:resolved:news_lookup']);
+  const snapshots = eventlog.listEvents(session.id, { types: [SNAPSHOT_TYPE] });
+  assert.equal(snapshots.length, 1, 'the late card is installed exactly once');
+
+  const reused = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+  });
+  assert.equal(reused.ok, true, reused.ok ? '' : reused.reason);
+  if (!reused.ok) return;
+  assert.equal(reused.planning.digest, late.planning.digest, 'the late-installed card is reused, not restamped');
+  assert.equal(eventlog.listEvents(session.id, { types: [SNAPSHOT_TYPE] }).length, 1);
 });
 
 test('content-consistent corruption and a foreign source snapshot both fail closed', async () => {

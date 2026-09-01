@@ -151,7 +151,7 @@ test('exact v3.14 APIs seed a disposable home and current store boots migrate it
     const harness = report.firstBoot.sqlite['state/harness.db'];
     const memory = report.firstBoot.sqlite['state/memory.db'];
     const workspace = report.firstBoot.sqlite['state/workspaces.db'];
-    assert.equal(report.currentSchemas.harness, 73, 'the current candidate is released against harness schema 73');
+    assert.equal(report.currentSchemas.harness, 74, 'the current candidate is released against harness schema 74');
     assert.equal(
       harness.schemaVersions?.at(-1),
       report.currentSchemas.harness,
