@@ -8174,3 +8174,59 @@ test('a carried provider READ absent from the frozen snapshot is provisioned onc
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
   }
 });
+
+// --- a bare CONTINUE: marker keeps the same host turn open (live 2026-09-01) ---
+function runProductionHostSteps(
+  fixture: ReturnType<typeof acceptHostCanarySource>,
+  agent: Record<string, unknown>,
+  maxTurns: number,
+) {
+  return brackets.withHarnessRunContext(fixture.parent, () => hostRunRunner(
+    throwingRunner() as never,
+    agent as never,
+    [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+    { maxTurns, hostTurnEngine: 'host_v1', context: fixture.context } as never,
+  ));
+}
+
+test('production host keeps the turn open for a CONTINUE marker and runs the promised call', async () => {
+  const fixture = acceptHostCanarySource('continue-marker');
+  let toolRuns = 0;
+  const ping = {
+    type: 'function' as const, name: 'ping', description: 'test', parameters: { type: 'object', properties: {} },
+    invoke: async () => { toolRuns += 1; return 'pong'; },
+    needsApproval: async () => false,
+  };
+  const model = stubModel([
+    [textMsg('CONTINUE: capability resolution complete, ready to call the tool next turn')],
+    [toolCall('promised-call', 'ping', {})],
+    [textMsg('wrote it')],
+  ]);
+  const agent = { model, tools: [ping] };
+  bindHostCanarySurface(fixture, agent, [ping]);
+  const outcome = await runProductionHostSteps(fixture, agent, 8);
+  assert.equal(outcome.finalOutput, 'wrote it');
+  const attempted = outcome.history.filter((item) => (item as { type?: string }).type === 'function_call') as Array<{ callId?: string }>;
+  assert.deepEqual(attempted.map((item) => item.callId), ['promised-call'], 'the promised call was made in the SAME turn');
+  assert.ok(toolRuns <= 1, 'the fixture tool has no durable owner here; the host may pair a no-effect refusal instead of running the body');
+  assert.equal(model.calls(), 3);
+  assert.equal(
+    outcome.history.some((item) => JSON.stringify(item).includes('CONTINUE HONORED')),
+    false,
+    'the directive is a one-shot request layer, never canonical history',
+  );
+});
+
+test('production host bounds CONTINUE markers and then delivers the text as the answer', async () => {
+  const { MAX_HOST_CONTINUE_MARKER_CONTINUATIONS } = await import('./host-turn-runner.js');
+  const fixture = acceptHostCanarySource('continue-marker-budget');
+  const frames = Array.from({ length: MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1 }, (_, index) => (
+    [textMsg(`CONTINUE: still going ${index}`)]
+  ));
+  const model = stubModel(frames);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const outcome = await runProductionHostSteps(fixture, agent, 10);
+  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1, 'budget spent, then the frame stands');
+  assert.match(String(outcome.finalOutput), /CONTINUE: still going/);
+});

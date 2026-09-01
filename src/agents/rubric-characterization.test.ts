@@ -157,10 +157,10 @@ const GOLDEN = {
   // 2026-08-31: every model lane now treats external/tool bytes as untrusted
   // evidence. Nearby wording was tightened so legacy stays inside its token
   // guard and fresh-action remains below its 5.5 KB stable-policy ceiling.
-  instructions: { len: 31888, sha16: 'c4ace9eb986895f3' },
+  instructions: { len: 31884, sha16: '0b5dbd98814a3bca' },
   native: { len: 30991, sha16: '10c57b280785f498' },
   claudeBrain: { len: 8527, sha16: '663983956ba48fb5' },
-  lean: { len: 10537, sha16: 'fc109b9ec0343857' },
+  lean: { len: 10533, sha16: '76bfa5879bab95b5' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

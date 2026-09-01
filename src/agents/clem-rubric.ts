@@ -116,7 +116,7 @@ export const ORCHESTRATOR_DECISION_CONTRACT = [
   "END YOUR TURN WITH PLAIN TEXT — no JSON, no envelope. What you write IS what the user reads: the actual answer/result (for \"find Marlow's email\" → sender, subject, date, link; for \"schedule daily briefing\" → what got scheduled and how to disable). Put any large deliverable in FILES via the file tools, not inline.",
   "One OPTIONAL marker on the FIRST line controls the loop:",
   "  ASK: <question>  — you need the user to continue (a clarifying question, or an approval you can't self-serve). The rest of the line is the question.",
-  "  CONTINUE: <note> — you still have MORE tool calls to make next turn (rare — usually you finish in one turn). The note is an internal reason, not shown.",
+  "  CONTINUE: <note> — you still have MORE tool calls to make; the host keeps THIS turn open, so make them now (rare). The note is internal, not shown.",
   "  (no marker)      — DEFAULT: you're DONE. The whole text is your reply.",
   "Never end with an empty turn. If you took action, state the outcome; if you're blocked, use ASK:. Do not narrate a marker you didn't act on.",
 ];

@@ -78,6 +78,17 @@ import {
 } from './host-durable-continuation.js';
 
 const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
+
+/**
+ * Bounded in-turn honoring of the model's own `CONTINUE:` marker. The host
+ * lane runs one turn per accepted source and reduces the turn to a terminal,
+ * so "more tool calls next turn" has no next turn: live 2026-09-01 an
+ * authoring turn spent its frames on discovery, wrote "CONTINUE: … ready to
+ * submit via one workflow_update call next turn", and the run finished as a
+ * successful answer with nothing written. The marker now keeps THIS turn open
+ * for the calls it promised, a bounded number of times.
+ */
+export const MAX_HOST_CONTINUE_MARKER_CONTINUATIONS = 3;
 import {
   ModelStreamStalledError,
   modelFirstByteStallMs,
@@ -2181,6 +2192,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let acceptedReadPlanContinuationUsed = false;
   let acceptedUniqueWorkflowContinuationUsed = false;
   let workflowStepResultContinuationsUsed = 0;
+  let continueMarkerContinuationsUsed = 0;
   let pendingHostModelDirective: string | undefined;
   const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
@@ -6114,6 +6126,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             settlementStatus: missingWorkflowResult.auditStatus,
             settlementReason: missingWorkflowResult.auditReason,
           }, 'host retained the accepted workflow step for its required structured result');
+          continue;
+        }
+      }
+      if (hostProduction && continueMarkerContinuationsUsed < MAX_HOST_CONTINUE_MARKER_CONTINUATIONS) {
+        const decision = toOrchestratorDecision(admission.frame.text);
+        // The bare CONTINUE: shape (turn-decision.ts): done:false,
+        // awaiting_handoff_result, reply null, the note in reason. A narrated
+        // envelope or an ASK: keeps its own reading.
+        if (
+          decision
+          && decision.done === false
+          && decision.nextAction === 'awaiting_handoff_result'
+          && decision.reply === null
+        ) {
+          continueMarkerContinuationsUsed += 1;
+          pendingHostModelDirective = [
+            'CONTINUE HONORED — there is no next turn: this turn stays open until you stop calling tools.',
+            'Make the tool calls you said you still have now, in this turn, then give the final result.',
+            'Do not restate the plan and do not write CONTINUE again.',
+          ].join(' ');
+          hostTurnLogger.info({
+            sessionId: exactHostIdentity().sessionId,
+            attempt: continueMarkerContinuationsUsed,
+            maxAttempts: MAX_HOST_CONTINUE_MARKER_CONTINUATIONS,
+            note: (decision.reason ?? '').slice(0, 200),
+          }, 'host kept the turn open for a CONTINUE marker');
           continue;
         }
       }
