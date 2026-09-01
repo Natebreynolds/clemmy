@@ -54,17 +54,57 @@ test('the repair names a READ to search for, not a substitute to pick', () => {
   assert.match(fn, /cite BOTH/, 'it must say the write cannot be admitted alone');
 });
 
-test('both refusal paths use it — a verifier refusal is never given the generic advice', () => {
+test('every verifier refusal reaches the model through it — never through the generic advice', () => {
   const src = readFileSync(PLAN, 'utf8');
   // The generic "pick from admissibleCapabilities" advice is actively wrong
   // here: the cited write is correct and no substitute exists. It sent the
   // model round the admissible list looking for something that isn't there.
-  const uses = src.match(/verifierRepairInstruction\(/g) ?? [];
-  assert.ok(uses.length >= 3, `expected the helper plus both call sites, saw ${uses.length}`);
+  //
+  // Shape today: the verifier decision is made BEFORE the graph/intent
+  // transaction (admit-and-compile's verificationSuccessorDisposition) and
+  // surfaces as planned.reason, so the admission refusal is the one place a
+  // verifier reason reaches the model. The post-seal path can no longer carry
+  // a verifier reason at all: a seal failure after the graph is write-once is
+  // a host-owned continuation (thrown, retried by restart recovery), not
+  // advice for the model.
+  const executePlanTask = src.slice(
+    src.indexOf('async function executePlanTask'),
+    src.indexOf('export function buildPlanTaskTool'),
+  );
+  const admissionRefusal = executePlanTask.slice(
+    executePlanTask.indexOf('if (!planned.ok) {'),
+    executePlanTask.indexOf("code: 'plan_not_admitted'"),
+  );
+  assert.match(
+    admissionRefusal,
+    /verifierRepairInstruction\(planned\.reason\)/,
+    'the admission refusal must route a verifier reason through the searchable instruction',
+  );
+  const sealPath = executePlanTask.slice(
+    executePlanTask.indexOf('let bindingSeal = await sealFreshPlanCapabilityBindings'),
+    executePlanTask.indexOf('appendConversationPreambleOnce({ source, text: preamble })'),
+  );
+  assert.ok(sealPath.length > 0, 'the binding-seal path was not found');
+  assert.match(
+    sealPath,
+    /throw new Error\(`plan_task binding seal recovery pending: /,
+    'a post-write-once seal failure is a host-owned continuation, not model advice',
+  );
+  assert.doesNotMatch(sealPath, /repair:/, 'the binding-seal path must not hand the model repair prose');
   assert.doesNotMatch(
     src,
-    /detail: bindingSeal\.reason,\s*\n\s*repair: 'Select an exact current capability set/,
-    'the binding-seal path must not fall back to advice that names nothing',
+    /Select an exact current capability set/,
+    'advice that names nothing searchable must not come back on any path',
+  );
+  const sealFn = src.slice(
+    src.indexOf('async function sealFreshPlanCapabilityBindings'),
+    src.indexOf('export async function recoverPlanTaskBindingSealPreparation'),
+  );
+  assert.ok(sealFn.length > 0, 'sealFreshPlanCapabilityBindings was not found');
+  assert.doesNotMatch(
+    sealFn,
+    /verification_successor_required/,
+    'the seal must not mint a verifier refusal after the graph is immutable — that decision is pre-transaction',
   );
 });
 

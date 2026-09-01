@@ -229,6 +229,18 @@ export function parseExactPlanTaskRefusal(value: unknown): ExactPlanTaskRefusal 
       && (payload.requestedEffectScope === 'write' || payload.requestedEffectScope === 'mixed')
       && boundedPlanTaskResultText(payload.repair);
     if (!common) return null;
+    // The current producer asks for the exact missing write and names no
+    // substitutes: one tool_search is the only recovery. It carries no
+    // capability list at all, by pin — offering card writes here is the
+    // substitution incident.
+    if (
+      exactPlanTaskResultKeys(payload, [
+        'ok', 'code', 'detail', 'requestedEffectScope', 'repair', 'recoveryTool',
+      ])
+      && payload.recoveryTool === 'tool_search'
+    ) return result(payload, 'settled_refusal', 'tool_search', true);
+    // Durable payloads written while the refusal advertised a bounded write
+    // list keep their recorded routing.
     if (
       exactPlanTaskResultKeys(payload, [
         'ok', 'code', 'detail', 'requestedEffectScope', 'admissibleCapabilities',

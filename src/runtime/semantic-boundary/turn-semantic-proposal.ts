@@ -38,6 +38,32 @@ const OPAQUE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,127}$/;
 const opaqueIdSchema = z.string().min(1).max(128).regex(OPAQUE_ID_RE);
 const nonBlankString = (max: number) => z.string().min(1).max(max).regex(/\S/);
 
+type ExactOrderedLiteralList<T extends readonly string[]> = { -readonly [K in keyof T]: T[K] };
+
+/**
+ * A fixed, ordered list of literals that must be strict-representable.
+ *
+ * `z.tuple([...literals])` emits tuple-form `items`, which strict structured
+ * output refuses outright — the whole proposal schema became unusable at the
+ * model boundary (semantic-schema-strictness pins exactly this). The
+ * model-facing shape is therefore an array over the allowed literals with an
+ * exact length, and the exact ordered set is enforced on parse. The static
+ * type stays the tuple the graph IR and local-write commit already consume,
+ * which the refinement makes true for every value that parses.
+ */
+export function exactOrderedLiteralListSchema<const T extends readonly [string, ...string[]]>(
+  values: T,
+): z.ZodType<ExactOrderedLiteralList<T>> {
+  return z.array(z.enum(values)).min(values.length).max(values.length).superRefine((list, ctx) => {
+    if (list.length !== values.length || list.some((value, index) => value !== values[index])) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `must be exactly [${values.join(', ')}] in that order`,
+      });
+    }
+  }) as unknown as z.ZodType<ExactOrderedLiteralList<T>>;
+}
+
 const goalRefSchema = z.object({
   goalId: opaqueIdSchema,
   baseRevision: z.number().int().nonnegative(),
@@ -158,11 +184,7 @@ const proposedSemanticWorkV1BaseSchema = z.object({
       collectionPointer: z.literal('/posts'),
       visibleMirrorPointer: z.literal('/_mobile/records/items'),
       calendarPointer: z.literal('/calendar'),
-      calendarRequiredFields: z.tuple([
-        z.literal('date'),
-        z.literal('channel'),
-        z.literal('theme'),
-      ]),
+      calendarRequiredFields: exactOrderedLiteralListSchema(['date', 'channel', 'theme']),
       sourceEvidence: z.object({
         operationId: opaqueIdSchema,
         recordsPointer: z.enum(['/news', '/web', '/results', '/items', '/records']),
@@ -172,11 +194,8 @@ const proposedSemanticWorkV1BaseSchema = z.object({
         publishedDatePointer: z.enum([
           '/date', '/publishedAt', '/published_at', '/publishedDate', '/published_date',
         ]),
-        findingPointers: z.tuple([
-          z.literal('/snippet'),
-          z.literal('/description'),
-          z.literal('/content'),
-          z.literal('/markdown'),
+        findingPointers: exactOrderedLiteralListSchema([
+          '/snippet', '/description', '/content', '/markdown',
         ]),
         publisherPointer: z.enum(['/publisher', '/source', '/siteName', '/site_name']),
         maxAgeDays: z.number().int().min(1).max(30),

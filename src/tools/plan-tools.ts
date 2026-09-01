@@ -3,9 +3,10 @@ import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
-import type {
-  HostCapabilityDescriptorV1,
-  TurnSemanticProposalV1,
+import {
+  exactOrderedLiteralListSchema,
+  type HostCapabilityDescriptorV1,
+  type TurnSemanticProposalV1,
 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
@@ -85,6 +86,22 @@ import {
 
 const MAX_PREAMBLE_CHARS = 1_000;
 
+/** Admission's own pre-persist refusal for a graph that compiled to a non-act
+ * route (admit-and-compile-accepted-source.ts). plan_task maps it to the same
+ * typed `plan_not_required` the model already knows how to walk, so the
+ * compiler owns the route and the model contract does not change. */
+const NON_ACTION_GRAPH_ADMISSION_REASON = 'plan_task may persist only an admitted action graph';
+
+/** One graph-neutral read needs no graph: call_tool once. Both the shape
+ * short-circuit and the compiler-route refusal return these exact bytes. */
+const GRAPH_NEUTRAL_READ_REFUSAL = Object.freeze({
+  ok: false,
+  code: 'plan_not_required',
+  detail: 'plan_task is only for action work or an exact reviewed Clementine-local read; use a graph-neutral read otherwise.',
+  repair: 'Call call_tool exactly once with the exact graph-neutral read operation and schema already disclosed for this request. Do not call plan_task for this read.',
+  recoveryTool: 'call_tool',
+});
+
 type PlanTaskPreparationTestHooks = {
   afterGraphIntentPersisted?: (identity: {
     sessionId: string;
@@ -133,11 +150,7 @@ export const FreshActionPlanDraftSchema = z.object({
       collectionPointer: z.literal('/posts'),
       visibleMirrorPointer: z.literal('/_mobile/records/items'),
       calendarPointer: z.literal('/calendar'),
-      calendarRequiredFields: z.tuple([
-        z.literal('date'),
-        z.literal('channel'),
-        z.literal('theme'),
-      ]),
+      calendarRequiredFields: exactOrderedLiteralListSchema(['date', 'channel', 'theme']),
       sourceEvidence: z.object({
         operationId: PlanId,
         recordsPointer: z.enum(['/news', '/web', '/results', '/items', '/records']),
@@ -147,11 +160,8 @@ export const FreshActionPlanDraftSchema = z.object({
         publishedDatePointer: z.enum([
           '/date', '/publishedAt', '/published_at', '/publishedDate', '/published_date',
         ]),
-        findingPointers: z.tuple([
-          z.literal('/snippet'),
-          z.literal('/description'),
-          z.literal('/content'),
-          z.literal('/markdown'),
+        findingPointers: exactOrderedLiteralListSchema([
+          '/snippet', '/description', '/content', '/markdown',
         ]),
         publisherPointer: z.enum(['/publisher', '/source', '/siteName', '/site_name']),
         maxAgeDays: z.number().int().min(1).max(30),
@@ -1222,23 +1232,19 @@ async function executePlanTask(
       capabilities: completenessCapabilities,
     })
   ) {
-    const admissibleCapabilities = planningRefusalRepairCatalog(
-      planning.capabilities.filter((capability) => (
-        capability.effect === 'local_write'
-        || capability.effect === 'external_write'
-        || capability.effect === 'admin'
-      )),
-    );
+    // The write this ask needs is not in the draft. That is a discovery
+    // question about the EXACT missing write, never a pick-from-list: handing
+    // the card's other writes back as candidates is the same substitution
+    // class as offering greenhouse/airtable for an Outlook ask (live
+    // 2026-08-29 seq 98118), because nothing here can tell the matching write
+    // from an unrelated one. One tool_search for the named write, then plan.
     return JSON.stringify({
       ok: false,
       code: 'plan_incomplete_missing_write',
       detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
       requestedEffectScope,
-      admissibleCapabilities,
-      repair: admissibleCapabilities.length > 0
-        ? 'Call plan_task again with the exact already-disclosed write capability that matches the requested destination bound to a local_write, external_write, or admin topology operation. Do not call tool_search again, substitute an unrelated write, or freeze a read-only subset.'
-        : 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
-      recoveryTool: admissibleCapabilities.length > 0 ? 'plan_task' : 'tool_search',
+      repair: 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
+      recoveryTool: 'tool_search',
     });
   }
   const lineage = collectConstructLineageCompleteness(input.draft);
@@ -1261,12 +1267,27 @@ async function executePlanTask(
       (readBindingCounts.get(binding.operationId) ?? 0) + 1,
     );
   }
-  const readOnlyDraft = input.draft.destination === null
+  // Only the shape that needs no graph is refused before admission: one
+  // once-cardinality read of a single record (coverage 'single' or none) with
+  // no destination and no counted/structured collection contract. Every other
+  // read-only draft — a complete_set, accepted_set, or resolved_operation
+  // read, a counted set — is graph work whose route the compiler owns; a
+  // lexical guess here refused a complete_set calendar read, its sibling
+  // work_call was refused with it, nothing dispatched, and the turn still
+  // published "done" (11788). Admission refuses non-act graphs before any
+  // persist, and that refusal maps to the same typed answer below.
+  const soleOperation = input.draft.topology.operations.length === 1
+    ? input.draft.topology.operations[0]!
+    : null;
+  const graphNeutralReadDraft = input.draft.destination === null
+    && (input.draft.cardinality === null
+      || (input.draft.cardinality.count === 1 && !input.draft.cardinality.locator))
     && input.draft.bindings.length === 1
-    && input.draft.topology.operations.length === 1
-    && input.draft.topology.operations.every((operation) => operation.effect === 'read');
-  const reviewedLocalReadPlan = readOnlyDraft
-    && input.draft.destination === null
+    && soleOperation !== null
+    && soleOperation.effect === 'read'
+    && (soleOperation.coverage === 'single' || soleOperation.coverage === null)
+    && soleOperation.cardinality.kind === 'once';
+  const reviewedLocalReadPlan = graphNeutralReadDraft
     && input.draft.topology.operations.every((operation) => (
       readBindingCounts.get(operation.id) === 1
     ))
@@ -1283,27 +1304,28 @@ async function executePlanTask(
         && local.definition.reversibility === 'read_only'
         && local.definition.descriptor.destinationPosture === null;
     }))).every(Boolean);
-  if (
-    readOnlyDraft
-    && !reviewedLocalReadPlan
-  ) {
-    return JSON.stringify({
-      ok: false,
-      code: 'plan_not_required',
-      detail: 'plan_task is only for action work or an exact reviewed Clementine-local read; use a graph-neutral read otherwise.',
-      repair: 'Call call_tool exactly once with the exact graph-neutral read operation and schema already disclosed for this request. Do not call plan_task for this read.',
-      recoveryTool: 'call_tool',
-    });
+  if (graphNeutralReadDraft && !reviewedLocalReadPlan) {
+    return JSON.stringify(GRAPH_NEUTRAL_READ_REFUSAL);
   }
-  const logical = currentLogicalCall();
-  if (!logical || logical.logicalToolCallId !== logical.logicalToolCallId.trim()) {
-    throw new Error('plan_task lost its exact logical-call identity before graph admission');
-  }
-  const planIdentity = {
-    sessionId,
-    sourceUserSeq,
-    acceptedTaskId: logical.acceptedTaskId,
-    logicalToolCallId: logical.logicalToolCallId,
+  // The exact logical-call identity is needed only once a graph is about to
+  // persist (the immutable seal intent commits in that same transaction) and
+  // again after admission. Requiring it BEFORE admission turned every typed
+  // pre-admission refusal — namespace conflict, plan_not_required, account
+  // selection, missing write — into a thrown Error that the SDK laundered
+  // into "An error occurred while running the tool" (12041). The frame is an
+  // AsyncLocalStorage store, so it is visible inside the synchronous persist
+  // callback of this same async chain.
+  const requirePlanIdentity = (stage: string) => {
+    const logical = currentLogicalCall();
+    if (!logical || logical.logicalToolCallId !== logical.logicalToolCallId.trim()) {
+      throw new Error(`plan_task lost its exact logical-call identity before ${stage}`);
+    }
+    return {
+      sessionId,
+      sourceUserSeq,
+      acceptedTaskId: logical.acceptedTaskId,
+      logicalToolCallId: logical.logicalToolCallId,
+    };
   };
   const deliveryOwner = context.onConversationPreamble
     ? 'carrier_owned' as const
@@ -1318,7 +1340,7 @@ async function executePlanTask(
     onFirstPersistInTransaction: (db, graphEvent) => {
       recordPlanTaskBindingSealIntentInTransaction({
         db,
-        identity: planIdentity,
+        identity: requirePlanIdentity('graph persistence'),
         graphEvent,
         objective,
         operationIds,
@@ -1328,6 +1350,12 @@ async function executePlanTask(
     },
   });
   if (!planned.ok) {
+    // The compiler routed this proposal as non-action work and admission
+    // refused it before any persist: the same graph-neutral answer, from the
+    // route owner rather than from a lexical guess.
+    if (planned.reason === NON_ACTION_GRAPH_ADMISSION_REASON) {
+      return JSON.stringify(GRAPH_NEUTRAL_READ_REFUSAL);
+    }
     // Admission may have promoted an exact same-source staged ref that the
     // initial eight-slot display card withheld. Re-read the opaque authority
     // so repair names the ref the model actually cited instead of sending it
@@ -1373,6 +1401,7 @@ async function executePlanTask(
       recoveryTool,
     });
   }
+  const planIdentity = requirePlanIdentity('binding seal');
   const sealIntent = exactPlanTaskBindingSealIntent({ sessionId, sourceUserSeq });
   if (
     !sealIntent

@@ -33,6 +33,7 @@ const expectedWork = await import('../runtime/harness/expected-work-contract.js'
 const planCoexistence = await import('../runtime/harness/host-planned-resolution-coexistence.js');
 const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
 const { hostRunRunner } = await import('../runtime/harness/host-turn-runner.js');
+const { discoveryGovernor } = await import('../runtime/harness/discovery-governor.js');
 const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
 const { buildPlanTaskTool } = await import('./plan-tools.js');
 
@@ -148,11 +149,40 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
 
   const readRef = await discloseLocal(primed.planning, 'user_profile_read');
   assert.equal(readRef, 'cap:local:user_profile_read:read');
-  const writeRef = await discloseLocal(primed.planning, 'workflow_create');
-  assert.equal(writeRef, 'cap:local:workflow_create:reversible');
+  // The write is deliberately NOT disclosed up front: the missing-write
+  // recovery is ask-only (one tool_search for the exact write), and it is that
+  // in-turn search that discloses this ref and restores the planning surface.
+  const writeRef = 'cap:local:workflow_create:reversible';
   const planTask = brackets.wrapToolForHarness(
     buildPlanTaskTool({ planning: primed.planning }) as never,
   );
+  // The agent carries the same scoped local search the setup used so the
+  // recovery surface has something real to offer.
+  const toolSearch = brackets.wrapToolForHarness(
+    buildScopedLocalToolSearch(
+      new Set(['user_profile_read', 'workflow_create']),
+      'work_call',
+      undefined,
+      undefined,
+      (candidates) => semantic.disclosePrimaryModelPlanningCapabilities({
+        authority: primed.planning.authority,
+        candidates,
+      }),
+    ) as never,
+  );
+  const surfaceOf = (request: unknown): string[] => (
+    ((request as { tools?: Array<{ name?: string }> }).tools ?? [])
+      .map((entry) => entry.name ?? '')
+      .filter(Boolean)
+  );
+  // The orchestrator opens the accepted task's discovery budget before any
+  // turn; this fixture drives hostRunRunner directly, so open it here or the
+  // recovery search is denied as task_not_initialized.
+  discoveryGovernor.initializeTask({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    knownCapability: false,
+  });
   const deliveredPreambles: string[] = [];
 
   const readOnlyDraft = {
@@ -249,10 +279,13 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
           /plan_incomplete_missing_write/,
           'the typed completeness refusal reaches the model before its retry',
         );
-        assert.match(requestText, /admissibleCapabilities/);
-        assert.match(requestText, new RegExp(writeRef));
-        assert.match(requestText, /already-disclosed write capability/);
-        assert.match(requestText, /Do not call tool_search again/);
+        // Ask, never substitute: the refusal names the exact missing write as
+        // a search, carries no card writes to pick from, and the surface
+        // offers exactly that search.
+        assert.doesNotMatch(requestText, /admissibleCapabilities/);
+        assert.match(requestText, /Use tool_search for the exact missing write capability/);
+        assert.match(requestText, /Call tool_search exactly once/);
+        assert.deepEqual(surfaceOf(request), ['tool_search']);
         assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
         assert.equal(eventlog.listEvents(session.id, {
           types: ['accepted_task_authority_armed', 'conversation_preamble'],
@@ -262,13 +295,28 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
         refusalObservedBeforeRetry = true;
         return {
           responseId: 'plan-completeness-response-2',
+          output: [toolCall('plan-missing-write-search', 'tool_search', {
+            query: 'workflow_create', role_key: null, limit: 8,
+          })],
+        };
+      }
+      if (modelCalls === 3) {
+        const requestText = JSON.stringify(request);
+        assert.match(requestText, new RegExp(writeRef), requestText);
+        assert.ok(
+          surfaceOf(request).includes('plan_task'),
+          'the disclosed write restores the ordinary planning surface',
+        );
+        assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
+        return {
+          responseId: 'plan-completeness-response-3',
           output: [toolCall('plan-missing-lineage-retry', 'plan_task', {
             preamble: 'I’ll read the profile and create the workflow now.',
             draft: missingLineageDraft,
           })],
         };
       }
-      if (modelCalls === 3) {
+      if (modelCalls === 4) {
         assert.match(
           JSON.stringify(request),
           /plan_incomplete_data_lineage/,
@@ -284,7 +332,7 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
         assert.deepEqual(deliveredPreambles, []);
         lineageRepairObservedBeforeRetry = true;
         return {
-          responseId: 'plan-completeness-response-3',
+          responseId: 'plan-completeness-response-4',
           output: [toolCall('plan-complete-retry', 'plan_task', {
             preamble: 'I’ll read the profile and create the workflow now.',
             draft: completeDraft,
@@ -314,11 +362,11 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
     },
     getStreamedResponse: testModelStream,
   };
-  const agent = { model, tools: [planTask] };
+  const agent = { model, tools: [planTask, toolSearch] };
   const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({
     sessionId: session.id,
-    universeTools: [planTask],
-    activeToolNames: [planTask.name],
+    universeTools: [planTask, toolSearch],
+    activeToolNames: [planTask.name, toolSearch.name],
     policyHash: 'plan-completeness-test-v1',
     budget: {
       maxUncachedTokens: 2_000,
@@ -422,12 +470,17 @@ test('clarification answer plans the verified parent objective, not answer text'
   }), { toolCall: { callId: 'continuation-parent-plan' } })));
   const refusal = JSON.parse(output) as {
     code?: unknown;
-    admissibleCapabilities?: Array<{ capabilityRef?: unknown }>;
+    repair?: unknown;
     recoveryTool?: unknown;
   };
+  // The parent objective needs a write, so the read-only draft is incomplete.
+  // The refusal asks for the exact missing write — it never offers the card's
+  // already-disclosed write (here `writeRef`) as a substitute to pick.
   assert.equal(refusal.code, 'plan_incomplete_missing_write');
-  assert.equal(refusal.recoveryTool, 'plan_task');
-  assert.ok(refusal.admissibleCapabilities?.some((row) => row.capabilityRef === writeRef));
+  assert.equal(refusal.recoveryTool, 'tool_search');
+  assert.equal('admissibleCapabilities' in refusal, false, output);
+  assert.doesNotMatch(output, new RegExp(writeRef));
+  assert.match(String(refusal.repair), /Use tool_search for the exact missing write capability/);
   assert.equal(eventlog.getTurnGraphEventForSource(session.id, answer.seq), null);
 });
 
