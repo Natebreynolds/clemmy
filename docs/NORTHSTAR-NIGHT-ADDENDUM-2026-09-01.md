@@ -213,8 +213,13 @@ in two weeks a failed run named its own cause.
   `coverage and cardinality describe different read sets` twice → loop floor. The brief's own gate-5
   hint ("keep every plan_task field short") had nudged it toward `plan_task` at all; a reversible local
   write is a direct call. The brief now asks for one direct `workflow_update` and forbids planning or
-  running the workflow's own operations in that session; the topology refusal names its valid pairs.
-  Attempt 12 runs on all of it.
+  running the workflow's own operations in that session; the topology refusal names its valid pairs;
+  (12) the model then drafted the right one-op `local_write` plan on the exact ref, the host ADMITTED it
+  and refused its own persist as `internal_error` (a blanket catch in `turn-graph-shadow.ts`, nothing
+  naming the cause), told the model `recoveryTool: retry_host`, and the model called
+  `call_tool({name:'retry_host'})`. The cause now goes to the log (the reason vocabulary stays closed);
+  the repair text and the directive spell the only walkable edge: `plan_task` again, identical. Attempt 13
+  runs to capture the cause.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
