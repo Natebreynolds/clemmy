@@ -5,11 +5,16 @@ import Database from 'better-sqlite3';
 import {
   PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
   PLAN_TASK_ACTIVATION_RECEIPT_INSERT_TRIGGER,
+  PLAN_TASK_BINDING_SEAL_INTENTS_TABLE,
   PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE,
   createHostPlannedResolutionCoexistenceSchema,
   createPlanTaskPreparationCheckpointSchema,
   refreshPlanTaskActivationReceiptInsertTrigger,
 } from './host-planned-resolution-coexistence.js';
+
+/** Exact bytes the checkpoint trigger compares against the seeded pre_execution
+ * preamble event (`intent.preamble_text = json_extract(preamble.data_json, '$.text')`). */
+const PREAMBLE_TEXT = 'I’ll do that now.';
 
 const IDS = Object.freeze({
   session: 'settled-plan-recovery-session',
@@ -19,7 +24,8 @@ const IDS = Object.freeze({
   graphEvent: 'graph-event',
   graph: 'graph-id',
   graphHash: 'a'.repeat(64),
-  contract: 'contract-id',
+  // The v71 binding-seal intent row CHECKs `contract_id GLOB 'expected-work:v1:*'`.
+  contract: `expected-work:v1:${'9'.repeat(64)}`,
   logical: 'plan-call',
   argumentDigest: 'b'.repeat(64),
   preamble: 'preamble-event',
@@ -49,8 +55,10 @@ function createFixtureSchema(db: Database.Database): void {
       session_id TEXT NOT NULL,
       source_user_seq INTEGER NOT NULL,
       accepted_task_id TEXT NOT NULL,
+      authority_protocol INTEGER NOT NULL DEFAULT 1,
       authority_kind TEXT NOT NULL,
       engine_version TEXT NOT NULL,
+      surface_version TEXT NOT NULL DEFAULT 'configured_harness_capability_surface_v1',
       state TEXT NOT NULL,
       graph_event_id TEXT,
       graph_hash TEXT,
@@ -201,7 +209,7 @@ function seedPlan(input: {
   insertEvent.run(IDS.graphEvent, IDS.session, 2, 'system', 'turn_graph_compiled', IDS.source,
     JSON.stringify({ route: 'act', sourceUserSeq: IDS.sourceSeq, graphId: IDS.graph, graphHash: IDS.graphHash }));
   insertEvent.run(IDS.preamble, IDS.session, 3, 'Clem', 'conversation_preamble', IDS.source,
-    JSON.stringify({ version: 1, kind: 'pre_execution', sourceUserSeq: IDS.sourceSeq, text: 'I’ll do that now.' }));
+    JSON.stringify({ version: 1, kind: 'pre_execution', sourceUserSeq: IDS.sourceSeq, text: PREAMBLE_TEXT }));
   insertEvent.run(IDS.delivery, IDS.session, 4, 'system', 'conversation_preamble_delivered', IDS.preamble,
     JSON.stringify(deliveryData));
   insertEvent.run(IDS.settlementEvent, IDS.session, 5, 'system', 'logical_call_settled', IDS.source,
@@ -209,9 +217,10 @@ function seedPlan(input: {
 
   db.prepare(`
     INSERT INTO accepted_turn_call_authorities
-      (session_id, source_user_seq, accepted_task_id, authority_kind, engine_version,
-       state, graph_event_id, graph_hash, source_event_id, source_turn)
-    VALUES (?, ?, ?, 'host_v1', 'host_v1', 'open', NULL, NULL, ?, 1)
+      (session_id, source_user_seq, accepted_task_id, authority_protocol, authority_kind,
+       engine_version, surface_version, state, graph_event_id, graph_hash, source_event_id, source_turn)
+    VALUES (?, ?, ?, 1, 'host_v1', 'host_v1', 'configured_harness_capability_surface_v1',
+            'open', NULL, NULL, ?, 1)
   `).run(IDS.session, IDS.sourceSeq, IDS.acceptedTask, IDS.source);
   db.prepare(`
     INSERT INTO accepted_task_authority
@@ -353,6 +362,43 @@ function insertReceipt(db: Database.Database): void {
   );
 }
 
+/** Production records the binding-seal intent inside the first graph persist
+ * and the checkpoint only later; the v71 backfill inserts intents for legacy
+ * rows. The checkpoint trigger JOINs that intent, so the fixture seeds it the
+ * way the legacy backfill does. */
+function insertIntent(
+  db: Database.Database,
+  deliveryOwner: 'durable_conversation' | 'carrier_owned' = 'carrier_owned',
+): void {
+  db.prepare(`
+    INSERT INTO ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+      (session_id, source_user_seq, accepted_task_id, logical_tool_call_id,
+       intent_version, intent_origin, plan_argument_digest, graph_event_id, graph_id,
+       graph_hash, contract_id, objective_text, objective_digest, semantic_input_digest,
+       operation_ids_json, operation_ids_digest, preamble_text, preamble_text_digest,
+       delivery_owner, recorded_at)
+    VALUES (?, ?, ?, ?, 1, 'legacy_backfill', ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?)
+  `).run(
+    IDS.session,
+    IDS.sourceSeq,
+    IDS.acceptedTask,
+    IDS.logical,
+    IDS.argumentDigest,
+    IDS.graphEvent,
+    IDS.graph,
+    IDS.graphHash,
+    IDS.contract,
+    'Create the requested artifact.',
+    '2'.repeat(64),
+    '3'.repeat(64),
+    '4'.repeat(64),
+    PREAMBLE_TEXT,
+    '5'.repeat(64),
+    deliveryOwner,
+    '2026-08-30T00:00:00.000Z',
+  );
+}
+
 function insertCheckpoint(
   db: Database.Database,
   deliveryOwner: 'durable_conversation' | 'carrier_owned' = 'carrier_owned',
@@ -491,6 +537,7 @@ test('v71 checkpoint lets an interrupted host-only plan bind its exact later rec
       /plan_task receipt requires exact host/,
       'an interrupted settlement alone cannot acquire delivery authority',
     );
+    insertIntent(db);
     insertCheckpoint(db);
     insertReceipt(db);
     assert.equal((db.prepare(`
@@ -508,6 +555,7 @@ test('v71 presentation owner prevents a carrier receipt from substituting for th
   const db = seedPlan({ state: 'open' });
   try {
     createPlanTaskPreparationCheckpointSchema(db);
+    insertIntent(db, 'durable_conversation');
     insertCheckpoint(db, 'durable_conversation');
     assert.throws(
       () => insertReceipt(db),
