@@ -66,7 +66,16 @@ in two weeks a failed run named its own cause.
   constructor threw at its cap of 8, and the runner turned that *projection exception* into a blocked
   terminal (`control_progress_projection_unavailable`) after 3m40s. Fix: the recovery surface is the set of
   DISTINCT refused carriers bounded to one exported cap; pinned (nine same-carrier refusals →
-  `['call_tool']`; ten distinct → the cap). Baseline #2 (`1788256808207-d4945e`) is the re-run on the fix.
+  `['call_tool']`; ten distinct → the cap).
+- **platform-49 GLM baseline #2 (03:00, run `1788256808207-d4945e`):** 23 successful reads over 25
+  minutes — including `GOOGLESHEETS_GET_SPREADSHEET_INFO`, which the JIT read edge provisioned live —
+  then every write was refused until the governor exhausted (`blockedDetail:
+  host_disposition:refused_pre_dispatch`). The step's plan scope had been opened with
+  `WORKFLOW_STEP_WALL_CLOCK_MS + 60s` (16 min) while the host legitimately ran the step past its wall
+  clock; every write after minute 16 hit `plan_scope_missing_or_changed`. Fix: `openPlanScope` gains
+  `attemptBound` — a workflow step's scope lives until the runner closes it on `workflow-step-finished`,
+  with no TTL and no 1h ceiling (consent semantics unchanged; cron keeps its TTL because it preserves held
+  scopes). Pinned. Baseline #3 (`1788258688680-d341f5`) is the re-run on that fix.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
