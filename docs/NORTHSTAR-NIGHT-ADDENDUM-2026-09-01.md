@@ -88,7 +88,16 @@ in two weeks a failed run named its own cause.
   result itself; any crossing, mutation, or contract upgrade still fails closed (the row-less provider
   adapter and crossed-inner pins stay green). Note: refusing broker-carried local names pre-dispatch was
   tried and rejected — the host deliberately reroutes `tool_slug: tool_search` through the sealed
-  acquisition surface (pinned). Baseline #4 (`1788260460200-4efef7`) is the re-run on that fix.
+  acquisition surface (pinned).
+- **platform-49 GLM baseline #4 (04:01, run `1788260460200-4efef7`):** 27 settled reads in 17 minutes,
+  then **brain availability**: GLM hit the first-byte transport timeout twice on a ~58k-token prompt
+  (history 41k) and went into silent cooldown; the Codex Pro rescue's *weekly* quota is exhausted
+  (`usage_limit_reached`, resets 2026-09-06 — `state/model-rate-limits.json`); the Claude OAuth
+  subscription rescue had carried several earlier turns of this very run but had gone silent once, so the
+  live chain shrank to `[codex]` and one 429 ended the step. Fix: brains silenced earlier in the run are
+  demoted to the chain tail instead of dropped (pinned). Not fixed tonight: the prompt size itself —
+  compaction is the real latency/timeout lever for a 27-read step. Baseline #5 (`1788261863184-23695e`)
+  is the re-run on that fix.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
