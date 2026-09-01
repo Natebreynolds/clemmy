@@ -303,8 +303,12 @@ test('an exact workflow graph session retains its workflow-owned settlement lane
   );
 });
 
-test('exact background and cron execution owners retain binding-demanding work', () => {
-  for (const surface of ['background', 'cron'] as const) {
+test('exact background, cron, and direct execution owners retain binding-demanding work', () => {
+  // 'direct' rides here since 2026-09-01: a system authoring turn (kind
+  // execution via bridge:cron, graph surface direct) is owned by the same
+  // interactive host engine that writes bindings for chat, and its ADMITTED
+  // plan was refused at persist for lacking this recognition.
+  for (const surface of ['background', 'cron', 'direct'] as const) {
     const task = accept('execution', surface);
     const expected = resolution.expectedTaskFor(task.sessionId, task.sourceUserSeq);
     assert.equal(expected.status, 'ok', `${surface}: ${JSON.stringify(expected)}`);

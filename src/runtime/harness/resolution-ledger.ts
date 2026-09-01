@@ -152,7 +152,16 @@ function expectedWorkBinderPresent(
     const session = getSession(sessionId);
     if (!session) return false;
     const sessionKind = session.kind;
-    if (sessionKind === 'chat' && isHostTurnEngine(selectTurnEngine({ sessionKind }))) return true;
+    // The interactive host engine is the fresh-turn owner for chat AND
+    // execution sessions alike (selectTurnEngine ignores kind for a fresh
+    // source), and its carrier admission writes call bindings for both. Live
+    // 2026-09-01: a system authoring turn (kind execution via bridge:cron,
+    // graph surface 'direct') had its ADMITTED one-op plan refused at persist
+    // three times because this predicate only recognized chat.
+    if (
+      (sessionKind === 'chat' || sessionKind === 'execution')
+      && isHostTurnEngine(selectTurnEngine({ sessionKind }))
+    ) return true;
     // Background and cron are the two non-interactive surfaces whose
     // execution owner constructs the action expected-work carrier before it
     // exposes business tools (both the standard agent and the full Claude SDK
