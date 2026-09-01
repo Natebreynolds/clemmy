@@ -505,6 +505,19 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
       'Do not call tool_search, substitute an unrelated write, or claim that the user must continue this internal repair.',
     ].join(' ');
   }
+  if (
+    consequence.stage.startsWith('schema_invalid')
+    && consequence.recoveryToolNames.length === 1
+  ) {
+    // Directive and surface derive from the same consequence: the surface is
+    // exactly the refused carrier, so the text must never send the model to a
+    // control that surface does not contain.
+    return [
+      'BOUNDED AUTO RECOVERY — the last call was refused before dispatch because its arguments did not match the exact schema; the refusal lists the exact failing paths and required shape.',
+      `Call ${consequence.recoveryToolNames[0]} exactly once with one corrected JSON object for the same operation.`,
+      'Do not call tool_search, plan_task, or another operation.',
+    ].join(' ');
+  }
   return [
     `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
     'Use the exact result already present and make one corrective call from the restricted tool surface.',
@@ -3054,12 +3067,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const sourcePurpose = classifyMaterialSourceManifestPurpose(manifest.purpose);
       const validateForegroundPayload = (): InvalidArgumentsPreDispatchResult | null => {
         const validation = catalogEntry.validateForegroundPayload?.(effectiveArgs);
-        return validation && !validation.ok
-          ? new InvalidArgumentsPreDispatchResult(
-              validation.repair,
-              validation.schemaAvailable,
-            )
-          : null;
+        if (!validation || validation.ok) return null;
+        // The proof validator's host-authored, value-free repair key rides
+        // the same nominal carrier so both mint paths (pre-approval marker
+        // and preparation settlement) key repair progress identically.
+        const repairKey = 'repairKey' in validation && typeof validation.repairKey === 'string'
+          ? validation.repairKey
+          : undefined;
+        return new InvalidArgumentsPreDispatchResult(
+          validation.repair,
+          validation.schemaAvailable,
+          repairKey,
+        );
       };
       // Native MCP must cross the local exact carrier for both accepted
       // work_call and direct call_tool. Bypassing call_tool here would skip its
@@ -4024,6 +4043,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     retired?: boolean;
     countsRefusal?: boolean;
     diagnostic?: string;
+    repairKey?: string;
   }): AgentInputItem => {
     return buildHostToolDispositionResult({
       callId: input.call.callId,
@@ -4035,6 +4055,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       countsRefusal: input.countsRefusal,
       retired: input.retired,
       diagnostic: input.diagnostic,
+      repairKey: input.repairKey,
     });
   };
 
@@ -4201,7 +4222,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const pairLocallyRefusedFrame = (
     calls: readonly CanonicalHostCall[],
     retired = false,
-    diagnosticsByCallId?: ReadonlyMap<string, string>,
+    // A plain string is the diagnostic alone; the object form also carries
+    // the host-authored repair key of a schema refusal.
+    diagnosticsByCallId?: ReadonlyMap<string, string | { diagnostic: string; repairKey?: string }>,
     countingCallIds?: ReadonlySet<string>,
   ): PairedCallAttempts => {
     const frameDigest = semanticFrameDigest(calls);
@@ -4211,6 +4234,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const countingIndex = explicitCountingIndex < 0 && (countingCallIds?.size ?? 0) > 0
       ? 0
       : explicitCountingIndex;
+    const repairFor = (callId: string): { diagnostic?: string; repairKey?: string } => {
+      const entry = diagnosticsByCallId?.get(callId);
+      if (!entry) return {};
+      if (typeof entry === 'string') return { diagnostic: entry };
+      return {
+        ...(entry.diagnostic ? { diagnostic: entry.diagnostic } : {}),
+        ...(entry.repairKey ? { repairKey: entry.repairKey } : {}),
+      };
+    };
     return {
       frameDigest,
       zeroCrossingRefusal: true,
@@ -4228,9 +4260,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // current capability, not evidence that the capability is absent.
         // The caller disables this marker for that exact recovery class.
         countsRefusal: index === countingIndex,
-        ...(diagnosticsByCallId?.get(call.callId)
-          ? { diagnostic: diagnosticsByCallId.get(call.callId)! }
-          : {}),
+        ...repairFor(call.callId),
       })),
     };
   };
@@ -6268,7 +6298,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // has never run.
     const pendingBatch: PendingHostCall[] = [];
     const preparedInBatch: object[] = [];
-    const preApprovalRepairDiagnostics = new Map<string, string>();
+    const preApprovalRepairDiagnostics = new Map<
+      string,
+      { diagnostic: string; repairKey?: string }
+    >();
     const preApprovalTypedRefusals = new Map<
       string,
       'repair_arguments' | 'stop_and_explain'
@@ -6320,7 +6353,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         }
         const schemaRefusal = approvalExactProduction.validateBeforeConsent?.();
         if (schemaRefusal) {
-          preApprovalRepairDiagnostics.set(call.callId, schemaRefusal.output);
+          preApprovalRepairDiagnostics.set(call.callId, {
+            diagnostic: schemaRefusal.output,
+            ...(schemaRefusal.repairKey ? { repairKey: schemaRefusal.repairKey } : {}),
+          });
           preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
           preApprovalRefused = true;
           break;
@@ -6408,7 +6444,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               if (prepared.status !== 'prepared') {
                 if (prepared.status === 'refused') {
                   const diagnostic = boundedHostPreparationRepairDiagnostic(prepared.output);
-                  if (diagnostic) preApprovalRepairDiagnostics.set(call.callId, diagnostic);
+                  if (diagnostic) preApprovalRepairDiagnostics.set(call.callId, { diagnostic });
                   preApprovalTypedRefusals.set(call.callId, prepared.recovery);
                 }
                 return null;

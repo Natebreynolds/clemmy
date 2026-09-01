@@ -962,3 +962,222 @@ test('stop-factual recovery cannot manufacture an ask or resumable terminal', as
     assert.notEqual(outcome.finalOutput, text);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Nested-schema repair (gate 2). The refusal diagnostic, the recovery surface,
+// and the recovery directive all derive from ONE consequence: the surface is
+// exactly the refused carrier, the directive never names a control that
+// surface does not contain, the diagnostic never recommends discovery, a NEW
+// failing-path set continues as bounded progress, and an identical one
+// terminalizes. (Appended pins; the earlier tests in this file are unchanged.)
+// ---------------------------------------------------------------------------
+const proofArgs = await import('./proof-provider-args.js');
+const noProgressProjection = await import('./host-no-progress-projection.js');
+const hostResults = await import('./host-model-result-receipt.js');
+
+const OPAQUE_TABLE_INSERT_V7 = {
+  type: 'object',
+  required: ['destination_id', 'insertion'],
+  properties: {
+    destination_id: { type: 'string', description: 'SENTINEL_DESCRIPTION' },
+    insertion: {
+      type: 'object',
+      required: ['range'],
+      properties: {
+        range: {
+          type: 'object',
+          required: ['axis', 'start_index', 'end_index'],
+          properties: {
+            sheet_id: { type: 'integer' },
+            axis: { type: 'string', enum: ['ROWS', 'COLUMNS'] },
+            start_index: { type: 'integer' },
+            end_index: { type: 'integer' },
+          },
+        },
+        inherit_from_before: { type: 'boolean' },
+      },
+    },
+  },
+};
+const SCHEMA_REPAIR_CARRIER = 'opaque_provider_carrier';
+const NO_PROGRESS_AUTHORITY = { operation: [], account: [], target: [], evidence: [], effect: [] } as const;
+
+function schemaRefusalValidator() {
+  const validator = proofArgs.createProofProviderForegroundPayloadValidator({
+    operationId: 'OPAQUE_TABLE_INSERT_V7',
+    schema: OPAQUE_TABLE_INSERT_V7,
+  });
+  assert.ok(validator);
+  return validator!;
+}
+
+function refusedSchemaPayload(validator: ReturnType<typeof schemaRefusalValidator>, payload: unknown) {
+  const refused = validator(payload);
+  assert.equal(refused.ok, false);
+  if (refused.ok) throw new Error('fixture payload unexpectedly matched the schema');
+  return refused;
+}
+
+function schemaRefusalSource(label: string) {
+  const session = eventlog.createSession({ id: `host-no-progress-schema-repair-${label}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Insert two rows into the opaque table.' },
+  });
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+function projectSchemaRefusal(input: {
+  identity: { sessionId: string; sourceUserSeq: number };
+  callId: string;
+  refused: { repair: string; repairKey: string };
+  args: Record<string, unknown>;
+}) {
+  const marker = hostResults.buildHostToolDispositionResult({
+    callId: input.callId,
+    toolName: SCHEMA_REPAIR_CARRIER,
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'd'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    countsRefusal: false,
+    diagnostic: input.refused.repair,
+    repairKey: input.refused.repairKey,
+  });
+  const projected = noProgressProjection.projectHostNoProgressAttempt({
+    ...input.identity,
+    historyDelta: [functionCall(input.callId, SCHEMA_REPAIR_CARRIER, input.args), marker],
+  });
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok' || !projected.consequence) throw new Error('expected a projected consequence');
+  assert.equal(projected.attemptClass, 'zero_crossing_repair');
+  return { marker, consequence: projected.consequence };
+}
+
+/** The runner's recovery-surface rule for a consequence with recovery tool
+ * names: the model sees exactly those tool names and nothing else. */
+function recoverySurface(consequence: { recoveryToolNames: readonly string[] }, toolNames: readonly string[]) {
+  const exact = new Set(consequence.recoveryToolNames);
+  return toolNames.filter((name) => exact.has(name));
+}
+
+test('a schema refusal recovers on exactly the refused carrier with a no-discovery directive', () => {
+  eventlog.resetEventLog();
+  const validator = schemaRefusalValidator();
+  const camelArgs = {
+    destination_id: 'dest-1',
+    insertion: { range: { sheetId: 7, axis: 'ROWS', startIndex: 1, endIndex: 2 } },
+  };
+  const refused = refusedSchemaPayload(validator, camelArgs);
+  assert.match(refused.repair, /^\[provider-dispatch:not-started:invalid-args\] OPAQUE_TABLE_INSERT_V7 arguments did not match its exact current schema\./);
+  assert.match(refused.repair, /"\/insertion\/range\/start_index" \(missing required, expected integer\)/);
+  assert.match(refused.repair, /Required shape at "\/insertion\/range": object; required: \[axis, start_index, end_index\]/);
+  // The diagnostic never recommends discovery; its one mention of tool_search
+  // is the negative instruction, matching the directive below.
+  assert.doesNotMatch(refused.repair, /call the first-class local tool_search/i);
+  assert.equal(refused.repair.replace(/do not call tool_search/g, '').includes('tool_search'), false);
+  assert.doesNotMatch(refused.repair, /SENTINEL_/);
+
+  const identity = schemaRefusalSource('surface');
+  const { marker, consequence } = projectSchemaRefusal({
+    identity, callId: 'call:schema:1', refused, args: camelArgs,
+  });
+  assert.equal(consequence.stage, `schema_invalid:${refused.repairKey.slice(0, 16)}`);
+  assert.equal(consequence.recovery, 'repair_model');
+  assert.equal(consequence.effectState, 'not_started');
+  assert.deepEqual(consequence.recoveryToolNames, [SCHEMA_REPAIR_CARRIER]);
+  assert.deepEqual(
+    recoverySurface(consequence, ['tool_search', 'plan_task', 'ask_user_question', 'call_tool', SCHEMA_REPAIR_CARRIER, 'workflow_run']),
+    [SCHEMA_REPAIR_CARRIER],
+    'the recovery surface is exactly the refused carrier',
+  );
+
+  const initial = initializeNoProgressGovernor({
+    taskKey: attemptIdentity.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),
+    authority: NO_PROGRESS_AUTHORITY,
+  });
+  const decision = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'zero_crossing_repair',
+    authority: initial.authority,
+    consequence,
+  });
+  assert.equal(decision.action, 'continue');
+  const directive = hostNoProgressRecoveryDirective(decision.state);
+  assert.match(directive, /^BOUNDED AUTO RECOVERY — the last call was refused before dispatch because its arguments did not match the exact schema/);
+  assert.match(directive, new RegExp(`Call ${SCHEMA_REPAIR_CARRIER} exactly once with one corrected JSON object for the same operation`));
+  assert.match(directive, /Do not call tool_search, plan_task, or another operation\./);
+  assert.doesNotMatch(directive, /Call tool_search/);
+
+  // The keyed marker is an exact host projection: the receipt lane accepts it.
+  assert.equal(hostResults.describeCanonicalHostModelResult(marker)?.disposition, 'refused_pre_dispatch');
+  assert.equal(hostResults.canonicalHostModelResultClass(marker), 'refused_pre_dispatch');
+  const markerText = (marker as unknown as { output: { text: string } }).output.text;
+  assert.equal((JSON.parse(markerText) as Record<string, unknown>).repairKey, refused.repairKey);
+});
+
+test('a second schema refusal with a new failing-path set continues; an identical one terminalizes', () => {
+  eventlog.resetEventLog();
+  const validator = schemaRefusalValidator();
+  const camelArgs = {
+    destination_id: 'dest-1',
+    insertion: { range: { sheetId: 7, axis: 'ROWS', startIndex: 1, endIndex: 2 } },
+  };
+  const camelAgainArgs = {
+    destination_id: 'a different destination',
+    insertion: { range: { sheetId: 99, axis: 'COLUMNS', startIndex: 40, endIndex: 41 } },
+  };
+  const flatArgs = {
+    destination_id: 'dest-1',
+    insertion: { axis: 'ROWS', start_index: 1, end_index: 2 },
+  };
+  const camel = refusedSchemaPayload(validator, camelArgs);
+  const camelAgain = refusedSchemaPayload(validator, camelAgainArgs);
+  const flat = refusedSchemaPayload(validator, flatArgs);
+  assert.equal(camel.repairKey, camelAgain.repairKey, 'different wrong values at the same paths are the same mistake');
+  assert.notEqual(camel.repairKey, flat.repairKey, 'a different failing-path set is a different mistake');
+  assert.deepEqual(validator({
+    destination_id: 'dest-1',
+    insertion: { range: { sheet_id: 7, axis: 'ROWS', start_index: 1, end_index: 2 } },
+  }), { ok: true });
+
+  const identity = schemaRefusalSource('progress');
+  const first = projectSchemaRefusal({ identity, callId: 'call:schema:a1', refused: camel, args: camelArgs });
+  const identical = projectSchemaRefusal({ identity, callId: 'call:schema:a2', refused: camelAgain, args: camelAgainArgs });
+  const progressed = projectSchemaRefusal({ identity, callId: 'call:schema:b1', refused: flat, args: flatArgs });
+  assert.equal(first.consequence.key, identical.consequence.key);
+  assert.notEqual(first.consequence.key, progressed.consequence.key);
+  assert.deepEqual(progressed.consequence.recoveryToolNames, [SCHEMA_REPAIR_CARRIER]);
+
+  const initial = initializeNoProgressGovernor({
+    taskKey: attemptIdentity.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),
+    authority: NO_PROGRESS_AUTHORITY,
+  });
+  const observe = (
+    state: typeof initial,
+    consequence: typeof first.consequence,
+  ) => observeNoProgress(state, {
+    taskKey: state.taskKey,
+    attemptClass: 'zero_crossing_repair',
+    authority: NO_PROGRESS_AUTHORITY,
+    consequence,
+  });
+
+  const afterFirst = observe(initial, first.consequence);
+  assert.equal(afterFirst.action, 'continue');
+  const afterIdentical = observe(afterFirst.state, identical.consequence);
+  assert.equal(afterIdentical.action, 'terminalize', 'the same mistake again terminalizes');
+
+  const afterProgress = observe(afterFirst.state, progressed.consequence);
+  assert.equal(afterProgress.action, 'continue', 'a new failing-path set is bounded structural progress');
+  if (afterProgress.action === 'continue') assert.equal(afterProgress.reason, 'consequence_progress');
+  assert.match(
+    hostNoProgressRecoveryDirective(afterProgress.state),
+    new RegExp(`Call ${SCHEMA_REPAIR_CARRIER} exactly once with one corrected JSON object for the same operation`),
+  );
+  const afterRepeatedProgress = observe(afterProgress.state, progressed.consequence);
+  assert.equal(afterRepeatedProgress.action, 'terminalize');
+});
