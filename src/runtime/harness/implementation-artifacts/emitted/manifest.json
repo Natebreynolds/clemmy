@@ -147,7 +147,7 @@
           "bytes": 20230
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
-          "bytes": 52937
+          "bytes": 54441
         },
         "src/runtime/semantic-boundary/project-checked-semantics.ts": {
           "bytes": 11376
@@ -1269,7 +1269,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 79540
+          "bytes": 79738
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -2622,7 +2622,7 @@
           "bytes": 20230
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
-          "bytes": 52937
+          "bytes": 54441
         },
         "src/runtime/semantic-boundary/project-checked-semantics.ts": {
           "bytes": 11376
@@ -3744,7 +3744,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 79540
+          "bytes": 79738
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
