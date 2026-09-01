@@ -856,3 +856,16 @@ test('effective lifecycle identity collapses only trusted local carriers', () =>
     'model-supplied carrier names cannot create unbounded lifecycle metadata',
   );
 });
+
+test('the workflow step result channel is a registered read-effect host control, never effect_unknown', () => {
+  // Live 2026-09-01 (platform-49 run 5b1e0b): every business write crossed,
+  // then workflow_step_result was refused effect_unknown twice and the
+  // finished step blocked on the no-progress governor.
+  assert.deepEqual(classifyRuntimeToolEffect('workflow_step_result', { data: { rows: [] } }), {
+    effect: 'read',
+    mutating: false,
+    dangerousWrite: false,
+    source: 'registry',
+  });
+  assert.equal(actionTopologyRoleForRuntimeCall('workflow_step_result', { data: {} }), 'control');
+});

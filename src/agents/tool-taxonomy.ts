@@ -332,6 +332,10 @@ const ALWAYS_READ = new Set<string>([
   // The same logic applies to a small set of "the agent tells the user
   // something" affordances that have only local side effects:
   'notify_user',
+  // workflow_step_result — the step hands its exact structured result back
+  // to the host; it records, it does not act (live 2026-09-01: refused as
+  // effect_unknown after every business write had already crossed).
+  'workflow_step_result',
   // ask_user_question — asks for clarifying input, doesn't mutate.
   // The QUESTION itself isn't the approval gate; the AGENT's response
   // to the user's answer might be, and that's a separate tool call.
