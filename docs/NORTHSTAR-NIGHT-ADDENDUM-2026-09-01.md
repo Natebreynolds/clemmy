@@ -224,7 +224,12 @@ in two weeks a failed run named its own cause.
   retry — the same floor that killed attempts 3 and 4. `NO_PROGRESS_RETRY_BUDGET` is now a counter of
   three (17 pins re-paced; checkpoint parse restores older checkpoints as fresh; the loop floor and the
   typed-stage budget are unchanged), and the brief says that the same nearest operation twice means no
-  closer match exists. Attempt 14 runs on all of it.
+  closer match exists; (14) Sonnet then crossed the 150 s first-content budget on a frame that was one
+  large `workflow_update` call: the raw Messages adapter streams a tool call as `tool-input-start/delta`
+  parts, which matched neither the actionable nor the private-activity classifier — 150 s of "silence"
+  while the model wrote arguments — and the turn fell to a rate-limited Codex, then GLM, whose frame was
+  refused (`host_control_requires_direct_first_class_call`). Tool-input parts now classify as actionable
+  output (`fallback-model.ts`; classifier + chain pins). Attempt 15 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
