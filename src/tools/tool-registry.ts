@@ -449,15 +449,6 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'workflow_run', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, localPlanning: { consequence: 'workflow_definition', reversibility: 'reversible', destructive: false, purpose: 'dispatch_named_workflow', inputKind: 'workflow_identity', outputKind: 'workflow_run', deliverableKind: 'workflow', destinationPosture: 'create_new', advisoryRoles: ['control', 'destination'] }, description: 'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon an…' },
   { name: 'workflow_run_status', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Check workflow runs.' },
   { name: 'workflow_schedule', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Schedule a workflow to fire on a cron expression.' },
-  // The per-step result channel the workflow runner attaches to a step's own
-  // session (WORKFLOW_GRAPH_RESULT_ONLY_TOOL). It records the step's exact
-  // structured result for the host and performs no external effect. Live
-  // 2026-09-01 (platform-49 run 5b1e0b): three Sheets writes, the Space
-  // refresh and the notification all crossed, then the hand-back itself was
-  // refused `effect_unknown` twice because nothing had classified it, and the
-  // no-progress governor blocked the finished step. Identity before spelling:
-  // a control the host provisions is never unclassifiable.
-  { name: 'workflow_step_result', sideEffect: 'read', tier: 'core', lanes: [], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Hand the exact structured result of the current workflow step back to the host.' },
   { name: 'workflow_set_enabled', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Approve or disable a workflow.' },
   // Data-operation primitive (2026-07-21 capability audit #1): deterministic
   // reconcile/transform — the "spreadsheet brain". Pure read-class compute

@@ -440,6 +440,19 @@ export function canonicalRuntimeEffectiveToolName(toolName: string | null): stri
     : normalized;
 }
 
+/**
+ * The per-step structural result channel the workflow runner attaches to a
+ * step's own session (workflow-graph.ts re-exports it as
+ * WORKFLOW_GRAPH_RESULT_ONLY_TOOL). It records the step's exact structured
+ * result for the host and performs no external effect. It is deliberately
+ * NOT a catalog/registry tool — the positive project manifest stays closed —
+ * so the classifier names it here the way it names call_tool and work_call.
+ * Live 2026-09-01 (platform-49 run 5b1e0b): every business write crossed,
+ * then this channel was refused `effect_unknown` twice and the no-progress
+ * governor blocked a finished step as a "bounded internal host error".
+ */
+export const WORKFLOW_STEP_RESULT_CHANNEL = 'workflow_step_result' as const;
+
 function readDecision(source: RuntimeToolEffectDecision['source']): RuntimeToolEffectDecision {
   return { effect: 'read', mutating: false, dangerousWrite: false, source };
 }
@@ -620,6 +633,7 @@ export function actionTopologyRoleForRuntimeCall(
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .replace(/-/g, '_')
     .toLowerCase();
+  if (registryName === WORKFLOW_STEP_RESULT_CHANNEL) return 'control';
   return actionTopologyRoleFor(registryName);
 }
 
@@ -793,6 +807,13 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
   // the exact Sheets create its own advisory demanded (live 2026-08-18).
   if (!isNamespaced && /^[A-Z0-9]+(?:_[A-Z0-9]+)+$/.test(normalized)) {
     return classifyComposio({ tool_slug: normalized, arguments: args });
+  }
+
+  if (
+    tail === WORKFLOW_STEP_RESULT_CHANNEL
+    && isPlainOrClementineLocalTool(toolName, WORKFLOW_STEP_RESULT_CHANNEL)
+  ) {
+    return readDecision('registry');
   }
 
   return classifyRegistered(normalized)

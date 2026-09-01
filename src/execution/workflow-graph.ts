@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { WORKFLOW_STEP_RESULT_CHANNEL } from '../runtime/harness/tool-effect.js';
 import { irreversibleBoundaryViolations } from './workflow-graph-boundaries.js';
 import {
   firedEdgesFromCompleted,
@@ -119,7 +120,7 @@ export interface WorkflowGraphPatchResult {
  * run workspace by the ephemeral graph-step agent. This exact pair must never
  * be replaced with `*` or treated as an empty/inherited allowlist.
  */
-export const WORKFLOW_GRAPH_RESULT_ONLY_TOOL = 'workflow_step_result';
+export const WORKFLOW_GRAPH_RESULT_ONLY_TOOL = WORKFLOW_STEP_RESULT_CHANNEL;
 export const WORKFLOW_GRAPH_CONTEXT_QUERY_TOOL = 'workspace_artifact_query';
 export const WORKFLOW_GRAPH_ALLOWED_TOOLS = [
   WORKFLOW_GRAPH_RESULT_ONLY_TOOL,
