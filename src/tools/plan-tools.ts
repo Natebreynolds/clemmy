@@ -3,9 +3,10 @@ import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
-import type {
-  HostCapabilityDescriptorV1,
-  TurnSemanticProposalV1,
+import {
+  exactOrderedLiteralListSchema,
+  type HostCapabilityDescriptorV1,
+  type TurnSemanticProposalV1,
 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
@@ -133,11 +134,7 @@ export const FreshActionPlanDraftSchema = z.object({
       collectionPointer: z.literal('/posts'),
       visibleMirrorPointer: z.literal('/_mobile/records/items'),
       calendarPointer: z.literal('/calendar'),
-      calendarRequiredFields: z.tuple([
-        z.literal('date'),
-        z.literal('channel'),
-        z.literal('theme'),
-      ]),
+      calendarRequiredFields: exactOrderedLiteralListSchema(['date', 'channel', 'theme']),
       sourceEvidence: z.object({
         operationId: PlanId,
         recordsPointer: z.enum(['/news', '/web', '/results', '/items', '/records']),
@@ -147,11 +144,8 @@ export const FreshActionPlanDraftSchema = z.object({
         publishedDatePointer: z.enum([
           '/date', '/publishedAt', '/published_at', '/publishedDate', '/published_date',
         ]),
-        findingPointers: z.tuple([
-          z.literal('/snippet'),
-          z.literal('/description'),
-          z.literal('/content'),
-          z.literal('/markdown'),
+        findingPointers: exactOrderedLiteralListSchema([
+          '/snippet', '/description', '/content', '/markdown',
         ]),
         publisherPointer: z.enum(['/publisher', '/source', '/siteName', '/site_name']),
         maxAgeDays: z.number().int().min(1).max(30),
