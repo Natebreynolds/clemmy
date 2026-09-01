@@ -840,7 +840,7 @@
           "bytes": 57569
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
-          "bytes": 13370
+          "bytes": 13776
         },
         "src/runtime/harness/host-tool-invocation.ts": {
           "bytes": 71421
@@ -1269,7 +1269,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 78878
+          "bytes": 79540
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -2190,7 +2190,7 @@
           "bytes": 59570
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 26673
+          "bytes": 27279
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -2199,7 +2199,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 38322
+          "bytes": 38816
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 297662
@@ -3315,7 +3315,7 @@
           "bytes": 57569
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
-          "bytes": 13370
+          "bytes": 13776
         },
         "src/runtime/harness/host-tool-invocation.ts": {
           "bytes": 71421
@@ -3744,7 +3744,7 @@
           "bytes": 76697
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 78878
+          "bytes": 79540
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -4665,7 +4665,7 @@
           "bytes": 59570
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 26673
+          "bytes": 27279
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -4674,7 +4674,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 38322
+          "bytes": 38816
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 297662
