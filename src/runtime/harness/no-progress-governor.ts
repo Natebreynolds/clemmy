@@ -18,7 +18,17 @@ import { createHash } from 'node:crypto';
 
 export const NO_PROGRESS_GOVERNOR_VERSION = 2 as const;
 export const NO_PROGRESS_RETRY_BUDGET = 1 as const;
-export const NO_PROGRESS_STAGE_TRANSITION_BUDGET = 2 as const;
+/**
+ * Distinct host-validated repair consequences one attempt sequence may move
+ * through before the host stops it. Re-entering ANY prior consequence key
+ * still terminates immediately (that is the loop floor); this budget only
+ * bounds genuine convergence. Live 2026-09-01: a system authoring turn fixed
+ * four different plan_task complaints in a row (evidence-string pattern,
+ * missing write binding, bindings coverage, topology dependency) and was
+ * terminalized at the third because the budget was 2 — a converging turn
+ * killed for making progress.
+ */
+export const NO_PROGRESS_STAGE_TRANSITION_BUDGET = 6 as const;
 
 export type NoProgressRecovery =
   | 'repair_model'
@@ -247,7 +257,8 @@ export interface NoProgressGovernorState {
    * Re-entering any prior key is a cycle, even when another stage intervened. */
   readonly seenConsequenceKeys: readonly string[];
   readonly lastConsequence: NoProgressConsequence | null;
-  readonly stageTransitionsRemaining: 0 | 1 | typeof NO_PROGRESS_STAGE_TRANSITION_BUDGET;
+  /** Integer in [0, NO_PROGRESS_STAGE_TRANSITION_BUDGET]; restore validates the bound. */
+  readonly stageTransitionsRemaining: number;
   readonly observations: number;
 }
 
@@ -515,7 +526,7 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
       retriesRemaining: candidate.retriesRemaining,
       seenConsequenceKeys,
       lastConsequence,
-      stageTransitionsRemaining: Number(candidate.stageTransitionsRemaining) as 0 | 1 | 2,
+      stageTransitionsRemaining: Number(candidate.stageTransitionsRemaining),
       observations,
     }) satisfies NoProgressGovernorState;
     return state;
@@ -660,9 +671,9 @@ export function observeNoProgress(
     ]);
     const stageTransitionsRemaining = firstConsequence
       ? (state.retriesRemaining === 0
-        ? (state.stageTransitionsRemaining - 1) as 0 | 1
+        ? Math.max(0, state.stageTransitionsRemaining - 1)
         : state.stageTransitionsRemaining)
-      : (state.stageTransitionsRemaining - 1) as 0 | 1;
+      : Math.max(0, state.stageTransitionsRemaining - 1);
     const next = Object.freeze({
       ...state,
       authority,

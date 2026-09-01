@@ -1639,12 +1639,22 @@ function planTaskInvalidInputRefusal(error: unknown): string | null {
   const detail = issues.length > 0
     ? `plan_task input did not match its schema — ${issues.join('; ')}`
     : 'plan_task input was not one parseable JSON object matching its schema';
+  // Host-authored repair key over the violated PATHS and their messages (no
+  // argument values): the no-progress projection keys the stage on it, so a
+  // draft that fixes one complaint and receives a different one registers
+  // as progress instead of "the same schema failure again" (live 2026-09-01:
+  // four distinct plan_task complaints in a row terminalized a converging
+  // authoring turn). Same paths → same key → the loop floor still holds.
+  const repairKey = issues.length > 0
+    ? createHash('sha256').update(JSON.stringify([...new Set(issues)].sort())).digest('hex').slice(0, 32)
+    : undefined;
   return JSON.stringify({
     ok: false,
     code: 'plan_invalid_input',
     detail: detail.slice(0, 4_000),
     repair: 'Fix exactly the named paths and call plan_task again; do not resend the identical arguments.',
     recoveryTool: 'plan_task',
+    ...(repairKey ? { repairKey } : {}),
   });
 }
 

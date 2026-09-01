@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  NO_PROGRESS_STAGE_TRANSITION_BUDGET,
   canonicalNoProgressAskArguments,
   createNoProgressConsequence,
   initializeNoProgressGovernor,
@@ -77,7 +78,7 @@ test('a second lookup with zero authority gain terminalizes before another model
       retriesRemaining: 0,
       seenConsequenceKeys: [],
       lastConsequence: null,
-      stageTransitionsRemaining: 2,
+      stageTransitionsRemaining: NO_PROGRESS_STAGE_TRANSITION_BUDGET,
       observations: 2,
     },
   });
@@ -311,18 +312,44 @@ test('host-validated schema to semantic admission is bounded acyclic progress', 
   });
   assert.equal(third.action, 'continue');
   assert.equal(third.reason, 'consequence_progress');
-  assert.equal(third.state.stageTransitionsRemaining, 0);
+  // The clean retry absorbed the first stage; each later distinct stage spends
+  // one transition of the budget (2026-09-01: raised so a converging repair
+  // sequence is bounded by the budget, not killed at its third distinct stage).
+  assert.equal(third.state.stageTransitionsRemaining, NO_PROGRESS_STAGE_TRANSITION_BUDGET - 2);
   assert.deepEqual(
     parseNoProgressGovernorState(JSON.parse(JSON.stringify(third.state))),
     third.state,
   );
+  // Every further DISTINCT consequence is bounded progress until the budget is
+  // spent; the one after that terminalizes. (A repeated key terminalizes at
+  // once — pinned separately — so this bounds convergence, not loops.)
+  let cursor = third;
+  let remaining = third.state.stageTransitionsRemaining;
+  let ordinal = 0;
+  while (remaining > 0) {
+    ordinal += 1;
+    const distinct = createNoProgressConsequence({
+      stage: `execution:transient:${ordinal}`,
+      recovery: 'repair_model',
+      effectState: 'known_terminal',
+      recoveryToolNames: ['work_call'],
+    });
+    cursor = observeNoProgress(cursor.state, {
+      taskKey: initial.taskKey,
+      attemptClass: 'zero_crossing_repair',
+      authority: initial.authority,
+      consequence: distinct,
+    });
+    assert.equal(cursor.action, 'continue', `distinct stage ${ordinal} within the budget continues`);
+    remaining = cursor.state.stageTransitionsRemaining;
+  }
   const beyondBudget = createNoProgressConsequence({
-    stage: 'execution:transient',
+    stage: 'execution:transient:beyond',
     recovery: 'repair_model',
     effectState: 'known_terminal',
     recoveryToolNames: ['work_call'],
   });
-  const stopped = observeNoProgress(third.state, {
+  const stopped = observeNoProgress(cursor.state, {
     taskKey: initial.taskKey,
     attemptClass: 'zero_crossing_repair',
     authority: initial.authority,

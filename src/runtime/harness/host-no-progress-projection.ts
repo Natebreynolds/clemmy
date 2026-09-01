@@ -709,8 +709,15 @@ function controlConsequence(input: {
     });
   }
   if (payload.code === 'plan_invalid_input') {
+    // Keyed on the host-authored digest of the violated paths when present:
+    // a draft that repaired one complaint and met a different one is a new
+    // stage (progress), an identical complaint is the same stage (the loop
+    // floor). Legacy payloads without a key keep the flat stage.
+    const planRepairKey = typeof payload.repairKey === 'string' && REPAIR_KEY_RE.test(payload.repairKey)
+      ? payload.repairKey
+      : null;
     return createNoProgressConsequence({
-      stage: 'schema_invalid',
+      stage: planRepairKey ? schemaInvalidStage([planRepairKey]) : 'schema_invalid',
       recovery: 'repair_model',
       effectState: 'not_started',
       recoveryToolNames: [input.call.name],

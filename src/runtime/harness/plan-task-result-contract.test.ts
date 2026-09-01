@@ -183,3 +183,39 @@ test('recorded payloads that carried a capability list keep their recorded routi
     recoveryTool: 'plan_task',
   })), null);
 });
+
+test('a keyed plan_invalid_input refusal parses as the structural plan_task member and projects a path-keyed stage', () => {
+  // Live 2026-09-01: four distinct plan_task complaints in a row all landed on
+  // the flat 'schema_invalid' stage and a converging authoring turn was
+  // terminalized. The host-authored repairKey (violated-path digest) keys the
+  // stage so a new complaint is progress and the same complaint is the floor.
+  const base = {
+    ok: false,
+    code: 'plan_invalid_input',
+    detail: 'plan_task input did not match its schema — draft.bindings: bindings must cover every canonical topology operation exactly once',
+    repair: 'Fix exactly the named paths and call plan_task again; do not resend the identical arguments.',
+    recoveryTool: 'plan_task',
+  };
+  const keyedA = { ...base, repairKey: 'a'.repeat(32) };
+  const keyedB = { ...base, repairKey: 'b'.repeat(32) };
+  const parsed = parseExactPlanTaskRefusal(JSON.stringify(keyedA));
+  assert.ok(parsed, 'the keyed shape is a member of the closed union');
+  assert.equal(parsed.recoveryTool, 'plan_task');
+  assert.equal(parsed.structural, true);
+  assert.equal(parseExactPlanTaskRefusal(JSON.stringify(base))?.structural, true, 'the legacy unkeyed shape still parses');
+  assert.equal(parseExactPlanTaskRefusal(JSON.stringify({ ...base, repairKey: 'not-hex' })), null, 'a malformed key is not a member');
+
+  const first = projectRefusal('keyed-a', keyedA);
+  const second = projectRefusal('keyed-b', keyedB);
+  const legacy = projectRefusal('keyed-none', base);
+  assert.equal(first.status, 'ok', JSON.stringify(first));
+  assert.equal(second.status, 'ok', JSON.stringify(second));
+  assert.equal(legacy.status, 'ok', JSON.stringify(legacy));
+  if (first.status === 'ok' && second.status === 'ok' && legacy.status === 'ok') {
+    assert.equal(first.consequence?.stage, `schema_invalid:${'a'.repeat(16)}`);
+    assert.equal(second.consequence?.stage, `schema_invalid:${'b'.repeat(16)}`);
+    assert.notEqual(first.consequence?.key, second.consequence?.key, 'a different violated-path set is a different stage');
+    assert.equal(legacy.consequence?.stage, 'schema_invalid');
+    assert.deepEqual(first.consequence?.recoveryToolNames, ['plan_task']);
+  }
+});

@@ -182,8 +182,16 @@ export function parseExactPlanTaskRefusal(value: unknown): ExactPlanTaskRefusal 
     const common = boundedPlanTaskResultText(payload.detail)
       && boundedPlanTaskResultText(payload.repair);
     if (!common) return null;
+    // Optional host-authored repair key (violated paths digest); a member
+    // without it is the legacy shape and still parses unchanged.
+    const keyed = 'repairKey' in payload;
+    if (keyed && !(typeof payload.repairKey === 'string' && /^[a-f0-9]{16,64}$/.test(payload.repairKey))) {
+      return null;
+    }
     if (
-      exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair', 'recoveryTool'])
+      exactPlanTaskResultKeys(payload, keyed
+        ? ['ok', 'code', 'detail', 'repair', 'recoveryTool', 'repairKey']
+        : ['ok', 'code', 'detail', 'repair', 'recoveryTool'])
       && payload.recoveryTool === 'plan_task'
     ) return result(payload, 'settled_refusal', 'plan_task', true);
     if (exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair'])) {
