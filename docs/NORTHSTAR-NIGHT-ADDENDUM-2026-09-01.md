@@ -199,7 +199,12 @@ in two weeks a failed run named its own cause.
   crossed the 60 s first-content budget composing on a 45k-token prompt, was silenced, and the turn ended
   on `ask_user_question` (a genuine fork: local baseline file, runtime-built queries, org-URL read) —
   budget 60→150 s with watchdog 75→180 s, the prompt decides max-preserving and never asks, and the
-  model's note rides with a failed attempt. Attempt 9 runs on all of it.
+  model's note rides with a failed attempt; (9) on all of that, Sonnet's `plan_task` was refused
+  `plan_incomplete_missing_write` (the card never carried `workflow_update`), it ran the prescribed
+  `tool_search`, the search disclosed the exact write — and the host terminalized right after that
+  success: every write disclosure collapsed to ONE effect token, already spent by the first broad
+  search's three unrelated writes. Each distinct exact write ref is now its own bounded effect gain
+  (`host-no-progress-projection.ts`, pin added). Attempt 10 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
