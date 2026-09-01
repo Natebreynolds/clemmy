@@ -2184,7 +2184,7 @@
           "bytes": 59570
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 26511
+          "bytes": 26673
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -2193,7 +2193,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 37717
+          "bytes": 38322
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 295226
@@ -4653,7 +4653,7 @@
           "bytes": 59570
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 26511
+          "bytes": 26673
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -4662,7 +4662,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 37717
+          "bytes": 38322
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 295226
