@@ -5144,8 +5144,58 @@ export async function runConversation(
 ): Promise<RunConversationResult> {
   return withRuntimeConfigSnapshot(() => withAcceptedSourceCatalogManifestScope(
     options.acceptedCatalogScope,
-    () => runConversationWithinRuntimeConfig(options),
+    async () => {
+      const outcome = await runConversationWithinRuntimeConfig(options);
+      // A 'continue' checkpoint is a READY ordinary same-source continuation:
+      // the host has already committed the recovered frame's exact results
+      // and only needs the next model step. It is consumed at the top of the
+      // next activation (checkpoint adoption below), which used to mean the
+      // caller got "still owned by recovery" and the work waited for the next
+      // periodic/restart tick. Take that next activation here, once: the
+      // frame is committed and the batch is claim-cursored, so re-entering
+      // cannot replay a model step or a tool body. Anything but a ready
+      // continuation returns unchanged; a second hold stays with the durable
+      // owner exactly as before.
+      if (!checkpointContinuationIsReady(outcome, options)) return outcome;
+      return runConversationWithinRuntimeConfig(options);
+    },
   ));
+}
+
+/**
+ * True only for the hold that a committed recovered frame leaves behind: a
+ * recovery-owned `recovery_pending` result whose durable private recovery
+ * state is a `continue` checkpoint for this exact accepted source. The caller
+ * must identify the source; a fresh input never hops (it would accept a new
+ * source), and admit/finalize states keep their own one-hop re-entry inside
+ * the runner activation.
+ */
+export function checkpointContinuationIsReady(
+  result: Pick<RunConversationResult, 'status' | 'hold'>,
+  options: Pick<RunConversationOptions, 'sessionId' | 'sourceUserSeq'>,
+): boolean {
+  if (
+    result.status !== 'held'
+    || result.hold?.wake !== 'recovery'
+    || result.hold.reason !== 'recovery_pending'
+  ) return false;
+  if (!Number.isSafeInteger(options.sourceUserSeq) || Number(options.sourceUserSeq) <= 0) return false;
+  let blob: string | null;
+  try {
+    blob = HarnessSession.load(options.sessionId)?.loadRecoveryState() ?? null;
+  } catch {
+    return false;
+  }
+  if (!blob || !HostRecoveryState.isHostState(blob)) return false;
+  try {
+    const state = HostRecoveryState.fromString(blob);
+    return state.phase === 'continue'
+      && state.sessionId === options.sessionId
+      && state.sourceUserSeq === Number(options.sourceUserSeq)
+      && state.acceptedModelBatchRef !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 async function runConversationWithinRuntimeConfig(
@@ -10649,7 +10699,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
               // One immediate exact re-entry closes ordinary transient local
               // store failures. The recovery state replays neither model nor
               // tool body; a second hold remains durable for the periodic/
-              // restart owner.
+              // restart owner. A 'continue' checkpoint is not re-run here: it
+              // is adopted as the conversation snapshot by the NEXT
+              // activation, which runConversation takes once in the same call
+              // (checkpointContinuationIsReady) so a committed recovered frame
+              // does not wait for the next restart tick.
               const recovery = HostRecoveryState.fromString(outcome.serializedRecoveryState);
               if (recovery.phase !== 'continue') {
                 outcome = await run(
