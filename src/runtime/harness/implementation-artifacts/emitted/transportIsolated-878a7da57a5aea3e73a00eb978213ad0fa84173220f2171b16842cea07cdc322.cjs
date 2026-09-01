@@ -36,6 +36,7 @@ __export(transport_isolated_entry_exports, {
   executeAttestedTransport: () => executeAttestedTransport,
   isolatedTransportCalls: () => isolatedTransportCalls,
   observeAttestedTransport: () => observeAttestedTransport,
+  prepareAttestedComposioDispatch: () => prepareAttestedComposioDispatch,
   reconcileAttestedTransport: () => reconcileAttestedTransport,
   refreshAttestedTransportObservation: () => refreshAttestedTransportObservation,
   registerIsolatedObservation: () => registerIsolatedObservation
@@ -1054,6 +1055,16 @@ function registerIsolatedObservation(observation) {
   state.observations = { ...state.observations ?? {}, [key]: observation };
   saveState(state);
 }
+async function prepareAttestedComposioDispatch(input) {
+  const operationId = input.operationId.trim();
+  const accountId = input.accountId.trim();
+  const current = operationId && accountId ? observeAttestedTransport({ operationId, accountId }) : null;
+  if (!current || current.operationId !== operationId || current.accountId !== accountId) {
+    throw new Error(
+      `${operationId || "unknown operation"} sealed connected account ${accountId || "unknown"} is missing_or_changed`
+    );
+  }
+}
 function isolatedTransportCalls() {
   return [...loadState().calls];
 }
@@ -1130,6 +1141,7 @@ function createAttestedTransport(digest) {
   executeAttestedTransport,
   isolatedTransportCalls,
   observeAttestedTransport,
+  prepareAttestedComposioDispatch,
   reconcileAttestedTransport,
   refreshAttestedTransportObservation,
   registerIsolatedObservation

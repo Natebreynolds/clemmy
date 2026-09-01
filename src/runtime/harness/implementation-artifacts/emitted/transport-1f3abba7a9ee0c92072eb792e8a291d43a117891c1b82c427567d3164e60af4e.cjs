@@ -34,6 +34,7 @@ __export(transport_entry_exports, {
   createAttestedTransport: () => createAttestedTransport,
   executeAttestedTransport: () => executeAttestedTransport,
   observeAttestedTransport: () => observeAttestedTransport,
+  prepareAttestedComposioDispatch: () => prepareAttestedComposioDispatch,
   reconcileAttestedTransport: () => reconcileAttestedTransport,
   refreshAttestedTransportObservation: () => refreshAttestedTransportObservation,
   registerIsolatedObservation: () => registerIsolatedObservation
@@ -311,7 +312,7 @@ function fingerprintComposioProviderDefinition(input) {
 }
 
 // src/runtime/harness/reviewed-local-tool-transport.ts
-var import_zod3 = require("zod");
+var import_zod4 = require("zod");
 
 // src/runtime/schema-normalizer.ts
 var import_zod = require("zod");
@@ -1082,7 +1083,7 @@ var TOOL_REGISTRY = [
   { name: "space_refresh", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", delegationPrimitive: true, description: "Re-run a Workspace's data source(s) NOW (server-side, no LLM) and persist the fresh datas\u2026" },
   { name: "space_revert_runner", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", delegationPrimitive: true, description: "Undo the most recent space_edit_runner on a runner, restoring its prior source from the s\u2026" },
   { name: "space_save", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workspace_definition", reversibility: "reversible", destructive: false, purpose: "author_workspace", inputKind: "workspace_definition", outputKind: "workspace_revision", deliverableKind: "workspace", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"] }, description: "Create or update a Workspace \u2014 a persistent, interactive HTML surface you build for the u\u2026" },
-  { name: "space_set_data", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id \u2014\u2026" },
+  { name: "space_set_data", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", loopClass: "mutating", localPlanning: { consequence: "workspace_definition", reversibility: "reversible", destructive: false, purpose: "update_workspace_dataset", inputKind: "workspace_dataset", outputKind: "workspace_observation", deliverableKind: "workspace", destinationPosture: "named_existing", advisoryRoles: ["update", "destination"] }, localExecution: { version: 1, adapter: "workspace_dataset_v1", idempotency: "content_addressed", reconciliation: "workspace_dataset_v1" }, description: "Commit a dataset you ALREADY HAVE IN HAND directly into the workspace under a source id \u2014\u2026" },
   { name: "space_try_runner", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Statically inspect a legacy Workspace runner's declared role and provenance without executing it; execution remains behind space_refresh or the normal Workspace action approval path." },
   { name: "surface_plan", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", description: "Surface a Plan you just received from `draft_plan` to the user for review." },
   { name: "task_add", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Add a passive one-time item to the user's TODO list; it does not fire at a scheduled time." },
@@ -1103,6 +1104,7 @@ var TOOL_REGISTRY = [
   { name: "update_agent", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Update an existing team agent." },
   { name: "user_profile_read", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Read the user's current profile (name, role, timezone, working hours, communication prefe\u2026" },
   { name: "workflow_apply_contract_fixes", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Apply safe, machine-readable fixes from a workflow visual contract." },
+  { name: "workflow_capability_resolve", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Resolve an exact workflow capability pause by saving a human account choice or retrying after setup." },
   { name: "workflow_create", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "author_workflow", inputKind: "workflow_definition", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"] }, description: "Create a workflow." },
   { name: "workflow_delete", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", localPlanning: { consequence: "workflow_definition", reversibility: "irreversible", destructive: true, purpose: "delete_workflow", inputKind: "workflow_reference", outputKind: "deletion_receipt", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["delete", "destination"] }, description: "Permanently delete a workflow definition file." },
   { name: "workflow_edit_step", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "author_workflow", inputKind: "workflow_patch", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Make a TARGETED, reversible edit to ONE step's prompt in an existing workflow \u2014 the FAST,\u2026" },
@@ -1505,6 +1507,148 @@ function executeArtifactBundleSave(args) {
   });
 }
 
+// src/spaces/workspace-set-data-contract.ts
+var import_node_crypto5 = require("node:crypto");
+var import_zod3 = require("zod");
+var WORKSPACE_SET_DATA_MAX_BYTES = 5 * 1024 * 1024;
+var WORKSPACE_SET_DATA_MAX_SOURCE_CHARS = 120;
+var WORKSPACE_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
+var SOURCE_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+var ARTIFACT_PREFIX = "workspace-dataset:v1";
+var REFRESH_PREFIX = "workspace-set-data:v1";
+var MAX_JSON_NODES = 2e5;
+var MAX_JSON_DEPTH = 64;
+var WORKSPACE_SET_DATA_TOOL_PARAMETERS = {
+  slug: import_zod3.z.string().min(2).max(63).regex(WORKSPACE_SLUG_RE).describe("The existing active workspace slug."),
+  source_id: import_zod3.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_SOURCE_CHARS).describe("The canonical non-reserved source id to replace."),
+  data_json: import_zod3.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_BYTES).describe("A complete JSON object or array for this source id.")
+};
+var WorkspaceSetDataContractError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "WorkspaceSetDataContractError";
+  }
+  code;
+};
+function sha2562(value) {
+  return (0, import_node_crypto5.createHash)("sha256").update(value, "utf8").digest("hex");
+}
+function utf8(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+function canonicalWorkspaceJson(value) {
+  let nodes = 0;
+  const visit = (input, depth) => {
+    nodes += 1;
+    if (nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) {
+      throw new WorkspaceSetDataContractError(
+        "json_limit_exceeded",
+        "data_json exceeds the reviewed JSON traversal limit"
+      );
+    }
+    if (input === null || typeof input === "string" || typeof input === "boolean") {
+      return JSON.stringify(input);
+    }
+    if (typeof input === "number" && Number.isFinite(input)) return JSON.stringify(input);
+    if (Array.isArray(input)) {
+      return `[${input.map((entry) => visit(entry, depth + 1)).join(",")}]`;
+    }
+    if (input && typeof input === "object") {
+      const object = input;
+      return `{${Object.keys(object).sort().map(
+        (key) => `${JSON.stringify(key)}:${visit(object[key], depth + 1)}`
+      ).join(",")}}`;
+    }
+    throw new WorkspaceSetDataContractError(
+      "invalid_json",
+      "data_json contains a value outside the JSON domain"
+    );
+  };
+  const canonical = visit(value, 0);
+  if (utf8(canonical) > WORKSPACE_SET_DATA_MAX_BYTES) {
+    throw new WorkspaceSetDataContractError(
+      "json_limit_exceeded",
+      `data_json exceeds the ${WORKSPACE_SET_DATA_MAX_BYTES}-byte limit`
+    );
+  }
+  return canonical;
+}
+function exactArguments(value) {
+  const parsed = import_zod3.z.strictObject(WORKSPACE_SET_DATA_TOOL_PARAMETERS).safeParse(value);
+  if (!parsed.success) {
+    const record3 = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    if (typeof record3.slug === "string" && !WORKSPACE_SLUG_RE.test(record3.slug)) {
+      throw new WorkspaceSetDataContractError("invalid_slug", `invalid workspace slug "${record3.slug}"`);
+    }
+    throw new WorkspaceSetDataContractError(
+      "arguments_invalid",
+      "space_set_data arguments do not match the closed reviewed schema"
+    );
+  }
+  return parsed.data;
+}
+function prepareWorkspaceSetData(value) {
+  const args = exactArguments(value);
+  if (!WORKSPACE_SLUG_RE.test(args.slug)) {
+    throw new WorkspaceSetDataContractError("invalid_slug", `invalid workspace slug "${args.slug}"`);
+  }
+  const sourceId = args.source_id;
+  if (sourceId !== sourceId.trim() || sourceId.length === 0 || sourceId.length > WORKSPACE_SET_DATA_MAX_SOURCE_CHARS || SOURCE_CONTROL_RE.test(sourceId)) {
+    throw new WorkspaceSetDataContractError(
+      "invalid_source",
+      "source_id must already be canonical, bounded, and free of control characters"
+    );
+  }
+  if (sourceId === "_meta") {
+    throw new WorkspaceSetDataContractError(
+      "reserved_source",
+      '"_meta" is a reserved Workspace source key'
+    );
+  }
+  if (utf8(args.data_json) > WORKSPACE_SET_DATA_MAX_BYTES) {
+    throw new WorkspaceSetDataContractError(
+      "json_limit_exceeded",
+      `data_json exceeds the ${WORKSPACE_SET_DATA_MAX_BYTES}-byte limit`
+    );
+  }
+  let data;
+  try {
+    data = JSON.parse(args.data_json);
+  } catch (error) {
+    throw new WorkspaceSetDataContractError(
+      "invalid_json",
+      `data_json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!data || typeof data !== "object") {
+    throw new WorkspaceSetDataContractError(
+      "invalid_json_root",
+      "data_json must contain one complete JSON object or array"
+    );
+  }
+  const canonicalData = canonicalWorkspaceJson(data);
+  const contentDigest = sha2562(canonicalData);
+  const argsDigest = sha2562([
+    `${ARTIFACT_PREFIX}\0`,
+    args.slug,
+    "\0",
+    sourceId,
+    "\0",
+    canonicalData
+  ].join(""));
+  return Object.freeze({
+    args: Object.freeze({ ...args }),
+    slug: args.slug,
+    sourceId,
+    data,
+    canonicalData,
+    contentDigest,
+    argsDigest,
+    refreshId: `${REFRESH_PREFIX}:${argsDigest}`
+  });
+}
+
 // src/runtime/harness/reviewed-local-tool-transport.ts
 var REVIEWED_LOCAL_PROVIDER_IDENTITY = "local_registry";
 var REVIEWED_LOCAL_PROVIDER_VERSION = "local-registry-v1";
@@ -1525,7 +1669,7 @@ function exactDeclaration(name) {
 function validExecutionContract(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const contract = value;
-  return contract.version === 1 && contract.adapter === "artifact_bundle_v1" && contract.idempotency === "content_addressed" && contract.reconciliation === "artifact_bundle_v1";
+  return contract.version === 1 && contract.idempotency === "content_addressed" && (contract.adapter === "artifact_bundle_v1" && contract.reconciliation === "artifact_bundle_v1" || contract.adapter === "workspace_dataset_v1" && contract.reconciliation === "workspace_dataset_v1");
 }
 function safeToken(value) {
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._/-]+/g, "_");
@@ -1654,11 +1798,10 @@ function deriveReviewedLocalDefinition(input) {
     descriptor
   });
 }
-function currentArtifactBundleSchema() {
-  const deferredParameters = import_zod3.z.strictObject(
-    normalizeShapeForDeferredJson(ARTIFACT_BUNDLE_TOOL_PARAMETERS)
-  );
-  const parameters = import_zod3.z.toJSONSchema(deferredParameters);
+function currentReviewedLocalSchema(execution) {
+  const parametersShape = execution.adapter === "artifact_bundle_v1" ? ARTIFACT_BUNDLE_TOOL_PARAMETERS : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
+  const deferredParameters = import_zod4.z.strictObject(normalizeShapeForDeferredJson(parametersShape));
+  const parameters = import_zod4.z.toJSONSchema(deferredParameters);
   const schema = relaxJsonSchemaForDeferred(parameters);
   return isRecord(schema) ? schema : null;
 }
@@ -1667,7 +1810,7 @@ function observeReviewedLocalTool(operationId) {
   if (!name || name !== operationId) return null;
   const declaration = exactDeclaration(name);
   if (!declaration || !validExecutionContract(declaration.localExecution)) return null;
-  const schema = currentArtifactBundleSchema();
+  const schema = currentReviewedLocalSchema(declaration.localExecution);
   if (!schema) return null;
   const definition = deriveReviewedLocalDefinition({ declaration, schema });
   if (!definition || definition.accountIdentity !== REVIEWED_LOCAL_ACCOUNT) return null;
@@ -1734,8 +1877,18 @@ function reviewedLocalCapabilityManifest(observed2) {
   });
 }
 function reviewedLocalToolArgumentsMatch(observed2, args) {
-  const parsed = import_zod3.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
-  if (!parsed.success) return false;
+  if (observed2.execution.adapter === "artifact_bundle_v1") {
+    const parsed = import_zod4.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
+    if (!parsed.success) return false;
+  } else if (observed2.execution.adapter === "workspace_dataset_v1") {
+    try {
+      prepareWorkspaceSetData(args);
+    } catch {
+      return false;
+    }
+  } else {
+    return false;
+  }
   const safeMode = observed2.definition.safeMode;
   if (!safeMode) return true;
   const nullEquivalent = new Set(safeMode.nullEquivalentToRequired ?? []);
@@ -1754,7 +1907,7 @@ function exactExpectedIdentity(call, observed2) {
     expected && manifest && call.accountId === REVIEWED_LOCAL_ACCOUNT && expected.manifestDigest === capabilityManifestDigest(manifest) && expected.providerKind === "local_registry" && expected.providerIdentity === REVIEWED_LOCAL_PROVIDER_IDENTITY && expected.providerVersion === REVIEWED_LOCAL_PROVIDER_VERSION && expected.operationVersion === REVIEWED_LOCAL_OPERATION_VERSION && expected.definitionFingerprint === observed2.definition.envelopeFingerprint && expected.manifestId === observed2.manifestId && expected.invokePortId === observed2.invokePortId && expected.argumentCompiler.id === REVIEWED_LOCAL_ARGUMENT_COMPILER.id && expected.argumentCompiler.version === REVIEWED_LOCAL_ARGUMENT_COMPILER.version && expected.providerInputSchemaDigest === void 0 && expected.providerOutputSchemaObserved === void 0 && expected.providerOutputSchemaDigest === void 0
   );
 }
-async function executeReviewedLocalTool(call) {
+function prepareReviewedLocalToolExecution(call) {
   const observed2 = observeReviewedLocalTool(call.operationId);
   if (!observed2 || !exactExpectedIdentity(call, observed2)) {
     throw new Error("reviewed local execution identity changed before dispatch");
@@ -1762,8 +1915,25 @@ async function executeReviewedLocalTool(call) {
   if (!reviewedLocalToolArgumentsMatch(observed2, call.args)) {
     throw new Error("reviewed local execution arguments exceed the declared safe mode");
   }
-  const parsed = import_zod3.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args);
-  return executeArtifactBundleSave(parsed);
+  if (observed2.execution.adapter === "artifact_bundle_v1") {
+    return {
+      observed: observed2,
+      adapter: observed2.execution.adapter,
+      args: import_zod4.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args)
+    };
+  }
+  return {
+    observed: observed2,
+    adapter: observed2.execution.adapter,
+    args: prepareWorkspaceSetData(call.args).args
+  };
+}
+async function executeReviewedLocalTool(call) {
+  const prepared = prepareReviewedLocalToolExecution(call);
+  if (prepared.adapter === "artifact_bundle_v1") {
+    return executeArtifactBundleSave(prepared.args);
+  }
+  throw new Error("reviewed Workspace dataset execution requires the host storage carrier");
 }
 async function reconcileReviewedLocalTool(input) {
   const observed2 = observeReviewedLocalTool(input.operationId);
@@ -1781,10 +1951,10 @@ async function reconcileReviewedLocalTool(input) {
 
 // src/runtime/harness/reviewed-cli-read-transport.ts
 var import_node_child_process = require("node:child_process");
-var import_node_crypto7 = require("node:crypto");
+var import_node_crypto8 = require("node:crypto");
 
 // src/runtime/harness/reviewed-cli-read-config.ts
-var import_node_crypto6 = require("node:crypto");
+var import_node_crypto7 = require("node:crypto");
 var import_node_fs4 = require("node:fs");
 var import_node_path6 = __toESM(require("node:path"), 1);
 
@@ -1795,7 +1965,7 @@ var UUID_TOKEN_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f
 var OWNER_TOKEN_PATTERN = new RegExp(`^([1-9]\\d*):([1-9]\\d*)(?::(${UUID_TOKEN_PATTERN}))?$`, "i");
 
 // src/runtime/harness/authority-argument-seal.ts
-var import_node_crypto5 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 var import_node_fs3 = require("node:fs");
 var import_node_path5 = __toESM(require("node:path"), 1);
 var SEAL_VERSION = 2;
@@ -1850,7 +2020,7 @@ function openCanonicalArguments(cipherText) {
       }
       lastMissing = false;
       try {
-        const decipher = (0, import_node_crypto5.createDecipheriv)("aes-256-gcm", key, Buffer.from(parsed.iv, "base64"));
+        const decipher = (0, import_node_crypto6.createDecipheriv)("aes-256-gcm", key, Buffer.from(parsed.iv, "base64"));
         decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
         const plain = Buffer.concat([
           decipher.update(Buffer.from(parsed.ct, "base64")),
@@ -2033,7 +2203,7 @@ function listReviewedCliReadDescriptors(filePath = reviewedCliReadConfigPath()) 
   return Object.freeze(closed.descriptors.map((entry) => Object.freeze(entry.descriptor)));
 }
 function hashOpenFile(fd) {
-  const hash = (0, import_node_crypto6.createHash)("sha256");
+  const hash = (0, import_node_crypto7.createHash)("sha256");
   const buffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
   let position = 0;
   for (; ; ) {
@@ -2078,7 +2248,7 @@ function observeReviewedCliExecutable(executablePath) {
 function reviewedCliDescriptorDigest(descriptor) {
   const closed = closeReviewedCliReadDescriptor(descriptor);
   if (!closed) throw new Error("reviewed CLI descriptor is invalid");
-  return (0, import_node_crypto6.createHash)("sha256").update(closedCanonicalJson(closed, CLOSED_OPTIONS), "utf8").digest("hex");
+  return (0, import_node_crypto7.createHash)("sha256").update(closedCanonicalJson(closed, CLOSED_OPTIONS), "utf8").digest("hex");
 }
 function currentReviewedCliDescriptor(descriptor) {
   const closed = closeReviewedCliReadDescriptor(descriptor);
@@ -2194,7 +2364,7 @@ function currentTransportIdentity(descriptor) {
   const schemaFingerprint = stableJsonFingerprint(inputSchema);
   const outputSchemaFingerprint = stableJsonFingerprint(REVIEWED_CLI_OUTPUT_SCHEMA);
   const invokePortId = `port:reviewed-cli:v1:${operationVersion}`;
-  const definitionFingerprint = (0, import_node_crypto7.createHash)("sha256").update(closedCanonicalJson({
+  const definitionFingerprint = (0, import_node_crypto8.createHash)("sha256").update(closedCanonicalJson({
     domain: "live-read-capability-definition",
     version: 1,
     carrier: {
@@ -2441,6 +2611,32 @@ async function executeAttestedTransport(call) {
   });
   return client.executePreparedComposioTool(prepared);
 }
+async function prepareAttestedComposioDispatch(input) {
+  if (loopbackOutboundDenied()) {
+    throw new Error(`${input.operationId} exact connected-account refresh was unavailable`);
+  }
+  const client = loadComposioClient();
+  if (!client.isComposioEnabled()) {
+    throw new Error(`${input.operationId} exact connected-account refresh was unavailable`);
+  }
+  let connection;
+  try {
+    connection = await client.revalidateSelectedComposioConnections([{
+      identifier: input.operationId,
+      connectionId: input.accountId
+    }]);
+  } catch (cause) {
+    throw new Error(
+      `${input.operationId} exact connected-account refresh was unavailable`,
+      { cause }
+    );
+  }
+  if (!connection.ok) {
+    throw new Error(
+      `${input.operationId} sealed connected account ${input.accountId} is ${connection.reason}`
+    );
+  }
+}
 var observed = /* @__PURE__ */ new Map();
 function observationKey(operationId, accountId) {
   return `${operationId}\0${accountId}`;
@@ -2584,6 +2780,7 @@ function createAttestedTransport(digest) {
   createAttestedTransport,
   executeAttestedTransport,
   observeAttestedTransport,
+  prepareAttestedComposioDispatch,
   reconcileAttestedTransport,
   refreshAttestedTransportObservation,
   registerIsolatedObservation
