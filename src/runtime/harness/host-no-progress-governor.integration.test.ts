@@ -49,6 +49,7 @@ const {
   createNoProgressConsequence,
   initializeNoProgressGovernor,
   observeNoProgress,
+  NO_PROGRESS_RETRY_BUDGET,
 } = await import('./no-progress-governor.js');
 const { projectHostNoProgressAuthority } = await import('./host-no-progress-projection.js');
 
@@ -154,7 +155,7 @@ test('approval-resume state preserves a spent no-progress retry and exact histor
     },
   );
   const resumed = HostInterruptState.fromString(paused.toString());
-  assert.equal(resumed.noProgressCheckpoint?.state.retriesRemaining, 0);
+  assert.equal(resumed.noProgressCheckpoint?.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 1);
   assert.equal(resumed.noProgressCheckpoint?.state.noProgressAttempts, 1);
   assert.equal(resumed.noProgressCheckpoint?.historyCursor, 1);
   assert.equal(resumed.noProgressCheckpoint?.recoveryOnly, true);
@@ -163,7 +164,7 @@ test('approval-resume state preserves a spent no-progress retry and exact histor
   const checkpoint = forged.noProgressCheckpoint as {
     state: { retriesRemaining: number };
   };
-  checkpoint.state.retriesRemaining = 1;
+  checkpoint.state.retriesRemaining = NO_PROGRESS_RETRY_BUDGET;
   assert.throws(
     () => HostInterruptState.fromString(JSON.stringify(forged)),
     /invalid no-progress checkpoint/i,

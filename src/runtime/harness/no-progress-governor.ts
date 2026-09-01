@@ -17,7 +17,15 @@
 import { createHash } from 'node:crypto';
 
 export const NO_PROGRESS_GOVERNOR_VERSION = 2 as const;
-export const NO_PROGRESS_RETRY_BUDGET = 1 as const;
+/**
+ * Consecutive zero-gain metered lookups one attempt sequence may spend before
+ * the host stops it. Live 2026-09-01 (three separate runs): one clean retry
+ * killed read_file+recall paging, workflow_get summary→full, and a role search
+ * re-worded three times against a catalog that kept answering the same nearest
+ * operation. The discovery governor already meters discovery per role; this
+ * budget is the floor under everything else, not the pace of ordinary work.
+ */
+export const NO_PROGRESS_RETRY_BUDGET = 3 as const;
 /**
  * Distinct host-validated repair consequences one attempt sequence may move
  * through before the host stops it. Re-entering ANY prior consequence key
@@ -251,8 +259,8 @@ export interface NoProgressGovernorState {
   readonly authority: AuthorityProgressSnapshot;
   /** Consecutive metered attempts since the last exact authority gain. */
   readonly noProgressAttempts: number;
-  /** One clean model-led recovery is allowed after each genuine gain. */
-  readonly retriesRemaining: 0 | typeof NO_PROGRESS_RETRY_BUDGET;
+  /** Clean model-led recoveries left after the last genuine gain; integer in [0, NO_PROGRESS_RETRY_BUDGET]. */
+  readonly retriesRemaining: number;
   /** Host-validated consequence stages seen since the last authority gain.
    * Re-entering any prior key is a cycle, even when another stage intervened. */
   readonly seenConsequenceKeys: readonly string[];
@@ -461,16 +469,22 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
     || Number(candidate.noProgressAttempts) < 0
     || !Number.isSafeInteger(candidate.observations)
     || Number(candidate.observations) < 0
-    || (candidate.retriesRemaining !== 0
-      && candidate.retriesRemaining !== NO_PROGRESS_RETRY_BUDGET)
+    || !Number.isSafeInteger(candidate.retriesRemaining)
+    || Number(candidate.retriesRemaining) < 0
+    || Number(candidate.retriesRemaining) > NO_PROGRESS_RETRY_BUDGET
   ) return null;
   const noProgressAttempts = Number(candidate.noProgressAttempts);
   const observations = Number(candidate.observations);
   if (observations < noProgressAttempts) return null;
-  if (
-    (candidate.retriesRemaining === NO_PROGRESS_RETRY_BUDGET && noProgressAttempts !== 0)
-    || (candidate.retriesRemaining === 0 && noProgressAttempts === 0)
-  ) return null;
+  // A fresh sequence (no metered miss yet) always holds the full budget — a
+  // checkpoint written under an older, smaller budget restores as fresh. Once
+  // a miss is recorded the budget is strictly below full; arbitrary JSON
+  // cannot turn a spent retry back into a clean one.
+  if (noProgressAttempts === 0 && Number(candidate.retriesRemaining) === 0) return null;
+  const retriesRemaining = noProgressAttempts === 0
+    ? NO_PROGRESS_RETRY_BUDGET
+    : Number(candidate.retriesRemaining);
+  if (noProgressAttempts !== 0 && retriesRemaining >= NO_PROGRESS_RETRY_BUDGET) return null;
   try {
     if (candidate.version === 1) {
       // V1 knew only the single retry bit. Preserve that spent budget without
@@ -483,7 +497,7 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
           candidate.authority as AuthorityProgressSnapshot,
         ),
         noProgressAttempts,
-        retriesRemaining: candidate.retriesRemaining,
+        retriesRemaining,
         seenConsequenceKeys: Object.freeze([]),
         lastConsequence: null,
         stageTransitionsRemaining: 0,
@@ -512,7 +526,7 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
     if (
       (lastConsequence === null && seenConsequenceKeys.length !== 0)
       || (lastConsequence !== null && !seenConsequenceKeys.includes(lastConsequence.key))
-      || (candidate.retriesRemaining === NO_PROGRESS_RETRY_BUDGET
+      || (retriesRemaining === NO_PROGRESS_RETRY_BUDGET
         && (seenConsequenceKeys.length !== 0
           || Number(candidate.stageTransitionsRemaining) !== NO_PROGRESS_STAGE_TRANSITION_BUDGET))
     ) return null;
@@ -523,7 +537,7 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
         candidate.authority as AuthorityProgressSnapshot,
       ),
       noProgressAttempts,
-      retriesRemaining: candidate.retriesRemaining,
+      retriesRemaining,
       seenConsequenceKeys,
       lastConsequence,
       stageTransitionsRemaining: Number(candidate.stageTransitionsRemaining),
@@ -538,9 +552,9 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
 /**
  * Reduce one fully paired host frame.
  *
- * A new exact token in any authority dimension resets the one-retry budget.
- * A metered frame with no new token spends that retry. The next such frame
- * terminalizes without another model call. Unmetered task work never spends
+ * A new exact token in any authority dimension resets the retry budget.
+ * A metered frame with no new token spends one retry. The frame after the
+ * budget is spent terminalizes without another model call. Unmetered task work never spends
  * the budget, though evidence/effect tokens it earns still reset it.
  */
 export function observeNoProgress(
@@ -710,7 +724,7 @@ export function observeNoProgress(
       ...state,
       authority,
       noProgressAttempts,
-      retriesRemaining: 0 as const,
+      retriesRemaining: state.retriesRemaining - 1,
       observations,
     }) satisfies NoProgressGovernorState;
     return Object.freeze({

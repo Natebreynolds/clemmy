@@ -234,6 +234,7 @@ import {
   initializeNoProgressGovernor,
   isCanonicalNoProgressAskArguments,
   observeNoProgress,
+  NO_PROGRESS_RETRY_BUDGET,
   parseNoProgressGovernorState,
   type NoProgressGovernorState,
 } from './no-progress-governor.js';
@@ -747,7 +748,11 @@ function parseHostNoProgressCheckpoint(
     || historyCursor > historyLength
     || typeof candidate.recoveryOnly !== 'boolean'
     || typeof candidate.recoveryDirectiveWritten !== 'boolean'
-    || (candidate.recoveryOnly && state.retriesRemaining !== 0)
+    // Recovery-only mode follows a metered miss or a typed consequence; a
+    // fresh full budget with no consequence cannot be recovery-only.
+    || (candidate.recoveryOnly
+      && state.retriesRemaining === NO_PROGRESS_RETRY_BUDGET
+      && state.lastConsequence === null)
   ) throw new Error('paused host state has an invalid no-progress checkpoint');
   return {
     state,

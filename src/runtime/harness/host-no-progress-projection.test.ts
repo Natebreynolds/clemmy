@@ -22,6 +22,7 @@ const {
   NO_PROGRESS_RECOVERY_TOOL_NAME_CAP,
   initializeNoProgressGovernor,
   observeNoProgress,
+  NO_PROGRESS_RETRY_BUDGET,
 } = await import('./no-progress-governor.js');
 const { discoveryGovernor } = await import('./discovery-governor.js');
 
@@ -899,11 +900,20 @@ test('varied call ids and irrelevant capability refs cannot buy repeated retries
   });
   assert.equal(second.reason, 'retry_available');
   state = second.state;
+  for (let index = 2; index <= NO_PROGRESS_RETRY_BUDGET; index += 1) {
+    const spend = observeNoProgress(state, {
+      taskKey: state.taskKey,
+      attemptClass: 'authority_acquisition',
+      authority: addCatalogResult(index + 1),
+    });
+    assert.equal(spend.reason, 'retry_available', 'more catalog siblings are not authority');
+    state = spend.state;
+  }
 
   const third = observeNoProgress(state, {
     taskKey: state.taskKey,
     attemptClass: 'authority_acquisition',
-    authority: addCatalogResult(3),
+    authority: addCatalogResult(NO_PROGRESS_RETRY_BUDGET + 2),
   });
   assert.equal(third.action, 'terminalize');
   assert.equal(third.state.authority.operation.length, 1);
@@ -1018,7 +1028,7 @@ test('mixed recall discovery and refusal gains one citable path, then repeated l
   });
   assert.equal(second.reason, 'retry_available');
   assert.equal(second.state.authority.operation.length, 1);
-  assert.equal(second.state.retriesRemaining, 0);
+  assert.equal(second.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 1);
 });
 
 test('typed plan consequences advance by host stage while ids, args, and detail prose cannot mint stages', () => {

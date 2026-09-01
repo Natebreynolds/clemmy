@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  NO_PROGRESS_RETRY_BUDGET,
   NO_PROGRESS_STAGE_TRANSITION_BUDGET,
   canonicalNoProgressAskArguments,
   createNoProgressConsequence,
@@ -39,6 +40,21 @@ function observe(
   });
 }
 
+/** Spend every clean retry with zero-gain metered lookups. */
+function exhaust(
+  state: ReturnType<typeof initializeNoProgressGovernor>,
+  attemptClass: NoProgressAttemptClass = 'dependency_lookup',
+) {
+  let cursor = observe(state, attemptClass);
+  for (let index = 1; index < NO_PROGRESS_RETRY_BUDGET; index += 1) {
+    assert.equal(cursor.action, 'continue');
+    assert.equal(cursor.reason, 'retry_available');
+    cursor = observe(cursor.state, attemptClass);
+  }
+  assert.equal(cursor.state.retriesRemaining, 0);
+  return cursor;
+}
+
 test('one grounded lookup with an exact action path receives one clean recovery', () => {
   const initial = initializeNoProgressGovernor({
     taskKey: 'accepted:invite',
@@ -48,17 +64,17 @@ test('one grounded lookup with an exact action path receives one clean recovery'
   const decision = observe(initial, 'dependency_lookup');
   assert.equal(decision.action, 'continue');
   assert.equal(decision.reason, 'retry_available');
-  assert.equal(decision.state.retriesRemaining, 0);
+  assert.equal(decision.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 1);
   assert.equal(decision.state.noProgressAttempts, 1);
 });
 
-test('a second lookup with zero authority gain terminalizes before another model call', () => {
+test('the lookup after the retry budget is spent terminalizes before another model call', () => {
   const initial = initializeNoProgressGovernor({
     taskKey: 'accepted:lookup-loop',
     authority: snapshot({ operation: ['operation:exact'], account: ['account:exact'] }),
   });
-  const first = observe(initial, 'dependency_lookup');
-  const second = observe(first.state, 'authority_acquisition');
+  const spent = exhaust(initial, 'dependency_lookup');
+  const second = observe(spent.state, 'authority_acquisition');
 
   assert.deepEqual(second, {
     action: 'terminalize',
@@ -74,12 +90,12 @@ test('a second lookup with zero authority gain terminalizes before another model
       version: 2,
       taskKey: 'accepted:lookup-loop',
       authority: snapshot({ operation: ['operation:exact'], account: ['account:exact'] }),
-      noProgressAttempts: 2,
+      noProgressAttempts: NO_PROGRESS_RETRY_BUDGET + 1,
       retriesRemaining: 0,
       seenConsequenceKeys: [],
       lastConsequence: null,
       stageTransitionsRemaining: NO_PROGRESS_STAGE_TRANSITION_BUDGET,
-      observations: 2,
+      observations: NO_PROGRESS_RETRY_BUDGET + 1,
     },
   });
 });
@@ -89,7 +105,7 @@ test('varying discovery, lookup, plan, and refusal classes cannot mint progress'
     taskKey: 'accepted:varied-loop',
     authority: EMPTY,
   });
-  const first = observe(initial, 'authority_acquisition');
+  const first = exhaust(initial, 'authority_acquisition');
   const second = observe(first.state, 'plan_admission');
   assert.equal(second.action, 'terminalize');
 
@@ -97,7 +113,7 @@ test('varying discovery, lookup, plan, and refusal classes cannot mint progress'
     taskKey: 'accepted:varied-repair-loop',
     authority: EMPTY,
   });
-  const repair = observe(repairedInitial, 'zero_crossing_repair');
+  const repair = exhaust(repairedInitial, 'zero_crossing_repair');
   const lookup = observe(repair.state, 'dependency_lookup');
   assert.equal(lookup.action, 'terminalize');
 });
@@ -108,7 +124,7 @@ for (const kind of ['operation', 'account', 'target', 'evidence', 'effect'] as c
       taskKey: `accepted:progress:${kind}`,
       authority: EMPTY,
     });
-    const miss = observe(initial, 'dependency_lookup');
+    const miss = exhaust(initial, 'dependency_lookup');
     assert.equal(miss.state.retriesRemaining, 0);
 
     const progress = observe(
@@ -120,7 +136,7 @@ for (const kind of ['operation', 'account', 'target', 'evidence', 'effect'] as c
     assert.equal(progress.reason, 'authority_progress');
     assert.deepEqual(progress.gained, [kind]);
     assert.equal(progress.state.noProgressAttempts, 0);
-    assert.equal(progress.state.retriesRemaining, 1);
+    assert.equal(progress.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
 
     const nextMiss = observe(progress.state, 'plan_admission');
     assert.equal(nextMiss.action, 'continue');
@@ -155,7 +171,14 @@ test('snapshot ordering and duplicate event projections do not count as work', (
     evidence: ['evidence:b', 'evidence:a', 'evidence:a'],
   }));
   assert.equal(first.reason, 'retry_available');
-  const second = observe(first.state, 'dependency_lookup', snapshot({
+  let cursor = first;
+  for (let index = 1; index < NO_PROGRESS_RETRY_BUDGET; index += 1) {
+    cursor = observe(cursor.state, 'dependency_lookup', snapshot({
+      evidence: ['evidence:a', 'evidence:b', 'evidence:b'],
+    }));
+    assert.equal(cursor.reason, 'retry_available');
+  }
+  const second = observe(cursor.state, 'dependency_lookup', snapshot({
     evidence: ['evidence:a', 'evidence:b'],
   }));
   assert.equal(second.action, 'terminalize');
@@ -168,12 +191,12 @@ test('task work and terminal projection never spend the no-progress retry', () =
   });
   const work = observe(initial, 'task_work');
   assert.equal(work.reason, 'unmetered_attempt');
-  assert.equal(work.state.retriesRemaining, 1);
+  assert.equal(work.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
   assert.equal(work.state.noProgressAttempts, 0);
 
   const terminal = observe(work.state, 'terminal_projection');
   assert.equal(terminal.reason, 'unmetered_attempt');
-  assert.equal(terminal.state.retriesRemaining, 1);
+  assert.equal(terminal.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
   assert.equal(terminal.state.noProgressAttempts, 0);
 });
 
@@ -182,12 +205,12 @@ test('task work still resets a previously spent retry when it earns evidence', (
     taskKey: 'accepted:work-progress',
     authority: EMPTY,
   });
-  const miss = observe(initial, 'authority_acquisition');
+  const miss = exhaust(initial, 'authority_acquisition');
   const work = observe(miss.state, 'task_work', snapshot({ evidence: ['receipt:read:one'] }));
 
   assert.equal(work.reason, 'authority_progress');
   assert.deepEqual(work.gained, ['evidence']);
-  assert.equal(work.state.retriesRemaining, 1);
+  assert.equal(work.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
   assert.equal(work.state.noProgressAttempts, 0);
 });
 
@@ -227,11 +250,15 @@ test('serialized state cannot restore a spent retry on approval resume', () => {
     taskKey: 'accepted:resume',
     authority: EMPTY,
   });
-  const spent = observe(initial, 'dependency_lookup').state;
+  const spent = exhaust(initial, 'dependency_lookup').state;
   assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(spent))), spent);
   assert.equal(parseNoProgressGovernorState({
     ...spent,
-    retriesRemaining: 1,
+    retriesRemaining: NO_PROGRESS_RETRY_BUDGET,
+  }), null, 'a recorded miss cannot restore the full budget');
+  assert.equal(parseNoProgressGovernorState({
+    ...spent,
+    retriesRemaining: NO_PROGRESS_RETRY_BUDGET + 1,
   }), null);
   assert.equal(parseNoProgressGovernorState({
     ...spent,
@@ -367,7 +394,7 @@ test('a typed repair consequence still reaches the model after one untyped looku
     taskKey: 'accepted:landed-read-recall-repair',
     authority: snapshot({ operation: ['operation:calendar-read'] }),
   });
-  const lookup = observe(initial, 'dependency_lookup');
+  const lookup = exhaust(initial, 'dependency_lookup');
   assert.equal(lookup.reason, 'retry_available');
   assert.equal(lookup.state.retriesRemaining, 0);
   assert.equal(lookup.state.lastConsequence, null);
