@@ -1563,7 +1563,11 @@ async function executePlanTask(
 export function buildPlanTaskTool(input: {
   planning: HostFreshPlanningContextV1;
 }): Tool<RuntimeContextValue> {
-  return tool({
+  // The description below re-renders the planning card, which grows with
+  // same-source disclosures across re-primes (including a crash-resume). It
+  // is turn state the model reads, not the callable contract, so the shipped
+  // schema fingerprint covers name + parameters only (capability-envelope.ts).
+  return Object.assign(tool({
     name: 'plan_task',
     description: [
       'Admit and freeze one action plan or exact reviewed Clementine-local read plan for the current accepted request inside this foreground model loop.',
@@ -1602,7 +1606,7 @@ export function buildPlanTaskTool(input: {
       const details = error instanceof Error ? error.toString() : String(error);
       return `An error occurred while running the tool. Please try again. Error: ${details}`;
     },
-  });
+  }), { descriptionCarriesTurnState: true as const });
 }
 
 /**

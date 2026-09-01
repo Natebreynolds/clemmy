@@ -30,6 +30,25 @@ test('the schema fingerprint is content identity — description included', () =
   assert.notEqual(toolSchemaFingerprint(base), toolSchemaFingerprint({ ...base, parameters: { type: 'object', required: ['q'] } }));
 });
 
+test('a description declared turn state is excluded from the fingerprint; parameters still bind', () => {
+  // Live 2026-09-01: a crash-resume re-primed plan_task with the disclosures
+  // its card had gained; the description-bearing fingerprint changed and the
+  // immutable host root read the same source as a changed surface (poison).
+  const armed = {
+    name: 'plan_task',
+    description: 'Admit one plan. Exact host planning catalog: (none yet)',
+    parameters: { type: 'object', properties: { topology: {} } },
+    descriptionCarriesTurnState: true as const,
+  };
+  const resumed = { ...armed, description: 'Admit one plan. Exact host planning catalog: [cap:local:a, cap:composio:b]' };
+  assert.equal(toolSchemaFingerprint(armed), toolSchemaFingerprint(resumed));
+  // The marker survives the harness wrapper's object spread.
+  assert.equal(toolSchemaFingerprint(armed), toolSchemaFingerprint({ ...resumed, invoke: () => undefined }));
+  assert.notEqual(toolSchemaFingerprint(armed), toolSchemaFingerprint({ ...armed, parameters: { type: 'object' } }));
+  // Only an exact `true` declares it; a truthy string or an ordinary tool keeps the full contract.
+  assert.notEqual(toolSchemaFingerprint({ ...armed, descriptionCarriesTurnState: 'yes' }), toolSchemaFingerprint({ ...resumed, descriptionCarriesTurnState: 'yes' }));
+});
+
 test('effect classes flatten UP, never down', () => {
   // The classifier already fails closed; the mapping must not undo that.
   assert.equal(toolEffectClass('memory_recall'), 'read');

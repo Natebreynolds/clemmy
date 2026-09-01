@@ -35,6 +35,14 @@ export interface SealableToolLike {
   name?: unknown;
   description?: unknown;
   parameters?: unknown;
+  /**
+   * Set by a builder whose description is re-rendered from per-turn host
+   * state (a planning card that grows with same-source disclosures). Such
+   * prose is turn STATE the model reads, not the callable contract, so it is
+   * excluded from the shipped-schema fingerprint; name + parameters remain.
+   * Plain own property on purpose: harness wrappers spread the tool object.
+   */
+  descriptionCarriesTurnState?: unknown;
 }
 
 function sha256(text: string): string {
@@ -50,11 +58,16 @@ function stableJson(value: unknown): string {
 }
 
 /** The schema a tool SHIPPED with, fingerprinted. Description is part of the
- *  contract the model sees, so it is part of the fingerprint. */
+ *  contract the model sees, so it is part of the fingerprint — unless the
+ *  builder declared it turn state (see SealableToolLike). Live 2026-09-01: a
+ *  crash-resume re-primed plan_task with the disclosures its card had gained,
+ *  the description-bearing fingerprint changed, and the immutable host root
+ *  read the same source as a changed surface (authority_conflict → poison). */
 export function toolSchemaFingerprint(tool: SealableToolLike): string {
+  const volatileDescription = tool.descriptionCarriesTurnState === true;
   return sha256(stableJson({
     name: typeof tool.name === 'string' ? tool.name : '',
-    description: typeof tool.description === 'string' ? tool.description : '',
+    description: !volatileDescription && typeof tool.description === 'string' ? tool.description : '',
     parameters: tool.parameters ?? null,
   }));
 }
