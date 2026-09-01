@@ -234,7 +234,16 @@ in two weeks a failed run named its own cause.
   completed as a successful answer with nothing written. The host lane runs one turn per source and
   reduces it to a terminal, so the rubric's "more tool calls next turn" had no next turn. The runner now
   keeps the same turn open for a bare CONTINUE marker (bounded, 3), the rubric says so, and the two
-  pins cover it. Attempt 16 runs on all of it.
+  pins cover it; (16) the gate-12 logging fix named the real persist cause: `plan_task binding-seal
+  intent could not prepare exact work: non-conversational graph has no expected-work binding writer` —
+  the predicate recognized only chat under the host engine (plus background/cron-labeled execution
+  graphs), while `selectTurnEngine` ignores session kind: the same host engine owns an execution
+  session's turn. An ADMITTED one-op local-write plan was therefore refused at persist, three times per
+  run. Chat OR execution under the host engine now counts as the binding writer (`resolution-ledger.ts`;
+  the binderless workflow fail-closed pin untouched; the execution-owners pin covers `direct`). Sonnet
+  also hit the 150 s first-content wall twice more at exactly the budget (silence measured event-to-
+  event), handing the frames to GLM — which would have completed the write both times but for this
+  persist gate. Attempt 17 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
