@@ -129,6 +129,16 @@ in two weeks a failed run named its own cause.
   the authority on the port. Baseline #6 (`1788271157248-5b1e0b`) is the live connection proof. The
   suite/packaged declarations below were taken at `a6248874`/`1c3e1177`; this commit was verified with
   focused suites (host 218, adapters, settlement lanes, artifact leaf closure) only.
+- **platform-49 GLM baseline #6 (06:59, run `1788271157248-5b1e0b`) — the business work completed.**
+  `GOOGLESHEETS_INSERT_DIMENSION` ✔, `GOOGLESHEETS_BATCH_UPDATE` ×2 ✔ (three real mutating crossings on
+  the authored call authority), `space_refresh` ✔, `notify_user` ✔, one invalid-arguments write repaired
+  in flight. It then blocked on the very last hoop: the step's own hand-back, `workflow_step_result`,
+  was refused twice as `effect_unknown` (the runner attaches it per step; it had never been in the tool
+  registry) and the no-progress governor reported a finished step as a "bounded internal host error".
+  Fix (`fe4f628e`): registry row as a read-effect control + `ALWAYS_READ` in the name taxonomy; pinned.
+  Baseline #7 (`1788272392212-08d201`) is the end-to-end proof. Note: #6 already appended today's digest
+  row to the real sheet; the workflow's own reconcile-against-log logic is what should keep #7 from
+  duplicating it.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
