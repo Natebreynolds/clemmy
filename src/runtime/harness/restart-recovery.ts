@@ -550,7 +550,8 @@ export interface RestartRecoveryRecord {
     | 'boot_cap'
     | 'user_stopped'
     | 'identity_missing'
-    | 'batch_unproven';
+    | 'batch_unproven'
+    | 'not_exact_checkpoint';
   errors: string[];
 }
 
@@ -1205,6 +1206,19 @@ export function recoverInterruptedChatRuns(
       // earlier generic restart dispatch in this same scan began running).
       // Defer without an audit/progress row rather than exceeding the global
       // ceiling or publishing a generic terminal for this private owner.
+      continue;
+    }
+    // Periodic ticks own only the private exact-checkpoint queue.
+    // exactCheckpointsOnly narrows the session LIST, not the decision: a
+    // listed session whose durable HostRecoveryState names a different source
+    // than its in-flight identity is not an exact checkpoint, and it must not
+    // fall through to the generic auto-resume branch here — that branch's
+    // per-call cap resets every tick and the marker stays armed across
+    // dispatch, so a still-running generic resume could be re-dispatched on
+    // every tick. Boot keeps the broader reconciliation surface unchanged.
+    if (options.exactCheckpointsOnly && !exactCheckpointRecovery) {
+      record.autoResumeSkipped = 'not_exact_checkpoint';
+      records.push(record);
       continue;
     }
     if (!recoveryIdentity || acceptedInput === null) record.autoResumeSkipped = 'identity_missing';
