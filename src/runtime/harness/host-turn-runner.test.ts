@@ -7908,6 +7908,34 @@ test('production host stops and names a literally scoped operation the catalog n
   }
 });
 
+test('the last refusal check survives a text-only give-up frame after the refused tool frame (say why)', async () => {
+  // Live 2026-09-01: two refused write frames, then the model answered in
+  // text; the terminal persisted only the governor stage because the trailing
+  // history item was not a tool result. The most recent TOOL frame is the
+  // cause; a later frame that dispatched cleanly still hides older refusals.
+  const { lastHostRefusalDetail } = await import('./host-turn-runner.js');
+  const { buildHostToolDispositionResult } = await import('./host-model-result-receipt.js');
+  const refused = buildHostToolDispositionResult({
+    callId: 'call-write',
+    toolName: 'composio_execute_tool',
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'c'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    countsRefusal: true,
+    diagnostic: "Tool 'composio_execute_tool' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed. Failed check: workflow_plan_scope_missing_or_changed. No local or external mutation was attempted.",
+  });
+  const call = { type: 'function_call' as const, callId: 'call-write', name: 'composio_execute_tool', arguments: '{}' };
+  const giveUp = { type: 'message' as const, role: 'assistant' as const, status: 'completed' as const, content: [{ type: 'output_text' as const, text: 'I could not complete the write.' }] };
+  assert.equal(
+    lastHostRefusalDetail([call, refused, giveUp] as never),
+    'workflow_plan_scope_missing_or_changed',
+  );
+  const clean = { type: 'function_call_result' as const, callId: 'call-read', name: 'file_query', status: 'completed' as const, output: { type: 'text' as const, text: 'ok' } };
+  const readCall = { type: 'function_call' as const, callId: 'call-read', name: 'file_query', arguments: '{}' };
+  assert.equal(lastHostRefusalDetail([call, refused, readCall, clean, giveUp] as never), undefined, 'a later clean frame hides the older refusal');
+});
+
 test('a no-progress terminal carries the last host refusal check as bounded blockedDetail (say why)', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();

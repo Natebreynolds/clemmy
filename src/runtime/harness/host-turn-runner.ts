@@ -6853,13 +6853,22 @@ function hostRefusalDiagnosticDetail(diagnostic: string): string {
   return diagnostic;
 }
 
-/** The last frame's host refusal, as bounded machine detail. Only the trailing
- * run of tool results (the most recent frame) is inspected, so an older
- * refusal can never be reported for a later, refusal-free terminal. */
+/** The most recent tool frame's host refusal, as bounded machine detail. Only
+ * one run of tool results is inspected — the latest one — so an older refusal
+ * can never be reported past a later frame that dispatched cleanly. Items
+ * after that run (the model's give-up text, a host directive) are skipped:
+ * live 2026-09-01 a run that ended on the model's text after two refused
+ * write frames persisted only the governor stage, and the actual check
+ * (`plan_scope_missing_or_changed`) had to be reconstructed from timestamps. */
 export function lastHostRefusalDetail(history: readonly AgentInputItem[]): string | undefined {
+  let insideResultRun = false;
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const item = history[index]!;
-    if ((item as { type?: unknown }).type !== 'function_call_result') break;
+    if ((item as { type?: unknown }).type !== 'function_call_result') {
+      if (insideResultRun) break;
+      continue;
+    }
+    insideResultRun = true;
     const text = (functionResultText(item) ?? '').trim();
     if (!text) continue;
     let diagnostic: string | null = null;
