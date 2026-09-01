@@ -70,6 +70,7 @@ import {
 } from '../runtime/harness/local-planning-capability.js';
 import { requestedCapabilityEffectScope } from '../memory/capability-effect-scope.js';
 import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
+import { acceptedSourceIsWorkflowInternal } from '../runtime/harness/named-workflow-host-dispatch.js';
 import {
   accountSelectionForCitedWrite,
   thisTurnSearchAccountSelectionBlockers,
@@ -1159,7 +1160,10 @@ async function executePlanTask(
       ? continuation.parentInput.trim()
       : consumingObjective;
   if (!objective) throw new Error('plan_task accepted source text is missing');
-  const uniqueWorkflow = uniqueWorkflowRunRequest(
+  // A workflow step's own accepted text names its workflow and says "run";
+  // the step surface denies workflow_run, so the class guard decides first
+  // (lane parity with tryHostDispatchNamedWorkflow).
+  const uniqueWorkflow = acceptedSourceIsWorkflowInternal(sessionId, sourceUserSeq) ? null : uniqueWorkflowRunRequest(
     objective,
     priorAcceptedSourceTexts(sessionId, sourceUserSeq),
   );
