@@ -1026,7 +1026,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 21257
+          "bytes": 23462
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -2427,7 +2427,7 @@
           "bytes": 3744
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 157274
+          "bytes": 157934
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -3501,7 +3501,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 21257
+          "bytes": 23462
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -4902,7 +4902,7 @@
           "bytes": 3744
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 157274
+          "bytes": 157934
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
