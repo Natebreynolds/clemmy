@@ -241,3 +241,113 @@ test('the 45s memo prevents repeat probes inside the TTL; force busts it', async
   await getCliHealth('railway', { force: true });
   assert.equal(probes, after + 1, 'force re-probes');
 });
+
+// ─── Transient probe failures keep the last verdict ─────────────────
+// Live evidence: the owner's CLI answered its probe in 1.5s with exit 0 from
+// the daemon's exact spawn shape, yet the cache said authStatus 'error' from
+// one earlier transient — and every surface rendered that as "re-auth". A
+// probe that produced no verdict must not overwrite one that did.
+
+test('previous ok + non-zero exit without the signed-out pattern keeps ok and marks it stale', async () => {
+  const { getCliHealth, invalidateCliHealth, readPersistedHealth, cliHealthStaleNote } = await import('./auth-health.js');
+  stubInstalled();
+  invalidateCliHealth('railway');
+  _testOnly_setProbeExec(async () => ({ exitCode: 0, output: 'Logged in as keep@example.com', timedOut: false }));
+  const good = await getCliHealth('railway', { force: true });
+  assert.equal(good.authStatus, 'ok');
+  assert.equal(good.staleSince, undefined);
+
+  invalidateCliHealth('railway');
+  _testOnly_setProbeExec(async () => ({
+    exitCode: 1,
+    output: '',
+    stderr: '\u001B[31mError: connect ETIMEDOUT api.example.test:443\u001B[39m',
+    timedOut: false,
+  }));
+  const kept = await getCliHealth('railway', { force: true });
+  assert.equal(kept.authStatus, 'ok', 'an unexplained non-zero exit is not a sign-out');
+  assert.equal(kept.username, 'keep@example.com');
+  assert.equal(kept.staleSince, good.checkedAt, 'staleSince is the time of the verdict being kept');
+  assert.deepEqual(kept.lastProbeError, {
+    exitCode: 1,
+    timedOut: false,
+    stderrHead: 'Error: connect ETIMEDOUT api.example.test:443',
+  });
+  assert.equal(readPersistedHealth().railway?.authStatus, 'ok', 'the persisted cache keeps the verdict too');
+  assert.equal(readPersistedHealth().railway?.staleSince, good.checkedAt);
+  assert.match(cliHealthStaleNote(kept, Date.parse(kept.checkedAt) + 3 * 3_600_000) ?? '', /^checked 3h ago, last probe failed \(exit 1\)$/);
+
+  // A second transient keeps the ORIGINAL staleSince (age keeps growing), and
+  // the memo serves the settled record, not the raw probe.
+  invalidateCliHealth('railway');
+  const keptAgain = await getCliHealth('railway', { force: true });
+  assert.equal(keptAgain.authStatus, 'ok');
+  assert.equal(keptAgain.staleSince, good.checkedAt);
+  assert.equal((await getCliHealth('railway')).authStatus, 'ok');
+
+  // The next real verdict clears the stale marker.
+  invalidateCliHealth('railway');
+  _testOnly_setProbeExec(async () => ({ exitCode: 0, output: 'Logged in as keep@example.com', timedOut: false }));
+  const fresh = await getCliHealth('railway', { force: true });
+  assert.equal(fresh.authStatus, 'ok');
+  assert.equal(fresh.staleSince, undefined);
+  assert.equal(fresh.lastProbeError, undefined);
+  assert.equal(cliHealthStaleNote(fresh), null);
+});
+
+test('the signed-out pattern still flips a kept ok to signed_out and fires the signed-out event once', async () => {
+  const { getCliHealth, invalidateCliHealth, onCliSignedOut } = await import('./auth-health.js');
+  stubInstalled();
+  const signedOut: string[] = [];
+  const unsubscribe = onCliSignedOut((h) => signedOut.push(h.id));
+  try {
+    invalidateCliHealth('railway');
+    _testOnly_setProbeExec(async () => ({ exitCode: 1, output: '', stderr: 'boom', timedOut: false }));
+    assert.equal((await getCliHealth('railway', { force: true })).authStatus, 'ok', 'transient first: still ok');
+    assert.deepEqual(signedOut, []);
+
+    invalidateCliHealth('railway');
+    _testOnly_setProbeExec(async () => ({
+      exitCode: 1,
+      output: 'Unauthorized. Please login with `railway login`',
+      timedOut: false,
+    }));
+    const out = await getCliHealth('railway', { force: true });
+    assert.equal(out.authStatus, 'signed_out');
+    assert.equal(out.staleSince, undefined);
+    assert.equal(out.lastProbeError, undefined);
+    assert.deepEqual(signedOut, ['railway']);
+
+    // A transient AFTER signed_out keeps signed_out (no verdict = no change)
+    // and does not re-fire the event.
+    invalidateCliHealth('railway');
+    _testOnly_setProbeExec(async () => ({ exitCode: null, output: '', timedOut: true }));
+    const stillOut = await getCliHealth('railway', { force: true });
+    assert.equal(stillOut.authStatus, 'signed_out');
+    assert.equal(stillOut.staleSince, out.checkedAt);
+    assert.deepEqual(signedOut, ['railway']);
+  } finally {
+    unsubscribe();
+  }
+});
+
+test('a timeout with no previous verdict is unknown, never error', async () => {
+  const { getCliHealth, invalidateCliHealth, readPersistedHealth, cliHealthStaleNote } = await import('./auth-health.js');
+  stubInstalled();
+  assert.equal(readPersistedHealth().gcloud, undefined, 'fixture: gcloud has never been probed in this home');
+  invalidateCliHealth('gcloud');
+  _testOnly_setProbeExec(async () => ({ exitCode: null, output: '', timedOut: true }));
+  const first = await getCliHealth('gcloud', { force: true });
+  assert.equal(first.authStatus, 'unknown');
+  assert.notEqual(first.authStatus, 'error');
+  assert.equal(first.staleSince, undefined, 'nothing was kept, so nothing is stale');
+  assert.deepEqual(first.lastProbeError, { exitCode: null, timedOut: true, stderrHead: '' });
+  assert.match(cliHealthStaleNote(first, Date.parse(first.checkedAt)) ?? '', /^checked just now, last probe failed \(timed out\)$/);
+  assert.equal(readPersistedHealth().gcloud?.authStatus, 'unknown');
+});
+
+test('classifyProbeOutput is unchanged: the pure classifier still says error for a no-verdict probe', () => {
+  // The truth table above is the oracle for classification; the transient
+  // handling lives in commit, where the previous verdict is known.
+  assert.equal(classifyProbeOutput(railway, { exitCode: 1, output: 'connect ETIMEDOUT', timedOut: false }).authStatus, 'error');
+});
