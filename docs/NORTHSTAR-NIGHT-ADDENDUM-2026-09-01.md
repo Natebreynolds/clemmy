@@ -185,6 +185,21 @@ in two weeks a failed run named its own cause.
   named-workflow shortcut swallowed the first improvement turn because its prompt said the workflow
   "was asked to run" (fixed: improvement sessions are host-internal, `cc71b172`).
 - Brain switched to `claude_oauth` / `claude-sonnet-5` via the console door for the owner's test.
+- **Live attempts on `team-activity-slack-updates` (09:00–09:55), each one a real gate, each fixed +
+  pinned the same hour:** (1) the named-workflow shortcut swallowed the turn — improvement sessions are
+  host-internal; (2) four *different* `plan_task` complaints terminalized at the third — keyed
+  `schema_invalid:<key>` stages + transition budget 2→6; (3–4) the single "clean retry" for zero-gain
+  lookups killed `read_file`+`recall` paging and `workflow_get` summary→full — deferred as the next
+  governor change (ten pins), worked around by inlining the definition and the script into the prompt;
+  (5) `schema_too_big:goal.objective` refused three times with no limit named — the admission reason now
+  keeps the validator message, and the prompt states the step shapes + field bounds; (6) the consumer
+  passed `MODELS.primary` (a Codex id) and overrode the brain switch — no explicit model, the bridge
+  resolves the brain role (the cron path still does this); (7) the pinned Sonnet was preselected away
+  by a silent cooldown — a pin is a pin for Claude/Codex too and a cooldown never skips it; (8) Sonnet
+  crossed the 60 s first-content budget composing on a 45k-token prompt, was silenced, and the turn ended
+  on `ask_user_question` (a genuine fork: local baseline file, runtime-built queries, org-URL read) —
+  budget 60→150 s with watchdog 75→180 s, the prompt decides max-preserving and never asks, and the
+  model's note rides with a failed attempt. Attempt 9 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
