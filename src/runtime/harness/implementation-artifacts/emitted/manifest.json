@@ -144,7 +144,7 @@
           "bytes": 7317
         },
         "src/runtime/graph/work-topology.ts": {
-          "bytes": 20230
+          "bytes": 20530
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
           "bytes": 54441
@@ -1026,7 +1026,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 24233
+          "bytes": 24381
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -2619,7 +2619,7 @@
           "bytes": 7317
         },
         "src/runtime/graph/work-topology.ts": {
-          "bytes": 20230
+          "bytes": 20530
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
           "bytes": 54441
@@ -3501,7 +3501,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 24233
+          "bytes": 24381
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
