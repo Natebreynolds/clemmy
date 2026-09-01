@@ -2624,6 +2624,7 @@ export async function runPackagedV314DaemonRehearsal(
     'vault/00-System/workflows/objective-execution-loop/SKILL.md',
     'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md',
     canonicalMigrationSeed,
+    ...BUILTIN_SKILL_SEED_IDS.map((id) => `skills/${id}/SKILL.md`),
   ].sort();
   add('first_packaged_boot_added_files_are_closed_causal_categories_with_exact_seed_semantics',
     firstBootAdded.unexpected.length === 0
