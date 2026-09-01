@@ -26,7 +26,9 @@ import {
   appendConversationPreambleOnce,
   conversationPreambleDeliveryRequest,
   listEvents,
+  openEventLog,
 } from '../runtime/harness/eventlog.js';
+import { PLAN_TASK_BINDING_SEAL_INTENTS_TABLE } from '../runtime/harness/host-planned-resolution-coexistence.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
 import {
@@ -116,6 +118,8 @@ type PlanTaskPreparationTestHooks = {
     acceptedTaskId: string;
     logicalToolCallId: string;
   }) => string | null;
+  /** Clock for the pre-seal recovery age budget (tests only). */
+  sealRecoveryNow?: () => number;
 };
 
 let planTaskPreparationTestHooks: PlanTaskPreparationTestHooks | null = null;
@@ -125,6 +129,50 @@ export function installPlanTaskPreparationTestHooks(
   hooks: PlanTaskPreparationTestHooks | null,
 ): void {
   planTaskPreparationTestHooks = hooks;
+}
+
+/**
+ * Age budget for host-owned pre-seal recovery of an exact current intent.
+ *
+ * Sealing is metadata/port reproof only — seconds, never a model call — so an
+ * intent that is still failing to seal this long after it was recorded is not
+ * going to seal without something outside this loop changing (a frozen catalog
+ * whose identity no longer matches, a provider identity that cannot be
+ * reproved). Without a budget the fresh-turn path answered "host preparation
+ * is still pending. Please retry" and the daemon sweep re-sealed forever: safe
+ * but unavailable, which is a failure. Past the budget a failing attempt
+ * becomes `expired`, a factual non-resumable stop that names the last reason.
+ * The budget is measured from the immutable intent's own `recorded_at`, so it
+ * needs no counter and no schema; it is only ever applied to an attempt that
+ * has just failed, so a machine that slept past the budget still gets one real
+ * attempt before it is told the truth.
+ */
+export const PLAN_TASK_SEAL_RECOVERY_MAX_AGE_MS = 15 * 60_000;
+
+type PlanTaskSealRecoveryHold =
+  | { status: 'held'; reason: string }
+  | { status: 'expired'; reason: string; heldSince: string; ageMs: number };
+
+function planTaskSealRecoveryAgeBudget(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): { heldSince: string; ageMs: number; exhausted: boolean } {
+  const row = openEventLog().prepare(`
+    SELECT recorded_at AS recordedAt
+      FROM ${PLAN_TASK_BINDING_SEAL_INTENTS_TABLE}
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(input.sessionId, input.sourceUserSeq) as { recordedAt: string } | undefined;
+  const heldSince = typeof row?.recordedAt === 'string' ? row.recordedAt : '';
+  const recordedAtMs = heldSince ? Date.parse(heldSince) : Number.NaN;
+  const now = planTaskPreparationTestHooks?.sealRecoveryNow?.() ?? Date.now();
+  const ageMs = Number.isFinite(recordedAtMs) ? Math.max(0, now - recordedAtMs) : 0;
+  return {
+    heldSince,
+    ageMs,
+    // An unreadable timestamp never expires anything: fail toward the
+    // existing held behavior, never toward a terminal the row cannot justify.
+    exhausted: Number.isFinite(recordedAtMs) && ageMs > PLAN_TASK_SEAL_RECOVERY_MAX_AGE_MS,
+  };
 }
 
 const PlanId = WorkTopologyIdSchema;
@@ -698,12 +746,23 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
   sourceUserSeq: number;
 }): Promise<
   | { status: 'not_pending' | 'prepared' | 'replayed' }
-  | { status: 'held'; reason: string }
+  | PlanTaskSealRecoveryHold
 > {
   const owner = planTaskBindingSealRecoveryOwner(input);
   if (owner.status === 'held') {
+    // A legacy/corrupt owner is deliberately visible and held, never expired:
+    // it has no exact recorded intent to measure a budget from.
     return { status: 'held', reason: 'plan graph has no exact current pre-seal recovery owner' };
   }
+  // Every hold below is a failed attempt on an exact current intent. Inside
+  // the age budget it stays `held` (retry is honest); past it the same failure
+  // is reported as `expired` so the fresh-turn owner can stop factually.
+  const budget = owner.status === 'ready' ? planTaskSealRecoveryAgeBudget(input) : null;
+  const hold = (reason: string): PlanTaskSealRecoveryHold => (
+    budget?.exhausted
+      ? { status: 'expired', reason, heldSince: budget.heldSince, ageMs: budget.ageMs }
+      : { status: 'held', reason }
+  );
   // A completed plan has no remaining pre-seal owner, but a later host-only
   // checkpoint (for example an asynchronous read refinement) still resumes in
   // a fresh process with an empty capability factory.  Reconstruct the exact
@@ -717,14 +776,14 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
     if (owner.status === 'missing' && persistedCatalog.reason === 'missing_snapshot') {
       return { status: 'not_pending' };
     }
-    return { status: 'held', reason: `persisted frozen catalog is ${persistedCatalog.reason}` };
+    return hold(`persisted frozen catalog is ${persistedCatalog.reason}`);
   }
   const source = listEvents(input.sessionId, {
     sinceSeq: input.sourceUserSeq - 1,
     types: ['user_input_received'],
     limit: 1,
   }).find((event) => event.seq === input.sourceUserSeq);
-  if (!source) return { status: 'held', reason: 'accepted source is unavailable for exact plan recovery' };
+  if (!source) return hold('accepted source is unavailable for exact plan recovery');
   // A fresh process intentionally starts with no process-local tool_search
   // disclosures. Re-materialize only the manifest ids already named by this
   // source's immutable snapshot, then require the ordinary snapshot reader to
@@ -744,10 +803,7 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
         || !identity.operationId.trim()
       ));
       if (missingProviderSchemaIdentity) {
-        return {
-          status: 'held',
-          reason: `frozen provider identity is incomplete: ${missingProviderSchemaIdentity.capabilityId}`,
-        };
+        return hold(`frozen provider identity is incomplete: ${missingProviderSchemaIdentity.capabilityId}`);
       }
       if (providerExpected.length > 0) {
         const reproved = await registerProofProvisionedCapabilities(input, {
@@ -759,21 +815,15 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
           recoveryExpectedIdentities: persistedCatalog.identities,
         });
         if (reproved.refusal) {
-          return {
-            status: 'held',
-            reason: `frozen proof-provisioned catalog reproof refused: ${reproved.refusal.code}:${reproved.refusal.identifier}`,
-          };
+          return hold(`frozen proof-provisioned catalog reproof refused: ${reproved.refusal.code}:${reproved.refusal.identifier}`);
         }
       }
     } catch (error) {
-      return {
-        status: 'held',
-        reason: `frozen catalog materialization failed: ${String(error instanceof Error ? error.message : error)}`,
-      };
+      return hold(`frozen catalog materialization failed: ${String(error instanceof Error ? error.message : error)}`);
     }
     rehydratedCatalog = freezeCatalogSnapshotForSource(input);
     if (!rehydratedCatalog.ok) {
-      return { status: 'held', reason: `frozen catalog ${rehydratedCatalog.reason}` };
+      return hold(`frozen catalog ${rehydratedCatalog.reason}`);
     }
   }
   if (owner.status === 'missing') return { status: 'not_pending' };
@@ -783,12 +833,9 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
     (frozen.status !== 'fixed' && frozen.status !== 'replayed')
     || frozen.contract.contractId !== intent.contractId
   ) {
-    return {
-      status: 'held',
-      reason: frozen.status === 'fixed' || frozen.status === 'replayed'
-        ? 'recovered contract conflicts with immutable pre-seal intent'
-        : `expected-work freeze is ${frozen.status}`,
-    };
+    return hold(frozen.status === 'fixed' || frozen.status === 'replayed'
+      ? 'recovered contract conflicts with immutable pre-seal intent'
+      : `expected-work freeze is ${frozen.status}`);
   }
   const sealInput = {
     sessionId: input.sessionId,
@@ -802,11 +849,11 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
   const injectedSealFailure = planTaskPreparationTestHooks
     ?.recoveryBindingSealFailure?.(intent.identity) ?? null;
   if (injectedSealFailure) {
-    return { status: 'held', reason: injectedSealFailure };
+    return hold(injectedSealFailure);
   }
   let sealed = await sealFreshPlanCapabilityBindings(sealInput);
   if (!sealed.ok) sealed = await sealFreshPlanCapabilityBindings(sealInput);
-  if (!sealed.ok) return { status: 'held', reason: sealed.reason };
+  if (!sealed.ok) return hold(sealed.reason);
   // The intent owns the exact future acknowledgement, but it is not public
   // conversation state until every selected binding is executable. Publishing
   // first can visibly promise work while the immutable graph is still held.
@@ -814,10 +861,7 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
   try {
     preamble = appendConversationPreambleOnce({ source, text: intent.preamble });
   } catch (error) {
-    return {
-      status: 'held',
-      reason: `exact preamble recovery failed: ${String(error instanceof Error ? error.message : error)}`,
-    };
+    return hold(`exact preamble recovery failed: ${String(error instanceof Error ? error.message : error)}`);
   }
   try {
     const checkpoint = recordPlanTaskPreparationCheckpoint({
@@ -827,10 +871,7 @@ export async function recoverPlanTaskBindingSealPreparation(input: {
     });
     return { status: checkpoint.inserted ? 'prepared' : 'replayed' };
   } catch (error) {
-    return {
-      status: 'held',
-      reason: `exact checkpoint recovery failed: ${String(error instanceof Error ? error.message : error)}`,
-    };
+    return hold(`exact checkpoint recovery failed: ${String(error instanceof Error ? error.message : error)}`);
   }
 }
 
@@ -848,6 +889,9 @@ export async function recoverPendingPlanTaskBindingSealPreparations(input: {
   activated: number;
   deliveryRequired: number;
   held: number;
+  /** Exact intents whose failing seal is past the age budget. They are not
+   * retried into activation; the fresh-turn owner reports them factually. */
+  expired: number;
   records: Array<{
     sessionId: string;
     sourceUserSeq: number;
@@ -864,6 +908,7 @@ export async function recoverPendingPlanTaskBindingSealPreparations(input: {
     activated: 0,
     deliveryRequired: 0,
     held: 0,
+    expired: 0,
     records: [] as Array<{
       sessionId: string;
       sourceUserSeq: number;
@@ -874,8 +919,9 @@ export async function recoverPendingPlanTaskBindingSealPreparations(input: {
   };
   for (const candidate of candidates) {
     const preparation = await recoverPlanTaskBindingSealPreparation(candidate);
-    if (preparation.status === 'held') {
-      summary.held += 1;
+    if (preparation.status === 'held' || preparation.status === 'expired') {
+      if (preparation.status === 'held') summary.held += 1;
+      else summary.expired += 1;
       summary.records.push({
         ...candidate,
         preparation: preparation.status,
