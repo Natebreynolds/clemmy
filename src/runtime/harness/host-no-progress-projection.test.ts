@@ -268,6 +268,66 @@ test('all same-source citable catalog growth collapses to one pre-graph transiti
   assert.deepEqual(grown.authority, projected.authority);
 });
 
+test('each distinct exact write ref disclosed is its own effect gain; re-disclosure and siblings are not', () => {
+  const identity = accepted('write-refs');
+  const disclose = (capabilities: Record<string, unknown>[]) => appendEvent({
+    sessionId: identity.sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: { sourceUserSeq: identity.sourceUserSeq, capabilities },
+  });
+  // The first broad search discloses unrelated writes (live 2026-09-01:
+  // workflow_run/create/edit_step) plus reads.
+  disclose([
+    { identifier: 'workflow_run', capabilityRef: 'cap:local:workflow_run', effectClass: 'write' },
+    { identifier: 'workflow_create', capabilityRef: 'cap:local:workflow_create', effectClass: 'write' },
+    { identifier: 'soql', capabilityRef: 'cap:live:soql', effectClass: 'read' },
+  ]);
+  const first = projectHostNoProgressAuthority(identity);
+  assert.equal(first.status, 'ok');
+  if (first.status !== 'ok') return;
+  assert.equal(first.authority.effect.length, 3, 'one write class token + one token per exact write ref');
+  assert.doesNotMatch(JSON.stringify(first.authority), /workflow_run|workflow_create|cap:local/);
+
+  // Re-disclosing the same writes (a reworded query) mints nothing.
+  disclose([
+    { identifier: 'workflow_create', capabilityRef: 'cap:local:workflow_create', effectClass: 'write' },
+    { identifier: 'workflow_run', capabilityRef: 'cap:local:workflow_run', effectClass: 'write' },
+  ]);
+  const repeated = projectHostNoProgressAuthority(identity);
+  assert.equal(repeated.status, 'ok');
+  if (repeated.status !== 'ok') return;
+  assert.deepEqual(repeated.authority, first.authority);
+
+  // The refusal's prescribed search discloses the exact write the draft
+  // lacked: a genuinely new effect authority, not another sibling.
+  disclose([
+    { identifier: 'workflow_update', capabilityRef: 'cap:local:workflow_update:reversible', effectClass: 'write' },
+  ]);
+  const exact = projectHostNoProgressAuthority(identity);
+  assert.equal(exact.status, 'ok');
+  if (exact.status !== 'ok') return;
+  assert.equal(exact.authority.effect.length, 4);
+  assert.deepEqual(exact.authority.operation, first.authority.operation, 'catalog growth stays one transition');
+  const governor = initializeNoProgressGovernor({ taskKey: 'write-refs', authority: repeated.authority });
+  const decision = observeNoProgress(governor, {
+    taskKey: 'write-refs',
+    attemptClass: 'authority_acquisition',
+    authority: exact.authority,
+  });
+  assert.equal(decision.action, 'continue');
+  assert.equal(decision.reason, 'authority_progress');
+  assert.deepEqual(decision.gained, ['effect']);
+
+  // A read-only disclosure after that adds no effect authority.
+  disclose([{ identifier: 'r', capabilityRef: 'cap:live:read-only', effectClass: 'read' }]);
+  const readOnly = projectHostNoProgressAuthority(identity);
+  assert.equal(readOnly.status, 'ok');
+  if (readOnly.status !== 'ok') return;
+  assert.deepEqual(readOnly.authority.effect, exact.authority.effect);
+});
+
 test('distinct role-bound top-ranked capability stages advance without counting catalog siblings', () => {
   const identity = accepted('role-bound-discovery-stages');
   const roleKey = initializeDiscoveryRole(identity);

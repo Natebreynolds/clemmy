@@ -142,10 +142,16 @@ function sortedSnapshot(
   });
 }
 
+/** Distinct exact write refs (most recently disclosed first) that may each
+ * carry an effect-authority token. Prior authority is cumulative inside the
+ * governor, so this bounds the snapshot, never the memory of what was seen. */
+const MAX_DISCLOSED_WRITE_REF_TOKENS = 8;
+
 function eventCapabilityTokens(
   events: readonly EventRow[],
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
+  const disclosedWriteRefs: string[] = [];
   for (const event of events) {
     if (event.type === 'capability_resolution') {
       // Resolution entries are candidate alternatives, even when their
@@ -171,19 +177,24 @@ function eventCapabilityTokens(
       if (citable) {
         tokens.operation.add(token('operation', 'citable_discovery_available', ['available']));
       }
-      // A typed missing-write refusal can expose tool_search only when the
-      // current card has no write. The first exact same-source write found by
-      // that search is a genuinely new effect authority class, not another
-      // sibling candidate. Give that one class its own bounded token so the
-      // runner can leave recovery-only mode and present plan_task. Further
-      // write discoveries collapse to this same token.
-      const citableWrite = capabilities.some((candidate) => {
+      // A typed missing-write refusal exposes tool_search so the model can
+      // find the exact write the draft lacks. The first same-source write is
+      // a new effect authority class (one bounded token), and EACH distinct
+      // exact write ref is its own gain as well. Live 2026-09-01: the first
+      // broad search of a turn disclosed three unrelated writes and spent the
+      // class token; when the refusal's prescribed search later disclosed the
+      // exact write it asked for, that disclosure counted as nothing and the
+      // spent retry terminalized a converging turn. Re-disclosing a ref the
+      // governor already holds is still no gain (its authority is cumulative),
+      // and query wording, siblings, and schema churn never enter the token.
+      const writeRefs = capabilities.flatMap((candidate) => {
         const row = record(candidate);
-        return nonEmptyString(row?.capabilityRef) !== null
-          && row?.effectClass === 'write';
+        const capabilityRef = nonEmptyString(row?.capabilityRef);
+        return capabilityRef !== null && row?.effectClass === 'write' ? [capabilityRef] : [];
       });
-      if (citableWrite) {
+      if (writeRefs.length > 0) {
         tokens.effect.add(token('effect', 'citable_discovery_effect', ['write']));
+        disclosedWriteRefs.push(...writeRefs);
       }
       continue;
     }
@@ -216,6 +227,11 @@ function eventCapabilityTokens(
       }
       continue;
     }
+  }
+  const recentWriteRefs = [...new Set(disclosedWriteRefs.reverse())]
+    .slice(0, MAX_DISCLOSED_WRITE_REF_TOKENS);
+  for (const capabilityRef of recentWriteRefs) {
+    tokens.effect.add(token('effect', 'citable_write_ref', [capabilityRef]));
   }
 }
 
