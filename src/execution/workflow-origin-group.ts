@@ -374,7 +374,7 @@ export interface WorkflowOriginGroupTerminalIdentity {
 }
 
 export type WorkflowOriginGroupReportBackOutcome = 'done' | 'blocked' | 'failed';
-export type WorkflowOriginGroupTerminalStatus = WorkflowOriginGroupReportBackOutcome | 'needs_input';
+export type WorkflowOriginGroupTerminalStatus = WorkflowOriginGroupReportBackOutcome | 'needs_input' | 'cancelled';
 
 export interface WorkflowOriginGroupMemberReportBackDigest {
   runId: string;
@@ -2105,6 +2105,7 @@ function workflowOriginTerminalDigest(input: WorkflowOriginGroupSettlementTermin
       && input.status !== 'blocked'
       && input.status !== 'failed'
       && input.status !== 'needs_input'
+      && input.status !== 'cancelled'
     )
     || !text
   ) {
@@ -2212,6 +2213,7 @@ function decodeWorkflowOriginGroupSettlementReceipt(
       && raw.terminalStatus !== 'blocked'
       && raw.terminalStatus !== 'failed'
       && raw.terminalStatus !== 'needs_input'
+      && raw.terminalStatus !== 'cancelled'
     )
     || !isDigest(raw.terminalDigest)
     || memberRunIds.length === 0

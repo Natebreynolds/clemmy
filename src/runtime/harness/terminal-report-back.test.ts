@@ -31,7 +31,7 @@ const {
 type TerminalRunFacts = import('./terminal-report-back.js').TerminalRunFacts;
 const { attachSessionViewer, sessionViewerSeenSince, resetSessionViewersForTest } =
   await import('./session-viewers.js');
-const { listNotifications, getNotificationDestinationsForRecord } = await import('../notifications.js');
+const { addNotification, listNotifications, getNotificationDestinationsForRecord } = await import('../notifications.js');
 
 const BASE: TerminalRunFacts = {
   sessionId: 'sess-x',
@@ -241,6 +241,68 @@ test('an unwatched foreground run emits the same terminal signal a background ta
     getNotificationDestinationsForRecord(notification).map((d) => `${d.type}:${d.id}`).sort(),
     getNotificationDestinationsForRecord(backgroundEquivalent).map((d) => `${d.type}:${d.id}`).sort(),
     'foreground and background terminal report-backs must resolve identical destinations',
+  );
+});
+
+test('an exact workflow-origin terminal keeps one authoritative report-back carrier', async () => {
+  stopWatcher = startTerminalReportBackWatcher({ graceMs: 0 });
+  const sessionId = 'sess-exact-workflow-origin';
+  createSession({ id: sessionId, kind: 'chat', channel: 'mobile', title: 'workflow origin' });
+  const source = appendEvent({
+    sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'run the workflow' },
+  });
+  for (let i = 0; i < 12; i += 1) {
+    appendEvent({
+      sessionId, turn: 1, role: 'assistant', type: 'tool_called',
+      data: { tool: 'workflow_read', callId: `workflow-origin-${i}` },
+    });
+  }
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq, runId: 'workflow-run-1' };
+  const detail = 'The workflow is blocked because its result still needs verification.';
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'blocked',
+    resumable: true,
+    presentation: { kind: 'blocked', text: detail },
+  }, {
+    legacyReason: 'workflow_async_terminal',
+    metadata: { transport: 'workflow_report_back' },
+  });
+
+  // Production's workflow-origin report-back owns this durable receipt. The
+  // generic foreground watcher must not mint a second page for the same source.
+  addNotification({
+    id: `workflow-origin-carrier-${sessionId}`,
+    kind: 'workflow',
+    title: 'Workflow blocked',
+    body: detail,
+    createdAt: new Date().toISOString(),
+    read: false,
+    silent: true,
+    metadata: {
+      runId: 'workflow-run-1',
+      source: 'workflow_origin_terminal',
+      sourceUserSeq: source.seq,
+      terminalReportBack: true,
+      exactOriginDelivery: { version: 1, target: { type: 'origin_chat' } },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const sourceNotifications = listNotifications(100).filter((item) => (
+    item.id.includes(sessionId)
+  ));
+  assert.deepEqual(
+    sourceNotifications.map((item) => item.id),
+    [`workflow-origin-carrier-${sessionId}`],
+    'the exact workflow carrier is the sole notification record for this source',
+  );
+  assert.equal(
+    sourceNotifications.some((item) => item.id.startsWith('foreground-report-back-')),
+    false,
+    'the foreground fallback does not duplicate exact workflow-origin delivery',
   );
 });
 

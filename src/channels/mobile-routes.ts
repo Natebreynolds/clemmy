@@ -4476,6 +4476,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           title: record.title,
           status: record.status,
           objective: record.contract?.objective ?? null,
+          contentMode: record.contentMode ?? null,
           updatedAt: record.updatedAt,
           lastRefreshedAt: record.lastRefreshedAt ?? null,
           freshness: health?.freshness.state ?? 'unknown',
@@ -4524,6 +4525,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         title: record.title,
         status: record.status,
         objective: record.contract?.objective ?? null,
+        contentMode: record.contentMode ?? null,
         // The full contract, not just the objective — what "good" means for
         // this workspace and what must never happen.
         successCriteria: record.contract?.successCriteria ?? [],
@@ -4662,6 +4664,133 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         appendWorkflowEvent(entry.name, runId, { kind: 'run_cancelled', error: 'Stopped from the phone' });
       } catch { /* the cancellation is the effect; the event is a courtesy */ }
       res.json({ ok: true, outcome: outcome.status });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Cancel every exact occurrence represented by one delegated workflow card.
+   * Resolve the complete bounded set before mutating any member. An occurrence
+   * that already reached a terminal is a successful no-op: the group is no
+   * longer running, while any live siblings are still stopped in this call.
+  */
+  router.post('/api/workflow-runs/cancel', requireMobileSession, async (req, res) => {
+    const rawRunIds: unknown[] | null = Array.isArray(req.body?.runIds)
+      ? req.body.runIds as unknown[]
+      : null;
+    if (
+      !rawRunIds
+      || rawRunIds.length === 0
+      || rawRunIds.length > 32
+      || rawRunIds.some((runId) => (
+        typeof runId !== 'string'
+        || runId.length === 0
+        || runId.length > 200
+        || !/^[A-Za-z0-9_.:-]+$/.test(runId)
+      ))
+    ) {
+      res.status(400).json({ error: 'INVALID_RUN_IDS' });
+      return;
+    }
+    const runIds = [...new Set(rawRunIds as string[])];
+    try {
+      const { readWorkflowRunRecord } = await import('../execution/workflow-run-record.js');
+      const resolved = runIds.map((runId) => {
+        const record = readWorkflowRunRecord<Record<string, unknown>>(
+          path.join(WORKFLOW_RUNS_DIR, `${runId}.json`),
+        );
+        const workflow = typeof record?.workflow === 'string' ? record.workflow.trim() : '';
+        return record?.id === runId && workflow ? { runId, workflow } : null;
+      });
+      if (resolved.some((entry) => entry === null)) {
+        res.status(404).json({
+          error: 'RUN_NOT_FOUND',
+          runIds: runIds.filter((_, index) => resolved[index] === null),
+        });
+        return;
+      }
+
+      const { cancelWorkflowRunAtBoundary } = await import('../execution/workflow-run-cancellation.js');
+      const results = resolved.map((entry) => {
+        const exact = entry!;
+        const outcome = cancelWorkflowRunAtBoundary({
+          runId: exact.runId,
+          reason: 'Stopped from the phone',
+          source: 'mobile-chat-delegated',
+          expectedWorkflow: exact.workflow,
+        });
+        return { runId: exact.runId, outcome };
+      });
+      const conflict = results.find(({ outcome }) => (
+        outcome.status === 'not_found' || outcome.status === 'workflow_mismatch'
+      ));
+      if (conflict) {
+        res.status(409).json({ error: 'RUN_IDENTITY_CHANGED', runId: conflict.runId });
+        return;
+      }
+      const kickRunIds = results
+        .filter(({ outcome }) => outcome.status === 'cancelled' || outcome.status === 'already_cancelled')
+        .map(({ runId }) => runId);
+      requestWorkflowRunDrainKick(kickRunIds);
+      res.json({
+        ok: true,
+        state: 'stopped',
+        results: results.map(({ runId, outcome }) => ({
+          runId,
+          outcome: outcome.status,
+          ...(outcome.status === 'already_terminal'
+            ? { terminalStatus: outcome.terminalStatus }
+            : {}),
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * Stop a workflow occurrence by its immutable run identity. Chat dispatches
+   * intentionally expose exact run ids but not mutable catalog names, so the
+   * server resolves the canonical run record and then asks the cancellation
+   * boundary to re-check that workflow identity under its own lock.
+   */
+  router.post('/api/workflow-runs/:runId/cancel', requireMobileSession, async (req, res) => {
+    const runId = Array.isArray(req.params.runId) ? req.params.runId[0] : req.params.runId;
+    if (!runId || runId.length > 200 || !/^[A-Za-z0-9_.:-]+$/.test(runId)) {
+      res.status(400).json({ error: 'INVALID_RUN_ID' });
+      return;
+    }
+    try {
+      const { readWorkflowRunRecord } = await import('../execution/workflow-run-record.js');
+      const filePath = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+      const record = readWorkflowRunRecord<Record<string, unknown>>(filePath);
+      const workflow = typeof record?.workflow === 'string' ? record.workflow.trim() : '';
+      if (!record || record.id !== runId || !workflow) {
+        res.status(404).json({ error: 'RUN_NOT_FOUND' });
+        return;
+      }
+
+      const { cancelWorkflowRunAtBoundary } = await import('../execution/workflow-run-cancellation.js');
+      const outcome = cancelWorkflowRunAtBoundary({
+        runId,
+        reason: 'Stopped from the phone',
+        source: 'mobile-chat-delegated',
+        expectedWorkflow: workflow,
+      });
+      if (outcome.status === 'not_found' || outcome.status === 'workflow_mismatch') {
+        res.status(404).json({ error: 'RUN_NOT_FOUND' });
+        return;
+      }
+      if (outcome.status === 'already_terminal') {
+        res.status(409).json({ error: 'ALREADY_FINISHED', status: outcome.terminalStatus });
+        return;
+      }
+      // Cancellation writes a report-back intent. Kick the exact occurrence so
+      // the source chat receives its canonical stopped terminal promptly; the
+      // periodic drain remains restart recovery if no kick is registered.
+      requestWorkflowRunDrainKick([runId]);
+      res.json({ ok: true, outcome: outcome.status, runId });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -81,6 +81,18 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   assert.match(css, /\.drawer-item\[aria-current='page'\] \{[\s\S]*?var\(--accent\)/);
 });
 
+test('drawer tab selection cannot be undone by a synthetic history-back entry', () => {
+  const app = read('../app.tsx');
+  assert.doesNotMatch(app, /useBackGesture\(drawerOpen/,
+    'the drawer must not push history: closing that entry after replaceState returns to the old tab');
+  assert.match(app, /onTouchEnd=\{\(event\) => \{[\s\S]*?clientX - s\.x < -48\) closeDrawer\(\)/,
+    'the drawer retains its direct iOS swipe-to-close gesture without browser history');
+  assert.match(app, /navigateTo\(t\.id\);[\s\S]*?closeDrawer\(false\);/,
+    'a section tap selects its exact peer tab and then closes the menu');
+  assert.match(app, /window\.history\.replaceState/,
+    'peer tab selection updates the deep-link URL in place rather than adding back-stack depth');
+});
+
 /**
  * Owner mandates 2026-08-25: Settings rides the drawer (gear row at the
  * BOTTOM of the menu), the header sign-out moves into Settings > Devices &

@@ -26,11 +26,15 @@ import {
   publicReplyText,
   publicUserInputText,
 } from '../runtime/harness/public-presentation.js';
+import {
+  RETAINED_WORK_TERMINAL_HEADER,
+  renderFailureWithRetainedWork,
+} from '../runtime/harness/retained-work-terminal.js';
 export { resolveWorkflowOriginReplyTarget } from '../runtime/workflow-origin-authority.js';
 
 export type WorkflowOriginReplyTarget = ExactOriginDeliveryTarget;
 
-export type WorkflowOriginTerminalOutcome = 'done' | 'blocked' | 'failed';
+export type WorkflowOriginTerminalOutcome = 'done' | 'blocked' | 'failed' | 'cancelled';
 
 export interface WorkflowOriginTerminalInput {
   observer: ExactWorkflowRunOriginRecord;
@@ -42,6 +46,10 @@ export interface WorkflowOriginTerminalInput {
   evidenceRunIds?: readonly string[];
   outcome: WorkflowOriginTerminalOutcome;
   detail: string;
+  /** A multi-run reducer removed member-scoped retained-work sections before
+   * aggregation. Re-project the exact origin's authoritative inventory once,
+   * after the complete aggregate has been rendered. */
+  reprojectRetainedWorkFromOrigin?: boolean;
 }
 
 export type ReviewWorkflowOriginTerminalOptions = EvaluateTerminalDeliveryOptions;
@@ -72,6 +80,24 @@ export function renderWorkflowOriginTerminalText(detail: string, runId: string):
   const suffix = `\n\nFull result: workflow_run_status run_id="${runId}"`;
   const available = Math.max(1, MAX_ORIGIN_TERMINAL_CHARS - suffix.length - 1);
   return `${compact.slice(0, available).trimEnd()}…${suffix}`;
+}
+
+/** Render one member before it enters a multi-run public aggregate. A retained
+ * inventory is terminal within its member's copy, not within the aggregate;
+ * remove it here so it cannot swallow summaries for later sealed members. The
+ * final origin terminal re-projects authoritative retained work once. */
+export function renderWorkflowOriginTerminalGroupMemberText(
+  detail: string,
+  runId: string,
+): { text: string; removedRetainedWork: boolean } {
+  const text = renderWorkflowOriginTerminalText(detail, runId);
+  const retainedWorkIndex = text.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+  return retainedWorkIndex < 0
+    ? { text, removedRetainedWork: false }
+    : {
+        text: text.slice(0, retainedWorkIndex).trimEnd(),
+        removedRetainedWork: true,
+      };
 }
 
 function workflowTurnOutcome(
@@ -115,6 +141,14 @@ function workflowTurnOutcome(
       presentation: { kind: 'question', text },
     };
   }
+  if (status === 'cancelled') {
+    return {
+      ...common,
+      status: 'cancelled',
+      resumable: false,
+      presentation: { kind: 'stopped', text },
+    };
+  }
   return {
     ...common,
     status: 'failed',
@@ -137,6 +171,23 @@ function preparedWorkflowOriginTerminal(
 ): PreparedWorkflowOriginTerminal | null {
   const source = exactAcceptedSource(input.observer);
   if (!source) return null;
+  const renderedText = renderWorkflowOriginTerminalText(input.detail, input.runId);
+  // A blocked/failed workflow detail can carry a retained-work inventory from
+  // its child step session. At the origin boundary that inventory must be
+  // re-projected against the exact accepted origin source before it becomes
+  // public. Doing this before the terminal's first writer also gives the
+  // report-back verifier one canonical string to compare on every retry.
+  const text = input.outcome !== 'done'
+    && (
+      input.reprojectRetainedWorkFromOrigin === true
+      || renderedText.includes(RETAINED_WORK_TERMINAL_HEADER)
+    )
+    ? renderFailureWithRetainedWork({
+        sessionId: input.observer.originSessionId,
+        sourceUserSeq: source.seq,
+        fallbackText: renderedText,
+      })
+    : renderedText;
   return {
     source,
     identity: {
@@ -145,13 +196,22 @@ function preparedWorkflowOriginTerminal(
       sourceUserSeq: source.seq,
       runId: input.identityRunId ?? input.runId,
     },
-    text: renderWorkflowOriginTerminalText(input.detail, input.runId),
+    text,
     renderedDetail: publicReplyText(input.detail, ''),
     evidenceRunIds: input.evidenceRunIds ?? [input.runId],
     deliveryConcern: input.outcome === 'blocked'
       ? { reason: WORKFLOW_BLOCKED_DELIVERY_CONCERN }
       : null,
   };
+}
+
+/** Exact public text the origin-terminal committer will propose. Report-back
+ * retries use this instead of independently rendering the pre-canonical child
+ * detail, so an already-durable winner is acknowledged idempotently. */
+export function workflowOriginTerminalExpectedText(
+  input: WorkflowOriginTerminalInput,
+): string | null {
+  return preparedWorkflowOriginTerminal(input)?.text ?? null;
 }
 
 function existingWorkflowOriginTerminal(
@@ -244,7 +304,7 @@ export function workflowOriginTerminalCommitMatches(input: {
     && presentation.text === PUBLIC_RUN_FAILURE_TEXT
     && input.expectedText === PUBLIC_RUN_FAILURE_TEXT
   ) return true;
-  if (input.outcome === 'failed') return false;
+  if (input.outcome === 'failed' || input.outcome === 'cancelled') return false;
 
   if (
     presentation.status === 'needs_input'

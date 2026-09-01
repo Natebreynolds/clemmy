@@ -35,6 +35,7 @@ import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getModelSettings } from '../lib/api';
 import { BrainSheet } from '../components/BrainSheet';
+import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 
 interface Props {
   sessionId?: string;
@@ -311,6 +312,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             onApprovalAction={actOnApproval}
             onRetry={(id) => void engine.retry(id)}
             onDiscard={(id) => engine.discard(id)}
+            onDelegatedStateChange={(sourceUserSeq, state) => {
+              engine.setDelegatedWorkState(sourceUserSeq, state);
+            }}
+            onDelegatedChanged={() => engine.resume()}
           />
         ))}
       </div>
@@ -376,6 +381,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 function MessageRow({
   message, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction,
+  onDelegatedStateChange, onDelegatedChanged,
 }: {
   message: ChatMessage;
   planActing: string | null;
@@ -386,6 +392,11 @@ function MessageRow({
   approvalActing: string | null;
   approvalDecided: boolean;
   onApprovalAction: (approvalId: string, decision: 'approve' | 'reject') => void;
+  onDelegatedStateChange: (
+    sourceUserSeq: number,
+    state: 'running' | 'cancelling' | 'stopped',
+  ) => void;
+  onDelegatedChanged: () => void;
 }) {
   if (message.role === 'user') {
     return (
@@ -444,7 +455,15 @@ function MessageRow({
       {/* The work Clem did is ONE quiet line, not a stack of tool rows: while
           she is working it narrates the current step, and once settled it
           becomes a summary you can open. The reply is what the screen is for. */}
-      {activity.length > 0 ? <WorkLine activity={activity} live={thinking} /> : null}
+      {activity.length > 0 ? (
+        <WorkLine
+          activity={activity}
+          live={thinking}
+          message={message}
+          onDelegatedStateChange={onDelegatedStateChange}
+          onDelegatedChanged={onDelegatedChanged}
+        />
+      ) : null}
       {message.text ? (
         // Safe by construction: renderMarkdown escapes ALL input before adding
         // markup, refuses raw HTML, and only links http(s).
@@ -492,10 +511,26 @@ function MessageRow({
  * receipts. Failures are never hidden: if any step failed the line says so and
  * starts open, because that is the one case where the detail IS the answer.
  */
-function WorkLine({ activity, live }: { activity: ActivityItem[]; live: boolean }) {
+function WorkLine({
+  activity,
+  live,
+  message,
+  onDelegatedStateChange,
+  onDelegatedChanged,
+}: {
+  activity: ActivityItem[];
+  live: boolean;
+  message: ChatMessage;
+  onDelegatedStateChange: (
+    sourceUserSeq: number,
+    state: 'running' | 'cancelling' | 'stopped',
+  ) => void;
+  onDelegatedChanged: () => void;
+}) {
   const failed = activity.some((item) => item.status === 'failed');
   const [open, setOpen] = useState(failed);
   const elapsed = useElapsed(activity, live);
+  const delegatedControl = delegatedRunControlForExpandedWork(message, open);
 
   const summary = live
     ? liveActivityHeadline(activity)
@@ -503,11 +538,24 @@ function WorkLine({ activity, live }: { activity: ActivityItem[]; live: boolean 
 
   return (
     <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}`}>
-      <button class="work-line" onClick={() => setOpen(!open)} aria-expanded={open}>
-        {live ? <span class="work-spinner" aria-hidden="true" /> : <span class="work-caret" aria-hidden="true">{open ? '⌄' : '›'}</span>}
-        <span class="work-summary">{summary}</span>
-        {live && elapsed ? <span class="work-elapsed">{elapsed}</span> : null}
-      </button>
+      <div class="work-head">
+        <button class="work-line" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {live ? <span class="work-spinner" aria-hidden="true" /> : <span class="work-caret" aria-hidden="true">{open ? '⌄' : '›'}</span>}
+          <span class="work-summary">{summary}</span>
+          {live && elapsed ? <span class="work-elapsed">{elapsed}</span> : null}
+        </button>
+        {delegatedControl?.target ? (
+          <RunControl
+            compact
+            state={delegatedControl.state}
+            target={delegatedControl.target}
+            onStateChange={(state) => onDelegatedStateChange(delegatedControl.sourceUserSeq, state)}
+            onChanged={onDelegatedChanged}
+          />
+        ) : delegatedControl?.state === 'stopped' ? (
+          <div class="delegated-work-state" role="status">Stopped</div>
+        ) : null}
+      </div>
       {open ? (
         <div class="work-detail">
           {activity.map((item) => <ActivityRow key={item.id} item={item} />)}

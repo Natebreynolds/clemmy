@@ -36,6 +36,16 @@ export interface MobileWorkspaceRecord {
    *  leading few; the rest are one tap away, because "I can see the summary
    *  but not the actual data" is the complaint a summary-only view earns. */
   fields: MobileWorkspaceField[];
+  /** Authored-only long copy. Raw/inferred datasets never get this escape
+   * hatch, keeping arbitrary provider payloads inside the old 80-char cap. */
+  body?: string;
+  /** Authored-only, protocol-checked citations/actions. */
+  links?: MobileWorkspaceLink[];
+}
+
+export interface MobileWorkspaceLink {
+  label: string;
+  url: string;
 }
 
 /** A named breakdown out of the summary — byStage, byBand, byLeadSource. */
@@ -437,6 +447,11 @@ export function projectSourceHealth(data: unknown): MobileSourceHealth[] {
 const AUTHORED_MAX_TILES = 8;
 const AUTHORED_MAX_RECORDS = 60;
 const AUTHORED_MAX_FIELDS = 28;
+const AUTHORED_MAX_BODY_CHARS = 4_000;
+const AUTHORED_MAX_LINKS_PER_RECORD = 12;
+const AUTHORED_MAX_URL_CHARS = 1_000;
+/** Shared across every long body, link label, and URL in one response. */
+const AUTHORED_LONG_CONTENT_BUDGET_CHARS = 48_000;
 
 function asText(value: unknown, max = MAX_VALUE_CHARS): string | null {
   if (value === null || value === undefined) return null;
@@ -459,6 +474,49 @@ function authoredFields(raw: unknown, cap: number): MobileWorkspaceField[] {
     if (label && value) out.push({ label, value });
   }
   return out;
+}
+
+function authoredBody(raw: unknown, budget: { remaining: number }): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const body = raw.trim();
+  if (!body || budget.remaining <= 0) return undefined;
+  const cap = Math.min(AUTHORED_MAX_BODY_CHARS, budget.remaining);
+  const value = body.length <= cap
+    ? body
+    : cap > 1 ? `${body.slice(0, cap - 1)}…` : '…';
+  budget.remaining -= value.length;
+  return value;
+}
+
+function safeHttpUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  if (!text || text.length > AUTHORED_MAX_URL_CHARS || /[\u0000-\u001f\u007f]/.test(text)) return null;
+  try {
+    const parsed = new URL(text);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+function authoredLinks(raw: unknown, budget: { remaining: number }): MobileWorkspaceLink[] {
+  if (!Array.isArray(raw)) return [];
+  const links: MobileWorkspaceLink[] = [];
+  for (const candidate of raw.slice(0, AUTHORED_MAX_LINKS_PER_RECORD)) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const item = candidate as Record<string, unknown>;
+    const label = asText(item.label, 80);
+    const url = safeHttpUrl(item.url);
+    if (!label || !url) continue;
+    const cost = label.length + url.length;
+    if (cost > budget.remaining) break;
+    budget.remaining -= cost;
+    links.push({ label, url });
+  }
+  return links;
 }
 
 /**
@@ -533,6 +591,7 @@ export function readAuthoredProjection(data: unknown): MobileWorkspaceProjection
     ? block.records as Record<string, unknown>
     : null;
   const items = Array.isArray(recordsBlock?.items) ? recordsBlock!.items : [];
+  const longContentBudget = { remaining: AUTHORED_LONG_CONTENT_BUDGET_CHARS };
   const records: MobileWorkspaceRecord[] = items
     .slice(0, AUTHORED_MAX_RECORDS)
     .map((raw, index) => {
@@ -540,10 +599,14 @@ export function readAuthoredProjection(data: unknown): MobileWorkspaceProjection
       const item = raw as Record<string, unknown>;
       const primary = asText(item.primary);
       if (!primary) return null;
+      const body = authoredBody(item.body, longContentBudget);
+      const links = authoredLinks(item.links, longContentBudget);
       return {
         key: asText(item.key, 64) ?? `authored-${index}`,
         primary,
         fields: authoredFields(item.fields, AUTHORED_MAX_FIELDS),
+        ...(body ? { body } : {}),
+        ...(links.length > 0 ? { links } : {}),
       };
     })
     .filter((r): r is MobileWorkspaceRecord => r !== null);

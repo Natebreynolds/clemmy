@@ -32,6 +32,7 @@ const {
   hasExactOriginDeliveryReceipt,
   hasExpectedExactOriginDeliveryReceipt,
   listQueuedNotificationDeliveries,
+  updateNotificationDeliveryStatus,
   upsertNotificationDestination,
 } = await import('./notifications.js');
 
@@ -182,7 +183,7 @@ test('missing or corrupt exact-origin targets stay undelivered and never fall ba
   assert.deepEqual(getNotificationDestinationsForRecord(stored), []);
 });
 
-test('exact origin_chat is acknowledged by its precise receipt without an outbound or push leg', () => {
+test('exact origin_chat keeps its transcript receipt and queues one own-device push with no fallback fan-out', () => {
   const id = 'exact-origin-chat';
   const target = { type: 'origin_chat' } as const;
   const createdAt = '2026-08-03T12:34:56.000Z';
@@ -190,10 +191,10 @@ test('exact origin_chat is acknowledged by its precise receipt without an outbou
     ...record({
       ...exactOriginDeliveryMetadata(target),
       terminalReportBack: true,
-      reportBackTargetType: 'origin_chat',
     }),
     id,
     createdAt,
+    silent: true,
   });
 
   const stored = getNotification(id);
@@ -202,8 +203,43 @@ test('exact origin_chat is acknowledged by its precise receipt without an outbou
   assert.deepEqual(stored.deliveredDestinations, [exactOriginDeliveryDestinationId(target)]);
   assert.equal(hasExactOriginDeliveryReceipt(stored, target), true);
   assert.equal(hasExpectedExactOriginDeliveryReceipt(stored), true);
-  assert.deepEqual(getNotificationDestinationsForRecord(stored), []);
-  assert.ok(!listQueuedNotificationDeliveries().some((job) => job.notificationId === id));
+  assert.deepEqual(
+    getNotificationDestinationsForRecord(stored).map((destination) => [destination.id, destination.type]),
+    [['configured-push', 'web_push']],
+    'exact origin-chat authority resolves only the registered device, never configured or fallback channels',
+  );
+  assert.ok(listQueuedNotificationDeliveries().some((job) => job.notificationId === id));
+
+  // The provider worker appends its own-device receipt to the same immutable
+  // carrier. Replaying the same receipt is idempotent and preserves the exact
+  // transcript acknowledgement used by workflow settlement.
+  updateNotificationDeliveryStatus(id, {
+    deliveredAt: '2026-08-03T12:35:00.000Z',
+    deliveredDestinations: ['configured-push'],
+    deliveryPlanCompletedAt: '2026-08-03T12:35:00.000Z',
+  });
+  updateNotificationDeliveryStatus(id, {
+    deliveredAt: '2026-08-03T12:35:00.000Z',
+    deliveredDestinations: ['configured-push'],
+    deliveryPlanCompletedAt: '2026-08-03T12:35:00.000Z',
+  });
+  const delivered = getNotification(id);
+  assert.ok(delivered);
+  assert.equal(
+    delivered.deliveredDestinations?.filter((receipt) => receipt === 'configured-push').length,
+    1,
+    'one logical device receives one retained provider receipt across replay',
+  );
+  assert.equal(hasExactOriginDeliveryReceipt(delivered, target), true);
+  assert.equal(
+    getNotificationDestinationsForRecord(delivered).some(
+      (destination) => destination.type === 'discord_channel'
+        || destination.type === 'discord_user'
+        || destination.type === 'slack_channel'
+        || destination.type === 'slack_user',
+    ),
+    false,
+  );
 });
 
 test('receipt predicate requires exact target identity, including Slack thread', () => {

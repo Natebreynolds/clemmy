@@ -560,6 +560,11 @@ export function startTerminalReportBackWatcher(options: {
 
     const presentation = decodeOwnedPresentation(event);
     if (!presentation) return;
+    // A workflow-origin terminal has its own durable, source-bound carrier.
+    // That carrier owns both the transcript receipt and the away-user device
+    // alert; arming this generic foreground fallback would create a second
+    // Activity record and a second push for the same accepted source.
+    if (event.data.transport === 'workflow_report_back') return;
     const key = pendingReportId(event.sessionId, presentation.identity.sourceUserSeq);
     if (armed.has(key)) return;
     const terminatedAtMs = now();

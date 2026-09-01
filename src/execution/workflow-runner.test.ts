@@ -1416,9 +1416,16 @@ test('compiled specialists fan out as workers while only the exact brain sink is
     const exactOrdinaryNotice = loadNotifications()
       .find((row) => row.id === `workflow-${exactOrdinary.id}-completed`);
     assert.equal(
-      exactOrdinaryNotice?.silent,
-      true,
-      'global completion is dashboard evidence only; exact-origin terminal owns the one external reply',
+      exactOrdinaryNotice,
+      undefined,
+      'exact-origin terminal carrier replaces the duplicate global Activity row',
+    );
+    assert.equal(
+      loadNotifications().filter((row) =>
+        row.metadata?.runId === exactOrdinary.id
+        && row.metadata?.source === 'workflow_origin_terminal').length,
+      1,
+      'exact ordinary run retains one terminal notification carrier',
     );
 
     // Biting end-to-end contribution check: the step result contains no
@@ -1486,8 +1493,12 @@ test('compiled specialists fan out as workers while only the exact brain sink is
       'the intermediate notify_user record is dashboard-only under exact terminal authority',
     );
     const notifyCompletion = notifyRows.find((row) => row.id === `workflow-${notifyRun.id}-completed`);
-    assert.equal(notifyCompletion?.body, authoredNotifyBody);
-    assert.equal(notifyCompletion?.silent, true, 'the global completion fan-out is also suppressed');
+    assert.equal(notifyCompletion, undefined, 'the duplicate global completion row is omitted');
+    const notifyTerminalCarriers = notifyRows.filter((row) =>
+      row.metadata?.runId === notifyRun.id
+      && row.metadata?.source === 'workflow_origin_terminal');
+    assert.equal(notifyTerminalCarriers.length, 1);
+    assert.equal(notifyTerminalCarriers[0]?.body, authoredNotifyBody);
 
     const sourceTerminals = listEvents(notifySessionId, { types: ['conversation_completed'] })
       .filter((event) => event.data.sourceUserSeq === notifySource.seq);

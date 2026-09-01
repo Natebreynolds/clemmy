@@ -72,6 +72,8 @@ const outcomes = await import('../runtime/harness/attempt-outcome.js');
 const settlements = await import('../runtime/harness/logical-call-settlement-store.js');
 const audit = await import('../runtime/harness/accepted-source-settlement-audit.js');
 const shadow = await import('../runtime/graph/turn-graph-shadow.js');
+const { RETAINED_WORK_TERMINAL_HEADER } = await import('../runtime/harness/retained-work-terminal.js');
+const { foldTranscript } = await import('../../packages/chat-engine/src/engine.js');
 
 test.after(() => {
   _setWorkflowRunReportBackAfterExactReceiptObservationForTests();
@@ -529,6 +531,63 @@ test('a blocked member is judged before report-back and DELIVER preserves the ex
     (entry) => entry.metadata?.originObserverId === observerId,
   );
   assert.equal(carrier?.title, 'Workflow completed: Ack Workflow');
+});
+
+test('blocked origin report-back canonicalizes foreign retained work and acknowledges one idempotent terminal', async () => {
+  const runId = 'report-exact-blocked-foreign-retained-work';
+  const origin = 'report-exact-blocked-foreign-retained-work-origin';
+  const source = addAcceptedSource({
+    sessionId: origin,
+    channel: 'mobile',
+    text: 'Run the Platform 49 workflow and report back here.',
+  });
+  const file = writeRun(runId, origin);
+  markRunPartial(file);
+  const { observerId, active } = addExactOriginGroup([runId], origin, source.seq);
+  const canonicalPrefix = 'The workflow stopped before it could update the tracker.';
+  const childOnlyDetail = [
+    canonicalPrefix,
+    '',
+    RETAINED_WORK_TERMINAL_HEADER,
+    '- Source/tool slack_fetch_conversation_history: completed result retained as rh_child_only.',
+    'External write state: no settled external-write attempt is recorded.',
+  ].join('\n');
+
+  _setWorkflowRunReportBackTerminalJudgeForTests(unavailableTerminalJudgePort());
+  try {
+    assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+      workflowName: 'Ack Workflow',
+      outcome: 'blocked',
+      detail: childOnlyDetail,
+    }), false, 'the blocked report waits for the asynchronous judge fallback');
+    await waitForCondition(
+      () => typeof readRun(file).reportBackAcknowledgedAt === 'string',
+      'canonical blocked workflow report-back acknowledgement',
+    );
+  } finally {
+    _setWorkflowRunReportBackTerminalJudgeForTests();
+  }
+
+  const delivered = readRun(file);
+  assert.deepEqual(delivered.reportBack.acknowledgedOriginObserverIds, [observerId]);
+  assert.equal(delivered.reportBackRetry, undefined);
+  const terminals = listEvents(origin, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].data.presentation.status, 'blocked');
+  assert.equal(terminals[0].data.reply, canonicalPrefix);
+  assert.doesNotMatch(String(terminals[0].data.reply), /rh_child_only|Retained work/);
+  const settlement = readWorkflowOriginGroupSettlement(active.sealed.sourceGroupId);
+  assert.equal(settlement?.terminalIdentity.eventId, terminals[0].id);
+  assert.equal(settlement?.terminalStatus, 'blocked');
+
+  assert.equal(recordAndAttemptWorkflowRunReportBack(file, {
+    workflowName: 'Ack Workflow',
+    outcome: 'blocked',
+    detail: childOnlyDetail,
+  }), false, 'an acknowledged generation does not reopen delivery');
+  assert.equal(listEvents(origin, { types: ['conversation_completed'] }).length, 1);
+  assert.deepEqual(readRun(file).reportBack.acknowledgedOriginObserverIds, [observerId]);
+  assert.equal(readRun(file).reportBackRetry, undefined);
 });
 
 test('workflow-origin ASK commits typed needs-input and settles the exact carrier with judge prose', async () => {
@@ -1123,6 +1182,72 @@ test('one accepted source with two out-of-order runs publishes one ordered reduc
   );
 });
 
+test('a grouped blocked member cannot let its retained-work section erase a later done member', async () => {
+  const origin = 'report-group-member-retained-work-origin';
+  const source = addAcceptedSource({
+    sessionId: origin,
+    channel: 'mobile',
+    text: 'Run both reviews and report both results.',
+  });
+  settleOriginBusinessCall(source, 'report-group-member-retained-work-read', true);
+  settleOriginBusinessCall(source, 'report-group-member-retained-work-write', false);
+  const runA = 'report-group-member-retained-work-a';
+  const runB = 'report-group-member-retained-work-b';
+  const fileA = writeRun(runA, origin);
+  const fileB = writeRun(runB, origin);
+  markRunPartial(fileA);
+  const { observerId } = addExactOriginGroup([runA, runB], origin, source.seq);
+  const blockedPrefix = 'The Slack review stopped before the tracker update.';
+  const childDetail = [
+    blockedPrefix,
+    '',
+    RETAINED_WORK_TERMINAL_HEADER,
+    '- Source/tool slack_fetch_conversation_history: completed result retained as rh_group_child_only.',
+    'External write state: no settled external-write attempt is recorded.',
+  ].join('\n');
+  const laterDoneDetail = 'The later Salesforce review completed and its summary must remain visible.';
+
+  _setWorkflowRunReportBackTerminalJudgeForTests(unavailableTerminalJudgePort());
+  try {
+    assert.equal(recordAndAttemptWorkflowRunReportBack(fileA, {
+      workflowName: 'Slack Review',
+      outcome: 'blocked',
+      detail: childDetail,
+    }), false, 'the first member waits for its sealed sibling');
+    assert.equal(recordAndAttemptWorkflowRunReportBack(fileB, {
+      workflowName: 'Salesforce Review',
+      outcome: 'done',
+      detail: laterDoneDetail,
+    }), false, 'the mixed reducer waits for the asynchronous judge fallback');
+    await waitForCondition(
+      () => typeof readRun(fileB).reportBackAcknowledgedAt === 'string',
+      'mixed grouped report-back acknowledgement',
+    );
+    assert.equal(attemptWorkflowRunReportBack(fileA), true);
+  } finally {
+    _setWorkflowRunReportBackTerminalJudgeForTests();
+  }
+
+  const terminals = listEvents(origin, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  const reply = String(terminals[0].data.reply);
+  assert.match(reply, /2 workflows finished for this request/);
+  assert.match(reply, new RegExp(blockedPrefix));
+  assert.match(reply, new RegExp(laterDoneDetail));
+  assert.ok(
+    reply.indexOf(laterDoneDetail) < reply.indexOf(RETAINED_WORK_TERMINAL_HEADER),
+    'the later member remains before the one origin-level retained-work projection',
+  );
+  assert.equal(reply.split(RETAINED_WORK_TERMINAL_HEADER).length - 1, 1);
+  assert.doesNotMatch(reply, /rh_group_child_only/);
+  assert.match(reply, /Source\/tool googlesheets_batch_get/);
+  assert.equal(listEvents(origin, { types: ['conversation_completed'] }).length, 1);
+  for (const file of [fileA, fileB]) {
+    assert.deepEqual(readRun(file).reportBack.acknowledgedOriginObserverIds, [observerId]);
+    assert.equal(readRun(file).reportBackRetry, undefined);
+  }
+});
+
 test('a blocked group reducer keeps the conservative shared fallback when the judge is unavailable', async () => {
   const origin = 'report-group-blocked-qualified-origin';
   const source = addAcceptedSource({
@@ -1429,6 +1554,62 @@ test('cancellation winning immediately before checkpoint cannot accept a stale s
   assert.equal(run.status, 'cancelled');
   assert.equal(run.reportBack.outcome, 'failed');
   assert.equal(run.reportBack.detail, 'cancel won boundary');
+});
+
+test('one exact cancelled workflow reports and replays as stopped, never failed', () => {
+  const runId = 'report-cancelled-origin-stopped';
+  const origin = 'report-cancelled-origin-stopped-chat';
+  const source = addAcceptedSource({
+    sessionId: origin,
+    channel: 'desktop',
+    text: 'Run the workflow and let me stop it if needed.',
+  });
+  const file = runFile(runId);
+  writeFileSync(file, JSON.stringify({
+    id: runId,
+    workflow: 'Ack Workflow',
+    status: 'running',
+    originSessionId: origin,
+  }), 'utf-8');
+  const { active } = addExactOriginGroup([runId], origin, source.seq);
+  appendEvent({
+    sessionId: origin,
+    turn: source.turn,
+    role: 'assistant',
+    type: 'async_work_dispatched',
+    data: { sourceUserSeq: source.seq, runIds: [runId] },
+  });
+
+  const cancelled = cancelWorkflowRunAtBoundary({
+    runId,
+    reason: 'Stopped from the phone',
+    source: 'mobile-chat-delegated',
+  });
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(attemptWorkflowRunReportBack(file), true);
+
+  const terminals = listEvents(origin, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].data.presentation.status, 'cancelled');
+  assert.equal(terminals[0].data.presentation.kind, 'stopped');
+  assert.equal(terminals[0].data.turnOutcome.status, 'cancelled');
+  assert.equal(terminals[0].data.reply, 'Stopped from the phone');
+  assert.equal(
+    readWorkflowOriginGroupSettlement(active.sealed.sourceGroupId)?.terminalStatus,
+    'cancelled',
+    'the immutable delivery settlement retains cancellation rather than failure',
+  );
+  assert.equal(
+    listNotifications(2_000).find((entry) => entry.metadata?.runId === runId)?.title,
+    'Workflow cancelled: Ack Workflow',
+  );
+
+  const assistant = foldTranscript(listEvents(origin))
+    .filter((message) => message.role === 'assistant');
+  assert.equal(assistant.length, 1, 'the stopped terminal replaces the delegated running card');
+  assert.equal(assistant[0]?.status, 'stopped');
+  assert.equal(assistant[0]?.text, 'Stopped from the phone');
+  assert.equal(assistant[0]?.delegatedWork, undefined, 'replay exposes no stale Stop control');
 });
 
 test('the first exact terminal envelope is immutable even when another lane is status-compatible', () => {

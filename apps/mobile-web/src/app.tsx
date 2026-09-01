@@ -1,7 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { Component } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
-import { useBackGesture } from './lib/back-gesture';
 import {
   adoptOriginSession,
   finalizeOriginHandoff,
@@ -28,6 +27,12 @@ import {
 import { originHandoffMintCoordinator } from './lib/origin-handoff-mint';
 import { runOriginHandoffAdoption } from './lib/origin-handoff-adoption';
 import { authBootstrapMode } from './lib/auth-bootstrap';
+import {
+  mobileWorkspacePath,
+  workspaceColdOpenNeedsParent,
+  workspaceFromSearch,
+  workspaceNavigationIntent,
+} from './lib/workspace-route';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
@@ -62,6 +67,9 @@ export function App() {
   const [tab, setTab] = useState<Tab>(() => tabFromSearch(window.location.search));
   const [inboxNotification, setInboxNotification] = useState<string | null>(
     () => inboxNotificationFromSearch(window.location.search),
+  );
+  const [workspaceId, setWorkspaceId] = useState<string | null>(
+    () => workspaceFromSearch(window.location.search),
   );
   // Left drawer (owner directive 2026-08-25): sections live in a slide-in
   // menu, never a bottom dock — content gets the full height.
@@ -167,12 +175,23 @@ export function App() {
     return () => window.removeEventListener('clem:needs-login', handler);
   }, [refreshAuth]);
 
+  // A direct terminal handoff may cold-open a Workspace detail. Give that
+  // real URL one list-level parent entry so native edge-back closes the detail
+  // instead of leaving the app or reopening the same slug.
+  useEffect(() => {
+    const slug = workspaceFromSearch(window.location.search);
+    if (!slug || !workspaceColdOpenNeedsParent(window.location.search, window.history.state)) return;
+    window.history.replaceState(null, '', `${window.location.pathname}?tab=spaces`);
+    window.history.pushState({ clemWorkspace: slug }, '', mobileWorkspacePath(slug));
+  }, []);
+
   // Push/native navigation can replace the URL while this shell is alive.
   // Keep the visible destination and exact notification selection in sync.
   useEffect(() => {
     const syncLocation = () => {
       setTab(tabFromSearch(window.location.search));
       setInboxNotification(inboxNotificationFromSearch(window.location.search));
+      setWorkspaceId(workspaceFromSearch(window.location.search));
     };
     window.addEventListener('popstate', syncLocation);
     return () => window.removeEventListener('popstate', syncLocation);
@@ -394,6 +413,7 @@ export function App() {
 
   const navigateTo = (next: Tab, notificationId?: string | null) => {
     setTab(next);
+    setWorkspaceId(null);
     const selectedNotification = next === 'inbox' ? notificationId ?? null : null;
     setInboxNotification(selectedNotification);
     const params = new URLSearchParams();
@@ -403,15 +423,28 @@ export function App() {
     window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
   };
 
+  const selectWorkspace = (slug: string | null) => {
+    const intent = workspaceNavigationIntent({
+      search: window.location.search,
+      historyState: window.history.state,
+      next: slug,
+    });
+    if (intent.kind === 'none') return;
+    if (intent.kind === 'push') {
+      setWorkspaceId(slug);
+      window.history.pushState(intent.state, '', intent.path);
+    } else if (intent.kind === 'back') {
+      window.history.back();
+    } else {
+      setWorkspaceId(null);
+      window.history.replaceState(null, '', `${window.location.pathname}?tab=spaces`);
+    }
+  };
+
   const goToChat = (payload: ChatHandoff) => {
     setHandoff(payload);
     navigateTo('chats');
   };
-
-  // An open drawer is depth: a back swipe should close it rather than
-  // leaving the app. Registered before the deep views inside a screen so
-  // the innermost layer always unwinds first.
-  useBackGesture(drawerOpen && !drawerClosing, () => closeDrawer());
 
   const openDrawer = () => {
     if (drawerCloseTimer.current !== null) {
@@ -506,6 +539,11 @@ export function App() {
             }}
             onTouchEnd={(event) => {
               const s = swipe.current;
+              // The drawer owns this gesture directly rather than minting a
+              // browser-history entry. A history entry made tab selection
+              // self-cancelling: navigateTo() replaced the drawer entry, then
+              // closing it went back to the previous tab. Tabs are peers, so
+              // opening or closing the menu must never change history.
               if (s.horizontal && event.changedTouches[0].clientX - s.x < -48) closeDrawer();
             }}
           >
@@ -590,7 +628,9 @@ export function App() {
               }}
             />
           ) : tab === 'workflows' ? <Workflows />
-            : tab === 'spaces' ? <Workspaces />
+            : tab === 'spaces' ? (
+              <Workspaces initialOpenId={workspaceId} onOpenChange={selectWorkspace} />
+            )
             : tab === 'memory' ? <Memory />
             : tab === 'settings' ? (
               <Settings

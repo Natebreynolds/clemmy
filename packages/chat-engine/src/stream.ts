@@ -52,6 +52,14 @@ export interface ChatStreamOptions {
   /** Resume cursor: replay strictly after this seq. */
   sinceSeq?: number;
   onEvent(event: HarnessEvent): void;
+  /**
+   * A durable terminal can legitimately trail an earlier public pause. When a
+   * new turn has already attached from that pause's cursor, the trailing
+   * terminal belongs to the prior source and must be drained without closing
+   * the new turn's stream. The engine owns that source correlation; transports
+   * remain ordered byte carriers.
+   */
+  shouldStopOnTerminal?(event: HarnessEvent): boolean;
   onConnectionState?(state: ConnectionState): void;
   /** The stream saw a terminal event and closed itself. */
   onTerminal?(): void;
@@ -152,8 +160,11 @@ export function runChatStream(options: ChatStreamOptions): ChatStreamHandle {
       }
       if (event.seq > cursor) cursor = event.seq;
     }
+    const stopsStream = ownSession
+      && isTerminalEvent(event.type)
+      && (options.shouldStopOnTerminal?.(event) ?? true);
     options.onEvent(event);
-    if (ownSession && isTerminalEvent(event.type)) {
+    if (stopsStream) {
       if (event.type === 'approval_requested') {
         // One SDK turn can emit sibling approval cards; closing the stream
         // synchronously on the first one used to discard the rest. Debounce,

@@ -5,7 +5,8 @@
  * the mobile chat rendered the raw asterisks. This renderer escapes ALL input
  * first and only then adds markup, so no HTML in a reply can ever execute —
  * there is deliberately no raw-HTML passthrough and links are restricted to
- * http(s). Covers the structures chat replies actually use: paragraphs,
+ * http(s) plus the exact mobile Workspace route. Covers the structures chat
+ * replies actually use: paragraphs,
  * headings, bold/italic, inline code, fenced code blocks, links, blockquotes,
  * and unordered/ordered lists (single level — chat replies don't nest deeper
  * in practice, and a flat list renders those fine too).
@@ -28,9 +29,15 @@ function renderInline(escaped: string): string {
     codeSpans.push(code);
     return `\u0000${codeSpans.length - 1}\u0000`;
   });
-  // Links: [text](http…) only — anything else stays literal text.
-  out = out.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label: string, href: string) =>
-    `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+  // Links: public http(s), plus one exact same-origin mobile Workspace route.
+  // No other relative path is activated, so model text cannot manufacture a
+  // privileged in-app navigation target.
+  out = out.replace(
+    /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+|\/m\/\?tab=spaces&amp;workspace=[a-z0-9][a-z0-9-]{0,61}[a-z0-9])\)/g,
+    (_m, label: string, href: string) => href.startsWith('/m/')
+      ? `<a href="${href}">${label}</a>`
+      : `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`,
+  );
   // Bold before italic so ** doesn't get eaten as two singles.
   out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   out = out.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>');

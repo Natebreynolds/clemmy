@@ -293,6 +293,9 @@ export interface NotificationRecord {
    * Activity panel with useful signal but spam channels like Discord
    * with no substance. The "completed" notification (which carries
    * the actual result) is the one that should hit external channels.
+   * The sole exception is an exact origin-chat workflow terminal: its
+   * source-bound carrier stays locally silent to avoid a second in-app toast,
+   * but may alert the user's own registered web-push devices.
    */
   silent?: boolean;
 }
@@ -992,10 +995,24 @@ function isDuplicateApprovalNotification(existing: NotificationRecord, next: Not
     existing.body === next.body;
 }
 
+/** Exact workflow-origin delivery already owns the transcript receipt. Reuse
+ * that immutable carrier for the away-user alert instead of minting a second
+ * foreground notification. This predicate grants no provider/channel route. */
+export function isExactOriginChatTerminalReportBack(item: NotificationRecord): boolean {
+  return hasExactOriginDeliveryMode(item)
+    && exactOriginDeliveryTarget(item)?.type === 'origin_chat'
+    && item.metadata?.terminalReportBack === true;
+}
+
 function isTerminalOriginChatPushEligible(item: NotificationRecord): boolean {
   if (
-    item.metadata?.reportBackTargetType !== 'origin_chat'
-    || item.metadata?.terminalReportBack !== true
+    !(
+      isExactOriginChatTerminalReportBack(item)
+      || (
+        item.metadata?.reportBackTargetType === 'origin_chat'
+        && item.metadata?.terminalReportBack === true
+      )
+    )
     || (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() === 'off'
   ) return false;
   const destinations = loadDestinationsUnlocked();
@@ -1008,12 +1025,19 @@ function shouldQueueNotificationDelivery(item: NotificationRecord): boolean {
   // not new outbound interruptions. In particular, an answer receipt often
   // carries the same question/check-in identifier as the request it resolves;
   // queueing it would immediately push “Clem needs you” a second time.
-  if (item.silent || item.read || item.metadata?.inboxOnly === true) return false;
+  const exactOriginChatReportBack = isExactOriginChatTerminalReportBack(item);
+  if (
+    (item.silent && !exactOriginChatReportBack)
+    || item.read
+    || item.metadata?.inboxOnly === true
+  ) return false;
   if (hasExactOriginDeliveryMode(item)) {
     // A malformed exact-origin envelope deliberately remains queueable: the
     // resolver returns zero destinations and the worker records a durable
     // undelivered/deferred state. It must never fall through to defaults.
-    return exactOriginDeliveryTarget(item)?.type !== 'origin_chat';
+    return exactOriginDeliveryTarget(item)?.type === 'origin_chat'
+      ? isTerminalOriginChatPushEligible(item)
+      : true;
   }
   const isOriginChatReport = item.metadata?.reportBackTargetType === 'origin_chat';
   return !isOriginChatReport || isTerminalOriginChatPushEligible(item);
@@ -1022,6 +1046,15 @@ function shouldQueueNotificationDelivery(item: NotificationRecord): boolean {
 function notificationNeedsDeliveryQueue(item: NotificationRecord): boolean {
   if (!shouldQueueNotificationDelivery(item)) return false;
   if (hasExactOriginDeliveryMode(item)) {
+    if (exactOriginDeliveryTarget(item)?.type === 'origin_chat') {
+      if (item.deliveryPlan) {
+        return !Number.isFinite(Date.parse(item.deliveryPlanCompletedAt ?? ''));
+      }
+      const transcriptReceipt = expectedExactOriginDeliveryReceipt(item);
+      return !item.deliveredDestinations?.some(
+        (destination) => destination !== transcriptReceipt,
+      );
+    }
     return !hasExpectedExactOriginDeliveryReceipt(item);
   }
   if (item.deliveryPlan) {
@@ -2328,10 +2361,18 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
   if (hasExactOriginDeliveryMode(notification)) {
     const target = exactOriginDeliveryTarget(notification);
     const receipt = expectedExactOriginDeliveryReceipt(notification);
-    // Presence of the marker owns routing. A corrupt/unsupported target and
-    // origin_chat both resolve to zero outbound destinations; neither may
-    // inherit a configured, derived, fallback, proactive, push, or desktop leg.
-    if (!target || !receipt || target.type === 'origin_chat') return [];
+    // Presence of the marker owns routing. A corrupt/unsupported target never
+    // inherits a configured, derived, fallback, proactive, push, or desktop
+    // leg. A terminal origin_chat carrier may resolve only the user's own
+    // registered web-push devices; the exact marker still prevents all other
+    // fallback fan-out.
+    if (!target || !receipt) return [];
+    if (target.type === 'origin_chat') {
+      if (!isTerminalOriginChatPushEligible(notification)) return [];
+      const destinations = listNotificationDestinations();
+      if (destinationsRequireRecovery()) return [];
+      return destinations.filter((entry) => entry.enabled && entry.type === 'web_push');
+    }
 
     if (target.type === 'discord_channel') {
       return [{

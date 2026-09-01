@@ -18,6 +18,7 @@ import {
   writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
 import {
+  deriveWorkflowTerminalOutcome,
   isWorkflowTerminalOutcome,
   workflowTerminalOutcomeMatchesReport,
   type WorkflowTerminalOutcome,
@@ -34,10 +35,13 @@ import {
 } from '../runtime/notifications.js';
 import {
   commitWorkflowOriginTerminal,
+  renderWorkflowOriginTerminalGroupMemberText,
   renderWorkflowOriginTerminalText,
   reviewAndCommitWorkflowOriginTerminal,
+  workflowOriginTerminalExpectedText,
   workflowOriginTerminalCommitMatches,
   workflowOriginTerminalNeedsAsyncJudge,
+  type WorkflowOriginTerminalOutcome,
   type WorkflowOriginTerminalInput,
 } from './workflow-origin-terminal.js';
 import type { TerminalDeliveryJudgePort } from '../runtime/harness/terminal-delivery-judge.js';
@@ -498,16 +502,29 @@ interface WorkflowOriginGroupReportProjection {
   memberRunIds: string[];
   memberReportBackDigests: WorkflowOriginGroupMemberReportBackDigest[];
   workflowName: string;
-  outcome: WorkflowRunReportBackOutcome;
+  outcome: WorkflowOriginTerminalOutcome;
   detail: string;
+  reprojectRetainedWorkFromOrigin: boolean;
 }
 
 type WorkflowOriginGroupReportResolution =
   | { status: 'ready'; projection: WorkflowOriginGroupReportProjection }
   | { status: 'pending' | 'corrupt'; error: string };
 
-function reportBackOutcomeRank(outcome: WorkflowRunReportBackOutcome): number {
-  return outcome === 'failed' ? 3 : outcome === 'blocked' ? 2 : 1;
+function workflowOriginOutcomeRank(outcome: WorkflowOriginTerminalOutcome): number {
+  return outcome === 'failed' ? 4 : outcome === 'blocked' ? 3 : outcome === 'cancelled' ? 2 : 1;
+}
+
+function workflowOriginOutcomeForReport(
+  run: WorkflowRunReportBackRecord,
+  envelope: WorkflowRunReportBackEnvelope,
+): WorkflowOriginTerminalOutcome {
+  // V1 report envelopes deliberately encode cancellation on the failed lane.
+  // The immutable run outcome disambiguates an intentional user Stop from a
+  // genuine failure without rewriting old envelope bytes or their digests.
+  return deriveWorkflowTerminalOutcome(run, envelope.outcome) === 'cancelled'
+    ? 'cancelled'
+    : envelope.outcome;
 }
 
 function workflowOriginTerminalStatus(
@@ -516,6 +533,7 @@ function workflowOriginTerminalStatus(
   return status === 'done'
     || status === 'blocked'
     || status === 'failed'
+    || status === 'cancelled'
     || status === 'needs_input'
     ? status
     : null;
@@ -564,6 +582,7 @@ function resolveWorkflowOriginGroupReport(
     runId: string;
     workflowName: string;
     outcome: WorkflowRunReportBackOutcome;
+    originOutcome: WorkflowOriginTerminalOutcome;
     detail: string;
   }> = [];
   for (const member of active.sealed.members) {
@@ -611,30 +630,39 @@ function resolveWorkflowOriginGroupReport(
       runId: member.runId,
       workflowName: record.reportBack.workflowName,
       outcome: record.reportBack.outcome,
+      originOutcome: workflowOriginOutcomeForReport(record, record.reportBack),
       detail: record.reportBack.detail,
     });
   }
 
-  const outcome = reports.reduce<WorkflowRunReportBackOutcome>(
-    (winner, report) => reportBackOutcomeRank(report.outcome) > reportBackOutcomeRank(winner)
-      ? report.outcome
+  const outcome = reports.reduce<WorkflowOriginTerminalOutcome>(
+    (winner, report) => workflowOriginOutcomeRank(report.originOutcome) > workflowOriginOutcomeRank(winner)
+      ? report.originOutcome
       : winner,
     'done',
   );
+  let reprojectRetainedWorkFromOrigin = false;
   const detail = reports.length === 1
     ? reports[0].detail
     : [
         `${reports.length} workflows finished for this request:`,
         ...reports.map((report) => {
           const label = report.workflowName.replace(/\s+/g, ' ').trim().slice(0, 120) || report.runId;
-          const rendered = renderWorkflowOriginTerminalText(report.detail, report.runId);
-          return `• ${label} — ${report.outcome}\n${rendered}`;
+          const rendered = outcome === 'done'
+            ? { text: renderWorkflowOriginTerminalText(report.detail, report.runId), removedRetainedWork: false }
+            : renderWorkflowOriginTerminalGroupMemberText(report.detail, report.runId);
+          if (rendered.removedRetainedWork) reprojectRetainedWorkFromOrigin = true;
+          return `• ${label} — ${report.originOutcome}\n${rendered.text}`;
         }),
       ].join('\n\n');
   const memberRunIds = reports.map((report) => report.runId);
   const memberReportBackDigests = reports.map((report) => ({
     runId: report.runId,
-    reportBackDigest: workflowRunReportBackContentDigest(report),
+    reportBackDigest: workflowRunReportBackContentDigest({
+      workflowName: report.workflowName,
+      outcome: report.outcome,
+      detail: report.detail,
+    }),
   }));
   return {
     status: 'ready',
@@ -648,6 +676,7 @@ function resolveWorkflowOriginGroupReport(
       workflowName: reports.length === 1 ? reports[0].workflowName : `${reports.length} workflows`,
       outcome,
       detail,
+      reprojectRetainedWorkFromOrigin,
     },
   };
 }
@@ -837,6 +866,7 @@ function deliverToOrigins(
         evidenceRunIds: projection.memberRunIds,
         outcome: projection.outcome,
         detail: projection.detail,
+        reprojectRetainedWorkFromOrigin: projection.reprojectRetainedWorkFromOrigin,
       };
       if (workflowOriginTerminalNeedsAsyncJudge(terminalInput)) {
         exactEvidenceComplete = false;
@@ -844,6 +874,7 @@ function deliverToOrigins(
         scheduleWorkflowOriginTerminalReview(terminalInput, onTerminalReviewCommitted);
         continue;
       }
+      const expectedText = workflowOriginTerminalExpectedText(terminalInput);
       const committed = commitWorkflowOriginTerminal(terminalInput);
       if (!committed) {
         exactEvidenceComplete = false;
@@ -851,10 +882,10 @@ function deliverToOrigins(
         errors.push(`Origin observer ${observer.observerId} no longer names an accepted user source.`);
         continue;
       }
-      const expectedText = renderWorkflowOriginTerminalText(projection.detail, projection.primaryRunId);
       const committedStatus = workflowOriginTerminalStatus(committed.presentation.status);
       if (
-        committed.presentation.identity.runId !== projection.identityRunId
+        expectedText === null
+        || committed.presentation.identity.runId !== projection.identityRunId
         || committed.presentation.identity.sourceUserSeq !== observer.sourceUserSeq
         || committedStatus === null
         || !workflowOriginTerminalCommitMatches({

@@ -24,6 +24,7 @@ import {
   loadWorkflowGraphSnapshotByRunId,
 } from './workflow-graph-store.js';
 import {
+  isCatalogWorkflowRunDefinitionSnapshot,
   isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
 } from './workflow-run-definition.js';
@@ -39,12 +40,22 @@ import {
 // so the backpressure, catch-up, and enqueue-failure notices silently fell into
 // their catch blocks and NEVER reached the user. No cycle: notifications
 // imports nothing from execution/.
-import { addNotification, getNotification } from '../runtime/notifications.js';
-import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
+import {
+  addNotification,
+  getNotification,
+  markNotificationRead,
+} from '../runtime/notifications.js';
+import {
+  queueWorkflowRun,
+  readWorkflowTriggerReceiptAcceptance,
+  type QueueWorkflowRunResult,
+} from '../tools/workflow-run-queue.js';
 import {
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
+  writeWorkflowRunRecordDurablyUnlocked,
 } from './workflow-run-record.js';
+import { readWorkflowRunCancellation } from './workflow-run-cancellation.js';
 import {
   workflowRunReportBackNeedsRetry,
   type WorkflowRunReportBackRecord,
@@ -58,6 +69,7 @@ import {
   workflowRunsWithPendingChatDispatchAdmissions,
 } from './workflow-origin-group.js';
 import { processWorkflowIntervalSchedules } from './workflow-interval-scheduler.js';
+import { WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE } from './workflow-raw-subprocess-policy.js';
 
 /**
  * Workflow scheduling tick.
@@ -384,6 +396,10 @@ interface ScheduledFireResult {
   /** Names of stale occurrences durably held before execution for a user
    *  Resume/Skip decision. A held occurrence has not run any workflow step. */
   held: string[];
+  /** Names whose exact occurrence was durably recorded as non-executable after
+   *  a deterministic readiness refusal. These are not catch-up decisions and
+   *  cannot be opened by Resume. */
+  blocked: string[];
   /** Stale decisions left durably pending because this tick reached the
    * bounded control-plane materialization budget. */
   deferred: string[];
@@ -391,12 +407,464 @@ interface ScheduledFireResult {
   deduped: string[];
 }
 
+interface ScheduledReadinessBlockerEvidence {
+  kind?: string;
+  name?: string;
+  reason?: string;
+  stepIds?: string[];
+}
+
+export interface ScheduledReadinessBlockClassification {
+  kind: 'migration_required' | 'capability_required';
+  code: typeof WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE | 'workflow_readiness_blocked';
+  blockers: ScheduledReadinessBlockerEvidence[];
+  detail: string;
+}
+
+/**
+ * Pure scheduler policy: a typed queue readiness refusal is deterministic and
+ * must become one durable no-effect occurrence. Thrown queue/storage failures
+ * are deliberately outside this classifier and retain the existing retry path.
+ */
+export function classifyScheduledReadinessBlock(input: {
+  status: string;
+  message?: string;
+  blockers?: ScheduledReadinessBlockerEvidence[];
+}): ScheduledReadinessBlockClassification | null {
+  if (input.status !== 'blocked_readiness') return null;
+  const blockers = Array.isArray(input.blockers) ? input.blockers : [];
+  const migrationBlockers = blockers.filter((blocker) =>
+    typeof blocker.reason === 'string'
+    && blocker.reason.includes(WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE));
+  if (migrationBlockers.length > 0) {
+    return {
+      kind: 'migration_required',
+      code: WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE,
+      blockers,
+      detail: migrationBlockers.map((blocker) => blocker.reason).filter(Boolean).join('\n'),
+    };
+  }
+  return {
+    kind: 'capability_required',
+    code: 'workflow_readiness_blocked',
+    blockers,
+    detail: blockers.map((blocker) => blocker.reason).filter(Boolean).join('\n')
+      || input.message?.trim()
+      || 'The workflow readiness contract is not currently satisfied.',
+  };
+}
+
+interface ScheduledReadinessRecordIdentity {
+  runId: string;
+  workflowName: string;
+  workflowSlug: string;
+  scheduledAtMs: number;
+  createdAt: string;
+  readiness: Record<string, unknown>;
+  blockers: ScheduledReadinessBlockerEvidence[];
+  detail: string;
+  state: 'legacy_hold' | 'blocked_readiness';
+}
+
+export interface LegacyScheduledReadinessReconcileResult {
+  inspected: number;
+  migrated: number;
+  recovered: number;
+  noticesEnsured: number;
+  notificationsRetired: number;
+  rejected: number;
+  failed: number;
+  limitReached: boolean;
+  migratedRunIds: string[];
+}
+
+function scheduledReadinessObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function scheduledReadinessString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function scheduledReadinessBlockers(value: unknown): ScheduledReadinessBlockerEvidence[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): ScheduledReadinessBlockerEvidence[] => {
+    const raw = scheduledReadinessObject(item);
+    if (!raw) return [];
+    return [{
+      ...(typeof raw.kind === 'string' ? { kind: raw.kind } : {}),
+      ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
+      ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+      ...(Array.isArray(raw.stepIds)
+        ? { stepIds: raw.stepIds.filter((step): step is string => typeof step === 'string') }
+        : {}),
+    }];
+  });
+}
+
+function hasRawSubprocessReadinessRefusal(record: Record<string, unknown>): boolean {
+  const readiness = scheduledReadinessObject(record.readiness);
+  return readiness?.ok === false
+    && scheduledReadinessBlockers(readiness.blockers).some((blocker) =>
+      blocker.reason?.includes(WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE));
+}
+
+const SCHEDULED_READINESS_EXECUTION_PROJECTION_FIELDS = [
+  'startedAt',
+  'finishedAt',
+  'cancelledAt',
+  'originSessionId',
+  'originSessionIds',
+  'requeuedFromRunId',
+  'retryFailedItemsFromRunId',
+  'retryFailedItemsStepId',
+  'retryFailedItemKeys',
+  'targetStepId',
+  'selfHealAttempt',
+  'goalAttempt',
+  'stepOutputs',
+  'output',
+  'error',
+  'mutationContractSnapshot',
+  'parked',
+  'capabilityBlock',
+  'mutationBlock',
+  'workflowGraphFinalizingFingerprint',
+  'reportBack',
+  'recoveryIntent',
+] as const;
+
+/**
+ * Authenticate one exact pre-fix hold (or an already-migrated generation that
+ * still needs its notification repaired). The receipt, immutable definition,
+ * empty scheduled inputs, and total absence of execution projections are all
+ * required; a hand-authored status string cannot gain migration authority.
+ */
+function scheduledReadinessRecordIdentity(
+  record: Record<string, unknown>,
+  expectedRunId: string,
+): ScheduledReadinessRecordIdentity | null {
+  const runId = scheduledReadinessString(record.id);
+  const workflowName = scheduledReadinessString(record.workflow);
+  const workflowSlug = scheduledReadinessString(record.workflowSlug);
+  const createdAt = scheduledReadinessString(record.createdAt);
+  if (
+    runId !== expectedRunId
+    || !workflowName
+    || !workflowSlug
+    || workflowSlug.includes(':')
+    || !createdAt
+    || !Number.isFinite(Date.parse(createdAt))
+    || record.source !== 'schedule'
+  ) return null;
+
+  const inputs = scheduledReadinessObject(record.inputs);
+  if (!inputs || Object.keys(inputs).length !== 0) return null;
+  if (SCHEDULED_READINESS_EXECUTION_PROJECTION_FIELDS.some((field) => record[field] !== undefined)) {
+    return null;
+  }
+  if (readWorkflowRunCancellation(runId)) return null;
+
+  const admitted = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+  if (
+    admitted.status !== 'valid'
+    || !isCatalogWorkflowRunDefinitionSnapshot(admitted.snapshot)
+    || admitted.snapshot.workflowSlug !== workflowSlug
+    || admitted.snapshot.definition.name.trim() !== workflowName
+  ) return null;
+
+  const triggerReceiptId = scheduledReadinessString(record.triggerReceiptId);
+  const receipt = triggerReceiptId
+    ? /^workflow-schedule:v1:([^:]+):(\d+)$/.exec(triggerReceiptId)
+    : null;
+  if (!receipt || receipt[1] !== workflowSlug) return null;
+  const scheduledAtMs = Number(receipt[2]);
+  if (!Number.isSafeInteger(scheduledAtMs) || scheduledAtMs < 0) return null;
+  if (readWorkflowTriggerReceiptAcceptance(triggerReceiptId!) !== runId) return null;
+
+  const recordedScheduledAtMs = record.catchupScheduledAtMs;
+  if (
+    recordedScheduledAtMs !== undefined
+    && (!Number.isSafeInteger(recordedScheduledAtMs) || recordedScheduledAtMs !== scheduledAtMs)
+  ) return null;
+  if (
+    existsSync(path.join(WORKFLOWS_DIR, workflowSlug, 'runs', runId))
+    || loadWorkflowGraphSnapshotByRunId(runId)
+  ) return null;
+
+  const readiness = scheduledReadinessObject(record.readiness);
+  if (!readiness || readiness.ok !== false) return null;
+  const blockers = scheduledReadinessBlockers(readiness.blockers);
+  const classification = classifyScheduledReadinessBlock({
+    status: 'blocked_readiness',
+    message: scheduledReadinessString(record.readinessMessage),
+    blockers,
+  });
+  if (
+    !classification
+    || classification.kind !== 'migration_required'
+    || classification.code !== WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE
+  ) return null;
+
+  let state: ScheduledReadinessRecordIdentity['state'];
+  if (record.status === 'awaiting_catchup_decision') {
+    const heldAt = scheduledReadinessString(record.catchupHeldAt);
+    const occurrenceAtMs = record.catchupOccurrenceAtMs;
+    const firstDueAtMs = record.catchupFirstDueAtMs;
+    const missedCount = record.catchupMissedCount;
+    if (
+      record.catchupFire !== true
+      || record.catchupDisposition !== 'held'
+      || record.catchupDecidedAt !== undefined
+      || record.scheduledReadinessBlock !== undefined
+      || !heldAt
+      || !Number.isFinite(Date.parse(heldAt))
+      || !Number.isSafeInteger(occurrenceAtMs)
+      || (occurrenceAtMs as number) < 0
+      || (occurrenceAtMs as number) > scheduledAtMs
+      || !Number.isSafeInteger(firstDueAtMs)
+      || (firstDueAtMs as number) < 0
+      || (firstDueAtMs as number) > scheduledAtMs
+      || !Number.isSafeInteger(missedCount)
+      || (missedCount as number) < 1
+    ) return null;
+    state = 'legacy_hold';
+  } else if (record.status === 'blocked_readiness') {
+    const marker = scheduledReadinessObject(record.scheduledReadinessBlock);
+    if (
+      !marker
+      || marker.protocol !== 'workflow_schedule_readiness_block_v1'
+      || marker.provenNoDispatch !== true
+      || !scheduledReadinessString(marker.blockedAt)
+      || record.catchupDisposition !== undefined
+      || record.catchupHeldAt !== undefined
+      || record.catchupDecidedAt !== undefined
+    ) return null;
+    state = 'blocked_readiness';
+  } else {
+    return null;
+  }
+
+  return {
+    runId,
+    workflowName,
+    workflowSlug,
+    scheduledAtMs,
+    createdAt,
+    readiness,
+    blockers,
+    detail: classification.detail,
+    state,
+  };
+}
+
+function scheduledReadinessNoticeMatches(
+  notification: ReturnType<typeof getNotification>,
+  identity: ScheduledReadinessRecordIdentity,
+): boolean {
+  if (!notification) return false;
+  const metadata = notification.metadata;
+  return notification.id === `system-workflow-readiness-blocked-${identity.runId}`
+    && metadata?.errorCategory === 'workflow_schedule_migration_required'
+    && metadata.workflow === identity.workflowName
+    && metadata.workflowRunId === identity.runId
+    && metadata.runId === identity.runId
+    && metadata.status === 'blocked_readiness'
+    && metadata.blockerCode === WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE
+    && metadata.provenNoDispatch === true
+    && metadata.needsAttention === true
+    && metadata.migrationRequired === true
+    && /not resumable/i.test(notification.body)
+    && !/Resume or Skip/i.test(notification.body);
+}
+
+function matchingLegacyCatchupNotice(
+  identity: ScheduledReadinessRecordIdentity,
+): ReturnType<typeof getNotification> {
+  const notification = getNotification(`system-workflow-catchup-held-${identity.runId}`);
+  if (
+    notification?.metadata?.errorCategory !== 'workflow_schedule_catchup_held'
+    || notification.metadata.workflow !== identity.workflowName
+    || notification.metadata.workflowRunId !== identity.runId
+    || notification.metadata.runId !== identity.runId
+    || notification.metadata.catchupHeld !== true
+  ) return undefined;
+  return notification;
+}
+
+function matchingLegacyEnqueueFailureNotice(
+  identity: ScheduledReadinessRecordIdentity,
+): ReturnType<typeof getNotification> {
+  const dayKey = new Date(identity.scheduledAtMs).toISOString().slice(0, 10);
+  const notification = getNotification(
+    `system-workflow-enqueue-failed-${identity.workflowName}-${dayKey}`,
+  );
+  if (
+    notification?.metadata?.errorCategory !== 'workflow_enqueue_failed'
+    || notification.metadata.workflow !== identity.workflowName
+    || !notification.body.includes(WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE)
+  ) return undefined;
+  return notification;
+}
+
+/**
+ * One-time compatibility repair for schedule occurrences admitted immediately
+ * before `persistScheduledReadinessBlock` shipped. It is state-only: no run is
+ * queued, resumed, drained, or given execution authority.
+ *
+ * Crash order is deliberate: canonical run state first, replacement notice
+ * second, stale carriers retired last. A later boot can finish either partial
+ * generation without repeating workflow work or hiding the old warning early.
+ */
+export function reconcileLegacyScheduledReadinessHolds(
+  options: { limit?: number } = {},
+): LegacyScheduledReadinessReconcileResult {
+  const requestedLimit = options.limit ?? 32;
+  const limit = Number.isSafeInteger(requestedLimit)
+    ? Math.max(1, Math.min(256, requestedLimit))
+    : 32;
+  const result: LegacyScheduledReadinessReconcileResult = {
+    inspected: 0,
+    migrated: 0,
+    recovered: 0,
+    noticesEnsured: 0,
+    notificationsRetired: 0,
+    rejected: 0,
+    failed: 0,
+    limitReached: false,
+    migratedRunIds: [],
+  };
+  if (!existsSync(WORKFLOW_RUNS_DIR)) return result;
+
+  let files: string[];
+  try {
+    files = readdirSync(WORKFLOW_RUNS_DIR)
+      .filter((file) => file.endsWith('.json'))
+      .sort();
+  } catch {
+    result.failed += 1;
+    return result;
+  }
+
+  for (const file of files) {
+    let snapshot: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as unknown;
+      const object = scheduledReadinessObject(parsed);
+      if (!object) continue;
+      snapshot = object;
+    } catch {
+      continue;
+    }
+    if (
+      snapshot.status !== 'awaiting_catchup_decision'
+      && snapshot.status !== 'blocked_readiness'
+    ) continue;
+    if (!hasRawSubprocessReadinessRefusal(snapshot)) continue;
+    if (result.inspected >= limit) {
+      result.limitReached = true;
+      break;
+    }
+    result.inspected += 1;
+
+    const filePath = path.join(WORKFLOW_RUNS_DIR, file);
+    let identity: ScheduledReadinessRecordIdentity | null = null;
+    let migrated = false;
+    try {
+      identity = withWorkflowRunRecordLock(filePath, () => {
+        const current = readWorkflowRunRecordUnlocked<Record<string, unknown>>(filePath);
+        if (!current) return null;
+        const authenticated = scheduledReadinessRecordIdentity(
+          current,
+          file.slice(0, -'.json'.length),
+        );
+        if (!authenticated) return null;
+        if (authenticated.state === 'blocked_readiness') return authenticated;
+
+        const {
+          catchupDisposition: _catchupDisposition,
+          catchupHeldAt: _catchupHeldAt,
+          catchupDecidedAt: _catchupDecidedAt,
+          ...preserved
+        } = current;
+        const next: Record<string, unknown> = {
+          ...preserved,
+          status: 'blocked_readiness',
+          scheduledReadinessBlock: {
+            protocol: 'workflow_schedule_readiness_block_v1',
+            blockedAt: authenticated.createdAt,
+            provenNoDispatch: true,
+          },
+          readinessMessage: authenticated.detail,
+        };
+        writeWorkflowRunRecordDurablyUnlocked(filePath, next);
+        migrated = true;
+        return { ...authenticated, state: 'blocked_readiness' };
+      });
+    } catch (err) {
+      result.failed += 1;
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err), file },
+        'Legacy scheduled readiness hold reconciliation failed closed',
+      );
+      continue;
+    }
+    if (!identity) {
+      result.rejected += 1;
+      continue;
+    }
+    if (migrated) {
+      result.migrated += 1;
+      result.migratedRunIds.push(identity.runId);
+    } else {
+      result.recovered += 1;
+    }
+
+    const oldCatchup = matchingLegacyCatchupNotice(identity);
+    const scheduledMinuteKey = typeof oldCatchup?.metadata?.scheduledMinuteKey === 'string'
+      ? oldCatchup.metadata.scheduledMinuteKey
+      : currentMinuteKey(new Date(identity.scheduledAtMs));
+    const classification = classifyScheduledReadinessBlock({
+      status: 'blocked_readiness',
+      message: identity.detail,
+      blockers: identity.blockers,
+    });
+    if (
+      !classification
+      || classification.kind !== 'migration_required'
+      || !emitScheduledReadinessBlockedNotice(
+        identity.workflowName,
+        identity.runId,
+        scheduledMinuteKey,
+        classification,
+      )
+      || !scheduledReadinessNoticeMatches(
+        getNotification(`system-workflow-readiness-blocked-${identity.runId}`),
+        identity,
+      )
+    ) {
+      result.failed += 1;
+      continue;
+    }
+    result.noticesEnsured += 1;
+
+    for (const legacy of [oldCatchup, matchingLegacyEnqueueFailureNotice(identity)]) {
+      if (!legacy || legacy.read) continue;
+      const retired = markNotificationRead(legacy.id);
+      if (retired?.read) result.notificationsRetired += 1;
+    }
+  }
+  return result;
+}
+
 /**
  * Daemon entry point. Idempotent within a minute. Safe to call every
  * 15s — only the first match per workflow per minute writes a run.
  */
 export async function processWorkflowSchedules(now: Date = new Date()): Promise<ScheduledFireResult> {
-  const result: ScheduledFireResult = { fired: [], held: [], deferred: [], deduped: [] };
+  const result: ScheduledFireResult = { fired: [], held: [], blocked: [], deferred: [], deduped: [] };
   const nowMinuteMs = minuteFloor(now.getTime());
   const minuteKey = currentMinuteKey(new Date(nowMinuteMs));
 
@@ -677,6 +1145,57 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         occurrence.firstDueAtMs,
         occurrence.missed + 1,
       );
+      if (queued.status === 'blocked_readiness') {
+        const classification = scheduledReadinessBlockClassificationForRun(workflowName, queued);
+        if (!classification) {
+          throw new Error(
+            `Scheduled workflow "${workflowName}" returned blocked_readiness without durable blocker evidence.`,
+          );
+        }
+        // Notification durability precedes retiring the pending occurrence. If
+        // storage fails, the exact trigger receipt reopens this same blocked
+        // run on the next tick and retries only the notice—not workflow work.
+        if (!emitScheduledReadinessBlockedNotice(
+          workflowName,
+          queued.id,
+          latestKey,
+          classification,
+        )) {
+          logger.warn(
+            { workflow: workflowName, runId: queued.id },
+            'Could not durably surface scheduled readiness block; occurrence remains pending',
+          );
+          continue;
+        }
+        markWorkflowOccurrenceHandled(state, dedupeKey, occurrence);
+        saveScheduleState(state);
+        result.blocked.push(workflowName);
+        try {
+          recordProspectiveOutcome(
+            prospectiveId,
+            'blocked',
+            {
+              reason: 'schedule_readiness_blocked',
+              blockerKind: classification.kind,
+              blockerCode: classification.code,
+              runId: queued.id,
+              cueKey: prospectiveCueKey,
+              provenNoDispatch: true,
+            },
+            now,
+          );
+        } catch { /* durable run + notification remain authoritative */ }
+        logger.warn(
+          {
+            workflow: workflowName,
+            runId: queued.id,
+            blockerKind: classification.kind,
+            blockerCode: classification.code,
+          },
+          'Scheduled workflow occurrence recorded as readiness-blocked before execution',
+        );
+        continue;
+      }
       markWorkflowOccurrenceHandled(state, dedupeKey, occurrence);
       saveScheduleState(state);
       if (queued.status === 'duplicate') {
@@ -959,6 +1478,116 @@ function countActiveRunsFor(workflowName: string, workflowSlug = workflowName): 
 /** Daily-bucketed system notification so the user knows their schedule
  *  is firing faster than the workflow can finish. We import lazily to
  *  avoid a runtime cycle (notifications → maintenance → scheduler). */
+function scheduledReadinessBlockClassificationForRun(
+  workflowName: string,
+  queued: QueueWorkflowRunResult & { id: string },
+): ScheduledReadinessBlockClassification | null {
+  try {
+    const record = JSON.parse(
+      readFileSync(path.join(WORKFLOW_RUNS_DIR, `${queued.id}.json`), 'utf-8'),
+    ) as Record<string, unknown>;
+    const marker = record.scheduledReadinessBlock;
+    const readiness = record.readiness;
+    if (
+      record.id !== queued.id
+      || record.workflow !== workflowName
+      || record.source !== 'schedule'
+      || record.status !== 'blocked_readiness'
+      || !marker
+      || typeof marker !== 'object'
+      || Array.isArray(marker)
+      || (marker as Record<string, unknown>).protocol !== 'workflow_schedule_readiness_block_v1'
+      || (marker as Record<string, unknown>).provenNoDispatch !== true
+      || !readiness
+      || typeof readiness !== 'object'
+      || Array.isArray(readiness)
+      || (readiness as Record<string, unknown>).ok !== false
+    ) return null;
+    const rawBlockers = (readiness as Record<string, unknown>).blockers;
+    const blockers: ScheduledReadinessBlockerEvidence[] = Array.isArray(rawBlockers)
+      ? rawBlockers.flatMap((value): ScheduledReadinessBlockerEvidence[] => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+          const raw = value as Record<string, unknown>;
+          return [{
+            ...(typeof raw.kind === 'string' ? { kind: raw.kind } : {}),
+            ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
+            ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+            ...(Array.isArray(raw.stepIds)
+              ? { stepIds: raw.stepIds.filter((item): item is string => typeof item === 'string') }
+              : {}),
+          }];
+        })
+      : [];
+    return classifyScheduledReadinessBlock({
+      status: 'blocked_readiness',
+      message: typeof record.readinessMessage === 'string'
+        ? record.readinessMessage
+        : queued.message,
+      blockers,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function emitScheduledReadinessBlockedNotice(
+  workflowName: string,
+  runId: string,
+  scheduledMinuteKey: string,
+  classification: ScheduledReadinessBlockClassification,
+): boolean {
+  const id = `system-workflow-readiness-blocked-${runId}`;
+  try {
+    if (getNotification(id)) return true;
+    const blockerNames = Array.from(new Set(
+      classification.blockers
+        .map((blocker) => blocker.name?.trim())
+        .filter((name): name is string => Boolean(name)),
+    ));
+    const target = blockerNames.length > 0 ? ` (${blockerNames.join(', ')})` : '';
+    const migration = classification.kind === 'migration_required';
+    addNotification({
+      id,
+      kind: 'workflow',
+      title: migration
+        ? `Workflow update required: "${workflowName}" did not start`
+        : `Workflow needs attention: "${workflowName}" did not start`,
+      body: migration
+        ? `The scheduled occurrence was stopped before any workflow step or provider call because this workflow still uses a retired raw script runner${target}. `
+          + `Open "${workflowName}" in Workflows—or ask Clem to inspect it with workflow_get—and replace external work with exact call steps plus bounded transform or a reviewed in-process host primitive using workflow_update. `
+          + 'This saved occurrence is not resumable and will not retry automatically; after the migration, run the updated workflow once or let its next schedule fire.'
+        : `The scheduled occurrence was stopped before any workflow step or provider call because required workflow readiness is not satisfied${target}. `
+          + `Open "${workflowName}" in Workflows, fix the listed definition or capability, then run the updated workflow once or let its next schedule fire. `
+          + 'This saved occurrence is not resumable and will not retry automatically.',
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: {
+        errorCategory: migration
+          ? 'workflow_schedule_migration_required'
+          : 'workflow_schedule_readiness_blocked',
+        workflow: workflowName,
+        workflowRunId: runId,
+        runId,
+        status: 'blocked_readiness',
+        blockerKind: classification.kind,
+        blockerCode: classification.code,
+        blockerNames,
+        scheduledMinuteKey,
+        provenNoDispatch: true,
+        needsAttention: true,
+        migrationRequired: migration,
+      },
+    });
+    return getNotification(id) !== undefined;
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), workflow: workflowName, runId },
+      'Failed to emit scheduled readiness-block notice',
+    );
+    return false;
+  }
+}
+
 /** Surface an occurrence whose durable retry is blocked at enqueue time
  *  (daily-bucketed per workflow). */
 function emitEnqueueFailureNotice(workflowName: string, err: unknown): void {
@@ -1058,7 +1687,7 @@ function enqueueScheduledRun(
   catchupFire = false,
   catchupAdmissionAtMs = occurrenceAtMs,
   catchupMissedCount = 1,
-): { id: string; status: 'queued' | 'held' | 'duplicate' } {
+): QueueWorkflowRunResult & { id: string } {
   const queued = queueWorkflowRun(workflowName, {}, {
     source: 'schedule',
     idPrefix: 'sched',
@@ -1067,6 +1696,10 @@ function enqueueScheduledRun(
     // Persist the immutable catalog identity separately from the mutable
     // display name. Exact-send authority and its receipt ledger bind this slug.
     workflowSlug,
+    // Only this exact schedule receipt may turn a deterministic readiness red
+    // into a durable non-executable occurrence. Other callers still receive an
+    // unbound blocked_readiness response and can retry after their own repair.
+    persistScheduledReadinessBlock: true,
     ...(catchupFire
       ? {
           catchupFire: true,
@@ -1078,10 +1711,15 @@ function enqueueScheduledRun(
       : {}),
   });
   if (!queued.id) throw new Error(queued.message || `Scheduled workflow "${workflowName}" did not return a run id.`);
-  if (queued.status !== 'queued' && queued.status !== 'held' && queued.status !== 'duplicate') {
+  if (
+    queued.status !== 'queued'
+    && queued.status !== 'held'
+    && queued.status !== 'duplicate'
+    && queued.status !== 'blocked_readiness'
+  ) {
     throw new Error(queued.message || `Scheduled workflow "${workflowName}" was not accepted.`);
   }
-  return { id: queued.id, status: queued.status };
+  return { ...queued, id: queued.id };
 }
 
 /**

@@ -84,13 +84,19 @@ import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { reapOrphanedWorkflowChatDispatches } from '../tools/workflow-run-queue.js';
 import { cancelWorkflowRunAtBoundary } from '../execution/workflow-run-cancellation.js';
 import {
+  recoverParkedApprovalSurfaces,
   reconcileActivatedWorkflowDispatchGroups,
   reconcileClosedWorkflowDispatchBatches,
 } from '../runtime/harness/loop.js';
 import { fireDueTimers } from '../runtime/timers.js';
 import { syncProspectiveIntentions } from '../runtime/prospective-sync.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
-import { processWorkflowSchedules, reapStaleWorkflowRuns, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
+import {
+  processWorkflowSchedules,
+  reapStaleWorkflowRuns,
+  reconcileLegacyScheduledReadinessHolds,
+  scheduleCatchupWindow,
+} from '../execution/workflow-scheduler.js';
 import { recoverPendingWorkflowTriggerEvents, syncWorkflowTriggerRegistry } from '../execution/workflow-trigger-engine.js';
 import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
@@ -158,6 +164,7 @@ import {
   getNotificationDestinationsForRecord,
   getNotification,
   isDeliveryJobStale,
+  isExactOriginChatTerminalReportBack,
   listQueuedNotificationDeliveries,
   markNotificationRead,
   recoverCorruptedNotificationDeliveryQueue,
@@ -1545,7 +1552,7 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
     // Queue bytes are only retry cursors, never authority to widen a local
     // Activity record into an external disclosure. This also removes legacy
     // or manually forged jobs for silent failure diagnostics.
-    if (notification.silent) {
+    if (notification.silent && !isExactOriginChatTerminalReportBack(notification)) {
       continue;
     }
 
@@ -2299,6 +2306,20 @@ export async function startDaemon(
       'Historical harness-state boot reconcile failed closed',
     );
   }
+  try {
+    const recoveredApprovalSurfaces = recoverParkedApprovalSurfaces();
+    if (recoveredApprovalSurfaces.surfaced > 0 || recoveredApprovalSurfaces.failed > 0) {
+      logger.warn(
+        recoveredApprovalSurfaces,
+        'Reconciled parked approval surfaces on boot',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Parked approval-surface boot reconcile failed; ordinary tick will retry',
+    );
+  }
   // Register the live approval listener and drain decisions that landed before
   // this daemon existed. This must run after orphan attempts are interrupted
   // (so a dead executor cannot still own the session) and before generic chat
@@ -2382,6 +2403,63 @@ export async function startDaemon(
       'Boot activated workflow dispatch reconcile failed',
     );
   }
+  const interruptedChatResumesInFlight = new Set<string>();
+  const interruptedChatResumeKey = (sessionId: string, sourceUserSeq: number): string =>
+    `${sessionId}:${sourceUserSeq}`;
+  const dispatchInterruptedChatResume = async (restart: Parameters<NonNullable<Parameters<typeof reportInterruptedChatRuns>[1]>>[0]) => {
+    const key = interruptedChatResumeKey(restart.sessionId, restart.sourceUserSeq);
+    // Recovery selection normally filters this before recording its durable
+    // claim. Keep the dispatcher idempotent too, so an unexpected overlapping
+    // caller still cannot enter the same accepted source twice.
+    if (interruptedChatResumesInFlight.has(key)) return;
+    interruptedChatResumesInFlight.add(key);
+    try {
+      await respondPreferHarness(restart.surface, {
+        sessionId: restart.sessionId,
+        channel: restart.channel ?? restart.surface,
+        message: restart.acceptedInput,
+        sourceUserSeq: restart.sourceUserSeq,
+        model: MODELS.primary,
+      }, (req) => assistant.respond(req));
+    } finally {
+      interruptedChatResumesInFlight.delete(key);
+    }
+  };
+  let finalizeExactCheckpointStop:
+    NonNullable<Parameters<typeof reportInterruptedChatRuns>[2]>['finalizeExactCheckpointStop'];
+  try {
+    const [{ finalizeCancelledAsyncReadRefinement }, { loadAsyncReadRefinementOwner }] = await Promise.all([
+      import('../runtime/harness/async-read-refinement-executor.js'),
+      import('../runtime/harness/async-read-refinement-store.js'),
+    ]);
+    finalizeExactCheckpointStop = (input) => {
+      const owner = loadAsyncReadRefinementOwner({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        startLogicalToolCallId: input.ownerLogicalToolCallId,
+      });
+      if (!owner) return { status: 'not_applicable' };
+      return finalizeCancelledAsyncReadRefinement({
+        ...input,
+        acceptedTaskId: owner.intent.acceptedTaskId,
+      });
+    };
+  } catch (err) {
+    // Fail closed: restart recovery retains the exact HRS/marker and emits no
+    // provider call or cancelled terminal until this finalizer is available.
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Async-read checkpoint Stop finalizer is unavailable',
+    );
+  }
+  const interruptedChatRecoveryOptions = {
+    bootCutoffMs: performance.timeOrigin,
+    exactCheckpointDispatchLimit: 3,
+    isExactCheckpointDispatchInFlight: (sessionId: string, sourceUserSeq: number) =>
+      interruptedChatResumesInFlight.has(interruptedChatResumeKey(sessionId, sourceUserSeq)),
+    exactCheckpointDispatchInFlightCount: () => interruptedChatResumesInFlight.size,
+    ...(finalizeExactCheckpointStop ? { finalizeExactCheckpointStop } : {}),
+  };
   // The closed-batch and activated-group reconcilers above both replay from a
   // durable receipt. A dispatch that was PREPARED and never closed has neither,
   // so nothing reclaimed it: the run stayed held forever AND blocked every
@@ -2400,21 +2478,54 @@ export async function startDaemon(
       'Boot orphaned workflow dispatch reap failed',
     );
   }
+  // A plan graph and its immutable pre-seal intent commit together. Recover
+  // that host-only continuation before generic chat restart can invoke a
+  // model: this pass may seal/freeze/checkpoint/durably deliver/activate the
+  // exact accepted plan, but it owns no provider or business invocation.
+  try {
+    const { recoverPendingPlanTaskBindingSealPreparations } = await import('../tools/plan-tools.js');
+    const recovered = await recoverPendingPlanTaskBindingSealPreparations({ limit: 8 });
+    if (
+      recovered.prepared > 0
+      || recovered.replayed > 0
+      || recovered.activated > 0
+      || recovered.deliveryRequired > 0
+      || recovered.held > 0
+    ) logger.warn(recovered, 'Recovered immutable plan preparation owners on boot');
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Immutable plan preparation boot recovery failed closed; ordinary tick will retry',
+    );
+  }
+  // An async read can durably own START/GET children before its private pending
+  // signal reaches the turn runner. After boot has interrupted the dead run and
+  // revoked its lease, reconstruct the exact accepted sole-call frame BEFORE
+  // generic revoked-call reconciliation. This claim performs no model/provider
+  // work; ordinary restart dispatch resumes only the next missing getter.
+  try {
+    const { claimPendingAsyncReadRefinementRecoveries } = await import('../runtime/harness/async-read-refinement-recovery.js');
+    const claimed = claimPendingAsyncReadRefinementRecoveries({ limit: 8 });
+    if (claimed.claimed > 0 || claimed.replayed > 0 || claimed.held > 0) {
+      logger.warn(claimed, 'Claimed durable async-read refinement recoveries on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Async-read refinement boot claim failed closed; ordinary tick will retry',
+    );
+  }
   // Chat runs execute in-process with no resumer; a restart mid-run would
   // otherwise die SILENTLY. Surface each interrupted chat run, and — when the
   // interrupted turn provably made no external writes — RESUME it automatically
   // through the same harness spine a user's `continue` uses (2026-07-09: users
   // sat on "reply continue" banners after every restart; the resume path itself
   // was live-verified to work). Write-touched / stale runs keep the manual banner.
-  const recoveredChats = reportInterruptedChatRuns(Date.now, async (restart) => {
-    await respondPreferHarness(restart.surface, {
-      sessionId: restart.sessionId,
-      channel: restart.channel ?? restart.surface,
-      message: restart.acceptedInput,
-      sourceUserSeq: restart.sourceUserSeq,
-      model: MODELS.primary,
-    }, (req) => assistant.respond(req));
-  }, { bootCutoffMs: performance.timeOrigin });
+  const recoveredChats = reportInterruptedChatRuns(
+    Date.now,
+    dispatchInterruptedChatResume,
+    interruptedChatRecoveryOptions,
+  );
   if (recoveredChats > 0) {
     logger.warn({ recoveredChats }, 'Surfaced chat runs interrupted by a previous restart (safe ones auto-resumed)');
   }
@@ -2468,6 +2579,27 @@ export async function startDaemon(
     logger.warn(
       { sweptRuns, sweptExecutions, sweptApprovals, sweptCrashed, sweptBlocked, repairedDoneTasks },
       'Auto-closed stale runs / executions / approvals on daemon start',
+    );
+  }
+  // A short-lived scheduler generation represented deterministic readiness
+  // refusals as Resume/Skip catch-ups. Repair only receipt-authenticated,
+  // provably unstarted records before Inbox hygiene or workflow draining can
+  // observe them. This pass changes local control-plane state only.
+  try {
+    const readinessHolds = reconcileLegacyScheduledReadinessHolds();
+    if (
+      readinessHolds.migrated > 0
+      || readinessHolds.noticesEnsured > 0
+      || readinessHolds.notificationsRetired > 0
+      || readinessHolds.failed > 0
+      || readinessHolds.limitReached
+    ) {
+      logger.warn(readinessHolds, 'Reconciled legacy scheduled readiness holds on boot');
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Legacy scheduled readiness hold boot reconciliation failed closed',
     );
   }
   // Notification hygiene on boot: stale unread approval/execution cards
@@ -2671,6 +2803,17 @@ export async function startDaemon(
   // itself has an in-flight guard, so explicit approval kicks and this
   // timer cannot double-run the same task.
   const drainBackgroundTasks = () => {
+    try {
+      const approvalSurfaces = recoverParkedApprovalSurfaces();
+      if (approvalSurfaces.surfaced > 0 || approvalSurfaces.failed > 0) {
+        logger.warn(approvalSurfaces, 'Reconciled parked approval surfaces');
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Parked approval-surface tick failed; exact interrupted state remains held',
+      );
+    }
     try {
       const admissions = reconcileApprovedPlanTaskAdmissions();
       if (admissions.materialized > 0 || admissions.completed > 0 || admissions.failed > 0) {
@@ -3100,6 +3243,46 @@ export async function startDaemon(
     setDaemonRuntimePhase('daemon.loop.tick', { tickCount });
     await withDaemonRuntimePhase('daemon.loop.cron_schedules', { tickCount }, () => processCronSchedules(assistant, state));
     await withDaemonRuntimePhase('daemon.loop.cron_triggers', { tickCount }, () => processCronTriggers(assistant));
+    await withDaemonRuntimePhase('daemon.loop.plan_task_preparation_recovery', { tickCount }, async () => {
+      try {
+        const { recoverPendingPlanTaskBindingSealPreparations } = await import('../tools/plan-tools.js');
+        const recovered = await recoverPendingPlanTaskBindingSealPreparations({ limit: 8 });
+        if (
+          recovered.prepared > 0
+          || recovered.replayed > 0
+          || recovered.activated > 0
+          || recovered.deliveryRequired > 0
+          || recovered.held > 0
+        ) logger.warn(recovered, 'Recovered immutable plan preparation owners');
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Immutable plan preparation recovery tick failed closed',
+        );
+      }
+    });
+    await withDaemonRuntimePhase('daemon.loop.async_read_refinement_recovery', { tickCount }, async () => {
+      try {
+        const { claimPendingAsyncReadRefinementRecoveries } = await import('../runtime/harness/async-read-refinement-recovery.js');
+        const claimed = claimPendingAsyncReadRefinementRecoveries({ limit: 8 });
+        // Also retry an exact checkpoint whose prior boot dispatch was rejected.
+        // Its HostRecoveryState remains durable, so this call needs no new claim
+        // and cannot replay START/Search/model work.
+        const resumed = reportInterruptedChatRuns(
+          Date.now,
+          dispatchInterruptedChatResume,
+          { ...interruptedChatRecoveryOptions, exactCheckpointsOnly: true },
+        );
+        if (claimed.claimed > 0 || claimed.replayed > 0 || claimed.held > 0 || resumed > 0) {
+          logger.warn({ claimed, resumed }, 'Recovered durable async-read refinement owners');
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Async-read refinement recovery tick failed closed',
+        );
+      }
+    });
     // Prospective memory control plane: rebuild the compact future-intention
     // index from timers, goals, workflows, monitors, check-ins, and background
     // report-backs. Boot + ~60s cadence; unchanged definitions are true DB

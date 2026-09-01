@@ -268,6 +268,26 @@ input, textarea, select { font: inherit; font-size: 16px; }
   flex-wrap: wrap;
   justify-content: flex-end;
 }
+.run-control-compact { margin-left: 0; }
+.run-stop-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid rgba(208, 69, 58, 0.34);
+  border-radius: 50%;
+  background: var(--fail-soft);
+  color: var(--accent-fail);
+  font-family: var(--font-display);
+  line-height: 1;
+  transition: transform 0.14s var(--ease-out), opacity 0.16s ease, border-color 0.16s ease;
+}
+.run-stop-trigger > span { font-size: 10px; transform: translateY(-0.5px); }
+.run-stop-trigger:active:not(:disabled) { transform: scale(0.92); }
+.run-stop-trigger:disabled { opacity: 0.58; }
 .run-control-ask {
   font-size: var(--t-xs);
   color: var(--fg-2);
@@ -1117,6 +1137,14 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 .turn-assistant { margin-bottom: var(--sp-4); }
 .turn-failed .reply { color: var(--fg); }
+.delegated-work-state {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  color: var(--fg-3);
+  font-size: var(--t-xs);
+  font-weight: 700;
+}
 
 .reply {
   font-size: var(--t-body);
@@ -1150,6 +1178,12 @@ input, textarea, select { font: inherit; font-size: 16px; }
    One line per turn for everything Clem did. Muted by default: it sits
    above the reply the way a timestamp does, present but not loud.      */
 .work { margin-bottom: var(--sp-2); }
+.work-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
 .work-line {
   display: flex;
   align-items: center;
@@ -1162,6 +1196,18 @@ input, textarea, select { font: inherit; font-size: 16px; }
   color: var(--fg-3);
   font-size: var(--t-xs);
   text-align: left;
+}
+.work-head .work-line {
+  flex: 1 1 160px;
+  width: auto;
+  min-width: 0;
+}
+.work-head .run-control-compact.confirming {
+  flex: 1 0 100%;
+  padding-left: 17px;
+}
+.work-head .run-control-compact:not(.confirming) .run-control-error {
+  max-width: min(240px, 62vw);
 }
 .work-line:active { opacity: 0.6; }
 .work-summary { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2526,6 +2572,43 @@ input, textarea, select { font: inherit; font-size: 16px; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.ws-record-copy { margin-top: var(--sp-3); }
+.ws-record-body {
+  color: var(--fg);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
+}
+.ws-record-body.expanded {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+.ws-record-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: var(--sp-2);
+}
+.ws-record-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line);
+}
+.ws-record-link {
+  color: var(--accent-deep);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  overflow-wrap: anywhere;
 }
 .ws-more {
   font-size: var(--t-xs);

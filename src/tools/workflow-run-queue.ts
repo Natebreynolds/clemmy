@@ -1300,6 +1300,11 @@ export interface QueueWorkflowRunOptions {
    *  installs the run directly as awaiting_catchup_decision, so an independent
    *  drain tick can never start it between queueing and a later "hold" write. */
   holdForCatchupDecision?: boolean;
+  /** Scheduler-only admission boundary for a deterministic readiness refusal.
+   *  When the exact occurrence is not executable, persist one non-executable
+   *  run instead of returning an unbound refusal that the scheduler can only
+   *  rediscover and retry. This grants no execution or Resume authority. */
+  persistScheduledReadinessBlock?: boolean;
   /** Stable workflow entry/directory slug. Required for scheduler admissions
    * because the display name is mutable and cannot own occurrence, recovery,
    * or exact-send mutation authority. */
@@ -1379,6 +1384,51 @@ interface NormalizedCatchupHold {
   firstDueAtMs: number;
   scheduledAtMs: number;
   missedCount: number;
+}
+
+interface NormalizedScheduledReadinessBlock {
+  workflowSlug: string;
+}
+
+/**
+ * Validate the narrower scheduler authority that may persist a readiness-red
+ * occurrence. The exact schedule receipt is its only creation identity; other
+ * queue surfaces must continue receiving an unbound blocked_readiness result.
+ */
+function normalizeScheduledReadinessBlock(
+  opts: QueueWorkflowRunOptions | undefined,
+  triggerReceiptId: string | undefined,
+): NormalizedScheduledReadinessBlock | undefined {
+  if (opts?.persistScheduledReadinessBlock !== true) return undefined;
+  const workflowSlug = normalizedOptionalString(opts.workflowSlug);
+  if (
+    normalizedOptionalString(opts.source) !== 'schedule'
+    || !triggerReceiptId
+    || !workflowSlug
+    || workflowSlug.includes(':')
+    || opts.originObserver !== undefined
+    || normalizedOptionalString(opts.originSessionId) !== undefined
+    || opts.acceptDisabled === true
+    || normalizedOptionalString(opts.targetStepId) !== undefined
+    || normalizedOptionalString(opts.requeuedFromRunId) !== undefined
+    || opts.retryFailedItems !== undefined
+    || opts.workflowReadPilotAdmission !== undefined
+    || opts.workflowRecurringReadAdmission !== undefined
+  ) {
+    throw new Error(
+      'A persisted scheduled readiness block requires source=schedule, a stable workflowSlug, '
+      + 'its exact schedule receipt, and no chat, retry, pilot, or execution bypass authority.',
+    );
+  }
+  const receiptPrefix = `workflow-schedule:v1:${workflowSlug}:`;
+  const scheduledRaw = triggerReceiptId.startsWith(receiptPrefix)
+    ? triggerReceiptId.slice(receiptPrefix.length)
+    : '';
+  const scheduledAtMs = Number(scheduledRaw);
+  if (!/^\d+$/.test(scheduledRaw) || !Number.isSafeInteger(scheduledAtMs) || scheduledAtMs < 0) {
+    throw new Error('A persisted scheduled readiness block requires its canonical workflow schedule receipt.');
+  }
+  return { workflowSlug };
 }
 
 /**
@@ -2228,6 +2278,7 @@ function queueWorkflowRunUnlocked(
     }
   }
   const catchupHold = normalizeCatchupHold(opts, triggerReceiptId);
+  const scheduledReadinessBlock = normalizeScheduledReadinessBlock(opts, triggerReceiptId);
   const requestedWorkflowSlug = normalizedOptionalString(opts?.workflowSlug);
   if (requestedWorkflowSlug && workflowEntry && requestedWorkflowSlug !== workflowEntry.name) {
     throw new Error(
@@ -2235,6 +2286,7 @@ function queueWorkflowRunUnlocked(
     );
   }
   const workflowSlug = catchupHold?.workflowSlug
+    ?? scheduledReadinessBlock?.workflowSlug
     ?? requestedWorkflowSlug
     ?? (source === 'schedule' ? workflowEntry?.name : undefined);
   if (typeof triggerReceiptId === 'string' && triggerReceiptId.startsWith('workflow-schedule:v1:')) {
@@ -2424,7 +2476,30 @@ function queueWorkflowRunUnlocked(
           !== JSON.stringify(expected.admission)
       ) throw new Error('Duplicate recurrence receipt is bound to a different occurrence admission contract.');
     }
+    let duplicateStatus = duplicate.status;
+    if (scheduledReadinessBlock) {
+      try {
+        const durableDuplicate = JSON.parse(
+          readFileSync(workflowRunFile(duplicate.id), 'utf8'),
+        ) as { id?: unknown; status?: unknown };
+        if (durableDuplicate.id !== duplicate.id) {
+          throw new Error(`Workflow run ${duplicate.id} changed identity during readiness-block replay.`);
+        }
+        if (typeof durableDuplicate.status === 'string') duplicateStatus = durableDuplicate.status;
+      } catch (error) {
+        throw new Error(`Scheduled readiness-block run ${duplicate.id} is unreadable during replay.`, {
+          cause: error,
+        });
+      }
+    }
     attachWorkflowRunOriginsToRun(duplicate.id, origins);
+    if (scheduledReadinessBlock && duplicateStatus === 'blocked_readiness') {
+      return {
+        status: 'blocked_readiness',
+        id: duplicate.id,
+        message: `Scheduled occurrence for "${name}" is already durably blocked by workflow readiness in run ${duplicate.id}; no duplicate or execution was created.`,
+      };
+    }
     return {
       status: 'duplicate',
       id: duplicate.id,
@@ -2440,6 +2515,7 @@ function queueWorkflowRunUnlocked(
   }
   const readinessTargetStepId = opts?.targetStepId ?? opts?.retryFailedItems?.stepId;
   let readiness: WorkflowRunReadinessCheck | undefined;
+  let persistReadinessBlock = false;
   if (workflowEntry) {
     readiness = checkWorkflowRunReadiness(workflowEntry.data, workflowEntry.name, {
       targetStepId: readinessTargetStepId,
@@ -2447,7 +2523,8 @@ function queueWorkflowRunUnlocked(
     // A held catch-up performs no work. Persist it even when execution
     // readiness is red so the user can still Skip it; Resume rechecks the
     // current workflow and leaves the record held until blockers are fixed.
-    if (!readiness.ok && !catchupHold) {
+    persistReadinessBlock = !readiness.ok && scheduledReadinessBlock !== undefined;
+    if (!readiness.ok && !catchupHold && !persistReadinessBlock) {
       return {
         status: 'blocked_readiness',
         message: readiness.message,
@@ -2584,7 +2661,9 @@ function queueWorkflowRunUnlocked(
       id: runId,
       workflow: name,
       inputs: normalizedInputs,
-      status: catchupHold
+      status: persistReadinessBlock
+        ? 'blocked_readiness'
+        : catchupHold
         ? 'awaiting_catchup_decision'
         : originObserver
           ? 'awaiting_chat_dispatch_seal'
@@ -2595,8 +2674,16 @@ function queueWorkflowRunUnlocked(
       ...(opts?.catchupFire && catchupFirstDueAtMs !== undefined ? { catchupFirstDueAtMs } : {}),
       ...(opts?.catchupFire && catchupScheduledAtMs !== undefined ? { catchupScheduledAtMs } : {}),
       ...(opts?.catchupFire && catchupMissedCount !== undefined ? { catchupMissedCount } : {}),
-      ...(opts?.catchupFire && catchupDisposition ? { catchupDisposition } : {}),
-      ...(catchupHold ? { catchupHeldAt: createdAt } : {}),
+      ...(opts?.catchupFire && catchupDisposition && !persistReadinessBlock ? { catchupDisposition } : {}),
+      ...(catchupHold && !persistReadinessBlock ? { catchupHeldAt: createdAt } : {}),
+      ...(persistReadinessBlock ? {
+        scheduledReadinessBlock: {
+          protocol: 'workflow_schedule_readiness_block_v1',
+          blockedAt: createdAt,
+          provenNoDispatch: true,
+        },
+        readinessMessage: readiness?.message,
+      } : {}),
       ...(opts?.catchupFire && normalizedOptionalString(opts?.catchupDecidedAt)
         ? { catchupDecidedAt: normalizedOptionalString(opts?.catchupDecidedAt) }
         : {}),
@@ -2735,7 +2822,9 @@ function queueWorkflowRunUnlocked(
   }
   const resultStatus = originObserver && exactAdmission && !exactAdmission.installed
     ? 'duplicate'
-    : catchupHold || originObserver ? 'held' : 'queued';
+    : persistReadinessBlock
+      ? 'blocked_readiness'
+      : catchupHold || originObserver ? 'held' : 'queued';
   // The run record and any trigger receipt are durable at this point. Wake the
   // daemon immediately for fresh executable work; the 15-second timer remains
   // the crash/failure recovery path. Held and duplicate records do not kick.
@@ -2745,7 +2834,9 @@ function queueWorkflowRunUnlocked(
     id,
     ...(chatDispatchPreparation ? { chatDispatchPreparation } : {}),
     ...(readiness ? { readiness } : {}),
-    message: catchupHold
+    message: persistReadinessBlock
+      ? `Recorded scheduled occurrence for "${name}" as readiness-blocked (run ${id}). No workflow step or provider call started; update the workflow or missing capability before a new run is attempted.`
+      : catchupHold
       ? `Held missed schedule for "${name}" (run ${id}) — no workflow step will run until the user chooses Resume. They may also Skip it without performing any work.`
       : originObserver
         ? `Prepared "${name}" (run ${id}) for this chat. It remains non-executable until the complete source dispatch group is durably sealed and activated. `

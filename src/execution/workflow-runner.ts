@@ -53,6 +53,8 @@ import {
 } from '../tools/composio-tools.js';
 import { runBoundedPool } from './bounded-pool.js';
 import { resolveWorkflowRunConcurrency } from './workflow-run-concurrency.js';
+import { prepareWorkflowStepExternalCatalog } from './workflow-step-external-catalog.js';
+import { recordAuthoredWorkflowWriteAuthority } from '../runtime/harness/authored-workflow-write-authority.js';
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import {
   addNotification,
@@ -4792,18 +4794,10 @@ async function runStepViaHarness(
       ? `${proseMessage}\n\n${renderedContextBlock}`
       : proseMessage;
     const message = workflowMessageWithAnsweredInput(initialMessage, step.id, sessionIdSuffix, resumeInput);
-    // This is request policy, not retrieval text. Retain it across a tool-limit
-    // checkpoint that starts a fresh runConversation activation; otherwise the
-    // synthetic "pick up where you left off" input could silently re-enable
-    // memory after the authored workflow step explicitly declined it.
-    const suppressAutomaticMemoryForWorkflowRequest =
-      explicitlyOptsOutOfAutomaticMemoryRecall(message);
-    const workflowMemoryPrimerQuery = buildWorkflowMemoryPrimerQuery({
-      workflow: workflowDefForPin ?? { name: workflowName, description: '' },
-      step,
-      renderedPrompt: promptBody,
-      originSessionId,
-    });
+    // Persist the accepted source before any exact provider metadata is
+    // acquired. Missing-manifest provisioning records account/schema/effect
+    // proof against this exact event; without a durable source first, that
+    // proof is intentionally inadmissible.
     const sourceUserEvent = recordRunAttemptUserInput(stepAttempt, {
       turn: 1,
       role: 'user',
@@ -4816,6 +4810,67 @@ async function runStepViaHarness(
       },
     });
     const stepExecutionSourceUserSeqs = new Set<number>([sourceUserEvent.seq]);
+    // A prompt step may explicitly name exact provider operations and call
+    // them directly without foreground tool_search. After a daemon restart the
+    // process catalog is intentionally empty even though their durable
+    // manifests remain current. Revalidate only the literal, authored
+    // operation set after persisting the accepted source but before the model
+    // edge, reconstruct its exact ports, and carry that subtractive manifest
+    // scope through planning and freeze. Rendered inputs/context never
+    // participate in operation selection.
+    const preparedExternalCatalog = await prepareWorkflowStepExternalCatalog({
+      immutablePrompt: step.prompt,
+      allowedTools,
+      acceptedSource: {
+        sessionId: realSessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        acceptedInput: message,
+      },
+      deadlineAt: stepDeadlineAt,
+    });
+    if (preparedExternalCatalog.status === 'refused') {
+      throw new Error([
+        `workflow step "${step.id}" exact external catalog preparation refused`,
+        preparedExternalCatalog.reason,
+        preparedExternalCatalog.operationId,
+        preparedExternalCatalog.detail,
+      ].filter(Boolean).join(':'));
+    }
+    const acceptedCatalogScope = preparedExternalCatalog.status === 'ready'
+      ? {
+          manifestIds: preparedExternalCatalog.manifestIds,
+          operationIds: preparedExternalCatalog.operationIds,
+        }
+      : undefined;
+    if (preparedExternalCatalog.status === 'ready') {
+      const writeAuthority = recordAuthoredWorkflowWriteAuthority({
+        sessionId: realSessionId,
+        sourceUserSeq: sourceUserEvent.seq,
+        attemptId: stepAttempt.attemptId,
+        workflowRunId,
+        workflowSlug: workflowStorageName,
+        stepId: step.id,
+        expectedPlanProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
+        catalogIdentities: preparedExternalCatalog.catalogIdentities,
+      });
+      if (writeAuthority.status === 'refused') {
+        throw new Error(
+          `workflow step "${step.id}" authored write authority refused:${writeAuthority.reason}`,
+        );
+      }
+    }
+    // This is request policy, not retrieval text. Retain it across a tool-limit
+    // checkpoint that starts a fresh runConversation activation; otherwise the
+    // synthetic "pick up where you left off" input could silently re-enable
+    // memory after the authored workflow step explicitly declined it.
+    const suppressAutomaticMemoryForWorkflowRequest =
+      explicitlyOptsOutOfAutomaticMemoryRecall(message);
+    const workflowMemoryPrimerQuery = buildWorkflowMemoryPrimerQuery({
+      workflow: workflowDefForPin ?? { name: workflowName, description: '' },
+      step,
+      renderedPrompt: promptBody,
+      originSessionId,
+    });
     // The pre-model graph persist that used to live here was DELETED
     // (2026-08-25). It compiled a heuristic graph from the step PROSE before
     // any model ran, and that legacy digestless graph then collided with the
@@ -4946,6 +5001,7 @@ async function runStepViaHarness(
         sourceUserSeq: sourceUserEvent.seq,
         runAttemptId: stepAttempt.attemptId,
         mcpToolScope: workflowMcpToolScope,
+        ...(acceptedCatalogScope ? { acceptedCatalogScope } : {}),
         reuseRecordedUserInput: true,
         deferToolCallsLimitTerminal: true,
         // Specialist budgets are authored execution semantics. Keep this
@@ -5013,6 +5069,7 @@ async function runStepViaHarness(
           sourceUserSeq: checkpointSourceUserSeq,
           runAttemptId: stepAttempt.attemptId,
           mcpToolScope: workflowMcpToolScope,
+          ...(acceptedCatalogScope ? { acceptedCatalogScope } : {}),
           reuseRecordedUserInput: true,
           deferToolCallsLimitTerminal: true,
           ...(scopedMaxTurns !== undefined ? { maxTurns: scopedMaxTurns } : {}),
@@ -14774,41 +14831,48 @@ async function processOneRunFile(
         });
       } catch { /* summary event is best-effort */ }
       attemptWorkflowRunReportBack(filePath);
-      addNotification({
-        id: `workflow-${run.id}-completed`,
-        kind: 'workflow',
-        title: runIsNoOp
-          ? `Nothing new — ${workflow.data.name}`
-          : hasFailures && !needsAttention
-            ? `Workflow completed with ${publicForEachFailures.length} failure${publicForEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
-            // renderLegibleOutcome titles a no-blocked-step run "completed"; a
-            // target-miss or goal-miss is needs-attention with no blocked step,
-            // so title it honestly.
-            : needsAttention && blockedSteps.length === 0
-              ? `⚠️ Workflow needs attention: ${workflow.data.name}`
-              : outcome.title,
-        // Send the full body. Discord delivery splits long content into
-        // multiple messages; previous 2000-char slice cut off workflow
-        // results above that length with no continuation. Quality advisories
-        // are appended to whichever body we send (never replace the deliverable).
-        body: reportBody,
-        createdAt: new Date().toISOString(),
-        read: false,
-        // Advisories must reach the user — never silence a run that has one.
-        // A chronic-failure escalation must also always deliver. A routine
-        // no-op goes dashboard-only (recorded + auditable, no Discord/push).
-        silent: suppressGlobalTerminal
-          || ((stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused),
-        metadata: {
-          workflow: workflow.data.name,
-          runId: run.id,
-          forEachFailures: hasFailures ? publicForEachFailures : undefined,
-          needsAttention: needsAttention || undefined,
-          proposedFixId: proposedFix?.id,
-          qualityAdvisories: hasAdvisories ? publicQualityAdvisories : undefined,
-          ...(runIsNoOp ? { noOp: true, noOpReason: 'no new items' } : {}),
-        },
-      });
+      // An exact observer already produced the one source-bound terminal
+      // carrier in attemptWorkflowRunReportBack above. A second, silent global
+      // completion row is still duplicate Activity/inbox content even though
+      // it does not fan out. Scheduled runs and legacy origins retain the
+      // existing global notification path unchanged.
+      if (!hasExactOriginObserver) {
+        addNotification({
+          id: `workflow-${run.id}-completed`,
+          kind: 'workflow',
+          title: runIsNoOp
+            ? `Nothing new — ${workflow.data.name}`
+            : hasFailures && !needsAttention
+              ? `Workflow completed with ${publicForEachFailures.length} failure${publicForEachFailures.length === 1 ? '' : 's'}: ${workflow.data.name}`
+              // renderLegibleOutcome titles a no-blocked-step run "completed"; a
+              // target-miss or goal-miss is needs-attention with no blocked step,
+              // so title it honestly.
+              : needsAttention && blockedSteps.length === 0
+                ? `⚠️ Workflow needs attention: ${workflow.data.name}`
+                : outcome.title,
+          // Send the full body. Discord delivery splits long content into
+          // multiple messages; previous 2000-char slice cut off workflow
+          // results above that length with no continuation. Quality advisories
+          // are appended to whichever body we send (never replace the deliverable).
+          body: reportBody,
+          createdAt: new Date().toISOString(),
+          read: false,
+          // Advisories must reach the user — never silence a run that has one.
+          // A chronic-failure escalation must also always deliver. A routine
+          // no-op goes dashboard-only (recorded + auditable, no Discord/push).
+          silent: suppressGlobalTerminal
+            || ((stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused),
+          metadata: {
+            workflow: workflow.data.name,
+            runId: run.id,
+            forEachFailures: hasFailures ? publicForEachFailures : undefined,
+            needsAttention: needsAttention || undefined,
+            proposedFixId: proposedFix?.id,
+            qualityAdvisories: hasAdvisories ? publicQualityAdvisories : undefined,
+            ...(runIsNoOp ? { noOp: true, noOpReason: 'no new items' } : {}),
+          },
+        });
+      }
       markRunNotified(filePath);
       try {
         finishRun(run.id, {

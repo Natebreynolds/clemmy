@@ -3787,6 +3787,121 @@ test('/m/relay-info publishes the relay origin anonymously, null when no relay',
   }
 });
 
+test('delegated chat run control cancels only the exact canonical workflow run id', async () => {
+  const key = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const runId = `mobile-delegated-stop-${key}`;
+  const siblingId = `mobile-delegated-keep-${key}`;
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const siblingFile = path.join(WORKFLOW_RUNS_DIR, `${siblingId}.json`);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(runFile, JSON.stringify({
+    id: runId,
+    workflow: 'Any Provider Workflow',
+    status: 'running',
+    createdAt: new Date().toISOString(),
+  }));
+  writeFileSync(siblingFile, JSON.stringify({
+    id: siblingId,
+    workflow: 'Any Provider Workflow',
+    status: 'running',
+    createdAt: new Date().toISOString(),
+  }));
+
+  const h = await startHarness();
+  try {
+    const anon = await fetch(`${h.url}/m/api/workflow-runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    });
+    assert.equal(anon.status, 401, 'exact-run stop still requires the bound mobile session');
+
+    const cookie = await loginMobile(h, 'Delegated workflow stop phone');
+    const response = await fetch(
+      `${h.url}/m/api/workflow-runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST', headers: { cookie } },
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, outcome: 'cancelled', runId });
+
+    const retry = await fetch(
+      `${h.url}/m/api/workflow-runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST', headers: { cookie } },
+    );
+    assert.equal(retry.status, 200, 'a repeated exact tap is idempotent');
+    assert.deepEqual(await retry.json(), { ok: true, outcome: 'already_cancelled', runId });
+
+    const stopped = JSON.parse(readFileSync(runFile, 'utf-8')) as Record<string, unknown>;
+    const untouched = JSON.parse(readFileSync(siblingFile, 'utf-8')) as Record<string, unknown>;
+    assert.equal(stopped.id, runId);
+    assert.equal(stopped.workflow, 'Any Provider Workflow');
+    assert.equal(stopped.status, 'cancelled');
+    assert.equal(stopped.terminalOutcome, 'cancelled');
+    assert.equal(
+      (stopped.reportBack as Record<string, unknown> | undefined)?.detail,
+      'Stopped from the phone',
+      'the exact cancellation creates the canonical origin report-back intent',
+    );
+    assert.equal(untouched.status, 'running', 'a sibling occurrence is never inferred from workflow name');
+  } finally {
+    await h.close();
+    rmSync(runFile, { force: true });
+    rmSync(siblingFile, { force: true });
+  }
+});
+
+test('delegated group Stop treats an already-terminal member as a no-op and cancels the live member', async () => {
+  const key = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const completedId = `mobile-delegated-done-${key}`;
+  const liveId = `mobile-delegated-live-${key}`;
+  const completedFile = path.join(WORKFLOW_RUNS_DIR, `${completedId}.json`);
+  const liveFile = path.join(WORKFLOW_RUNS_DIR, `${liveId}.json`);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(completedFile, JSON.stringify({
+    id: completedId,
+    workflow: 'First Generic Workflow',
+    status: 'completed',
+    terminalOutcome: 'succeeded',
+    finishedAt: new Date().toISOString(),
+  }));
+  writeFileSync(liveFile, JSON.stringify({
+    id: liveId,
+    workflow: 'Second Generic Workflow',
+    status: 'running',
+  }));
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Delegated group stop phone');
+    const response = await fetch(`${h.url}/m/api/workflow-runs/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ runIds: [completedId, liveId] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      state: 'stopped',
+      results: [
+        { runId: completedId, outcome: 'already_terminal', terminalStatus: 'completed' },
+        { runId: liveId, outcome: 'cancelled' },
+      ],
+    });
+    assert.equal(
+      (JSON.parse(readFileSync(completedFile, 'utf-8')) as Record<string, unknown>).status,
+      'completed',
+      'the existing terminal winner is preserved',
+    );
+    assert.equal(
+      (JSON.parse(readFileSync(liveFile, 'utf-8')) as Record<string, unknown>).status,
+      'cancelled',
+      'the live sibling is stopped despite the earlier terminal member',
+    );
+  } finally {
+    await h.close();
+    rmSync(completedFile, { force: true });
+    rmSync(liveFile, { force: true });
+  }
+});
+
 test('run control: /m/api/runs/:id/cancel delegates to the injected canceller', async () => {
   // Pin: the phone must use the SAME verb as the dashboard rather than
   // inventing its own stop semantics.

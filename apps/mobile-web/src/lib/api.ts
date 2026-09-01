@@ -1261,6 +1261,37 @@ export async function cancelWorkflowRun(name: string, runId: string): Promise<{ 
   );
 }
 
+/** Stop an exact workflow occurrence when the chat dispatch has the immutable
+ * run id but intentionally exposes no workflow/catalog name. The daemon
+ * resolves and re-checks the run's own workflow identity under cancellation. */
+export async function cancelWorkflowRunById(runId: string): Promise<{ ok: true; outcome: string; runId: string }> {
+  return api<{ ok: true; outcome: string; runId: string }>(
+    `/m/api/workflow-runs/${encodeURIComponent(runId)}/cancel`,
+    { method: 'POST' },
+  );
+}
+
+export interface WorkflowRunBatchCancelResult {
+  ok: true;
+  state: 'stopped';
+  results: Array<{
+    runId: string;
+    outcome: 'cancelled' | 'already_cancelled' | 'already_terminal';
+    terminalStatus?: string;
+  }>;
+}
+
+/** Resolve a delegated card as one bounded cancellation decision. Every exact
+ * member is preflighted server-side before the first mutation, so a completed
+ * sibling and a live sibling cannot leave the UI claiming the group is still
+ * running after the live occurrence was successfully stopped. */
+export async function cancelWorkflowRunsById(runIds: readonly string[]): Promise<WorkflowRunBatchCancelResult> {
+  return api<WorkflowRunBatchCancelResult>('/m/api/workflow-runs/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ runIds }),
+  });
+}
+
 export async function cancelRun(runId: string): Promise<{ ok: boolean; message: string }> {
   return api<{ ok: boolean; message: string }>(`/m/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
 }
@@ -1321,6 +1352,8 @@ export interface WorkspaceSummary {
   title: string;
   status: 'active' | 'paused' | 'archived';
   objective: string | null;
+  /** Explicit one-off content contract; null means a dynamic/draft surface. */
+  contentMode?: 'static_snapshot' | null;
   updatedAt: string;
   lastRefreshedAt: string | null;
   freshness: string;
@@ -1344,7 +1377,14 @@ export async function setWorkspaceMobile(id: string, show: boolean | null): Prom
 }
 
 export interface WorkspaceField { label: string; value: string }
-export interface WorkspaceRecord { key: string; primary: string; fields: WorkspaceField[] }
+export interface WorkspaceLink { label: string; url: string }
+export interface WorkspaceRecord {
+  key: string;
+  primary: string;
+  fields: WorkspaceField[];
+  body?: string;
+  links?: WorkspaceLink[];
+}
 export interface WorkspaceBreakdown {
   label: string;
   entries: Array<{ label: string; value: string; ratio: number }>;

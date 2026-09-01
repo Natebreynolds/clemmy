@@ -11,8 +11,7 @@
  * the projecting (src/spaces/mobile-projection.ts) so the choices are
  * deterministic and testable rather than guessed in a component.
  */
-import { useState } from 'preact/hooks';
-import { useBackGesture } from '../lib/back-gesture';
+import { useEffect, useState } from 'preact/hooks';
 import {
   getWorkspace,
   listWorkspaces,
@@ -26,11 +25,22 @@ import { haptic } from '../lib/native-bridge';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
+import { failedWorkspaceSources, workspaceNeedsSourceRepair } from '../lib/workspace-presentation';
 import { Chat } from './Chat';
 
-export function Workspaces() {
-  const [openId, setOpenId] = useState<string | null>(null);
-  useBackGesture(openId !== null, () => setOpenId(null));
+export function Workspaces({
+  initialOpenId = null,
+  onOpenChange = () => undefined,
+}: {
+  initialOpenId?: string | null;
+  onOpenChange?: (id: string | null) => void;
+}) {
+  const [openId, setOpenId] = useState<string | null>(initialOpenId);
+  useEffect(() => setOpenId(initialOpenId), [initialOpenId]);
+  const selectWorkspace = (id: string | null) => {
+    setOpenId(id);
+    onOpenChange(id);
+  };
   const { data, loading, error, offline, refresh } = useScreenData(
     listWorkspaces,
     { intervalMs: 15_000, disabled: openId !== null },
@@ -38,7 +48,7 @@ export function Workspaces() {
   const spaces = (data?.workspaces ?? []).filter((w) => w.status !== 'archived');
 
   if (openId) {
-    return <WorkspaceDetailView id={openId} onBack={() => { setOpenId(null); void refresh(); }} />;
+    return <WorkspaceDetailView id={openId} onBack={() => { selectWorkspace(null); void refresh(); }} />;
   }
 
   if (loading && spaces.length === 0) {
@@ -74,7 +84,7 @@ export function Workspaces() {
       ) : null}
       {renderRows(live, 0)}
       {empty.length > 0 ? (
-        <EmptyWorkspaces spaces={empty} onOpen={(id) => setOpenId(id)} startIndex={live.length} />
+        <EmptyWorkspaces spaces={empty} onOpen={selectWorkspace} startIndex={live.length} />
       ) : null}
     </div>
   );
@@ -85,7 +95,7 @@ export function Workspaces() {
           key={space.id}
           class="card card-tap rise"
           style={{ '--i': i + offset }}
-          onClick={() => { haptic('light'); setOpenId(space.id); }}
+          onClick={() => { haptic('light'); selectWorkspace(space.id); }}
         >
           <div class="min-w-0">
             <div class="card-title-sm truncate">{space.title}</div>
@@ -223,11 +233,15 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
     );
   }
 
-  const failed = detail.sources.filter((s) => !s.ok);
+  const failed = failedWorkspaceSources(detail.sources);
   const { projection } = detail;
-  // 'no_sources' is the daemon's own freshness verdict — the workspace has
-  // nothing registered that could ever pull data.
-  const canRefresh = detail.freshness !== 'no_sources' && detail.sources.length > 0;
+  const canRefresh = detail.sources.length > 0;
+  // A one-off authored report is intentionally complete without a runner.
+  // Only an unmarked no-source Workspace is a setup defect worth escalating.
+  const needsSourceRepair = workspaceNeedsSourceRepair({
+    sourceCount: detail.sources.length,
+    contentMode: detail.contentMode,
+  });
   // Lots of rows and almost no summary means the phone is inferring a layout
   // from raw JSON. That is when a runner-authored one is worth asking for.
   const thinLayout = projection.total >= 8 && projection.headline.length <= 1;
@@ -270,7 +284,7 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
         ) : null}
       </div>
 
-      {!canRefresh ? (
+      {needsSourceRepair ? (
         <div class="ws-refresh-note">
           <div>This workspace has no data source, so it can’t refresh on its own.</div>
           <button class="link-btn" onClick={() => setChatOpen({ draft: FIX_REFRESH_ASK })}>
@@ -413,11 +427,44 @@ const CARD_FIELDS = 4;
 
 function RecordCard({ record, index }: { record: WorkspaceRecord; index: number }) {
   const [open, setOpen] = useState(false);
+  const [bodyOpen, setBodyOpen] = useState(false);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const hidden = record.fields.length - CARD_FIELDS;
   const shown = open ? record.fields : record.fields.slice(0, CARD_FIELDS);
+  const longBody = (record.body?.length ?? 0) > 360;
+
+  async function copyBody(): Promise<void> {
+    if (!record.body) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(record.body);
+      setCopyState('copied');
+      haptic('success');
+      window.setTimeout(() => setCopyState('idle'), 2_000);
+    } catch {
+      setCopyState('failed');
+      haptic('error');
+    }
+  }
+
   return (
     <article class="card rise" style={{ '--i': index }}>
       <div class="card-title-sm">{record.primary}</div>
+      {record.body ? (
+        <div class="ws-record-copy">
+          <div class={`ws-record-body${bodyOpen || !longBody ? ' expanded' : ''}`}>{record.body}</div>
+          <div class="ws-record-actions">
+            {longBody ? (
+              <button class="link-btn" onClick={() => setBodyOpen(!bodyOpen)}>
+                {bodyOpen ? 'Show less' : 'Read full copy'}
+              </button>
+            ) : null}
+            <button class="link-btn" onClick={() => void copyBody()}>
+              {copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'}
+            </button>
+          </div>
+        </div>
+      ) : null}
       {shown.length > 0 ? (
         <dl class="ws-fields">
           {shown.map((field) => (
@@ -432,6 +479,21 @@ function RecordCard({ record, index }: { record: WorkspaceRecord; index: number 
         <button class="link-btn" onClick={() => { haptic('light'); setOpen(!open); }}>
           {open ? 'Show less' : `All ${record.fields.length} fields`}
         </button>
+      ) : null}
+      {record.links?.length ? (
+        <div class="ws-record-links" aria-label="Sources">
+          {record.links.map((link) => (
+            <a
+              key={`${link.label}:${link.url}`}
+              class="ws-record-link"
+              href={link.url}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {link.label} ↗
+            </a>
+          ))}
+        </div>
       ) : null}
     </article>
   );
@@ -494,7 +556,12 @@ function FreshnessDot({ state }: { state: string }) {
   return <span class={`status-dot ws-fresh-${state}`} aria-hidden="true" />;
 }
 
-function freshnessLabel(space: { freshness: string; lastRefreshedAt: string | null }): string {
+function freshnessLabel(space: {
+  freshness: string;
+  lastRefreshedAt: string | null;
+  contentMode?: 'static_snapshot' | null;
+}): string {
+  if (space.contentMode === 'static_snapshot') return 'Saved snapshot';
   if (!space.lastRefreshedAt) return 'Never refreshed';
   const when = relativeTime(space.lastRefreshedAt);
   if (space.freshness === 'stale') return `Stale · updated ${when}`;

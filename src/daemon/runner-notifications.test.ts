@@ -57,6 +57,83 @@ const assistantStub = {
   },
 } as never;
 
+test('silent exact origin-chat carrier owns one web-push receipt and never falls back', async () => {
+  replaceQueuedNotificationDeliveries([]);
+  const notificationId = 'workflow-origin-own-device-push';
+  const pushId = 'exact-origin-device';
+  const genericId = 'exact-origin-must-not-fallback';
+  const target = { type: 'origin_chat' } as const;
+  upsertNotificationDestination({
+    id: pushId,
+    name: 'Origin device',
+    type: 'web_push',
+    pushEndpoint: 'https://push.example/exact-origin-device',
+    pushP256dh: 'p256dh',
+    pushAuth: 'auth',
+    deviceId: 'device-1',
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  });
+  upsertNotificationDestination({
+    id: genericId,
+    name: 'Configured fallback that exact authority must ignore',
+    type: 'generic_webhook',
+    url: 'https://example.invalid/must-not-receive',
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  });
+  addNotification({
+    id: notificationId,
+    kind: 'workflow',
+    title: 'Workflow blocked',
+    body: 'The workflow result needs attention.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    // It remains silent to the open local app; the same exact carrier owns the
+    // away-user alert instead of creating a second foreground notification.
+    silent: true,
+    metadata: {
+      terminalReportBack: true,
+      ...exactOriginDeliveryMetadata(target),
+    },
+  });
+
+  assert.deepEqual(
+    getNotificationDestinationsForRecord(getNotification(notificationId)!)
+      .map((destination) => [destination.id, destination.type]),
+    [[pushId, 'web_push']],
+  );
+  assert.ok(listQueuedNotificationDeliveries().some((job) => job.notificationId === notificationId));
+
+  const sends: Array<[string, string]> = [];
+  _setNotificationDeliveryForTests(async (_notification, destination) => {
+    sends.push([destination.id, destination.type]);
+  });
+  try {
+    await processNotificationDeliveries(assistantStub);
+    await processNotificationDeliveries(assistantStub);
+  } finally {
+    _setNotificationDeliveryForTests(null);
+  }
+
+  assert.deepEqual(sends, [[pushId, 'web_push']], 'replay never sends a second own-device alert');
+  const delivered = getNotification(notificationId);
+  assert.ok(delivered);
+  assert.equal(
+    delivered.deliveredDestinations?.filter((receipt) => receipt === pushId).length,
+    1,
+  );
+  assert.ok(delivered.deliveredDestinations?.includes(exactOriginDeliveryDestinationId(target)));
+  assert.equal(delivered.deliveredDestinations?.includes(genericId), false);
+  assert.equal(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === notificationId),
+    false,
+  );
+
+  removeNotificationDestination(pushId);
+  removeNotificationDestination(genericId);
+});
+
 test('a settled capability gate cannot leak through an already-admitted delivery cursor', async () => {
   replaceQueuedNotificationDeliveries([]);
   const destinationId = 'dest-settled-capability-guard';

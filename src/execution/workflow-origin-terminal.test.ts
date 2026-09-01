@@ -195,6 +195,26 @@ test('workflow terminal commits once against the original human source with no s
   );
 });
 
+test('an intentional workflow cancellation is a canonical stopped terminal', () => {
+  const source = acceptedSource({
+    sessionId: 'origin-terminal-cancelled',
+    channel: 'desktop',
+    metadata: {},
+  });
+  const cancelled = commitWorkflowOriginTerminal({
+    observer: observerFor(source, 'run-cancelled'),
+    runId: 'run-cancelled',
+    outcome: 'cancelled',
+    detail: 'Stopped from the phone',
+  });
+
+  assert.equal(cancelled?.presentation.status, 'cancelled');
+  assert.equal(cancelled?.presentation.kind, 'stopped');
+  assert.equal(cancelled?.presentation.text, 'Stopped from the phone');
+  assert.equal(cancelled?.event.data.turnOutcome.status, 'cancelled');
+  assert.equal(listEvents(source.sessionId, { types: ['conversation_completed'] }).length, 1);
+});
+
 test('a precomputed blocked workflow asks the shared delivery rule while a genuine failure stays failed', () => {
   const source = acceptedSource({
     sessionId: 'origin-terminal-shared-disclosure',

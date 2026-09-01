@@ -30,6 +30,15 @@ export type MessageStatus =
   | 'thinking' | 'complete' | 'failed' | 'stopped'
   | 'awaiting-approval' | 'awaiting-reply' | 'awaiting-plan';
 
+/** Durable identity for workflow work delegated by one accepted chat source.
+ * The client may use these exact run ids for controls, but never derives them
+ * from prose or a workflow label. */
+export interface DelegatedWorkControl {
+  sourceUserSeq: number;
+  runIds: string[];
+  state: 'running' | 'cancelling' | 'stopped';
+}
+
 /** One live step in a turn's activity strip — a tool call, a spawned agent, a
  *  batch meter, or a trust check (judge verdict / watcher steer). */
 export interface ActivityItem {
@@ -77,6 +86,9 @@ export interface ChatMessage {
   idempotencyKey?: string;
   /** Mid-run steer: text delivered into the live turn, not a new attempt. */
   steer?: 'pending' | 'delivered' | 'failed';
+  /** Present only while this assistant bubble represents exact, source-bound
+   * delegated workflow work. A canonical terminal removes the control. */
+  delegatedWork?: DelegatedWorkControl;
 }
 
 /** What the transport layer is doing right now, for an honest connection pill. */
@@ -110,10 +122,7 @@ export function isTerminalEvent(type: string): boolean {
     type === 'conversation_completed' ||
     type === 'run_failed' ||
     type === 'awaiting_user_input' ||
-    type === 'approval_requested' ||
-    // Host-owned workflow dispatch: the foreground turn is the ACK. The
-    // workflow's later conversation_completed arrives on the late watch.
-    type === 'async_work_dispatched'
+    type === 'approval_requested'
   );
 }
 

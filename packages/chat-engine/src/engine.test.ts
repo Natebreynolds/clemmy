@@ -24,7 +24,7 @@ class FakeTransport implements StreamTransport {
   connectCalls = 0;
   failConnects = 0;
   recentPayloads: ReplayPayload[] = [];
-  live: { onEvent(e: HarnessEvent): void; onError(): void } | null = null;
+  live: { onReplay(p: ReplayPayload): void; onEvent(e: HarnessEvent): void; onError(): void } | null = null;
   fetchRecentCalls = 0;
   connectedSessionIds: string[] = [];
 
@@ -38,7 +38,7 @@ class FakeTransport implements StreamTransport {
       this.failConnects -= 1;
       throw new Error('connect refused');
     }
-    this.live = { onEvent: opts.onEvent, onError: opts.onError };
+    this.live = { onReplay: opts.onReplay, onEvent: opts.onEvent, onError: opts.onError };
     queueMicrotask(() => opts.onReplay({ sessionId: opts.sessionId, events: [] }));
     return { close: () => { if (this.live) this.live = null; } };
   }
@@ -195,6 +195,88 @@ test('awaiting_user_input renders the question and releases mobile immediately',
   assert.equal(reply?.status, 'awaiting-reply');
   assert.equal(snap.busy, false, 'the composer must return to ordinary send mode');
   assert.equal(snap.cancelKey, null, 'Stop ownership ends at the user-input pause');
+  engine.dispose();
+});
+
+test('a trailing completion for a prior awaiting source cannot settle the next mobile turn', async () => {
+  const transport = new FakeTransport();
+  const sessionId = 'sess-mob-3cd5b791c813490fcd61c65095ff87a5';
+  const engine = new ChatEngine({
+    transport,
+    sessionId,
+    api: {
+      send: async () => ({ sessionId, accepted: true }),
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+  });
+
+  await engine.send('Run my platform 59 flow please');
+  await wait(10);
+  transport.live!.onEvent(ev(100903, 'user_input_received', {
+    text: 'Run my platform 59 flow please',
+  }));
+  const question = 'Which Platform flow do you want me to run?';
+  transport.live!.onEvent(ev(100930, 'awaiting_user_input', {
+    sourceUserSeq: 100903,
+    question,
+    options: ['platform-49-slack-channel-review', 'Skip'],
+  }));
+  assert.equal(engine.snapshot().busy, false, 'the first question releases the composer immediately');
+  assert.equal(transport.live, null, 'awaiting_user_input still closes its completed live turn');
+
+  await engine.send('Sorry platform 49');
+  await wait(10);
+  assert.equal(engine.snapshot().busy, true);
+
+  // This is the canonical terminal paired with the prior awaiting event. It
+  // was appended after the cursor where mobile stopped and therefore arrives
+  // first on the new turn's replay.
+  transport.live!.onReplay({ events: [
+    ev(100934, 'conversation_completed', {
+      sourceUserSeq: 100903,
+      reason: 'awaiting_user_input',
+      awaitingUser: true,
+      reply: question,
+    }),
+  ] });
+  let snap = engine.snapshot();
+  assert.equal(snap.busy, true, 'the prior source terminal cannot stop the correction');
+  assert.ok(transport.live, 'the stream drains through the prior terminal');
+  assert.deepEqual(
+    snap.messages.filter((message) => message.role === 'assistant').map((message) => message.text),
+    [question, ''],
+    'the prior terminal cannot rewrite the new assistant placeholder',
+  );
+
+  transport.live!.onReplay({ events: [
+    ev(100935, 'user_input_received', {
+      text: 'Sorry platform 49',
+    }),
+    ev(100940, 'conversation_completed', {
+      sourceUserSeq: 100935,
+      reply: 'I found platform-49-slack-channel-review and queued it.',
+      reason: 'success',
+    }),
+  ] });
+
+  snap = engine.snapshot();
+  assert.equal(snap.busy, false);
+  assert.deepEqual(snap.messages.map((message) => [message.role, message.text]), [
+    ['user', 'Run my platform 59 flow please'],
+    ['assistant', question],
+    ['user', 'Sorry platform 49'],
+    ['assistant', 'I found platform-49-slack-channel-review and queued it.'],
+  ]);
+  assert.equal(
+    snap.messages.filter((message) => message.text === question).length,
+    1,
+    'the prior clarification renders exactly once',
+  );
+  assert.equal(
+    snap.messages.filter((message) => message.text.includes('queued it')).length,
+    1,
+    'the new source terminal renders exactly once',
+  );
   engine.dispose();
 });
 
@@ -383,4 +465,17 @@ test('renderMarkdown sanitizes and covers the reply structures', () => {
   // javascript: links stay literal text.
   const bad = renderMarkdown('[x](javascript:alert(1))');
   assert.ok(!bad.includes('<a '), 'non-http(s) links must not become anchors');
+});
+
+test('renderMarkdown activates only the exact validated mobile Workspace handoff', () => {
+  const good = renderMarkdown('[Open on mobile](/m/?tab=spaces&workspace=local-llm-content)');
+  assert.match(good, /<a href="\/m\/\?tab=spaces&amp;workspace=local-llm-content"/);
+  assert.doesNotMatch(good, /target="_blank"/, 'same-origin handoff stays in the paired WKWebView');
+  for (const unsafe of [
+    '[bad](/m/?tab=spaces&workspace=../secrets)',
+    '[bad](/m/?tab=settings&workspace=local-llm-content)',
+    '[bad](/api/console/spaces/local-llm-content/data)',
+  ]) {
+    assert.doesNotMatch(renderMarkdown(unsafe), /<a /);
+  }
 });

@@ -4,6 +4,50 @@ import { humanHarnessText } from './types.js';
 export const GENERIC_TURN_ERROR = 'Something went wrong on that turn — try again. (Details are in the logs.)';
 export const EMPTY_COMPLETION_ERROR = 'The run ended without a usable answer, so I haven’t marked it complete. Check the activity above or try again.';
 
+type CanonicalTerminalStatus =
+  | 'done'
+  | 'needs_input'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled'
+  | 'transferred'
+  | 'uncertain';
+
+const CANONICAL_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  'done',
+  'needs_input',
+  'blocked',
+  'failed',
+  'cancelled',
+  'transferred',
+  'uncertain',
+]);
+
+function canonicalStatusFrom(value: unknown): CanonicalTerminalStatus | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const status = (value as Record<string, unknown>).status;
+  return typeof status === 'string' && CANONICAL_TERMINAL_STATUSES.has(status)
+    ? status as CanonicalTerminalStatus
+    : null;
+}
+
+/** The typed terminal is authoritative over legacy reason strings. Both
+ * projections are normally identical; a disagreement is corrupt/uncertain
+ * evidence and must never turn a non-success terminal green. */
+function canonicalTerminalStatus(data: Record<string, unknown>): CanonicalTerminalStatus | null {
+  const presentationStatus = canonicalStatusFrom(data.presentation);
+  const outcomeStatus = canonicalStatusFrom(data.turnOutcome);
+  if (presentationStatus && outcomeStatus && presentationStatus !== outcomeStatus) return 'uncertain';
+  return presentationStatus ?? outcomeStatus;
+}
+
+function messageStatusForCanonicalTerminal(status: CanonicalTerminalStatus): MessageStatus {
+  if (status === 'done') return 'complete';
+  if (status === 'needs_input') return 'awaiting-reply';
+  if (status === 'cancelled' || status === 'transferred') return 'stopped';
+  return 'failed';
+}
+
 export function meaningfulCompletionText(value: unknown): string {
   const text = humanHarnessText(value, '');
   // A bare terminal placeholder is not work-product. Treating it as evidence
@@ -19,6 +63,7 @@ export function terminalCompletionPresentation(
   currentText: string,
   currentStatus?: MessageStatus,
 ): Pick<ChatMessage, 'text' | 'status' | 'progress'> {
+  const canonicalStatus = canonicalTerminalStatus(data);
   const reason = typeof data.reason === 'string' ? data.reason : '';
   const reasonKey = reason
     .replace(/([a-z])([A-Z])/g, '$1_$2')
@@ -39,10 +84,12 @@ export function terminalCompletionPresentation(
     && /fail|error|abandon|stall|exhaust|invalid|blocked|unavailable|timed?_?out|no_structured/.test(reasonKey);
 
   if (text) {
-    const status: MessageStatus = awaitingUser ? 'awaiting-reply' : stopped ? 'stopped' : failed ? 'failed' : 'complete';
+    const status: MessageStatus = canonicalStatus
+      ? messageStatusForCanonicalTerminal(canonicalStatus)
+      : awaitingUser ? 'awaiting-reply' : stopped ? 'stopped' : failed ? 'failed' : 'complete';
     return { text, status, progress: undefined };
   }
-  if (awaitingUser) {
+  if (canonicalStatus === 'needs_input' || awaitingUser) {
     return {
       text: 'I need your input before I can continue.',
       status: 'awaiting-reply',
@@ -56,7 +103,11 @@ export function terminalCompletionPresentation(
       progress: undefined,
     };
   }
-  if (awaitingContinue) {
+  if (
+    canonicalStatus === 'cancelled'
+    || canonicalStatus === 'transferred'
+    || awaitingContinue
+  ) {
     return {
       text: 'I reached this run’s current limit before I had a usable answer. Say “continue” and I’ll keep working.',
       status: 'stopped',
@@ -65,7 +116,7 @@ export function terminalCompletionPresentation(
   }
   // Delivered-but-unrenderable (e.g. a placeholder-only reply): the server
   // vouched for the delivery — never contradict it with a failure banner.
-  if (judgedDelivered && !stopped) {
+  if (canonicalStatus === 'done' || (canonicalStatus === null && judgedDelivered && !stopped)) {
     return { text: 'Done — the full reply is in the activity above.', status: 'complete', progress: undefined };
   }
   return { text: EMPTY_COMPLETION_ERROR, status: stopped ? 'stopped' : 'failed', progress: undefined };

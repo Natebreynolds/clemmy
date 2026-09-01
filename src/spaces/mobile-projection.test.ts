@@ -214,6 +214,54 @@ test('authored content is bounded and coerced — it is agent-written, not trust
   assert.equal(p.headline[0].value, '0', 'numbers are coerced to display strings');
 });
 
+test('authored long-form records preserve five full posts and expose only safe citation links', () => {
+  const posts = Array.from({ length: 5 }, (_, index) => {
+    const body = `Post ${index + 1}\n\n${'Grounded local-LLM insight. '.repeat(24)}`;
+    return {
+      primary: `Social post ${index + 1}`,
+      body,
+      fields: [{ label: 'Channel', value: index % 2 ? 'LinkedIn' : 'X' }],
+      links: [
+        { label: `Source ${index + 1}`, url: `https://example.com/news/${index + 1}` },
+        { label: 'Unsafe', url: 'javascript:alert(1)' },
+        { label: 'Credential URL', url: 'https://user:secret@example.com/private' },
+        { label: 'Control URL', url: 'https://example.com/unsafe\nheader' },
+      ],
+    };
+  });
+  const projection = projectWorkspaceData({
+    calendar: [{ day: 'Monday', theme: 'Local inference' }],
+    _mobile: { records: { label: 'Calendar and posts', total: 5, items: posts } },
+  });
+  assert.equal(projection.records.length, 5);
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(projection.records[index].body, posts[index].body.trim(), 'body is not forced through the 80-char scalar cap');
+    assert.deepEqual(projection.records[index].links, [{
+      label: `Source ${index + 1}`,
+      url: `https://example.com/news/${index + 1}`,
+    }]);
+  }
+});
+
+test('authored long-form content has per-record and whole-response budgets', () => {
+  const projection = projectWorkspaceData({
+    _mobile: {
+      records: {
+        items: Array.from({ length: 60 }, (_, index) => ({
+          primary: `Post ${index}`,
+          body: 'x'.repeat(10_000),
+          links: [{ label: 'Source', url: `https://example.com/${'u'.repeat(900)}${index}` }],
+        })),
+      },
+    },
+  });
+  assert.ok(projection.records.every((record) => (record.body?.length ?? 0) <= 4_000));
+  const totalLongChars = projection.records.reduce((sum, record) => sum
+    + (record.body?.length ?? 0)
+    + (record.links ?? []).reduce((linkSum, link) => linkSum + link.label.length + link.url.length, 0), 0);
+  assert.ok(totalLongChars <= 48_000, `long-form response budget exceeded: ${totalLongChars}`);
+});
+
 test('_mobile is never mistaken for the dataset by inference', () => {
   // Without excluding it, the walk could pick _mobile's own items array as
   // "the largest array of objects" and render the summary as the data.
