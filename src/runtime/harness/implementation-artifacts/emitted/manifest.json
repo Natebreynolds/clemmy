@@ -90,7 +90,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 89611
+          "bytes": 88784
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -102,7 +102,7 @@
           "bytes": 2927
         },
         "src/runtime/harness/tool-effect.ts": {
-          "bytes": 35767
+          "bytes": 36764
         },
         "src/runtime/harness/public-presentation.ts": {
           "bytes": 43639
@@ -990,7 +990,7 @@
           "bytes": 21326
         },
         "src/execution/workflow-validator.ts": {
-          "bytes": 81101
+          "bytes": 81172
         },
         "src/execution/workflow-objective-judge.ts": {
           "bytes": 12380
@@ -1010,12 +1010,6 @@
         "src/execution/workflow-run-readiness.ts": {
           "bytes": 17742
         },
-        "src/execution/workflow-call-receipts.ts": {
-          "bytes": 64063
-        },
-        "src/execution/workflow-v3-call-evidence.ts": {
-          "bytes": 13092
-        },
         "src/runtime/sandboxed-script.ts": {
           "bytes": 9882
         },
@@ -1024,6 +1018,21 @@
         },
         "src/execution/workflow-run-definition.ts": {
           "bytes": 17263
+        },
+        "src/execution/workflow-trigger-engine.ts": {
+          "bytes": 43079
+        },
+        "src/execution/workflow-write.ts": {
+          "bytes": 3323
+        },
+        "src/execution/workflow-self-improvement.ts": {
+          "bytes": 20097
+        },
+        "src/execution/workflow-call-receipts.ts": {
+          "bytes": 64063
+        },
+        "src/execution/workflow-v3-call-evidence.ts": {
+          "bytes": 13092
         },
         "src/runtime/harness/live-model-guard.ts": {
           "bytes": 837
@@ -1189,12 +1198,6 @@
         },
         "src/execution/workflow-codify.ts": {
           "bytes": 5226
-        },
-        "src/execution/workflow-trigger-engine.ts": {
-          "bytes": 43079
-        },
-        "src/execution/workflow-write.ts": {
-          "bytes": 3323
         },
         "src/execution/workflow-authoring.ts": {
           "bytes": 24272
@@ -1815,7 +1818,7 @@
           "bytes": 4098
         },
         "src/execution/workflow-graph.ts": {
-          "bytes": 27924
+          "bytes": 28012
         },
         "src/execution/automation-opportunity.ts": {
           "bytes": 32083
@@ -2118,7 +2121,7 @@
           "bytes": 5520
         },
         "src/tools/workflow-run-queue.ts": {
-          "bytes": 152986
+          "bytes": 153918
         },
         "src/execution/workflow-awaiting-input.ts": {
           "bytes": 12681
@@ -2562,7 +2565,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 89611
+          "bytes": 88784
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -2574,7 +2577,7 @@
           "bytes": 2927
         },
         "src/runtime/harness/tool-effect.ts": {
-          "bytes": 35767
+          "bytes": 36764
         },
         "src/runtime/harness/public-presentation.ts": {
           "bytes": 43639
@@ -3462,7 +3465,7 @@
           "bytes": 21326
         },
         "src/execution/workflow-validator.ts": {
-          "bytes": 81101
+          "bytes": 81172
         },
         "src/execution/workflow-objective-judge.ts": {
           "bytes": 12380
@@ -3482,12 +3485,6 @@
         "src/execution/workflow-run-readiness.ts": {
           "bytes": 17742
         },
-        "src/execution/workflow-call-receipts.ts": {
-          "bytes": 64063
-        },
-        "src/execution/workflow-v3-call-evidence.ts": {
-          "bytes": 13092
-        },
         "src/runtime/sandboxed-script.ts": {
           "bytes": 9882
         },
@@ -3496,6 +3493,21 @@
         },
         "src/execution/workflow-run-definition.ts": {
           "bytes": 17263
+        },
+        "src/execution/workflow-trigger-engine.ts": {
+          "bytes": 43079
+        },
+        "src/execution/workflow-write.ts": {
+          "bytes": 3323
+        },
+        "src/execution/workflow-self-improvement.ts": {
+          "bytes": 20097
+        },
+        "src/execution/workflow-call-receipts.ts": {
+          "bytes": 64063
+        },
+        "src/execution/workflow-v3-call-evidence.ts": {
+          "bytes": 13092
         },
         "src/runtime/harness/live-model-guard.ts": {
           "bytes": 837
@@ -3661,12 +3673,6 @@
         },
         "src/execution/workflow-codify.ts": {
           "bytes": 5226
-        },
-        "src/execution/workflow-trigger-engine.ts": {
-          "bytes": 43079
-        },
-        "src/execution/workflow-write.ts": {
-          "bytes": 3323
         },
         "src/execution/workflow-authoring.ts": {
           "bytes": 24272
@@ -4287,7 +4293,7 @@
           "bytes": 4098
         },
         "src/execution/workflow-graph.ts": {
-          "bytes": 27924
+          "bytes": 28012
         },
         "src/execution/automation-opportunity.ts": {
           "bytes": 32083
@@ -4590,7 +4596,7 @@
           "bytes": 5520
         },
         "src/tools/workflow-run-queue.ts": {
-          "bytes": 152986
+          "bytes": 153918
         },
         "src/execution/workflow-awaiting-input.ts": {
           "bytes": 12681
@@ -4964,8 +4970,8 @@
       }
     },
     "transport": {
-      "file": "transport-29c77a2f7ab00db339210f3beb5d508def5e97db0f27c4193c4e16d1a3d8e7ec.cjs",
-      "sha256": "29c77a2f7ab00db339210f3beb5d508def5e97db0f27c4193c4e16d1a3d8e7ec",
+      "file": "transport-77d37195632b0868799108ec27b2a8b7bcd82fc805380a6ab9080d3dc13f6553.cjs",
+      "sha256": "77d37195632b0868799108ec27b2a8b7bcd82fc805380a6ab9080d3dc13f6553",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -5007,7 +5013,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 89611
+          "bytes": 88784
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -5081,5 +5087,5 @@
       }
     }
   },
-  "manifestDigest": "1b4f44acdce45416e9b7ef96e7131ab14d712555456d05e2cbe356d36983a9dd"
+  "manifestDigest": "cbbbfd9ada1d2586272b311b3aa106bc0b406dda0b659ba182dfe33afced83bf"
 }
