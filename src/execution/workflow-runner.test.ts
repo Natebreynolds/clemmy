@@ -7648,3 +7648,230 @@ test('a Claude-model step routes through the harness lane and never enters the S
     }
   }
 });
+
+// ─── Gate 12: ordinary-step output-contract repair beat ─────────────────────
+// A contract violation on an ordinary contract-bearing step used to fail the
+// run outright; loopUntil steps already got evidence-fed retries. The ordinary
+// step now gets ONE evidence-fed re-run on the same durable step session; the
+// second failure still raises WorkflowContractViolationError('output_contract').
+// A step whose session already crossed irreversibly is never re-run.
+const contractRepair = await import('./workflow-runner.js');
+const harnessEventlog = await import('../runtime/harness/eventlog.js');
+
+test('stepContractRepairEnabled: contract-bearing plain steps only', () => {
+  const base = { id: 's', prompt: 'p', sideEffect: 'read' as const, output: { type: 'object', required_keys: ['summary'] } };
+  assert.equal(contractRepair.stepContractRepairEnabled(base as never), true);
+  assert.equal(contractRepair.stepContractRepairEnabled({ ...base, sideEffect: 'send' } as never), true,
+    'eligibility is shape-based; the side-effect law is enforced at retry time');
+  assert.equal(contractRepair.stepContractRepairEnabled({ id: 's', prompt: 'p', sideEffect: 'read' } as never), false, 'no contract, nothing to repair');
+  assert.equal(contractRepair.stepContractRepairEnabled({ ...base, loopUntil: { maxAttempts: 3 } } as never), false, 'loopUntil owns its own loop');
+  assert.equal(contractRepair.stepContractRepairEnabled({ ...base, forEach: 'items' } as never), false);
+  assert.equal(contractRepair.stepContractRepairEnabled({ ...base, deterministic: { runner: 'x.mjs' } } as never), false);
+  assert.equal(contractRepair.stepContractRepairEnabled({ ...base, call: { tool: 'FIXTURE_READ', args: {} } } as never), false,
+    'an exact call node re-executes the provider, it does not re-shape output');
+  assert.equal(contractRepair.CONTRACT_REPAIR_MAX_ATTEMPTS, 2);
+});
+
+function contractRepairCtx(
+  workflowSlug: string,
+  runId: string,
+  step: Record<string, unknown>,
+  respond: (request: unknown) => Promise<{ text: string }>,
+) {
+  return {
+    workflow: { name: `Contract Repair ${runId}`, description: '', enabled: true, trigger: { manual: true }, steps: [step] },
+    workflowSlug,
+    runId,
+    inputs: {},
+    stepOutputs: {},
+    assistant: { respond },
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof executeStep>[1];
+}
+
+/** Drive the real harness step lane with a stubbed conversation: each call
+ *  answers with the next reply and records the exact prompt it was given. */
+async function withStubbedHarnessLane<T>(
+  replies: (input: string, call: number) => string,
+  work: (inputs: string[]) => Promise<T>,
+): Promise<T> {
+  const inputs: string[] = [];
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string; input?: string }) => {
+      const input = options.input ?? '';
+      inputs.push(input);
+      const text = replies(input, inputs.length);
+      return {
+        sessionId: options.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: 1,
+        lastDecision: { summary: text, reply: text, done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+  try {
+    return await work(inputs);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
+}
+
+test('an ordinary contract-bearing step gets one evidence-fed re-run and passes', async () => {
+  const workflowSlug = 'contract-repair-pass';
+  const runId = 'cr-pass-1';
+  const step = {
+    id: 'wrap_up',
+    prompt: 'Summarize the day.',
+    sideEffect: 'read',
+    output: { type: 'object', required_keys: ['summary'] },
+  };
+  await withStubbedHarnessLane(
+    (_input, call) => (call === 1
+      ? 'Here is a prose summary with none of the contracted keys.'
+      : JSON.stringify({ summary: 'corrected on the repair beat' })),
+    async (inputs) => {
+    const ctx = contractRepairCtx(workflowSlug, runId, step, async () => { throw new Error('legacy assistant must not run'); });
+    const output = await workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx);
+    assert.deepEqual(output, { summary: 'corrected on the repair beat' });
+    assert.equal(inputs.length, 2, 'exactly one repair re-run');
+    assert.match(inputs[1]!, /CONTRACT RETRY \(attempt 2\)/, 'the second attempt carries the exact contract evidence');
+    assert.match(inputs[1]!, /summary/, 'the evidence names the missing key');
+    assert.doesNotMatch(inputs[0]!, /CONTRACT RETRY/, 'the first attempt is the plain authored step');
+    const events = readWorkflowEvents(workflowSlug, runId);
+    const retry = events.find((event) => event.kind === 'step_loop_retry' && event.stepId === step.id);
+    assert.ok(retry, 'the repair beat is journaled as a contract retry');
+    assert.equal(retry?.meta?.attempt, 1);
+    assert.equal(retry?.meta?.maxAttempts, 2);
+    assert.ok(events.some((event) => event.kind === 'step_completed' && event.stepId === step.id));
+  });
+});
+
+test('two contract failures still fail the step with output_contract', async () => {
+  const workflowSlug = 'contract-repair-fail';
+  const runId = 'cr-fail-1';
+  const step = {
+    id: 'wrap_up',
+    prompt: 'Summarize the day.',
+    sideEffect: 'read',
+    output: { type: 'object', required_keys: ['summary'] },
+  };
+  await withStubbedHarnessLane(() => 'Still prose, still no contracted keys.', async (inputs) => {
+    const calls = () => inputs.length;
+    const ctx = contractRepairCtx(workflowSlug, runId, step, async () => { throw new Error('legacy assistant must not run'); });
+    await assert.rejects(
+      () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowContractViolationError);
+        assert.equal(error.reason, 'output_contract');
+        assert.match(error.message, /output failed its contract/);
+        return true;
+      },
+    );
+    assert.equal(calls(), 2, 'bounded: one repair beat, then the violation propagates');
+    const events = readWorkflowEvents(workflowSlug, runId);
+    assert.equal(events.filter((event) => event.kind === 'step_loop_retry').length, 1);
+    assert.equal(events.filter((event) => event.kind === 'step_failed' && event.meta?.reason === 'output_contract').length, 2);
+    assert.ok(!events.some((event) => event.kind === 'step_completed'));
+  });
+});
+
+test('a step whose session already crossed irreversibly is never re-run for a contract repair', async () => {
+  const workflowSlug = 'contract-repair-crossed';
+  const runId = 'cr-crossed-1';
+  // The crossing truth is the SESSION's, not the declaration's: the guard reads
+  // the durable ledger of this step's own harness session.
+  const step = {
+    id: 'post_update',
+    prompt: 'Report the update and return the structured receipt.',
+    sideEffect: 'read',
+    output: { type: 'object', required_keys: ['posted'] },
+  };
+  const sessionId = `workflow:${runId}:${step.id}`;
+  harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+  harnessEventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: { toolName: 'fixture_send', callId: 'sent-1', irreversible: true },
+  });
+  assert.equal(contractRepair.stepIrreversibleCrossingRecorded(runId, step.id), true);
+  assert.equal(contractRepair.stepIrreversibleCrossingRecorded(runId, 'never_ran'), false);
+  await withStubbedHarnessLane(() => 'Posted, but as prose.', async (inputs) => {
+    const ctx = contractRepairCtx(workflowSlug, runId, step, async () => { throw new Error('legacy assistant must not run'); });
+    await assert.rejects(
+      () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
+      (error: unknown) => error instanceof WorkflowContractViolationError && error.reason === 'output_contract',
+    );
+    assert.equal(inputs.length, 1, 'a second crossing is never risked for a shape fix');
+    assert.equal(readWorkflowEvents(workflowSlug, runId).some((event) => event.kind === 'step_loop_retry'), false);
+  });
+});
+
+// ─── Ever-learning: the learned pin is the CORRECTED call, never the refused one
+const learnedPinToolChoices = await import('../memory/tool-choice-store.js');
+const learnedPinBindings = await import('../memory/workflow-certified-binding.js');
+
+test('rememberProvenWorkflowStepTool records the corrected invocation template, never a refused attempt', () => {
+  const toolChoices = learnedPinToolChoices;
+  const { workflowStepPinIntent } = learnedPinBindings;
+  const refusedMarker = JSON.stringify({
+    protocol: 'host_tool_disposition_v1',
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'f'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    effect: 'none',
+    retry: 'replan',
+    requiresReconciliation: false,
+    message: 'Retry this same operation exactly once with one corrected JSON object.',
+  });
+  const refusedArgs = JSON.stringify({ tool_slug: 'FIXTURE_SHEETS_UPDATE', arguments: JSON.stringify({ range: 'A1', values: [[1]] }) });
+  const correctedArgs = JSON.stringify({ tool_slug: 'FIXTURE_SHEETS_UPDATE', arguments: JSON.stringify({ range: { sheetId: 0, startIndex: 1 }, values: [[1]] }) });
+  const seed = (sessionId: string, order: 'refused_then_corrected' | 'corrected_then_refused') => {
+    harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+    const pairs = order === 'refused_then_corrected'
+      ? [['refused-1', refusedArgs, refusedMarker], ['corrected-1', correctedArgs, '{"successful":true,"data":{"updatedRows":1}}']]
+      : [['corrected-1', correctedArgs, '{"successful":true,"data":{"updatedRows":1}}'], ['refused-2', refusedArgs, refusedMarker]];
+    for (const [callId, args, result] of pairs) {
+      harnessEventlog.appendEvent({
+        sessionId, turn: 1, role: 'agent', type: 'tool_called',
+        data: { tool: 'composio_execute_tool', callId, arguments: args },
+      });
+      harnessEventlog.appendEvent({
+        sessionId, turn: 1, role: 'agent', type: 'tool_returned',
+        data: { tool: 'composio_execute_tool', callId, result },
+      });
+    }
+  };
+  for (const [index, order] of (['refused_then_corrected', 'corrected_then_refused'] as const).entries()) {
+    const workflowName = `Learned Pin ${order}`;
+    const stepId = 'update_sheet';
+    const sessionId = `workflow:learned-pin-${index}:${stepId}`;
+    seed(sessionId, order);
+    workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId, workflowName, stepId });
+    const record = toolChoices.peekToolChoice(workflowStepPinIntent(workflowName, stepId));
+    assert.ok(record, `${order}: a proven call is pinned`);
+    assert.equal(record?.choice.identifier, 'FIXTURE_SHEETS_UPDATE');
+    assert.match(record?.choice.invocationTemplate ?? '', /startIndex/, `${order}: the CORRECTED shape is the template`);
+    assert.doesNotMatch(record?.choice.invocationTemplate ?? '', /"A1"/, `${order}: the refused shape never becomes a pin`);
+  }
+  const emptySession = 'workflow:learned-pin-refused-only:update_sheet';
+  harnessEventlog.createSession({ id: emptySession, kind: 'workflow', channel: 'workflow' });
+  harnessEventlog.appendEvent({
+    sessionId: emptySession, turn: 1, role: 'agent', type: 'tool_called',
+    data: { tool: 'composio_execute_tool', callId: 'refused-only', arguments: refusedArgs },
+  });
+  harnessEventlog.appendEvent({
+    sessionId: emptySession, turn: 1, role: 'agent', type: 'tool_returned',
+    data: { tool: 'composio_execute_tool', callId: 'refused-only', result: refusedMarker },
+  });
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId: emptySession, workflowName: 'Learned Pin refused only', stepId: 'update_sheet' });
+  assert.ok(!toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin refused only', 'update_sheet')),
+    'a step whose only provider call was refused learns nothing');
+});
