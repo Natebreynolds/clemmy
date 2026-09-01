@@ -4704,15 +4704,16 @@ async function runStepViaHarness(
     // are steps AUTHORED `requiresApproval`. A step the author declared
     // `sideEffect: 'send'` (without requiresApproval) sends without parking —
     // saving + launching/enabling the workflow is the consent, first run
-    // included. Graduated slugs remain as the audit trail/belt.
-    const authoredSendConsent = !step.requiresApproval && stepSideEffectClass(step) === 'send';
+    // included. That consent is no longer a scope-wide flag: it is the exact
+    // authored-step receipt recorded below and evaluated per call by the host
+    // (one send per step attempt, bound to source/batch/args/destination).
+    // Graduated slugs remain as the audit trail/belt for the legacy lanes.
     openPlanScope({
       sessionId: realSessionId,
       planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
       approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
       ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
       allowedTools,
-      allowAnySend: authoredSendConsent,
       allowedSends: [...new Set([
         ...(step.requiresApproval
           ? allowedTools.filter((tool) => tool !== '*' && isIrreversibleSendSlug(tool))
@@ -4720,16 +4721,14 @@ async function runStepViaHarness(
         ...graduatedSends,
       ])],
     });
-    if (authoredSendConsent || graduatedSends.length > 0) {
+    if (graduatedSends.length > 0) {
       try {
         addNotification({
           id: `send-graduated-${workflowRunId}-${step.id}`,
           kind: 'workflow',
           title: `Send runs without approval: ${workflowName} · ${step.id}`,
           body: [
-            authoredSendConsent
-              ? `Run ${workflowRunId}: this step is authored as a send (sideEffect: send) without a human-in-the-loop gate, so it sends without pausing — saving and running/enabling the workflow is the consent.`
-              : `Run ${workflowRunId} sends via ${graduatedSends.join(', ')} without pausing — a person approved this step's send in a prior run, and the workflow is enabled + scheduled.`,
+            `Run ${workflowRunId} sends via ${graduatedSends.join(', ')} without pausing — a person approved this step's send in a prior run, and the workflow is enabled + scheduled.`,
             'Author the step with `requiresApproval` to always wait for a human; disable the workflow to stop it entirely.',
           ].join('\n'),
           createdAt: new Date().toISOString(),
@@ -4879,6 +4878,33 @@ async function runStepViaHarness(
           { stepId: step.id, workflowRunId, reason: writeAuthority.reason },
           'authored step local-write coverage not recorded; local writes fall to uncovered consent',
         );
+      }
+      const declaredSendStep = stepSideEffectClass(step) === 'send';
+      // A step the author declared as a SEND must carry its exact receipt or
+      // not run at all: `none` means the immutable definition this run admitted
+      // does not declare this step as a send, so no send authority exists and
+      // the model must not be handed the step as if it did.
+      if (declaredSendStep && writeAuthority.status === 'none') {
+        throw new Error(
+          `workflow step "${step.id}" is declared as a send but the admitted definition mints no send authority`,
+        );
+      }
+      if (declaredSendStep && writeAuthority.status === 'ready' && !step.requiresApproval) {
+        try {
+          addNotification({
+            id: `send-authored-${workflowRunId}-${step.id}`,
+            kind: 'workflow',
+            title: `Send runs without approval: ${workflowName} · ${step.id}`,
+            body: [
+              `Run ${workflowRunId}: this step is authored as a send (sideEffect: send) without a human-in-the-loop gate, so it sends without pausing — saving and running/enabling the workflow is the consent. The host binds that consent to this exact step attempt: one send, the exact recipient/arguments the step names, never a second copy.`,
+              'Author the step with `requiresApproval` to always wait for a human; disable the workflow to stop it entirely.',
+            ].join('\n'),
+            createdAt: new Date().toISOString(),
+            read: false,
+            silent: true,
+            metadata: { workflow: workflowName, runId: workflowRunId, stepId: step.id, authorityDigest: writeAuthority.authorityDigest },
+          });
+        } catch { /* audit notification is best-effort */ }
       }
     }
     // This is request policy, not retrieval text. Retain it across a tool-limit

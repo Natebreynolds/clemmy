@@ -378,11 +378,14 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
     const step = steps.length === 1 ? steps[0]! : null;
     // Owner rule: the only human-in-the-loop gate inside a saved workflow is a
     // step AUTHORED `requiresApproval`. Every other authored write/send step's
-    // save + enable/run chain is the consent, so it gets an exact receipt.
+    // save + enable/run chain is the consent, so it gets an exact receipt. A
+    // send step AUTHORED `requiresApproval` also gets a receipt — it carries
+    // the gate (requiresApproval:true) so its one approval card can bind to
+    // the exact immutable step instead of a TTL-wide scope.
     if (
       !step
       || (step.sideEffect !== 'write' && step.sideEffect !== 'send')
-      || step.requiresApproval === true
+      || (step.sideEffect === 'write' && step.requiresApproval === true)
     ) {
       return { status: 'none' };
     }
@@ -428,7 +431,7 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
       definitionHash: resolved.snapshot.definitionHash,
       admissionHash: resolved.snapshot.admissionHash,
       stepSideEffect: step.sideEffect,
-      requiresApproval: false,
+      requiresApproval: step.requiresApproval === true,
       promptDigest: digest(step.prompt),
       catalogIdentities: externalWrites,
     };
@@ -725,10 +728,146 @@ function coverageFor(input: {
 }
 
 /**
+ * Process-local same-frame cardinality ledger for authored sends.
+ *
+ * One authored send per step attempt. The durable ledgers (logical calls,
+ * settlements, physical dispatches) only learn about a call once it reaches
+ * dispatch, so two send calls inside ONE model frame would each be evaluated
+ * before either has a durable row. The host evaluates a frame's calls in
+ * order; the first call that binds a send receipt is recorded here and any
+ * sibling in the same frame that binds the same receipt is `cardinality_spent`.
+ * The same logical call re-evaluated (approval resume in-process) keeps its
+ * own reservation. Bounded: oldest frames are forgotten first.
+ */
+const MAX_TRACKED_SEND_FRAMES = 256;
+const sendGrantsByFrame = new Map<string, Map<string, string>>();
+
+function sendFrameKey(ref: AcceptedModelBatchRef): string {
+  return `${ref.sessionId}\0${ref.sourceUserSeq}\0${ref.batchId}`;
+}
+
+function rememberSendGrant(input: {
+  acceptedBatch: AcceptedModelBatchRef;
+  authorityDigest: string;
+  logicalToolCallId: string;
+}): void {
+  const key = sendFrameKey(input.acceptedBatch);
+  let frame = sendGrantsByFrame.get(key);
+  if (!frame) {
+    frame = new Map();
+    sendGrantsByFrame.set(key, frame);
+    while (sendGrantsByFrame.size > MAX_TRACKED_SEND_FRAMES) {
+      const oldest = sendGrantsByFrame.keys().next().value;
+      if (oldest === undefined) break;
+      sendGrantsByFrame.delete(oldest);
+    }
+  }
+  if (!frame.has(input.authorityDigest)) frame.set(input.authorityDigest, input.logicalToolCallId);
+}
+
+/**
+ * Has this step attempt already spent its one authored send on a DIFFERENT
+ * logical call? Same-frame siblings come from the process-local ledger above;
+ * earlier frames come from the durable ledgers: any other logical call for the
+ * same operation in this session/source that settled as executed (never a
+ * refused_pre_dispatch settlement) or that started a physical crossing.
+ * Unreadable truth fails closed (spent).
+ */
+function sendReservationAlreadyClaimed(input: {
+  attestation: HostCallAttestation;
+  receipt: AuthoredWorkflowWriteReceiptV1;
+  acceptedBatch: AcceptedModelBatchRef;
+}): boolean {
+  const { attestation } = input;
+  const holder = sendGrantsByFrame.get(sendFrameKey(input.acceptedBatch))?.get(input.receipt.authorityDigest);
+  if (holder && holder !== attestation.logicalToolCallId) return true;
+  try {
+    // The durable rows record the logical contract's canonical tool name,
+    // which normalizes case; compare case-insensitively so a claimed send can
+    // never hide behind its spelling.
+    const db = openEventLog();
+    const settled = db.prepare(`
+      SELECT 1
+        FROM logical_call_settlements settlement
+        JOIN logical_tool_calls call
+          ON call.session_id = settlement.session_id
+         AND call.source_user_seq = settlement.source_user_seq
+         AND call.logical_tool_call_id = settlement.logical_tool_call_id
+       WHERE settlement.session_id = ?
+         AND settlement.source_user_seq = ?
+         AND UPPER(call.tool_name) = UPPER(?)
+         AND settlement.execution_kind != 'refused_pre_dispatch'
+         AND settlement.logical_tool_call_id != ?
+       LIMIT 1
+    `).get(
+      attestation.sessionId,
+      attestation.sourceUserSeq,
+      attestation.operationId,
+      attestation.logicalToolCallId,
+    );
+    if (settled) return true;
+    const started = db.prepare(`
+      SELECT 1
+        FROM physical_dispatches
+       WHERE session_id = ?
+         AND source_user_seq = ?
+         AND UPPER(tool_name) = UPPER(?)
+         AND logical_tool_call_id != ?
+       LIMIT 1
+    `).get(
+      attestation.sessionId,
+      attestation.sourceUserSeq,
+      attestation.operationId,
+      attestation.logicalToolCallId,
+    );
+    return Boolean(started);
+  } catch {
+    return true;
+  }
+}
+
+type AuthoredCatalogGate = 'ordinary_write' | 'send';
+
+/**
+ * Which authored authority class does this exact projection fall under?
+ *  - ordinary_write: reversible / ordinary non-destructive external write and
+ *    never a send/delete/admin consequence — covered by any authored write or
+ *    send step;
+ *  - send: an admissible, non-destructive external write whose consequence is
+ *    `send` and whose reversibility is `irreversible` — covered ONLY by a step
+ *    the author declared `sideEffect: 'send'`.
+ * Delete, admin, destructive, protected/untrusted and unknown projections are
+ * never authored authority and return null exactly as before.
+ */
+function authoredCatalogGate(
+  stepSideEffect: AuthoredWorkflowWriteReceiptV1['stepSideEffect'],
+  projection: {
+    effect: string;
+    safety: string;
+    risk: CapabilityRiskAttestationV1['risk'];
+  },
+): AuthoredCatalogGate | null {
+  if (projection.effect !== 'external_write' || projection.safety !== 'admissible') return null;
+  if (projection.risk.destructive) return null;
+  if (projection.risk.consequence === 'delete' || projection.risk.consequence === 'admin') return null;
+  const ordinary = (projection.risk.reversibility === 'reversible'
+    || projection.risk.reversibility === 'ordinary_non_destructive')
+    && projection.risk.consequence !== 'send';
+  if (ordinary) return 'ordinary_write';
+  if (
+    stepSideEffect === 'send'
+    && projection.risk.consequence === 'send'
+    && projection.risk.reversibility === 'irreversible'
+  ) return 'send';
+  return null;
+}
+
+/**
  * Exact external-catalog branch: one frozen catalog identity named by the
- * immutable step, current schema/account/manifest/port, ordinary reversible
- * risk, and the standing workflow grant. High-consequence projections (send,
- * delete, admin, destructive, irreversible) deliberately return null here.
+ * immutable step, current schema/account/manifest/port, an authored risk
+ * class (ordinary write, or send for a send step), and the standing workflow
+ * grant. Sends are once per step attempt. Delete/admin/destructive/unknown
+ * projections deliberately return null.
  */
 async function evaluateAuthoredCatalogWrite(input: {
   attestation: HostCallAttestation;
@@ -739,6 +878,9 @@ async function evaluateAuthoredCatalogWrite(input: {
 }): Promise<HostInteractiveConsentResult | null> {
   const { attestation, reopened } = input;
   const { receipt } = reopened;
+  // A step AUTHORED `requiresApproval` keeps its human gate (its exact card
+  // and durable resume are a separate branch); never the standing grant.
+  if (receipt.requiresApproval || reopened.step.requiresApproval === true) return null;
   const acceptedScope = currentAcceptedSourceCatalogManifestScope();
   if (!acceptedScope) return null;
   const candidates = receipt.catalogIdentities.filter((identity) => (
@@ -812,20 +954,17 @@ async function evaluateAuthoredCatalogWrite(input: {
   });
   if (!risk.ok) return null;
   const projection = risk.attestation.projection;
-  const highConsequence = projection.effect !== 'external_write'
-    || projection.safety !== 'admissible'
-    || projection.risk.destructive
-    || !['reversible', 'ordinary_non_destructive'].includes(projection.risk.reversibility)
-    || projection.risk.consequence === 'send'
-    || projection.risk.consequence === 'delete'
-    || projection.risk.consequence === 'admin';
-  if (highConsequence) return null;
+  const gate = authoredCatalogGate(receipt.stepSideEffect, projection);
+  if (!gate) return null;
   const crossing = crossingFor({
     sessionId: attestation.sessionId,
     sourceUserSeq: attestation.sourceUserSeq,
     logicalToolCallId: attestation.logicalToolCallId,
   });
   if (!crossing) return null;
+  const cardinality = gate === 'send'
+    ? { kind: 'once' as const }
+    : occurrenceCardinality({ receipt, acceptedBatch: input.acceptedBatch });
   const call: CapabilityRiskAttestationV1 = {
     version: 1,
     source: {
@@ -842,12 +981,23 @@ async function evaluateAuthoredCatalogWrite(input: {
     effect: 'external_write',
     accountId: attestation.accountId,
     destination: exactDestination,
-    cardinality: occurrenceCardinality({ receipt, acceptedBatch: input.acceptedBatch }),
+    cardinality,
     risk: projection.risk,
     semanticBasis: projection.semanticBasis,
     safety: projection.safety,
   };
-  const coverage = coverageFor({ ...input, receipt, call });
+  const coverage: ExactWorkCoverageV1 = gate === 'send'
+    ? {
+        ...coverageFor({ ...input, receipt, call }),
+        // One authored send per step attempt: the reservation is the receipt
+        // itself, not the admitted occurrence.
+        reservationKey: digest({
+          version: VERSION,
+          authorityDigest: receipt.authorityDigest,
+          cardinality: 'once',
+        }),
+      }
+    : coverageFor({ ...input, receipt, call });
   const grantScope: ExactUserGrantV1['scope'] = {
     source: call.source,
     acceptedTaskId: call.acceptedTaskId,
@@ -863,6 +1013,12 @@ async function evaluateAuthoredCatalogWrite(input: {
     risk: call.risk,
     semanticBasis: call.semanticBasis,
   };
+  // Owner rule (2026-07-24): saving + enabling/running the workflow IS the
+  // consent for a step the author declared as a send without an approval
+  // gate. The exact standing grant binds source, batch occurrence, arguments,
+  // destination, account, schema and risk — strictly tighter than any
+  // TTL-wide scope flag — and the reducer accepts it before its
+  // high-consequence floor.
   const standingGrant: ExactUserGrantV1 = {
     version: 1,
     source: 'standing_workflow_scope',
@@ -874,19 +1030,34 @@ async function evaluateAuthoredCatalogWrite(input: {
     }),
     scope: grantScope,
   };
+  const reservationAlreadyClaimed = gate === 'send'
+    ? sendReservationAlreadyClaimed({ attestation, receipt, acceptedBatch: input.acceptedBatch })
+    : false;
   const decision = evaluateInteractiveConsentV1({
     call,
     coverage,
     userGrant: standingGrant,
     readiness: { kind: 'ready' },
     crossing,
-    reservationAlreadyClaimed: false,
+    reservationAlreadyClaimed,
   });
-  if (
-    decision.kind !== 'proceed'
-    || !['exact_user_grant', 'settled_replay'].includes(decision.basis)
-  ) return null;
-  return { status: 'decided', decision, call, coverage };
+  if (decision.kind === 'proceed' && ['exact_user_grant', 'settled_replay'].includes(decision.basis)) {
+    if (gate === 'send' && decision.basis === 'exact_user_grant') {
+      rememberSendGrant({
+        acceptedBatch: input.acceptedBatch,
+        authorityDigest: receipt.authorityDigest,
+        logicalToolCallId: attestation.logicalToolCallId,
+      });
+    }
+    return { status: 'decided', decision, call, coverage };
+  }
+  // A send that the reducer refuses for an exact reason (its one reservation
+  // already spent, or a scope mismatch) is reported as that reason rather than
+  // laundered into a generic coverage_missing by the uncovered path.
+  if (gate === 'send' && decision.kind === 'repair') {
+    return { status: 'decided', decision, call, coverage };
+  }
+  return null;
 }
 
 interface AuthoredLocalWriteRisk {
@@ -1053,13 +1224,14 @@ async function evaluateAuthoredLocalWrite(input: {
   return { status: 'decided', decision, call, coverage };
 }
 
+
 /**
  * Reopen one saved workflow's exact, pre-model write receipt and project it
  * into the shared consent reducer. This is coverage, never a bypass: current
  * schema, catalog, account, destination, risk, accepted batch occurrence,
  * active attempt, PlanScope, and source-local catalog narrowing must all still
- * agree. High-consequence calls deliberately return null to their existing
- * authored approval/send policies.
+ * agree. Delete/admin/destructive/unknown projections deliberately return
+ * null to the uncovered path.
  */
 export async function evaluateAuthoredWorkflowMutationConsent(input: {
   attestation: HostCallAttestation;
@@ -1077,12 +1249,13 @@ export async function evaluateAuthoredWorkflowMutationConsent(input: {
     if (!catalogWrite && !localWrite) return null;
     const reopened = reopenAuthoredStepAuthority(attestation);
     if (!reopened) return null;
-    // A step AUTHORED `requiresApproval` keeps its human gate; it never takes
-    // the standing/self-coverage branches below.
-    if (reopened.receipt.requiresApproval || reopened.step.requiresApproval === true) return null;
-    return catalogWrite
-      ? await evaluateAuthoredCatalogWrite({ ...input, reopened })
-      : await evaluateAuthoredLocalWrite({ ...input, reopened });
+    if (localWrite) {
+      // A step AUTHORED `requiresApproval` keeps its human gate; local
+      // self-coverage never applies to it.
+      if (reopened.receipt.requiresApproval || reopened.step.requiresApproval === true) return null;
+      return await evaluateAuthoredLocalWrite({ ...input, reopened });
+    }
+    return await evaluateAuthoredCatalogWrite({ ...input, reopened });
   } catch {
     return null;
   }
