@@ -32,6 +32,15 @@ const logger = pino({ name: 'clementine-next.cli-auth-health' });
 
 export type CliAuthStatus = 'ok' | 'signed_out' | 'unknown' | 'error';
 
+/** What the most recent probe did when it produced no verdict. */
+export interface CliProbeError {
+  exitCode: number | null;
+  timedOut: boolean;
+  /** Leading stderr (stdout+stderr when the executor does not split them),
+   *  ANSI-stripped and capped at PROBE_ERROR_HEAD_CHARS. */
+  stderrHead: string;
+}
+
 export interface CliHealth {
   /** Catalog id, or `saved:<command>` for roster-only bare names. */
   id: string;
@@ -40,7 +49,19 @@ export interface CliHealth {
   authStatus: CliAuthStatus;
   username?: string;
   checkedAt: string;
+  /**
+   * Present when `authStatus` is a KEPT verdict: the latest probe failed
+   * transiently (timeout, non-zero exit without the signed-out pattern, an
+   * exception) and produced no verdict of its own, so the previous one stands.
+   * ISO time of the probe that last produced the standing verdict. Cleared by
+   * the next probe that yields a verdict.
+   */
+  staleSince?: string;
+  /** The transient failure that left the previous verdict standing. */
+  lastProbeError?: CliProbeError;
 }
+
+const PROBE_ERROR_HEAD_CHARS = 200;
 
 const HEALTH_FILE = path.join(BASE_DIR, 'state', 'cli-auth-health.json');
 /** Mirror of composio's CLI_STATUS_TTL_MS — probes are cheap but not free. */
@@ -116,6 +137,8 @@ export interface ProbeExecResult {
   exitCode: number | null;
   output: string;
   timedOut: boolean;
+  /** stderr alone, when the executor can separate it (the real executor does). */
+  stderr?: string;
 }
 
 type ProbeExec = (binaryPath: string, args: string[], timeoutMs: number) => Promise<ProbeExecResult>;
@@ -130,11 +153,11 @@ const realExec: ProbeExec = (binaryPath, args, timeoutMs) =>
     }, (err, stdout, stderr) => {
       const output = [stdout, stderr].filter(Boolean).join('\n');
       if (err && (err as { killed?: boolean }).killed) {
-        resolve({ exitCode: null, output, timedOut: true });
+        resolve({ exitCode: null, output, timedOut: true, stderr });
         return;
       }
       const code = err ? ((err as { code?: unknown }).code as number | null ?? 1) : 0;
-      resolve({ exitCode: typeof code === 'number' ? code : 1, output, timedOut: false });
+      resolve({ exitCode: typeof code === 'number' ? code : 1, output, timedOut: false, stderr });
     });
   });
 
@@ -236,6 +259,11 @@ async function delegatedHealth(item: RosterItem): Promise<CliHealth | null> {
           : 'error',
         ...(status.username ? { username: status.username } : {}),
         checkedAt,
+        // A delegated probe that neither confirmed nor denied the login is a
+        // transient like any other: it produced no verdict.
+        ...(status.installed && status.authStatus !== 'ok' && status.authStatus !== 'invalid'
+          ? { lastProbeError: { exitCode: null, timedOut: false, stderrHead: '' } }
+          : {}),
       };
     }
     if (item.id === 'composio' || item.command === 'composio') {
@@ -250,10 +278,22 @@ async function delegatedHealth(item: RosterItem): Promise<CliHealth | null> {
       };
     }
   } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err), cli: item.id }, 'delegated CLI health probe failed');
-    return { id: item.id, command: item.command, installed: true, authStatus: 'error', checkedAt };
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: message, cli: item.id }, 'delegated CLI health probe failed');
+    return {
+      id: item.id,
+      command: item.command,
+      installed: true,
+      authStatus: 'error',
+      checkedAt,
+      lastProbeError: { exitCode: null, timedOut: false, stderrHead: probeErrorHead(message) },
+    };
   }
   return null;
+}
+
+function probeErrorHead(text: string | undefined): string {
+  return stripAnsi(text ?? '').replace(/\s+/g, ' ').trim().slice(0, PROBE_ERROR_HEAD_CHARS);
 }
 
 // ─── Health resolution ──────────────────────────────────────────────
@@ -273,21 +313,87 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
     return { id: item.id, command: item.command, installed: true, authStatus: 'unknown', checkedAt };
   }
   const result = await execImpl(safe.path, item.probe.args, item.probe.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
+  const verdict = classifyProbeOutput(item.probe, result);
   return {
     id: item.id,
     command: item.command,
     installed: true,
-    ...classifyProbeOutput(item.probe, result),
+    ...verdict,
     checkedAt,
+    // 'error' from the classifier means "no verdict" — a timeout, a non-zero
+    // exit that did not match the signed-out pattern, or silence. Record what
+    // happened so commit can keep the last real verdict instead of caching a
+    // transient as if the login had failed.
+    ...(verdict.authStatus === 'error'
+      ? {
+          lastProbeError: {
+            exitCode: result.exitCode,
+            timedOut: result.timedOut,
+            stderrHead: probeErrorHead(result.stderr ?? result.output),
+          },
+        }
+      : {}),
   };
+}
+
+/**
+ * A probe that produced no verdict must not overwrite one that did. Only the
+ * signed-out pattern flips a login to signed_out; a timeout or an unexplained
+ * non-zero exit keeps the previous 'ok' (or 'signed_out') standing and marks it
+ * stale, and a first-ever probe with nothing to keep stays 'unknown' — never
+ * 'error', which every surface renders as an auth failure the user must fix.
+ */
+function settleTransientProbe(next: CliHealth, previous: CliHealth | undefined): CliHealth {
+  if (!next.lastProbeError) return next;
+  const kept = previous?.authStatus === 'ok' || previous?.authStatus === 'signed_out'
+    ? previous.authStatus
+    : 'unknown';
+  const staleSince = previous ? (previous.staleSince ?? previous.checkedAt) : undefined;
+  const settled: CliHealth = {
+    id: next.id,
+    command: next.command,
+    installed: next.installed,
+    authStatus: kept,
+    ...(kept === 'ok' && previous?.username ? { username: previous.username } : {}),
+    checkedAt: next.checkedAt,
+    ...(staleSince ? { staleSince } : {}),
+    lastProbeError: next.lastProbeError,
+  };
+  logger.warn({
+    cli: next.id,
+    command: next.command,
+    exitCode: next.lastProbeError.exitCode,
+    timedOut: next.lastProbeError.timedOut,
+    stderrHead: next.lastProbeError.stderrHead,
+    keptVerdict: kept,
+    ...(staleSince ? { staleSince } : {}),
+  }, 'CLI auth probe produced no verdict; keeping the last one');
+  return settled;
+}
+
+/** Human line for surfaces that show the status text: "checked 3h ago, last
+ *  probe failed (exit 1)" while a kept verdict is stale; null otherwise. */
+export function cliHealthStaleNote(health: CliHealth, now: number = Date.now()): string | null {
+  if (!health.lastProbeError) return null;
+  const since = Date.parse(health.staleSince ?? health.checkedAt);
+  const ageMs = Number.isFinite(since) ? Math.max(0, now - since) : 0;
+  const age = ageMs < 60_000 ? 'just now'
+    : ageMs < 3_600_000 ? `${Math.round(ageMs / 60_000)}m ago`
+    : ageMs < 86_400_000 ? `${Math.round(ageMs / 3_600_000)}h ago`
+    : `${Math.round(ageMs / 86_400_000)}d ago`;
+  const why = health.lastProbeError.timedOut ? 'timed out'
+    : health.lastProbeError.exitCode === null ? 'failed'
+    : `exit ${health.lastProbeError.exitCode}`;
+  return `checked ${age}, last probe failed (${why})`;
 }
 
 /** Persist + fire the recovered event on a signed_out→ok transition.
  *  The persisted previous state is the transition authority so a daemon
  *  restart can neither double-fire nor swallow a recovery. */
-function commitHealth(next: CliHealth): CliHealth {
+function commitHealth(probed: CliHealth): CliHealth {
   const entries = readHealthFile();
-  const previous = entries[next.id];
+  const previous = entries[probed.id];
+  const next = settleTransientProbe(probed, previous);
   entries[next.id] = next;
   writeHealthFile(entries);
   if (previous?.authStatus === 'signed_out' && next.authStatus === 'ok') {
@@ -332,9 +438,12 @@ export async function getCliHealth(id: string, opts: { force?: boolean } = {}): 
     };
   }
   const promise = probeHealth(item)
-    .then((health) => {
+    .then((probed) => {
+      // Memoize the SETTLED record: a transient must not be served for 45s
+      // as 'error' while the persisted truth kept the last verdict.
+      const health = commitHealth(probed);
       memo.set(id, { at: Date.now(), value: health });
-      return commitHealth(health);
+      return health;
     })
     .finally(() => inFlight.delete(id));
   inFlight.set(id, promise);

@@ -134,6 +134,9 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/daemon/process.ts',
       'src/runtime/build-info.ts',
       'src/runtime/cutover-hold.ts',
+      // Pure leaf (only a `type` import of better-sqlite3): the v72 async-read
+      // refinement schema module rides along with eventlog-schema's migration list.
+      'src/runtime/harness/async-read-refinement-schema.ts',
       'src/runtime/harness/eventlog-schema.ts',
       'src/runtime/harness/host-planned-resolution-coexistence.ts',
       'src/runtime/harness/schema-version.ts',
@@ -144,6 +147,7 @@ test('held parent and migration child have exact minimal runtime import closures
   });
   assert.deepEqual(runtimeImportClosure('src/runtime/harness/eventlog-schema.ts'), {
     modules: [
+      'src/runtime/harness/async-read-refinement-schema.ts',
       'src/runtime/harness/eventlog-schema.ts',
       'src/runtime/harness/host-planned-resolution-coexistence.ts',
       'src/runtime/harness/schema-version.ts',

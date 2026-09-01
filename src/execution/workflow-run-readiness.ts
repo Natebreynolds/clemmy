@@ -4,7 +4,9 @@ import type { WorkflowDefinition } from '../memory/workflow-store.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { listSkills } from '../memory/skill-store.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
+import { deriveReviewedLocalNames } from '../tools/tool-registry.js';
 import { listWorkspaceProjects } from '../tools/shared.js';
+import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
 import { readCachedScan } from '../runtime/cli-discovery.js';
 import { getSavedClis } from '../runtime/saved-clis.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
@@ -74,7 +76,18 @@ interface WorkflowRunReadinessOptions
 export function buildWorkflowReadinessInventory(workflowSlug?: string): WorkflowToolReadinessInventory {
   const cachedCliScan = readCachedScan();
   return {
-    availableTools: compactUniqueStrings(Array.from(LOCAL_MCP_TOOL_NAMES as readonly string[])),
+    // The inventory must be the union of the registries the workflow call
+    // carrier itself dispatches from — the CLI-lane registry projection, the
+    // registry tools with a reviewed in-process execution contract, and the
+    // durable reviewed-CLI read descriptors — or readiness calls an operation
+    // "missing" that the executor would run without hesitation. Neither the
+    // capability index nor the auth-health cache is a source here: the first
+    // is a discovery projection, the second attests no exact account.
+    availableTools: compactUniqueStrings([
+      ...(LOCAL_MCP_TOOL_NAMES as readonly string[]),
+      ...deriveReviewedLocalNames(),
+      ...reviewedCliReadOperationIds(),
+    ]),
     availableClis: compactUniqueStrings([
       ...getSavedClis(),
       ...(cachedCliScan?.detected ?? []).map((cli) => cli.command),
@@ -320,6 +333,18 @@ function readinessSourceLabel(source: string): string {
     case 'workflow_project': return 'workflow project';
     case 'step_project': return 'step project';
     default: return source.replace(/_/g, ' ');
+  }
+}
+
+/** Operation ids the reviewed-CLI read carrier can dispatch right now: the
+ *  same durable descriptor file its live catalog snapshot is built from. A
+ *  missing or malformed registry contributes nothing rather than failing the
+ *  preflight — readiness informs, it never refuses on its own bookkeeping. */
+function reviewedCliReadOperationIds(): string[] {
+  try {
+    return listReviewedCliReadDescriptors().map((descriptor) => descriptor.operationId);
+  } catch {
+    return [];
   }
 }
 

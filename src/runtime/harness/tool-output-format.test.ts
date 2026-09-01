@@ -28,6 +28,7 @@ const {
   extractResourceIdIndex,
   densifyMarkdownForModelHead,
   exactToolOutputForInvocation,
+  truncateToolText,
 } = await import('./tool-output-format.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
 const { textResult } = await import('../../tools/shared.js');
@@ -274,6 +275,22 @@ test('textResult uses active tool-output context for MCP-style local tools', asy
   const row = getToolOutput(sess.id, 'call_text_result_full');
   assert.ok(row);
   assert.equal(row.output, full);
+});
+
+test('truncateToolText keeps a HEAD budget while the detached format keeps a TOTAL budget on the same input', () => {
+  // Two budgets, two callers. Plain tool results hand the model the first
+  // maxChars untouched and append a truthful marker beyond them; the
+  // recallable formatter composes several pieces inside ONE visible cap, so
+  // it clips each piece total-bounded. Same input, both contracts hold.
+  const big = 'a'.repeat(2000);
+  const head = truncateToolText(big, 500);
+  assert.ok(head.startsWith('a'.repeat(500)));
+  assert.match(head, /1,500 of 2,000 chars omitted/);
+  assert.match(head, /re-call with a narrower scope/);
+  const bounded = formatRecallableToolText(big, { maxChars: 500 });
+  assert.ok(bounded.length <= 500, `detached format escaped its cap: ${bounded.length}`);
+  assert.match(bounded, /of 2,000 chars omitted/);
+  assert.match(bounded, /re-call with a narrower scope/);
 });
 
 test('formatRecallableToolText falls back to plain truncation without call context', () => {
