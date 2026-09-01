@@ -96,8 +96,27 @@ in two weeks a failed run named its own cause.
   subscription rescue had carried several earlier turns of this very run but had gone silent once, so the
   live chain shrank to `[codex]` and one 429 ended the step. Fix: brains silenced earlier in the run are
   demoted to the chain tail instead of dropped (pinned). Not fixed tonight: the prompt size itself —
-  compaction is the real latency/timeout lever for a 27-read step. Baseline #5 (`1788261863184-23695e`)
-  is the re-run on that fix.
+  compaction is the real latency/timeout lever for a 27-read step.
+- **platform-49 GLM baseline #5 (04:24, run `1788261863184-23695e`) — reached the write.** 19 reads in
+  10 minutes, then the model dispatched `GOOGLESHEETS_INSERT_DIMENSION` through `composio_execute_tool`
+  — the first mutating crossing in five runs; consent, frozen catalog, plan scope and JIT all held. The
+  physical dispatch **threw in 3 ms inside the shipped invoke artifact**: `generic external write
+  requires current call authority` (`production-capability-adapters.ts:721`). Because the throw came
+  after dispatch-start, the host had to settle it `uncertain_write / unacknowledged_mutation` and block
+  the run `tool_effect_uncertain` ("must be reconciled") — for a call that provably never left the
+  process. **This is the remaining platform-49 blocker, and it is a design fork, not a bug:** the
+  adapter's `authority` is a `ResolvedCallAuthority` that only the admitted-construct lane mints
+  (`admitted-construct-run.ts:1342` — graph id/hash, node lease, claim event, semantic provenance, write
+  judge), i.e. writes are meant to go `plan_task` → `work_call`; rings L/C's authored-step consent lane
+  grants the same write through the direct broker path, and its acceptance pins pass only because they
+  stub the port (the shipped adapter is never exercised). Two candidate fixes, owner's call: (a) the
+  host passes the adapter the narrow invoke authority it actually reads (manifest identity + the sealed
+  canonical args from `compileSealedProviderArgs`) *only* when the authored-consent evaluator granted
+  the call — the receipt is the authority the owner defined; or (b) refuse a direct broker external
+  write pre-dispatch with a diagnostic that names the repair (`plan_task` naming the op, then
+  `work_call`), so the model takes the construct lane instead of hitting a dead end. Either way the
+  pre-body authority throw in the adapter should become a typed *not-started* refusal so it can never
+  read as an uncertain mutation.
 - **Crash-resume poison (hard-cut journey, ring B's same-run diagnostic):** PID A armed the immutable host
   root while `plan_task`'s description carried the initial planning card; PID B's re-prime rebuilt
   `plan_task` with the disclosures the card had gained; `toolSchemaFingerprint` hashed the description, so
