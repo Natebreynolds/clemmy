@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   AUTOMATION_OPPORTUNITY_PROPOSAL_DB,
   WORK_TABLES,
+  BUILTIN_SKILL_SEED_IDS,
   classifyPackagedFirstBootAddedFile,
   isExactApprovalResolutionAuditAppend,
   isPackagedCapabilityAcquisitionMissingDetail,
@@ -234,6 +235,7 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
     ['cron/daemon-state.json', 'recovery_projection'],
     [eventFile, 'recovery_projection'],
     ['state/check-in-templates/seed-friday-wrap.json', 'deterministic_boot_seed'],
+    ['skills/technical-content-marketing/SKILL.md', 'deterministic_boot_seed'],
     ['state/space-schedule-state.json', 'scheduler_observation'],
     ['daemon.lock/owner-123e4567-e89b-12d3-a456-426614174000.json', 'ephemeral_process_owner'],
     ['daemon.pid.123.123e4567-e89b-12d3-a456-426614174000.tmp', 'ephemeral_process_owner'],
@@ -259,7 +261,20 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
     'spaces/upgrade-rehearsal-space/data.json',
     'state/operational-telemetry.json',
     'vault/00-System/workflows/other/SKILL.md',
+    'skills/other/SKILL.md',
+    'skills/technical-content-marketing/notes.md',
   ]) assert.equal(classifyPackagedFirstBootAddedFile(file, recovery), 'unexpected', file);
+  // The closed seed list IS the package's builtin-skills directory: a shipped
+  // skill the rehearsal does not know would otherwise fail first boot as
+  // "unexpected" (live 2026-09-01), and a listed skill that no longer ships
+  // would be a phantom category.
+  assert.deepEqual(
+    [...BUILTIN_SKILL_SEED_IDS].sort(),
+    readdirSync(path.join(process.cwd(), 'builtin-skills'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort(),
+  );
 
   const lease = {
     version: 1,

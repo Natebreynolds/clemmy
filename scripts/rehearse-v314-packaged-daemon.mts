@@ -1452,6 +1452,11 @@ function preservedPreexistingFiles(
   return { ok: changed.length === 0 && missing.length === 0, changed, missing };
 }
 
+/** Shipped first-party instruction skills that setup seeds into `skills/` on
+ * first boot (src/setup/builtin-skills.ts). Closed on purpose: the pin proves
+ * this list equals the package's `builtin-skills/` directory. */
+export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['technical-content-marketing'] as const);
+
 export type PackagedFirstBootAddedFileCategory =
   | 'recovery_projection'
   | 'deterministic_boot_seed'
@@ -1488,6 +1493,7 @@ export function classifyPackagedFirstBootAddedFile(
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/SKILL.md'
     || relativePath === 'vault/00-System/workflows/objective-execution-loop/references/operating-principles.md'
     || relativePath === `memory/tool-procedures/${V314_GATE_MACHINE_ID}/.canonical-procedure-migration-v1.json`
+    || BUILTIN_SKILL_SEED_IDS.some((id) => relativePath === `skills/${id}/SKILL.md`)
     || (relativePath === 'state/starter-workspace-offer.json'
       && causalFiles.starterWorkspaceOffer === true)
   ) return 'deterministic_boot_seed';
@@ -1551,6 +1557,16 @@ export function validDeterministicBootSeed(home: string, relativePath: string): 
     const bytes = readFileSync(path.join(home, relativePath), 'utf8');
     return /(?:^|\n)name:\s*Objective Execution Loop(?:\n|$)/.test(bytes)
       && bytes.includes('requires_approval: true');
+  }
+  const builtinSkill = BUILTIN_SKILL_SEED_IDS.find((id) => relativePath === `skills/${id}/SKILL.md`);
+  if (builtinSkill) {
+    // Exact seed semantics mirror the provisioner's own validation: bounded,
+    // front-matter `name` equal to the directory, and a non-empty body.
+    const bytes = readFileSync(path.join(home, relativePath), 'utf8');
+    return Buffer.byteLength(bytes, 'utf8') <= 256 * 1024
+      && bytes.startsWith('---\n')
+      && new RegExp(`(?:^|\\n)name:\\s*${builtinSkill}(?:\\n|$)`).test(bytes)
+      && bytes.split('\n---\n')[1]?.trim().length > 0;
   }
   if (relativePath.endsWith('/objective-execution-loop/references/operating-principles.md')) {
     const bytes = readFileSync(path.join(home, relativePath), 'utf8');
