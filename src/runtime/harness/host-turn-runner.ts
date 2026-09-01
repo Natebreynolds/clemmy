@@ -3039,6 +3039,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           && isPlainOrClementineLocalTool(name, 'call_tool')
         );
       const attestation = { ...common, ...binding, bindingDigest };
+      // Pre-dispatch account preparation is keyed on manifest and port facts,
+      // never on a provider name: this kernel must not learn which service a
+      // manifest adapts. An externally-defined manifest whose port declares
+      // no preflight crossing of its own is prepared through the shipped
+      // attested transport immediately before its business dispatch; a port
+      // that owns admitPreparation/prepareInvocation already performs that
+      // crossing itself, and locally reviewed manifests carry no external
+      // definition at all.
+      const shippedTransportPreparation = Boolean(manifest.externalDefinition)
+        && typeof port.prepareInvocation !== 'function';
       return {
         attestation,
         manifest,
@@ -3053,12 +3063,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? { validateBeforeConsent: validateForegroundPayload }
           : {}),
         ...(!preserveExternalCarrier
-          && (manifest.providerKind === 'composio' || catalogEntry.validateForegroundPayload)
+          && (shippedTransportPreparation || catalogEntry.validateForegroundPayload)
           ? {
               prepareBeforePhysical: async () => {
                 const validation = validateForegroundPayload();
                 if (validation) return validation;
-                if (manifest.providerKind === 'composio') {
+                if (shippedTransportPreparation) {
                   await loadShippedImplementations().prepareComposioDispatch({
                     operationId: manifest.operationId,
                     accountId: manifest.accountId,
