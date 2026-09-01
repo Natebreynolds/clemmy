@@ -195,7 +195,7 @@
           "bytes": 13483
         },
         "src/agents/plan-scope.ts": {
-          "bytes": 48322
+          "bytes": 46986
         },
         "src/agents/tool-observability.ts": {
           "bytes": 8049
@@ -1383,7 +1383,7 @@
           "bytes": 60121
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 40664
+          "bytes": 47898
         },
         "src/execution/goal-validate.ts": {
           "bytes": 14928
@@ -1776,7 +1776,7 @@
           "bytes": 20182
         },
         "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 15295
+          "bytes": 18156
         },
         "src/runtime/harness/reviewed-local-tool-carrier.ts": {
           "bytes": 340
@@ -1857,7 +1857,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 709677
+          "bytes": 712142
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 143354
@@ -2196,7 +2196,7 @@
           "bytes": 37717
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 290135
+          "bytes": 295226
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2259,7 +2259,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 661802
+          "bytes": 664406
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2394,7 +2394,7 @@
           "bytes": 14727
         },
         "src/runtime/harness/indexed-capability-catalog.ts": {
-          "bytes": 22622
+          "bytes": 24591
         },
         "src/runtime/semantic-boundary/host-bind-operations.ts": {
           "bytes": 13738
@@ -2664,7 +2664,7 @@
           "bytes": 13483
         },
         "src/agents/plan-scope.ts": {
-          "bytes": 48322
+          "bytes": 46986
         },
         "src/agents/tool-observability.ts": {
           "bytes": 8049
@@ -3852,7 +3852,7 @@
           "bytes": 60121
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 40664
+          "bytes": 47898
         },
         "src/execution/goal-validate.ts": {
           "bytes": 14928
@@ -4245,7 +4245,7 @@
           "bytes": 20182
         },
         "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 15295
+          "bytes": 18156
         },
         "src/runtime/harness/reviewed-local-tool-carrier.ts": {
           "bytes": 340
@@ -4326,7 +4326,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 709677
+          "bytes": 712142
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 143354
@@ -4665,7 +4665,7 @@
           "bytes": 37717
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 290135
+          "bytes": 295226
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4728,7 +4728,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 661802
+          "bytes": 664406
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4863,7 +4863,7 @@
           "bytes": 14727
         },
         "src/runtime/harness/indexed-capability-catalog.ts": {
-          "bytes": 22622
+          "bytes": 24591
         },
         "src/runtime/semantic-boundary/host-bind-operations.ts": {
           "bytes": 13738
