@@ -99,6 +99,82 @@ test('fresh plan schema has one topology and capability-only bindings', () => {
   }).success, false, 'partial binding coverage crossed the plan boundary');
 });
 
+test('fresh plan schema exposes truthful bounded resolved-operation root reads', () => {
+  const draft = {
+    criteria: ['Run one bounded current-news lookup and create one grounded Workspace.'],
+    cardinality: {
+      count: 5,
+      fields: ['body', 'citations'],
+      locator: {
+        contract: 'workspace_social_posts_v1',
+        collectionPointer: '/posts',
+        visibleMirrorPointer: '/_mobile/records/items',
+        calendarPointer: '/calendar',
+        calendarRequiredFields: ['date', 'channel', 'theme'],
+        sourceEvidence: {
+          operationId: 'research',
+          recordsPointer: '/news',
+          minDistinctRecords: 3,
+          titlePointer: '/title',
+          urlPointer: '/url',
+          publishedDatePointer: '/date',
+          findingPointers: ['/snippet', '/description', '/content', '/markdown'],
+          publisherPointer: '/publisher',
+          maxAgeDays: 30,
+        },
+      },
+    },
+    destination: { posture: 'create_new', family: 'workspace', handleRequired: true },
+    topology: {
+      version: 1,
+      operations: [
+        {
+          id: 'research', effect: 'read', coverage: 'resolved_operation',
+          dependsOn: [], dataFrom: [], cardinality: { kind: 'once' },
+        },
+        {
+          id: 'author', effect: 'local_write', coverage: null,
+          dependsOn: ['research'], dataFrom: ['research'], cardinality: { kind: 'once' },
+        },
+      ],
+      universes: [],
+    },
+    bindings: [
+      { operationId: 'research', role: 'source', capabilityRef: 'cap:read', evidence: ['records'] },
+      { operationId: 'author', role: 'destination', capabilityRef: 'cap:write', evidence: ['receipt'] },
+    ],
+    deliverables: [{ id: 'workspace', kind: 'workspace' }],
+    evidenceRequirements: ['records', 'receipt'],
+  };
+  const parsed = FreshActionPlanDraftSchema.safeParse(draft);
+  assert.equal(parsed.success, true, parsed.success ? '' : parsed.error.message);
+  assert.equal(
+    parsed.success && parsed.data.topology.operations[0]?.coverage,
+    'resolved_operation',
+    'the producer/parser retains the exact non-exhaustive coverage declaration',
+  );
+  assert.equal(FreshActionPlanDraftSchema.safeParse({
+    ...draft,
+    cardinality: { count: 5, fields: ['body', 'citations'] },
+  }).success, false, 'a counted Workspace cannot omit its exact structured locator');
+  assert.equal(FreshActionPlanDraftSchema.safeParse({
+    ...draft,
+    cardinality: {
+      ...draft.cardinality,
+      locator: { ...draft.cardinality.locator, collectionPointer: '/_proof' },
+    },
+  }).success, false, 'a hidden array cannot replace the canonical visible posts collection');
+  assert.equal(FreshActionPlanDraftSchema.safeParse({
+    ...draft,
+    cardinality: { count: 5, fields: ['name', 'rating', 'phone'] },
+  }).success, true, 'non-social counted Workspaces retain their existing generic record contract');
+  const widened = structuredClone(draft);
+  widened.topology.operations[0]!.cardinality = { kind: 'set', universeId: 'rows' } as never;
+  widened.topology.universes = [{ id: 'rows', seal: 'accepted_input', members: ['a'] }] as never;
+  assert.equal(FreshActionPlanDraftSchema.safeParse(widened).success, false,
+    'resolved-operation cannot be advertised as a finite/set cardinality read');
+});
+
 // ─── A door that cannot open must not be offered ─────────────────────────────
 //
 // Every plan_task binding must carry a capabilityRef, and admission refuses any

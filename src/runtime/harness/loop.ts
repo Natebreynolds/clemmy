@@ -8,6 +8,10 @@ import {
   clearRunInFlightAfterTerminal,
   releaseRunInFlightAfterWorkflowTransfer,
 } from './restart-recovery.js';
+import {
+  finalizeUnresolvedClarificationReoffer,
+  unresolvedClarificationReofferForAcceptedSource,
+} from './task-continuity-runtime.js';
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
   acceptUserInputForRun,
@@ -18,6 +22,7 @@ import {
   appendEvent,
   clearKill,
   getActiveRunAttempt,
+  getEvent,
   getRunAttemptSourceUserEvent,
   getLatestCanonicalTopLevelToolEvent,
   getLatestRunAttempt,
@@ -137,7 +142,10 @@ import {
   type TurnIdentity,
   type TurnOutcome,
 } from './turn-outcome.js';
-import { parkObservedConnectionDependencyForSource } from './dependency-request.js';
+import {
+  observedConnectionDependencyPresentationForSource,
+  parkObservedConnectionDependencyForSource,
+} from './dependency-request.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import {
   getActiveGoalForSession,
@@ -180,6 +188,7 @@ import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../a
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
 import { getRuntimeEnv, withRuntimeConfigSnapshot } from '../../config.js';
+import { withAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
   autoCaptureProvenanceFromAcceptedEvent,
   captureInteractionSignals,
@@ -347,7 +356,15 @@ export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText 
 import { looksLikeDispatchHandoffReply, steerTurnReplySalvage, textAwaitsUserMaterial, recoverySummaryReplyIsDeliverable } from './turn-decision.js';
 import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
-import { peekStepResult, recordStepResultFromTranscript } from '../../tools/step-result-tool.js';
+import {
+  peekStepResult,
+  recordStepResultFromTranscript,
+} from '../../tools/step-result-tool.js';
+import {
+  MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS,
+  missingWorkflowStepResultContinuation,
+  workflowStepDecisionEndedWithoutResult,
+} from './workflow-step-result-continuation.js';
 import { pairTransportMirrorToolCalls, projectCanonicalTopLevelToolEvents } from './tool-effect.js';
 import {
   createWorkflowChatDispatchPreparedReceipt,
@@ -998,12 +1015,13 @@ function reduceStandardConversationTerminal(input: {
     }
     case 'awaiting_user_input': {
       const question = terminalQuestionText(result);
-      parkObservedConnectionDependencyForSource({
+      const parked = parkObservedConnectionDependencyForSource({
         sessionId: result.sessionId,
         sourceUserSeq,
         turn: result.lastTurn,
         text: question,
       });
+      const publicQuestion = parked?.text ?? question;
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
@@ -1011,7 +1029,7 @@ function reduceStandardConversationTerminal(input: {
         status: 'needs_input',
         resumable: true,
         needs: { kind: 'input' },
-        presentation: { kind: 'question', text: question },
+        presentation: { kind: 'question', text: publicQuestion },
       };
       legacyReason = 'awaiting_user_input';
       break;
@@ -1257,6 +1275,140 @@ function commitStandardNeedsInputTerminal(input: {
     ...(input.legacyReason ? { legacyReason: input.legacyReason } : {}),
     metadata: input.metadata,
   }).presentation;
+}
+
+/** Re-offer the exact still-open ordinary clarification when semantic
+ * admission could not consume B. This is not a catalog failure and it never
+ * calls a model/tool: Q and its public shortcuts are cloned onto B, then the
+ * continuity store supersedes the old packet with an exact-root successor so
+ * the next human answer remains adjacent and consumable. */
+export function reofferUnresolvedAcceptedSourceClarification(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+}): RunConversationResult | null {
+  const prepared = unresolvedClarificationReofferForAcceptedSource({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  if (!prepared) return null;
+  const sameOptions = (value: unknown): boolean => (
+    Array.isArray(value)
+    && value.length === prepared.options.length
+    && value.every((option, index) => option === prepared.options[index])
+  );
+  const awaiting = listEvents(input.sessionId, {
+    types: ['awaiting_user_input'],
+    desc: true,
+    limit: 20,
+  }).find((event) => (
+    event.turn === input.turn
+    && event.data.source === 'continuation_unresolved_reoffer'
+    && event.data.sourceUserSeq === input.sourceUserSeq
+    && event.data.continuityParentPacketId === prepared.parentPacketId
+    && event.data.question === prepared.question
+    && sameOptions(event.data.options)
+  )) ?? appendEvent({
+    sessionId: input.sessionId,
+    turn: input.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: {
+      question: prepared.question,
+      options: [...prepared.options],
+      purpose: 'clarification',
+      source: 'continuation_unresolved_reoffer',
+      sourceUserSeq: input.sourceUserSeq,
+      continuityParentPacketId: prepared.parentPacketId,
+    },
+  });
+  const identity = standardTurnIdentity(input);
+  const committed = commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'needs_input',
+    resumable: true,
+    needs: { kind: 'input' },
+    presentation: { kind: 'question', text: prepared.question },
+  }, {
+    legacyReason: 'awaiting_user_input',
+    metadata: {
+      steps: 0,
+      reason: 'continuation_unresolved_reoffer',
+      continuityParentPacketId: prepared.parentPacketId,
+    },
+  });
+  if (
+    committed.presentation.status !== 'needs_input'
+    || committed.presentation.kind !== 'question'
+    || committed.presentation.needs?.kind !== 'input'
+    || committed.presentation.identity.sessionId !== input.sessionId
+    || committed.presentation.identity.sourceUserSeq !== input.sourceUserSeq
+    || committed.presentation.text !== prepared.question
+  ) {
+    throw new Error('exact unresolved clarification terminal replay contradicted its accepted source');
+  }
+  const successor = finalizeUnresolvedClarificationReoffer({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    parentPacketId: prepared.parentPacketId,
+    awaitingEventId: awaiting.id,
+    terminalEventId: committed.event.id,
+  });
+  if (!successor) {
+    throw new Error('exact unresolved clarification successor could not be persisted');
+  }
+  return {
+    sessionId: input.sessionId,
+    status: 'awaiting_user_input',
+    steps: 0,
+    lastTurn: input.turn,
+    lastDecision: {
+      summary: prepared.question,
+      reply: prepared.question,
+      done: false,
+      nextAction: 'awaiting_user_input',
+      reason: 'continuation_unresolved_reoffer',
+    },
+    publicPresentation: committed.presentation,
+  };
+}
+
+/** Close the crash window after the exact reoffer ask/terminal landed but
+ * before its continuity successor did. Replays use only durable event bytes
+ * plus the still-open parent; no model, catalog, or effect is re-entered. */
+function repairUnresolvedClarificationSuccessor(
+  source: EventRow,
+  terminal: { event: EventRow; presentation: PresentationEvent },
+): boolean {
+  if (
+    terminal.presentation.status !== 'needs_input'
+    || terminal.presentation.kind !== 'question'
+    || terminal.presentation.needs?.kind !== 'input'
+    || terminal.presentation.identity.sourceUserSeq !== source.seq
+  ) return false;
+  const awaiting = listEvents(source.sessionId, {
+    types: ['awaiting_user_input'],
+    desc: true,
+    limit: 20,
+  }).filter((event) => (
+    event.turn === source.turn
+    && event.data.source === 'continuation_unresolved_reoffer'
+    && event.data.sourceUserSeq === source.seq
+    && event.data.question === terminal.presentation.text
+    && typeof event.data.continuityParentPacketId === 'string'
+    && event.data.continuityParentPacketId.length > 0
+  ));
+  if (awaiting.length !== 1) return false;
+  const marker = awaiting[0]!;
+  return Boolean(finalizeUnresolvedClarificationReoffer({
+    sessionId: source.sessionId,
+    sourceUserSeq: source.seq,
+    parentPacketId: String(marker.data.continuityParentPacketId),
+    awaitingEventId: marker.id,
+    terminalEventId: terminal.event.id,
+  }));
 }
 
 function commitStandardTransferredTerminal(input: {
@@ -1552,19 +1704,22 @@ function commitStandardPauseTerminal(input: {
   delivered?: boolean;
 }): void {
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
+  const proposedText = publicReplyText(input.reply, '') || publicReplyText(input.summary, '');
+  let publicText = proposedText;
   if (Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0) {
-    parkObservedConnectionDependencyForSource({
+    const parked = parkObservedConnectionDependencyForSource({
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq as number,
       turn: input.turn,
-      text: publicReplyText(input.reply, '') || publicReplyText(input.summary, ''),
+      text: proposedText,
     });
+    publicText = parked?.text ?? proposedText;
   }
   commitStandardNeedsInputTerminal({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     turn: input.turn,
-    text: publicReplyText(input.reply, '') || publicReplyText(input.summary, '') || 'I need your input before I can continue.',
+    text: publicText || 'I need your input before I can continue.',
     legacyReason: 'awaiting_user_input',
     metadata: {
       steps: input.steps,
@@ -2018,16 +2173,12 @@ export function inferTurnPriors(
 }
 
 /**
- * Register pending approvals in the approval-registry and emit the
- * `approval_requested` events with the approval ID inlined into the
- * event data. The two emit sites (runTurn at ~530, resumePendingApproval
- * at ~742) used to inline this; consolidated here so both surfaces stay
- * in sync. The registry write is best-effort — if it fails (e.g. table
- * missing on a pre-migration DB), the event still emits so the existing
- * "is paused?" check based on loadInterruptState keeps working.
- *
- * Returns the array of approval IDs (one per interruption) so the
- * caller can include them in the user-facing prompt body.
+ * Register pending approvals and publish their exact visible carriers.
+ * Returning from this boundary is the authority for an `awaiting_approval`
+ * result, so registry/event/prompt binding are deliberately fail-loud. The
+ * interrupted state is saved first by the caller; a failure therefore keeps
+ * exact restart authority without falsely claiming that an actionable gate is
+ * waiting for the user.
  */
 /** A human-facing recipient-grounding warning for the approval card, built from
  *  the `recipient_set_omission_advisory` the recipient gate emitted for this
@@ -2101,12 +2252,104 @@ function exactLinkedPendingActionApproval(
   }
 }
 
-function registerAndEmitApprovals(
+class ApprovalSurfaceUnavailable extends Error {
+  readonly stage: 'registration' | 'carrier' | 'binding' | 'verification';
+  readonly operatorCause: string;
+
+  constructor(
+    stage: ApprovalSurfaceUnavailable['stage'],
+    cause: unknown,
+  ) {
+    super('I could not safely surface the approval request. The exact interrupted work is retained for recovery; retry after approval storage recovers.');
+    this.name = 'ApprovalSurfaceUnavailable';
+    this.stage = stage;
+    this.operatorCause = normalizeError(cause);
+  }
+}
+
+interface RegisteredApprovalSurface {
+  approvalId: string;
+  approvalCreated: boolean;
+  event: EventRow;
+  eventCreated: boolean;
+  row: approvalRegistry.PendingApprovalRow;
+}
+
+interface ApprovalRegistrationWork {
+  interruption: InterruptionInfo;
+  approvalArgs: Record<string, unknown> | null;
+  subject: string;
+  row: approvalRegistry.PendingApprovalRow;
+  approvalCreated: boolean;
+}
+
+function approvalCarrierMatches(
+  event: EventRow,
+  row: approvalRegistry.PendingApprovalRow,
+): boolean {
+  if (
+    event.sessionId !== row.sessionId
+    || event.type !== 'approval_requested'
+    || event.data.approvalId !== row.approvalId
+  ) return false;
+  return row.presentation
+    ? event.data.approvalPresentation === 'conversation'
+      && event.data.question === row.presentation.question
+    : event.data.approvalPresentation !== 'conversation';
+}
+
+function existingApprovalCarrier(
+  row: approvalRegistry.PendingApprovalRow,
+): EventRow | null {
+  const boundEventId = row.presentation?.promptEventId;
+  if (boundEventId) {
+    const bound = getEvent(boundEventId);
+    return bound && approvalCarrierMatches(bound, row) ? bound : null;
+  }
+  const ids = openEventLog().prepare(`
+    SELECT id
+      FROM events
+     WHERE session_id = ?
+       AND type = 'approval_requested'
+       AND json_extract(data_json, '$.approvalId') = ?
+     ORDER BY seq DESC
+  `).all(row.sessionId, row.approvalId) as Array<{ id: string }>;
+  for (const candidate of ids) {
+    const event = getEvent(candidate.id);
+    if (event && approvalCarrierMatches(event, row)) return event;
+  }
+  return null;
+}
+
+function exactActionableApprovalRow(
+  row: approvalRegistry.PendingApprovalRow | undefined,
+  authority: {
+    sessionId: string;
+    tool: string;
+    args: Record<string, unknown> | null;
+    resumeKey: string | null;
+  },
+): row is approvalRegistry.PendingApprovalRow {
+  return Boolean(
+    row
+    && row.approvalId.trim()
+    && approvalRegistry.isActionable(row)
+    && exactApprovalAuthorityMatches(row, { approvalId: '', ...authority }),
+  );
+}
+
+function registerAndEmitApprovalsOnce(
   options: { sessionId: string; turn: number },
   session: HarnessSession,
   interruptions: InterruptionInfo[],
-): string[] {
-  const approvalIds: string[] = [];
+): RegisteredApprovalSurface[] {
+  if (interruptions.length === 0) {
+    throw new ApprovalSurfaceUnavailable(
+      'registration',
+      'runner reported an approval pause without an interruption',
+    );
+  }
+  const registrations: ApprovalRegistrationWork[] = [];
   const channel = session.sessionRow.channel ?? null;
   const metadata = session.sessionRow.metadata ?? {};
   const channelId = typeof metadata.channelId === 'string'
@@ -2117,16 +2360,29 @@ function registerAndEmitApprovals(
   const workflowName = typeof metadata.workflowName === 'string' ? metadata.workflowName : null;
   const stepId = typeof metadata.stepId === 'string' ? metadata.stepId : null;
   for (const interruption of interruptions) {
+    const approvalResumeKey = typeof interruption.approvalResumeKey === 'string'
+      && interruption.approvalResumeKey.trim()
+      ? interruption.approvalResumeKey.trim()
+      : null;
     const pendingActionId = pendingActionIdFromArgs(interruption.args);
     const pendingActionSnapshot = pendingActionId
       ? pendingActionApprovalViewFromArgs(interruption.args)
       : undefined;
-    const linkedExactApproval = exactLinkedPendingActionApproval(
+    const linkedPendingActionApproval = exactLinkedPendingActionApproval(
       options.sessionId,
       interruption.toolName,
       pendingActionId,
       pendingActionSnapshot,
     );
+    const linkedExactApproval = linkedPendingActionApproval
+      && exactActionableApprovalRow(linkedPendingActionApproval, {
+        sessionId: options.sessionId,
+        tool: interruption.toolName,
+        args: linkedPendingActionApproval.args,
+        resumeKey: approvalResumeKey,
+      })
+      ? linkedPendingActionApproval
+      : null;
     // request_approval is an SDK interruption: its tool body never executes.
     // Enrich the raw model args here, before dedupe or persistence, so the
     // registry owns an independent immutable copy of the exact queued action.
@@ -2152,14 +2408,7 @@ function registerAndEmitApprovals(
           { source: acceptedSource },
         )
       : null;
-    let approvalId: string | null = null;
-    let approvalPresentation: approvalRegistry.PendingApprovalRow['presentation'] = null;
-    let approvalCreated = false;
     try {
-      const approvalResumeKey = typeof interruption.approvalResumeKey === 'string'
-        && interruption.approvalResumeKey.trim()
-        ? interruption.approvalResumeKey.trim()
-        : null;
       const authority = {
         approvalId: '',
         sessionId: options.sessionId,
@@ -2202,107 +2451,302 @@ function registerAndEmitApprovals(
         ?? resumable?.row
         ?? approvalRegistry.register(registration);
       const created = !existingExact && (resumable?.created ?? true);
-      approvalCreated = created;
-      approvalId = row.approvalId;
-      approvalPresentation = row.presentation;
-      // Fan out to the notification delivery queue so every enabled
-      // destination (Discord DMs, web_push subscriptions on the mobile
-      // PWA, generic webhooks) hears about the new approval. The
-      // dedupe in addNotification keys on the stable approvalId
-      // metadata so multiple harness turns registering the same
-      // approval don't spam.
-      if (created) {
-        try {
-          if (!row.presentation) addNotification({
-            id: `approval-${row.approvalId}`,
-            kind: 'approval',
-            title: 'Approval pending',
-            body: subject || (interruption.toolName ? `${interruption.toolName} needs approval` : 'A tool call is paused waiting for your decision.'),
-            createdAt: new Date().toISOString(),
-            read: false,
-            metadata: {
-              approvalId: row.approvalId,
-              tool: interruption.toolName,
-              sessionId: options.sessionId,
-              workflowName,
-              stepId,
-              // When this approval came from a live Discord conversation,
-              // the Discord harness transport already attaches Approve/
-              // Reject buttons INLINE on the conversational reply
-              // (discord-harness.ts `approval_requested`). Flag the
-              // notification so the notification-delivery queue does NOT
-              // post a SECOND Discord approval card for the same id — that
-              // duplicate is what produced "double approvals in Discord"
-              // (desktop only renders the notification surface, so it never
-              // doubled). Other destinations (web_push/PWA, dashboard) and
-              // non-Discord channels are unaffected.
-              discordInlineHandled: channel === 'discord' && Boolean(channelId),
-            },
-          });
-        } catch (notifyErr) {
-          // Notification failures must not break the approval pause —
-          // the approval still lives in approvalRegistry and the
-          // dashboard surfaces it.
-          console.error('[harness] addNotification for approval failed', {
-            approvalId: row.approvalId,
-            error: notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
-          });
-        }
+      const durable = approvalRegistry.get(row.approvalId);
+      if (!exactActionableApprovalRow(durable, authority)) {
+        throw new Error('registered approval is not durable, actionable, and exact');
       }
-    } catch (err) {
-      // Best-effort. The hot-patch flow today exercises a DB where the
-      // table may be missing if migrations didn't run yet; we don't
-      // want to fail the whole approval pause on a registry write.
-      console.error('[harness] approval-registry.register failed (continuing without ID)', {
-        sessionId: options.sessionId,
-        error: normalizeError(err),
-      });
-    }
-    if (approvalId) approvalIds.push(approvalId);
-    const approvalEvent = (!approvalCreated && interruption.approvalResumeKey)
-      ? null
-      : (() => {
-      try {
-        return appendEvent({
-      sessionId: options.sessionId,
-      turn: options.turn,
-      role: 'Clem',
-      type: 'approval_requested',
-      data: {
-        tool: interruption.toolName,
+      registrations.push({
+        interruption,
+        approvalArgs: approvalArgs ?? null,
         subject,
-        args: approvalArgs,
-        rawArgs: interruption.rawArgs,
-        pendingAction: linkedExactApproval?.args?.pendingAction
-          ?? pendingActionSnapshot
-          ?? pendingActionApprovalViewFromArgs(approvalArgs),
-        approvalId, // null when registry write failed; consumers fall
-                    // back to old "single pending approval" routing.
-        ...(approvalPresentation ? {
-          approvalPresentation: 'conversation',
-          question: approvalPresentation.question,
-        } : {}),
-      },
-        });
-      } catch (err) {
-        console.error('[harness] failed to write approval_requested event', {
-          sessionId: options.sessionId,
-          err: normalizeError(err),
-        });
-        return null;
-      }
-      })();
-    if (approvalEvent && approvalPresentation && approvalId) {
+        row: durable,
+        approvalCreated: created,
+      });
+    } catch (err) {
+      throw err instanceof ApprovalSurfaceUnavailable
+        ? err
+        : new ApprovalSurfaceUnavailable('registration', err);
+    }
+  }
+
+  // Register every row before emitting any carrier. A sibling registration can
+  // atomically demote conversational questions to formal cards; re-reading here
+  // guarantees the public event reflects the final durable presentation.
+  const surfaces: RegisteredApprovalSurface[] = [];
+  for (const registered of registrations) {
+    const authority = {
+      sessionId: options.sessionId,
+      tool: registered.interruption.toolName,
+      args: registered.approvalArgs,
+      resumeKey: typeof registered.interruption.approvalResumeKey === 'string'
+        && registered.interruption.approvalResumeKey.trim()
+        ? registered.interruption.approvalResumeKey.trim()
+        : null,
+    };
+    let row = approvalRegistry.get(registered.row.approvalId);
+    if (!exactActionableApprovalRow(row, authority)) {
+      throw new ApprovalSurfaceUnavailable(
+        'verification',
+        'approval changed or disappeared before carrier publication',
+      );
+    }
+    let approvalEvent = existingApprovalCarrier(row);
+    let eventCreated = false;
+    if (!approvalEvent) {
       try {
-        approvalRegistry.bindConversationalApprovalPrompt({
-          approvalId,
+        approvalEvent = appendEvent({
+          sessionId: options.sessionId,
+          turn: options.turn,
+          role: 'Clem',
+          type: 'approval_requested',
+          data: {
+            tool: registered.interruption.toolName,
+            subject: registered.subject,
+            args: registered.approvalArgs,
+            rawArgs: registered.interruption.rawArgs,
+            pendingAction: pendingActionApprovalViewFromArgs(row.args),
+            approvalId: row.approvalId,
+            ...(row.presentation ? {
+              approvalPresentation: 'conversation',
+              question: row.presentation.question,
+            } : {}),
+          },
+        });
+        eventCreated = true;
+      } catch (err) {
+        throw new ApprovalSurfaceUnavailable('carrier', err);
+      }
+    }
+    if (!approvalCarrierMatches(approvalEvent, row)) {
+      throw new ApprovalSurfaceUnavailable('verification', 'approval carrier is not exact');
+    }
+    if (row.presentation) {
+      try {
+        const bound = approvalRegistry.bindConversationalApprovalPrompt({
+          approvalId: row.approvalId,
           promptEventId: approvalEvent.id,
           promptEventSeq: approvalEvent.seq,
         });
-      } catch { /* an unbound question remains unanswerable and formal-recoverable */ }
+        if (
+          !bound?.presentation
+          || !approvalRegistry.isActionable(bound)
+          || bound.presentation.promptEventId !== approvalEvent.id
+          || bound.presentation.promptEventSeq !== approvalEvent.seq
+        ) throw new Error('conversational approval prompt did not bind exactly');
+        row = bound;
+      } catch (err) {
+        throw new ApprovalSurfaceUnavailable('binding', err);
+      }
+    } else {
+      const verified = approvalRegistry.get(row.approvalId);
+      if (!exactActionableApprovalRow(verified, authority) || verified.presentation) {
+        throw new ApprovalSurfaceUnavailable('verification', 'formal approval changed before publication completed');
+      }
+      row = verified;
+    }
+
+    // Fan out to notification destinations after the durable carrier exists.
+    // Notification delivery remains best-effort because the canonical event +
+    // registry row already form the resolvable user surface.
+    if (registered.approvalCreated && !row.presentation) {
+      try {
+        addNotification({
+          id: `approval-${row.approvalId}`,
+          kind: 'approval',
+          title: 'Approval pending',
+          body: registered.subject || (registered.interruption.toolName
+            ? `${registered.interruption.toolName} needs approval`
+            : 'A tool call is paused waiting for your decision.'),
+          createdAt: new Date().toISOString(),
+          read: false,
+          metadata: {
+            approvalId: row.approvalId,
+            tool: registered.interruption.toolName,
+            sessionId: options.sessionId,
+            workflowName,
+            stepId,
+            discordInlineHandled: channel === 'discord' && Boolean(channelId),
+          },
+        });
+      } catch (notifyErr) {
+        console.error('[harness] addNotification for approval failed', {
+          approvalId: row.approvalId,
+          error: notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+        });
+      }
+    }
+    surfaces.push({
+      approvalId: row.approvalId,
+      approvalCreated: registered.approvalCreated,
+      event: approvalEvent,
+      eventCreated,
+      row,
+    });
+  }
+  return surfaces;
+}
+
+function registerAndEmitApprovals(
+  options: { sessionId: string; turn: number },
+  session: HarnessSession,
+  interruptions: InterruptionInfo[],
+): RegisteredApprovalSurface[] {
+  try {
+    return registerAndEmitApprovalsOnce(options, session, interruptions);
+  } catch (firstError) {
+    // The operation is exact-idempotent: a retry reuses any row/carrier that
+    // committed before a transient split and fills only the missing side.
+    console.error('[harness] approval surface incomplete; retrying exact registration once', {
+      sessionId: options.sessionId,
+      stage: firstError instanceof ApprovalSurfaceUnavailable ? firstError.stage : 'registration',
+      error: firstError instanceof ApprovalSurfaceUnavailable
+        ? firstError.operatorCause
+        : normalizeError(firstError),
+    });
+    try {
+      return registerAndEmitApprovalsOnce(options, session, interruptions);
+    } catch (finalError) {
+      console.error('[harness] approval surface remains incomplete after exact retry', {
+        sessionId: options.sessionId,
+        stage: finalError instanceof ApprovalSurfaceUnavailable ? finalError.stage : 'registration',
+        error: finalError instanceof ApprovalSurfaceUnavailable
+          ? finalError.operatorCause
+          : normalizeError(finalError),
+      });
+      throw finalError;
     }
   }
-  return approvalIds;
+}
+
+function interruptionInfosFromPending(pending: readonly unknown[]): InterruptionInfo[] {
+  return pending.map((item): InterruptionInfo => {
+    const interruption = item as {
+      rawItem?: { name?: unknown; arguments?: unknown };
+      toolName?: unknown;
+      approvalResumeKey?: unknown;
+    };
+    const rawName = interruption.rawItem?.name ?? interruption.toolName;
+    const rawArgs = interruption.rawItem?.arguments;
+    const toolName = typeof rawName === 'string' ? rawName : 'unknown';
+    const rawArguments = typeof rawArgs === 'string' ? rawArgs : '';
+    let args: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(rawArguments) as unknown;
+      args = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
+    } catch { /* unparseable arguments remain exact raw bytes */ }
+    return {
+      toolName,
+      args,
+      rawArgs: rawArguments,
+      ...(typeof interruption.approvalResumeKey === 'string'
+        ? { approvalResumeKey: interruption.approvalResumeKey }
+        : {}),
+    };
+  });
+}
+
+export interface ParkedApprovalSurfaceRecoveryResult {
+  examined: number;
+  surfaced: number;
+  alreadyComplete: number;
+  unsupported: number;
+  failed: number;
+}
+
+/**
+ * Bounded boot/tick owner for the crash cut after exact HostInterruptState was
+ * persisted but before its approval identity/carrier became visible. Legacy
+ * SDK state requires its original Agent to deserialize and remains untouched;
+ * fresh production host turns are fully reconstructable from host-owned bytes.
+ */
+export function recoverParkedApprovalSurfaces(
+  options: { limit?: number } = {},
+): ParkedApprovalSurfaceRecoveryResult {
+  const result: ParkedApprovalSurfaceRecoveryResult = {
+    examined: 0,
+    surfaced: 0,
+    alreadyComplete: 0,
+    unsupported: 0,
+    failed: 0,
+  };
+  const limit = Number.isSafeInteger(options.limit)
+    ? Math.max(1, Math.min(options.limit!, 500))
+    : 100;
+  const parked = openEventLog().prepare(`
+    SELECT id
+      FROM sessions
+     WHERE json_type(metadata_json, '$.__interrupt_state') = 'text'
+     ORDER BY updated_at ASC, id ASC
+     LIMIT ?
+  `).all(limit) as Array<{ id: string }>;
+
+  for (const candidate of parked) {
+    result.examined += 1;
+    const session = HarnessSession.load(candidate.id);
+    const blob = session?.loadInterruptState();
+    if (!session || !blob) continue;
+    if (!HostInterruptState.isHostState(blob)) {
+      result.unsupported += 1;
+      continue;
+    }
+    try {
+      const state = HostInterruptState.fromString(blob);
+      const interruptions = interruptionInfosFromPending(state.getInterruptions());
+      if (interruptions.length === 0) {
+        result.alreadyComplete += 1;
+        continue;
+      }
+      const historical = approvalRegistry.listPending({
+        sessionId: candidate.id,
+        status: 'any',
+      });
+      const recoverable = interruptions.filter((interruption) => {
+        const resumeKey = typeof interruption.approvalResumeKey === 'string'
+          && interruption.approvalResumeKey.trim()
+          ? interruption.approvalResumeKey.trim()
+          : null;
+        const pendingActionId = pendingActionIdFromArgs(interruption.args);
+        return !historical.some((row) => (
+          row.status !== 'pending'
+          && (resumeKey
+            ? row.resumeKey === resumeKey
+            : ((pendingActionId
+                && row.tool === interruption.toolName
+                && pendingActionIdFromArgs(row.args) === pendingActionId)
+              || exactApprovalAuthorityMatches(row, {
+                approvalId: '',
+                sessionId: candidate.id,
+                tool: interruption.toolName,
+                args: interruption.args,
+                resumeKey: null,
+              })))
+        ));
+      });
+      if (recoverable.length === 0) {
+        result.alreadyComplete += 1;
+        continue;
+      }
+      const surfaces = registerAndEmitApprovals(
+        { sessionId: candidate.id, turn: 0 },
+        session,
+        recoverable,
+      );
+      const changed = surfaces.some((surface) => surface.approvalCreated || surface.eventCreated);
+      if (changed) result.surfaced += 1;
+      else result.alreadyComplete += 1;
+    } catch (err) {
+      result.failed += 1;
+      console.error('[harness] parked approval surface recovery remains pending', {
+        sessionId: candidate.id,
+        error: err instanceof ApprovalSurfaceUnavailable
+          ? err.operatorCause
+          : normalizeError(err),
+      });
+    }
+  }
+  return result;
 }
 
 /**
@@ -2792,6 +3236,10 @@ export interface RunConversationOptions {
   /** See RunTurnOptions.semanticTaskInput. Threaded across internal
    * continuations while the literal accepted user message remains `input`. */
   semanticTaskInput?: string;
+  /** Bridge-verified, one-turn model guidance for a checked conversational
+   * continuation. It is transient system context: the byte-exact accepted
+   * user item remains `input`, and this grants no tool/effect authority. */
+  continuationSteer?: string;
   /** See RunTurnOptions.memoryPrimerQuery. Threaded across internal
    * continuations exclusively to the automatic memory warm/primer. */
   memoryPrimerQuery?: string;
@@ -2819,6 +3267,16 @@ export interface RunConversationOptions {
   suppressMemoryCapture?: true;
   /** Exact external MCP authority, forwarded to every continuation turn. */
   mcpToolScope?: McpToolScope | null;
+  /**
+   * Workflow-owned exact catalog narrowing. These are current durable
+   * manifest ids revalidated before the accepted source/model edge. The scope
+   * only subtracts planning/frozen catalog rows; it grants no call or effect
+   * authority.
+   */
+  acceptedCatalogScope?: {
+    manifestIds: readonly string[];
+    operationIds: readonly string[];
+  };
   /**
    * Opt-in for closed decision lanes whose requested deliverable is a strict
    * JSON object, not a tool effect. A matching result bypasses only the generic
@@ -2980,9 +3438,16 @@ function hostActivationConversationResult(
         } catch { return false; }
       })();
       if (!askedThisTurn) {
-        const question = decision.reply?.trim()
+        const proposedQuestion = decision.reply?.trim()
           ? decision.reply
           : decision.summary ?? 'Could you clarify how you\'d like me to proceed?';
+        const connectionProjection = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+          ? observedConnectionDependencyPresentationForSource({
+              sessionId: turnResult.sessionId,
+              sourceUserSeq: sourceUserSeq as number,
+            })
+          : null;
+        const question = connectionProjection?.question ?? proposedQuestion;
         safeAppend({
           sessionId: turnResult.sessionId,
           turn: turnResult.turn,
@@ -2990,7 +3455,12 @@ function hostActivationConversationResult(
           type: 'awaiting_user_input',
           data: {
             question,
-            source: 'decision_awaiting',
+            ...(connectionProjection
+              ? {
+                  options: [...connectionProjection.options],
+                  source: 'host_connection_dependency_projection',
+                }
+              : { source: 'decision_awaiting' }),
             ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
               ? { sourceUserSeq }
               : {}),
@@ -3049,6 +3519,12 @@ function hostActivationConversationResult(
 function replayedRunConversationResult(source: EventRow): RunConversationResult | null {
   const terminal = exactTerminalForAcceptedSource(source);
   if (!terminal) return null;
+  if (terminal.presentation.status === 'needs_input') {
+    // Ordinary terminals are already complete. A continuation-reoffer marker
+    // additionally owns a private successor packet; repair that exact derived
+    // row before returning the public winner if a crash split the two writes.
+    void repairUnresolvedClarificationSuccessor(source, terminal);
+  }
   const presentation = terminal.presentation;
   const status = runConversationStatusForPresentation(presentation);
   return {
@@ -4666,7 +5142,10 @@ function scheduleHostCheckpointRecovery(
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
-  return withRuntimeConfigSnapshot(() => runConversationWithinRuntimeConfig(options));
+  return withRuntimeConfigSnapshot(() => withAcceptedSourceCatalogManifestScope(
+    options.acceptedCatalogScope,
+    () => runConversationWithinRuntimeConfig(options),
+  ));
 }
 
 async function runConversationWithinRuntimeConfig(
@@ -4709,6 +5188,25 @@ async function runConversationWithinRuntimeConfig(
       sourceUserSeq,
       engine: frozenTurnEngine,
     });
+    // A first plan graph and its immutable seal owner commit atomically. If the
+    // process then died while freezing the exact contract/preamble/bindings,
+    // resume only that host-owned preparation before presentation or business
+    // admission. The dynamic edge avoids making the loop/plan-tool module
+    // dependency circular during ordinary fresh turns.
+    const { recoverPlanTaskBindingSealPreparation } = await import('../../tools/plan-tools.js');
+    const recoveredPreparation = await recoverPlanTaskBindingSealPreparation({
+      sessionId: options.sessionId,
+      sourceUserSeq,
+    });
+    if (recoveredPreparation.status === 'held') {
+      return {
+        sessionId: options.sessionId,
+        status: 'blocked',
+        steps: 0,
+        lastTurn: acceptedSource.turn,
+        error: 'I retained the accepted plan, but its host preparation is still pending. No requested action has started. Please retry.',
+      };
+    }
     const recoveredPlan = await recoverSettledPlanTaskActivation({
       sessionId: options.sessionId,
       sourceUserSeq,
@@ -4735,6 +5233,14 @@ async function runConversationWithinRuntimeConfig(
       })
     : null;
   if (hostPlanningCatalog && !hostPlanningCatalog.ok) {
+    if (hostPlanningCatalog.reason === 'durable accepted-source continuation is unresolved') {
+      const reoffered = reofferUnresolvedAcceptedSourceClarification({
+        sessionId: options.sessionId,
+        sourceUserSeq,
+        turn: acceptedSource.turn,
+      });
+      if (reoffered) return reoffered;
+    }
     return {
       sessionId: options.sessionId,
       status: 'blocked',
@@ -4954,6 +5460,7 @@ async function runConversationWithinRuntimeConfig(
         onConversationPreamble: options.onConversationPreamble,
         mcpToolScope: options.mcpToolScope,
         ...(options.semanticTaskInput ? { semanticTaskInput: options.semanticTaskInput } : {}),
+        ...(options.continuationSteer ? { continuationSteer: options.continuationSteer } : {}),
         ...(options.memoryPrimerQuery ? { memoryPrimerQuery: options.memoryPrimerQuery } : {}),
         ...(options.suppressAutomaticMemoryForRequest === true
           || explicitlyOptsOutOfAutomaticMemoryRecall(options.semanticTaskInput ?? options.input)
@@ -5208,6 +5715,7 @@ async function runConversationCore(
   // runConversation() call starts from zero.
   let stallRetriesUsed = 0;
   let missingReplyRetriesUsed = 0;
+  let workflowStepResultContinuationsUsed = 0;
   // One-shot recovery-summary turn after stall retries exhaust (2026-07-23):
   // ask the model for the user-facing reply before ANY meta-failure fallback.
   let stallRecoverySummaryUsed = false;
@@ -5400,8 +5908,14 @@ async function runConversationCore(
         ? { suppressAutomaticMemoryForRequest: true as const }
         : {}),
       ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
-      ...(resolvingClarification && (stepIndex === 1 || falloverReattempt)
-        ? { continuationSteer: CONVERGENCE_STEER }
+      ...((stepIndex === 1 || falloverReattempt)
+        && (options.continuationSteer || resolvingClarification)
+        ? {
+            continuationSteer: [
+              options.continuationSteer,
+              resolvingClarification ? CONVERGENCE_STEER : '',
+            ].filter(Boolean).join('\n\n'),
+          }
         : {}),
       authoritativeUserInput: stepIndex === 1 ? options.input : undefined,
       // Only the first step carries the real user message; every later step is a
@@ -6066,6 +6580,34 @@ async function runConversationCore(
         steps: stepIndex,
         decision,
       });
+    }
+
+    const missingWorkflowResult = missingWorkflowStepResultContinuation({
+      sessionId: options.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
+      endedWithoutResult: workflowStepDecisionEndedWithoutResult(decision),
+      used: workflowStepResultContinuationsUsed,
+      stepIndex,
+      maxSteps,
+    });
+    if (missingWorkflowResult) {
+      workflowStepResultContinuationsUsed += 1;
+      safeAppend({
+        sessionId: options.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'workflow_step_result_required',
+          attempt: workflowStepResultContinuationsUsed,
+          maxAttempts: MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS,
+          settlementStatus: missingWorkflowResult.auditStatus,
+          settlementReason: missingWorkflowResult.auditReason,
+          sourceUserSeq: activeSourceUserSeq,
+        },
+      });
+      nextInput = missingWorkflowResult.directive;
+      continue;
     }
 
     const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
@@ -10068,6 +10610,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             ? { onConversationPreamble: options.onConversationPreamble }
             : {}),
           ...(options.runAttemptId ? { runAttemptId: options.runAttemptId } : {}),
+          ...(options.taskContinuation ? { taskContinuation: options.taskContinuation } : {}),
           // Anti-thrash authority belongs to the accepted request, not to one
           // physical model turn. Synthetic continuations, provider fallover,
           // and infra retries all retain sourceUserSeq, so they must also
@@ -10472,7 +11015,9 @@ export async function resumePendingApproval(
           type: 'guardrail_tripped',
           data: { kind: 'approval_authority_mismatch', reason: message },
         });
-        return { sessionId: options.sessionId, turn, status: 'awaiting_approval', error: message };
+        session.markStatus('failed');
+        bumpTurnNumber(options.sessionId, turn);
+        return { sessionId: options.sessionId, turn, status: 'failed', error: message };
       }
       resumeSourceUserSeq = consentSubjects[0]!.sourceUserSeq;
     }
@@ -10495,37 +11040,59 @@ export async function resumePendingApproval(
     // The paused state is committed before card registration. Re-running this
     // idempotent registration on resume closes the crash window where the
     // process died after serializing the exact subject but before surfacing
-    // its card. Subject-bound resume keys prevent duplicate cards/prompts.
-    registerAndEmitApprovals(
-      { sessionId: options.sessionId, turn },
-      session,
-      pending.map((item) => {
-        const interruption = item as {
-          rawItem?: { name?: unknown; arguments?: unknown };
-          toolName?: unknown;
-          approvalResumeKey?: unknown;
-        };
-        const rawName = interruption.rawItem?.name ?? interruption.toolName;
-        const rawArgs = interruption.rawItem?.arguments;
-        const toolName = typeof rawName === 'string' ? rawName : 'unknown';
-        const rawArguments = typeof rawArgs === 'string' ? rawArgs : '';
-        let args: Record<string, unknown> | null = null;
-        try {
-          const parsed = JSON.parse(rawArguments) as unknown;
-          args = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-            ? parsed as Record<string, unknown>
-            : null;
-        } catch { /* unparseable arguments remain exact raw bytes */ }
-        return {
-          toolName,
-          args,
-          rawArgs: rawArguments,
-          ...(typeof interruption.approvalResumeKey === 'string'
-            ? { approvalResumeKey: interruption.approvalResumeKey }
-            : {}),
-        };
-      }),
+    // its card. Legacy SDK bytes require their original Agent to deserialize
+    // and are already covered by the strict first-pause boundary; host-native
+    // bytes remain independently reconstructable on boot/tick. A user
+    // decision that arrived before recovery exposed a new carrier is not
+    // authority for that newly-created card; surface it and wait for the next
+    // exact decision instead.
+    const interruptions = interruptionInfosFromPending(pending);
+    const selectedBeforeRepair = options.approvalId
+      ? approvalRegistry.get(options.approvalId)
+      : undefined;
+    const needsRegistration = interruptions.filter((interruption) => !(
+      selectedBeforeRepair
+      && selectedBeforeRepair.status === 'resolved'
+      && approvalAuthorityMatchesToolCall(
+        selectedBeforeRepair,
+        interruption.toolName,
+        interruption.rawArgs,
+      )
+    ));
+    const resolvableCarrierIdsBefore = new Set(
+      approvalRegistry.listPending({ sessionId: options.sessionId, status: 'pending' })
+        .filter((row) => {
+          // A formal registry row is itself the addressable card projected by
+          // approvals surfaces. The conversation event is a second carrier we
+          // repair here, but an exact dashboard/card decision need not be
+          // discarded merely because that transcript copy crashed.
+          if (!row.presentation) return true;
+          const carrier = existingApprovalCarrier(row);
+          if (!carrier) return false;
+          return row.presentation.promptEventId === carrier.id
+            && row.presentation.promptEventSeq === carrier.seq;
+        })
+        .map((row) => row.approvalId),
     );
+    let repairedSurfaces: RegisteredApprovalSurface[] = [];
+    if (needsRegistration.length > 0) {
+      try {
+        repairedSurfaces = registerAndEmitApprovals(
+          { sessionId: options.sessionId, turn },
+          session,
+          needsRegistration,
+        );
+      } catch (err) {
+        return handleRunError(options.sessionId, turn, session, err, {
+          sourceUserSeq: resumeSourceUserSeq,
+          runAttemptId: options.runAttemptId,
+        });
+      }
+    }
+    if (repairedSurfaces.some((surface) => !resolvableCarrierIdsBefore.has(surface.approvalId))) {
+      bumpTurnNumber(options.sessionId, turn);
+      return { sessionId: options.sessionId, turn, status: 'awaiting_approval' };
+    }
   }
   const approvalRowsAtResume = pending.length > 0
     ? approvalRegistry.listPending({ sessionId: options.sessionId, status: 'pending' })
@@ -11415,6 +11982,7 @@ async function runConversationFromResumeCore(opts: {
   // bland nudge but gets overridden with the stall-forcing message on a hit.
   let stallRetriesUsed = 0;
   let missingReplyRetriesUsed = 0;
+  let workflowStepResultContinuationsUsed = 0;
   let resumeContinuationInput = CONTINUATION_INPUT;
   let infraRecoveryEpisodeId: string | undefined;
   let terminalJudgeConsecutiveResumes: 0 | 1 = 0;
@@ -11563,6 +12131,44 @@ async function runConversationFromResumeCore(opts: {
       steps: 1,
       decision,
     });
+  }
+
+  const firstMissingWorkflowResult = missingWorkflowStepResultContinuation({
+    sessionId: opts.sessionId,
+    sourceUserSeq: activeSourceUserSeq,
+    endedWithoutResult: workflowStepDecisionEndedWithoutResult(decision),
+    used: workflowStepResultContinuationsUsed,
+    stepIndex: 1,
+    maxSteps,
+  });
+  if (firstMissingWorkflowResult) {
+    workflowStepResultContinuationsUsed += 1;
+    safeAppend({
+      sessionId: opts.sessionId,
+      turn: lastTurn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: {
+        kind: 'workflow_step_result_required',
+        attempt: workflowStepResultContinuationsUsed,
+        maxAttempts: MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS,
+        path: 'approval_resume',
+        settlementStatus: firstMissingWorkflowResult.auditStatus,
+        settlementReason: firstMissingWorkflowResult.auditReason,
+        sourceUserSeq: activeSourceUserSeq,
+      },
+    });
+    resumeContinuationInput = firstMissingWorkflowResult.directive;
+    decision = decision
+      ? { ...decision, done: false, nextAction: 'awaiting_handoff_result' }
+      : {
+          summary: 'The workflow step still owes its structured result.',
+          reply: null,
+          done: false,
+          nextAction: 'awaiting_handoff_result',
+          reason: null,
+        };
+    lastDecision = decision;
   }
 
   // Steps 2..N: same loop semantics as runConversation, but starting
@@ -12146,6 +12752,45 @@ async function runConversationFromResumeCore(opts: {
         steps: stepIndex,
         decision,
       });
+    }
+
+    const missingWorkflowResult = missingWorkflowStepResultContinuation({
+      sessionId: opts.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
+      endedWithoutResult: workflowStepDecisionEndedWithoutResult(decision),
+      used: workflowStepResultContinuationsUsed,
+      stepIndex,
+      maxSteps,
+    });
+    if (missingWorkflowResult) {
+      workflowStepResultContinuationsUsed += 1;
+      safeAppend({
+        sessionId: opts.sessionId,
+        turn: turnResult.turn,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: {
+          kind: 'workflow_step_result_required',
+          attempt: workflowStepResultContinuationsUsed,
+          maxAttempts: MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS,
+          path: 'approval_resume',
+          settlementStatus: missingWorkflowResult.auditStatus,
+          settlementReason: missingWorkflowResult.auditReason,
+          sourceUserSeq: activeSourceUserSeq,
+        },
+      });
+      resumeContinuationInput = missingWorkflowResult.directive;
+      decision = decision
+        ? { ...decision, done: false, nextAction: 'awaiting_handoff_result' }
+        : {
+            summary: 'The workflow step still owes its structured result.',
+            reply: null,
+            done: false,
+            nextAction: 'awaiting_handoff_result',
+            reason: null,
+          };
+      lastDecision = decision;
+      continue;
     }
 
     const missingReplyDecision = isCompletedWithoutUserFacingReply(decision) ? decision : null;
@@ -12923,6 +13568,28 @@ function handleRunError(
     infraRecoveryEpisodeId?: string;
   } = {},
 ): RunTurnResult {
+  if (err instanceof ApprovalSurfaceUnavailable) {
+    // The exact serialized interruption was committed before the surface
+    // boundary ran. Keep it nonterminal and let the bounded boot/tick owner
+    // replay registration; never turn a missing card into public
+    // `awaiting_approval`, and never mark the recoverable session failed.
+    safeAppend({
+      sessionId,
+      turn,
+      role: 'system',
+      type: 'heartbeat',
+      data: {
+        kind: 'approval_surface_recovery_pending',
+        stage: err.stage,
+      },
+    });
+    return {
+      sessionId,
+      turn,
+      status: 'held',
+      hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
+    };
+  }
   // A kill that lands while a tool call is in flight throws KillRequested
   // INSIDE the SDK's tool execution, and the SDK re-wraps it as a plain
   // Error: "Failed to run function tools: KillRequested: session X has a

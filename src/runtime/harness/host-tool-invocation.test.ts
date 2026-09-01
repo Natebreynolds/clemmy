@@ -16,6 +16,7 @@ const leases = await import('./dispatch-lease.js');
 const dispatch = await import('./dispatch-ledger.js');
 const identities = await import('./attempt-identity.js');
 const attemptSettlements = await import('./attempt-settlement.js');
+const settlementAudit = await import('./accepted-source-settlement-audit.js');
 const brackets = await import('./brackets.js');
 const invocation = await import('./host-tool-invocation.js');
 const settlements = await import('./logical-call-settlement-store.js');
@@ -207,6 +208,7 @@ function runCall<T>(
     callerSignal?: AbortSignal;
     isKillRequested?: () => boolean;
     beforePhysicalAdmission?: invocation.InvokeHostToolCallInput<T>['beforePhysicalAdmission'];
+    beforePhysicalPreparation?: invocation.InvokeHostToolCallInput<T>['beforePhysicalPreparation'];
     invoke: invocation.InvokeHostToolCallInput<T>['invoke'];
   },
 ) {
@@ -269,6 +271,7 @@ function runCall<T>(
     isKillRequested: options.isKillRequested,
     killPollMs: 5,
     beforePhysicalAdmission: options.beforePhysicalAdmission,
+    beforePhysicalPreparation: options.beforePhysicalPreparation,
     invoke: options.invoke,
   }))) as Promise<invocation.HostToolInvocationResult<T>>;
 }
@@ -317,7 +320,31 @@ test('exact typed plan_task recoveries settle normally and replay without activa
         ok: false,
         code: 'plan_not_admitted',
         detail: 'The proposed capability was not disclosed for this accepted source.',
+        reasonCode: 'capability_not_disclosed',
+        admissibleCapabilities: [],
+        ceiling: 'external_write',
+        withheld: [],
         repair: 'Search the exact role, then submit a corrected plan.',
+        recoveryTool: 'tool_search',
+      }),
+    },
+    {
+      label: 'plan not admitted with bounded correction',
+      callId: 'model:plan-refusal-not-admitted-bounded',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_not_admitted',
+        detail: 'write_not_aligned:destination',
+        reasonCode: 'write_not_aligned',
+        admissibleCapabilities: [{
+          capabilityRef: 'cap:provider:sheet_write',
+          effect: 'external_write',
+          purpose: 'write_sheet_rows',
+        }],
+        ceiling: 'external_write',
+        withheld: [],
+        repair: 'Correct the proposal with the exact disclosed capability.',
+        recoveryTool: 'plan_task',
       }),
     },
     {
@@ -327,6 +354,8 @@ test('exact typed plan_task recoveries settle normally and replay without activa
         ok: false,
         code: 'plan_not_required',
         detail: 'This accepted source does not require an action graph.',
+        repair: 'Call call_tool exactly once for the disclosed read.',
+        recoveryTool: 'call_tool',
       }),
     },
     {
@@ -338,6 +367,7 @@ test('exact typed plan_task recoveries settle normally and replay without activa
         detail: 'this accepted request uniquely names an existing workflow; call workflow_run with that exact name',
         workflowName: 'platform-49-slack-channel-review',
         repair: 'Call workflow_run with name "platform-49-slack-channel-review". Do not plan_task. Do not workflow_get unless the user asked to inspect the definition.',
+        recoveryTool: 'workflow_run',
       }),
     },
     {
@@ -351,6 +381,7 @@ test('exact typed plan_task recoveries settle normally and replay without activa
         question: 'Which connected account should I use?',
         accountChoices: ['work@corp.example', 'personal@example.net'],
         repair: 'Ask the user which exact connected account to use. Do not pick a substitute write.',
+        recoveryTool: 'ask_user_question',
       }),
     },
     {
@@ -361,7 +392,26 @@ test('exact typed plan_task recoveries settle normally and replay without activa
         code: 'plan_incomplete_missing_write',
         detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
         requestedEffectScope: 'mixed',
+        admissibleCapabilities: [],
         repair: 'Use tool_search for the exact missing write capability, then call plan_task again.',
+        recoveryTool: 'tool_search',
+      }),
+    },
+    {
+      label: 'missing required write with bounded current-card repair',
+      callId: 'model:plan-incomplete-missing-write-card-repair',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_incomplete_missing_write',
+        detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
+        requestedEffectScope: 'mixed',
+        admissibleCapabilities: [{
+          capabilityRef: 'cap:local:workflow_create:reversible',
+          effect: 'local_write',
+          purpose: 'author_workflow',
+        }],
+        repair: 'Call plan_task again with the exact already-disclosed write capability.',
+        recoveryTool: 'plan_task',
       }),
     },
     {
@@ -374,6 +424,48 @@ test('exact typed plan_task recoveries settle normally and replay without activa
         writeOperationIds: ['write_sheet'],
         sourceOperationIds: ['read_accounts'],
         repair: 'Keep dependsOn for ordering and set dataFrom to the exact operation whose bytes construct the artifact.',
+        recoveryTool: 'plan_task',
+      }),
+    },
+    {
+      label: 'verifier discovery required before persistence',
+      callId: 'model:plan-refusal-verifier-search',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_not_admitted',
+        detail: 'verification_successor_required:missing_compatible_verifier:family=sheet:handle=row_id',
+        reasonCode: 'verification_successor_required',
+        admissibleCapabilities: [{
+          capabilityRef: 'cap:provider:sheet_write',
+          effect: 'external_write',
+          purpose: 'write_sheet_rows',
+        }],
+        ceiling: 'external_write',
+        withheld: [],
+        repair: 'Search once for the exact compatible verifier read.',
+        recoveryTool: 'tool_search',
+      }),
+    },
+    {
+      label: 'post-persist verification seal blocker is factual',
+      callId: 'model:plan-refusal-verifier-seal',
+      value: JSON.stringify({
+        ok: false,
+        code: 'verification_successor_required',
+        detail: 'verification_successor_required:seal_conflict',
+        repair: 'Report the exact post-persist seal blocker without changing the graph.',
+        recoveryTool: 'stop_factual',
+      }),
+    },
+    {
+      label: 'post-persist binding seal blocker is factual',
+      callId: 'model:plan-refusal-binding-seal',
+      value: JSON.stringify({
+        ok: false,
+        code: 'plan_binding_not_sealed',
+        detail: 'one or more sealed graph capabilities conflicted with durable state',
+        repair: 'Report the exact post-persist seal blocker without changing the graph.',
+        recoveryTool: 'stop_factual',
       }),
     },
   ] as const;
@@ -431,6 +523,7 @@ test('exact typed plan_task recoveries settle normally and replay without activa
 
       const replay = await execute();
       assert.equal(replay.settlement.duplicate, true);
+      assert.equal(replay.value, candidate.value, 'replay redeems the exact original refusal bytes');
       assert.equal(bodies, 1, 'the typed refusal replay never re-enters the tool body');
       const replayed = JSON.parse(String(replay.value)) as { ok?: unknown; code?: unknown };
       assert.equal(replayed.ok, false, 'the replay hands back a typed refusal');
@@ -734,6 +827,133 @@ test('beforePhysicalAdmission refusal settles a truthful zero-crossing call and 
     'model:before-physical-refused',
   ) as { revoked_at: string | null };
   assert.ok(child.revoked_at);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('async physical preparation failure is a zero-business pre-dispatch refusal, never an uncertain write', async () => {
+  const task = fixture();
+  const order: string[] = [];
+  await assert.rejects(
+    runCall(task, {
+      callId: 'model:before-physical-preparation-refused',
+      effect: 'external_write',
+      boundary: 'host_owned_external',
+      deadlineMs: 200,
+      beforePhysicalPreparation: async () => {
+        order.push('connection-refresh');
+        assert.equal(rows(task, 'model:before-physical-preparation-refused').length, 0);
+        throw new Error('sealed connected account ca-old is missing_or_changed');
+      },
+      invoke: async () => {
+        order.push('business-body');
+        return 'must not run';
+      },
+    }),
+    (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
+      && /before-physical preparation refused/i.test(error.message),
+  );
+  assert.deepEqual(order, ['connection-refresh']);
+  assert.equal(rows(task, 'model:before-physical-preparation-refused').length, 0);
+  const settlement = eventlog.openEventLog().prepare(`
+    SELECT execution_kind, physical_crossing_count, outcome_kind
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    task.sessionId,
+    task.sourceUserSeq,
+    'model:before-physical-preparation-refused',
+  ) as { execution_kind: string; physical_crossing_count: number; outcome_kind: string };
+  assert.deepEqual(settlement, {
+    execution_kind: 'refused_pre_dispatch',
+    physical_crossing_count: 0,
+    outcome_kind: 'policy_denial',
+  });
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('typed provider-argument repair refuses before crossing and a corrected call succeeds on the same source', async () => {
+  const task = fixture('Look up the exact record and keep working after a correctable argument error.');
+  const repair = [
+    '[provider-dispatch:not-started:invalid-args] OP_LOOKUP arguments did not match its exact current schema.',
+    'Required top-level fields: (none).',
+    'Allowed top-level fields: "correct_field", "include_metadata".',
+    'Remove unknown fields: "wrong_id".',
+    'If any value or nested object shape is unclear, inspect this same exact operation with tool_search; do not substitute another operation.',
+    'Then retry with one JSON object using the allowed field names. No provider request was sent.',
+  ].join(' ');
+  let bodies = 0;
+  const refused = await runCall(task, {
+    callId: 'model:provider-args-refused',
+    toolName: 'read_file',
+    args: { wrong_id: 'record-42' },
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    beforePhysicalPreparation: async () => (
+      new attemptSettlements.InvalidArgumentsPreDispatchResult(repair)
+    ),
+    invoke: async () => {
+      bodies += 1;
+      return 'must not run';
+    },
+  });
+  assert.equal(refused.value, repair, 'the model receives exact bounded repair guidance');
+  assert.equal(refused.settlement.outcome.kind, 'invalid_arguments');
+  assert.equal(refused.settlement.outcome.directive.action, 'repair_arguments');
+  assert.equal(refused.settlement.creditedProgress, false,
+    'a malformed object cannot satisfy or consume business work');
+  assert.equal(bodies, 0);
+  assert.equal(rows(task, 'model:provider-args-refused').length, 0,
+    'the rejected object cannot be compiled to an empty provider dispatch');
+
+  const refusedSettlement = eventlog.openEventLog().prepare(`
+    SELECT execution_kind, physical_crossing_count, outcome_kind
+      FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(
+    task.sessionId,
+    task.sourceUserSeq,
+    'model:provider-args-refused',
+  ) as { execution_kind: string; physical_crossing_count: number; outcome_kind: string };
+  assert.deepEqual(refusedSettlement, {
+    execution_kind: 'refused_pre_dispatch',
+    physical_crossing_count: 0,
+    outcome_kind: 'invalid_arguments',
+  });
+  const rootAfterRefusal = callAuthority.acceptedTurnCallAuthorityFor(
+    task.sessionId,
+    task.sourceUserSeq,
+  );
+  assert.equal(rootAfterRefusal.status, 'ok');
+  assert.equal(rootAfterRefusal.status === 'ok' && rootAfterRefusal.authority.state, 'open',
+    'a correctable payload mismatch must not poison the accepted-source authority');
+
+  const repaired = await runCall(task, {
+    callId: 'model:provider-args-repaired',
+    toolName: 'read_file',
+    args: { correct_field: 'record-42', include_metadata: false },
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    beforePhysicalPreparation: async () => undefined,
+    invoke: async () => {
+      bodies += 1;
+      return { successful: true, data: { id: 'record-42' } };
+    },
+  });
+  assert.equal(repaired.settlement.outcome.kind, 'succeeded');
+  assert.equal(bodies, 1);
+  assert.deepEqual(
+    rows(task, 'model:provider-args-repaired').map((row) => row.state),
+    ['returned'],
+    'the corrected exact call crosses once',
+  );
+  const audit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    requireEveryBusinessReadToSettle: true,
+  });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 0,
+    'the zero-crossing argument refusal does not poison terminal settlement truth');
   leases.revokeDispatchLease(task.parentLease);
 });
 

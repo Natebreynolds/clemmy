@@ -88,7 +88,7 @@ const {
   recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
-const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, _acceptResumeConversationInputForTest, finalizeDeferredToolCallsLimitTerminal, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText, _terminalQuestionTextForTest } = await import('./loop.js');
+const { runTurn, runConversation, resumePendingApproval, runConversationFromResume, recoverParkedApprovalSurfaces, _acceptResumeConversationInputForTest, finalizeDeferredToolCallsLimitTerminal, isCodexAuthRevoked, normalizeError, buildStallRetryMessage, goalObjectiveString, toOrchestratorDecision, recordOrphanedToolInFlight, claimOrphanedToolCompletions, drainOrphanedToolCompletions, recipientGroundingNote, _testOnly_strictStructuredNoToolResultText, _terminalQuestionTextForTest } = await import('./loop.js');
 const {
   isSafeDurableMemoryReceiptPresentation,
   looksLikeHealthyDurableMemoryAcknowledgement,
@@ -647,6 +647,49 @@ async function appendPublicWorkflowDispatchInChild(input: Record<string, unknown
   const [code] = await once(child, 'close') as [number | null];
   assert.equal(code, 0, stderr || stdout);
   return JSON.parse(stdout) as { id: string; inserted: boolean };
+}
+
+async function recoverParkedApprovalSurfacesInChild(): Promise<{
+  examined: number;
+  surfaced: number;
+  alreadyComplete: number;
+  unsupported: number;
+  failed: number;
+}> {
+  const loopModuleUrl = new URL('./loop.ts', import.meta.url).href;
+  const marker = '__CLEM_APPROVAL_RECOVERY_RESULT__';
+  const script = `
+    const loop = await import(process.env.CLEM_LOOP_MODULE_URL);
+    const result = loop.recoverParkedApprovalSurfaces();
+    process.stdout.write(${JSON.stringify('\n__CLEM_APPROVAL_RECOVERY_RESULT__')} + JSON.stringify(result));
+  `;
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: TMP_HOME,
+      CLEM_LOOP_MODULE_URL: loopModuleUrl,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+  child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+  const [code] = await once(child, 'close') as [number | null];
+  assert.equal(code, 0, stderr || stdout);
+  const markerAt = stdout.lastIndexOf(marker);
+  assert.notEqual(markerAt, -1, stdout);
+  const payload = stdout.slice(markerAt + marker.length);
+  const payloadEnd = payload.indexOf('}');
+  assert.notEqual(payloadEnd, -1, stdout);
+  return JSON.parse(payload.slice(0, payloadEnd + 1)) as {
+    examined: number;
+    surfaced: number;
+    alreadyComplete: number;
+    unsupported: number;
+    failed: number;
+  };
 }
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('./public-presentation.js');
 const { buildCallTool } = await import('../../tools/call-tool.js');
@@ -2896,6 +2939,11 @@ test('interruption saves serialized RunState and returns awaiting_approval', asy
     finalOutput: undefined,
     hasInterruptions: true,
     serializedState: '{"$schema":1,"items":[]}',
+    interruptions: [{
+      toolName: 'request_approval',
+      rawArgs: '{"subject":"deploy now"}',
+      args: { subject: 'deploy now' },
+    }],
   });
 
   const result = await runTurn({
@@ -2911,6 +2959,170 @@ test('interruption saves serialized RunState and returns awaiting_approval', asy
   assert.equal(reloaded!.loadInterruptState(), '{"$schema":1,"items":[]}');
   const paused = listEvents(sess.id, { types: ['run_paused'] });
   assert.equal(paused.length, 1);
+});
+
+test('persistent approval registration failure holds, then a fresh recovery pass surfaces one gate before any decision can execute', async (t) => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const rawArgs = JSON.stringify({ subject: 'Authorize the restart-safe exact action.' });
+  const state = new HostInterruptState(
+    [],
+    [{
+      callId: 'approval-registration-restart-call',
+      name: 'request_approval',
+      rawItem: {
+        name: 'request_approval',
+        arguments: rawArgs,
+        callId: 'approval-registration-restart-call',
+      },
+    }],
+    undefined,
+    'host_v1',
+  );
+  const trigger = 'fixture_fail_pending_approval_registration';
+  const dropTrigger = () => {
+    try { openEventLog().exec(`DROP TRIGGER IF EXISTS ${trigger}`); } catch { /* cleanup only */ }
+  };
+  t.after(dropTrigger);
+  openEventLog().exec(`
+    CREATE TRIGGER ${trigger}
+    BEFORE INSERT ON pending_approvals
+    BEGIN
+      SELECT RAISE(ABORT, 'fixture persistent approval registration failure');
+    END
+  `);
+
+  const first = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Perform the exact action after permission.',
+    makeRunner: makeRunnerStub,
+    runRunner: async () => ({
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: undefined,
+      hasInterruptions: true,
+      serializedState: state.toString(),
+      interruptions: [{
+        toolName: 'request_approval',
+        rawArgs,
+        args: JSON.parse(rawArgs) as Record<string, unknown>,
+      }],
+    }),
+  });
+
+  assert.equal(first.status, 'held', 'a missing card is recovery work, never awaiting approval');
+  assert.ok(HarnessSession.load(sess.id)?.loadInterruptState(), 'exact host interruption remains durable');
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'any' }).length, 0);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0);
+  assert.equal(getSession(sess.id)?.status, 'active', 'recoverable surface failure does not terminally fail the session');
+
+  const stillFaulted = recoverParkedApprovalSurfaces();
+  assert.equal(stillFaulted.failed, 1, 'ordinary recovery remains armed while storage is unavailable');
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0);
+
+  dropTrigger();
+  closeEventLog();
+  const recovered = await recoverParkedApprovalSurfacesInChild();
+  assert.equal(recovered.surfaced, 1, 'fresh-process recovery owns the parked host bytes');
+  const [row] = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' });
+  assert.ok(row && approvalRegistry.isActionable(row));
+  const approvalEvents = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(approvalEvents.length, 1);
+  assert.equal(approvalEvents[0]?.data.approvalId, row.approvalId);
+
+  const replay = recoverParkedApprovalSurfaces();
+  assert.equal(replay.alreadyComplete, 1);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' }).length, 1);
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 1,
+    'recovery replay cannot duplicate the exact row or carrier');
+
+  let executions = 0;
+  const completed = await resumePendingApproval({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    approvalId: row.approvalId,
+    decision: 'approve',
+    resolver: 'unit-test',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, resumed) => {
+      const host = resumed as InstanceType<typeof HostInterruptState>;
+      assert.equal(host.pending[0]?.decision, 'approved');
+      executions += 1;
+      return { history: [], lastResponseId: undefined, finalOutput: 'exact action completed' };
+    },
+  });
+  assert.equal(completed.status, 'completed');
+  assert.equal(executions, 1, 'only the later exact visible-card decision reaches execution');
+});
+
+test('approval event persistence split holds and boot recovery fills the carrier without minting a second row', async (t) => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  const rawArgs = JSON.stringify({ subject: 'Authorize the event-split action.' });
+  const state = new HostInterruptState(
+    [],
+    [{
+      callId: 'approval-event-restart-call',
+      name: 'request_approval',
+      rawItem: {
+        name: 'request_approval',
+        arguments: rawArgs,
+        callId: 'approval-event-restart-call',
+      },
+    }],
+    undefined,
+    'host_v1',
+  );
+  const trigger = 'fixture_fail_approval_requested_event';
+  const dropTrigger = () => {
+    try { openEventLog().exec(`DROP TRIGGER IF EXISTS ${trigger}`); } catch { /* cleanup only */ }
+  };
+  t.after(dropTrigger);
+  openEventLog().exec(`
+    CREATE TRIGGER ${trigger}
+    BEFORE INSERT ON events
+    WHEN NEW.type = 'approval_requested'
+    BEGIN
+      SELECT RAISE(ABORT, 'fixture persistent approval carrier failure');
+    END
+  `);
+
+  const first = await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Pause on the exact event-split permission.',
+    makeRunner: makeRunnerStub,
+    runRunner: async () => ({
+      history: [],
+      lastResponseId: undefined,
+      finalOutput: undefined,
+      hasInterruptions: true,
+      serializedState: state.toString(),
+      interruptions: [{
+        toolName: 'request_approval',
+        rawArgs,
+        args: JSON.parse(rawArgs) as Record<string, unknown>,
+      }],
+    }),
+  });
+
+  assert.equal(first.status, 'held');
+  const [registered] = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' });
+  assert.ok(registered && approvalRegistry.isActionable(registered), 'registry side committed durably');
+  assert.equal(listEvents(sess.id, { types: ['approval_requested'] }).length, 0,
+    'no false visible carrier was claimed');
+
+  dropTrigger();
+  closeEventLog();
+  const recovered = recoverParkedApprovalSurfaces();
+  assert.equal(recovered.surfaced, 1);
+  const rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'pending' });
+  const events = listEvents(sess.id, { types: ['approval_requested'] });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.approvalId, registered.approvalId, 'repair reuses the first durable identity');
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.data.approvalId, registered.approvalId);
 });
 
 test('interruption emits approval_requested per interrupted tool call with parsed args', async () => {
@@ -3948,7 +4160,7 @@ test('a restart reconstructs one exact host consent card after crashing before r
 
   let resumes = 0;
   let grantedIds: string[] = [];
-  const result = await resumePendingApproval({
+  const reconstructed = await resumePendingApproval({
     agent,
     sessionId: sess.id,
     decision: 'approve',
@@ -3964,17 +4176,45 @@ test('a restart reconstructs one exact host consent card after crashing before r
     },
   });
 
-  const rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'any' });
+  let rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'any' });
+  assert.equal(reconstructed.status, 'awaiting_approval',
+    'an approve that arrived before any visible card cannot authorize the reconstructed card');
+  assert.equal(resumes, 0, 'unseen permission never reaches the paused runner');
+  assert.equal(rows.length, 1, 'restart reconstruction mints exactly one durable card');
+  assert.equal(rows[0]?.status, 'pending');
+  assert.equal(
+    listEventsForConv(sess.id, { types: ['approval_requested'] }).length,
+    1,
+    'the recovered card is surfaced exactly once before another decision is accepted',
+  );
+
+  const result = await resumePendingApproval({
+    agent,
+    sessionId: sess.id,
+    approvalId: rows[0]!.approvalId,
+    decision: 'approve',
+    resolver: 'restart-fixture-visible-card',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, persisted, opts) => {
+      resumes += 1;
+      assert.equal((persisted as InstanceType<typeof HostInterruptState>).pending[0]?.decision, 'approved');
+      grantedIds = Array.isArray(opts.hostApprovalIds)
+        ? opts.hostApprovalIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      return { history: [], lastResponseId: undefined, finalOutput: 'restart send completed' };
+    },
+  });
+  rows = approvalRegistry.listPending({ sessionId: sess.id, status: 'any' });
   assert.equal(result.status, 'completed');
   assert.equal(resumes, 1);
-  assert.equal(rows.length, 1, 'restart reconstruction mints exactly one durable card');
+  assert.equal(rows.length, 1, 'the exact second decision cannot mint a duplicate card');
   assert.equal(rows[0]?.status, 'resolved');
   assert.equal(rows[0]?.resolution, 'approved');
   assert.deepEqual(grantedIds, [rows[0]!.approvalId]);
   assert.equal(
     listEventsForConv(sess.id, { types: ['approval_requested'] }).length,
     1,
-    'the recovered card is surfaced exactly once',
+    'the recovered card remains surfaced exactly once',
   );
 });
 

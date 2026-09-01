@@ -13,6 +13,8 @@ import {
 import {
   activateDispatchLease,
   assertDispatchLeaseCurrent,
+  DURABLE_HOST_CONTINUATION_PENDING_REVOCATION,
+  revokeDispatchLeaseForDurableHostContinuation,
   revokeDispatchLeaseBeforeRecovery,
   runWithDispatchLease,
   type DispatchLeaseRef,
@@ -21,6 +23,7 @@ import {
   durableLogicalCallRecoveryMaterial,
 } from './logical-call-contract.js';
 import {
+  InvalidArgumentsPreDispatchResult,
   settleAdmittedLogicalCallPreDispatchRefusal,
   settleToolAttempt,
   type SettledToolAttempt,
@@ -40,7 +43,7 @@ import {
   type HarnessRunContext,
 } from './brackets.js';
 import type { RuntimeToolEffect, TrustedRuntimeEffectCarrier } from './tool-effect.js';
-import { openEventLog } from './eventlog.js';
+import { getToolOutput, openEventLog, writeToolOutput } from './eventlog.js';
 import { openCanonicalArguments } from './authority-argument-seal.js';
 import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
 import {
@@ -48,6 +51,9 @@ import {
   verifyHostCallCapabilityBindingForReplay,
 } from './host-call-capability-binding.js';
 import { settleDiscoveryClaimForCallId } from './discovery-boundary.js';
+import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
+import { isHostDurableContinuationPendingError } from './host-durable-continuation.js';
+import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
 
 export type HostToolInvocationStopReason = 'deadline' | 'caller' | 'kill';
 export type HostToolInvocationBoundary =
@@ -106,6 +112,12 @@ export interface InvokeHostToolCallInput<T> {
     turn?: number;
   };
   parentLease: DispatchLeaseRef;
+  /** Narrow host-derived continuation lane. Ordinary model-authored calls are
+   * parented directly by the run lease. A frozen read continuation may instead
+   * parent its deterministic, read-only provider children beneath the exact
+   * still-open owner call. The caller must name that owner and may not use the
+   * lane for business or mutating work. */
+  nestedReadOwnerLogicalToolCallId?: string;
   effect: RuntimeToolEffect;
   /** `nested_owned` means a trusted wrapper owns any paid crossing and the
    * normal-completion logical settlement. The host still owns deadline, lease,
@@ -124,6 +136,13 @@ export interface InvokeHostToolCallInput<T> {
    * a physical reservation. Throwing is a proven zero-crossing refusal and
    * follows the same durable recovery path as reservation denial. */
   beforePhysicalAdmission?: (context: HostToolBeforePhysicalAdmissionContext) => void;
+  /** Optional host-owned async metadata preparation. It runs after synchronous
+   * policy admission and before the business physical reservation. A failure
+   * therefore settles as a truthful pre-dispatch refusal, never an uncertain
+   * business effect. */
+  beforePhysicalPreparation?: (
+    context: HostToolBeforePhysicalAdmissionContext,
+  ) => Promise<void | InvalidArgumentsPreDispatchResult>;
   invoke: (context: { signal: AbortSignal; lease: DispatchLeaseRef }) => Promise<T> | T;
 }
 
@@ -208,7 +227,8 @@ function frozenRecoveryContract(lease: DispatchLeaseRef): FrozenHostToolRecovery
     || !lease.logicalToolCallId
   ) throw new HostToolInvocationAuthorityError('recovery requires an exact call-bound lease');
   const row = openEventLog().prepare(`
-    SELECT lease.revoked_at, lease.recovery_effect, lease.recovery_business_call,
+    SELECT lease.revoked_at, lease.revocation_reason,
+           lease.recovery_effect, lease.recovery_business_call,
            lease.recovery_tool_name, lease.recovery_argument_digest,
            lease.recovery_argument_cipher, lease.recovery_turn,
            call.accepted_task_id, call.tool_name, call.argument_digest,
@@ -230,6 +250,7 @@ function frozenRecoveryContract(lease: DispatchLeaseRef): FrozenHostToolRecovery
     lease.logicalToolCallId,
   ) as {
     revoked_at: string | null;
+    revocation_reason: string | null;
     recovery_effect: string | null;
     recovery_business_call: number | null;
     recovery_tool_name: string | null;
@@ -244,6 +265,11 @@ function frozenRecoveryContract(lease: DispatchLeaseRef): FrozenHostToolRecovery
   } | undefined;
   if (!row || row.revoked_at === null) {
     throw new HostToolInvocationAuthorityError('recovery lease is missing or still current');
+  }
+  if (row.revocation_reason === DURABLE_HOST_CONTINUATION_PENDING_REVOCATION) {
+    throw new HostToolInvocationAuthorityError(
+      'revoked call is retained by its durable host continuation owner',
+    );
   }
   if (
     !row.recovery_effect
@@ -296,6 +322,21 @@ function frozenRecoveryContract(lease: DispatchLeaseRef): FrozenHostToolRecovery
 export function reconcileRevokedHostToolInvocation(input: {
   lease: DispatchLeaseRef;
 }): SettledToolAttempt {
+  const asyncOwner = openEventLog().prepare(`
+    SELECT 1 FROM ${ASYNC_READ_REFINEMENT_INTENTS_TABLE}
+     WHERE session_id = ? AND source_user_seq = ?
+       AND accepted_task_id = ? AND start_logical_tool_call_id = ?
+  `).get(
+    input.lease.sessionId,
+    input.lease.sourceUserSeq,
+    input.lease.acceptedTaskId,
+    input.lease.logicalToolCallId,
+  );
+  if (asyncOwner) {
+    throw new HostToolInvocationAuthorityError(
+      'revoked logical call is owned by an immutable async-read continuation',
+    );
+  }
   const frozen = frozenRecoveryContract(input.lease);
   const presence = frozenPhysicalCrossingPresence(input.lease);
   const isMutating = mutatingEffect(frozen.effect);
@@ -401,14 +442,22 @@ export function reconcileRevokedHostToolInvocations(
          AND call.source_user_seq = lease.source_user_seq
          AND call.logical_tool_call_id = lease.logical_tool_call_id
        WHERE lease.revoked_at IS NOT NULL
+         AND COALESCE(lease.revocation_reason, '') != ?
          AND lease.source_user_seq IS NOT NULL
          AND lease.accepted_task_id IS NOT NULL
          AND lease.logical_tool_call_id IS NOT NULL
          AND call.state = 'open'
+         AND NOT EXISTS (
+           SELECT 1 FROM ${ASYNC_READ_REFINEMENT_INTENTS_TABLE} async_owner
+            WHERE async_owner.session_id = lease.session_id
+              AND async_owner.source_user_seq = lease.source_user_seq
+              AND async_owner.accepted_task_id = lease.accepted_task_id
+              AND async_owner.start_logical_tool_call_id = lease.logical_tool_call_id
+         )
        ORDER BY lease.revoked_at, lease.session_id, lease.source_user_seq,
                 lease.logical_tool_call_id, lease.scope_id, lease.lease_id
        LIMIT ?
-    `).all(limit) as Candidate[];
+    `).all(DURABLE_HOST_CONTINUATION_PENDING_REVOCATION, limit) as Candidate[];
   } catch (error) {
     return {
       scanned: 0,
@@ -647,67 +696,7 @@ function settledPlanTaskResultDisposition(input: {
   }
   if (!exactPlanTaskResultRecord(payload) || typeof payload.ok !== 'boolean') return null;
   if (payload.ok === false) {
-    if (
-      (payload.code === 'plan_not_admitted' || payload.code === 'plan_invalid_input')
-      && exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair'])
-      && boundedPlanTaskResultText(payload.detail)
-      && boundedPlanTaskResultText(payload.repair)
-    ) return 'settled_refusal';
-    if (
-      payload.code === 'plan_not_required'
-      && (
-        exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail'])
-        || exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair'])
-        || exactPlanTaskResultKeys(payload, ['ok', 'code', 'detail', 'repair', 'workflowName'])
-      )
-      && boundedPlanTaskResultText(payload.detail)
-      && (payload.repair === undefined || boundedPlanTaskResultText(payload.repair))
-      && (payload.workflowName === undefined || boundedPlanTaskResultText(payload.workflowName, 256))
-    ) return 'settled_refusal';
-    if (
-      payload.code === 'account_selection_required'
-      && exactPlanTaskResultKeys(payload, [
-        'ok', 'code', 'detail', 'question', 'accountChoices', 'repair',
-      ])
-      && boundedPlanTaskResultText(payload.detail)
-      && boundedPlanTaskResultText(payload.question, 500)
-      && exactPlanTaskResultTextList({
-        value: payload.accountChoices,
-        maxItems: 5,
-        maxItemBytes: 256,
-      })
-      && boundedPlanTaskResultText(payload.repair)
-    ) return 'input_required';
-    if (
-      payload.code === 'plan_incomplete_missing_write'
-      && exactPlanTaskResultKeys(payload, [
-        'ok', 'code', 'detail', 'requestedEffectScope', 'repair',
-      ])
-      && boundedPlanTaskResultText(payload.detail)
-      && (payload.requestedEffectScope === 'write' || payload.requestedEffectScope === 'mixed')
-      && boundedPlanTaskResultText(payload.repair)
-    ) return 'settled_refusal';
-    if (
-      payload.code === 'plan_incomplete_data_lineage'
-      && exactPlanTaskResultKeys(payload, [
-        'ok', 'code', 'detail', 'writeOperationIds', 'sourceOperationIds', 'repair',
-      ])
-      && boundedPlanTaskResultText(payload.detail)
-      && exactPlanTaskResultTextList({
-        value: payload.writeOperationIds,
-        maxItems: PLAN_TASK_RESULT_MAX_REQUIREMENTS,
-        maxItemBytes: 128,
-        idOnly: true,
-      })
-      && exactPlanTaskResultTextList({
-        value: payload.sourceOperationIds,
-        maxItems: PLAN_TASK_RESULT_MAX_REQUIREMENTS,
-        maxItemBytes: 128,
-        idOnly: true,
-      })
-      && boundedPlanTaskResultText(payload.repair)
-    ) return 'settled_refusal';
-    return null;
+    return parseExactPlanTaskRefusal(payload)?.disposition ?? null;
   }
   const successKeys = [
     'ok', 'acceptedTaskId', 'graphId', 'graphHash', 'contractId',
@@ -815,11 +804,28 @@ export async function invokeHostToolCall<T>(
     argumentDigest: recoveryMaterial.argumentDigest,
   };
   const frozenBusinessCall = input.businessCall ?? true;
-  if (
+  const nestedReadOwner = input.nestedReadOwnerLogicalToolCallId?.trim();
+  if (nestedReadOwner) {
+    if (
+      input.effect !== 'read'
+      || frozenBusinessCall
+      || input.parentLease.sourceUserSeq !== input.identity.sourceUserSeq
+      || input.parentLease.acceptedTaskId !== acceptedTaskId
+      || input.parentLease.logicalToolCallId !== nestedReadOwner
+    ) {
+      throw new HostToolInvocationAuthorityError(
+        'nested read continuation is not owned by its exact read-only logical parent',
+      );
+    }
+  } else if (
     input.parentLease.sourceUserSeq !== undefined
     || input.parentLease.acceptedTaskId !== undefined
     || input.parentLease.logicalToolCallId !== undefined
-  ) throw new HostToolInvocationAuthorityError('host parent lease must own the run, not another logical call');
+  ) {
+    throw new HostToolInvocationAuthorityError(
+      'host parent lease must own the run unless an exact nested read owner is supplied',
+    );
+  }
 
   // Continuation/restart fast path. A terminal success is immutable execution
   // state, so adopt its exact retained bytes before logical admission (which
@@ -886,23 +892,20 @@ export async function invokeHostToolCall<T>(
       );
     }
     if (!['succeeded', 'empty_result'].includes(prior.settlement.outcome.kind)) {
-      // A settled plan_task FAILURE is a durable typed refusal, not a wedge: a
-      // control refusal has no retained success bytes to redeem, so the host
-      // regenerates the exact typed refusal grammar from the settlement's own
-      // verdict and returns it to the model. Re-execution stays impossible
-      // (the settled logical call is immutable) and the conversation survives
-      // a restart instead of failing closed on its own repair outcome.
       if (contract.toolName === 'plan_task') {
-        const detailSuffix = prior.settlement.outcome.detail
-          ? `: ${prior.settlement.outcome.detail}`
-          : '';
+        const retained = getToolOutput(input.identity.sessionId, modelCallId);
+        if (
+          !retained
+          || retained.truncatedAtWrite
+          || retained.tool !== 'plan_task'
+          || !parseExactPlanTaskRefusal(retained.output)
+        ) {
+          throw new HostToolInvocationAuthorityError(
+            'settled plan_task refusal has no exact durable refusal bytes to replay',
+          );
+        }
         return {
-          value: JSON.stringify({
-            ok: false,
-            code: 'plan_not_admitted',
-            detail: `this exact plan_task call already settled ${prior.settlement.outcome.kind}${detailSuffix}`,
-            repair: 'Correct the semantic proposal against the exact host planning catalog, then call plan_task again with a fresh call id.',
-          }) as T,
+          value: retained.output as T,
           settlement: {
             outcome: prior.settlement.outcome,
             openedDiscoveryEpoch: prior.settlement.recovery.openedDiscoveryEpoch,
@@ -1211,6 +1214,53 @@ export async function invokeHostToolCall<T>(
                 detail
                   ? `before-physical admission refused: ${detail}`
                   : 'before-physical admission refused',
+                error,
+              );
+            }
+          }
+          if (input.beforePhysicalPreparation) {
+            try {
+              assertDispatchLeaseCurrent(childLease);
+              const preparation = await input.beforePhysicalPreparation({
+                sessionId: input.identity.sessionId,
+                sourceUserSeq: input.identity.sourceUserSeq,
+                acceptedTaskId,
+                logicalToolCallId: modelCallId,
+                tool: contract.toolName,
+                args: input.identity.args,
+                lease: childLease,
+              });
+              assertDispatchLeaseCurrent(childLease);
+              if (preparation instanceof InvalidArgumentsPreDispatchResult) {
+                const settlement = settleToolAttempt({
+                  sessionId: input.identity.sessionId,
+                  sourceUserSeq: input.identity.sourceUserSeq,
+                  acceptedTaskId,
+                  callId: modelCallId,
+                  turn: input.identity.turn,
+                  lane: 'byo',
+                  toolName: input.identity.toolName,
+                  args: input.identity.args,
+                  dispatchLease: childLease,
+                  mutating: mutatingEffect(input.effect),
+                  businessCall: frozenBusinessCall,
+                  result: preparation,
+                });
+                await revokeDispatchLeaseBeforeRecovery(childLease);
+                return {
+                  value: preparation.output as T,
+                  settlement,
+                };
+              }
+            } catch (error) {
+              const detail = String(error instanceof Error ? error.message : error)
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 180);
+              await refuseBeforePhysical(
+                detail
+                  ? `before-physical preparation refused: ${detail}`
+                  : 'before-physical preparation refused',
                 error,
               );
             }
@@ -1538,6 +1588,18 @@ export async function invokeHostToolCall<T>(
                   await yieldBeforeParallelSettlement();
                   assertDispatchLeaseCurrent(childLease);
                   closeTop('returned');
+                  if (contract.toolName === 'plan_task') {
+                    const refusal = parseExactPlanTaskRefusal(value);
+                    if (refusal) {
+                      const output = typeof value === 'string' ? value : JSON.stringify(value);
+                      writeToolOutput({
+                        sessionId: input.identity.sessionId,
+                        callId: modelCallId,
+                        tool: 'plan_task',
+                        output,
+                      });
+                    }
+                  }
                   const settlement = input.boundary === 'nested_owned'
                     ? adoptedNestedSettlement()
                     : logicalSettlement({ result: value, resultPresent: true });
@@ -1570,6 +1632,22 @@ export async function invokeHostToolCall<T>(
                 try {
                   await yieldBeforeParallelSettlement();
                   assertDispatchLeaseCurrent(childLease);
+                  if (isHostDurableContinuationPendingError(error)) {
+                    if (
+                      input.boundary !== 'nested_owned'
+                      || error.ownerLogicalToolCallId !== modelCallId
+                      || topCrossing !== undefined
+                    ) {
+                      throw new HostToolInvocationAuthorityError(
+                        'durable continuation hold crossed an unsupported invocation boundary',
+                      );
+                    }
+                    await revokeDispatchLeaseForDurableHostContinuation(childLease);
+                    controller.abort(error);
+                    state = 'done';
+                    reject(error);
+                    return;
+                  }
                   closeTop('threw');
                   if (input.boundary === 'nested_owned') adoptedNestedSettlement();
                   else logicalSettlement({ thrown: error, thrownPresent: true });

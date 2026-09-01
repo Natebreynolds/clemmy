@@ -49,7 +49,10 @@ import {
   durableLogicalCallContract,
   durableLogicalCallRecoveryMaterial,
 } from './logical-call-contract.js';
-import { settleAdmittedLogicalCallPreDispatchRefusal } from './attempt-settlement.js';
+import {
+  InvalidArgumentsPreDispatchResult,
+  settleAdmittedLogicalCallPreDispatchRefusal,
+} from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import {
@@ -68,6 +71,10 @@ import {
 } from './dispatch-lease.js';
 import pino from 'pino';
 import { getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
+import {
+  isHostDurableContinuationPendingError,
+  type HostDurableContinuationPendingError,
+} from './host-durable-continuation.js';
 
 const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
 import {
@@ -81,6 +88,7 @@ import {
   classifyRuntimeToolEffect,
   isDelegationPrimitiveRuntimeCall,
   isUnscopedShellRuntimeCall,
+  resolveProviderCarrierLocalReadControl,
   runtimeToolAuthorityBinding,
   trustedRuntimeEffectCarrier,
   unwrapRuntimeEffectiveToolIdentity,
@@ -120,7 +128,12 @@ import {
 import {
   invokeHostToolCall,
 } from './host-tool-invocation.js';
-import { executeFrozenMutationVerification } from './mutation-verification-executor.js';
+import {
+  committedMutationVerificationHoldForOwner,
+  recoverCommittedMutationVerificationsForSource,
+  executeFrozenMutationVerification,
+  type CommittedMutationVerificationHold,
+} from './mutation-verification-executor.js';
 import type { HostTurnEngineMode } from './turn-engine-selection.js';
 import {
   canonicalCatalogIdentityOf,
@@ -147,6 +160,7 @@ import {
   type HostModelFrameDisposition,
 } from './host-model-frame-policy.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
+import { loadShippedImplementations } from './shipped-implementation-identity.js';
 import { inspectDurableMaterialSourceContinuation } from './task-continuity-runtime.js';
 import {
   sourceStrategyBindingsEqual,
@@ -174,8 +188,14 @@ import {
   parseHostInteractiveConsentSubjectV1,
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
+import { evaluateAuthoredWorkflowMutationConsent } from './authored-workflow-write-authority.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
 import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
+import {
+  MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS,
+  missingWorkflowStepResultContinuation,
+  workflowStepDecisionEndedWithoutResult,
+} from './workflow-step-result-continuation.js';
 import {
   recordModelRequestDispatchProvenance,
 } from './model-request-provenance.js';
@@ -215,6 +235,7 @@ import {
   parseNoProgressGovernorState,
   type NoProgressGovernorState,
 } from './no-progress-governor.js';
+import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { toOrchestratorDecision } from './turn-decision.js';
 import {
   projectHostNoProgressAttempt,
@@ -254,6 +275,33 @@ export function hostPreparationRefusalProgress(
   return recovery === 'repair_arguments'
     ? { countsCapabilityRefusal: false, retireSemanticFrame: false }
     : { countsCapabilityRefusal: true, retireSemanticFrame: true };
+}
+
+/** A returned nested carrier is model-repairable only when its immutable
+ * settlement proves that no host or provider body was entered. Returned text
+ * is deliberately absent from this predicate: it supplies the diagnostic
+ * only after the durable execution/outcome authority has classified the
+ * attempt. */
+export function isReturnedPreDispatchHostRefusalSettlement(
+  returnedAttempt: {
+    outcome: { kind: string; directive?: { action?: string } };
+  },
+  settlement: {
+  executionKind: string;
+  outcome: { kind: string; directive?: { action?: string } };
+  physicalCrossingCount: number;
+  hostCrossingCount: number;
+  },
+): boolean {
+  return returnedAttempt.outcome.kind === 'invalid_arguments'
+    && returnedAttempt.outcome.directive?.action === 'repair_arguments'
+    && settlement.outcome.kind === 'invalid_arguments'
+    && settlement.outcome.directive?.action === 'repair_arguments'
+    && settlement.executionKind === 'refused_pre_dispatch'
+    && settlement.physicalCrossingCount === 0
+    // One in-process crossing is the nested host carrier itself. It proves the
+    // nominal local validator ran; no provider/body crossing left the process.
+    && settlement.hostCrossingCount === 1;
 }
 
 export function aggregateHostPreparationRefusalProgress(
@@ -305,6 +353,39 @@ export const HOST_TOOL_DEADLINE_BLOCKED_TEXT =
 export const HOST_TOOL_UNCERTAIN_BLOCKED_TEXT =
   'The tool stopped after execution may have begun. I preserved the call as uncertain and blocked replay; its effect must be reconciled before continuing.';
 
+function boundedVerificationSurface(value: string, max = 180): string {
+  return value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+/** Host-authored user truth for the distinct post-write/readback state. It is
+ * intentionally not the generic effect-unknown copy: every listed owner has a
+ * redeemable successful write settlement and cannot be dispatched again. */
+export function committedWriteVerificationHeldText(
+  holds: readonly CommittedMutationVerificationHold[],
+): string {
+  const visible = holds.slice(0, 4);
+  return [
+    'The write is committed and will not be repeated. Its exact readback verification is pending or failed, so I stopped before any later action.',
+    ...visible.map((hold) => {
+      const resource = hold.resourceId
+        ? ` Resource: ${boundedVerificationSurface(hold.resourceId)}.`
+        : '';
+      const verifier = hold.verifierLogicalCallId
+        ? ` Verifier: ${boundedVerificationSurface(hold.verifierLogicalCallId)}.`
+        : '';
+      const recovery = hold.recoveryKind === 'user_action'
+        ? ' Reconnect or refresh the exact readback capability, then resume; the write will not repeat.'
+        : hold.recoveryKind === 'automatic'
+          ? ' Host-owned retry remains pending; no user approval is required.'
+          : ' The bounded verifier attempts are exhausted; inspect the readback failure before resuming.';
+      return `- ${boundedVerificationSurface(hold.requirementId)}: ${hold.status}; committed result ${boundedVerificationSurface(hold.resultHandleId)}.${resource}${verifier} ${boundedVerificationSurface(hold.reason)}.${recovery}`;
+    }),
+    ...(holds.length > visible.length
+      ? [`- ${holds.length - visible.length} additional committed write verification hold(s).`]
+      : []),
+  ].join('\n');
+}
+
 export const HOST_RESULT_CHECKPOINT_BLOCKED_TEXT =
   'I completed the bounded tool attempt, but its durable tool-result checkpoint could not be verified. I stopped before sending those result bytes to another model or starting another step. The recorded call state must be reconciled, then this task can resume.';
 
@@ -335,7 +416,7 @@ const HOST_NO_PROGRESS_RECOVERY_DIRECTIVE = [
   'Do not perform another discovery, dependency, provider, or business call, and do not combine planning with work.',
 ].join(' ');
 
-function hostNoProgressRecoveryDirective(state: NoProgressGovernorState): string {
+export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState): string {
   const consequence = state.lastConsequence;
   if (!consequence) return HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
   if (consequence.recovery === 'ask_user' && consequence.userInput) {
@@ -353,6 +434,74 @@ function hostNoProgressRecoveryDirective(state: NoProgressGovernorState): string
       `FACTUAL RESULT — the host validated consequence stage ${consequence.stage}.`,
       'Give one concise factual answer from the exact result already present.',
       'Do not call a tool, ask the user to continue an internal repair, or claim an unobserved effect.',
+    ].join(' ');
+  }
+  if (
+    consequence.stage === 'plan_incomplete:missing_write'
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'tool_search'
+  ) {
+    return [
+      'BOUNDED AUTO RECOVERY — the accepted plan is missing an exact write and the current planning card has no write repair.',
+      'Call tool_search exactly once for the exact missing write capability named by the accepted request.',
+      'Do not call plan_task until that search returns a citable write, and do not call a dependency, provider, or business tool.',
+    ].join(' ');
+  }
+  if (
+    consequence.stage === 'plan_not_required:graph_neutral'
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'call_tool'
+  ) {
+    return [
+      'BOUNDED AUTO RECOVERY — plan_task proved this is graph-neutral read work.',
+      'Call call_tool exactly once with the exact read operation and schema already present in the result.',
+      'Do not call plan_task, tool_search, a write, or any other tool.',
+    ].join(' ');
+  }
+  if (
+    consequence.stage === 'plan_not_required:unique_workflow'
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'workflow_run'
+  ) {
+    return [
+      'BOUNDED AUTO RECOVERY — plan_task proved the accepted request uniquely names an existing workflow.',
+      'Call workflow_run exactly once with the exact workflowName present in the plan_task result.',
+      'Do not call plan_task, workflow_get, tool_search, or any other tool.',
+    ].join(' ');
+  }
+  if (
+    (consequence.stage.startsWith('semantic_admission:')
+      || consequence.stage === 'plan_binding:verification_successor_required')
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'tool_search'
+  ) {
+    return [
+      `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
+      'Call tool_search exactly once for the exact missing capability or verifier named by the refusal.',
+      'Do not call plan_task until that search returns a citable ref, and do not call a provider or business tool.',
+    ].join(' ');
+  }
+  if (
+    (consequence.stage.startsWith('semantic_admission:')
+      || consequence.stage === 'plan_binding:verification_successor_required')
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'plan_task'
+  ) {
+    return [
+      `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
+      'Call plan_task exactly once with the exact disclosed capabilities and correction named by the refusal.',
+      'Do not rediscover, substitute capabilities, or call a provider or business tool.',
+    ].join(' ');
+  }
+  if (
+    consequence.stage === 'plan_incomplete:missing_write'
+    && consequence.recoveryToolNames.length === 1
+    && consequence.recoveryToolNames[0] === 'plan_task'
+  ) {
+    return [
+      'BOUNDED AUTO RECOVERY — the accepted plan is missing a write already present in the exact result.',
+      'Call plan_task exactly once with that matching disclosed write bound to the correct write topology operation.',
+      'Do not call tool_search, substitute an unrelated write, or claim that the user must continue this internal repair.',
     ].join(' ');
   }
   return [
@@ -389,22 +538,35 @@ export function pendingUniqueWorkflowNameFromHistory(
 ): string | null {
   let workflowName: string | null = null;
   let queued = false;
+  const planCallIds = new Set<string>();
   for (const item of history) {
     if (workflowName && uniqueRunQueueCarrierIssued(item)) queued = true;
+    const row = item as unknown as { type?: unknown; callId?: unknown; name?: unknown };
+    if (
+      row.type === 'function_call'
+      && typeof row.callId === 'string'
+      && row.name === 'plan_task'
+    ) {
+      planCallIds.add(row.callId);
+      continue;
+    }
+    if (
+      row.type !== 'function_call_result'
+      || typeof row.callId !== 'string'
+      || !planCallIds.has(row.callId)
+    ) continue;
     const text = functionResultText(item as AgentInputItem);
     if (!text) continue;
-    try {
-      const parsed = JSON.parse(text) as { code?: unknown; workflowName?: unknown };
-      if (
-        parsed.code === 'plan_not_required'
-        && typeof parsed.workflowName === 'string'
-        && parsed.workflowName.trim()
-      ) {
-        workflowName = parsed.workflowName.trim();
-        queued = false;
-      }
-    } catch {
-      // Opaque tool output is not a unique-workflow nomination.
+    const refusal = parseExactPlanTaskRefusal(text);
+    if (
+      refusal
+      && refusal.payload.code === 'plan_not_required'
+      && typeof refusal.payload.workflowName === 'string'
+      && refusal.payload.workflowName.trim()
+      && (refusal.recoveryTool === 'workflow_run' || refusal.recoveryTool === null)
+    ) {
+      workflowName = refusal.payload.workflowName.trim();
+      queued = false;
     }
   }
   return queued ? null : workflowName;
@@ -899,15 +1061,20 @@ type FunctionToolLike = {
   outputGuardrails?: unknown[];
 };
 
-type HostCallScheduleClass = 'parallel' | 'barrier';
+export type HostCallScheduleClass = 'parallel' | 'barrier';
 
 interface HostCallInvocationObservation {
   /** True only after execution has crossed the local pre-invocation phase. */
   invocationEntered: boolean;
 }
 
-type HostCallExecutionAttempt<R> =
+export type HostCallExecutionAttempt<R> =
   | { status: 'returned'; value: R; invocationEntered: boolean }
+  | {
+      status: 'durable_continuation_pending';
+      error: HostDurableContinuationPendingError;
+      invocationEntered: true;
+    }
   | { status: 'tool_calls_limit'; error: ToolCallsLimitExceeded; invocationEntered: false }
   | { status: 'failed'; error: unknown; invocationEntered: boolean };
 
@@ -938,11 +1105,12 @@ export function hostToolCallsLimitCheckpointFor(
  * their exact results can still be paired in model order. Undefined entries
  * are calls that provably never entered execution.
  */
-async function mapHostCallAttemptsWithBarriersInOrder<T, R>(
+export async function mapHostCallAttemptsWithBarriersInOrder<T, R>(
   values: readonly T[],
   concurrency: number,
   classify: (value: T) => HostCallScheduleClass,
   fn: (value: T) => Promise<HostCallExecutionAttempt<R>>,
+  stopAfterReturned?: (value: R) => boolean,
 ): Promise<Array<HostCallExecutionAttempt<R> | undefined>> {
   if (values.length === 0) return [];
   const attempts = new Array<HostCallExecutionAttempt<R> | undefined>(values.length);
@@ -960,7 +1128,10 @@ async function mapHostCallAttemptsWithBarriersInOrder<T, R>(
       attempt = { status: 'failed', error, invocationEntered: true };
     }
     attempts[entry.index] = attempt;
-    if (attempt.status !== 'returned') stopped = true;
+    if (
+      attempt.status !== 'returned'
+      || (attempt.status === 'returned' && stopAfterReturned?.(attempt.value) === true)
+    ) stopped = true;
   };
 
   const flushParallelWave = async (): Promise<void> => {
@@ -1646,7 +1817,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     const identity = exactHostIdentity();
     const freshPlan = freshPlanControlConfigured();
-    const planActivated = freshPlan && actionExpectedWorkRequired(identity);
+    // `plan_task` is intentionally retired from the rebuilt model surface once
+    // its exact winner activates expected work. That retirement is not a new
+    // call-authority posture: the immutable host root was admitted under the
+    // progressive planning catalog and must keep that same root digest across
+    // a fresh-process resume. Requiring the process-local tool to still be
+    // configured made a completed plan re-arm as an ordinary frozen catalog,
+    // poisoning an otherwise byte-identical root before terminal publication.
+    // The settled activation winner is durable, source-bound phase authority;
+    // neither current tool membership nor prompt reconstruction may replace it.
+    const settledPlanControl = settledFreshPlanControl(identity);
+    const progressivePlanningRoot = freshPlan || settledPlanControl;
+    const planActivated = progressivePlanningRoot && actionExpectedWorkRequired(identity);
     const emptyModelSurface = tools.length === 0;
     // A fresh foreground action begins under a graph-neutral host call root.
     // Catalog discovery is metadata only; freezing here would persist an empty
@@ -1688,9 +1870,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && productionCatalogSnapshot.digest === snapshot.digest;
       const exactPlanTransition = productionCatalogSnapshot.phase === 'graph_neutral'
         && snapshot.phase === 'frozen'
-        && freshPlan
+        && progressivePlanningRoot
         && planActivated
-        && settledFreshPlanControl(identity);
+        && settledPlanControl;
       if (!same && !exactPlanTransition) {
         throw new HostCallAuthorityBoundaryError('catalog_snapshot_changed');
       }
@@ -1701,7 +1883,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // identity is then re-proved by exactProductionHostCall and the graph/work
     // ledgers. Keeping this root digest stable avoids inventing a second call
     // authority when plan_task phases the model-visible surface.
-    const rootCatalogDigest = freshPlan
+    const rootCatalogDigest = progressivePlanningRoot
       ? hostSurfaceDigest({ version: 1, posture: 'foreground_plan_task_progressive_catalog' })
       : snapshot.digest;
     const sealedUniverse = envelope?.capabilities
@@ -1749,8 +1931,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         sourceUserSeq: identity.sourceUserSeq,
         catalogRevisionDigest: surface.catalogRevisionDigest,
         bindingRevisionDigest: surface.bindingRevisionDigest,
-        maxLogicalCalls: identity.maxLogicalCalls,
-        maxParallelCalls: Math.min(maxToolConcurrency, identity.maxLogicalCalls),
+        // A recovery runner may intentionally have a smaller process-local
+        // ToolCallsCounter (for example the four-call terminal/report-back
+        // slice after a twelve-call foreground action). The accepted root's
+        // maxima are immutable source authority, not a per-entry allowance.
+        // Re-adopt them exactly when the same verified host root already
+        // exists; the smaller ambient counter and current concurrency setting
+        // continue to constrain this physical entry independently. Replacing
+        // the root maxima with the recovery slice poisoned a fully settled
+        // task as `host surface changed after admission` before publication.
+        maxLogicalCalls: current.status === 'ok'
+          && current.authority.authorityKind === 'host_v1'
+          ? current.authority.maxLogicalCalls!
+          : identity.maxLogicalCalls,
+        maxParallelCalls: current.status === 'ok'
+          && current.authority.authorityKind === 'host_v1'
+          ? current.authority.maxParallelCalls!
+          : Math.min(maxToolConcurrency, identity.maxLogicalCalls),
       });
       if (armed.status === 'armed' || armed.status === 'existing') return;
       if (armed.status === 'conflict') {
@@ -1945,6 +2142,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // terminal reduction; a second stop is handled by the delivery hold floor.
   let acceptedReadPlanContinuationUsed = false;
   let acceptedUniqueWorkflowContinuationUsed = false;
+  let workflowStepResultContinuationsUsed = 0;
   let pendingHostModelDirective: string | undefined;
   const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
@@ -2092,6 +2290,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
       serializedRecoveryState: state.toString(),
     } satisfies RunOutcome;
+  };
+
+  const committedVerificationHoldOutcome = (
+    holds: readonly CommittedMutationVerificationHold[],
+    ref: AcceptedModelBatchRef | undefined,
+  ): RunOutcome => {
+    if (
+      holds.length > 0
+      && holds.every((hold) => hold.recoveryKind === 'automatic' && hold.verifierOnlyRetryable)
+      && ref
+    ) {
+      // The result frame is already checkpointed. Retain a daemon-wakeable host
+      // continuation so the next generation runs only the remaining readback;
+      // no user retry or fresh model-authored write is required.
+      return recoveryContinuationOutcome(ref, 'write_verification_retry_pending');
+    }
+    return blockedOutcome(
+      committedWriteVerificationHeldText(holds),
+      'write_committed_verification_pending',
+    );
   };
 
   const approvalRecoveryOutcome = (
@@ -2528,6 +2746,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     sourceCapability?: PhysicalSourceCapabilityIdentityV1;
     sourcePurpose?: MaterialSourceManifestPurpose;
     trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
+    validateBeforeConsent?: () => InvalidArgumentsPreDispatchResult | null;
+    prepareBeforePhysical?: () => Promise<void | InvalidArgumentsPreDispatchResult>;
     invoke: (signal: AbortSignal) => Promise<unknown>;
   }
 
@@ -2547,6 +2767,47 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     };
     lastExactProductionMiss = '';
     if (!hostProduction || !args || !tool) return miss('host_or_args_or_tool_missing');
+    // A trusted provider carrier can contain an exact local read/control name
+    // when a model confuses adjacent discovery surfaces. Preserve the original
+    // accepted logical contract, but execute it through the already-sealed
+    // local surface. Direct active controls stay direct; deferred controls use
+    // the configured acquisition carrier, whose own scope/schema checks remain
+    // authoritative. No unknown, business, or mutating inner name enters here.
+    const carriedLocalControl = resolveProviderCarrierLocalReadControl(name, args);
+    if (carriedLocalControl) {
+      const directTool = toolByName.get(carriedLocalControl.toolName);
+      const acquisitionTool = toolByName.get('call_tool');
+      const routedName = directTool ? carriedLocalControl.toolName : 'call_tool';
+      const routedTool = directTool ?? acquisitionTool;
+      if (!routedTool) return miss('provider_carried_local_control_route_missing');
+      const routedArgs = directTool
+        ? carriedLocalControl.args
+        : {
+            name: carriedLocalControl.toolName,
+            args_json: JSON.stringify(carriedLocalControl.args),
+          };
+      const routedArgumentsJson = JSON.stringify(routedArgs);
+      const routedDetails = {
+        ...(details && typeof details === 'object'
+          ? details as Record<string, unknown>
+          : {}),
+        toolCall: {
+          type: 'function_call' as const,
+          callId: logicalToolCallId,
+          name: routedName,
+          arguments: routedArgumentsJson,
+        },
+      };
+      return exactProductionHostCall(
+        routedName,
+        routedArgs,
+        routedArgumentsJson,
+        routedTool,
+        logicalToolCallId,
+        runContextForCall,
+        routedDetails,
+      );
+    }
     if (
       !harnessToolBracketsEnabled()
       || tool.name !== name
@@ -2758,6 +3019,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           : {}),
       });
       const sourcePurpose = classifyMaterialSourceManifestPurpose(manifest.purpose);
+      const validateForegroundPayload = (): InvalidArgumentsPreDispatchResult | null => {
+        const validation = catalogEntry.validateForegroundPayload?.(effectiveArgs);
+        return validation && !validation.ok
+          ? new InvalidArgumentsPreDispatchResult(
+              validation.repair,
+              validation.schemaAvailable,
+            )
+          : null;
+      };
       // Native MCP must cross the local exact carrier for both accepted
       // work_call and direct call_tool. Bypassing call_tool here would skip its
       // fresh, separately-accounted metadata proof and invoke the port body
@@ -2779,6 +3049,24 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ...(sourceCapability ? { sourceCapability } : {}),
         sourcePurpose,
         trustedEffectCarrier: trustedRuntimeEffectCarrier(name, args),
+        ...(catalogEntry.validateForegroundPayload
+          ? { validateBeforeConsent: validateForegroundPayload }
+          : {}),
+        ...(!preserveExternalCarrier
+          && (manifest.providerKind === 'composio' || catalogEntry.validateForegroundPayload)
+          ? {
+              prepareBeforePhysical: async () => {
+                const validation = validateForegroundPayload();
+                if (validation) return validation;
+                if (manifest.providerKind === 'composio') {
+                  await loadShippedImplementations().prepareComposioDispatch({
+                    operationId: manifest.operationId,
+                    accountId: manifest.accountId,
+                  });
+                }
+              },
+            }
+          : {}),
         invoke: preserveExternalCarrier
           ? async (callSignal) => {
               const invokeCarrier = () => tool.invoke!(
@@ -3090,6 +3378,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     effect: RuntimeToolEffect;
     hostRefusal?: string;
     settlementRequiresReconciliation?: true;
+    committedVerificationHolds?: readonly CommittedMutationVerificationHold[];
   }> => {
     const executionContext = harnessRunContextStorage.getStore();
     if (executionContext?.hostOwnsToolAccounting) {
@@ -3133,7 +3422,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     emit('agent_tool_start', runContext, agent, tool ?? { name: call.name }, details);
     let output: unknown;
     let hostRefusal: string | undefined;
+    let returnedPreDispatchRefusal = false;
     let settlementRequiresReconciliation = false;
+    let committedVerificationHolds: CommittedMutationVerificationHold[] = [];
     if (canaryRefusal) {
       output = canaryRefusal;
       hostRefusal = canaryRefusal;
@@ -3293,6 +3584,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             deadlineMs,
             callerSignal: signal,
             isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
+            ...(exactProduction?.prepareBeforePhysical && boundary === 'host_owned_external'
+              ? { beforePhysicalPreparation: exactProduction.prepareBeforePhysical }
+              : {}),
             ...(exactProduction
               && boundary === 'host_owned_external'
               && materialGate.status === 'delegated'
@@ -3355,6 +3649,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                   { ...details, signal: callSignal },
                 ),
           });
+          if (preserveWorkCallCarrier) {
+            const redeemed = redeemDurableLogicalCallSettlementForHost({
+              sessionId: exactSource.sessionId,
+              sourceUserSeq: exactSource.sourceUserSeq,
+              acceptedTaskId: acceptedTaskIdFor(
+                exactSource.sessionId,
+                exactSource.sourceUserSeq,
+              ),
+              logicalToolCallId: call.callId,
+            });
+            returnedPreDispatchRefusal = redeemed.status === 'ok'
+              && isReturnedPreDispatchHostRefusalSettlement(
+                invoked.settlement,
+                redeemed.settlement,
+              );
+          }
           // Nested carriers can return an SDK-laundered error value after the
           // exact inner settlement has already proved that a mutation is
           // uncertain. The immutable settlement, never returned provider
@@ -3373,16 +3683,62 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             // deterministic logical call and traverses this same kernel after
             // the mutation has durably settled; the model emits no readback
             // node or tool call and receives no second dispatch authority.
-            await executeFrozenMutationVerification({
-              sessionId: exactSource.sessionId,
-              sourceUserSeq: exactSource.sourceUserSeq,
-              ownerLogicalToolCallId: call.callId,
-              parentLease: exactSource.parentLease,
-              turn: exactAmbient.turn,
-              deadlineMs,
-              callerSignal: signal,
-              isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
-            });
+            try {
+              await executeFrozenMutationVerification({
+                sessionId: exactSource.sessionId,
+                sourceUserSeq: exactSource.sourceUserSeq,
+                ownerLogicalToolCallId: call.callId,
+                parentLease: exactSource.parentLease,
+                turn: exactAmbient.turn,
+                deadlineMs,
+                callerSignal: signal,
+                isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
+              });
+            } catch (error) {
+              // The owner mutation is already durably successful at this edge.
+              // A verifier failure is a separate read-only continuation, never
+              // evidence that the write is uncertain and never authority to
+              // re-enter the original work_call.
+              const recovered = await recoverCommittedMutationVerificationsForSource({
+                sessionId: exactSource.sessionId,
+                sourceUserSeq: exactSource.sourceUserSeq,
+                parentLease: exactSource.parentLease,
+                turn: exactAmbient.turn,
+                deadlineMs,
+                callerSignal: signal,
+                isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
+              });
+              const projected = recovered.status === 'held'
+                ? recovered.holds.find((hold) => hold.ownerLogicalToolCallId === call.callId) ?? null
+                : recovered.status === 'verified'
+                  ? null
+                  : committedMutationVerificationHoldForOwner({
+                      sessionId: exactSource.sessionId,
+                      sourceUserSeq: exactSource.sourceUserSeq,
+                      ownerLogicalToolCallId: call.callId,
+                      observedFailure: error,
+                    });
+              const boundRequirement = expectedWork.status === 'ok'
+                ? expectedWork.binding.requirementId
+                : call.callId;
+              committedVerificationHolds = recovered.status === 'verified'
+                ? []
+                : [projected ?? {
+                    ownerLogicalToolCallId: call.callId,
+                    requirementId: boundRequirement,
+                    effect: effect as 'local_write' | 'external_write' | 'admin',
+                    resultHandleId: invoked.settlement.resultHandleId ?? 'durable-result-handle-unavailable',
+                    status: 'failed',
+                    reason: String(error instanceof Error ? error.message : error)
+                      .replace(/\s+/g, ' ').slice(0, 300),
+                    recoveryKind: 'exhausted',
+                    verifierOnlyRetryable: false,
+                  }];
+              hostTurnLogger.warn({
+                ownerLogicalToolCallId: call.callId,
+                holds: committedVerificationHolds,
+              }, 'committed write retained while exact verification is held');
+            }
           }
           return invoked.value;
         };
@@ -3425,6 +3781,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
     }
     const text = resultText(output);
+    if (!hostRefusal && returnedPreDispatchRefusal) hostRefusal = text;
     emit('agent_tool_end', runContext, agent, tool ?? { name: call.name }, text, details);
     return {
       historyItem: functionResultItem(call.callId, call.name, output),
@@ -3435,6 +3792,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       ...(hostRefusal ? { hostRefusal } : {}),
       ...(settlementRequiresReconciliation
         ? { settlementRequiresReconciliation: true as const }
+        : {}),
+      ...(committedVerificationHolds.length > 0
+        ? { committedVerificationHolds }
         : {}),
     };
   };
@@ -3500,6 +3860,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         invocationEntered: observation.invocationEntered,
       };
     } catch (error) {
+      if (isHostDurableContinuationPendingError(error) && observation.invocationEntered) {
+        return {
+          status: 'durable_continuation_pending',
+          error,
+          invocationEntered: true,
+        };
+      }
       // A host/lifecycle counter trip before invoke is turn control, not a tool
       // failure. Keep it typed so the scheduler can stop assigning work, drain
       // already-started siblings, and pair their exact results before the
@@ -3625,6 +3992,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         return effect === 'read' || effect === 'compute' ? 'parallel' : 'barrier';
       },
       executeCallAttempt,
+      (executed) => (executed.committedVerificationHolds?.length ?? 0) > 0,
     )
   );
 
@@ -3634,7 +4002,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     frameDigest: string;
     zeroCrossingRefusal: boolean;
     effectUnknown: boolean;
+    committedVerificationHolds: CommittedMutationVerificationHold[];
     toolCallsLimit?: ToolCallsLimitExceeded;
+    durableContinuationPending?: { callId: string; reason: string };
   }
 
   const pairCallAttempts = (
@@ -3642,6 +4012,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     attempts: readonly (HostCallExecutionAttempt<ExecutedHostCall> | undefined)[],
   ): PairedCallAttempts => {
     const frameDigest = semanticFrameDigest(calls);
+    const durableContinuations = attempts.flatMap((attempt, index) => (
+      attempt?.status === 'durable_continuation_pending'
+        ? [{ callId: calls[index]!.callId, reason: attempt.error.reason }]
+        : []
+    ));
+    const soleDurableContinuation = calls.length === 1 && durableContinuations.length === 1
+      ? durableContinuations[0]!
+      : undefined;
     const crossings = calls.map((call, index) => {
       const attempt = attempts[index];
       return attempt?.status === 'failed'
@@ -3657,7 +4035,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       && attempt.value.settlementRequiresReconciliation === true
     ));
     const effectUnknown = crossings.some((crossing) => crossing === 'effect_may_have_started')
-      || settlementReconciliation.some(Boolean);
+      || settlementReconciliation.some(Boolean)
+      || (durableContinuations.length > 0 && soleDurableContinuation === undefined);
+    const committedVerificationHolds = attempts.flatMap((attempt) => (
+      attempt?.status === 'returned'
+        ? [...(attempt.value.committedVerificationHolds ?? [])]
+        : []
+    ));
     const hostRefusals = attempts.map((attempt) => (
       attempt?.status === 'returned' && attempt.value.hostRefusal
         ? attempt.value.hostRefusal
@@ -3668,9 +4052,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         || hostRefusals.some((refusal) => refusal !== null));
     let refusalMarkerWritten = false;
     const returned: ExecutedHostCall[] = [];
-    const resultItems = calls.map((call, index) => {
+    const resultItems = calls.map((call, index): AgentInputItem | null => {
       const attempt = attempts[index];
       const hostRefusal = hostRefusals[index];
+      if (attempt?.status === 'durable_continuation_pending' && soleDurableContinuation) {
+        return null;
+      }
       if (settlementReconciliation[index]) {
         return dispositionResult({
           call,
@@ -3726,14 +4113,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         frameIndex: index,
         frameSize: calls.length,
       });
-    });
+    }).filter((item): item is AgentInputItem => item !== null);
     return {
       resultItems,
       returned,
       frameDigest,
       zeroCrossingRefusal,
       effectUnknown,
+      committedVerificationHolds,
       ...(toolCallsLimit ? { toolCallsLimit } : {}),
+      ...(soleDurableContinuation
+        ? { durableContinuationPending: soleDurableContinuation }
+        : {}),
     };
   };
 
@@ -3754,6 +4145,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       frameDigest,
       zeroCrossingRefusal: true,
       effectUnknown: false,
+      committedVerificationHolds: [],
       returned: [],
       resultItems: calls.map((call, index) => dispositionResult({
         call,
@@ -4302,7 +4694,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     } catch {
       planReady = false;
     }
-    if (!planReady) return pairLocallyRefusedFrame(calls);
+    if (!planReady) {
+      const reason = lastExactProductionMiss || 'plan_control_approval_unavailable';
+      return pairLocallyRefusedFrame(
+        calls,
+        false,
+        new Map([[frame.plan.callId,
+          `The exact host plan control was refused before dispatch (${reason}). No provider call was attempted.`]]),
+      );
+    }
 
     const planAttempt = await executeCallAttempt(frame.plan);
     if (planAttempt.status !== 'returned') {
@@ -4981,6 +5381,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         paired.resultItems,
       );
       if (resultCommitBlock) return resultCommitBlock;
+      if (paired.committedVerificationHolds.length > 0) {
+        return committedVerificationHoldOutcome(
+          paired.committedVerificationHolds,
+          resumedAcceptedFrame.ref,
+        );
+      }
       if (paired.effectUnknown) {
         return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
       }
@@ -4995,6 +5401,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   }
 
   if (hostProduction && !resumedHostState && !resumedRecoveryState) {
+    let namedWorkflowDispatchInput: {
+      sessionId: string;
+      sourceUserSeq: number;
+      userText: string;
+    } | null = null;
     try {
       const identity = exactHostIdentity();
       const accepted = listEvents(identity.sessionId, {
@@ -5008,22 +5419,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const text = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
       const userText = display || text;
       if (userText) {
-        const uniqueDispatch = tryHostDispatchNamedWorkflow({
+        namedWorkflowDispatchInput = {
           sessionId: identity.sessionId,
           sourceUserSeq: identity.sourceUserSeq,
           userText,
-          route: 'act',
-        });
-        if (uniqueDispatch.status === 'dispatched' || uniqueDispatch.status === 'blocked') {
-          return await completedOutcome(uniqueDispatch.message);
-        }
+        };
       }
     } catch {
       // Isolated runner fixtures have no accepted-source identity.
     }
+    if (namedWorkflowDispatchInput) {
+      // Queue preparation is a durable side effect. Keep it and the terminal
+      // projection outside the identity-probe catch: once the shared workflow
+      // admission path wins, an output/settlement failure must propagate into
+      // recovery rather than fall through to a second model/dispatch attempt.
+      const uniqueDispatch = tryHostDispatchNamedWorkflow({
+        ...namedWorkflowDispatchInput,
+        route: 'act',
+      });
+      if (uniqueDispatch.status === 'dispatched' || uniqueDispatch.status === 'blocked') {
+        return await completedOutcome(uniqueDispatch.message);
+      }
+    }
   }
 
   let remainingPreContentStallRetries = modelStreamStallRetries();
+  let committedVerificationRecoveryChecked = false;
   for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
     currentHostStepIndex = stepIndex;
     const recoveryFrameThisStep = recoveredToolFrame;
@@ -5036,6 +5457,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       await refreshTools();
     } catch (error) {
       if (consumingRecoveredFrame) {
+        const recoverySurfaceFailure = error instanceof HostCallAuthorityBoundaryError
+          ? error.boundaryKind
+          : error instanceof UnsupportedHostCapabilityError
+            ? `unsupported_${error.capabilityKind}`
+            : error instanceof Error
+              ? `${error.name}:${error.message}`.replace(/\s+/gu, ' ').trim().slice(0, 240)
+              : String(error).replace(/\s+/gu, ' ').trim().slice(0, 240);
+        hostTurnLogger.error({
+          recoverySurfaceFailure,
+          err: error instanceof Error
+            ? { name: error.name, message: error.message }
+            : { message: String(error) },
+        }, 'host checkpoint recovery could not reconstruct its exact tool surface');
         // This is bookkeeping for an already-accepted model response, not a
         // fresh attempt. Keep the exact frame privately owned if its callable
         // surface cannot be reconstructed yet; never expose a public authority
@@ -5046,7 +5480,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           frameHistory: recoveryFrameThisStep.history,
           responseId: recoveryFrameThisStep.responseId,
           stepIndexOverride: resumedRecoveryState?.stepIndex ?? currentHostStepIndex,
-          reason: 'recovery_surface_unavailable',
+          reason: `recovery_surface_unavailable:${recoverySurfaceFailure}`,
         });
       } else if (resumeSurfaceFallback) {
         // The pending approval frame has already been paired as a proven
@@ -5066,6 +5500,52 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         );
       } else {
         throw error;
+      }
+    }
+    if (hostProduction && !consumingRecoveredFrame && !committedVerificationRecoveryChecked) {
+      committedVerificationRecoveryChecked = true;
+      const identity = exactHostIdentity();
+      const ambient = harnessRunContextStorage.getStore();
+      if (!ambient?.dispatchLease) {
+        return blockedOutcome(
+          'I could not safely inspect the durable write-verification checkpoint. I stopped before starting another action.',
+          'write_verification_recovery_unavailable',
+        );
+      }
+      const killTarget = ambient.runAttemptId
+        ? { attemptId: ambient.runAttemptId, sourceUserSeq: identity.sourceUserSeq }
+        : { sourceUserSeq: identity.sourceUserSeq };
+      const recoveredVerification = await recoverCommittedMutationVerificationsForSource({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        parentLease: ambient.dispatchLease,
+        turn: ambient.turn,
+        deadlineMs: hostToolDeadlineMs('work_call'),
+        callerSignal: signal,
+        isKillRequested: () => isKillRequested(identity.sessionId, killTarget),
+      });
+      if (recoveredVerification.status === 'unavailable') {
+        return blockedOutcome(
+          'I could not safely inspect the durable write-verification checkpoint. I stopped before starting another action.',
+          'write_verification_recovery_unavailable',
+        );
+      }
+      if (recoveredVerification.status === 'held') {
+        return committedVerificationHoldOutcome(
+          recoveredVerification.holds,
+          latestAcceptedModelBatchRef,
+        );
+      }
+      if (recoveredVerification.status === 'verified' && recoveredVerification.verified.length > 0) {
+        const facts = recoveredVerification.verified.map((proof) => (
+          `${boundedVerificationSurface(proof.ownerLogicalToolCallId)} -> ${boundedVerificationSurface(proof.resourceId)}`
+        ));
+        pendingHostModelDirective = [
+          pendingHostModelDirective,
+          'HOST VERIFICATION RECOVERY — the retained write result is committed and its deterministic readback now verifies it.',
+          `Verified owner/resource: ${facts.join(', ')}.`,
+          'Use the retained result already in history and continue only unfinished downstream requirements. Do not issue or retry the owner write.',
+        ].filter(Boolean).join(' ');
       }
     }
     let modelStepSchemas: readonly unknown[] = schemas;
@@ -5393,6 +5873,35 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           continue;
         }
       }
+      if (hostProduction) {
+        const identity = exactHostIdentity();
+        const missingWorkflowResult = missingWorkflowStepResultContinuation({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          endedWithoutResult: workflowStepDecisionEndedWithoutResult(
+            toOrchestratorDecision(admission.frame.text),
+          ),
+          used: workflowStepResultContinuationsUsed,
+          // The host loop is zero-based; the shared completion fence uses the
+          // one-based completed-step count used by the legacy conversation
+          // loop and approval-resume path.
+          stepIndex: stepIndex + 1,
+          maxSteps: maxTurns,
+        });
+        if (missingWorkflowResult) {
+          workflowStepResultContinuationsUsed += 1;
+          pendingHostModelDirective = missingWorkflowResult.directive;
+          hostTurnLogger.info({
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+            attempt: workflowStepResultContinuationsUsed,
+            maxAttempts: MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS,
+            settlementStatus: missingWorkflowResult.auditStatus,
+            settlementReason: missingWorkflowResult.auditReason,
+          }, 'host retained the accepted workflow step for its required structured result');
+          continue;
+        }
+      }
       history.push(...admission.frame.history);
       if (step.responseId !== undefined) lastResponseId = step.responseId;
       return await completedOutcome(admission.frame.text);
@@ -5481,18 +5990,29 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const tool = toolByName.get(call.name);
         const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
         const argumentsValue = parsedArgs(argumentsJson);
-        const effectiveName = argumentsValue
-          ? unwrapRuntimeEffectiveToolIdentity(call.name, argumentsValue).toolName
+        // The fused frame is classified before plan_task has materialized its
+        // selected catalog rows. At this scheduling-only edge, an exact
+        // same-source discovery receipt may therefore be the sole current
+        // authority that the sibling is a read. Reuse the same proof predicate
+        // as the production call boundary; plan activation and the last-edge
+        // exactProductionHostCall still re-open the full catalog/manifest/
+        // account/schema/port identity before any provider dispatch.
+        const provenRead = argumentsValue
+          ? provenTurnReadDescent(call.name, argumentsValue, tool)
           : null;
+        const effectiveName = provenRead?.effectiveName ?? (argumentsValue
+          ? unwrapRuntimeEffectiveToolIdentity(call.name, argumentsValue).toolName
+          : null);
+        const classifiedEffect = argumentsValue
+          ? classifyRuntimeToolEffect(call.name, argumentsValue).effect
+          : 'unknown' as const;
         return {
           callId: call.callId,
           name: call.name,
           argumentsJson,
           argumentsValue,
           effectiveName,
-          effect: argumentsValue
-            ? classifyRuntimeToolEffect(call.name, argumentsValue).effect
-            : 'unknown' as const,
+          effect: provenRead ? 'read' as const : classifiedEffect,
           proposalFreeWorkCarrier: Boolean(
             tool
             && isHostPlanRequiredWorkCall(tool)
@@ -5507,8 +6027,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           : false,
         allowFreshPlanReadFusion: hostProduction,
       });
-    } catch {
-      const paired = pairLocallyRefusedFrame(canonicalCalls);
+    } catch (error) {
+      const detail = String(error instanceof Error ? error.message : error)
+        .replace(/\s+/gu, ' ').trim().slice(0, 240) || 'frame_materialization_failed';
+      const paired = pairLocallyRefusedFrame(
+        canonicalCalls,
+        false,
+        new Map([[canonicalCalls[0]!.callId,
+          `The host could not materialize the exact admitted frame (${detail}). No tool body was entered.`]]),
+      );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
         frameHistory: admission.frame.history,
@@ -5520,7 +6047,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       continue;
     }
     if (frameDisposition.kind === 'refused') {
-      const paired = pairLocallyRefusedFrame(canonicalCalls);
+      const paired = pairLocallyRefusedFrame(
+        canonicalCalls,
+        false,
+        new Map([[canonicalCalls[0]!.callId,
+          `The host refused this exact call frame before dispatch (${frameDisposition.reason}). No tool body was entered.`]]),
+      );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
         frameHistory: admission.frame.history,
@@ -5569,8 +6101,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? [{ call, carried: directPolicy !== 'sole' }]
           : [];
       });
-    } catch {
-      const paired = pairLocallyRefusedFrame(canonicalCalls);
+    } catch (error) {
+      const detail = String(error instanceof Error ? error.message : error)
+        .replace(/\s+/gu, ' ').trim().slice(0, 240) || 'control_consistency_check_failed';
+      const paired = pairLocallyRefusedFrame(
+        canonicalCalls,
+        false,
+        new Map([[canonicalCalls[0]!.callId,
+          `The host could not revalidate the exact control frame (${detail}). No tool body was entered.`]]),
+      );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
         frameHistory: admission.frame.history,
@@ -5582,7 +6121,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       continue;
     }
     if (soleControls.some((entry) => entry.carried)) {
-      const paired = pairLocallyRefusedFrame(canonicalCalls);
+      const paired = pairLocallyRefusedFrame(
+        canonicalCalls,
+        false,
+        new Map([[canonicalCalls[0]!.callId,
+          'The host refused an indirect control carrier before dispatch (host_control_requires_direct_first_class_call). No tool body was entered.']]),
+      );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
         frameHistory: admission.frame.history,
@@ -5598,7 +6142,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       && soleControls.length > 0
       && (soleControls.length !== 1 || canonicalCalls.length !== 1)
     ) {
-      const paired = pairLocallyRefusedFrame(canonicalCalls);
+      const paired = pairLocallyRefusedFrame(
+        canonicalCalls,
+        false,
+        new Map([[canonicalCalls[0]!.callId,
+          'The host refused a non-fused control frame before dispatch (host_control_requires_sole_call_frame). No tool body was entered.']]),
+      );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
         frameHistory: admission.frame.history,
@@ -5619,6 +6168,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         responseId: step.responseId,
       });
       if (resultCommitBlock) return resultCommitBlock;
+      if (frame.committedVerificationHolds.length > 0) {
+        return committedVerificationHoldOutcome(
+          frame.committedVerificationHolds,
+          acceptedFrame.ref,
+        );
+      }
       if (frame.effectUnknown) {
         return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
       }
@@ -5647,7 +6202,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       'repair_arguments' | 'stop_and_explain'
     >();
     let preApprovalRefused = false;
-    for (const call of canonicalCalls) {
+    for (const [callIndex, call] of canonicalCalls.entries()) {
       try {
       const tool = toolByName.get(call.name);
       const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
@@ -5688,6 +6243,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           sourceUserSeq: identity.sourceUserSeq,
         });
         if (materialGate.status === 'refused') {
+          preApprovalRefused = true;
+          break;
+        }
+        const schemaRefusal = approvalExactProduction.validateBeforeConsent?.();
+        if (schemaRefusal) {
+          preApprovalRepairDiagnostics.set(call.callId, schemaRefusal.output);
+          preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
           preApprovalRefused = true;
           break;
         }
@@ -5741,6 +6303,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let consentSubject: HostInteractiveConsentSubjectV1 | undefined;
       if (mutation && parsedArguments && tool && approvalExactProduction) {
         consentOwned = true;
+        const authoredWorkflowConsent = acceptedFrame.ref
+          ? await evaluateAuthoredWorkflowMutationConsent({
+              attestation: approvalExactProduction.attestation,
+              args: approvalExactProduction.logicalArgs,
+              acceptedBatch: acceptedFrame.ref,
+              callIndex,
+            })
+          : null;
         const consent = await (isPlainOrClementineLocalTool(call.name, 'work_call')
           && isHostPlanRequiredWorkCall(tool)
           ? (async () => {
@@ -5777,7 +6347,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               });
               return evaluated;
             })()
-          : evaluateUncoveredHostMutationConsent({
+          : authoredWorkflowConsent ?? evaluateUncoveredHostMutationConsent({
               attestation: approvalExactProduction.attestation,
               args: approvalExactProduction.logicalArgs,
             }));
@@ -5907,6 +6477,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
 
     const frame = await executeCalls(canonicalCalls);
+    if (frame.durableContinuationPending) {
+      return recoveryOutcome({
+        phase: 'admit',
+        baseHistory: [...history],
+        frameHistory: admission.frame.history,
+        responseId: step.responseId,
+        reason: 'durable_async_read_continuation_pending',
+      });
+    }
     const resultCommitBlock = commitAdmittedToolFrame({
       acceptedFrame,
       frameHistory: admission.frame.history,
@@ -5914,6 +6493,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       responseId: step.responseId,
     });
     if (resultCommitBlock) return resultCommitBlock;
+    if (frame.committedVerificationHolds.length > 0) {
+      return committedVerificationHoldOutcome(
+        frame.committedVerificationHolds,
+        acceptedFrame.ref,
+      );
+    }
     if (frame.effectUnknown) {
       return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
     }

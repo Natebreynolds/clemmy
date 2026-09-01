@@ -164,6 +164,7 @@ test('empty initial catalog gains plan_task on the next real model surface after
 
   let modelCalls = 0;
   const modelSurfaces: string[][] = [];
+  const modelRequestBytes: number[] = [];
   const model = {
     async getResponse(request: unknown) {
       modelCalls += 1;
@@ -171,6 +172,7 @@ test('empty initial catalog gains plan_task on the next real model surface after
         .map((entry) => entry.name ?? '');
       modelSurfaces.push(tools);
       const serialized = JSON.stringify(request);
+      modelRequestBytes.push(Buffer.byteLength(serialized, 'utf8'));
       let output: unknown[];
       if (modelCalls === 1) {
         assert.ok(tools.includes('tool_search'));
@@ -265,6 +267,10 @@ test('empty initial catalog gains plan_task on the next real model surface after
   }));
   assert.equal(modelSurfaces[0]?.includes('plan_task'), false);
   assert.equal(modelSurfaces[1]?.includes('plan_task'), true);
+  assert.equal(modelSurfaces[1]?.includes('work_call'), true,
+    'the same bounded post-discovery model surface can execute the frozen plan');
+  assert.ok((modelRequestBytes[1] ?? Number.POSITIVE_INFINITY) <= 64 * 1024,
+    `post-discovery planning surface exceeded 64KiB: ${modelRequestBytes[1]}`);
   const frozen = expectedWork.loadExpectedWorkContract(session.id, source.seq);
   assert.equal(frozen.status, 'ok', 'the newly visible real plan_task freezes expected work');
   if (frozen.status === 'ok') {

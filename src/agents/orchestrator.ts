@@ -47,6 +47,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { getCheckIn } from './check-ins.js';
 import { constrainNeedsInputPresentationForRecovery } from '../runtime/harness/recovery-presentation-truth.js';
+import { observedConnectionDependencyPresentationForSource } from '../runtime/harness/dependency-request.js';
 import {
   unresolvedRecipientClarification,
   type ExactRecipientActionPath,
@@ -172,6 +173,7 @@ import {
   renderTerminalToolReply,
   terminalToolShouldHalt,
 } from '../runtime/harness/terminal-tool.js';
+import { projectHostOwnedAsyncReadRefinementTerminal } from '../runtime/harness/async-read-refinement-terminal-projection.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 
@@ -954,6 +956,64 @@ export function userChoiceToolUseBehavior(
   toolResults: OrchestratorToolResult[],
   haltContext: UserChoiceHaltContext = {},
 ) {
+  // A bounded async read may finish with one immutable host-owned scope gate.
+  // Stop on the exact work_call result itself, before another model turn can
+  // paraphrase, omit, or accidentally treat it as verified evidence. This is
+  // deliberately result-based: work_call remains an ordinary nonterminal
+  // carrier for every other output.
+  const terminalIdentity = {
+    sessionId: extractSessionId(context),
+    sourceUserSeq: extractSourceUserSeq(context),
+  };
+  const asyncScopeGates = toolResults.flatMap((result) => {
+    if (result.type !== 'function_output') return [];
+    const logicalToolCallId = resultBatchCallId(result);
+    if (!terminalIdentity.sessionId || !terminalIdentity.sourceUserSeq || !logicalToolCallId) return [];
+    const parsed = projectHostOwnedAsyncReadRefinementTerminal({
+      sessionId: terminalIdentity.sessionId,
+      sourceUserSeq: terminalIdentity.sourceUserSeq,
+      logicalToolCallId,
+      rawToolName: result.tool.name ?? '',
+      output: result.output,
+    });
+    return parsed ? [parsed] : [];
+  });
+  const distinctAsyncQuestions = new Map(asyncScopeGates.map((gate) => [gate.question, gate]));
+  if (distinctAsyncQuestions.size === 1) {
+    const gate = distinctAsyncQuestions.values().next().value!;
+    const sessionId = extractSessionId(context);
+    const sourceUserSeq = extractSourceUserSeq(context);
+    const turn = extractTurn(context);
+    if (sessionId && sourceUserSeq) {
+      const existing = listEvents(sessionId, { types: ['awaiting_user_input'] }).find((event) => (
+        event.data.source === 'async_read_refinement_terminal'
+        && event.data.sourceUserSeq === sourceUserSeq
+        && event.data.protocol === gate.protocol
+      ));
+      if (!existing) {
+        appendEvent({
+          sessionId,
+          turn,
+          role: 'Clem',
+          type: 'awaiting_user_input',
+          data: {
+            question: gate.question,
+            options: [...gate.options],
+            purpose: 'clarification',
+            source: 'async_read_refinement_terminal',
+            sourceUserSeq,
+            protocol: gate.protocol,
+            terminalKind: gate.terminalKind,
+          },
+        });
+      }
+    }
+    return {
+      isFinalOutput: true as const,
+      isInterrupted: undefined,
+      finalOutput: formatAwaitingUserInputFinalOutput(gate.question),
+    };
+  }
   // The SDK executes parallel function calls concurrently, then supplies this
   // callback with the COMPLETE result array in provider order. Treat real asks
   // as staged candidates until this batch boundary: it lets two independent
@@ -1044,12 +1104,18 @@ export function userChoiceToolUseBehavior(
         finalOutput: rendered.question,
       };
     }
+    const connectionProjection = sourceUserSeq
+      ? observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq })
+      : null;
+    const publicAsk = connectionProjection
+      ? { question: connectionProjection.question, options: [...connectionProjection.options] }
+      : rendered;
     const existing = listEvents(sessionId, { types: ['awaiting_user_input'] })
       .find((event) => event.turn === turn);
     if (existing) {
       const existingQuestion = String(
-        (existing.data as { question?: unknown }).question ?? rendered.question,
-      ).trim() || rendered.question;
+        (existing.data as { question?: unknown }).question ?? publicAsk.question,
+      ).trim() || publicAsk.question;
       return {
         isFinalOutput: true as const,
         isInterrupted: undefined,
@@ -1060,9 +1126,9 @@ export function userChoiceToolUseBehavior(
       ? constrainNeedsInputPresentationForRecovery({
           sessionId,
           sourceUserSeq,
-          proposedText: rendered.question,
+          proposedText: publicAsk.question,
         })
-      : { text: rendered.question, constrained: false };
+      : { text: publicAsk.question, constrained: false };
     appendEvent({
       sessionId,
       turn,
@@ -1076,8 +1142,11 @@ export function userChoiceToolUseBehavior(
           }
         : {
             question: recoveryProjection.text,
-            options: rendered.options,
+            options: publicAsk.options,
             purpose,
+            ...(connectionProjection
+              ? { source: 'host_connection_dependency_projection' }
+              : {}),
             ...(sourceUserSeq ? { sourceUserSeq } : {}),
             ...(candidates.length > 1
               ? {
@@ -1830,6 +1899,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const routesPlanBoundLocalCapability = (name: string): boolean => (
     isRegistryDeclaredLocalPlanningCapability(name)
     && isWorkCallConfiguredLocalPlanningCapability(name, workCallLocalSchemaNames)
+    // Read-only control context (skill instructions, profile/status reads,
+    // recovery inspection) is evidence for the foreground model, not a node
+    // in the accepted business topology. Routing these through work_call made
+    // an action turn advertise skill_list/skill_read, then refuse call_tool as
+    // not_reachable before the model could load the requested procedure.
+    // Mutating controls such as space_save remain plan-bound because this
+    // exception is read-only; business reads retain their requirement binding.
+    && !(isRegistryDeclaredRead(name) && actionTopologyRoleFor(name) === 'control')
     && (Boolean(hostFreshPlanning) || durableSelectedLocalPlanningNames.has(name))
   );
   const frozenContract = actionWork
@@ -3548,7 +3625,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // every act-routed multi-item task unable to fan out at all (live
     // 2026-08-11, long-horizon-manifest run 4).
     ? hostFreshPlanning
-      ? [buildPlanTaskTool({ planning: hostFreshPlanning }), runWorkerTool]
+      // A missing connection or an evidence deficit can become known only
+      // after discovery/read results return. Keep the foreground question
+      // control on the fresh planning surface so that exact host evidence can
+      // produce one visible, resumable choice instead of falling back to the
+      // background-agent check-in tool with the same public name.
+      ? [buildPlanTaskTool({ planning: hostFreshPlanning }), buildAskUserQuestionTool(), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope
     ? [plannerTool!, buildAskUserQuestionTool()]

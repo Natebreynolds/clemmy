@@ -112,6 +112,7 @@ import {
   renderTerminalToolReply,
   terminalToolShouldHalt,
 } from './terminal-tool.js';
+import { projectHostOwnedAsyncReadRefinementTerminal } from './async-read-refinement-terminal-projection.js';
 import {
   completionEvidenceToolName,
   toolOutputLooksSuccessful,
@@ -153,6 +154,7 @@ import { composeRunProgressLine } from './run-progress.js';
 import { WorkCallInputSchema } from '../../tools/work-call.js';
 import { withLogicalToolCall } from './attempt-identity.js';
 import { settleToolAttempt } from './attempt-settlement.js';
+import { satisfyObservedConnectionDependencyForContinuation } from './dependency-request.js';
 
 type QueryFn = typeof claudeQuery;
 let queryImpl: QueryFn = claudeQuery;
@@ -3724,7 +3726,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           if (source?.name && resultLooksSuccessful) {
             successfulToolUses.push(completionEvidenceToolName(source.name, source.input));
           }
-          appendSdkTopLevelToolEvent(
+          const returnedEventId = appendSdkTopLevelToolEvent(
             options.sessionId,
             'tool_returned',
             tr.callId,
@@ -3746,7 +3748,44 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               attemptId: options.dispatchLease?.runAttemptId,
             },
           );
-          if (resultLooksSuccessful && source && isTerminalAfterTool(source.name)) {
+          if (
+            returnedEventId
+            && options.sessionId
+            && options.sourceUserSeq
+            && source
+            && mcpToolTail(source.name) === 'tool_search'
+            && resultLooksSuccessful
+          ) {
+            // A user saying “connected” cannot open her own gate. Only the
+            // complete, parented discovery return that was just durably parked
+            // may satisfy the exact parent continuation dependency.
+            satisfyObservedConnectionDependencyForContinuation({
+              sessionId: options.sessionId,
+              sourceUserSeq: options.sourceUserSeq,
+              returnedEventId,
+            });
+          }
+          const hostOwnedAwaiting = resultLooksSuccessful
+            && source
+            && options.sessionId
+            && Number.isSafeInteger(options.sourceUserSeq)
+            && (options.sourceUserSeq ?? 0) > 0
+            ? projectHostOwnedAsyncReadRefinementTerminal({
+                sessionId: options.sessionId,
+                sourceUserSeq: options.sourceUserSeq!,
+                logicalToolCallId: tr.callId,
+                rawToolName: source.name,
+                output: tr.output,
+              })
+            : null;
+          if (hostOwnedAwaiting) {
+            terminalRepliesThisMessage.push({
+              rawName: source!.name,
+              text: hostOwnedAwaiting.question,
+              reason: 'awaiting-input',
+              order: occurrence.order,
+            });
+          } else if (resultLooksSuccessful && source && isTerminalAfterTool(source.name)) {
             if (!terminalToolShouldHalt(source.name, tr.output, { actionExpectedWork })) continue;
             // Do not interrupt inside the result loop. Parallel tool uses from
             // one assistant frame are returned in this same user frame; breaking

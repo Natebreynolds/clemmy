@@ -31,6 +31,9 @@ const {
   HostInterruptState,
   HostRecoveryState,
   hostToolCallsLimitCheckpointFor,
+  committedWriteVerificationHeldText,
+  mapHostCallAttemptsWithBarriersInOrder,
+  isReturnedPreDispatchHostRefusalSettlement,
 } = await import('./host-turn-runner.js');
 const hostRunRunner: typeof productionHostRunRunner = (
   runner,
@@ -72,6 +75,7 @@ const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const capabilityManifests = await import('./capability-manifest.js');
 const capabilityManifestStores = await import('./capability-manifest-store.js');
 const productionPorts = await import('./production-capability-ports.js');
+const shippedImplementations = await import('./shipped-implementation-identity.js');
 const productionMcp = await import('./production-mcp-read-carrier.js');
 const continuityRuntime = await import('./task-continuity-runtime.js');
 const turnControl = await import('./turn-control.js');
@@ -88,6 +92,38 @@ const capabilityResolution = await import('./capability-resolution.js');
 const composioSchemas = await import('../../tools/composio-schema-cache.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
+
+test('returned nested-call repair requires exact zero-crossing invalid-arguments settlement truth', () => {
+  const returnedAttempt = {
+    outcome: { kind: 'invalid_arguments', directive: { action: 'repair_arguments' } },
+  };
+  const refused = {
+    outcome: { kind: 'invalid_arguments', directive: { action: 'repair_arguments' } },
+    executionKind: 'refused_pre_dispatch',
+    physicalCrossingCount: 0,
+    hostCrossingCount: 1,
+  };
+  assert.equal(isReturnedPreDispatchHostRefusalSettlement(returnedAttempt, refused), true);
+  assert.equal(isReturnedPreDispatchHostRefusalSettlement({
+    outcome: { kind: 'succeeded', directive: { action: 'settle' } },
+  }, refused), false, 'the returned host attempt must independently carry argument-repair truth');
+  assert.equal(isReturnedPreDispatchHostRefusalSettlement(returnedAttempt, {
+    ...refused,
+    outcome: { kind: 'succeeded', directive: { action: 'settle' } },
+  }), false, 'successful returned calls are ordinary results, never repair refusals');
+  assert.equal(isReturnedPreDispatchHostRefusalSettlement(returnedAttempt, {
+    ...refused,
+    physicalCrossingCount: 1,
+  }), false, 'a provider crossing cannot be projected as a safe argument repair');
+  assert.equal(isReturnedPreDispatchHostRefusalSettlement(returnedAttempt, {
+    ...refused,
+    hostCrossingCount: 2,
+  }), false, 'multiple host crossings cannot be projected as one nested argument repair');
+  assert.equal(isReturnedPreDispatchHostRefusalSettlement(returnedAttempt, {
+    ...refused,
+    outcome: { kind: 'invalid_arguments', directive: { action: 'settle' } },
+  }), false, 'the immutable recovery directive must authorize argument repair');
+});
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -2986,6 +3022,94 @@ test('production host call_tool keeps exact v57 authority through strict nullabl
         'the isolated runner leaves terminal root closure to its conversation owner');
       assert.equal(root.authority.closeReason, undefined);
     }
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
+test('production host reroutes a provider-carried local read control through the sealed acquisition surface', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const fixture = acceptHostCanarySource('provider-carried-local-read-control');
+  let providerBodies = 0;
+  const providerCarrier = brackets.wrapToolForHarness(tool({
+    name: 'composio_execute_tool',
+    description: 'Fixture provider carrier whose body must remain unopened.',
+    parameters: z.object({
+      tool_slug: z.string().min(1),
+      arguments: z.string(),
+      connected_account_id: z.string().nullable(),
+    }),
+    execute: async () => {
+      providerBodies += 1;
+      return 'provider body must not run';
+    },
+  }) as never);
+  const localAcquisition = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['tool_search']),
+    firstClassNames: new Set(['call_tool', 'composio_execute_tool']),
+    deniedNames: new Set(),
+    mcpToolScope: null,
+    controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async (name) => name === 'tool_search'
+      ? { ok: true }
+      : {
+          ok: false,
+          kind: 'requires_readmission',
+          outside: [name],
+        },
+  }) as never);
+  const model = stubModel([
+    [toolCall('carried-local-schema-inspection', 'composio_execute_tool', {
+      tool_slug: 'tool_search',
+      arguments: JSON.stringify({ query: 'harness_status' }),
+      connected_account_id: null,
+    })],
+    [textMsg('the local schema inspection settled')],
+  ]);
+  const tools = [providerCarrier, localAcquisition];
+  const agent = { model, tools };
+  bindHostCanarySurface(fixture, agent, tools);
+
+  try {
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(
+      outcome.finalOutput,
+      'the local schema inspection settled',
+      JSON.stringify(outcome.terminal),
+    );
+    assert.equal(model.calls(), 2);
+    assert.equal(providerBodies, 0, 'a local control name never enters the provider carrier body');
+    const result = outcome.history.find((item) => (
+      (item as { type?: unknown; callId?: unknown }).type === 'function_call_result'
+      && (item as { callId?: unknown }).callId === 'carried-local-schema-inspection'
+    )) as { name?: string; output?: unknown } | undefined;
+    assert.ok(result, 'the original admitted model edge received one local result');
+    assert.equal(result?.name, 'composio_execute_tool',
+      'history retains the model-authored carrier name while execution routes locally');
+    assert.match(JSON.stringify(result?.output), /tool_search|harness_status/);
+
+    const db = eventlog.openEventLog();
+    assert.deepEqual(db.prepare(`
+      SELECT tool_name, state
+        FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(fixture.session.id, fixture.source.seq, 'carried-local-schema-inspection'), {
+      tool_name: 'tool_search',
+      state: 'settled',
+    });
+    assert.equal((db.prepare(`
+      SELECT COUNT(*) AS n FROM physical_dispatches
+       WHERE session_id = ? AND source_user_seq = ?
+    `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0,
+    'schema inspection stays local with zero provider crossing');
+    const root = callAuthorities.acceptedTurnCallAuthorityFor(
+      fixture.session.id,
+      fixture.source.seq,
+    );
+    assert.equal(root.status, 'ok');
+    if (root.status === 'ok') assert.equal(root.authority.state, 'open');
   } finally {
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
@@ -5908,6 +6032,16 @@ test('production host consumes exact material-source A/Q/B authority before any 
       },
       lifecycle: { state: 'current' },
     });
+    if (providerKind === 'composio') {
+      shippedImplementations.loadShippedImplementations().registerIsolatedObservation({
+        operationId: manifest.operationId,
+        accountId: manifest.accountId,
+        definitionFingerprint: manifest.definitionFingerprint,
+        providerVersion: manifest.providerVersion,
+        operationVersion: manifest.operationVersion,
+        observedAt: Date.now(),
+      });
+    }
     let portBodies = 0;
     let outerBodies = 0;
     const portInvoke = async () => {
@@ -7620,4 +7754,66 @@ test('capabilityUnavailableTextFor carries host-measured causes and never echoes
   assert.ok(text.includes('the sf CLI is signed out'), `the host-measured cause is named: ${text}`);
   assert.ok(!text.includes('railway'), 'a healthy CLI is not blamed');
   assert.ok(text.includes('Signing that CLI back in'), 'the terminal names the unblocking action');
+});
+
+test('a committed-write verification hold tells the exact truth and never asks to repeat the write', () => {
+  const automatic = committedWriteVerificationHeldText([{
+    ownerLogicalToolCallId: 'write-a',
+    requirementId: 'author_workspace',
+    effect: 'local_write',
+    resultHandleId: 'result:space-save:a',
+    status: 'pending',
+    reason: 'transient verifier timeout',
+    resourceId: 'local-llm-calendar',
+    verifierLogicalCallId: 'verify-retry:1:abc',
+    recoveryKind: 'automatic',
+    verifierOnlyRetryable: true,
+  }]);
+  assert.match(automatic, /write is committed and will not be repeated/i);
+  assert.match(automatic, /result:space-save:a/);
+  assert.match(automatic, /Resource: local-llm-calendar/);
+  assert.match(automatic, /Verifier: verify-retry:1:abc/);
+  assert.match(automatic, /no user approval is required/i);
+  assert.doesNotMatch(automatic, /effect[_ -]?unknown/i);
+  assert.doesNotMatch(automatic, /retry (?:the )?write/i);
+
+  const userAction = committedWriteVerificationHeldText([{
+    ownerLogicalToolCallId: 'write-b',
+    requirementId: 'publish_sheet',
+    effect: 'external_write',
+    resultHandleId: 'result:sheet:b',
+    status: 'pending',
+    reason: 'verifier requires recover_connection',
+    resourceId: 'sheet-123',
+    verifierLogicalCallId: 'verify:sheet:b',
+    recoveryKind: 'user_action',
+    verifierOnlyRetryable: false,
+  }]);
+  assert.match(userAction, /Reconnect or refresh the exact readback capability/);
+  assert.match(userAction, /the write will not repeat/i);
+  assert.doesNotMatch(userAction, /ask.*approval/i);
+});
+
+test('a write whose verifier holds is a scheduling barrier: no later sibling write starts', async () => {
+  const entered: string[] = [];
+  const attempts = await mapHostCallAttemptsWithBarriersInOrder(
+    ['write-a', 'write-b'],
+    2,
+    () => 'barrier',
+    async (call) => {
+      entered.push(call);
+      return {
+        status: 'returned' as const,
+        value: call === 'write-a'
+          ? { call, committedVerificationHolds: ['held'] }
+          : { call, committedVerificationHolds: [] },
+        invocationEntered: true,
+      };
+    },
+    (result) => result.committedVerificationHolds.length > 0,
+  );
+  assert.deepEqual(entered, ['write-a']);
+  assert.equal(attempts[0]?.status, 'returned');
+  assert.equal(attempts[1], undefined,
+    'write B has no invocation attempt after write A commits but its verifier holds');
 });

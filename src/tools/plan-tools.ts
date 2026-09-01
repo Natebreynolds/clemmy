@@ -10,6 +10,7 @@ import type {
 import type { TurnGraphIR } from '../runtime/graph/turn-graph-ir.js';
 import {
   admitAndCompilePrimaryModelProposal,
+  snapshotPrimaryModelSelectedStagedPlanningDescriptors,
   snapshotPrimaryModelPlanningContext,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
@@ -27,18 +28,43 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
-import { recordPlanTaskPreambleDelivery } from '../runtime/harness/plan-task-post-settlement.js';
+import {
+  claimPendingPlanTaskBindingSealRecoveryCandidates,
+  exactPlanTaskBindingSealIntent,
+  planTaskBindingSealRecoveryOwner,
+  recoverSettledPlanTaskActivation,
+  recordPlanTaskBindingSealIntentInTransaction,
+  recordPlanTaskPreambleDelivery,
+  recordPlanTaskPreparationCheckpoint,
+} from '../runtime/harness/plan-task-post-settlement.js';
 import { bindAdmittedNodeCapability } from '../runtime/harness/graph-node-capability.js';
 import {
   freezeCatalogSnapshotForSource,
   canonicalCatalogIdentityOf,
+  isCurrentCallableCatalogEntry,
+  persistedCatalogSnapshotManifestIdsForSource,
   persistSealedNodeBinding,
   sealBoundCapability,
 } from '../runtime/harness/host-capability-catalog-factory.js';
+import { refreshTypedExecutionReadiness } from '../runtime/semantic-boundary/configure-typed-execution-runtime.js';
+import { registerProofProvisionedCapabilities } from '../runtime/harness/proof-provisioned-catalog.js';
 import {
   deriveMutationVerificationRecipe,
   parseOperationVerificationContract,
 } from '../runtime/harness/mutation-verification-contract.js';
+import {
+  deriveAsyncReadContinuationRecipe,
+} from '../runtime/harness/async-read-continuation-contract.js';
+import {
+  firecrawlBatchScrapeSchemasMatchV20260826,
+} from '../runtime/harness/firecrawl-batch-scrape-schema-contract.js';
+import {
+  getCachedToolSchema,
+  liveComposioOperationVersion,
+  liveComposioOutputSchema,
+  liveComposioOutputSchemaDigest,
+} from './composio-schema-cache.js';
+import { digestSchema } from './tool-contract-store.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
 } from '../runtime/harness/local-planning-capability.js';
@@ -59,6 +85,30 @@ import {
 
 const MAX_PREAMBLE_CHARS = 1_000;
 
+type PlanTaskPreparationTestHooks = {
+  afterGraphIntentPersisted?: (identity: {
+    sessionId: string;
+    sourceUserSeq: number;
+    acceptedTaskId: string;
+    logicalToolCallId: string;
+  }) => void;
+  recoveryBindingSealFailure?: (identity: {
+    sessionId: string;
+    sourceUserSeq: number;
+    acceptedTaskId: string;
+    logicalToolCallId: string;
+  }) => string | null;
+};
+
+let planTaskPreparationTestHooks: PlanTaskPreparationTestHooks | null = null;
+
+/** Test-only fault seam for the exact graph+intent -> seal crash window. */
+export function installPlanTaskPreparationTestHooks(
+  hooks: PlanTaskPreparationTestHooks | null,
+): void {
+  planTaskPreparationTestHooks = hooks;
+}
+
 const PlanId = WorkTopologyIdSchema;
 
 const PlanOperationBindingSchema = z.object({
@@ -78,6 +128,37 @@ export const FreshActionPlanDraftSchema = z.object({
   cardinality: z.object({
     count: z.number().int().min(1).max(10_000),
     fields: z.array(PlanId).max(32),
+    locator: z.object({
+      contract: z.literal('workspace_social_posts_v1'),
+      collectionPointer: z.literal('/posts'),
+      visibleMirrorPointer: z.literal('/_mobile/records/items'),
+      calendarPointer: z.literal('/calendar'),
+      calendarRequiredFields: z.tuple([
+        z.literal('date'),
+        z.literal('channel'),
+        z.literal('theme'),
+      ]),
+      sourceEvidence: z.object({
+        operationId: PlanId,
+        recordsPointer: z.enum(['/news', '/web', '/results', '/items', '/records']),
+        minDistinctRecords: z.literal(3),
+        titlePointer: z.enum(['/title', '/name', '/headline']),
+        urlPointer: z.enum(['/url', '/link', '/href']),
+        publishedDatePointer: z.enum([
+          '/date', '/publishedAt', '/published_at', '/publishedDate', '/published_date',
+        ]),
+        findingPointers: z.tuple([
+          z.literal('/snippet'),
+          z.literal('/description'),
+          z.literal('/content'),
+          z.literal('/markdown'),
+        ]),
+        publisherPointer: z.enum(['/publisher', '/source', '/siteName', '/site_name']),
+        maxAgeDays: z.number().int().min(1).max(30),
+      }).strict(),
+    }).strict().nullish().describe(
+      'Host-recognized structured output locator. For a counted social-post Workspace, use workspace_social_posts_v1 with exact /posts, /calendar, and /_mobile/records/items pointers plus one bounded source-record field vocabulary; otherwise use JSON null.',
+    ),
   }).strict().nullable(),
   destination: z.object({
     posture: z.enum(['create_new', 'named_existing']),
@@ -109,10 +190,46 @@ export const FreshActionPlanDraftSchema = z.object({
       message: 'bindings must cover every canonical topology operation exactly once',
     });
   }
+  if (
+    draft.cardinality
+    && draft.destination?.family === 'workspace'
+    && draft.cardinality.fields.includes('body')
+    && draft.cardinality.fields.includes('citations')
+    && !draft.cardinality.locator
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['cardinality', 'locator'],
+      message: 'a counted social-post Workspace requires one exact host-recognized collection and visible-mirror locator',
+    });
+  }
+  const sourceEvidence = draft.cardinality?.locator?.sourceEvidence;
+  if (sourceEvidence) {
+    const source = draft.topology.operations.find((operation) => operation.id === sourceEvidence.operationId);
+    const consumers = draft.topology.operations.filter((operation) => (
+      operation.effect === 'local_write' && operation.dataFrom.includes(sourceEvidence.operationId)
+    ));
+    if (
+      !source
+      || source.effect !== 'read'
+      || source.dataFrom.length !== 0
+      || source.cardinality.kind !== 'once'
+      || consumers.length !== 1
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cardinality', 'locator', 'sourceEvidence', 'operationId'],
+        message: 'structured source evidence must name one exact root read consumed by one local write',
+      });
+    }
+  }
 });
 
 export const PlanTaskInputSchema = z.object({
-  preamble: z.string().min(1).max(MAX_PREAMBLE_CHARS).describe(
+  preamble: z.string().min(1).max(MAX_PREAMBLE_CHARS).refine(
+    (value) => !value.includes('?'),
+    'preamble must be settled and must not ask a question',
+  ).describe(
     'One brief conversational acknowledgement shown immediately before work. It must state the concrete reading, make no completion claim, and ask no question.',
   ),
   draft: FreshActionPlanDraftSchema.describe(
@@ -378,6 +495,114 @@ async function sealFreshPlanCapabilityBindings(input: {
       });
     }
     if (!bound.ok) return null;
+    const batchScrapeOwner = bound.binding.manifest?.providerKind === 'composio'
+      && bound.binding.manifest.operationId === 'FIRECRAWL_BATCH_SCRAPE'
+      && bound.binding.manifest.operationVersion === '20260826_00'
+      && bound.binding.manifest.effect === 'read'
+      && Boolean(bound.binding.manifest.externalDefinition?.providerInputSchemaDigest)
+      && bound.binding.manifest.externalDefinition?.providerOutputSchemaObserved === true
+      && Boolean(bound.binding.manifest.externalDefinition.providerOutputSchemaDigest)
+      ? bound.binding.manifest
+      : null;
+    const topologyOperation = input.graph.workTopology?.topology.operations.find(
+      (operation) => operation.id === node.id,
+    );
+    const batchSourceEvidence = input.graph.classification.goalConstraints?.collection?.locator
+      ?.sourceEvidence;
+    const batchRecentArticleLocatorMatches = Boolean(
+      batchSourceEvidence
+      && batchSourceEvidence.operationId === node.id
+      && batchSourceEvidence.recordsPointer === '/records'
+      && batchSourceEvidence.minDistinctRecords === 3
+      && batchSourceEvidence.titlePointer === '/title'
+      && batchSourceEvidence.urlPointer === '/url'
+      && batchSourceEvidence.publishedDatePointer === '/publishedAt'
+      && JSON.stringify(batchSourceEvidence.findingPointers)
+        === JSON.stringify(['/snippet', '/description', '/content', '/markdown'])
+      && batchSourceEvidence.publisherPointer === '/publisher'
+      && Number.isSafeInteger(batchSourceEvidence.maxAgeDays)
+      && batchSourceEvidence.maxAgeDays >= 1
+      && batchSourceEvidence.maxAgeDays <= 30
+    );
+    const batchRecentArticlesTopology = Boolean(
+      batchScrapeOwner
+      && topologyOperation?.effect === 'read'
+      // R owns the exact fixed URL batch and may discharge only after the
+      // host-owned getter returns terminal `completed` evidence for that whole
+      // selected set. It is therefore complete_set, not another best-effort
+      // resolved root lookup.
+      && topologyOperation.coverage === 'complete_set'
+      && topologyOperation.cardinality.kind === 'once'
+      && topologyOperation.dataFrom.length === 0
+      && topologyOperation.dependsOn.length === 1
+      && input.graph.workTopology?.topology.operations.some((operation) => (
+        operation.id === topologyOperation.dependsOn[0]
+        && operation.effect === 'read'
+        && operation.dataFrom.length === 0
+      ))
+      && input.graph.workTopology?.topology.operations.filter((operation) => (
+        operation.effect === 'local_write'
+        && operation.dependsOn.includes(node.id)
+        && operation.dataFrom.includes(node.id)
+      )).length === 1
+      && batchRecentArticleLocatorMatches
+    );
+    // Starting provider-owned async work without its exact, host-verifiable
+    // terminal vocabulary would create a durable job that no admitted consumer
+    // can ever redeem. Refuse the plan before any provider call instead of
+    // silently sealing the start as an ordinary read.
+    if (batchScrapeOwner && !batchRecentArticlesTopology) return null;
+    const getterCandidates = !batchRecentArticlesTopology || !batchScrapeOwner
+      ? []
+      : frozen.entries.filter((entry) => (
+          isCurrentCallableCatalogEntry(entry)
+          && entry.manifest.operationId === 'FIRECRAWL_BATCH_SCRAPE_GET'
+          && entry.manifest.operationVersion === '20260826_00'
+          && entry.manifest.providerKind === 'composio'
+          && entry.manifest.providerIdentity === batchScrapeOwner.providerIdentity
+          && entry.manifest.accountId === batchScrapeOwner.accountId
+          && entry.manifest.effect === 'read'
+          && entry.manifest.externalDefinition?.providerInputSchemaDigest
+          && entry.manifest.externalDefinition.providerOutputSchemaObserved === true
+          && entry.manifest.externalDefinition.providerOutputSchemaDigest
+        ));
+    const batchSchemaPairMatches = (() => {
+      if (!batchRecentArticlesTopology || !batchScrapeOwner || getterCandidates.length !== 1) return false;
+      const getter = getterCandidates[0]!;
+      const startInput = getCachedToolSchema('FIRECRAWL_BATCH_SCRAPE');
+      const startOutput = liveComposioOutputSchema('FIRECRAWL_BATCH_SCRAPE');
+      const getterInput = getCachedToolSchema('FIRECRAWL_BATCH_SCRAPE_GET');
+      const getterOutput = liveComposioOutputSchema('FIRECRAWL_BATCH_SCRAPE_GET');
+      return Boolean(
+        startInput
+        && startOutput
+        && getterInput
+        && getterOutput
+        && liveComposioOperationVersion('FIRECRAWL_BATCH_SCRAPE') === '20260826_00'
+        && liveComposioOperationVersion('FIRECRAWL_BATCH_SCRAPE_GET') === '20260826_00'
+        && digestSchema(startInput) === batchScrapeOwner.externalDefinition!.providerInputSchemaDigest
+        && liveComposioOutputSchemaDigest('FIRECRAWL_BATCH_SCRAPE')
+          === batchScrapeOwner.externalDefinition!.providerOutputSchemaDigest
+        && digestSchema(getterInput) === getter.manifest!.externalDefinition!.providerInputSchemaDigest
+        && liveComposioOutputSchemaDigest('FIRECRAWL_BATCH_SCRAPE_GET')
+          === getter.manifest!.externalDefinition!.providerOutputSchemaDigest
+        && firecrawlBatchScrapeSchemasMatchV20260826({
+          startInput,
+          startOutput,
+          getterInput,
+          getterOutput,
+        })
+      );
+    })();
+    const exactAsyncGetter = getterCandidates.length === 1
+      ? (() => {
+          const entry = getterCandidates[0]!;
+          const identity = canonicalCatalogIdentityOf(entry);
+          const outputDigest = entry.manifest?.externalDefinition?.providerOutputSchemaDigest;
+          return identity && outputDigest ? { identity, outputDigest } : null;
+        })()
+      : null;
+    if (batchRecentArticlesTopology && (!exactAsyncGetter || !batchSchemaPairMatches)) return null;
     const operationVerification = parseOperationVerificationContract(
       bound.binding.manifest?.externalDefinition?.verification,
     );
@@ -408,7 +633,31 @@ async function sealFreshPlanCapabilityBindings(input: {
             },
           }
         : {}),
+      ...(batchRecentArticlesTopology && exactAsyncGetter && batchScrapeOwner
+        ? {
+            asyncRead: (baseBindingDigest: string) => deriveAsyncReadContinuationRecipe({
+              acceptedTaskId: input.acceptedTaskId,
+              workContractId: input.workContractId,
+              ownerRequirementId: node.id,
+              ownerBindingDigest: baseBindingDigest,
+              owner: {
+                providerIdentity: batchScrapeOwner.providerIdentity,
+                operationId: 'FIRECRAWL_BATCH_SCRAPE',
+                schemaVersion: '20260826_00',
+                providerInputSchemaDigest:
+                  batchScrapeOwner.externalDefinition!.providerInputSchemaDigest,
+                providerOutputSchemaDigest:
+                  batchScrapeOwner.externalDefinition!.providerOutputSchemaDigest!,
+                account: batchScrapeOwner.accountId,
+              },
+              getter: exactAsyncGetter.identity,
+              getterProviderIdentity: getterCandidates[0]!.manifest!.providerIdentity,
+              getterProviderOutputSchemaDigest: exactAsyncGetter.outputDigest,
+            }),
+          }
+        : {}),
     });
+    if (batchRecentArticlesTopology && !sealedBinding.asyncRead) return null;
     if (operationVerification && 'mutation' in operationVerification && !sealedBinding.verification) {
       // Slice 2: a missing host-derived recipe is an obligation, not a
       // plan refusal. The write seam reports "wrote, could not verify".
@@ -427,6 +676,218 @@ async function sealFreshPlanCapabilityBindings(input: {
   return persisted
     ? { ok: true, unverifiedMutations }
     : { ok: false, reason: 'one or more sealed graph capabilities conflicted with durable state' };
+}
+
+/** Restart-only continuation for a graph atomically paired with its immutable
+ * pre-seal owner. This path replays no model and owns no business invocation:
+ * it can only freeze the same contract/preamble, seal the same selected
+ * bindings, and advance to the pre-delivery checkpoint. */
+export async function recoverPlanTaskBindingSealPreparation(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): Promise<
+  | { status: 'not_pending' | 'prepared' | 'replayed' }
+  | { status: 'held'; reason: string }
+> {
+  const owner = planTaskBindingSealRecoveryOwner(input);
+  if (owner.status === 'held') {
+    return { status: 'held', reason: 'plan graph has no exact current pre-seal recovery owner' };
+  }
+  // A completed plan has no remaining pre-seal owner, but a later host-only
+  // checkpoint (for example an asynchronous read refinement) still resumes in
+  // a fresh process with an empty capability factory.  Reconstruct the exact
+  // frozen catalog before returning `not_pending`; otherwise the recovered
+  // frame reaches hostRunRunner and is immediately held by
+  // `catalog_snapshot_identity_mismatch`.  This remains metadata/port reproof
+  // only: ids come from the immutable accepted-source snapshot and the ordinary
+  // byte-exact snapshot reader is the final authority.
+  const persistedCatalog = persistedCatalogSnapshotManifestIdsForSource(input);
+  if (!persistedCatalog.ok) {
+    if (owner.status === 'missing' && persistedCatalog.reason === 'missing_snapshot') {
+      return { status: 'not_pending' };
+    }
+    return { status: 'held', reason: `persisted frozen catalog is ${persistedCatalog.reason}` };
+  }
+  const source = listEvents(input.sessionId, {
+    sinceSeq: input.sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === input.sourceUserSeq);
+  if (!source) return { status: 'held', reason: 'accepted source is unavailable for exact plan recovery' };
+  // A fresh process intentionally starts with no process-local tool_search
+  // disclosures. Re-materialize only the manifest ids already named by this
+  // source's immutable snapshot, then require the ordinary snapshot reader to
+  // reproduce every canonical identity byte. This is metadata/port reproof;
+  // it cannot call a model, rediscover a capability, or invoke business I/O.
+  let rehydratedCatalog = freezeCatalogSnapshotForSource(input);
+  if (!rehydratedCatalog.ok) {
+    try {
+      refreshTypedExecutionReadiness([...persistedCatalog.manifestIds]);
+      const providerExpected = persistedCatalog.identities.filter((identity) => (
+        identity.providerKind === 'composio'
+      ));
+      const missingProviderSchemaIdentity = providerExpected.find((identity) => (
+        typeof identity.providerInputSchemaDigest !== 'string'
+        || !/^[a-f0-9]{64}$/.test(identity.providerInputSchemaDigest)
+        || typeof identity.operationId !== 'string'
+        || !identity.operationId.trim()
+      ));
+      if (missingProviderSchemaIdentity) {
+        return {
+          status: 'held',
+          reason: `frozen provider identity is incomplete: ${missingProviderSchemaIdentity.capabilityId}`,
+        };
+      }
+      if (providerExpected.length > 0) {
+        const reproved = await registerProofProvisionedCapabilities(input, {
+          allowedIdentifiers: providerExpected.map((identity) => identity.operationId),
+          expectedSchemaDigests: providerExpected.map((identity) => ({
+            identifier: identity.operationId,
+            schemaDigest: identity.providerInputSchemaDigest!,
+          })),
+          recoveryExpectedIdentities: persistedCatalog.identities,
+        });
+        if (reproved.refusal) {
+          return {
+            status: 'held',
+            reason: `frozen proof-provisioned catalog reproof refused: ${reproved.refusal.code}:${reproved.refusal.identifier}`,
+          };
+        }
+      }
+    } catch (error) {
+      return {
+        status: 'held',
+        reason: `frozen catalog materialization failed: ${String(error instanceof Error ? error.message : error)}`,
+      };
+    }
+    rehydratedCatalog = freezeCatalogSnapshotForSource(input);
+    if (!rehydratedCatalog.ok) {
+      return { status: 'held', reason: `frozen catalog ${rehydratedCatalog.reason}` };
+    }
+  }
+  if (owner.status === 'missing') return { status: 'not_pending' };
+  const intent = owner.intent;
+  const frozen = freezePrimaryModelExpectedWorkContract(input);
+  if (
+    (frozen.status !== 'fixed' && frozen.status !== 'replayed')
+    || frozen.contract.contractId !== intent.contractId
+  ) {
+    return {
+      status: 'held',
+      reason: frozen.status === 'fixed' || frozen.status === 'replayed'
+        ? 'recovered contract conflicts with immutable pre-seal intent'
+        : `expected-work freeze is ${frozen.status}`,
+    };
+  }
+  const sealInput = {
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: intent.identity.acceptedTaskId,
+    acceptedText: intent.objective,
+    graph: intent.graph,
+    operationIds: intent.operationIds,
+    workContractId: intent.contractId,
+  };
+  const injectedSealFailure = planTaskPreparationTestHooks
+    ?.recoveryBindingSealFailure?.(intent.identity) ?? null;
+  if (injectedSealFailure) {
+    return { status: 'held', reason: injectedSealFailure };
+  }
+  let sealed = await sealFreshPlanCapabilityBindings(sealInput);
+  if (!sealed.ok) sealed = await sealFreshPlanCapabilityBindings(sealInput);
+  if (!sealed.ok) return { status: 'held', reason: sealed.reason };
+  // The intent owns the exact future acknowledgement, but it is not public
+  // conversation state until every selected binding is executable. Publishing
+  // first can visibly promise work while the immutable graph is still held.
+  let preamble: ReturnType<typeof appendConversationPreambleOnce>;
+  try {
+    preamble = appendConversationPreambleOnce({ source, text: intent.preamble });
+  } catch (error) {
+    return {
+      status: 'held',
+      reason: `exact preamble recovery failed: ${String(error instanceof Error ? error.message : error)}`,
+    };
+  }
+  try {
+    const checkpoint = recordPlanTaskPreparationCheckpoint({
+      identity: intent.identity,
+      preamble: preamble.event,
+      deliveryOwner: intent.deliveryOwner,
+    });
+    return { status: checkpoint.inserted ? 'prepared' : 'replayed' };
+  } catch (error) {
+    return {
+      status: 'held',
+      reason: `exact checkpoint recovery failed: ${String(error instanceof Error ? error.message : error)}`,
+    };
+  }
+}
+
+/** Daemon-owned bounded recovery pass. It advances only the immutable
+ * graph/intent through host seal, preamble, checkpoint, exact durable delivery
+ * (where that surface owns delivery), and activation. It never invokes a
+ * model, provider, or business tool. Carrier-owned delivery remains explicitly
+ * held for the ordinary channel resumer that can reconstruct its exact target. */
+export async function recoverPendingPlanTaskBindingSealPreparations(input: {
+  limit?: number;
+} = {}): Promise<{
+  scanned: number;
+  prepared: number;
+  replayed: number;
+  activated: number;
+  deliveryRequired: number;
+  held: number;
+  records: Array<{
+    sessionId: string;
+    sourceUserSeq: number;
+    preparation: string;
+    activation: string;
+    reason?: string;
+  }>;
+}> {
+  const candidates = claimPendingPlanTaskBindingSealRecoveryCandidates(input);
+  const summary = {
+    scanned: candidates.length,
+    prepared: 0,
+    replayed: 0,
+    activated: 0,
+    deliveryRequired: 0,
+    held: 0,
+    records: [] as Array<{
+      sessionId: string;
+      sourceUserSeq: number;
+      preparation: string;
+      activation: string;
+      reason?: string;
+    }>,
+  };
+  for (const candidate of candidates) {
+    const preparation = await recoverPlanTaskBindingSealPreparation(candidate);
+    if (preparation.status === 'held') {
+      summary.held += 1;
+      summary.records.push({
+        ...candidate,
+        preparation: preparation.status,
+        activation: 'not_attempted',
+        reason: preparation.reason,
+      });
+      continue;
+    }
+    if (preparation.status === 'prepared') summary.prepared += 1;
+    if (preparation.status === 'replayed') summary.replayed += 1;
+    const activation = await recoverSettledPlanTaskActivation(candidate);
+    if (activation.status === 'activated' || activation.status === 'replayed') {
+      summary.activated += 1;
+    } else if (activation.status === 'delivery_required') {
+      summary.deliveryRequired += 1;
+    }
+    summary.records.push({
+      ...candidate,
+      preparation: preparation.status,
+      activation: activation.status,
+    });
+  }
+  return summary;
 }
 
 export function derivePlanConstructFromTopology(
@@ -591,6 +1052,50 @@ function verifierRepairInstruction(reason: string): string | null {
     + `plan_task again. The write cannot be admitted alone.`;
 }
 
+function verifierRecoveryTool(reason: string): 'plan_task' | 'tool_search' | null {
+  if (!reason.startsWith('verification_successor_required:')) return null;
+  return reason.includes(':ambiguous_compatible_verifier:') ? 'plan_task' : 'tool_search';
+}
+
+function boundedPlanAdmissionReasonCode(reason: string): string {
+  if (reason.startsWith('verification_successor_required:')) return 'verification_successor_required';
+  if (reason.includes('capability that was not disclosed')) return 'capability_not_disclosed';
+  if (reason.startsWith('write_not_in_policy')) return 'write_not_in_policy';
+  if (reason.startsWith('effect_exceeds_policy')) return 'effect_exceeds_policy';
+  if (reason.startsWith('primary model planning catalog authority')) return 'host_planning_catalog_unavailable';
+  if (reason.startsWith('audience hash mismatch')) return 'audience_mismatch';
+  if (reason.startsWith('admitted graph persist refused')) return 'admitted_graph_persist_refused';
+  if (reason.startsWith('admitted graph replay failed')) return 'admitted_graph_replay_failed';
+  const token = reason.split(':', 1)[0]!.trim().replace(/[^A-Za-z0-9._/-]+/g, '_');
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(token) ? token : 'other';
+}
+
+function planAdmissionRecoveryTool(
+  reason: string,
+  admissibleCapabilities: readonly unknown[],
+): 'plan_task' | 'tool_search' | 'retry_host' | 'stop_factual' {
+  if (
+    reason.startsWith('write_not_in_policy')
+    || reason.startsWith('effect_exceeds_policy')
+  ) return 'stop_factual';
+  if (
+    reason.startsWith('host_destination_')
+    || reason.startsWith('primary model planning catalog authority')
+    || reason.startsWith('selected_definition_revalidation_refused:')
+    || reason.startsWith('selected_definition_exact_refresh_unavailable:')
+    || reason.startsWith('selected_definition_operation_version_unavailable:')
+    || reason.startsWith('audience hash mismatch')
+    || reason.startsWith('policy_revision_mismatch')
+    || reason.startsWith('audience_mismatch')
+    || reason.startsWith('admitted graph persist refused')
+    || reason.startsWith('admitted graph replay failed')
+  ) return 'retry_host';
+  return verifierRecoveryTool(reason)
+    ?? (reason.includes('capability that was not disclosed')
+      ? 'tool_search'
+      : admissibleCapabilities.length > 0 ? 'plan_task' : 'tool_search');
+}
+
 function priorAcceptedSourceTexts(sessionId: string, sourceUserSeq: number): string[] {
   try {
     return listEvents(sessionId, { types: ['user_input_received'] })
@@ -645,7 +1150,14 @@ async function executePlanTask(
   const turn = source.turn;
   const display = typeof source.data.displayText === 'string' ? source.data.displayText.trim() : '';
   const eventText = typeof source.data.text === 'string' ? source.data.text.trim() : '';
-  const objective = display || eventText;
+  const consumingObjective = display || eventText;
+  const continuation = context.taskContinuation;
+  const objective = continuation
+    && continuation.consumingSourceUserSeq === sourceUserSeq
+    && continuation.parentSourceUserSeq < sourceUserSeq
+    && continuation.parentInput.trim()
+      ? continuation.parentInput.trim()
+      : consumingObjective;
   if (!objective) throw new Error('plan_task accepted source text is missing');
   const uniqueWorkflow = uniqueWorkflowRunRequest(
     objective,
@@ -662,6 +1174,7 @@ async function executePlanTask(
       detail: 'this accepted request uniquely names an existing workflow; call workflow_run with that exact name',
       workflowName: uniqueWorkflow.name,
       repair: `Call workflow_run with name "${uniqueWorkflow.name}". Do not plan_task. Do not workflow_get unless the user asked to inspect the definition.`,
+      recoveryTool: 'workflow_run',
     });
   }
   // Change 2: a check may refuse only if the missing fact is outside the
@@ -686,19 +1199,46 @@ async function executePlanTask(
       question: 'Which connected account should I use?',
       accountChoices,
       repair: `Ask the user which exact connected account to use (${choices}). Do not pick a substitute write. After they name one, repeat one tool_search that includes that account, then call plan_task with the capabilityRef that search returns.`,
+      recoveryTool: 'ask_user_question',
     });
   }
   const requestedEffectScope = requestedCapabilityEffectScope(objective);
+  const selectedRefs = new Set(input.draft.bindings.map((binding) => binding.capabilityRef));
+  const selectedStagedCapabilities = snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: planning.authority,
+    identity: planning.identity,
+    selectedRefs,
+  });
+  const completenessCapabilities = [
+    ...planning.capabilities,
+    ...selectedStagedCapabilities.filter((descriptor) => (
+      !planning.capabilities.some((bounded) => bounded.id === descriptor.id)
+    )),
+  ];
   if (
     (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
-    && !planDraftHasHostAttestedWrite({ draft: input.draft, capabilities: planning.capabilities })
+    && !planDraftHasHostAttestedWrite({
+      draft: input.draft,
+      capabilities: completenessCapabilities,
+    })
   ) {
+    const admissibleCapabilities = planningRefusalRepairCatalog(
+      planning.capabilities.filter((capability) => (
+        capability.effect === 'local_write'
+        || capability.effect === 'external_write'
+        || capability.effect === 'admin'
+      )),
+    );
     return JSON.stringify({
       ok: false,
       code: 'plan_incomplete_missing_write',
       detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
       requestedEffectScope,
-      repair: 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
+      admissibleCapabilities,
+      repair: admissibleCapabilities.length > 0
+        ? 'Call plan_task again with the exact already-disclosed write capability that matches the requested destination bound to a local_write, external_write, or admin topology operation. Do not call tool_search again, substitute an unrelated write, or freeze a read-only subset.'
+        : 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
+      recoveryTool: admissibleCapabilities.length > 0 ? 'plan_task' : 'tool_search',
     });
   }
   const lineage = collectConstructLineageCompleteness(input.draft);
@@ -710,54 +1250,10 @@ async function executePlanTask(
       writeOperationIds: lineage.writeOperationIds,
       sourceOperationIds: lineage.sourceOperationIds,
       repair: 'Call plan_task again in this same turn. Keep dependsOn for ordering and set each affected write dataFrom to the exact immediate read/compute operation whose bytes construct the artifact; that dataFrom chain must reach one of sourceOperationIds. Do not ask the user about this internal topology repair.',
+      recoveryTool: 'plan_task',
     });
   }
   const proposal = proposalFromDraft({ objective, draft: input.draft });
-
-  const planned = await admitAndCompilePrimaryModelProposal({
-    identity: { sessionId, sourceUserSeq, turn },
-    surface: 'direct',
-    proposal,
-    planningCatalogAuthority: planning.authority,
-  });
-  if (!planned.ok) {
-    // Admission may have promoted an exact same-source staged ref that the
-    // initial eight-slot display card withheld. Re-read the opaque authority
-    // so repair names the ref the model actually cited instead of sending it
-    // back through another identical tool_search loop.
-    const repairPlanning = snapshotPrimaryModelPlanningContext(planning.authority) ?? planning;
-    const citedRefs = new Set(input.draft.bindings.map((binding) => binding.capabilityRef));
-    const admissibleCapabilities = planningRefusalRepairCatalog(
-      repairPlanning.capabilities,
-      citedRefs,
-    );
-    const withheld = repairPlanning.withheld ?? [];
-    const withheldWrite = withheld.find((entry) => (
-      entry.effect === 'external_write' || entry.effect === 'local_write' || entry.effect === 'admin'
-    ));
-    const withheldRepair = withheldWrite
-      ? ` The host proved ${withheldWrite.id} (${withheldWrite.effect}) this turn but withheld it from the planning card (${withheldWrite.reason}). It is not missing and the connector is not down.`
-      : withheld.length > 0
-        ? ` The host withheld ${withheld.length} ceiling-matching capabilities from this card: ${withheld.map((entry) => `${entry.id}:${entry.effect}:${entry.reason}`).join(', ')}.`
-        : '';
-    return JSON.stringify({
-      ok: false,
-      code: 'plan_not_admitted',
-      detail: planned.reason,
-      admissibleCapabilities,
-      ceiling: repairPlanning.effectCeiling,
-      withheld,
-      // A verifier refusal is not a "pick a different capability" problem — the
-      // cited write is correct and simply needs a readback partner. Handing the
-      // generic advice here sent the model round the admissible list looking
-      // for a substitute that does not exist.
-      repair: (verifierRepairInstruction(planned.reason)
-        ?? (admissibleCapabilities.length > 0
-          ? 'Correct the semantic proposal using only a capabilityRef from admissibleCapabilities with the matching effect, then call plan_task again. It may stand alone or be followed in the same frame by exactly one proposal-free dependency-root read/compute work_call.'
-          : 'No citable capability is currently available. Use tool_search once for the missing role, then call plan_task with only the exact capabilityRef it returns.'))
-        + withheldRepair,
-    });
-  }
   const readBindingCounts = new Map<string, number>();
   for (const binding of input.draft.bindings) {
     readBindingCounts.set(
@@ -765,11 +1261,12 @@ async function executePlanTask(
       (readBindingCounts.get(binding.operationId) ?? 0) + 1,
     );
   }
-  const reviewedLocalReadPlan = planned.compiled.graph.classification.route === 'retrieve'
-    && planned.compiled.graph.effectCeiling === 'read'
+  const readOnlyDraft = input.draft.destination === null
+    && input.draft.bindings.length === 1
+    && input.draft.topology.operations.length === 1
+    && input.draft.topology.operations.every((operation) => operation.effect === 'read');
+  const reviewedLocalReadPlan = readOnlyDraft
     && input.draft.destination === null
-    && input.draft.bindings.length > 0
-    && input.draft.topology.operations.every((operation) => operation.effect === 'read')
     && input.draft.topology.operations.every((operation) => (
       readBindingCounts.get(operation.id) === 1
     ))
@@ -786,13 +1283,107 @@ async function executePlanTask(
         && local.definition.reversibility === 'read_only'
         && local.definition.descriptor.destinationPosture === null;
     }))).every(Boolean);
-  if (planned.compiled.graph.classification.route !== 'act' && !reviewedLocalReadPlan) {
+  if (
+    readOnlyDraft
+    && !reviewedLocalReadPlan
+  ) {
     return JSON.stringify({
       ok: false,
       code: 'plan_not_required',
       detail: 'plan_task is only for action work or an exact reviewed Clementine-local read; use a graph-neutral read otherwise.',
+      repair: 'Call call_tool exactly once with the exact graph-neutral read operation and schema already disclosed for this request. Do not call plan_task for this read.',
+      recoveryTool: 'call_tool',
     });
   }
+  const logical = currentLogicalCall();
+  if (!logical || logical.logicalToolCallId !== logical.logicalToolCallId.trim()) {
+    throw new Error('plan_task lost its exact logical-call identity before graph admission');
+  }
+  const planIdentity = {
+    sessionId,
+    sourceUserSeq,
+    acceptedTaskId: logical.acceptedTaskId,
+    logicalToolCallId: logical.logicalToolCallId,
+  };
+  const deliveryOwner = context.onConversationPreamble
+    ? 'carrier_owned' as const
+    : 'durable_conversation' as const;
+  const operationIds = input.draft.topology.operations.map((operation) => operation.id);
+  const planned = await admitAndCompilePrimaryModelProposal({
+    identity: { sessionId, sourceUserSeq, turn },
+    surface: 'direct',
+    proposal,
+    planningCatalogAuthority: planning.authority,
+    ...(continuation ? { verifiedTaskContinuation: continuation } : {}),
+    onFirstPersistInTransaction: (db, graphEvent) => {
+      recordPlanTaskBindingSealIntentInTransaction({
+        db,
+        identity: planIdentity,
+        graphEvent,
+        objective,
+        operationIds,
+        preamble,
+        deliveryOwner,
+      });
+    },
+  });
+  if (!planned.ok) {
+    // Admission may have promoted an exact same-source staged ref that the
+    // initial eight-slot display card withheld. Re-read the opaque authority
+    // so repair names the ref the model actually cited instead of sending it
+    // back through another identical tool_search loop.
+    const repairPlanning = snapshotPrimaryModelPlanningContext(planning.authority) ?? planning;
+    const citedRefs = new Set(input.draft.bindings.map((binding) => binding.capabilityRef));
+    const admissibleCapabilities = planningRefusalRepairCatalog(
+      repairPlanning.capabilities,
+      citedRefs,
+    );
+    const withheld = (repairPlanning.withheld ?? []).slice(0, PLAN_REFUSAL_REPAIR_CAP);
+    const withheldWrite = withheld.find((entry) => (
+      entry.effect === 'external_write' || entry.effect === 'local_write' || entry.effect === 'admin'
+    ));
+    const withheldRepair = withheldWrite
+      ? ` The host proved ${withheldWrite.id} (${withheldWrite.effect}) this turn but withheld it from the planning card (${withheldWrite.reason}). It is not missing and the connector is not down.`
+      : withheld.length > 0
+        ? ` The host withheld ${withheld.length} ceiling-matching capabilities from this card: ${withheld.map((entry) => `${entry.id}:${entry.effect}:${entry.reason}`).join(', ')}.`
+        : '';
+    const recoveryTool = planAdmissionRecoveryTool(planned.reason, admissibleCapabilities);
+    const repair = recoveryTool === 'retry_host'
+      ? 'The host must retry this exact unchanged proposal against fresh internal authority. Do not rediscover, substitute capabilities, or change the plan.'
+      : recoveryTool === 'stop_factual'
+        ? 'State factually that the current policy does not admit the requested effect. Do not retry planning or discovery.'
+        : (verifierRepairInstruction(planned.reason)
+          ?? (admissibleCapabilities.length > 0
+            ? 'Correct the semantic proposal using only a capabilityRef from admissibleCapabilities with the matching effect, then call plan_task again. It may stand alone or be followed in the same frame by exactly one proposal-free dependency-root read/compute work_call.'
+            : 'No citable capability is currently available. Use tool_search once for the missing role, then call plan_task with only the exact capabilityRef it returns.'))
+          + withheldRepair;
+    return JSON.stringify({
+      ok: false,
+      code: 'plan_not_admitted',
+      detail: planned.reason,
+      reasonCode: boundedPlanAdmissionReasonCode(planned.reason),
+      admissibleCapabilities,
+      ceiling: repairPlanning.effectCeiling,
+      withheld,
+      // A verifier refusal is not a "pick a different capability" problem — the
+      // cited write is correct and simply needs a readback partner. Handing the
+      // generic advice here sent the model round the admissible list looking
+      // for a substitute that does not exist.
+      repair,
+      recoveryTool,
+    });
+  }
+  const sealIntent = exactPlanTaskBindingSealIntent({ sessionId, sourceUserSeq });
+  if (
+    !sealIntent
+    || sealIntent.identity.acceptedTaskId !== planIdentity.acceptedTaskId
+    || sealIntent.identity.logicalToolCallId !== planIdentity.logicalToolCallId
+    || sealIntent.graphEvent.id !== planned.event.id
+    || sealIntent.graph.compiler.graphHash !== planned.compiled.graph.compiler.graphHash
+  ) {
+    throw new Error('plan_task admitted graph has no exact immutable binding-seal owner');
+  }
+  planTaskPreparationTestHooks?.afterGraphIntentPersisted?.(planIdentity);
   const authority = requireAcceptedTaskAuthority({ sessionId, sourceUserSeq });
   const preparedExpectedWork = prepareActionExpectedWorkContract({
     sessionId,
@@ -802,41 +1393,52 @@ async function executePlanTask(
   if (preparedExpectedWork.status !== 'prepared') {
     throw new Error(`plan_task could not prepare its exact expected-work contract: ${preparedExpectedWork.reason}`);
   }
-  const bindingSeal = await sealFreshPlanCapabilityBindings({
+  const bindingSealInput = {
     sessionId,
     sourceUserSeq,
     acceptedTaskId: authority.acceptedTaskId,
     acceptedText: objective,
     graph: planned.compiled.graph,
-    operationIds: input.draft.topology.operations.map((operation) => operation.id),
+    operationIds,
     workContractId: preparedExpectedWork.contract.contractId,
-  });
-  if (!bindingSeal.ok) {
-    return JSON.stringify({
-      ok: false,
-      code: bindingSeal.reason.startsWith('verification_successor_required:')
-        ? 'verification_successor_required'
-        : 'plan_binding_not_sealed',
-      detail: bindingSeal.reason,
-      repair: verifierRepairInstruction(bindingSeal.reason)
-        ?? 'Select an exact current capability set whose host-declared verifier recipe can be frozen, then call plan_task again.',
-    });
-  }
+  };
   const expectedWork = freezePrimaryModelExpectedWorkContract({ sessionId, sourceUserSeq });
   if (expectedWork.status !== 'fixed' && expectedWork.status !== 'replayed') {
     throw new Error('plan_task admitted a graph whose expected-work topology is not deterministically projectable');
   }
-  if (expectedWork.contract.contractId !== preparedExpectedWork.contract.contractId) {
-    throw new Error('plan_task expected-work contract changed between recipe sealing and durable freeze');
+  if (
+    expectedWork.contract.contractId !== preparedExpectedWork.contract.contractId
+    || expectedWork.contract.contractId !== sealIntent.contractId
+  ) {
+    throw new Error('plan_task expected-work contract changed between durable intent and freeze');
   }
 
+  let bindingSeal = await sealFreshPlanCapabilityBindings(bindingSealInput);
+  // Every seal failure here is host-owned and occurs after the graph is
+  // write-once. Semantically invalid verifier topology was refused before the
+  // graph/intent transaction, so the identical seal is always the only safe
+  // retry at this point.
+  if (!bindingSeal.ok) {
+    bindingSeal = await sealFreshPlanCapabilityBindings(bindingSealInput);
+  }
+  if (!bindingSeal.ok) {
+    // The immutable intent owns this host-only continuation. Throw so the
+    // control call settles non-successfully and restart reconciliation retries
+    // only this exact seal; the model must never re-plan an immutable graph.
+    throw new Error(`plan_task binding seal recovery pending: ${bindingSeal.reason}`);
+  }
+  if (planIdentity.acceptedTaskId !== authority.acceptedTaskId) {
+    throw new Error('plan_task logical-call owner disagrees with accepted task authority');
+  }
+  // `conversation_preamble` is a user-visible durable lane. Append it only
+  // after the graph, contract, and every exact capability binding are sealed;
+  // the immutable intent retains the same text across a crash before append.
   const persisted = appendConversationPreambleOnce({ source, text: preamble });
-  const logical = currentLogicalCall();
-  if (
-    !logical
-    || logical.acceptedTaskId !== authority.acceptedTaskId
-    || logical.logicalToolCallId !== logical.logicalToolCallId.trim()
-  ) throw new Error('plan_task lost its exact logical-call identity before preamble delivery');
+  recordPlanTaskPreparationCheckpoint({
+    identity: planIdentity,
+    preamble: persisted.event,
+    deliveryOwner,
+  });
   // A carrier that paints its own live message supplies a port; one that
   // renders the conversation from the durable log has already been delivered
   // to by the append above. Both are deliveries — only one needs a transport.
@@ -848,12 +1450,7 @@ async function executePlanTask(
     throw new Error(`conversation preamble ${delivered.reason}`);
   }
   recordPlanTaskPreambleDelivery({
-    identity: {
-      sessionId,
-      sourceUserSeq,
-      acceptedTaskId: logical.acceptedTaskId,
-      logicalToolCallId: logical.logicalToolCallId,
-    },
+    identity: planIdentity,
     preamble: persisted.event,
     delivery: delivered,
   });
@@ -964,6 +1561,7 @@ function planTaskInvalidInputRefusal(error: unknown): string | null {
     code: 'plan_invalid_input',
     detail: detail.slice(0, 4_000),
     repair: 'Fix exactly the named paths and call plan_task again; do not resend the identical arguments.',
+    recoveryTool: 'plan_task',
   });
 }
 
