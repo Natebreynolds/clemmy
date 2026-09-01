@@ -128,6 +128,67 @@ export interface ProofProviderSchemaFailureBudget {
   /** Maximum pointer depth descended with per-path detail; deeper subtrees
    * are judged whole by the boolean matcher and reported as one entry. */
   maxDepth: number;
+  /**
+   * `exact` (default) mirrors the closed proof matcher: every key declared,
+   * every type/enum/const satisfied. `required_only` is the open policy of
+   * capability gates that must fail OPEN: only missing `required` members
+   * (at any depth) and keys under an explicit `additionalProperties: false`
+   * node are failures; types, enums and undeclared keys of open objects are
+   * left to the provider.
+   */
+  policy?: 'exact' | 'required_only';
+}
+
+/** Open-policy walk (see `policy: 'required_only'`). Never reports a type
+ * or enum problem and never descends a value the schema does not declare. */
+function collectRequiredOnlyFailures(
+  value: unknown,
+  schema: Record<string, unknown> | undefined,
+  pointer: string,
+  out: ProofProviderSchemaFailure[],
+  budget: ProofProviderSchemaFailureBudget,
+): void {
+  if (!schema || out.length >= budget.maxEntries) return;
+  if (pointerDepth(pointer) >= budget.maxDepth) return;
+  const push = (failure: ProofProviderSchemaFailure): void => {
+    if (out.length < budget.maxEntries) out.push(failure);
+  };
+  switch (propertyType(schema)) {
+    case 'array': {
+      if (!Array.isArray(value) || !isRecord(schema.items)) return;
+      const items = schema.items;
+      value.forEach((item, index) => {
+        collectRequiredOnlyFailures(item, items, childPointer(pointer, index), out, budget);
+      });
+      return;
+    }
+    case 'object': {
+      if (!isRecord(value)) return;
+      const { required, properties } = schemaShape(schema);
+      for (const key of required) {
+        if (!hasOwn(value, key)) {
+          push({
+            path: childPointer(pointer, key),
+            code: 'missing_required',
+            expected: schemaTypeWord(properties[key]),
+          });
+        }
+      }
+      const closed = schema.additionalProperties === false
+        && Object.keys(properties).length > 0
+        && !(isRecord(schema.patternProperties) && Object.keys(schema.patternProperties).length > 0);
+      for (const [key, child] of Object.entries(value)) {
+        if (hasOwn(properties, key)) {
+          collectRequiredOnlyFailures(child, properties[key], childPointer(pointer, key), out, budget);
+        } else if (closed) {
+          push({ path: childPointer(pointer, key), code: 'unknown_field' });
+        }
+      }
+      return;
+    }
+    default:
+      return;
+  }
 }
 
 const DEFAULT_SCHEMA_FAILURE_BUDGET: ProofProviderSchemaFailureBudget = Object.freeze({
@@ -220,6 +281,10 @@ export function collectProviderSchemaFailures(
   out: ProofProviderSchemaFailure[],
   budget: ProofProviderSchemaFailureBudget = DEFAULT_SCHEMA_FAILURE_BUDGET,
 ): void {
+  if (budget.policy === 'required_only') {
+    collectRequiredOnlyFailures(value, schema, pointer, out, budget);
+    return;
+  }
   const push = (failure: ProofProviderSchemaFailure): void => {
     if (out.length < budget.maxEntries) out.push(failure);
   };

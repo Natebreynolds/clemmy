@@ -513,3 +513,167 @@ console.log('composio-batch-validator tests passed');
   }
   console.log('✓ unambiguous field rename repairs query→q (session-fixture-unprovisioned-catalog)');
 }
+
+// ─── Nested shape (carrier sweep of the nested-blindness class) ───────────
+// The schema-grounded check used to stop at the top level: a present nested
+// object missing its own required members crossed to the provider, and a
+// missing top-level object rendered as an opaque `"<FILL: object — …>"`. The
+// same two provable rules (missing `required`, keys an exact closed contract
+// rejects) now apply at every depth; types, enums and undeclared keys of open
+// objects stay the provider's job (fail-open contract).
+{
+  const slug = 'OPAQUE_TABLE_INSERT_V7';
+  const schema = {
+    type: 'object',
+    required: ['destination_id', 'insertion'],
+    properties: {
+      destination_id: { type: 'string' },
+      insertion: {
+        type: 'object',
+        description: 'The details for the insertion request.',
+        required: ['range'],
+        properties: {
+          range: {
+            type: 'object',
+            required: ['axis', 'start_index', 'end_index'],
+            properties: {
+              sheet_id: { type: 'integer' },
+              axis: { type: 'string', enum: ['ROWS', 'COLUMNS'] },
+              start_index: { type: 'integer' },
+              end_index: { type: 'integer' },
+            },
+          },
+          inherit_from_before: { type: 'boolean' },
+        },
+      },
+    },
+  };
+  const templateOf = (error: { examples: string[] }) => {
+    const template = error.examples.find((line) => /Repair this exact call/.test(line));
+    if (!template) throw new Error('a nested missing-required refusal must carry a repaired call');
+    return JSON.parse(template.slice(template.indexOf('{'))) as {
+      tool_slug: string;
+      arguments: Record<string, unknown>;
+    };
+  };
+
+  // (1) A present nested object missing its own required child is refused
+  // with the exact pointer, the required shape, and a nested skeleton.
+  const nestedMissing = validateArgsAgainstSchema(slug, {
+    destination_id: 'dest-1',
+    insertion: { inherit_from_before: false },
+  }, schema);
+  if (!nestedMissing) throw new Error('a missing nested required member must be refused before dispatch');
+  if (nestedMissing.field !== '/insertion/range') throw new Error(`field must be the exact pointer: ${nestedMissing.field}`);
+  if (!nestedMissing.reason.includes('/insertion/range (missing required, expected object)')) {
+    throw new Error(`reason must name the pointer and the expected shape: ${nestedMissing.reason}`);
+  }
+  if (nestedMissing.kind !== undefined) throw new Error('a missing member is an add-repair, not an unsupported-field refusal');
+  const shapeLine = nestedMissing.examples.find((line) => line.startsWith('Required shape at '));
+  if (!shapeLine || !shapeLine.includes('"/insertion/range": object; required: [axis, start_index, end_index]; sheet_id: integer, axis*: enum["ROWS","COLUMNS"], start_index*: integer, end_index*: integer')) {
+    throw new Error(`the required nested shape must be rendered: ${shapeLine}`);
+  }
+  const nestedPayload = templateOf(nestedMissing);
+  if (nestedPayload.tool_slug !== slug) throw new Error('the repair targets the same action');
+  const insertion = nestedPayload.arguments.insertion as Record<string, unknown>;
+  if (insertion.inherit_from_before !== false) throw new Error('supplied nested values must be preserved verbatim');
+  const range = insertion.range as Record<string, unknown>;
+  if (!range || typeof range !== 'object') throw new Error('the missing nested object must be a fillable skeleton, not a string');
+  if (!/^<FILL: string enum\["ROWS","COLUMNS"\]/.test(String(range.axis))) {
+    throw new Error(`enum members travel with the gap: ${String(range.axis)}`);
+  }
+  if (!/^<FILL: integer/.test(String(range.start_index)) || !/^<FILL: integer/.test(String(range.end_index))) {
+    throw new Error('required nested scalars are marked as fillable gaps');
+  }
+  if ('sheet_id' in range) throw new Error('optional members are not invented into the skeleton');
+  const nestedMessage = formatBatchValidationError(nestedMissing, slug, 'schema');
+  if (nestedMessage.includes('composio_search_tools') || !nestedMessage.includes('add them and retry')) {
+    throw new Error(`schema-mode nested recovery must repair in place, never rediscover: ${nestedMessage}`);
+  }
+
+  // (2) A missing top-level object renders its required skeleton, not an
+  // opaque object placeholder.
+  const topMissing = validateArgsAgainstSchema(slug, { destination_id: 'dest-1' }, schema);
+  if (!topMissing) throw new Error('precondition: top-level required object missing');
+  const topPayload = templateOf(topMissing);
+  const topInsertion = topPayload.arguments.insertion as Record<string, unknown>;
+  if (typeof topInsertion !== 'object' || topInsertion === null) {
+    throw new Error(`a missing required object must expand into its required shape: ${JSON.stringify(topPayload.arguments.insertion)}`);
+  }
+  const topRange = topInsertion.range as Record<string, unknown>;
+  if (!/^<FILL: string enum/.test(String(topRange.axis)) || !/^<FILL: integer/.test(String(topRange.start_index))) {
+    throw new Error('the nested skeleton reaches the required grandchildren');
+  }
+  if (topPayload.arguments.destination_id !== 'dest-1') throw new Error('supplied arguments must be preserved verbatim');
+
+  // (3) Fail-open is preserved: nested type mismatches and undeclared keys of
+  // an OPEN nested object are the provider's job.
+  if (validateArgsAgainstSchema(slug, {
+    destination_id: 'dest-1',
+    insertion: { range: { axis: 'rows', start_index: '1', end_index: 2, extra: true } },
+  }, schema) !== null) {
+    throw new Error('nested types/enums/extra keys of an open object must not block a dispatch');
+  }
+
+  // (4) A nested closed contract rejects invented nested keys with the pointer.
+  const closedSchema = JSON.parse(JSON.stringify(schema)) as typeof schema & {
+    properties: { insertion: { properties: { range: { additionalProperties?: boolean } } } };
+  };
+  closedSchema.properties.insertion.properties.range.additionalProperties = false;
+  const nestedUnsupported = validateArgsAgainstSchema(slug, {
+    destination_id: 'dest-1',
+    insertion: { range: { axis: 'ROWS', start_index: 1, end_index: 2, sheetId: 7 } },
+  }, closedSchema);
+  if (nestedUnsupported?.kind !== 'unsupported-fields' || nestedUnsupported.field !== '/insertion/range/sheetId') {
+    throw new Error(`a nested closed contract must refuse the invented key: ${JSON.stringify(nestedUnsupported)}`);
+  }
+  const unsupportedMessage = formatBatchValidationError(nestedUnsupported, slug, 'schema');
+  if (!unsupportedMessage.includes('remove the unsupported field') || unsupportedMessage.includes('composio_search_tools')) {
+    throw new Error(`nested unsupported recovery must tell the model to remove, not rediscover: ${unsupportedMessage}`);
+  }
+
+  // (5) The corrected nested object passes.
+  if (validateArgsAgainstSchema(slug, {
+    destination_id: 'dest-1',
+    insertion: { range: { sheet_id: 7, axis: 'ROWS', start_index: 1, end_index: 2 }, inherit_from_before: false },
+  }, schema) !== null) {
+    throw new Error('a correct nested payload must pass');
+  }
+
+  // (6) Arrays of objects below the top level are walked too.
+  const batchSchema = {
+    type: 'object',
+    required: ['data'],
+    properties: {
+      data: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['range'],
+          properties: {
+            range: {
+              type: 'object',
+              required: ['start_index', 'end_index'],
+              properties: { start_index: { type: 'integer' }, end_index: { type: 'integer' } },
+            },
+          },
+        },
+      },
+    },
+  };
+  const deepBatch = validateArgsAgainstSchema('OPAQUE_BATCH_INSERT', {
+    data: [{ range: { start_index: 1, end_index: 2 } }, { range: { start_index: 3 } }],
+  }, batchSchema);
+  if (!deepBatch || deepBatch.field !== '/data/1/range/end_index') {
+    throw new Error(`nested array items must be walked to their pointer: ${JSON.stringify(deepBatch)}`);
+  }
+  const deepPayload = templateOf(deepBatch);
+  const rows = deepPayload.arguments.data as Array<Record<string, unknown>>;
+  if (JSON.stringify(rows[0]) !== JSON.stringify({ range: { start_index: 1, end_index: 2 } })) {
+    throw new Error('sibling items are preserved verbatim');
+  }
+  if (!/^<FILL: integer/.test(String((rows[1]!.range as Record<string, unknown>).end_index))) {
+    throw new Error('the nested array gap is marked in place');
+  }
+  console.log('✓ nested schema shape is refused with exact pointers and a fillable skeleton (carrier sweep)');
+}
