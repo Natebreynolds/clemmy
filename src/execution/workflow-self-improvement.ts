@@ -230,6 +230,18 @@ export function buildWorkflowImprovementPrompt(input: {
       sources.push(`- step "${runner.stepId}" (${runner.kind}): ${source.path} (${bytes} bytes; too large to inline — read it with read_file in as few calls as possible)`);
     }
   }
+  // The current definition rides in the prompt as well: with definition and
+  // script both present the turn's first call can be authoring, not lookup.
+  let definitionBytes = '';
+  try {
+    definitionBytes = readFileSync(entry.filePath, 'utf8');
+  } catch {
+    definitionBytes = '';
+  }
+  const definitionInlined = definitionBytes.length > 0 && Buffer.byteLength(definitionBytes, 'utf8') <= inlineBudget;
+  if (definitionInlined) {
+    inlined.unshift(`===== BEGIN current definition: ${entry.filePath} =====`, definitionBytes, '===== END current definition =====');
+  }
   return [
     `Workflow self-improvement: "${request.slug}" (definition file: ${entry.filePath}).`,
     '',
@@ -241,7 +253,9 @@ export function buildWorkflowImprovementPrompt(input: {
     '',
     'Binding rules:',
     '1. Preserve WHAT the workflow does and where it sends: its name, goal and success criteria, trigger/schedule/timezone, resources, enabled flag, every step\'s requiresApproval flag, and every destination (channel ids, recipients, spreadsheet ids). You may only change HOW a step does its work.',
-    '2. First read the current definition with workflow_get (section "full"). The legacy script source you need is included at the end of this message; do not spend calls re-reading it.',
+    definitionInlined
+      ? '2. The current definition and the legacy script source are both included at the end of this message. Do not spend calls on workflow_get or read_file for them; start with the rewrite.'
+      : '2. First read the current definition with workflow_get (section "full", one call). The legacy script source you need is included at the end of this message; do not spend calls re-reading it.',
     '3. Re-author each legacy script step as exact `call` steps for the external reads/writes the script performed — one call step per provider operation, with the exact operation name (use tool_search to find the exact reviewed CLI read or provider action; do not invent names) and the literal arguments the script used — plus a `transform` step or a short prose step for the pure computation/rendering the script did. Keep the same output contract (required_keys / non_empty) that downstream steps consume; if the old step produced several fields, the last new step must produce all of them.',
     '4. Write the improved definition with workflow_update, sending the COMPLETE steps array (it replaces the whole graph). Do not disable the workflow. Do not change its name.',
     '5. End with a 3–6 line plain-language note for the user: which step changed, what it does now, and anything they should glance at.',

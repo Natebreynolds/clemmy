@@ -1026,7 +1026,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 20097
+          "bytes": 21257
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -3501,7 +3501,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 20097
+          "bytes": 21257
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063

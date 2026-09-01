@@ -133,8 +133,10 @@ test('the prompt names the script to read and the rules that keep intent', () =>
   const prompt = improvement.buildWorkflowImprovementPrompt({ request, entry });
   assert.match(prompt, /scripts\/pull-activity\.mjs/);
   assert.match(prompt, /full source included below/);
+  assert.match(prompt, /BEGIN current definition/, 'the definition rides in the prompt so the first call can be authoring');
+  assert.match(prompt, /name: legacy-team-update/);
+  assert.match(prompt, /Do not spend calls on workflow_get/);
   assert.match(prompt, /\/\/ legacy runner/, 'the script bytes ride in the prompt so the turn spends no lookups paging them');
-  assert.match(prompt, /do not spend calls re-reading it/);
   assert.match(prompt, /workflow_update/);
   assert.match(prompt, /Preserve WHAT the workflow does/);
   assert.match(prompt, /workflow_raw_subprocess_authority_unrepresented/);
