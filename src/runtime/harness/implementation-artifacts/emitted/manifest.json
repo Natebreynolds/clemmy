@@ -648,7 +648,7 @@
           "bytes": 5382
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 55754
+          "bytes": 56924
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -3123,7 +3123,7 @@
           "bytes": 5382
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 55754
+          "bytes": 56924
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
