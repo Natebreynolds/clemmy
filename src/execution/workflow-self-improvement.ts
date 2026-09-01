@@ -259,6 +259,12 @@ export function buildWorkflowImprovementPrompt(input: {
     '3. Re-author each legacy script step as exact `call` steps for the external reads/writes the script performed — one call step per provider operation, with the exact operation name (use tool_search to find the exact reviewed CLI read or provider action; do not invent names) and the literal arguments the script used — plus a `transform` step or a short prose step for the pure computation/rendering the script did. Keep the same output contract (required_keys / non_empty) that downstream steps consume; if the old step produced several fields, the last new step must produce all of them.',
     '4. Write the improved definition with workflow_update, sending the COMPLETE steps array (it replaces the whole graph). Do not disable the workflow. Do not change its name.',
     '5. End with a 3–6 line plain-language note for the user: which step changed, what it does now, and anything they should glance at.',
+    '',
+    'Step shapes the runner executes (no other step kinds; do not search for documentation):',
+    '- exact provider read/write:  { id, prompt: "", side_effect: read|write|send, call: { tool: <exact operation name from tool_search>, args: { ...literal arguments } }, output: { type: object, required_keys: [stdout], non_empty: [stdout] } }',
+    '- pure computation/rendering: { id, prompt: "<what to compute from the named prior steps, and the exact JSON object to return>", dependsOn: [<step ids>], side_effect: read, output: { type: object, required_keys: [...], non_empty: [...] } }',
+    '- the existing send step stays as it is (same allowedTools, same destination, same output contract).',
+    'Keep every plan_task field short: objective and criteria are one sentence each; evidence strings are bare tokens (letters, digits, :._/-, ≤128 chars).',
     ...(inlined.length > 0 ? ['', ...inlined] : []),
   ].join('\n');
 }
