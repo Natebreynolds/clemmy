@@ -4731,7 +4731,10 @@ async function runStepViaHarness(
       sessionId: realSessionId,
       planProposalId: `workflow:${workflowName}:${sessionIdSuffix}`,
       approvedPlanObjective: `Approved workflow "${workflowName}" step "${step.id}"`,
-      ttlMs: WORKFLOW_STEP_WALL_CLOCK_MS + 60_000,
+      // The scope lives as long as this step attempt; it is closed below on
+      // `workflow-step-finished`. A wall-clock TTL here refused every write of
+      // a step that legitimately outlived WORKFLOW_STEP_WALL_CLOCK_MS.
+      attemptBound: true,
       allowedTools,
       allowedSends: [...new Set([
         ...(step.requiresApproval

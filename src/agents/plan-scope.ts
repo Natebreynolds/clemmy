@@ -234,6 +234,17 @@ export interface OpenPlanScopeInput {
   allowedDestructiveActions?: string[];
   /** Open a goal-lifetime scope (no TTL) keyed to this goal id. */
   goalScoped?: { goalId: string };
+  /**
+   * The scope lives exactly as long as its owner's attempt (an authored
+   * workflow step, a cron run, a background task): the owner closes it when
+   * the attempt finishes, so no wall-clock TTL applies. Live 2026-09-01: a
+   * step's scope carried `wallClock + 60s`, the host legitimately ran the
+   * step past its wall clock (23 reads on a slow brain), and every write
+   * after minute 16 was refused `plan_scope_missing_or_changed` — a
+   * long-horizon task killed by a timer nobody could extend. Ordinary
+   * consent semantics are unchanged (this is NOT goalScoped).
+   */
+  attemptBound?: boolean;
   /** Sends the plan enumerated + the user blessed (goal-scoped only). */
   allowedSends?: string[];
 }
@@ -246,7 +257,7 @@ export function openPlanScope(input: OpenPlanScopeInput): PlanScope {
   // A goal-scoped scope has no TTL — its lifetime is the goal's. We still stamp
   // a far-future expiresAt for back-compat with consumers that read the field,
   // but getPlanScope never expires a goal-scoped scope on time.
-  const ttl = input.goalScoped
+  const ttl = input.goalScoped || input.attemptBound === true
     ? 365 * 24 * 60 * 60 * 1000
     : Math.min(ABSOLUTE_MAX_TTL_MS, Math.max(60_000, input.ttlMs ?? DEFAULT_SCOPE_TTL_MS));
   const scope: PlanScope = {

@@ -427,6 +427,26 @@ test('a goal-scoped scope never time-expires (only its goal closes it)', () => {
   assert.equal(isAutoApprovedByScope('sess-gs1', 'run_shell_command'), false);
 });
 
+test('an attempt-bound scope outlives any wall-clock TTL and closes only when its owner closes it', () => {
+  // Live 2026-09-01: a workflow step's scope carried wallClock+60s; the host
+  // legitimately ran the step 25 minutes and every write after minute 16 was
+  // refused plan_scope_missing_or_changed. The owner (runner) closes the scope
+  // on step finish; time never does.
+  openPlanScope({
+    sessionId: 'sess-ab1', planProposalId: 'workflow:w:1', approvedPlanObjective: 'step',
+    allowedTools: ['*'], attemptBound: true,
+  });
+  const scope = getPlanScope('sess-ab1');
+  assert.ok(scope && !scope.closedAt);
+  assert.ok(Date.parse(scope.expiresAt) - Date.now() > 60 * 60 * 1000, 'not clamped to the 1h ceiling');
+  assert.equal(scope.goalScoped, undefined, 'attempt-bound is not goal-scoped consent');
+  // Two hours in, still the owner's scope.
+  backdate('sess-ab1', -2 * 60 * 60 * 1000, 300 * 24 * 60 * 60 * 1000);
+  assert.equal(isAutoApprovedByScope('sess-ab1', 'run_shell_command'), true);
+  closePlanScope('sess-ab1', 'workflow-step-finished');
+  assert.equal(isAutoApprovedByScope('sess-ab1', 'run_shell_command'), false);
+});
+
 test('goal-scoped send lock: a send auto-approves ONLY if enumerated in allowedSends', () => {
   openPlanScope({
     sessionId: 'sess-gs2', planProposalId: 'goal-2', approvedPlanObjective: 'auto',
