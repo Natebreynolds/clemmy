@@ -7,6 +7,7 @@ import { ensureTasksFile, ensureToolDirectories, replaceFile } from '../tools/sh
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
 import { writeWorkflowAndSyncTriggers } from '../execution/workflow-write.js';
 import { provisionAuthoritySealKey } from '../runtime/harness/authority-argument-seal.js';
+import { provisionBuiltinSkills } from './builtin-skills.js';
 
 function ensureDir(dir: string): void {
   if (!existsSync(dir)) {
@@ -36,6 +37,11 @@ async function main(): Promise<void> {
   ensureDir(goalsDir);
   ensureDir(pluginsDir);
   ensureDir(logsDir);
+
+  // First-party instruction skills ship with the candidate, but existing skill
+  // bytes remain user-owned. Provisioning only fills an absent SKILL.md (an
+  // empty incomplete directory is recovered in place).
+  provisionBuiltinSkills();
 
   // The typed crossing path needs a host-local seal key before its first use.
   // Scaffolding is the honest home for it: it is install state, not a user

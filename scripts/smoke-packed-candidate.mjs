@@ -18,6 +18,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -152,6 +153,20 @@ const observations = await load('runtime/harness/independent-capability-observat
 const approvals = await load('runtime/harness/approval-registry.js');
 const eventlog = await load('runtime/harness/eventlog.js');
 const shipped = await load('runtime/harness/shipped-implementation-identity.js');
+const skillTools = await load('tools/skill-tools.js');
+
+const skillHandlers = new Map();
+skillTools.registerSkillTools({
+  tool(name, ...parts) {
+    skillHandlers.set(name, parts.at(-1));
+  },
+});
+const skillText = (result) => (result?.content ?? [])
+  .filter((item) => item?.type === 'text')
+  .map((item) => item.text ?? '')
+  .join('\n');
+const skillList = skillText(await skillHandlers.get('skill_list')({}));
+const skillRead = skillText(await skillHandlers.get('skill_read')({ name: 'technical-content-marketing' }));
 
 const args = {
   bundle_id: 'packed-candidate-portal',
@@ -273,6 +288,7 @@ process.stdout.write('PACKED_RUNTIME_PROCESS_RESULT ' + JSON.stringify({
   snapshot: snapshot(completed.directory),
   counts,
   provenance,
+  skills: { list: skillList, read: skillRead },
 }) + '\n');
 eventlog.closeEventLog();
 `;
@@ -322,8 +338,10 @@ try {
   for (const required of [
     'package.json',
     'dist/index.js',
+    'dist/setup/builtin-skills.js',
     'dist/runtime/build-stamp.json',
     'dist/runtime/harness/implementation-artifacts/emitted/manifest.json',
+    'builtin-skills/technical-content-marketing/SKILL.md',
   ]) assert.equal(packedFiles.has(required), true, `npm tarball omitted ${required}`);
   const leakedSourceFixture = [...packedFiles].find((file) => (
     file === 'dist/execution/reviewed-local-workflow-v3-process.fixture.js'
@@ -421,8 +439,20 @@ try {
   const runtimeEnv = { ...isolatedEnv(), CLEMMY_INSTALLED_ROOT: installedRoot };
   const cliFirst = run(process.execPath, [installedCli, 'init-home'], { cwd: installDir, timeout: 60_000 });
   assert.match(cliFirst.stdout, /Initialized Clementine home at/);
+  const packedSkill = path.join(installedRoot, 'builtin-skills', 'technical-content-marketing', 'SKILL.md');
+  const provisionedSkill = path.join(runtimeHome, 'skills', 'technical-content-marketing', 'SKILL.md');
+  assert.equal(existsSync(packedSkill), true, 'installed package omitted the first-party marketing skill');
+  assert.equal(readFileSync(provisionedSkill, 'utf8'), readFileSync(packedSkill, 'utf8'));
+  const provisionedSkillTimes = {
+    mtimeMs: statSync(provisionedSkill).mtimeMs,
+    ctimeMs: statSync(provisionedSkill).ctimeMs,
+  };
   const cliSecond = run(process.execPath, [installedCli, 'init-home'], { cwd: installDir, timeout: 60_000 });
   assert.match(cliSecond.stdout, /Initialized Clementine home at/);
+  assert.deepEqual({
+    mtimeMs: statSync(provisionedSkill).mtimeMs,
+    ctimeMs: statSync(provisionedSkill).ctimeMs,
+  }, provisionedSkillTimes, 'repeat init-home rewrote the existing skill');
 
   const first = resultLine(run(process.execPath, [installedProbe, 'execute'], {
     cwd: installDir,
@@ -442,6 +472,9 @@ try {
     operationId: 'artifact_bundle_save',
     effect: 'local_write',
   });
+  assert.match(first.skills.list, /technical-content-marketing/);
+  assert.match(first.skills.read, /SOURCE-DATED-CALENDAR-ONE-IDEA-PER-POST/);
+  assert.match(first.skills.read, /one atomic `space_save` call/i);
   assert.equal(first.reconciled.exists, true);
   assert.equal(first.reconciled.contentDigest, first.completed.revisionDigest);
 

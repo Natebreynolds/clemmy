@@ -37,6 +37,7 @@ import { CUTOVER_HOLD } from './runtime/cutover-hold.js';
 import { warmMarkitdownInBackground } from './runtime/markitdown.js';
 import { runDoctor } from './setup/doctor.js';
 import { initHome } from './setup/init-home.js';
+import { provisionBuiltinSkills } from './setup/builtin-skills.js';
 import { runSetupWizard } from './setup/setup.js';
 import { PLUGINS_DIR } from './plugins/loader.js';
 import { getConfiguredDiscordInstallInfo } from './channels/discord-install.js';
@@ -55,6 +56,16 @@ const logger = pino({ name: 'clementine-next' });
 // the lease moments later. Packaged starts remain fast; this is only the upper
 // bound, and dead children are still detected immediately in the poll loop.
 const DAEMON_START_HANDSHAKE_TIMEOUT_MS = 30_000;
+
+/** Keep the lightweight runtime assets available on every foreground daemon
+ * entry. The full vault/workflow scaffold remains owned by initHome(). A
+ * provisioning failure is a readiness failure: accepting work while a shipped
+ * skill is absent would make the live UI claim a capability the daemon cannot
+ * actually use. The top-level startup boundary logs/surfaces the failure and a
+ * later boot retries the crash-safe provisioner. */
+function provisionForegroundDaemonBuiltins(): void {
+  provisionBuiltinSkills();
+}
 
 async function startConnectedCliSurfaces(): Promise<void> {
   try {
@@ -544,6 +555,7 @@ async function main(): Promise<void> {
     // Internal foreground mode — spawned by `daemon start`
     if (sub === '--foreground') {
       if (!claimForegroundDaemonLease()) return;
+      provisionForegroundDaemonBuiltins();
       registerShutdownHandlers(async () => {
         logger.info('Daemon shutting down...');
         await shutdownLocalTranscriptionRuntime();
@@ -580,6 +592,7 @@ async function main(): Promise<void> {
 
     // Anything else: treat as legacy foreground (old behavior)
     if (!claimForegroundDaemonLease()) return;
+    provisionForegroundDaemonBuiltins();
     registerShutdownHandlers(async () => {
       await shutdownLocalTranscriptionRuntime();
     });

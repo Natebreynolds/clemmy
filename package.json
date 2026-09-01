@@ -37,6 +37,7 @@
     "!dist/runtime/harness/current-capability-manifest.fixture.js",
     "apps/mobile-web/dist",
     "apps/console-web/dist",
+    "builtin-skills",
     "vendor/uv",
     "README.md",
     ".env.example"
@@ -146,6 +147,7 @@
     "discord.js": "^14.27.0",
     "express": "^4.22.2",
     "gray-matter": "^4.0.3",
+    "parse5": "8.0.1",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",
     "undici": "^6.27.0",
