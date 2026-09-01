@@ -204,7 +204,11 @@ in two weeks a failed run named its own cause.
   `tool_search`, the search disclosed the exact write — and the host terminalized right after that
   success: every write disclosure collapsed to ONE effect token, already spent by the first broad
   search's three unrelated writes. Each distinct exact write ref is now its own bounded effect gain
-  (`host-no-progress-projection.ts`, pin added). Attempt 10 runs on all of it.
+  (`host-no-progress-projection.ts`, pin added); (10) with the write disclosed, every `plan_task` was
+  refused `schema_too_big:goal.objective (<=8000)` — the objective is host-composed from the accepted
+  source (a 51 KB brief), nothing the model drafts can shrink it, and a pasted document in chat hits the
+  same wall. `boundedSemanticObjective()` projects the source into the budget (whitespace cut + a marker
+  naming the omitted count; the source event stays the authority). Attempt 11 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
