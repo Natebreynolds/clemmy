@@ -218,8 +218,13 @@ in two weeks a failed run named its own cause.
   and refused its own persist as `internal_error` (a blanket catch in `turn-graph-shadow.ts`, nothing
   naming the cause), told the model `recoveryTool: retry_host`, and the model called
   `call_tool({name:'retry_host'})`. The cause now goes to the log (the reason vocabulary stays closed);
-  the repair text and the directive spell the only walkable edge: `plan_task` again, identical. Attempt 13
-  runs to capture the cause.
+  the repair text and the directive spell the only walkable edge: `plan_task` again, identical;
+  (13) before reaching the persist again, four zero-gain `tool_search` calls for `sf org display` (no
+  reviewed read exists; the catalog answered `salesforce_sf_soql_query` every time) spent the ONE clean
+  retry — the same floor that killed attempts 3 and 4. `NO_PROGRESS_RETRY_BUDGET` is now a counter of
+  three (17 pins re-paced; checkpoint parse restores older checkpoints as fresh; the loop floor and the
+  typed-stage budget are unchanged), and the brief says that the same nearest operation twice means no
+  closer match exists. Attempt 14 runs on all of it.
 
 ### Declared state at the tip
 - Full isolated suite (`npm test` at `a6248874`, daemon stopped, zero owners of `harness.db` during the
