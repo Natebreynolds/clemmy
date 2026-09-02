@@ -62,3 +62,29 @@ test('the args alias is renamed to args_json so the work_call schema accepts it'
   assert.equal('args' in outer, false);
   assert.equal(typeof outer.args_json, 'string');
 });
+
+test('a doubled toolkit prefix on a proven operation is completed to that operation; an unknown slug is left for the exact refusal', () => {
+  const proven = [
+    { kind: 'composio', identifier: 'OUTLOOK_LIST_EVENTS', effectClass: 'read' },
+    { kind: 'composio', identifier: 'OUTLOOK_SEND_EMAIL', effectClass: 'write' },
+  ];
+  // The live standup step (2026-09-02): the model wrote OUTLOOK_OUTLOOK_SEND_EMAIL
+  // twice against a step whose prepared catalog held OUTLOOK_SEND_EMAIL.
+  const stuttered = JSON.stringify({
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'nate@example.com', subject: 'Daily Standup', body: 'x' }) }),
+  });
+  const completed = completeComposioCarrierArguments(stuttered, proven);
+  assert.ok(completed);
+  assert.equal(completed!.toolSlug, 'OUTLOOK_SEND_EMAIL');
+  assert.match(completed!.changes.join(' | '), /collapsed to the proven operation OUTLOOK_SEND_EMAIL/);
+  const inner = JSON.parse((JSON.parse(completed!.argumentsJson) as { args_json: string }).args_json) as { tool_slug: string; arguments: string };
+  assert.equal(inner.tool_slug, 'OUTLOOK_SEND_EMAIL');
+  assert.equal(JSON.parse(inner.arguments).subject, 'Daily Standup');
+  // A slug that is not a stutter of a proven operation is not guessed.
+  const unknown = JSON.stringify({
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({ tool_slug: 'OUTLOOK_OUTLOOK_CREATE_DRAFT', arguments: '{}' }),
+  });
+  assert.equal(completeComposioCarrierArguments(unknown, proven), null);
+});

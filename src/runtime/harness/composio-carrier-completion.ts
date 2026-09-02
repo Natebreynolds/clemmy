@@ -55,6 +55,12 @@ export function completeComposioCarrierArguments(
 
   const changes: string[] = [];
   let toolSlug = typeof inner.tool_slug === 'string' ? inner.tool_slug.trim() : '';
+  const provenIdentifiers = new Set(
+    provenEntries
+      .filter((entry) => entry.kind === 'composio' && typeof entry.identifier === 'string')
+      .map((entry) => entry.identifier.trim().toUpperCase())
+      .filter(Boolean),
+  );
   if (!toolSlug) {
     const provenReads = [...new Set(
       provenEntries
@@ -65,6 +71,16 @@ export function completeComposioCarrierArguments(
     if (provenReads.length !== 1) return null;
     toolSlug = provenReads[0]!;
     changes.push(`tool_slug bound to ${toolSlug}, the only operation proven this turn`);
+  } else if (!provenIdentifiers.has(toolSlug.toUpperCase())) {
+    // A doubled toolkit prefix (OUTLOOK_OUTLOOK_SEND_EMAIL for the proven
+    // OUTLOOK_SEND_EMAIL) names the proven operation with one stutter; the
+    // host completes it exactly as it completes a missing slug. Anything
+    // else is left for the exact refusal — no fuzzy matching.
+    const collapsed = toolSlug.toUpperCase().replace(/^([A-Z0-9]+)_\1_/, '$1_');
+    if (collapsed !== toolSlug.toUpperCase() && provenIdentifiers.has(collapsed)) {
+      changes.push(`tool_slug ${toolSlug} collapsed to the proven operation ${collapsed}`);
+      toolSlug = collapsed;
+    }
   }
 
   let argumentsValue: unknown;

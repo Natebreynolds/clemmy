@@ -3617,9 +3617,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // category ("capability, effect, account, schema, or invoke binding")
       // and no door; the model retried until the governor exhausted. Name the
       // one walkable edge for each effect class.
+      // A sealed workflow step has no plan_task door: its operations were
+      // proven into the frame before the model spoke. Name THOSE, so a wrong
+      // slug (a stuttered provider prefix on a prepared operation, 2026-09-02)
+      // is repaired on the next call instead of walking the model into a
+      // chat-lane ritual it cannot perform.
+      const provenOperations = boundOperations.length > 0
+        ? []
+        : [...new Set(
+            provenCapabilityEntriesForTurn({
+              sessionId: refusalIdentity.sessionId,
+              sourceUserSeq: refusalIdentity.sourceUserSeq,
+            })
+              .filter((entry) => typeof entry.identifier === 'string')
+              .map((entry) => entry.identifier.trim().toUpperCase())
+              .filter((operationId) => operationId && operationId !== name.toUpperCase()),
+          )];
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
-        : ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that is the door for a write no plan has bound. If it only reads: call tool_search and retry with the exact operation name it returns.';
+        : provenOperations.length > 0
+          ? ` The operations proven for this step are: ${provenOperations.join(', ')}. Use one of those exactly, with tool_slug spelled exactly as listed.`
+          : ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that is the door for a write no plan has bound. If it only reads: call tool_search and retry with the exact operation name it returns.';
       const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
       if (literalOperation) {
         return `Tool '${name}' was refused before dispatch because this step names the operation ${literalOperation} but the host did not provision it into this run's frozen catalog. Failed check: ${lastExactProductionMiss}. This is a host provisioning fault, not an argument error: no correction or substitute capability can be dispatched, and no local or external mutation was attempted.`;

@@ -804,7 +804,7 @@
           "bytes": 1131
         },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 4353
+          "bytes": 5234
         },
         "src/runtime/harness/carrier-completion.ts": {
           "bytes": 854
@@ -2214,7 +2214,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 314457
+          "bytes": 315516
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3291,7 +3291,7 @@
           "bytes": 1131
         },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 4353
+          "bytes": 5234
         },
         "src/runtime/harness/carrier-completion.ts": {
           "bytes": 854
@@ -4701,7 +4701,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 314457
+          "bytes": 315516
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
