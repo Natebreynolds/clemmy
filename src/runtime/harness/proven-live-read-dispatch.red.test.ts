@@ -26,6 +26,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
 const HOST = new URL('./host-turn-runner.ts', import.meta.url);
+const FACTORY = new URL('./host-capability-catalog-factory.ts', import.meta.url);
 const EFFECT = new URL('./tool-effect.ts', import.meta.url);
 const IDENTITY = new URL('./runtime-tool-identity.ts', import.meta.url);
 
@@ -48,8 +49,8 @@ test('NEGATIVE: native MCP, Composio, and catalog Sheets-read spellings are one 
 test('NEGATIVE: live-read dispatch does not require the name classifier to say read', () => {
   const src = readFileSync(HOST, 'utf8');
   const liveBlock = src.slice(
-    src.indexOf('const liveProvenReadEntry = candidates.length === 0'),
-    src.indexOf('const liveReadDiscoveryMatches'),
+    src.indexOf('const provenReadCandidate = candidates.length === 0'),
+    src.indexOf('// G2 (gate 10)'),
   );
   assert.doesNotMatch(
     liveBlock,
@@ -57,7 +58,6 @@ test('NEGATIVE: live-read dispatch does not require the name classifier to say r
     'a proven live read must not wait on the spelling classifier',
   );
   assert.match(liveBlock, /resolveProvenLiveReadCatalogEntry/);
-  assert.match(src, /liveReadEntryDispatchable/);
   assert.match(src, /catalogOperationIdentitiesEqual/);
 });
 
@@ -65,13 +65,13 @@ test('re-break (i): the old live-read path was gated on decision.effect === read
   const src = readFileSync(HOST, 'utf8');
   assert.match(
     src,
-    /const liveProvenReadEntry = candidates.length === 0/,
+    /const provenReadCandidate = candidates.length === 0/,
     'a snapshot miss opens the live-read path',
   );
   assert.doesNotMatch(
     src.slice(
-      src.indexOf('const liveProvenReadEntry = candidates.length === 0'),
-      src.indexOf('const liveReadDiscoveryMatches'),
+      src.indexOf('const provenReadCandidate = candidates.length === 0'),
+      src.indexOf('// G2 (gate 10)'),
     ),
     /&& readDescent/,
     'a worker session has no same-turn proof and must still bind a current live read',
@@ -92,18 +92,31 @@ test('re-break (i): the old live-read path was gated on decision.effect === read
   );
 });
 
-test('re-break (ii): live proven reads must not reuse the frozen-snapshot byte match', () => {
+// THE READ BAR (2026-09-01): the write bar's identity arithmetic must never
+// come back onto the read path. Each guard below names the live read it killed.
+test('re-break (ii): the read path carries no write-bar identity replay', () => {
   const src = readFileSync(HOST, 'utf8');
-  const candidate = src.slice(
-    src.indexOf('const provenReadCandidate = liveProvenReadEntry'),
+  const exact = src.slice(
+    src.indexOf('const exactProductionHostCall = ('),
     src.indexOf("const dispatchEffect: HostCallAttestation['effect'] | null"),
   );
+  assert.doesNotMatch(exact, /liveReadDiscoveryMatches/, 'nine-digest discovery replay (sess-mob-416706)');
+  assert.doesNotMatch(exact, /planningReadMatches/, 'planning-card digest replay');
+  assert.doesNotMatch(exact, /liveReadEntryDispatchable/, 'a second read predicate beside the catalog\'s own');
   assert.doesNotMatch(
-    candidate,
-    /exactEntryMatches\(liveProvenReadEntry\)/,
+    src.slice(src.indexOf('const provenReadCandidate = candidates.length === 0'), src.indexOf('// G2 (gate 10)')),
+    /exactEntryMatches\(/,
     'byte-identical operationId is the write bar, not the live-read bar',
   );
-  assert.match(candidate, /liveReadEntryDispatchable\(liveProvenReadEntry\)/);
+  const factory = readFileSync(FACTORY, 'utf8');
+  const resolver = factory.slice(
+    factory.indexOf('export function resolveProvenLiveReadCatalogEntry'),
+    factory.indexOf('export function resolveRuntimeCapabilityCatalog'),
+  );
+  assert.doesNotMatch(resolver, /installed\.digest|\.digest !== entry\.manifestDigest/, 'durable-store digest identity (SLACK history, 09-01)');
+  assert.doesNotMatch(resolver, /sameLineageFamily|:definition:/, 'lineage occupancy arithmetic (BATCH_GET, 08-29)');
+  assert.match(resolver, /lifecycle\.state !== 'revoked'/, 'a disconnect still refuses');
+  assert.match(resolver, /entry\.manifest\.effect === 'read'/, 'the sealed manifest is the effect authority');
 });
 
 test('re-break: namespaced MCP consults the catalog before fail-closed write', () => {

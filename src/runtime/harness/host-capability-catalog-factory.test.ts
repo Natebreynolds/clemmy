@@ -378,7 +378,9 @@ test('account-bound direct read resolution never transplants a legacy base from 
   installHostCapabilityCatalogFactory(null);
 });
 
-test('duplicate current identities in one exact account lineage fail closed', () => {
+test('two current rows of one read in one account are one operation: the proven id wins, else the first', () => {
+  // THE READ BAR (2026-09-01): occupancy is not ambiguity for a read. Live
+  // workflow:1788024507349 refused two transports of one read as a write.
   const operationId = 'FIXTURE_LIST_DUPLICATES';
   const baseId = 'cap:resolved:fixture_list_duplicates';
   const first = batchGetRead(baseId, operationId, 'acct-one');
@@ -389,11 +391,24 @@ test('duplicate current identities in one exact account lineage fail closed', ()
     capabilityId: baseId,
     effectiveName: operationId,
     accountIdentity: 'acct-one',
-  }), null);
+  })?.capabilityId, baseId);
+  assert.equal(resolveProvenLiveReadCatalogEntry({
+    capabilityId: duplicate.capabilityId,
+    effectiveName: operationId,
+    accountIdentity: 'acct-one',
+  })?.capabilityId, duplicate.capabilityId);
+  assert.equal(resolveProvenLiveReadCatalogEntry({
+    capabilityId: 'cap:resolved:something_else',
+    effectiveName: operationId,
+    accountIdentity: 'acct-one',
+  })?.capabilityId, baseId, 'no proven id: the first by id');
   installHostCapabilityCatalogFactory(null);
 });
 
-test('a superseded base with an uncallable successor cannot resolve or bind through its stale copy', () => {
+test('superseded is not revoked: a callable current row still serves a read; a revoked one does not', () => {
+  // THE READ BAR (2026-09-01): the durable store's lineage state was the write
+  // bar (exact-artifact identity) applied to reads; SLACK history died on it.
+  // Only a disconnect (revoked) refuses a read. Graph BINDING keeps its bar.
   const operationId = 'FIXTURE_LIST_STALE';
   const baseId = 'cap:resolved:fixture_list_stale';
   const base = batchGetRead(baseId, operationId, 'acct-stale');
@@ -407,7 +422,7 @@ test('a superseded base with an uncallable successor cannot resolve or bind thro
     capabilityId: baseId,
     effectiveName: operationId,
     accountIdentity: 'acct-stale',
-  }), null);
+  })?.capabilityId, baseId, 'superseded lineage state does not refuse a read');
   assert.equal(factory.catalog().bind({
     node: {
       id: 'read-stale',
@@ -418,7 +433,13 @@ test('a superseded base with an uncallable successor cannot resolve or bind thro
     },
     graph: { effectCeiling: 'read' } as never,
     acceptedText: 'read the fixture',
-  }), null);
+  }), null, 'graph binding keeps its exact-identity bar');
+  assert.equal(store.revoke(baseId), true);
+  assert.equal(resolveProvenLiveReadCatalogEntry({
+    capabilityId: baseId,
+    effectiveName: operationId,
+    accountIdentity: 'acct-stale',
+  }), null, 'a revoked manifest (disconnect) refuses');
   installHostCapabilityCatalogFactory(null);
   installCapabilityManifestStore(null);
 });

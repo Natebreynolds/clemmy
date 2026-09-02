@@ -582,16 +582,27 @@ export function accountPartitionedResolvedCapabilityId(
 }
 
 /**
- * Reopen one current callable READ for a same-turn proven descent.
+ * THE READ BAR.
  *
- * Live 2026-08-29 mobile sheet read: the classifier saw two current
- * GOOGLESHEETS_BATCH_GET rows (Composio + native spelling), fail-closed as
- * write, and factory.get(cap:resolved:googlesheets_batch_get) missed because
- * the live catalog only held a :definition: successor. Desktop and mobile
- * share host_v1; this is catalog occupancy, not a lane. Writes stay on the
- * frozen snapshot. Duplicate current reads of the same operation+account
- * (two transports) are one operation — pick the proven successor, else the
- * unique account match.
+ * A proven read binds on three facts and nothing else: the sealed manifest
+ * says read, the row is a current callable catalog entry for that operation,
+ * and — when the proof names an account — it is that account. Only a REVOKED
+ * manifest (a disconnect) still refuses.
+ *
+ * Everything this function used to check beyond that was the WRITE bar
+ * (durable-store digest identity, lineage occupancy, successor arithmetic)
+ * applied to reads, and each of those checks killed a live read this
+ * fortnight: 2026-08-29 GOOGLESHEETS_BATCH_GET (two current spellings),
+ * workflow:1788024507349 (two transports of one read), 2026-09-01
+ * SLACK_FETCH_CONVERSATION_HISTORY (store digest drift). A read has no
+ * idempotency key, no reconciliation, no exact artifact: there is nothing
+ * for that identity arithmetic to protect. Owner, 2026-09-01: "simplify read
+ * vs write once and for all".
+ *
+ * Two current rows for one operation in one account are two transports of
+ * one read: the proven capability id wins, else the first by id. Several
+ * accounts with no proof of which one is the only ambiguity left, and that
+ * is an input question, not a catalog one.
  */
 export function resolveProvenLiveReadCatalogEntry(input: {
   capabilityId: string;
@@ -602,78 +613,28 @@ export function resolveProvenLiveReadCatalogEntry(input: {
   if (!factory || !input.effectiveName.trim()) return null;
   const store = peekCapabilityManifestStore();
   const account = input.accountIdentity?.trim() || null;
-  const baseIdent = input.capabilityId.replace(/^cap:resolved:/, '').split(':definition:')[0] ?? '';
-  const baseId = `cap:resolved:${baseIdent}`;
-  const sameLineageFamily = (entry: RegisteredHostCapability): boolean => (
-    entry.capabilityId === baseId
-    || entry.capabilityId.startsWith(`${baseId}:definition:`)
-  );
-  const dispatchable = (
-    entry: RegisteredHostCapability | undefined | null,
-  ): entry is RegisteredHostCapability & {
-    manifest: import('./capability-manifest.js').CapabilityManifestV1;
-    manifestDigest: string;
-  } => {
-    if (!entry || !isCurrentCallableCatalogEntry(entry)) return false;
-    const installed = store?.get(entry.capabilityId);
-    if (store && (
-      installed?.manifest.lifecycle.state !== 'current'
-      || installed.digest !== entry.manifestDigest
-    )) return false;
-    return entry.effect === 'read'
+  const reads = factory.snapshot()
+    .filter((entry): entry is RegisteredHostCapability & {
+      manifest: import('./capability-manifest.js').CapabilityManifestV1;
+      manifestDigest: string;
+    } => (
+      isCurrentCallableCatalogEntry(entry)
+      && entry.effect === 'read'
       && entry.manifest.effect === 'read'
+      && store?.get(entry.capabilityId)?.manifest.lifecycle.state !== 'revoked'
       && (
         catalogOperationIdentitiesEqual(entry.manifest.operationId, input.effectiveName)
         || catalogOperationIdentitiesEqual(entry.toolName, input.effectiveName)
-      );
-  };
-  const currentReads = factory.snapshot().filter((entry) => (
-    dispatchable(entry)
-    && (
-      catalogOperationIdentitiesEqual(entry.manifest.operationId, input.effectiveName)
-      || catalogOperationIdentitiesEqual(entry.toolName, input.effectiveName)
-    )
-  ));
-  const accountReads = account
-    ? currentReads.filter((entry) => entry.account === account)
-    : currentReads;
-  const exactAccountLineage = accountReads.filter(sameLineageFamily);
-  if (account && exactAccountLineage.length > 1) return null;
-  const direct = factory.get(input.capabilityId);
-  if (
-    dispatchable(direct)
-    && (!account || direct.account === account)
-    && (!account || !sameLineageFamily(direct) || exactAccountLineage.length === 1)
-  ) return direct;
-  const resolvedId = canonicalResolvedCapabilityId(
-    baseIdent || input.effectiveName.trim().toLowerCase(),
-    input.accountIdentity,
-  );
-  const resolved = factory.get(resolvedId);
-  if (
-    dispatchable(resolved)
-    && (!account || resolved.account === account)
-    && (!account || !sameLineageFamily(resolved) || exactAccountLineage.length === 1)
-  ) return resolved;
-  const prefix = `cap:resolved:${baseIdent}`;
-  const byProven = accountReads.filter((entry) => (
-    entry.capabilityId === input.capabilityId
-    || entry.capabilityId === prefix
-    || entry.capabilityId.startsWith(`${prefix}:`)
-  ));
-  if (byProven.length === 1) return byProven[0]!;
-  if (account) {
-    if (exactAccountLineage.length === 1) return exactAccountLineage[0]!;
-    if (accountReads.length === 1) return accountReads[0]!;
-    return null;
-  }
-  if (currentReads.length === 1) return currentReads[0]!;
-  const accounts = [...new Set(currentReads.map((entry) => entry.account ?? ''))];
-  // One connected account, two transports of the same read: one operation.
-  // A worker session has no capability_resolution proof (live
-  // workflow:1788024507349, proven=none) and must still bind.
-  if (accounts.length <= 1 && currentReads.length > 0) return currentReads[0]!;
-  return null;
+      )
+      && (!account || entry.account === account)
+    ))
+    .sort((left, right) => left.capabilityId.localeCompare(right.capabilityId));
+  if (reads.length === 0) return null;
+  const proven = reads.find((entry) => entry.capabilityId === input.capabilityId);
+  if (proven) return proven;
+  if (account) return reads[0]!;
+  const accounts = new Set(reads.map((entry) => entry.account ?? ''));
+  return accounts.size === 1 ? reads[0]! : null;
 }
 
 export function resolveRuntimeCapabilityCatalog(

@@ -284,7 +284,6 @@ import {
 } from './logical-model-result-projection-receipt.js';
 import {
   AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
-  currentLiveReadPlanningDefinitionFromEntry,
 } from './live-read-planning-authority.js';
 import {
   evaluateQuantifiedWorkManifestGate,
@@ -3127,41 +3126,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         && canonical.invokePortId === manifest.invokePortId
       );
     };
-    // LIVE-READ identity: the catalog entry is the effect authority, not the
-    // model's spelling or a fail-closed name classifier. Writes still require
-    // the frozen-snapshot nine-way match above. A previously observed current
-    // catalog read was refused when a conservative name classifier disagreed
-    // with its sealed effect and the model used an alternate tool spelling.
-    const liveReadEntryDispatchable = (entry: RegisteredHostCapability): boolean => {
-      const manifest = currentCapabilityManifest(entry.manifest);
-      const canonical = canonicalCatalogIdentityOf(entry);
-      return Boolean(
-        manifest
-        && canonical
-        && isCurrentCallableCatalogEntry(entry)
-        && entry.effect === 'read'
-        && manifest.effect === 'read'
-        && entry.schemaDigest === manifest.definitionFingerprint
-        && entry.manifestDigest === capabilityManifestDigest(manifest)
-        && (entry.account ?? manifest.accountId) === manifest.accountId
-        && canonical.invokePortId === manifest.invokePortId
-        && (
-          catalogOperationIdentitiesEqual(manifest.operationId, effectiveName)
-          || catalogOperationIdentitiesEqual(entry.toolName, effectiveName)
-        )
-      );
-    };
     const candidates = decision.effect === 'unknown'
       ? []
       : surface.snapshot.entries.filter(exactEntryMatches);
     if (candidates.length > 1) return miss('catalog_snapshot_ambiguous');
-    // READ-FAST-PATH (2026-08-26 gauntlet, hole 12): before plan activation
-    // the frozen host surface is deliberately graph-neutral/empty, which made
-    // every read-effect provider call structurally undispatchable — the model
-    // could not even LOOK at the target it must plan against. A read whose
-    // exact operation this turn PROVED may bind the LIVE proof-provisioned
-    // catalog entry instead. Frozen-snapshot membership remains the WRITE bar.
-    const liveProvenReadEntry = candidates.length === 0
+    // THE READ BAR (owner 2026-09-01: "simplify read vs write once and for
+    // all"). A snapshot miss opens the read path: the current callable read
+    // for this operation — and, when the proof names one, this account —
+    // binds. The frozen snapshot, byte-identical spelling, the discovery
+    // record's nine digests and the planning card's manifest digest are the
+    // WRITE bar (idempotency, reconciliation, exact artifact); replayed onto
+    // reads they refused GOOGLESHEETS_BATCH_GET (08-29), two transports of one
+    // read (workflow:1788024507349) and SLACK_FETCH_CONVERSATION_HISTORY
+    // (09-01) that the host had itself just proved. A worker session with no
+    // same-turn proof still binds its current catalog read.
+    const provenReadCandidate = candidates.length === 0
       ? resolveProvenLiveReadCatalogEntry({
           capabilityId: readDescent?.capabilityId
             ?? canonicalResolvedCapabilityId(effectiveName.trim().toLowerCase()),
@@ -3169,35 +3148,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           accountIdentity: readDescent?.accountIdentity
             ?? readDescent?.liveReadDiscovery?.accountIdentity,
         }) ?? undefined
-      : undefined;
-    const liveReadDiscoveryMatches = liveProvenReadEntry && readDescent?.liveReadDiscovery
-      ? (() => {
-          const manifest = currentCapabilityManifest(liveProvenReadEntry.manifest);
-          const definition = currentLiveReadPlanningDefinitionFromEntry(liveProvenReadEntry);
-          const nomination = readDescent.liveReadDiscovery;
-          return Boolean(
-            manifest
-            && definition
-            && liveProvenReadEntry.manifestDigest === nomination.manifestDigest
-            && capabilityManifestDigest(manifest) === nomination.manifestDigest
-            && manifest.providerKind === nomination.providerKind
-            && manifest.accountId === nomination.accountIdentity
-            && definition.providerInputSchemaDigest === nomination.providerInputSchemaDigest
-            && definition.definitionFingerprint === nomination.definitionFingerprint
-            && definition.providerOperationVersion === nomination.providerOperationVersion
-            && definition.providerOutputSchemaDigest === nomination.providerOutputSchemaDigest
-            && definition.invokePortId === nomination.invokePortId
-          );
-        })()
-      : true;
-    const planningReadMatches = liveProvenReadEntry && readDescent?.planningManifestDigest
-      ? liveProvenReadEntry.manifestDigest === readDescent.planningManifestDigest
-      : true;
-    const provenReadCandidate = liveProvenReadEntry
-      && liveReadDiscoveryMatches
-      && planningReadMatches
-      && liveReadEntryDispatchable(liveProvenReadEntry)
-      ? liveProvenReadEntry
       : undefined;
     // G2 (gate 10): the accepted source literally named this operation (a
     // workflow step's own catalog scope), yet it is neither in the frozen

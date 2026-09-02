@@ -2211,7 +2211,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 315768
+          "bytes": 313176
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2460,7 +2460,7 @@
           "bytes": 316020
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
-          "bytes": 44364
+          "bytes": 42837
         },
         "src/runtime/harness/current-manifest-operation-semantics.ts": {
           "bytes": 3283
@@ -4695,7 +4695,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 315768
+          "bytes": 313176
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4944,7 +4944,7 @@
           "bytes": 316020
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
-          "bytes": 44364
+          "bytes": 42837
         },
         "src/runtime/harness/current-manifest-operation-semantics.ts": {
           "bytes": 3283
