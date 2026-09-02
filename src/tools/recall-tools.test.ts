@@ -101,7 +101,12 @@ test('recall_tool_result pages with offset and signals when more remains', async
   );
   const t1 = page1.content[0].text;
   assert.match(t1, /Recalled chars 0.30000 of 50000/);
-  assert.match(t1, /more remains.*offset: 30000/);
+  // The paging signal must name the EXACT next call, not just "more remains".
+  // A model that has to reconstruct the call guesses offsets, and blind paging
+  // spends a turn per slice while crediting no business progress until the
+  // no-progress governor ends the run (live platform-49 run, 2026-09-02).
+  assert.match(t1, /more remains/);
+  assert.match(t1, /recall_tool_result \{"call_id":"call_page","offset":30000\}/);
 
   const page2 = await withHarnessRunContext(
     { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
@@ -293,6 +298,32 @@ test('budget exhaustion is unmistakably an ERROR string, never parseable-looking
   // The recall tool prefixes this with "ERROR: " — pin the contract there via
   // the returned message shape used by the tool handler.
   assert.match(`ERROR: ${err}`, /^ERROR: recall budget exhausted/);
+});
+
+test('a recall budget refusal hands back the exact next call, never prose only', async () => {
+  // Live platform-49 run 2026-09-02: the refusal said only "proceed with the
+  // summary or split work into a new turn". The budget resets per turn, so the
+  // model re-recalled, exhausted it again, and burned the no-progress governor
+  // -- 19 recalls, zero business calls, the sheet never touched. A gate the
+  // model cannot get through is a defect, so both refusals must name
+  // tool_output_query AND carry the exact call_id to use.
+  const callBudget = new RecallBudget(1, 60_000);
+  assert.equal(callBudget.consume(100, 'call_abc123'), null, 'first call fits');
+  const callErr = callBudget.consume(100, 'call_abc123');
+  assert.ok(callErr, 'second call exhausts the call budget');
+  assert.match(callErr, /tool_output_query \{"call_id":"call_abc123"\}/);
+  assert.match(callErr, /Do NOT retry recall_tool_result/);
+
+  const byteBudget = new RecallBudget(9, 150);
+  const byteErr = byteBudget.consume(200, 'call_xyz789');
+  assert.ok(byteErr, 'an oversized slice exhausts the byte budget');
+  assert.match(byteErr, /^recall byte budget exhausted/);
+  assert.match(byteErr, /tool_output_query \{"call_id":"call_xyz789"\}/);
+
+  // Without a call_id the refusal still points at the tool rather than dead-ending.
+  const bare = new RecallBudget(0, 60_000).consume(10);
+  assert.ok(bare);
+  assert.match(bare, /tool_output_query with that same call_id/);
 });
 
 test('tool_output_query unwraps provider-wrapped records — the 2026-07-31 calendar-run class', async () => {

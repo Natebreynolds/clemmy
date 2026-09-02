@@ -1127,16 +1127,38 @@ export class RecallBudget {
    * Returns null if budget remains; otherwise an error message the
    * recall tool can return to the agent.
    */
-  consume(returnBytes: number): string | null {
+  consume(returnBytes: number, callId?: string): string | null {
     if (this.calls + 1 > this.maxCalls) {
-      return `recall budget exhausted this turn (max ${this.maxCalls} calls). Proceed with the summary or split work into a new turn.`;
+      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId)}`;
     }
     if (this.bytes + returnBytes > this.maxBytes) {
-      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). Recall a smaller slice or proceed with the summary.`;
+      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId)}`;
     }
     this.calls += 1;
     this.bytes += returnBytes;
     return null;
+  }
+
+  /**
+   * A budget refusal must hand back a way THROUGH, not just a stop.
+   *
+   * Retrying recall cannot succeed — the budget resets per turn, so a model
+   * that only hears "proceed or split the work" re-recalls on the next turn,
+   * exhausts it again, and burns the no-progress governor instead of the
+   * task (live platform-49 run, 2026-09-02: 19 recalls, zero business calls,
+   * a governor stop, and the sheet never touched). `tool_output_query` reads
+   * the SAME retained output, is not clipped to this tool's per-call slice,
+   * and spends none of this budget — so it is the exact next call, not a
+   * suggestion to give up.
+   */
+  private wayThrough(callId?: string): string {
+    const exact = callId
+      ? `tool_output_query {"call_id":"${callId}"}`
+      : 'tool_output_query with that same call_id';
+    return `Do NOT retry recall_tool_result — it will refuse again this turn. `
+      + `Call ${exact} instead: it queries the SAME stored output server-side, `
+      + `is not limited to this tool's per-call slice, and spends no recall budget. `
+      + `Only if that cannot answer it, proceed with what you already have.`;
   }
 
   snapshot(): { calls: number; bytes: number; maxCalls: number; maxBytes: number } {

@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
 import { extractCompleteJsonObjects, extractJsonCandidate } from '../runtime/harness/json-repair.js';
@@ -27,7 +28,28 @@ import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
  * rather than throwing — the agent can pivot without aborting the turn.
  */
 
-const DEFAULT_RECALL_MAX_CHARS = 30_000;
+/**
+ * Per-call slice, scaled to the routed brain's context window.
+ *
+ * A fixed 30KB slice is a long-horizon cliff: paging one large parked payload
+ * costs a tool call per 30KB, those calls credit no business progress, and the
+ * no-progress governor ends the run before the work starts (live platform-49
+ * run 2026-09-02: 19 recalls, zero business calls, the sheet never touched).
+ * A 1M-window brain can hold far more than 30KB per step, so the slice now
+ * rides the same window scale the recall BUDGET already uses rather than
+ * pinning every model to the smallest one's ceiling.
+ */
+const BASE_RECALL_MAX_CHARS = 30_000;
+/** Schema bound: BASE × the maximum window scale (4). Static so the tool
+ *  contract — and therefore the prompt cache — never churns per model. */
+const RECALL_MAX_CHARS_CEILING = 120_000;
+
+function recallSliceCeiling(routedModelId?: string): number {
+  return Math.min(
+    RECALL_MAX_CHARS_CEILING,
+    Math.max(BASE_RECALL_MAX_CHARS, Math.round(BASE_RECALL_MAX_CHARS * windowScaleForModel(routedModelId))),
+  );
+}
 
 // Cap a single tool_output_query response. The store now holds up to 2MB, and
 // tool_output_query intentionally bypasses the digest clip (it returns exactly
@@ -59,9 +81,9 @@ export const RECALL_TOOL_RESULT_SHAPE = {
     .number()
     .int()
     .min(100)
-    .max(DEFAULT_RECALL_MAX_CHARS)
+    .max(RECALL_MAX_CHARS_CEILING)
     .optional()
-    .describe('Optional cap on the returned slice. Defaults to 30000.'),
+    .describe('Optional cap on the returned slice. Defaults to the largest slice this brain\'s context window allows.'),
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
@@ -108,20 +130,20 @@ export function registerRecallTools(server: McpServer): void {
     [
       'Read the full verbatim output of a prior tool call by its call_id — whenever a `[clipped: …]` stub or `[digest: …]` footer names a call_id and you need a detail the shortened view dropped.',
       'Always available inside a turn; the payload is stored losslessly, so never say the data is unavailable — call this.',
-      'Returns up to 30KB per call from `offset` (default 0); the header names the next offset when more remains. Per-turn budget: 3 calls / 60KB.',
+      'Returns one slice per call from `offset` (default 0), sized to this brain\'s context window; the header names the next offset when more remains and the exact call to continue.',
       `Input is ONE JSON object, e.g. ${toolCallHint('recall_tool_result', { call_id: 'call_abc123' })}.`,
     ].join(' '),
     RECALL_TOOL_RESULT_SHAPE,
     async (input: Record<string, unknown>) => {
       const callId = String(input.call_id ?? '');
+      const ctx = harnessRunContextStorage.getStore();
+      const sliceCeiling = recallSliceCeiling(ctx?.routedModelId);
       const maxChars = Number.isFinite(input.max_chars as number)
-        ? Math.min(DEFAULT_RECALL_MAX_CHARS, Math.max(100, Math.trunc(input.max_chars as number)))
-        : DEFAULT_RECALL_MAX_CHARS;
+        ? Math.min(sliceCeiling, Math.max(100, Math.trunc(input.max_chars as number)))
+        : sliceCeiling;
       const offset = Number.isFinite(input.offset as number)
         ? Math.max(0, Math.trunc(input.offset as number))
         : 0;
-
-      const ctx = harnessRunContextStorage.getStore();
       if (!ctx?.sessionId) {
         return textResult(
           'recall_tool_result is only available within a harness-managed turn. (No active session context.)',
@@ -150,7 +172,7 @@ export function registerRecallTools(server: McpServer): void {
 
       // Budget check — only when a HarnessRunContext provided one.
       if (ctx.recallBudget) {
-        const err = ctx.recallBudget.consume(sliceBytes);
+        const err = ctx.recallBudget.consume(sliceBytes, callId);
         // Unmistakably an ERROR, never data (live 2026-07-24: a program
         // JSON.parsed the bare budget message and called good data malformed).
         if (err) return textResult(`ERROR: ${err}`);
@@ -162,7 +184,19 @@ export function registerRecallTools(server: McpServer): void {
         row.tool ? `tool=${row.tool}` : null,
         `recorded at ${row.createdAt}`,
         end < total
-          ? `(more remains — call again with offset: ${end} to continue)`
+          // Name the EXACT next call. A model that has to reconstruct it
+          // guesses offsets, and blind paging spends a turn per slice while
+          // crediting no business progress until the governor ends the run.
+          ? `(more remains — continue with recall_tool_result {"call_id":"${callId}","offset":${end}}`
+            // When a lot is left, paging is the wrong instrument entirely:
+            // tool_output_query answers over the SAME stored output instead of
+            // walking it a slice at a time.
+            + ((total - end) > maxChars * 2
+              ? `; that is ~${Math.ceil((total - end) / maxChars)} more slices, so if you need an ANSWER rather than `
+                + `the raw text, tool_output_query {"call_id":"${callId}"} reads the same stored output server-side `
+                + `and does not page`
+              : '')
+            + ')'
           : null,
       ]
         .filter(Boolean)
