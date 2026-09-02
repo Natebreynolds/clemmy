@@ -141,7 +141,11 @@ const FAILURE_STATUS_VOCAB = new Set([
   'error',
   'errored',
   'not_deployed',
-  'blocked',
+  // 'blocked' is deliberately NOT here: a step that blocks itself says
+  // `blocked: true` (detected first, above). A RECORD whose status is
+  // "blocked" — a goal, a deal stage, a ticket — is the step's data. Treating
+  // it as a self-report marked weekly-review's honest "1 goal, blocked since
+  // July" assessment as a failed step (2026-09-02).
 ]);
 const STATUS_KEY_RE = /^[a-z0-9]*status$/i;
 

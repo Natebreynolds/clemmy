@@ -175,3 +175,21 @@ test('mixed run: explicit block is Doctor-eligible, polite failure is not', () =
   const doctorEligible = out.filter((o) => o.kind === 'blocked');
   assert.deepEqual(doctorEligible.map((o) => o.stepId), ['a']);
 });
+
+test('a record whose status is "blocked" is the step\'s data, not the step blocking itself', () => {
+  // weekly-review assess_goals, 2026-09-02: one goal, honestly reported as
+  // blocked since July. The step did its job; the goal is blocked.
+  const out = detectBlockedSteps({
+    assess_goals: [{
+      id: '249a2309',
+      title: 'Ship the observability panel this week',
+      status: 'blocked',
+      blocker: 'Waiting on answer to check-in chk-5fe33c54; past due (2026-07-04)',
+      nextActions: ['Answer the check-in or close the goal'],
+    }],
+  });
+  assert.deepEqual(out, []);
+  // The step's own block and its own failure words still count.
+  assert.equal(detectBlockedSteps({ s: [{ id: 'row-3', blocked: true, reason: 'no sheet' }] })[0]?.kind, 'self_reported_failure');
+  assert.equal(detectBlockedSteps({ s: [{ id: 'row-3', status: 'failed', error: 'timeout' }] })[0]?.kind, 'self_reported_failure');
+});
