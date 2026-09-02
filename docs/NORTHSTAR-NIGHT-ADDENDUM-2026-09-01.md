@@ -718,3 +718,21 @@ That is a prompt-level change with behavior pins to re-verify; decision owed, no
 **Ledger hygiene (8d880ba4):** a reviewed-CLI result handle now projects its records from the stdout document
 (`result.stdout.result.records`, count = the records) instead of recording `result.argv` and seven "records".
 Nonzero exit → not a success; plain-text stdout → no records. Pinned.
+
+## Gate 22 — team-activity: a receipt rule Slack can never satisfy (2026-09-02 09:00 UTC)
+
+A manual run of team-activity-slack-updates (my run, 01:59 PDT — it posted "Team Activity Update — Morning
+baseline" to the team channel; a person's run carries send authority for an enabled scheduled send step, which
+I should have anticipated) reproduced the owner's seven-run streak exactly: the Slack post SUCCEEDED (ledger:
+`slack_send_message` succeeded, mutating, receipt with channel C0BHT7WHZDL and ts), and the step then returned
+`{"blocked": true, …}` — because the owner's legacy prompt demands "the provider-echoed posted body exactly
+byte-equal to the upstream summary". Slack echoes rendered rich-text blocks, never the markdown bytes, so the
+rule cannot be met by any model, ever, while the message posts every time.
+
+*Definition (vault, backed up `SKILL.md.pre-receipt-fix-2026-09-02.bak`):* success = explicit success + channel
++ a real `ts`; the harness ledger records the exact posted body. The 09:00 scheduled run is the proof; not
+re-run manually (it posts to the team).
+
+**Carrier note.** end-of-week-team-sales-snapshot's manual run door answered 409 (dry run passes); scheduled
+Friday 16:30, last real run 08-28 blocked on "not authorized" — same authority class as the reads fixed tonight;
+to verify Friday.
