@@ -714,3 +714,7 @@ The seven schemas: ask_user_question 3,247 · tool_output_query 2,199 · tool_se
 recall pages). Hiding any of them behind discovery is the wrong trade. The 5.4 KB to the ceiling is in schema
 DESCRIPTIONS — the four largest carry incident-tuned prose that can be halved without losing the affordance.
 That is a prompt-level change with behavior pins to re-verify; decision owed, not taken tonight.
+
+**Ledger hygiene (8d880ba4):** a reviewed-CLI result handle now projects its records from the stdout document
+(`result.stdout.result.records`, count = the records) instead of recording `result.argv` and seven "records".
+Nonzero exit → not a success; plain-text stdout → no records. Pinned.
