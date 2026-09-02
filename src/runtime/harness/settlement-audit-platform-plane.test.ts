@@ -25,6 +25,7 @@ const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
+const runner = await import('../../execution/workflow-runner.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -570,4 +571,52 @@ test('a declared write/send step whose only mutations are local has its evidence
   assert.equal(after.status, 'clean', JSON.stringify(after));
   assert.equal(after.facts.successfulLocalMutations, 2);
   assert.equal(after.facts.successfulBusinessSettlements, 0);
+});
+
+test('a declared write step that LOOKED (one local read), found nothing, and answered in a structured shape for a string contract is complete', () => {
+  const accepted = acceptedSource('weekly-review-no-goals', 'assess this week\'s goals');
+  const begun = dispatch.beginPhysicalDispatch({
+    identity: {
+      sessionId: accepted.sessionId,
+      sourceUserSeq: accepted.sourceUserSeq,
+      turn: accepted.turn,
+      acceptedTaskId: accepted.acceptedTaskId,
+      logicalToolCallId: 'logical:goal-list',
+      physicalDispatchId: 'dispatch:goal-list',
+      ordinal: 0,
+    },
+    tool: 'goal_list',
+    args: { status: 'active' },
+  });
+  assert.equal(begun.status, 'inserted');
+  if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+  assert.equal(dispatch.settlePhysicalDispatch({ identity: begun.identity, tool: 'goal_list', outcome: 'returned' }).status, 'inserted');
+  assert.equal(settlements.commitLogicalCallSettlement({
+    identity: {
+      sessionId: accepted.sessionId,
+      sourceUserSeq: accepted.sourceUserSeq,
+      turn: accepted.turn,
+      acceptedTaskId: accepted.acceptedTaskId,
+      logicalToolCallId: 'logical:goal-list',
+    },
+    contract: { toolName: 'goal_list', args: { status: 'active' } },
+    execution: { kind: 'provider_execution' },
+    result: { payload: { goals: [] } },
+    outcome: outcomes.classifyAttemptOutcome({ mutating: false, acknowledged: true, hostExecuted: true }),
+    recovery: { businessCall: false, mutating: false },
+    observer: { lane: 'byo', turn: accepted.turn },
+  }).status, 'committed');
+
+  // weekly-review's assess_goals, 2026-09-02: side_effect write, contract
+  // {type: string}, the model read goal_list (empty) and submitted a
+  // structured "(none)" assessment. That is the deliverable, not a phantom.
+  const output = [{ id: '', title: '(none)', status: 'none', blocker: 'No active goals found: goal_list returned an empty list' }];
+  const guarded = runner.settlementGuardedStepOutput({
+    step: { id: 'assess_goals', prompt: '', sideEffect: 'write', output: { type: 'string', non_empty: [''] } },
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+    toolUses: ['goal_list', 'workflow_step_result'],
+    output,
+  });
+  assert.deepEqual(guarded, output, JSON.stringify(guarded));
 });

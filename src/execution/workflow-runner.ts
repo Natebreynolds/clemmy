@@ -8903,9 +8903,13 @@ export function settlementGuardedStepOutput(input: {
       && actionTopologyRoleForRuntimeCall(tool, {}) !== 'control');
   const sideEffect = stepSideEffectClass(input.step);
   const declaredContract = input.step.output;
+  // Judge the declared shape on the same bound value the finalize gate sees
+  // (a JSON-text object, or a structured result for a string contract), so
+  // the settlement guard and the contract gate never disagree about whether
+  // the step produced its deliverable.
   const outputSatisfiesDeclaredContract = Boolean(
     declaredContract
-    && verifyStepOutput(declaredContract, input.output).ok,
+    && verifyStepOutput(declaredContract, coerceOutputForContract(input.output, declaredContract)).ok,
   );
   const audit = auditAcceptedSourceSettlementTruth({
     sessionId: input.sessionId,

@@ -1,6 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyStepOutput } from './step-output-verify.js';
+import { coerceOutputForContract, verifyStepOutput } from './step-output-verify.js';
+
+test('a structured result satisfies a string contract as rendered text', () => {
+  const contract = { type: 'string' as const, non_empty: [''] };
+  const structured = [{ id: '', title: '(none)', status: 'none', blocker: 'No active goals found' }];
+  const bound = coerceOutputForContract(structured, contract);
+  assert.equal(typeof bound, 'string');
+  assert.match(bound as string, /"blocker": "No active goals found"/);
+  assert.ok(verifyStepOutput(contract, bound).ok);
+  // A string stays a string; a string contract WITH required keys is left alone.
+  assert.equal(coerceOutputForContract('already text', contract), 'already text');
+  assert.deepEqual(coerceOutputForContract({ a: 1 }, { type: 'string', required_keys: ['a'] }), { a: 1 });
+});
 
 test('absent contract → ok (today path, no enforcement)', () => {
   assert.deepEqual(verifyStepOutput(undefined, { anything: true }), { ok: true, problems: [] });

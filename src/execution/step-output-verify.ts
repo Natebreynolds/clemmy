@@ -225,6 +225,22 @@ export function coerceOutputForContract(
   contract: WorkflowStepOutputContract | undefined,
 ): unknown {
   if (!contract) return output;
+  // A string contract asks for non-empty deliverable TEXT. A step that hands
+  // back a structured result (workflow_step_result with an object or array —
+  // weekly-review's "no active goals" assessment, 2026-09-02) has produced
+  // that deliverable; render it as text instead of failing the shape.
+  if (
+    contract.type === 'string'
+    && output !== null
+    && typeof output === 'object'
+    && !(contract.required_keys?.length)
+  ) {
+    try {
+      return JSON.stringify(output, null, 2);
+    } catch {
+      return output;
+    }
+  }
   const structured =
     contract.type === 'object' ||
     contract.type === 'array' ||
