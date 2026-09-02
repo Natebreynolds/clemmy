@@ -649,3 +649,27 @@ in a row" — three doors, none the model's fault:
    `blocked: true`; a record's status is data.
 
 Auto-heal had paused itself after the streak; one clean run resumes it.
+
+## Gate 20 — the full suite, the journeys, and what they said (2026-09-02 07:07–08:00 UTC)
+
+`npm test` with the daemon down: 13.9k results, six failures, all triaged and fixed (752f8975):
+
+- **Effect class (3 pins).** The send-slug regex read `TWITTER_GET_POST` as a send, so a read fan-out was
+  refused and the pinned "declared can strengthen, never downgrade" contract failed. b790d76a had also
+  narrowed that contract ("a label never fabricates a send"). Restored properly: the slug's evidence is the
+  floor (a read verb is never a send); a label only strengthens; a declared send on a non-send tool is still
+  classified send so the gate refuses it typed (`direct_send_tool_required`) at validation.
+- **Kernel neutrality (1).** host-turn-runner imported the Composio-named completion module (3971ef78,
+  pre-compaction). Now a provider-neutral seam over a leaf registry; the provider registers itself; the
+  kernel's comments name no provider. (First attempt created a module cycle — `Cannot access 'completers'
+  before initialization` — hence the leaf.)
+- **Honest plain voice (1).** The local-failure copy promised "I will retry", which the host does not own.
+  Dropped; the pins now read the plain phrases.
+- **Graph layer import (1).** `pino` in the observation seam (0fbeaafe, yesterday) listed as lawful.
+
+Journeys: 155/171. Every one of the 16 failures reproduces at the 09-01 baseline commit (1c3e1177) — the
+eight northstar workspace journeys, the read-plan prose continuation, the two large-catalog gates, the
+no-random-gate outbound trio, and the 16 KiB model-surface ledger (21.7 KB, before tonight's 0.4 KB voice
+line). Wave debt, unchanged by tonight; not hidden.
+
+Re-running both suites on the committed fixes before any tag.
