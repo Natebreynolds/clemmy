@@ -291,3 +291,50 @@ starting`, `Daemon loop started` → QR from the console Mobile panel or
 surprise: `daily-summary` → `morning-briefing` → `weekly-review` → `end-of-day` → `friday-dashboard`
 (creation test first) → `platform-49` (run it twice: the second run should show the learned pin for the
 repaired write) → `daily-standup-email`. Stop with `npx tsx src/index.ts daemon stop`, not `dev-down.sh`.
+
+### Evening (16:30–18:00 PT): the owner's live tests after the takeover
+Read straight off the daemon log, the run records and `pmset -g log` — no DB opened, no run replayed.
+- **What actually ran on the dev daemon (pid 66531, up since 12:57 PT, tip 548741b5):** nothing. No chat
+  turn and no workflow step left a log line in five hours. The three things the owner saw as "simple
+  workflows still failing" were all holds, none a model failure:
+  1. `platform-49` 16:00 slot: the laptop slept 15:44→16:28 (DarkWakes through it); the 16:03 tick called
+     the occurrence a catch-up and parked it `awaiting_catchup_decision` for a Resume/Skip tap. **Fixed
+     (`ada734c6`)**: a missed occurrence now RUNS, queued with `catchupDisposition: 'resumed'` by the
+     scheduler, paced one-at-a-time by the runner's existing catch-up admission (that pacing was always
+     the real v3.0.1 anti-stampede; the human gate on top was a hoop); the step prompt carries the
+     lateness so a time-sensitive step judges in its own words. The one record already held today stays
+     held until tapped or reaped (records from older builds keep the old contract).
+  2. `platform-49` 12:00 run (`trigger-8c1a2b91`): killed 80 s in by the 12:01 PT daemon restart, then
+     parked by `shouldHaltResumeForSideEffect` as "interrupted mid-run — NOT re-run" because a prose
+     `sideEffect: write` step carries no durable-dispatch proof. **OPEN — the owner's agreed item 2**: the
+     host settlement ledger for session `workflow:<runId>:<stepId>` (`logical_call_settlements`,
+     `physical_dispatches`) can prove zero mutating/uncertain crossings → resume; an uncertain row →
+     park as the one allowed terminal, readback edge named. Next change.
+  3. "run my slack team update" in chat → the raw readiness text. The self-improvement lane had failed
+     at 12:14 PT and its **six-hour cooldown** refused every new request, so the queue fell through to
+     `readiness.message`. **Fixed (`86e3020d`)**: budget of 3 attempts per unchanged
+     definition+script digest; each rejected attempt recorded with its reasons and the draft kept as
+     `.improvement-candidate-<stamp>.md`; the next prompt quotes prior attempts and the two missing step
+     shapes (reviewed transform, read-only forEach call); an exhausted budget answers in plain words with
+     the draft path and the next edge. Also found and fixed: **no rewrite could ever have landed** —
+     `workflow_update` on an enabled workflow saves it DISABLED + queues a creation test, which the
+     intent guard reads as "enabled flag changed" and reverts (all sixteen backups today were
+     byte-identical to SKILL.md: the failures were "nothing was saved", reported as drift). An
+     improvement session now keeps the workflow enabled; the re-queued run is the verification.
+- **Doors that lied**: the console run route answered a `held` rewrite with `{queued:true}` and no id
+  ("Started"), the dashboard action redirected green regardless of the queue's answer. Both now carry the
+  queue's message (`86e3020d`); `console-board.test.ts` had been red at HEAD since the lane landed.
+- **Brain availability during the tests**: the boot logged `AUTH_MODE=claude_oauth … no credentials —
+  booting degraded` (the vault token died 07-09; the Claude Code keychain is read asynchronously after
+  boot), Codex Pro weekly is exhausted until 09-06, and the Claude subscription that Clem's pinned Sonnet
+  runs on is the SAME quota Claude Code sessions spend — the 12:15–13:00 PT subagent fan-out in the
+  takeover session helped push it into the 13:00→15:50 PT limit. Rule for this branch: no large fan-outs
+  while the owner is live-testing on the Sonnet pin.
+- **Still spinning until the 12:57 restart**: the attempt-16 improvement session re-entered checkpoint
+  recovery every ~5 s for 90 minutes (1,006 `host retained exact checkpoint recovery ownership` lines,
+  `host_model_batch_admission_unavailable`) — the cause is gate 16's binding writer, fixed; the loop
+  itself still has no bound and belongs in the dead-end census.
+- Also seen, not fixed: `memory.maintenance` "sessions reaper tick failed: FOREIGN KEY constraint
+  failed" every hour (audit defect 5's reaper never succeeds); the codex CLI probe fails on a broken
+  `mcp_servers.openaiDeveloperDocs` entry in `~/.codex/config.toml` (harmless: the Codex brain uses
+  OAuth, not the CLI).
