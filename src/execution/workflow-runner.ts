@@ -124,7 +124,7 @@ import {
   type ResumeState,
   listWorkflowRunIds,
 } from './workflow-events.js';
-import { sumUsageTokensForSource, sumUsageTokensForRun } from '../runtime/usage-log.js';
+import { sumUsageTokensForSource, sumUsageTokensForRun, usageEfficiencyForSource } from '../runtime/usage-log.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { HostInterruptState } from '../runtime/harness/host-turn-runner.js';
 import { approvalAuthorityMatchesToolCall } from '../runtime/harness/approval-authority.js';
@@ -5566,6 +5566,21 @@ async function runStepViaHarness(
     clearWorkflowRunPausedForApproval(workflowRunId);
     closePlanScope(realSessionId, 'workflow-step-finished');
     clearSessionWorkerModelOverride(realSessionId);
+    // MEASURE (2026-09-01): the step's own efficiency from the usage rows its
+    // host session wrote — frames, cache-hit share, tokens, largest prompt —
+    // on the run's event log and in the daemon log, so "smarter and faster"
+    // is a number the owner can read after every run, not a feeling.
+    try {
+      const efficiency = usageEfficiencyForSource(realSessionId);
+      if (efficiency.frames > 0) {
+        appendWorkflowEvent(workflowName, workflowRunId, {
+          kind: 'step_advisory',
+          stepId: step.id,
+          meta: { reason: 'step_efficiency', ...efficiency },
+        });
+        logger.info({ workflow: workflowName, runId: workflowRunId, stepId: step.id, ...efficiency }, 'workflow step efficiency');
+      }
+    } catch { /* measurement never blocks a step */ }
   }
 }
 

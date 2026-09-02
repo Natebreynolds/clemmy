@@ -338,3 +338,24 @@ test('latency PRESENCE is visible per lane, not assumed', () => {
   assert.equal(r.byKind.chat!.durationSamples, 2);
   assert.equal(r.byKind.chat!.totalDurationMs, 2000);
 });
+
+
+test('usageEfficiencyForEvents: frames, cache-hit share and the largest prompt, over the canonical cache dialects', async () => {
+  const { usageEfficiencyForEvents } = await import('./usage-log.js');
+  const base = { at: '2026-09-01T00:00:00Z', source: 'workflow:r1:main', kind: 'workflow', model: 'm', totalTokens: 0 } as const;
+  const efficiency = usageEfficiencyForEvents([
+    // inclusive dialect (OpenAI-compatible): input ⊇ cached
+    { ...base, cacheDialect: 'inclusive', inputTokens: 10_000, cachedInputTokens: 8_000, outputTokens: 200, totalTokens: 10_200 },
+    { ...base, cacheDialect: 'inclusive', inputTokens: 30_000, cachedInputTokens: 24_000, outputTokens: 300, totalTokens: 30_300 },
+  ] as never);
+  assert.equal(efficiency.frames, 2);
+  assert.equal(efficiency.inputTokens, 40_000);
+  assert.equal(efficiency.cachedInputTokens, 32_000);
+  assert.equal(efficiency.uncachedInputTokens, 8_000);
+  assert.equal(efficiency.outputTokens, 500);
+  assert.equal(efficiency.cacheHitShare, 0.8);
+  assert.equal(efficiency.maxInputTokens, 30_000);
+  assert.deepEqual(usageEfficiencyForEvents([]), {
+    frames: 0, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheHitShare: 0, maxInputTokens: 0,
+  });
+});

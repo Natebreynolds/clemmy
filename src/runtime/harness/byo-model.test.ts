@@ -973,3 +973,40 @@ test('native stream does not buffer a tool-bearing turn even if a json_schema wa
   ));
   assert.equal(fake.calls[0]?.stream, true, 'calendar/tool turns on xAI must stream');
 });
+
+
+test('native stream asks for the usage chunk and records it once, on the ALS session captured before the stream is consumed', async () => {
+  const { readUsageEventsForDate } = await import('../usage-log.js');
+  const { harnessRunContextStorage } = await import('./brackets.js');
+  async function* realStream() {
+    yield { id: 's2', object: 'chat.completion.chunk', created: 1, model: 'glm-5.2', choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] };
+    yield { id: 's2', object: 'chat.completion.chunk', created: 1, model: 'glm-5.2', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+    // z.ai's terminal usage chunk (probed live 2026-09-01).
+    yield { id: 's2', object: 'chat.completion.chunk', created: 1, model: 'glm-5.2', choices: [], usage: { prompt_tokens: 1400, completion_tokens: 25, total_tokens: 1425, prompt_tokens_details: { cached_tokens: 900 } } };
+  }
+  const fake = makeFake([(p) => {
+    assert.equal(p.stream, true);
+    assert.deepEqual(p.stream_options, { include_usage: true }, 'the usage chunk is requested on the wire');
+    return realStream();
+  }]);
+  const mine = (ev: { model: string; source: string }) => ev.model === 'glm-5.2' && (ev.source === 'byo-usage-pin' || ev.source.startsWith('byo-usage-pin:'));
+  const before = readUsageEventsForDate().filter(mine).length;
+  const stream = await harnessRunContextStorage.run(
+    { sessionId: 'byo-usage-pin', sourceUserSeq: 3 } as never,
+    () => wrapCompletionsCreate(fake.fn, { nativeChatCompletionsStream: true })({
+      model: 'glm-5.2',
+      messages: [{ role: 'user', content: 'ok?' }],
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'work_call', parameters: { type: 'object' } } }],
+    }),
+  );
+  // Consumed OUTSIDE the ALS scope, the way the SDK drains a stream.
+  const chunks = await collect(stream);
+  assert.equal(chunks.length, 3, 'the usage chunk passes through untouched');
+  const recorded = readUsageEventsForDate().filter(mine);
+  assert.equal(recorded.length - before, 1, 'recorded exactly once, on the session captured before the await');
+  const row = recorded[recorded.length - 1]!;
+  assert.equal(row.inputTokens, 1400);
+  assert.equal(row.cachedInputTokens, 900);
+  assert.equal(row.outputTokens, 25);
+});

@@ -8235,3 +8235,18 @@ test('production host bounds CONTINUE markers and then stops typed, resumable, w
   assert.match(String(outcome.finalOutput), /without making the call/);
   assert.doesNotMatch(String(outcome.finalOutput), /^CONTINUE:/);
 });
+
+
+test('JIT read edge: a reviewed-CLI identity is recognised by shape, never a provider slug', async () => {
+  const { isReviewedLiveReadIdentity } = await import('./host-turn-runner.js');
+  // 2026-09-01: the Composio materializer uppercased salesforce_sf_soql_query
+  // into a slug that does not exist and the chat Salesforce read dead-ended.
+  assert.equal(isReviewedLiveReadIdentity('salesforce_sf_soql_query'), true);
+  assert.equal(isReviewedLiveReadIdentity('gh_pr_list'), true);
+  assert.equal(isReviewedLiveReadIdentity('GOOGLESHEETS_BATCH_GET'), false);
+  assert.equal(isReviewedLiveReadIdentity('SLACK_FETCH_CONVERSATION_HISTORY'), false);
+  assert.equal(isReviewedLiveReadIdentity('call_tool'), true, 'bare snake_case names are the live-read shape; the catalog check decides');
+  assert.equal(isReviewedLiveReadIdentity('tool_search'), true);
+  assert.equal(isReviewedLiveReadIdentity('composio'), false, 'a single word is neither');
+  assert.equal(isReviewedLiveReadIdentity('Mixed_Case'), false);
+});

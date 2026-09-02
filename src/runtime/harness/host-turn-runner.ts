@@ -3514,6 +3514,29 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (!carriedOperation || jitReadProvisionAttempted.has(carriedOperation)) return false;
     jitReadProvisionAttempted.add(carriedOperation);
     const jitIdentity = exactHostIdentity();
+    if (isReviewedLiveReadIdentity(carriedOperation)) {
+      // Supply only: the exact production check re-runs after acquisition and
+      // still proves candidate, account and effect; writes never enter here.
+      let acquired: Awaited<ReturnType<HostJitLiveReadAcquirer>>;
+      try {
+        acquired = await hostJitLiveReadAcquirer({
+          ownerId: jitIdentity.sessionId,
+          nodeId: `jit:${jitIdentity.sourceUserSeq}`,
+          operationId: carriedOperation,
+          deadlineAt: Date.now() + HOST_JIT_READ_PROVISION_BUDGET_MS,
+        });
+      } catch (error) {
+        acquired = { status: 'unavailable', detail: error instanceof Error ? error.message : String(error) };
+      }
+      hostTurnLogger.info({
+        sessionId: jitIdentity.sessionId,
+        sourceUserSeq: jitIdentity.sourceUserSeq,
+        operationId: carriedOperation,
+        status: acquired.status,
+        ...(acquired.detail ? { detail: acquired.detail } : {}),
+      }, 'host jit live-read acquisition');
+      return acquired.status !== 'unavailable';
+    }
     const acceptedEvent = listEvents(jitIdentity.sessionId, {
       sinceSeq: jitIdentity.sourceUserSeq - 1,
       types: ['user_input_received'],
@@ -6917,6 +6940,31 @@ const productionHostJitReadProvisioner: HostJitReadProvisioner = async (input) =
 let hostJitReadProvisioner: HostJitReadProvisioner = productionHostJitReadProvisioner;
 export function _setHostJitReadProvisionerForTests(provisioner: HostJitReadProvisioner | null): void {
   hostJitReadProvisioner = provisioner ?? productionHostJitReadProvisioner;
+}
+
+/** A reviewed-CLI or live-read identity (`salesforce_sf_soql_query`) is
+ * lowercase snake_case; a provider slug is UPPERCASE. The JIT read edge routes
+ * the former through the attested live-read registry (the same acquisition
+ * the workflow compiler uses), never through the provider materializer that
+ * uppercases it into a slug that does not exist (live 2026-09-01: a chat
+ * Salesforce read dead-ended unless tool_search had run first). */
+export function isReviewedLiveReadIdentity(operationId: string): boolean {
+  return /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(operationId.trim());
+}
+
+type HostJitLiveReadAcquirer = (input: {
+  ownerId: string;
+  nodeId: string;
+  operationId: string;
+  deadlineAt: number;
+}) => Promise<{ status: 'present' | 'acquired' | 'unavailable'; detail?: string }>;
+const productionHostJitLiveReadAcquirer: HostJitLiveReadAcquirer = async (input) => {
+  const { ensureLiveReadCapabilityForOperation } = await import('../../execution/workflow-live-call-compiler.js');
+  return ensureLiveReadCapabilityForOperation({ ...input, expectedEffect: 'read' });
+};
+let hostJitLiveReadAcquirer: HostJitLiveReadAcquirer = productionHostJitLiveReadAcquirer;
+export function _setHostJitLiveReadAcquirerForTests(acquirer: HostJitLiveReadAcquirer | null): void {
+  hostJitLiveReadAcquirer = acquirer ?? productionHostJitLiveReadAcquirer;
 }
 export const HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX = 'literal_workflow_operation_not_frozen:';
 

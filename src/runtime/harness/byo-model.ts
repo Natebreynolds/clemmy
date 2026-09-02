@@ -414,12 +414,20 @@ export function liftReasoningChunk(chunk: unknown): unknown {
   return chunk;
 }
 
-async function liftReasoningStream(stream: unknown): Promise<unknown> {
+async function liftReasoningStream(
+  stream: unknown,
+  onUsage?: (chunk: CompatCompletion) => void,
+): Promise<unknown> {
   if (!stream || typeof stream !== 'object' || !(Symbol.asyncIterator in stream)) {
     return stream;
   }
   async function* lifted(): AsyncIterable<unknown> {
     for await (const chunk of stream as AsyncIterable<unknown>) {
+      // The usage-only terminal chunk (`choices: []`, `usage: {...}`) is the
+      // backend's bill for the whole stream; record it once, pass it through.
+      if (onUsage && chunk && typeof chunk === 'object' && (chunk as { usage?: unknown }).usage) {
+        try { onUsage(chunk as CompatCompletion); } catch { /* measurement never breaks the stream */ }
+      }
       yield liftReasoningChunk(chunk);
     }
   }
@@ -639,8 +647,18 @@ async function wrappedCompletionsCreate(
       // response_format and must stream — that is the Grok-as-Codex path.
       const hasTools = Array.isArray(relaxed.tools) && relaxed.tools.length > 0;
       if (nativeChatCompletionsStream && (!structured || hasTools)) {
-        const stream = await original(relaxed, options);
-        return liftReasoningStream(stream);
+        // Ask for the terminal usage chunk (OpenAI `stream_options`; z.ai
+        // answers it with prompt/completion/cached counts — probed live
+        // 2026-09-01) so the owner's primary brain is measurable: until now
+        // every native GLM tool turn recorded NO usage and its rows landed on
+        // source 'unknown' with zero tokens. The ALS run context is captured
+        // here, before the stream is consumed on the caller's schedule.
+        const harnessContext = harnessRunContextStorage.getStore();
+        const streamOptions = relaxed.stream_options && typeof relaxed.stream_options === 'object' && !Array.isArray(relaxed.stream_options)
+          ? relaxed.stream_options as Record<string, unknown>
+          : {};
+        const stream = await original({ ...relaxed, stream_options: { ...streamOptions, include_usage: true } }, options);
+        return liftReasoningStream(stream, (usageChunk) => recordByoUsage(usageChunk, relaxed.model, harnessContext));
       }
       // This adapter intentionally pays for a full non-streaming completion and
       // only then emits one synthetic SDK chunk. Tell the outer watchdog that a
@@ -716,7 +734,11 @@ async function wrappedCompletionsCreate(
  * (absent on backends that don't cache → 0). Session id from the harness run
  * context. Fails silently — telemetry must never break the model call path.
  */
-function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): void {
+function recordByoUsage(
+  completion: CompatCompletion,
+  fallbackModel?: unknown,
+  context: ReturnType<typeof harnessRunContextStorage.getStore> = harnessRunContextStorage.getStore(),
+): void {
   try {
     const u = (completion as { usage?: Record<string, unknown> })?.usage;
     if (!u || typeof u !== 'object') return;
@@ -729,7 +751,7 @@ function recordByoUsage(completion: CompatCompletion, fallbackModel?: unknown): 
     const outputTokens = 'completion_tokens' in u ? n(u.completion_tokens) : n(u.output_tokens);
     if (inputTokens === 0 && outputTokens === 0) return;
     const cached = n(details?.cached_tokens) || n(u.cached_tokens);
-    const harnessContext = harnessRunContextStorage.getStore();
+    const harnessContext = context;
     const sessionId = harnessContext?.sessionId ?? 'unknown';
     recordModelUsage({
       sessionId,

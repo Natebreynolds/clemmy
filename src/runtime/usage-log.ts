@@ -837,6 +837,50 @@ export function sumUsageSplitForSource(
   return split;
 }
 
+export interface UsageEfficiency {
+  /** Model requests recorded for the source (one per frame). */
+  frames: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  uncachedInputTokens: number;
+  outputTokens: number;
+  /** cached / (cached + uncached) prompt tokens; 0 with no prompt tokens. */
+  cacheHitShare: number;
+  /** The largest single prompt the source composed. */
+  maxInputTokens: number;
+}
+
+/** The efficiency numbers the owner asked to read after a run (2026-09-01):
+ * frames per step, cache-stable share, tokens per step, largest prompt. Pure
+ * over usage rows; cache accounting goes through the canonical dialect. */
+export function usageEfficiencyForEvents(events: readonly UsageEvent[]): UsageEfficiency {
+  const out: UsageEfficiency = {
+    frames: 0, inputTokens: 0, cachedInputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheHitShare: 0, maxInputTokens: 0,
+  };
+  for (const ev of events) {
+    const canonical = canonicalCacheAccounting(ev);
+    out.frames += 1;
+    out.inputTokens += ev.inputTokens ?? 0;
+    out.cachedInputTokens += canonical.cachedReadTokens;
+    out.uncachedInputTokens += canonical.uncachedInputTokens;
+    out.outputTokens += ev.outputTokens ?? 0;
+    out.maxInputTokens = Math.max(out.maxInputTokens, ev.inputTokens ?? 0);
+  }
+  const prompt = out.cachedInputTokens + out.uncachedInputTokens;
+  out.cacheHitShare = prompt > 0 ? Math.round((out.cachedInputTokens / prompt) * 1000) / 1000 : 0;
+  return out;
+}
+
+/** Efficiency for a session id: its rows carry the accepted-source identity
+ * `<sessionId>:<seq>` (acceptedSourceIdentity), and a workflow step's forEach
+ * items run under `<sessionId>:<key>` — both belong to the step. */
+export function usageEfficiencyForSource(sessionId: string, date: Date = new Date()): UsageEfficiency {
+  const prefix = `${sessionId}:`;
+  return usageEfficiencyForEvents(
+    readUsageEventsForDate(date).filter((ev) => ev.source === sessionId || ev.source.startsWith(prefix)),
+  );
+}
+
 /**
  * Total tokens recorded across an entire workflow run (all its steps) on a date,
  * using the derived `runId` join key. Leverages the S2 join so the run-level
