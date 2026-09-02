@@ -37,6 +37,7 @@ import {
   type WorkflowDefinition,
   type WorkflowEntry,
 } from '../memory/workflow-store.js';
+import { draftRunnerMigration } from './workflow-runner-migration.js';
 import {
   WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE,
   workflowRawSubprocessDeclarations,
@@ -337,6 +338,37 @@ export function buildWorkflowImprovementPrompt(input: {
       sources.push(`- step "${runner.stepId}" (${runner.kind}): ${source.path} (${bytes} bytes; too large to inline — read it with read_file in as few calls as possible)`);
     }
   }
+  // THE MIGRATION PRIMITIVE (2026-09-01): the host drafts the exact steps
+  // deterministically from the runner's source — every SOQL read as a call
+  // step, a package transform, a render step carrying the script's own output
+  // format, the send repointed — and names the gaps. The model starts from
+  // the draft and fills gaps; it no longer translates 1,100 lines by hand
+  // (18 failed attempts in one day on team-activity-slack-updates).
+  const drafts: string[] = [];
+  for (const runner of request.runners) {
+    if (runner.kind !== 'deterministic.runner') continue;
+    const source = runnerSourceSnippet(entry, runner.runner);
+    if (!source) continue;
+    const draft = draftRunnerMigration({
+      definition: entry.data,
+      runnerStepId: runner.stepId,
+      runnerSource: source.bytes,
+    });
+    if (!draft.ok) continue;
+    const rendered = JSON.stringify({ inputs: draft.definition.inputs ?? {}, steps: draft.definition.steps }, null, 1);
+    const bytes = Buffer.byteLength(rendered, 'utf8');
+    if (bytes > inlineBudget) continue;
+    inlineBudget -= bytes;
+    drafts.push(
+      `===== BEGIN host draft for step "${runner.stepId}" (extracted from the script; start from this) =====`,
+      rendered,
+      ...(draft.gaps.length > 0 ? ['Gaps the draft could not express (decide each, then say what you did in the final note):', ...draft.gaps.map((gap) => `- ${gap}`)] : []),
+      ...(draft.reads.some((read) => read.unresolved.length > 0)
+        ? ['Declared inputs to fill with the literal the query needs: ' + draft.reads.flatMap((read) => read.unresolved).map((name) => `\`${name}\``).join(', ')]
+        : []),
+      `===== END host draft for step "${runner.stepId}" =====`,
+    );
+  }
   // The current definition rides in the prompt as well: with definition and
   // script both present the turn's first call can be authoring, not lookup.
   let definitionBytes = '';
@@ -368,6 +400,9 @@ export function buildWorkflowImprovementPrompt(input: {
     '',
     'Binding rules:',
     '1. Preserve WHAT the workflow does and where it sends: its name, goal and success criteria, trigger/schedule/timezone, resources, enabled flag, every step\'s requiresApproval flag, and every destination (channel ids, recipients, spreadsheet ids). You may only change HOW a step does its work.',
+    ...(drafts.length > 0
+      ? ['0. A host draft of the exact steps is included at the end of this message. Start from it: keep its call steps and package transform as they are, resolve each listed gap and declared input, review the render prompt, then save. Do not re-derive what the draft already extracted.']
+      : []),
     definitionInlined
       ? '2. The current definition and the legacy script source are both included at the end of this message. Do not spend calls on workflow_get or read_file for them; start with the rewrite.'
       : '2. First read the current definition with workflow_get (section "full", one call). The legacy script source you need is included at the end of this message; do not spend calls re-reading it.',
@@ -382,6 +417,7 @@ export function buildWorkflowImprovementPrompt(input: {
     '- reviewed in-process transform (pure data shaping; no model, no tools, no approval): { id, side_effect: read, dependsOn: [<step ids>], transform: <expression> } where an expression is one of { op: "get", from: "steps.<id>.output[.<path>]" | "input.<key>" | "item[.<path>]" }, { op: "jsonParse" | "jsonStringify" | "count", value: <expression> }, { op: "literal", value: <json> }, { op: "object", fields: [{ key, value: <expression> }] }, { op: "array", items: [<expression>] }, { op: "map", value: <expression>, each: <expression over item> }, { op: "select", value: <rows>, where?: { column, op: eq|ne|contains|empty|nonempty, value? }, columns?: [..], limit? }, { op: "aggregate", value: <rows>, groupBy: [..], metrics?: [{ fn: count|sum|avg|min|max, column? }] }. A reviewed CLI read returns its JSON as the step output\'s `stdout` string: parse it with { op: "jsonParse", value: { op: "get", from: "steps.<id>.output.stdout" } } and take the records with a further { op: "get" } on that transform step\'s own output.',
     '- one exact read per item of a prior step\'s array (reads only; a per-item write is not a step shape): { id, forEach: "steps.<id>.output.<path-to-array>", prompt: "", side_effect: read, call: { tool: <exact read>, args: { ...literals and "{{item.<field>}}" templates } } }',
     '- the existing send step stays as it is (same allowedTools, same destination, same output contract).',
+    ...(drafts.length > 0 ? ['', ...drafts] : []),
     ...(inlined.length > 0 ? ['', ...inlined] : []),
   ].join('\n');
 }
