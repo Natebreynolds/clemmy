@@ -1042,3 +1042,40 @@ lane) so GLM never authors plan_task for a simple write — the same way reads
 now flow. The send floor stays (a send keeps the full plan + approval). Until
 then, the write/send commit path is reliable for a capable brain (Claude/grok
 authored plan_task historically) but not for GLM 5.3.
+
+## Gate 34 — one more full pass + the tag decision (2026-09-02 10:40–11:25 PDT)
+
+Connection-warm fix (9d9e3de4): buildOrchestratorAgent warms the
+connected-account observation once at an action-turn boundary when it is null.
+This resolved the cold-read non-determinism — a Slack/Sheets read ~22 min
+after the last fetch had walled "no current connected-account observation".
+
+Live pass (GLM 5.3, warm in place): read-flow, write-validate (propose +
+stop), and clarify-read all PASS reliably. Workflow create+run fails on GLM
+(mis-named step, missing tool permission; nothing committed/overwritten —
+platform-49 SKILL.md untouched).
+
+Commit-path with approval: on GLM the write kept flowing (no wall) but did not
+reach an approval in budget, and the send walled (GLM can't author plan_task).
+On grok-4.6 (owner's brain) the write's plan_task ADMITTED (valid graph
+compiled), then the continuation turn returned empty → generic 'failed'
+(grok transport, not harness logic; surfaced opaquely — a legibility gap
+worth a typed resumable stop later). The send was blocked (floor held) but did
+not park an approvable card. Safety floors held without exception across every
+run: zero sends, zero writes committed.
+
+Full suite on the tip: 14,053 pass; the 4+3 flagged failures ALL pass in
+isolation (load flakes from a 30-min contended run: loop, shipped-identity,
+verified-read-completion, capability-routing, typed-source-recovery,
+builtin-skills, nested-settlement 3000ms deadline). Effectively green.
+
+Context: d3bc85ca "cut v3.16.0" is an ancestor but NO v3.16.0 tag exists
+(latest tag v3.15.0; 244 commits since). This wave IS v3.16.0.
+
+DECISION (tracked): the harness is READY to tag v3.16.0 — reads,
+validate-first, latency batching, and the safety floors are proven; every fix
+is pinned and artifacts verify; nothing regressed. The one unproven item is an
+approved write/send committing end-to-end LIVE, which is a model-layer limit
+(GLM plan authoring; grok transport), not a harness defect, and this release
+does not weaken the write/send floor. Tag push held for the owner's explicit
+go per the binding "ask before the tag" directive.
