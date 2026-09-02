@@ -1079,3 +1079,37 @@ approved write/send committing end-to-end LIVE, which is a model-layer limit
 (GLM plan authoring; grok transport), not a harness defect, and this release
 does not weaken the write/send floor. Tag push held for the owner's explicit
 go per the binding "ask before the tag" directive.
+
+## Gate 15 — the pagination completion is a MOUNT that was never wired
+
+`src/runtime/harness/host-pagination.ts` already implements host-driven
+collection: `collectCompleteSource({read(cursor)})`, sequential by necessity,
+bounded four ways (25 pages / 5,000 records / 8 MB / 60 s), stopping on a
+repeated cursor so an A -> B -> A cycle cannot spin, and returning
+`complete:false` with a typed `stopReason` instead of a quietly short set.
+Its docstring names the observed live failure exactly: a turn that stopped
+mid-collection with a cursor outstanding and still reported done.
+
+It has **zero production callers** — only two test files import it. This is
+the same defect class as the trajectory watcher fixed in e505332c: the right
+machinery exists and is tested, and no live path calls it.
+
+The obvious shortcut is forbidden by design. `RawResultHandleFacts.cursor`
+carries the comment "Host-only; never render this to the model", and
+`result-handle.ts` keeps opaque provider cursors inside the host on purpose,
+because a model is free to paraphrase an opaque token. Handing the cursor back
+in a model-facing hint would violate that invariant. The contract is that the
+host follows the continuation and the model receives a complete result.
+
+Mounting it is a real wave rather than a patch. The composio read path is
+`dispatchComposioTool` -> `providerDispatch()` (composio-tools.ts:3651), which
+wraps the provider body in `withPhysicalDispatch({args})`. Collecting pages
+there records N physical dispatches under one logical call, so it lands in the
+crossing/settlement kernel the write-evidence path depends on. Two sub-problems
+gate it: the cursor argument name is provider-specific and has to come from the
+tool schema, and the aggregate has to be re-shaped as a provider-shaped page
+(every record at `recordPath`, cursor key stripped) so authored evidence paths
+still resolve. Deliberately not attempted in the same session as a tag.
+
+Related: the plan DSL validates `complete_source_receipt`, but no production
+path performs a real collection to satisfy it.
