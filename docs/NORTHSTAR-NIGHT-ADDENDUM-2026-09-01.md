@@ -754,3 +754,19 @@ Harness class, not fixed tonight (queued first for the morning):
 2. The pre-dispatch refusal copy must be lane-aware: inside a sealed step it should say "use
    <proven operation> with <required field>" (the host knows both), never prescribe chat-lane discovery.
 The definition is correct as written; not edited.
+
+## Gate 24 — age is not identity, again: the operation-version label (2026-09-02 09:14 UTC, daily-standup)
+
+The standup's manual proof parked `blocked_capability` on `OUTLOOK_LIST_EVENTS`:
+`selected_definition_revalidation_refused: selected_definition_operation_version_drift`, reported to the
+person as "not connected", retried every minute toward a state that could never arrive. The stored durable
+manifest carried operation version `20260828_00`; the provider relabeled the same definition (input and
+output schemas byte-identical — the schema-drift check had already passed). One label move, and every
+workflow naming the operation dies forever — the 8 AM standup included.
+
+*Fix (this commit):* revalidation decides a label move once the live output schema and invoke port are known:
+when the selection's fingerprint is exactly the old-label fingerprint over the same schemas, the definition
+rebinds to the live label (`reboundFrom` recorded) and the proof-provisioned catalog installs the live
+definition as the recorded successor of the old manifest through its existing supersede path. An
+inconsistent selection or a schema change is still drift. Pinned. The parked standup run retries on the
+restarted daemon as the proof (it emails the owner only).
