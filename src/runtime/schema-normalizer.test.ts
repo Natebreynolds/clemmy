@@ -118,3 +118,54 @@ test('strict nullable materialization treats empty string as omitted, not too-sh
     'a real continuation is not coerced',
   );
 });
+
+// Live 2026-09-01 (GLM 5.3): an omitted optional argument arrives as the STRING
+// "null". Four exact shapes from one evening, each of which killed a turn.
+test('the omission word "null" is an absent optional key, JSON null for a required nullable key, and a value only when required and non-nullable', () => {
+  // task_list: priority is an optional enum — end-of-day died on it.
+  const taskList = {
+    type: 'object',
+    properties: {
+      status: { type: 'string' },
+      priority: { type: 'string', enum: ['high', 'medium', 'low'] },
+      since: { type: 'string' },
+      project: { type: 'string' },
+      limit: { type: 'number' },
+    },
+    required: ['status'],
+  };
+  assert.deepEqual(
+    materializeStrictNullableFields({ status: 'completed', priority: 'null', since: 'today', project: 'null', limit: 50 }, taskList),
+    { status: 'completed', since: 'today', limit: 50 },
+  );
+  // workflow_get: step:"null" counted as "both section and step".
+  const workflowGet = {
+    type: 'object',
+    properties: { name: { type: 'string' }, section: { type: 'string' }, step: { type: 'string' } },
+    required: ['name'],
+  };
+  assert.deepEqual(
+    materializeStrictNullableFields({ name: 'team-activity', section: 'metadata', step: 'null' }, workflowGet),
+    { name: 'team-activity', section: 'metadata' },
+  );
+  // Codex-strict transports: a required nullable key is JSON null (tool_search
+  // role_key/cursor; work_call lineage keys that must read as "no lineage").
+  const strict = {
+    type: 'object',
+    properties: {
+      query: { type: 'string' },
+      role_key: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+      source_call_ids: { anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] },
+    },
+    required: ['query', 'role_key', 'source_call_ids'],
+  };
+  assert.deepEqual(
+    materializeStrictNullableFields({ query: 'run it', role_key: 'null', source_call_ids: 'None' }, strict),
+    { query: 'run it', role_key: null, source_call_ids: null },
+  );
+  // A required, non-nullable string keeps the word so validation can name it.
+  assert.deepEqual(
+    materializeStrictNullableFields({ query: 'null' }, { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }),
+    { query: 'null' },
+  );
+});

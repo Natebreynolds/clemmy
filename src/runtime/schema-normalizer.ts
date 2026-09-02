@@ -301,6 +301,9 @@ function schemaBranchForValue(schemaValue: unknown, value: unknown): unknown {
  * JSON null is a transport repair, not a semantic default: real required
  * non-null values remain missing and fail normal validation.
  */
+/** Strings a compatible model emits to mean "no value". Exact words only. */
+const OMISSION_WORDS = new Set(['null', 'None', 'undefined', 'nil']);
+
 export function materializeStrictNullableFields(value: unknown, schemaValue: unknown): unknown {
   const schema = schemaBranchForValue(schemaValue, value);
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return value;
@@ -337,6 +340,19 @@ export function materializeStrictNullableFields(value: unknown, schemaValue: unk
     if (typeof out[key] === 'string' && out[key].trim() === '' && jsonSchemaAllowsNull(propertySchema)) {
       out[key] = null;
       continue;
+    }
+    // The same omission spelled as a WORD. GLM 5.3 serializes an omitted
+    // optional argument as the string "null" (live 2026-09-01: task_list
+    // priority:"null" failed its enum and the end-of-day workflow that had run
+    // for weeks died on the no-progress governor; workflow_get step:"null"
+    // counted as "both section and step"; work_call source_call_ids:"null"
+    // read as settled lineage and a reversible local dispatch was refused as
+    // plan-bound). A key the schema does not require is simply absent; a
+    // required nullable key is JSON null; a required non-nullable key keeps
+    // the value so validation can name it.
+    if (typeof out[key] === 'string' && OMISSION_WORDS.has(out[key].trim())) {
+      if (jsonSchemaAllowsNull(propertySchema)) { out[key] = null; continue; }
+      if (!required.has(key)) { delete out[key]; continue; }
     }
     out[key] = materializeStrictNullableFields(out[key], propertySchema);
   }
