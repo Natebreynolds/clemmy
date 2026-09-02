@@ -1418,7 +1418,6 @@ function readCatalogCache(): CatalogToolkit[] {
     if (!existsSync(CATALOG_CACHE_FILE)) return [];
     const parsed = JSON.parse(readFileSync(CATALOG_CACHE_FILE, 'utf-8')) as { at?: number; data?: CatalogToolkit[] };
     if (!parsed.at || !Array.isArray(parsed.data)) return [];
-    if (Date.now() - parsed.at > CATALOG_TTL_MS * 24) return [];
     return parsed.data;
   } catch {
     return [];
@@ -1426,8 +1425,15 @@ function readCatalogCache(): CatalogToolkit[] {
 }
 
 /** Synchronous, best-effort read of the cached toolkit catalog (slug + name).
- *  For author-time use (e.g. detecting a toolkit the chat discussed) where an
- *  async catalog fetch would be too heavy. Returns [] when the cache is cold. */
+ *  For author-time use (e.g. detecting a toolkit the chat discussed) and for
+ *  namespace IDENTITY (is `firecrawl` a provider toolkit?) where an async
+ *  catalog fetch would be too heavy. Returns [] only when no cache exists.
+ *  Age is not identity: a toolkit that was in the catalog two days ago is
+ *  still that toolkit. Live 2026-09-01: a 46-hour-old cache made every
+ *  non-curated provider "not a toolkit", so the JIT read edge refused
+ *  FIRECRAWL_SCRAPE as an invalid operation and scorpion-facebook-trends died
+ *  on its first read. Freshness for the live catalog is listAllToolkits'
+ *  own in-memory TTL, which this never touches. */
 export function listCachedToolkits(): CatalogToolkit[] {
   return readCatalogCache();
 }
