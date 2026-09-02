@@ -81,6 +81,15 @@ import {
   type ObjectiveJudgeVerdict,
 } from './objective-judge.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
+import {
+  MAX_WATCHER_CHECKS,
+  MAX_WATCHER_INJECTIONS,
+  runWatcherJudge,
+  shouldStartWatcherCheck,
+  watcherCheckIntervalTools,
+  watcherJudgeEnabled,
+  type WatcherVerdict,
+} from './watcher-judge.js';
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import {
   isHostDurableContinuationPendingError,
@@ -2253,6 +2262,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let workflowStepResultContinuationsUsed = 0;
   let continueMarkerContinuationsUsed = 0;
   let pendingHostModelDirective: string | undefined;
+  // TRAJECTORY WATCHER state (host_v1). Budgets are the shared watcher-judge
+  // constants so this mount cannot outspend the legacy one.
+  const hostWatcherEnabled = watcherJudgeEnabled();
+  const hostWatcherIntervalTools = watcherCheckIntervalTools();
+  const hostWatcherSteer: { pending: WatcherVerdict | null } = { pending: null };
+  let hostWatcherChecksUsed = 0;
+  let hostWatcherInjectionsUsed = 0;
+  let hostWatcherLastCheckedAt = 0;
+  let hostWatcherCheckInFlight = false;
   let lastContinueMarkerNote: string | undefined;
   let objectiveJudgeContinuations = 0;
   const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
@@ -5969,6 +5987,78 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     let modelStepSchemas: readonly unknown[] = schemas;
     let permittedNoProgressRecoveryToolNames: ReadonlySet<string> | null = null;
+    // TRAJECTORY WATCHER — the mid-run "is this still the thing Nate asked
+    // for?" check. It has existed for a while but only in the legacy core
+    // (loop.ts) and the workflow lane, and a live chat turn runs host_v1 which
+    // never enters either — so a turn that drifted at tool-call 3 burned the
+    // whole turn before the END-of-turn completion judge could bounce it, and
+    // that bounce costs a full re-loop. Same component, same contract:
+    // NON-BLOCKING (fired in the background, never on the critical path),
+    // GOAL-ONLY, advisory, silent when unsure, fail-open, and bounded by the
+    // shared check/injection budgets. A resolved drift verdict rides the
+    // ordinary one-shot directive at THIS continuation boundary.
+    if (hostProduction && hostWatcherEnabled) {
+      const drift = hostWatcherSteer.pending;
+      if (drift && !drift.onTrack && hostWatcherInjectionsUsed < MAX_WATCHER_INJECTIONS) {
+        hostWatcherSteer.pending = null;
+        hostWatcherInjectionsUsed += 1;
+        pendingHostModelDirective = [
+          pendingHostModelDirective,
+          `TRAJECTORY WATCHER (an independent check of the work so far against the ORIGINAL request) says OFF TRACK: ${drift.miss.slice(0, 300)}`,
+          drift.steer.slice(0, 300),
+        ].filter(Boolean).join(' ');
+        try {
+          appendEvent({
+            sessionId: exactHostIdentity().sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'goal_alignment_judged',
+            data: {
+              lane: 'host_v1',
+              kind: 'watcher',
+              fulfills: false,
+              reason: drift.miss.slice(0, 600),
+              steer: drift.steer.slice(0, 300),
+              continuation: true,
+            },
+          });
+        } catch { /* telemetry never blocks the turn */ }
+      }
+      const watcherToolCalls = history.filter((item) => {
+        const row = item as { type?: unknown; name?: unknown };
+        return row.type === 'function_call'
+          && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
+      }).length;
+      if (shouldStartWatcherCheck({
+        enabled: true,
+        totalToolCalls: watcherToolCalls,
+        lastCheckedAtToolCalls: hostWatcherLastCheckedAt,
+        checkIntervalTools: hostWatcherIntervalTools,
+        injectionsUsed: hostWatcherInjectionsUsed,
+        maxInjections: MAX_WATCHER_INJECTIONS,
+        checksUsed: hostWatcherChecksUsed,
+        maxChecks: MAX_WATCHER_CHECKS,
+        checkInFlight: hostWatcherCheckInFlight,
+      })) {
+        hostWatcherCheckInFlight = true;
+        hostWatcherChecksUsed += 1;
+        hostWatcherLastCheckedAt = watcherToolCalls;
+        const watcherObjective = judgedObjective();
+        const watcherSessionId = exactHostIdentity().sessionId;
+        void (async () => {
+          try {
+            const verdict = await runWatcherJudge({
+              objective: watcherObjective,
+              toolCallSummary: summarizeToolCallsForJudge(watcherSessionId),
+              latestAssistantNote: '',
+              toolCallCount: watcherToolCalls,
+            });
+            if (verdict && !verdict.onTrack) hostWatcherSteer.pending = verdict;
+          } catch { /* the watcher is silent on any failure */ }
+          finally { hostWatcherCheckInFlight = false; }
+        })();
+      }
+    }
     let modelInputDirective = pendingHostModelDirective;
     let writingNoProgressRecoveryDirective = false;
     if (!consumingRecoveredFrame) {

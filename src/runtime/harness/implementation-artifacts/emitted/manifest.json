@@ -800,6 +800,9 @@
         "src/runtime/harness/skill-execution.ts": {
           "bytes": 16140
         },
+        "src/runtime/harness/watcher-judge.ts": {
+          "bytes": 10157
+        },
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
         },
@@ -1742,9 +1745,6 @@
         "src/execution/workflow-fix-memory-store.ts": {
           "bytes": 5582
         },
-        "src/runtime/harness/watcher-judge.ts": {
-          "bytes": 10157
-        },
         "src/execution/workflow-step-judge.ts": {
           "bytes": 6266
         },
@@ -2217,7 +2217,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 316719
+          "bytes": 320754
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3290,6 +3290,9 @@
         "src/runtime/harness/skill-execution.ts": {
           "bytes": 16140
         },
+        "src/runtime/harness/watcher-judge.ts": {
+          "bytes": 10157
+        },
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
         },
@@ -4232,9 +4235,6 @@
         "src/execution/workflow-fix-memory-store.ts": {
           "bytes": 5582
         },
-        "src/runtime/harness/watcher-judge.ts": {
-          "bytes": 10157
-        },
         "src/execution/workflow-step-judge.ts": {
           "bytes": 6266
         },
@@ -4707,7 +4707,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 316719
+          "bytes": 320754
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
