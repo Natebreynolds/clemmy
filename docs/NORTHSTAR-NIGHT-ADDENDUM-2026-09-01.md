@@ -457,3 +457,29 @@ complex harness but removing what needs to be removed."
   registry + materializer + MCP carrier ×3.8k); (5) twelve effect vocabularies → `read | write | admin`
   with `send` as risk. Six `exactProductionHostCall` re-proofs per call are edge re-validation by design;
   collapse only with a pin per edge.
+
+### Later (20:10–21:35 PT): "legacy ones still need to be able to run"
+Owner, after "run my slack team activity update flow" answered with a rewrite promise and nothing visible:
+"I have no idea what she's doing right now"; "We can't just fix the problem though — Clem needs the right
+tools to migrate workflows, or legacy ones still need to be able to run."
+- **Measured:** the self-improvement lane had attempted the rewrite 18 times today (15:19 → 03:00Z), each
+  ending on a different harness gate (schema_invalid, schema_too_big, plan_incomplete, effect_unknown,
+  plan_sibling…); the 18th sat 10 minutes on GLM (46k-token prompt) with no output; none of it is visible
+  in the app (improvement sessions are filtered out of Working Now). The runner is a 1,109-line
+  owner-authored script (six SOQL reads, attribution reads, baseline files) — not a model-turn rewrite.
+- **Hand migration first** (kept as `SKILL.migrated-2026-09-01.md`): six exact `salesforce_sf_soql_query`
+  steps (all six proven live: 14/8/1/3/1/10 rows), a closed transform package, a render step with the exact
+  section order, the fixed-channel send. Validates: 9 steps, no errors.
+- **Reinstatement** (`77393c06`): the 08-30 release had re-retired deterministic runners (validator,
+  readiness, executeStep, scheduler holds) behind the rewrite lane; the executor itself never left the
+  tree. The refusal layer is deleted; the lane's bar is effects, not method (scripts/-confined path,
+  bytes pinned to the admitted run, interpreter allowlist, scrubbed env, capped wall clock/output,
+  redacted output, declared side_effect + output contract). Readiness = the script's presence; a missing
+  file blocks by name. The queue's improvement hold is deleted; `requestWorkflowImprovement` is an
+  explicit door (chat/dashboard), and the workflow keeps running on its own script meanwhile. 16 pins
+  retargeted; the two 08-26 loop-probe execution pins restored; 737 tests green across the touched suites.
+- **Vault:** `team-activity-slack-updates` restored to the owner's definition (runner + send). Daemon
+  restarted on 77393c06; the definition validates.
+- **Still owed (the "right tools" half):** a deterministic migration primitive the lane can call (extract
+  `sf data query`/Composio ops from a runner into exact call steps + package transform; the model only
+  names/reviews) and visibility of improvement sessions in Working Now with attempt N of 3.
