@@ -371,7 +371,14 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'memory_search_facts', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', actionTopologyRole: 'control', description: 'Semantically search durable FACTS (your long-term memory of the user, projects, standing…' },
   { name: 'memory_self_heal', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Inspect or run the audited long-term-memory self-heal loop.' },
   { name: 'note_create', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Create a new note in the vault.' },
-  { name: 'notify_user', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Send a notification to the user via the notification queue.' },
+  // A notification is a durable host-owned record the user will read: at
+  // runtime a host_only mutation like memory_remember, never a read. With no
+  // runtime override, a `send` step whose whole job is notify_user settled
+  // with zero mutations and the settlement audit called it unproven
+  // (morning-briefing, 2026-09-01, five runs). host_only asks no consent and
+  // stays out of business accounting; the taxonomy class stays `read` so the
+  // approval floor and the sideEffect/classifyTool mirror are unchanged.
+  { name: 'notify_user', sideEffect: 'read', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Send a notification to the user via the notification queue.' },
   { name: 'pending_action_execute', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['worker'], needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Execute the exact stored payload of an approved single-call pending action.' },
   { name: 'pending_action_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Read one queued action with its exact payload, status, approval id, preview, and result h…' },
   { name: 'pending_action_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'List durable pending actions.' },
