@@ -1007,3 +1007,38 @@ Verdict: the harness walls the battery found are fixed; the safety floors held
 without exception (zero sends, zero writes across ~12 turns); reads flow and
 validate-first works. The residual is GLM 5.3 indecision on the send/discovery
 path — always safe, model-side.
+
+## Gate 33 — commit-path tests with approval (2026-09-02 10:15–10:23 PDT)
+
+Four tests with the parked action actually approved (owner-owned/reversible
+targets: a scratch sheet, an email to the owner, a test workflow, a test
+space). No action ever committed — every write/send WALLED before an approval
+gate, so there was nothing to approve.
+
+- **create-sheet (write)**: GLM found GOOGLESHEETS_CREATE_GOOGLE_SHEET1 and
+  called plan_task FIVE times. Each refused a DIFFERENT hurdle: (1)
+  plan_invalid_input — evidence.0 prose failed the evidence pattern; (2)
+  plan_not_admitted host_destination_ambiguous_multiple_exact_targets (owner
+  has >1 Google account, create needs account disambiguation); (3-5)
+  plan_incomplete_missing_write — the cited capabilityRef `:definition:<digest>`
+  drifted (51949e→e9a32d) and never matched the staged entry's exact id. GLM
+  looped → control_no_progress_exhausted.
+- **send-self (send)**: GLM tool_searched twice (found OUTLOOK_OUTLOOK_SEND_EMAIL,
+  doubled prefix), never authored plan_task, walled plan_sibling. A send
+  correctly requires a plan; GLM could not author one.
+- **space**: correctly asked where to put a space (no notes app connected).
+- **read/validate/clarify** (gate 32): all succeed.
+
+Root finding: reads flow for GLM, but the WRITE/SEND path requires a plan_task
+DSL that GLM 5.3 authors unreliably across several independent dimensions
+(evidence format, destination account disambiguation, exact capabilityRef
+digest). Relaxing one reveals the next. The safety floors HELD throughout
+(zero writes, zero sends across all runs).
+
+DECISION OWED (not a pre-tag patch — touches the write-admission compiler):
+make a single, clear write "simple enough for GLM" by letting the host compile
+a single-action write plan from a DIRECT work_call (the host_owned_single_action_plan
+lane) so GLM never authors plan_task for a simple write — the same way reads
+now flow. The send floor stays (a send keeps the full plan + approval). Until
+then, the write/send commit path is reliable for a capable brain (Claude/grok
+authored plan_task historically) but not for GLM 5.3.
