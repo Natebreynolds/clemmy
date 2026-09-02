@@ -2097,7 +2097,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 19379
+          "bytes": 21430
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -2379,7 +2379,7 @@
           "bytes": 8581
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 238832
+          "bytes": 239958
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -4587,7 +4587,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 19379
+          "bytes": 21430
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -4869,7 +4869,7 @@
           "bytes": 8581
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 238832
+          "bytes": 239958
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
