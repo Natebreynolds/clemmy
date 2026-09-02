@@ -839,7 +839,7 @@ export function registerToolSearchTool(
         .max(128)
         .nullable()
         .optional()
-        .describe('Required on the wire: one exact unresolved role_key from the current capability card, or null when none is listed or for an exact tool-name schema refresh. Keys admission only; never ranking or authority.'),
+        .describe('Required on the wire. For broad discovery: one exact unresolved role_key from the current capability card; if no unresolved role is listed, pass null. For an exact tool-name schema refresh, pass null. Keys admission only, never ranking or authority.'),
       limit: z
         .number()
         .int()
