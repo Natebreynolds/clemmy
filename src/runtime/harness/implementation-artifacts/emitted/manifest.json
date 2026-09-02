@@ -113,8 +113,11 @@
         "src/runtime/harness/tool-effect.ts": {
           "bytes": 36764
         },
+        "src/shared/work-id.ts": {
+          "bytes": 674
+        },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 43639
+          "bytes": 43675
         },
         "src/assistant/request-segments.ts": {
           "bytes": 4916
@@ -153,7 +156,7 @@
           "bytes": 8367
         },
         "src/runtime/graph/work-topology.ts": {
-          "bytes": 20530
+          "bytes": 21983
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
           "bytes": 54441
@@ -534,7 +537,7 @@
           "bytes": 21483
         },
         "src/runtime/harness/expected-work-admission.ts": {
-          "bytes": 124439
+          "bytes": 124475
         },
         "src/runtime/shell-provider-outcome-adapters.ts": {
           "bytes": 3894
@@ -852,10 +855,10 @@
           "bytes": 57569
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
-          "bytes": 13776
+          "bytes": 13812
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 71421
+          "bytes": 71457
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
           "bytes": 26949
@@ -1278,7 +1281,7 @@
           "bytes": 77760
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 79825
+          "bytes": 80008
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -1476,7 +1479,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 48084
+          "bytes": 48078
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -2211,7 +2214,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 39834
+          "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 316365
@@ -2600,8 +2603,11 @@
         "src/runtime/harness/tool-effect.ts": {
           "bytes": 36764
         },
+        "src/shared/work-id.ts": {
+          "bytes": 674
+        },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 43639
+          "bytes": 43675
         },
         "src/assistant/request-segments.ts": {
           "bytes": 4916
@@ -2640,7 +2646,7 @@
           "bytes": 8367
         },
         "src/runtime/graph/work-topology.ts": {
-          "bytes": 20530
+          "bytes": 21983
         },
         "src/runtime/semantic-boundary/turn-semantic-proposal.ts": {
           "bytes": 54441
@@ -3021,7 +3027,7 @@
           "bytes": 21483
         },
         "src/runtime/harness/expected-work-admission.ts": {
-          "bytes": 124439
+          "bytes": 124475
         },
         "src/runtime/shell-provider-outcome-adapters.ts": {
           "bytes": 3894
@@ -3339,10 +3345,10 @@
           "bytes": 57569
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
-          "bytes": 13776
+          "bytes": 13812
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 71421
+          "bytes": 71457
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
           "bytes": 26949
@@ -3765,7 +3771,7 @@
           "bytes": 77760
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 79825
+          "bytes": 80008
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -3963,7 +3969,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 48084
+          "bytes": 48078
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -4698,7 +4704,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 39834
+          "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 316365

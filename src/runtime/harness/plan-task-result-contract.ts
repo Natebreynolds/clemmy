@@ -1,3 +1,4 @@
+import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 export const PLAN_TASK_RESULT_MAX_BYTES = 64 * 1024;
 
 export type PlanTaskRecoveryToolV1 =
@@ -19,7 +20,7 @@ export interface ExactPlanTaskRefusal {
   readonly structural: boolean;
 }
 
-const ID = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const ID = WORK_ID_PATTERN;
 const EFFECTS = new Set([
   'none',
   'read',

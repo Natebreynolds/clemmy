@@ -55,6 +55,7 @@ import { settleDiscoveryClaimForCallId } from './discovery-boundary.js';
 import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { isHostDurableContinuationPendingError } from './host-durable-continuation.js';
 import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
+import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 export type HostToolInvocationStopReason = 'deadline' | 'caller' | 'kill';
 export type HostToolInvocationBoundary =
@@ -558,7 +559,7 @@ type SettledPlanTaskResultDisposition =
 
 const PLAN_TASK_RESULT_MAX_BYTES = 64 * 1024;
 const PLAN_TASK_RESULT_MAX_REQUIREMENTS = 32;
-const PLAN_TASK_RESULT_ID = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const PLAN_TASK_RESULT_ID = WORK_ID_PATTERN;
 const PLAN_TASK_RESULT_EFFECTS = new Set([
   'read',
   'compute',

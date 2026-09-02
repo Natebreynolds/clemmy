@@ -107,7 +107,15 @@ function planTaskInvokable(): { invoke: (context: unknown, input: string) => Pro
 
 test('an input-validation failure returns a typed refusal that names the violated path', async () => {
   const tool = planTaskInvokable();
-  const raw = await tool.invoke({}, JSON.stringify(liveMismatchArgs()));
+  // The live 09-01 shape (a complete_set per-item read) is now DERIVED by the
+  // host (work-topology.test.ts), so this pin uses the pair the host cannot
+  // derive: a finite accepted set read once names no set at all.
+  const args = liveMismatchArgs();
+  const detail = (((args.draft as Record<string, unknown>).topology as Record<string, unknown>)
+    .operations as Array<Record<string, unknown>>)[1]!;
+  detail.coverage = 'accepted_set';
+  detail.cardinality = { kind: 'once' };
+  const raw = await tool.invoke({}, JSON.stringify(args));
   const text = String(raw);
   assert.doesNotMatch(text, /^An error occurred while running the tool/,
     'the SDK default string names nothing the model can correct — live cost: 5 blind identical retries, then a dead conversation');

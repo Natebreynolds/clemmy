@@ -17,6 +17,7 @@ import type {
 } from './no-progress-governor.js';
 import { NO_PROGRESS_RECOVERY_TOOL_NAME_CAP, createNoProgressConsequence } from './no-progress-governor.js';
 import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
+import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 /**
  * Exact, same-source projection for the pure no-progress reducer.
@@ -66,7 +67,7 @@ function record(value: unknown): UnknownRow | null {
     : null;
 }
 
-const PLAN_REPAIR_CAPABILITY_ID = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const PLAN_REPAIR_CAPABILITY_ID = WORK_ID_PATTERN;
 const PLAN_REPAIR_WRITE_EFFECTS = new Set(['local_write', 'external_write', 'admin']);
 
 function exactRecordKeys(value: UnknownRow, expected: readonly string[]): boolean {

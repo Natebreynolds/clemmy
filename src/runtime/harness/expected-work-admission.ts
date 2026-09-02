@@ -86,6 +86,7 @@ import {
 } from './host-capability-catalog-factory.js';
 import { proveFrozenMutationVerification } from './mutation-verification-proof.js';
 import { expectsHostLocalWorkspaceCompoundCommit } from './host-local-write-commit.js';
+import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 export interface ExpectedWorkUniverseSelectorV1 {
   /** RFC 6901 pointer into the normalized inner tool arguments. */
@@ -2137,7 +2138,7 @@ export function expectedWorkPlanLines(input: {
   return planLinesFor(openEventLog(), loaded.contract);
 }
 
-const WORK_PROGRESS_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const WORK_PROGRESS_ID_RE = WORK_ID_PATTERN;
 
 function publicWorkPlanDigest(lines: ExpectedWorkPlanLine[]): string {
   return JSON.stringify(lines.map((line) => ({

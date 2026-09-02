@@ -37,6 +37,7 @@ import {
   settledReadReplayCallId,
   SETTLED_READ_REUSE_LABEL,
 } from './settled-read-replay-semantics.js';
+import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'turn_ended',
@@ -297,7 +298,7 @@ function selected(data: Record<string, unknown>, keys: readonly string[]): Recor
 }
 
 const PUBLIC_WORKFLOW_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
-const PUBLIC_WORK_REQUIREMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const PUBLIC_WORK_REQUIREMENT_ID_RE = WORK_ID_PATTERN;
 const PUBLIC_SHA256_DIGEST_RE = /^[a-f0-9]{64}$/;
 
 export interface PublicAsyncWorkDispatchedData extends Record<string, unknown> {

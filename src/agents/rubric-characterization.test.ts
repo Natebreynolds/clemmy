@@ -157,10 +157,12 @@ const GOLDEN = {
   // 2026-08-31: every model lane now treats external/tool bytes as untrusted
   // evidence. Nearby wording was tightened so legacy stays inside its token
   // guard and fresh-action remains below its 5.5 KB stable-policy ceiling.
-  instructions: { len: 31884, sha16: '0b5dbd98814a3bca' },
-  native: { len: 30991, sha16: '10c57b280785f498' },
+  // 2026-09-02: ACCEPTED WORK AUTHORITY now says what the code allows — reads
+  // need no plan; call a disclosed read through work_call directly (byte-neutral).
+  instructions: { len: 31879, sha16: 'c6f90b90f9eeeaf3' },
+  native: { len: 30986, sha16: '85daf21e4addf1a5' },
   claudeBrain: { len: 8931, sha16: 'd628958eafd680ef' },
-  lean: { len: 10937, sha16: 'ea4567204fe1ed9e' },
+  lean: { len: 10936, sha16: '312178d94f766567' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { WORK_ID_MAX_CHARS, WORK_ID_PATTERN } from '../../shared/work-id.js';
 
 export const WORK_TOPOLOGY_VERSION = 1 as const;
 export const WORK_TOPOLOGY_MAX_OPERATIONS = 32 as const;
@@ -74,10 +75,10 @@ export type WorkTopologyValidation =
   | { ok: true; topology: WorkTopologyV1 }
   | { ok: false; errors: string[] };
 
-const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._/-]{0,127}$/;
+const ID_PATTERN = WORK_ID_PATTERN;
 const MEMBER_PATTERN = /^\S(?:[\s\S]{0,254}\S)?$/;
 
-export const WorkTopologyIdSchema = z.string().min(1).max(128).regex(ID_PATTERN);
+export const WorkTopologyIdSchema = z.string().min(1).max(WORK_ID_MAX_CHARS).regex(ID_PATTERN);
 export const WorkTopologyMemberSchema = z.string().min(1).max(256).regex(MEMBER_PATTERN);
 export const WorkTopologyEffectSchema = z.enum([
   'read', 'compute', 'local_write', 'external_write', 'admin',
@@ -287,6 +288,15 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
     errors.push(`topology exceeds ${WORK_TOPOLOGY_MAX_UNIVERSES} universes`);
   }
 
+  // Universe producers, read ahead of the operations so a producer's coverage
+  // can be derived (see the read-shape derivation below).
+  const completeSourceProducers = new Set<string>(
+    rawUniverses.flatMap((universe) => (
+      plainRecord(universe) && universe.seal === 'complete_source_receipt' && typeof universe.producedBy === 'string'
+        ? [universe.producedBy]
+        : []
+    )),
+  );
   const operations: WorkTopologyOperationV1[] = [];
   for (const [index, rawProposed] of rawOperations.entries()) {
     const label = `operation[${index}]`;
@@ -295,6 +305,24 @@ export function validateWorkTopology(value: unknown): WorkTopologyValidation {
       continue;
     }
     const raw = normalizeProposedOperation(rawProposed);
+    // Self-healing (live 2026-09-02): a read's coverage is DERIVABLE from what
+    // the model already said when the meaning is unambiguous. A per-member
+    // read (each) is coverage single; the once-read that produces a
+    // complete-source universe is complete_set. The host derives those instead
+    // of refusing and naming the fix — a chat turn died on that refusal, twice,
+    // with a different guess each time. A finite caller set (set) claiming
+    // whole-source exhaustion is NOT derived: that mismatch is a claim about
+    // the source, so it still refuses with the fix named.
+    if (raw.effect === 'read' && plainRecord(raw.cardinality)) {
+      const kind = raw.cardinality.kind;
+      if (kind === 'each') raw.coverage = 'single';
+      else if (
+        kind === 'once'
+        && typeof raw.id === 'string'
+        && completeSourceProducers.has(raw.id)
+        && raw.coverage !== 'resolved_operation'
+      ) raw.coverage = 'complete_set';
+    }
     exactKeys(raw, ['id', 'effect', 'coverage', 'dependsOn', 'dataFrom', 'cardinality'], label, errors);
     const idOk = validId(raw.id, `${label}.id`, errors);
     const effectOk = raw.effect === 'read'
