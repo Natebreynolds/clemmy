@@ -798,3 +798,11 @@ fact needed to repair it and did not.
 operation exactly as it binds a missing slug — no fuzzy matching, an unknown slug is still refused — and
 the pre-dispatch refusal inside a sealed step names the step's proven operations ("use one of those exactly")
 instead of prescribing tool_search → plan_task → work_call. Pinned.
+
+**Gate 25, second door (this commit).** The stutter completion never fired for the step: a sealed step calls
+the provider gateway DIRECTLY (tool = the gateway, args = the inner call), not through work_call/call_tool,
+and it has no "proven entries" — its operations were frozen into the accepted-source scope before the model
+spoke. The neutral registry now knows provider gateway names (each provider registers a predicate) and
+completes a direct call by lifting it into the wrapper form; with no proven entries the kernel hands the
+completers the frozen scope's operation ids; the refusal names the same scope. Pinned. Fresh standup run is
+the proof (it emails the owner only).
