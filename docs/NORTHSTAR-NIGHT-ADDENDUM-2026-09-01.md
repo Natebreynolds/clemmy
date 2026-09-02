@@ -673,3 +673,21 @@ no-random-gate outbound trio, and the 16 KiB model-surface ledger (21.7 KB, befo
 line). Wave debt, unchanged by tonight; not hidden.
 
 Re-running both suites on the committed fixes before any tag.
+
+## Gate 21 — one effect contract that holds every pin (2026-09-02 07:57–08:05 UTC)
+
+Second full run: 14,191 results, one failure — the 2026-07-20 draft trap (a stale `send` label on
+`OUTLOOK_CREATE_DRAFT` must stay a write) disagreed with the send-call gate (a declared `send` on a dynamic
+multiplexer must reach the gate). Both are right. The rule that holds both (c9f1042e): KNOWN slug evidence is
+authoritative in both directions — a real send is a send, a known read or reversible write is never a send,
+a label may strengthen a read to a write — and only an UNKNOWN carrier takes the label at face value, where
+the gate then refuses it typed. b790d76a had chosen "a label never fabricates a send" and missed the
+dynamic-carrier case; 752f8975 had chosen "strengthen only" and missed the draft trap.
+
+The chat lane had the same false positive in `isIrreversibleSendSlug` (call-tool, composio-tools, batch-tools,
+pending-action admission): `TWITTER_GET_POST` was an irreversible send — an approval card on a read. A read
+verb in the TOOL name is now a floor, judged after the MCP server segment or provider toolkit prefix, so a read
+verb in a SERVER slug still cannot vouch for a sending tool (that pin is kept).
+
+Journeys after 752f8975: 155/171, the same sixteen, all reproduced at the 09-01 baseline. Third full run on
+c9f1042e in progress before any tag.
