@@ -827,3 +827,17 @@ The 8 AM scheduled run is the next proof.
 
 **Final full pass on aae535bf (03:34 PT): 14,198 tests, 14,197 pass, 0 fail, 1 skipped.** Journeys: 155/171 — the
 same sixteen, all reproduced at the 09-01 baseline. Dev daemon back on the same commit at 03:44 PT.
+
+## Gate 27 — three dimensions of the goal in one pass (2026-09-02 10:45–11:20 UTC)
+
+- **Never hang on a task (gate 26 closed).** An absolute per-attempt response wall in the fallover model
+  (`CLEMMY_MODEL_RESPONSE_WALL_MS`, default 15 min). Silence walls never saw the standup's hang because the
+  brain kept emitting private reasoning. Before actionable output the wall falls over (`response-wall-exceeded`);
+  after, a typed failure for the caller's retry budget — never a duplicate brain. Two pins.
+- **Checks her own work.** The post-run goal judge audited on the 25 s boundary wall and timed out on every
+  large audit since mid-August. It now runs on its own `goal_fidelity` lane with its own deadline
+  (`CLEMMY_GOAL_JUDGE_TIMEOUT_MS`, default 90 s). Pinned.
+- **Fewer tokens.** The four largest always-loaded schemas rewritten to their rules (every affordance and every
+  "never claim unavailable" kept): cold first step 21,722 → 19,393 B; ask_user_question 3,247 → 1,809. The byte
+  ledger journey gains `CLEMMY_SURFACE_DUMP=1`. The last 3 KB to 16 KiB is the lean action rubric (5,492 B) and
+  the context snapshot (3,163 B) — a product decision, not a trim.
