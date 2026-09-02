@@ -22,8 +22,11 @@ test('a read-evidence slug declared write is a write on every path', () => {
 });
 
 test('send is a property of the operation: a label never fabricates one and never hides one', () => {
-  assert.equal(structuredCallSideEffectClass({ call: { tool: 'OUTLOOK_CREATE_DRAFT' }, sideEffect: 'send' }), 'write');
-  assert.equal(structuredCallSideEffectClass({ call: { tool: 'SLACK_FETCH_CONVERSATION_HISTORY' }, sideEffect: 'send' }), 'write');
+  assert.equal(structuredCallSideEffectClass({ call: { tool: 'OUTLOOK_CREATE_DRAFT' }, sideEffect: 'send' }), 'send');
+  assert.equal(structuredCallSideEffectClass({ call: { tool: 'SLACK_FETCH_CONVERSATION_HISTORY' }, sideEffect: 'send' }), 'send');
+  // A read verb is never a send, whatever the slug's nouns say.
+  assert.equal(structuredCallSideEffectClass({ call: { tool: 'TWITTER_GET_POST' } }), 'read');
+  assert.equal(structuredCallSideEffectClass({ call: { tool: 'TWITTER_GET_POST' }, sideEffect: 'read' }), 'read');
   assert.equal(structuredCallSideEffectClass({ call: { tool: 'OUTLOOK_SEND_EMAIL' }, sideEffect: 'read' }), 'send');
   assert.equal(enforce.classifyStepSideEffect({ id: 's', prompt: '', call: { tool: 'OUTLOOK_SEND_EMAIL' }, sideEffect: 'read' }), 'send');
 });

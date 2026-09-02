@@ -119,9 +119,9 @@ test('a zero-external-dispatch turn can never render the may-have-begun copy', (
     'zero external dispatches in the ledger: possible external execution may not be claimed');
   assert.doesNotMatch(text, /must be reconciled/i,
     'with nothing external in flight there is nothing to reconcile — the door this copy locks does not exist');
-  assert.match(text, /completed work and retained results remain preserved/i,
+  assert.match(text, /what I already gathered is kept|retained results remain preserved/i,
     'the honest terminal preserves prior work instead of denying that an earlier read ran');
-  assert.match(text, /no uncertain external change is pending/i,
+  assert.match(text, /nothing was sent or changed|no uncertain external change is pending/i,
     'the terminal states only the ledger fact it can prove about the failed step');
   assert.equal(text, HOST_LOCAL_FAILURE_BLOCKED_TEXT,
     'the residual terminal is one bounded factual host error, not a recovery instruction');

@@ -15,17 +15,14 @@
  * Anything ambiguous (zero or several proven reads, a non-object payload)
  * returns null and the ordinary refusal names the exact shape.
  */
-export interface ProvenCompletionEntry {
-  kind: string;
-  identifier: string;
-  effectClass?: string;
-}
+import {
+  registerCarrierCompleter,
+  type CarrierCompletion,
+  type ProvenCompletionEntry,
+} from './carrier-completion-registry.js';
 
-export interface CarrierCompletion {
-  argumentsJson: string;
-  toolSlug: string;
-  changes: string[];
-}
+export type { CarrierCompletion, ProvenCompletionEntry };
+
 
 const GATEWAY_TAIL = 'composio_execute_tool';
 
@@ -101,3 +98,6 @@ export function completeComposioCarrierArguments(
   if (usedArgsAlias) delete completedOuter.args;
   return { argumentsJson: JSON.stringify(completedOuter), toolSlug, changes };
 }
+
+// Register with the provider-neutral registry the host kernel's seam consults.
+registerCarrierCompleter(completeComposioCarrierArguments);

@@ -27,19 +27,25 @@ export function structuredCallSideEffectClass(step: {
   sideEffect?: string | undefined;
 }): StructuredCallSideEffectClass {
   const tool = step.call?.tool ?? '';
-  // A real SEND is a property of the operation, never of a label: the slug
-  // predicate decides it and no declaration can downgrade it.
-  if (isIrreversibleSendSlug(tool)) return 'send';
+  const declared = step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send'
+    ? step.sideEffect
+    : undefined;
+  // The slug's evidence is the FLOOR; an author's label can only strengthen it
+  // (read → write → send), never downgrade it. A read verb is never a send —
+  // TWITTER_GET_POST reads a post; the send-slug regex alone read "POST" as a
+  // send (2026-09-02). A declared send on a non-send tool is still classified
+  // send so the send gate sees it and refuses it as direct_send_tool_required
+  // at validation — the author relabels; nothing crosses.
   const evidence = composioSlugEffectEvidence(tool);
-  // Read evidence may be UPGRADED by a declared write/send — the author asks
-  // for consent and a receipt on a call the verb says is a read. It becomes a
-  // write: a label never fabricates a send (2026-07-20 draft trap — a stale
-  // `send` on GMAIL_CREATE_DRAFT put draft creation behind the send gate).
-  if (evidence === 'read') {
-    return step.sideEffect === 'write' || step.sideEffect === 'send' ? 'write' : 'read';
-  }
-  // No verb evidence (noun-shaped slug such as SLACK_CONVERSATIONS_HISTORY):
-  // an author-declared read is honoured. Everything else is a conservative write.
-  if (evidence === 'unknown' && step.sideEffect === 'read') return 'read';
-  return 'write';
+  const floor: 'read' | 'write' | 'send' | 'unknown' = evidence === 'read'
+    ? 'read'
+    : isIrreversibleSendSlug(tool)
+      ? 'send'
+      : evidence === 'unknown'
+        ? 'unknown'
+        : 'write';
+  if (floor === 'send' || declared === 'send') return 'send';
+  if (floor === 'write') return 'write';
+  if (floor === 'read') return declared === 'write' ? 'write' : 'read';
+  return declared === 'read' ? 'read' : 'write';
 }

@@ -42,6 +42,9 @@ const IMPORT_EXCEPTIONS: Record<string, string[]> = {
     '../../agents/proactivity-policy.js',
     './turn-graph-compiler.js',
     'node:perf_hooks',
+    // A swallowed persist exception is logged with its cause (0fbeaafe,
+    // 2026-09-01); the observation seam may report, it still does not decide.
+    'pino',
   ],
   // The chat spine intentionally bridges compiler + executor; its policy
   // snapshot type is a type-only concern but snapshotTurnGraphPolicy is a

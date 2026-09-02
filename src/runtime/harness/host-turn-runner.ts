@@ -156,7 +156,7 @@ import {
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
 import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
-import { completeComposioCarrierArguments } from './composio-carrier-completion.js';
+import { completeCarrierArguments } from './carrier-completion.js';
 import {
   catalogOperationIdentitiesEqual,
   isPlainOrClementineLocalTool,
@@ -3148,9 +3148,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // binds. The frozen snapshot, byte-identical spelling, the discovery
     // record's nine digests and the planning card's manifest digest are the
     // WRITE bar (idempotency, reconciliation, exact artifact); replayed onto
-    // reads they refused GOOGLESHEETS_BATCH_GET (08-29), two transports of one
-    // read (workflow:1788024507349) and SLACK_FETCH_CONVERSATION_HISTORY
-    // (09-01) that the host had itself just proved. A worker session with no
+    // reads they refused a spreadsheet batch read (08-29), two transports of one
+    // read (workflow:1788024507349) and a chat-history read (09-01) that the
+    // host had itself just proved. A worker session with no
     // same-turn proof still binds its current catalog read.
     const provenReadCandidate = candidates.length === 0
       ? resolveProvenLiveReadCatalogEntry({
@@ -6433,8 +6433,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const frameCalls = canonicalCalls.map((call) => {
         const tool = toolByName.get(call.name);
         let argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
-        // Complete a structurally wrong Composio carrier from facts the host
-        // already holds (composio-carrier-completion.ts): the one operation
+        // Complete a structurally wrong provider carrier from facts the host
+        // already holds (carrier-completion.ts, provider-neutral): the one operation
         // proven this turn, the `arguments` wrapper, one serialization. The
         // completed bytes are what this frame classifies AND dispatches, so the
         // settlement and the learned pin record the working shape.
@@ -6451,7 +6451,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               sourceUserSeq: completionIdentity.sourceUserSeq,
             });
           } catch { /* no accepted identity: nothing proven this turn */ }
-          const completed = completeComposioCarrierArguments(argumentsJson, provenEntries);
+          const completed = completeCarrierArguments(argumentsJson, provenEntries);
           if (completed) {
             argumentsJson = completed.argumentsJson;
             (call as { argumentsJson: string }).argumentsJson = completed.argumentsJson;
@@ -6461,7 +6461,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               carrier: call.name,
               toolSlug: completed.toolSlug,
               changes: completed.changes,
-            }, 'host completed a Composio carrier from the turn\'s proven disclosure');
+            }, 'host completed a provider carrier from the turn\'s proven disclosure');
           }
         }
         const argumentsValue = parsedArgs(argumentsJson);
@@ -7120,7 +7120,7 @@ export function _setHostJitReadProvisionerForTests(provisioner: HostJitReadProvi
  * the former through the attested live-read registry (the same acquisition
  * the workflow compiler uses), never through the provider materializer that
  * uppercases it into a slug that does not exist (live 2026-09-01: a chat
- * Salesforce read dead-ended unless tool_search had run first). */
+ * reviewed-CLI read dead-ended unless tool_search had run first). */
 export function isReviewedLiveReadIdentity(operationId: string): boolean {
   return /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(operationId.trim());
 }

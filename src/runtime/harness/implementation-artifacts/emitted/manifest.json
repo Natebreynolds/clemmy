@@ -800,8 +800,14 @@
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
         },
+        "src/runtime/harness/carrier-completion-registry.ts": {
+          "bytes": 1131
+        },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 4227
+          "bytes": 4353
+        },
+        "src/runtime/harness/carrier-completion.ts": {
+          "bytes": 854
         },
         "src/tools/structural-control-lookup.ts": {
           "bytes": 2380
@@ -969,7 +975,7 @@
           "bytes": 9730
         },
         "src/execution/workflow-step-effect.ts": {
-          "bytes": 2492
+          "bytes": 2652
         },
         "src/tools/composio-batch-validator.ts": {
           "bytes": 32535
@@ -1320,7 +1326,7 @@
           "bytes": 17601
         },
         "src/execution/step-output-verify.ts": {
-          "bytes": 11334
+          "bytes": 11882
         },
         "src/tools/step-result-tool.ts": {
           "bytes": 12085
@@ -1713,7 +1719,7 @@
           "bytes": 5022
         },
         "src/execution/workflow-diagnosis.ts": {
-          "bytes": 65440
+          "bytes": 65784
         },
         "src/execution/project-root-lifecycle.ts": {
           "bytes": 17726
@@ -1866,7 +1872,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 721359
+          "bytes": 721672
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -2208,7 +2214,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 314482
+          "bytes": 314457
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2220,7 +2226,7 @@
           "bytes": 25417
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 49495
+          "bytes": 49464
         },
         "src/runtime/harness/restart-recovery.ts": {
           "bytes": 69778
@@ -3281,8 +3287,14 @@
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
         },
+        "src/runtime/harness/carrier-completion-registry.ts": {
+          "bytes": 1131
+        },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 4227
+          "bytes": 4353
+        },
+        "src/runtime/harness/carrier-completion.ts": {
+          "bytes": 854
         },
         "src/tools/structural-control-lookup.ts": {
           "bytes": 2380
@@ -3450,7 +3462,7 @@
           "bytes": 9730
         },
         "src/execution/workflow-step-effect.ts": {
-          "bytes": 2492
+          "bytes": 2652
         },
         "src/tools/composio-batch-validator.ts": {
           "bytes": 32535
@@ -3801,7 +3813,7 @@
           "bytes": 17601
         },
         "src/execution/step-output-verify.ts": {
-          "bytes": 11334
+          "bytes": 11882
         },
         "src/tools/step-result-tool.ts": {
           "bytes": 12085
@@ -4194,7 +4206,7 @@
           "bytes": 5022
         },
         "src/execution/workflow-diagnosis.ts": {
-          "bytes": 65440
+          "bytes": 65784
         },
         "src/execution/project-root-lifecycle.ts": {
           "bytes": 17726
@@ -4347,7 +4359,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 721359
+          "bytes": 721672
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -4689,7 +4701,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 314482
+          "bytes": 314457
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4701,7 +4713,7 @@
           "bytes": 25417
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 49495
+          "bytes": 49464
         },
         "src/runtime/harness/restart-recovery.ts": {
           "bytes": 69778
