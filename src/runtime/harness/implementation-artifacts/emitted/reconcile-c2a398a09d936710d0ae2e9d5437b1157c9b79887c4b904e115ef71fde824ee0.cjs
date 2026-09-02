@@ -308,7 +308,7 @@ var init_mutation_verification_contract = __esm({
 });
 
 // src/shared/closed-canonical-json.ts
-var CLOSED_CANONICAL_JSON_DEFAULTS;
+var CLOSED_CANONICAL_JSON_DEFAULTS, SEALED_CALL_CANONICAL_LIMITS;
 var init_closed_canonical_json = __esm({
   "src/shared/closed-canonical-json.ts"() {
     "use strict";
@@ -317,6 +317,12 @@ var init_closed_canonical_json = __esm({
       maxNodes: 2e4,
       maxStringBytes: 64e3,
       maxTotalBytes: 512e3
+    });
+    SEALED_CALL_CANONICAL_LIMITS = Object.freeze({
+      maxDepth: 32,
+      maxNodes: 2e6,
+      maxStringBytes: 8e6,
+      maxTotalBytes: 8e6
     });
   }
 });

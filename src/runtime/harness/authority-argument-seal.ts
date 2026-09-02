@@ -4,6 +4,7 @@
  * CLEMMY_AUTHORITY_SEAL_KEY. Production uses the Clementine vault /
  * OS keychain via SecretStore.
  */
+import { SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -11,8 +12,18 @@ import path from 'node:path';
 import { BASE_DIR, invalidateRuntimeConfigSnapshot } from '../../config.js';
 
 const SEAL_VERSION = 2;
-export const AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES = 32_000;
-export const AUTHORITY_ARGUMENT_MAX_CIPHER_BYTES = 48_000;
+// The fifth door on the sealed-call argument path shares the one bound the
+// compiler, executor and runner already apply (SEALED_CALL_CANONICAL_LIMITS);
+// a 32 000-byte private cap here refused a 600 KB workspace dataset commit
+// after every other door had admitted it (2026-09-02).
+export const AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES = SEALED_CALL_CANONICAL_LIMITS.maxTotalBytes;
+// Ciphertext is JSON-wrapped base64 of base64 (~1.8x the plaintext): derive
+// the cap from the plaintext bound instead of keeping a second private number.
+export const AUTHORITY_ARGUMENT_MAX_CIPHER_BYTES = Math.min(
+  Math.ceil(AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES * 2) + 4_096,
+  // The durable lease column's CHECK (eventlog schema v75) is the outer wall.
+  16_777_216,
+);
 export const AUTHORITY_SEAL_KEY_ID_V2 = 'authority_seal_v2';
 export const AUTHORITY_SEAL_KEY_ID_V1 = 'authority_seal_v1';
 const VAULT_FILE = path.join(BASE_DIR, 'state', 'secrets-vault.json');

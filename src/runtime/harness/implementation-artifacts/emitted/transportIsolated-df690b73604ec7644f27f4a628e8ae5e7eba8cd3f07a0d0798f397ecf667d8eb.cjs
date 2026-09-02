@@ -111,6 +111,12 @@ var CLOSED_CANONICAL_JSON_DEFAULTS = Object.freeze({
   maxStringBytes: 64e3,
   maxTotalBytes: 512e3
 });
+var SEALED_CALL_CANONICAL_LIMITS = Object.freeze({
+  maxDepth: 32,
+  maxNodes: 2e6,
+  maxStringBytes: 8e6,
+  maxTotalBytes: 8e6
+});
 var ClosedCanonicalJsonError = class extends Error {
   constructor(message, code, path5) {
     super(`${message} at ${path5}`);
@@ -490,8 +496,12 @@ var import_node_crypto2 = require("node:crypto");
 var import_node_fs2 = require("node:fs");
 var import_node_path2 = __toESM(require("node:path"), 1);
 var SEAL_VERSION = 2;
-var AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES = 32e3;
-var AUTHORITY_ARGUMENT_MAX_CIPHER_BYTES = 48e3;
+var AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES = SEALED_CALL_CANONICAL_LIMITS.maxTotalBytes;
+var AUTHORITY_ARGUMENT_MAX_CIPHER_BYTES = Math.min(
+  Math.ceil(AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES * 2) + 4096,
+  // The durable lease column's CHECK (eventlog schema v75) is the outer wall.
+  16777216
+);
 var AUTHORITY_SEAL_KEY_ID_V2 = "authority_seal_v2";
 var AUTHORITY_SEAL_KEY_ID_V1 = "authority_seal_v1";
 var VAULT_FILE = import_node_path2.default.join(BASE_DIR, "state", "secrets-vault.json");

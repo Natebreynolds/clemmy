@@ -285,7 +285,10 @@ import {
   type WorkflowNodeCallExecutionIdentityV1,
   type WorkflowNodeCallAuthorityProof,
 } from './workflow-node-invocation-executor.js';
-import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
+import {
+  closedCanonicalJson,
+  SEALED_CALL_CANONICAL_LIMITS,
+} from '../shared/closed-canonical-json.js';
 import {
   produceCanonicalEntityWorkflowLineage,
   type CanonicalEntityWorkflowResultRootV1,
@@ -2982,7 +2985,10 @@ async function executeExactWorkflowV3CallNode(
     });
   }
   try {
-    if (closedCanonicalJson(args) !== closedCanonicalJson(preparation.prepared.canonicalArgs)) {
+    if (
+      closedCanonicalJson(args, SEALED_CALL_CANONICAL_LIMITS)
+      !== closedCanonicalJson(preparation.prepared.canonicalArgs, SEALED_CALL_CANONICAL_LIMITS)
+    ) {
       throw new WorkflowHarnessBlockedSignal({
         stepId: step.id,
         sessionId: callSessionId,

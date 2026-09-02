@@ -1190,3 +1190,11 @@ test('BARE CALL ACCOUNT GATE — choosing B dispatches only B and restart replay
   assert.equal(accountA.bodies(), 0);
   assert.equal(accountB.bodies(), 1);
 });
+
+test('a workspace-scale argument crosses one sealed call: every door on the path shares one bound', async () => {
+  const big = fixture('big-argument');
+  big.ctx.inputs.scope = 'x'.repeat(600_000);
+  const out = await runner.executeStep(big.step, big.ctx);
+  assert.deepEqual(out, { records: [{ id: 'big-argument' }] });
+  assert.equal(big.bodies(), 1);
+});

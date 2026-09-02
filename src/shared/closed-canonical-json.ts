@@ -7,6 +7,28 @@ export const CLOSED_CANONICAL_JSON_DEFAULTS = Object.freeze({
   maxTotalBytes: 512_000,
 });
 
+/**
+ * One bound for every door a sealed workflow call's ARGUMENTS pass through
+ * (argument compilation, executor canonicalization, the runner's drift
+ * comparison). Sized to what the transports on either side already accept —
+ * a reviewed-CLI read may return 1 MiB of stdout and a workspace dataset
+ * commit carries several such results in one argument — not to a chat-sized
+ * payload. Four doors with four different caps refused the Friday dashboard's
+ * 75 KB `space_set_data` commit one door at a time (2026-09-02). The bound
+ * keeps the canonical form finite; it does not decide what a workflow may commit.
+ */
+export const SEALED_CALL_CANONICAL_LIMITS = Object.freeze({
+  maxDepth: 32,
+  maxNodes: 2_000_000,
+  maxStringBytes: 8_000_000,
+  maxTotalBytes: 8_000_000,
+});
+
+export function isClosedCanonicalJsonLimitError(error: unknown): error is ClosedCanonicalJsonError {
+  return error instanceof ClosedCanonicalJsonError
+    && (error.code === 'string_limit' || error.code === 'total_byte_limit' || error.code === 'node_limit');
+}
+
 export interface ClosedCanonicalJsonOptions {
   maxDepth?: number;
   maxNodes?: number;

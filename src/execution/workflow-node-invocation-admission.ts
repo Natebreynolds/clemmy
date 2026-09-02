@@ -21,7 +21,11 @@ import {
   type IndependentCapabilityObservation,
 } from '../runtime/harness/independent-capability-observation.js';
 import { capabilityManifestDigest, currentCapabilityManifest } from '../runtime/harness/capability-manifest.js';
-import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
+import {
+  closedCanonicalJson,
+  isClosedCanonicalJsonLimitError,
+  SEALED_CALL_CANONICAL_LIMITS,
+} from '../shared/closed-canonical-json.js';
 import { workflowCapabilityDigest } from './workflow-capability-digest.js';
 
 export type WorkflowNodeInvocationBlockCode =
@@ -100,7 +104,7 @@ export type CompileWorkflowNodeArgumentsResult =
   | { ok: true; args: Record<string, unknown>; argumentDigest: string }
   | {
       ok: false;
-      reason: 'missing_source' | 'type_mismatch' | 'invalid_plan' | 'invalid_runtime_value';
+      reason: 'missing_source' | 'type_mismatch' | 'invalid_plan' | 'invalid_runtime_value' | 'too_large';
       argument?: string;
     };
 
@@ -203,17 +207,10 @@ export function compileWorkflowNodeInvocationArguments(
         domain: 'workflow-node-provider-arguments',
         version: 1,
         args,
-      }, {
-        maxDepth: 32,
-        maxNodes: 20_000,
-        // This pre-kernel digest boundary is bounded independently. The
-        // executor applies the stricter 64KB sealed-call ceiling and returns
-        // canonical_arguments_too_large before authority arming.
-        maxStringBytes: 256_000,
-        maxTotalBytes: 256_000,
-      })),
+      }, SEALED_CALL_CANONICAL_LIMITS)),
     };
-  } catch {
+  } catch (error) {
+    if (isClosedCanonicalJsonLimitError(error)) return { ok: false, reason: 'too_large' };
     return { ok: false, reason: 'invalid_runtime_value' };
   }
 }

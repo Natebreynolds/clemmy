@@ -2944,6 +2944,57 @@ function refreshCheckpointBackedPlanContinuationTriggersV71(db: Database.Databas
   `);
 }
 
+
+const RUN_DISPATCH_LEASE_CIPHER_MAX_BYTES_V75 = 16_777_216;
+const RUN_DISPATCH_LEASE_CIPHER_CHECK_V53 = 'length(recovery_argument_cipher) BETWEEN 1 AND 48000';
+
+function rebuildRunDispatchLeasesCipherBoundV75(db: Database.Database): void {
+  const table = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'run_dispatch_leases'`,
+  ).get() as { sql: string } | undefined;
+  if (!table || !table.sql.includes(RUN_DISPATCH_LEASE_CIPHER_CHECK_V53)) return;
+  const rebuiltSql = table.sql.replace(
+    RUN_DISPATCH_LEASE_CIPHER_CHECK_V53,
+    `length(recovery_argument_cipher) BETWEEN 1 AND ${RUN_DISPATCH_LEASE_CIPHER_MAX_BYTES_V75}`,
+  );
+  const objects = db.prepare(`
+    SELECT type, name, sql FROM sqlite_master
+     WHERE tbl_name = 'run_dispatch_leases' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+  `).all() as Array<{ type: string; name: string; sql: string }>;
+  const columns = (db.prepare('PRAGMA table_info(run_dispatch_leases)').all() as Array<{ name: string }>)
+    .map((column) => column.name);
+  const beforeRows = (db.prepare('SELECT COUNT(*) AS n FROM run_dispatch_leases').get() as { n: number }).n;
+  const priorLegacyRename = Number(db.pragma('legacy_alter_table', { simple: true })) === 1;
+  db.pragma('legacy_alter_table = ON');
+  try {
+    for (const object of objects) {
+      db.exec(`DROP ${object.type.toUpperCase()} ${quotedSchemaIdentifier(object.name)}`);
+    }
+    db.exec('ALTER TABLE run_dispatch_leases RENAME TO run_dispatch_leases_v74');
+    db.exec(rebuiltSql);
+    const columnList = columns.map(quotedSchemaIdentifier).join(', ');
+    db.exec(`INSERT INTO run_dispatch_leases (${columnList})
+      SELECT ${columnList} FROM run_dispatch_leases_v74`);
+    const copiedRows = (db.prepare('SELECT COUNT(*) AS n FROM run_dispatch_leases').get() as { n: number }).n;
+    if (copiedRows !== beforeRows) {
+      throw new Error(`schema v75 run_dispatch_leases row-count mismatch: ${beforeRows} -> ${copiedRows}`);
+    }
+    db.exec('DROP TABLE run_dispatch_leases_v74');
+    for (const object of objects) db.exec(object.sql);
+  } finally {
+    db.pragma(`legacy_alter_table = ${priorLegacyRename ? 'ON' : 'OFF'}`);
+  }
+  const violations = (db.pragma('foreign_key_check') as Array<{ table: string }>)
+    .filter((violation) => violation.table === 'run_dispatch_leases');
+  if (violations.length > 0) {
+    throw new Error(`schema v75 foreign-key check failed for ${violations.length} run_dispatch_leases row(s)`);
+  }
+  const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
+  if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
+    throw new Error(`schema v75 integrity check failed: ${JSON.stringify(integrity).slice(0, 240)}`);
+  }
+}
+
 const MIGRATIONS: EventLogMigration[] = [
   {
     version: 1,
@@ -11069,6 +11120,18 @@ const MIGRATIONS: EventLogMigration[] = [
           AND json_valid(metadata_json)
           AND json_type(metadata_json, '$.__run_in_flight') IS NOT NULL;
     `,
+  },
+  {
+    // v75: the sealed recovery argument on a call lease shares the one
+    // sealed-call bound every other door on the argument path applies. The
+    // 48 000-byte CHECK from v53 refused a 600 KB workspace dataset commit
+    // after the compiler, executor, runner and seal had all admitted it
+    // (2026-09-02). Column CHECKs cannot be altered: rebuild the table with
+    // the same DDL, indexes and triggers, and the literal bound below.
+    version: 75,
+    sql: 'SELECT 1;',
+    backfill: (db) => rebuildRunDispatchLeasesCipherBoundV75(db),
+    foreignKeysOff: true,
   },
 ];
 

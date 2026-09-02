@@ -2,8 +2,8 @@
   "version": 3,
   "artifacts": {
     "invoke": {
-      "file": "invoke-f6104b3c5609f60caa41bae2c0db9eea3c94f21db08bc5a7638f7811fe0bb2b0.cjs",
-      "sha256": "f6104b3c5609f60caa41bae2c0db9eea3c94f21db08bc5a7638f7811fe0bb2b0",
+      "file": "invoke-2e06508d9f3bdd705d637ac8264dc0b5f3716bc87b604ae0e9dd38959a397e21.cjs",
+      "sha256": "2e06508d9f3bdd705d637ac8264dc0b5f3716bc87b604ae0e9dd38959a397e21",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/invoke-support.ts": {
           "bytes": 159
@@ -150,7 +150,7 @@
           "bytes": 11181
         },
         "src/shared/closed-canonical-json.ts": {
-          "bytes": 7317
+          "bytes": 8367
         },
         "src/runtime/graph/work-topology.ts": {
           "bytes": 20530
@@ -498,7 +498,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 550747
+          "bytes": 554094
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -528,7 +528,7 @@
           "bytes": 23698
         },
         "src/runtime/harness/authority-argument-seal.ts": {
-          "bytes": 7660
+          "bytes": 8389
         },
         "src/runtime/harness/mutation-verification-proof.ts": {
           "bytes": 21483
@@ -1794,7 +1794,7 @@
           "bytes": 7571
         },
         "src/execution/workflow-node-invocation-admission.ts": {
-          "bytes": 18394
+          "bytes": 18266
         },
         "src/runtime/harness/workflow-read-only-call-kernel.ts": {
           "bytes": 54689
@@ -1803,7 +1803,7 @@
           "bytes": 24685
         },
         "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 43067
+          "bytes": 43263
         },
         "src/spaces/canonical-entity-workspace-binding-contract.ts": {
           "bytes": 11860
@@ -1866,7 +1866,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 719768
+          "bytes": 719881
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -2483,8 +2483,8 @@
       }
     },
     "reconcile": {
-      "file": "reconcile-c5d160b707e31337ab018a856c7e2194b42fa1b22b97bdfe701aee6df288ca23.cjs",
-      "sha256": "c5d160b707e31337ab018a856c7e2194b42fa1b22b97bdfe701aee6df288ca23",
+      "file": "reconcile-c2a398a09d936710d0ae2e9d5437b1157c9b79887c4b904e115ef71fde824ee0.cjs",
+      "sha256": "c2a398a09d936710d0ae2e9d5437b1157c9b79887c4b904e115ef71fde824ee0",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/reconcile-support.ts": {
           "bytes": 171
@@ -2631,7 +2631,7 @@
           "bytes": 11181
         },
         "src/shared/closed-canonical-json.ts": {
-          "bytes": 7317
+          "bytes": 8367
         },
         "src/runtime/graph/work-topology.ts": {
           "bytes": 20530
@@ -2979,7 +2979,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 550747
+          "bytes": 554094
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -3009,7 +3009,7 @@
           "bytes": 23698
         },
         "src/runtime/harness/authority-argument-seal.ts": {
-          "bytes": 7660
+          "bytes": 8389
         },
         "src/runtime/harness/mutation-verification-proof.ts": {
           "bytes": 21483
@@ -4275,7 +4275,7 @@
           "bytes": 7571
         },
         "src/execution/workflow-node-invocation-admission.ts": {
-          "bytes": 18394
+          "bytes": 18266
         },
         "src/runtime/harness/workflow-read-only-call-kernel.ts": {
           "bytes": 54689
@@ -4284,7 +4284,7 @@
           "bytes": 24685
         },
         "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 43067
+          "bytes": 43263
         },
         "src/spaces/canonical-entity-workspace-binding-contract.ts": {
           "bytes": 11860
@@ -4347,7 +4347,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 719768
+          "bytes": 719881
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -4982,8 +4982,8 @@
       }
     },
     "transport": {
-      "file": "transport-a8941a7a34b6af8b681da89de310cc28f6e5571906342fe3dafb0aec5079f547.cjs",
-      "sha256": "a8941a7a34b6af8b681da89de310cc28f6e5571906342fe3dafb0aec5079f547",
+      "file": "transport-bc4b69db0513309ad7abae4a1c580b7aae2f4da6ca8ad1bc100a4fa556f2d67b.cjs",
+      "sha256": "bc4b69db0513309ad7abae4a1c580b7aae2f4da6ca8ad1bc100a4fa556f2d67b",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -5013,7 +5013,7 @@
           "bytes": 33409
         },
         "src/shared/closed-canonical-json.ts": {
-          "bytes": 7317
+          "bytes": 8367
         },
         "src/runtime/harness/provider-read-evidence.ts": {
           "bytes": 14906
@@ -5046,7 +5046,7 @@
           "bytes": 29423
         },
         "src/runtime/harness/authority-argument-seal.ts": {
-          "bytes": 7660
+          "bytes": 8389
         },
         "src/runtime/harness/reviewed-cli-read-config.ts": {
           "bytes": 22207
@@ -5060,8 +5060,8 @@
       }
     },
     "transportIsolated": {
-      "file": "transportIsolated-6c6e41317cd4902effcc44b9f52e7f3f3e4389867c64f2d17315db81ba822102.cjs",
-      "sha256": "6c6e41317cd4902effcc44b9f52e7f3f3e4389867c64f2d17315db81ba822102",
+      "file": "transportIsolated-df690b73604ec7644f27f4a628e8ae5e7eba8cd3f07a0d0798f397ecf667d8eb.cjs",
+      "sha256": "df690b73604ec7644f27f4a628e8ae5e7eba8cd3f07a0d0798f397ecf667d8eb",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-isolated-support.ts": {
           "bytes": 149
@@ -5070,7 +5070,7 @@
           "bytes": 6696
         },
         "src/shared/closed-canonical-json.ts": {
-          "bytes": 7317
+          "bytes": 8367
         },
         "src/shared/stable-json-digest.ts": {
           "bytes": 1267
@@ -5085,7 +5085,7 @@
           "bytes": 29423
         },
         "src/runtime/harness/authority-argument-seal.ts": {
-          "bytes": 7660
+          "bytes": 8389
         },
         "src/runtime/harness/reviewed-cli-read-config.ts": {
           "bytes": 22207
@@ -5099,5 +5099,5 @@
       }
     }
   },
-  "manifestDigest": "d9bdbf852e9f8732aed66fa37cdc548dcae51bd9dbcb4ff9c4f640baa8f86608"
+  "manifestDigest": "ffa25cef877e843995891f79b9ee01d1e7546edb24567d4a8dc77e313e1d874a"
 }
