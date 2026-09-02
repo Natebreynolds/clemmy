@@ -200,9 +200,12 @@ export function tryHostDispatchNamedWorkflow(input: {
       sourceUserSeq: input.sourceUserSeq,
     });
     if (admitted.ok && admitted.runId) {
+      // Name the run and where to watch it: the owner's "I have no idea what
+      // she's doing right now" (2026-09-01) was a reply that promised a
+      // notification and pointed nowhere.
       const queued = admitted.status === 'duplicate'
-        ? `Rejoined the already-running "${admitted.workflowName}" workflow. I'll report back here when it finishes.`
-        : `Queued "${admitted.workflowName}". I'll report back here when it finishes.`;
+        ? `Rejoined the already-running "${admitted.workflowName}" workflow (run ${admitted.runId}) — it's in Working Now. I'll report back here when it finishes.`
+        : `Started "${admitted.workflowName}" (run ${admitted.runId}) — you can watch it in Working Now. I'll report back here when it finishes.`;
       return {
         status: 'dispatched',
         workflowName: admitted.workflowName,
