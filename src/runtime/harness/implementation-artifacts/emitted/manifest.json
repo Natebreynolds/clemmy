@@ -1383,7 +1383,7 @@
           "bytes": 659
         },
         "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 18988
+          "bytes": 19813
         },
         "src/runtime/harness/host-model-result-receipt.ts": {
           "bytes": 22396
@@ -3870,7 +3870,7 @@
           "bytes": 659
         },
         "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 18988
+          "bytes": 19813
         },
         "src/runtime/harness/host-model-result-receipt.ts": {
           "bytes": 22396

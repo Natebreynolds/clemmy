@@ -961,3 +961,62 @@ test('a label-only operation-version move re-provisions the stored manifest as i
   assert.equal(store.get(stored.manifestId)?.manifest.lifecycle.state, 'superseded');
   assert.equal(store.get(successor.manifestId)?.manifest.lifecycle.state, 'current');
 });
+
+test('two current manifests for one operation are two accounts: the connection the workflow names wins, an unnamed pair stays ambiguous', async () => {
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const personal = manifest('OUTLOOK_LIST_EVENTS', 'read');
+  const work: CapabilityManifestV1 = attachSemanticContract({
+    ...personal,
+    manifestId: `${personal.manifestId}:definition:account-work`,
+    accountId: 'ca_T9pDCuTalAI3',
+    definitionFingerprint: digest('definition:OUTLOOK_LIST_EVENTS:work'),
+  });
+  const store = createCapabilityManifestStore([personal, work]);
+  installCapabilityManifestStore(store);
+  const crossings = new Map<string, number>();
+  const factory = createHostCapabilityCatalogFactory([]);
+  installHostCapabilityCatalogFactory(factory);
+  const session = createSession({ kind: 'workflow', userId: 'workflow:test' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'daily standup' },
+  });
+  const dependencies = {
+    manifestStore: store,
+    catalogFactory: factory,
+    provisionExactOperations: async () => { throw new Error('nothing to provision'); },
+    revalidate: async (selections: Array<{ identifier: string; accountIdentity: string }>) => {
+      assert.equal(selections.length, 1);
+      const chosen = selections[0]!.accountIdentity === work.accountId ? work : personal;
+      return { ok: true as const, definitions: new Map([[chosen.operationId.toLowerCase(), revalidated(chosen)]]) };
+    },
+    refresh: (manifestIds: string[]) => {
+      for (const id of manifestIds) {
+        const exact = store.get(id);
+        assert.ok(exact);
+        factory.register(registered(exact!.manifest, crossings));
+      }
+    },
+    ready: () => true,
+  };
+
+  const named = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's events from the Scorpion Outlook calendar (connection ca_T9pDCuTalAI3) using OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
+  }, dependencies);
+  assert.equal(named.status, 'ready', JSON.stringify(named));
+  if (named.status !== 'ready') return;
+  assert.deepEqual(named.manifestIds, [work.manifestId]);
+
+  const unnamed = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's events using OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
+  }, dependencies);
+  assert.deepEqual(unnamed, { status: 'refused', reason: 'ambiguous_current_manifest', operationId: 'OUTLOOK_LIST_EVENTS' });
+});

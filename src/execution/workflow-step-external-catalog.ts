@@ -281,12 +281,26 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     return { status: 'refused', reason: 'too_many_explicit_operations' };
   }
   let currentRows = currentComposioManifestRows(store);
+  // Two current manifests for one operation are two ACCOUNTS (two Outlook
+  // connections, 2026-09-02). The workflow names its account the same way the
+  // exact provisioner resolves one — a connection id written verbatim in the
+  // immutable prompt or the accepted input — so honor that name here instead
+  // of refusing as ambiguous. No name, or a name matching none: still ambiguous.
+  const namedAccountTokens = new Set([
+    ...(input.immutablePrompt.match(/[A-Za-z0-9_-]+/g) ?? []),
+    ...((input.acceptedSource?.acceptedInput ?? '').match(/[A-Za-z0-9_-]+/g) ?? []),
+  ]);
   const rowsByOperation = (): Map<string, InstalledCapabilityManifest[]> => {
     const rows = new Map<string, InstalledCapabilityManifest[]>();
     for (const entry of currentRows) {
       const key = entry.manifest.operationId.toUpperCase();
       if (!operationIds.includes(key)) continue;
       rows.set(key, [...(rows.get(key) ?? []), entry]);
+    }
+    for (const [key, entries] of rows) {
+      if (entries.length < 2) continue;
+      const named = entries.filter((entry) => namedAccountTokens.has(entry.manifest.accountId));
+      if (named.length === 1) rows.set(key, named);
     }
     return rows;
   };
