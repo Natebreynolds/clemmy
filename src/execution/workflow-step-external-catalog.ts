@@ -352,7 +352,7 @@ export async function prepareWorkflowStepExternalCatalog(input: {
 
   if (selected.length > 0) {
     const revalidate = dependencies.revalidate ?? revalidateSelectedComposioDefinitions;
-    const revalidated = await revalidate(selected.map(selectionFromManifest));
+    let revalidated = await revalidate(selected.map(selectionFromManifest));
     if (!revalidated.ok) {
       return {
         status: 'refused',
@@ -360,6 +360,68 @@ export async function prepareWorkflowStepExternalCatalog(input: {
         operationId: revalidated.refusal.identifier,
         detail: revalidated.refusal.code,
       };
+    }
+    // A label-only operation-version move (revalidation: `reboundFrom`) means
+    // the durable manifest names a label the provider no longer reports for
+    // the same definition. Route it through exact provisioning, which installs
+    // the live definition as the recorded successor of the stored manifest,
+    // then select and revalidate the successor. Comparing the live definition
+    // against the stale manifest instead refused every workflow naming the
+    // operation as "not connected" forever (daily-standup, 2026-09-02).
+    const reboundOperationIds = selected
+      .filter((entry) => revalidated.ok
+        && revalidated.definitions.get(entry.manifest.operationId.toLowerCase())?.reboundFrom)
+      .map((entry) => entry.manifest.operationId);
+    if (reboundOperationIds.length > 0) {
+      if (!input.acceptedSource) {
+        return {
+          status: 'refused',
+          reason: 'exact_operation_provisioning_refused',
+          operationId: reboundOperationIds[0],
+          detail: 'operation_version_rebind_requires_accepted_source',
+        };
+      }
+      const reprovisioned = await (
+        dependencies.provisionExactOperations ?? provisionExactWorkflowProviderOperations
+      )({
+        ...input.acceptedSource,
+        operationIds: reboundOperationIds,
+        ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
+      });
+      if (!reprovisioned.ok) {
+        return {
+          status: 'refused',
+          reason: 'exact_operation_provisioning_refused',
+          operationId: reprovisioned.identifier,
+          detail: ['operation_version_rebind', reprovisioned.code, reprovisioned.detail].filter(Boolean).join(':'),
+        };
+      }
+      if (dependencies.manifestStore === undefined) store = peekCapabilityManifestStore();
+      currentRows = currentComposioManifestRows(store);
+      byOperation = rowsByOperation();
+      for (const operationId of reboundOperationIds) {
+        const rows = byOperation.get(operationId) ?? [];
+        if (rows.length !== 1) {
+          return {
+            status: 'refused',
+            reason: rows.length === 0
+              ? 'exact_operation_manifest_missing_after_provision'
+              : 'ambiguous_current_manifest',
+            operationId,
+          };
+        }
+        const index = selected.findIndex((entry) => entry.manifest.operationId === operationId);
+        if (index >= 0) selected[index] = rows[0]!;
+      }
+      revalidated = await revalidate(selected.map(selectionFromManifest));
+      if (!revalidated.ok) {
+        return {
+          status: 'refused',
+          reason: 'selected_definition_revalidation_refused',
+          operationId: revalidated.refusal.identifier,
+          detail: revalidated.refusal.code,
+        };
+      }
     }
     for (const entry of selected) {
       if (!publishRevalidatedObservation(

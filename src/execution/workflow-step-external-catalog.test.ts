@@ -876,3 +876,88 @@ test('lowercase local tool names in allowedTools and platform-plane tokens are n
   });
   assert.equal(result.status, 'none', JSON.stringify(result));
 });
+
+test('a label-only operation-version move re-provisions the stored manifest as its recorded successor before observation', async () => {
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const stored = manifest('OUTLOOK_LIST_EVENTS', 'read');
+  // Same definition (input/output schema digests identical), new provider label.
+  const successor: CapabilityManifestV1 = attachSemanticContract({
+    ...stored,
+    manifestId: `${stored.manifestId}:successor`,
+    operationVersion: 'v20260901_03',
+    definitionFingerprint: digest('definition:OUTLOOK_LIST_EVENTS:relabeled'),
+    delegatedFrom: stored.manifestId,
+  });
+  const store = createCapabilityManifestStore([stored]);
+  installCapabilityManifestStore(store);
+  const crossings = new Map<string, number>();
+  const factory = createHostCapabilityCatalogFactory([]);
+  installHostCapabilityCatalogFactory(factory);
+
+  const session = createSession({ kind: 'workflow', userId: 'workflow:test' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'daily standup' },
+  });
+
+  let revalidations = 0;
+  let provisioned = 0;
+  const prepared = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's calendar with OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'daily standup' },
+  }, {
+    manifestStore: store,
+    catalogFactory: factory,
+    provisionExactOperations: async ({ operationIds }) => {
+      provisioned += 1;
+      assert.deepEqual(operationIds, ['OUTLOOK_LIST_EVENTS']);
+      // What exact provisioning does for a relabeled definition: install the
+      // live definition as the recorded successor of the stored manifest.
+      assert.equal(store.supersede(stored.manifestId, successor).ok, true);
+      return { ok: true };
+    },
+    revalidate: async (selections) => {
+      revalidations += 1;
+      assert.equal(selections.length, 1);
+      const selection = selections[0]!;
+      if (selection.definitionFingerprint === stored.definitionFingerprint) {
+        // The provider reports the new label for byte-identical schemas.
+        return {
+          ok: true,
+          definitions: new Map([[stored.operationId.toLowerCase(), {
+            ...revalidated(stored),
+            providerOperationVersion: successor.operationVersion,
+            definitionFingerprint: successor.definitionFingerprint,
+            reboundFrom: {
+              providerOperationVersion: stored.operationVersion,
+              definitionFingerprint: stored.definitionFingerprint,
+            },
+          }]]),
+        };
+      }
+      assert.equal(selection.definitionFingerprint, successor.definitionFingerprint, 'the successor is what gets revalidated second');
+      return { ok: true, definitions: new Map([[successor.operationId.toLowerCase(), revalidated(successor)]]) };
+    },
+    refresh: (manifestIds) => {
+      for (const id of manifestIds) {
+        const exact = store.get(id);
+        assert.ok(exact);
+        factory.register(registered(exact!.manifest, crossings));
+      }
+    },
+    ready: () => true,
+  });
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  if (prepared.status !== 'ready') return;
+  assert.deepEqual(prepared.operationIds, ['OUTLOOK_LIST_EVENTS']);
+  assert.deepEqual(prepared.manifestIds, [successor.manifestId]);
+  assert.equal(provisioned, 1);
+  assert.equal(revalidations, 2);
+  assert.equal(store.get(stored.manifestId)?.manifest.lifecycle.state, 'superseded');
+  assert.equal(store.get(successor.manifestId)?.manifest.lifecycle.state, 'current');
+});
