@@ -939,3 +939,41 @@ Still visible in run 3 and worth its own gate: the model spent eight
 schema-discovery reads on Salesforce fields that the owner's canary notes
 already hold (`Business_Type__c INCLUDES ('Family Law')`, `Status__c`,
 `Active__c`). That is the memory-multiplier gap, not a wall.
+
+## Gate 31 — the graph should tell Clem what to do next (2026-09-02 08:00–08:40 PDT)
+
+Owner reinforced the north star with the graph-engineering diagram: a node
+does one thing, a conditional edge routes on shared state, the graph decides
+what runs next; reads flow, the write is gated. Standing platform-49 dedupe
+(FL Slack channel vs the tracker sheet) on GLM 5.3 surfaced four harness
+walls in sequence, each fixed:
+
+1. **Stale connected-account observation (bc391ef7).** GLM read the sheet and
+   several Slack pages, then every later Slack fetch refused "no current
+   connected-account observation" — the run outlived the 60 s connections
+   snapshot and the synchronous pre-dispatch check cannot refresh (a business
+   call must not load inventory inline). peekCurrentConnectedToolkits now
+   accepts an observation up to 15 min old (EXECUTION_OBSERVATION_TTL_MS); the
+   60 s list cache and its background SWR are unchanged.
+2. **Definition drift → not-connected (ac75cdb2).** Facebook trends' Apify
+   scrape refused selected_definition_schema_drift and the card said "connect
+   Apify" while Apify was connected. A definition drift now takes the same
+   successor-provisioning path a label-only move takes; an unsettled drift
+   parks under exact_schema_boundary_mismatch, never "not connected".
+3. **A read misread as a write, so the graph demanded a plan (24591425).**
+   GOOGLESHEETS_BATCH_GET / SLACK_FETCH_CONVERSATION_HISTORY, not yet in a
+   manifest at frame time, hit the absent-manifest default-to-write and the
+   frame refused the read as plan-bound (host_planned_work_call_requires_plan_
+   sibling). This is the D1 census seam / open-clem-up over-gating. A
+   provider-shaped slug with a read verb and no send/dispatch/mutation verb is
+   now a read; compound (GET_AND_UPDATE), mutation, and native MCP names still
+   fail closed; the send floor is unchanged.
+4. **Grok/GLM thinking declared dead (2f79e43e, earlier).** The pre-actionable
+   wall is off by default and no longer benches a chosen brain.
+
+Model/brain switched to GLM 5.3 (BYO_BRAIN_MODEL_ID, .env backed up). The
+route policy showed grok-4.6 at 0.64 success / 39 s — the stops were harness
+walls, not the brain, as the owner said.
+
+Not changed: brain selection, the fallover chain, the irreversible-send floor,
+the plan requirement for a write.
