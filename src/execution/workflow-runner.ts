@@ -65,6 +65,7 @@ import {
 } from '../runtime/notifications.js';
 import { addRunEvent, startRun, finishRun, getRun, type RunInputBlocker } from '../runtime/run-events.js';
 import { WORKFLOW_RUNS_DIR, listWorkspaceProjects } from '../tools/shared.js';
+import { scheduledLatenessLeadInForRun } from './workflow-scheduled-lateness.js';
 import { WORKFLOWS_DIR } from '../memory/vault.js';
 import {
   listWorkflows,
@@ -4789,7 +4790,11 @@ async function runStepViaHarness(
     // authority; the ordinary harness invocation below remains the sole owner
     // of any eventual call.
     const pinSpec = !isItemInvocation ? renderWorkflowToolPin(workflowName, step.id) : '';
-    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}`;
+    // A scheduled run that started after its minute says how late it is, so a
+    // time-sensitive step can judge in its own words; the run itself is never
+    // parked for a human (workflow-scheduled-lateness.ts).
+    const latenessSpec = scheduledLatenessLeadInForRun(workflowRunId);
+    const proseMessage = `Workflow: ${workflowName}\nStep: ${step.id}\n\n${promptBody}${contractSpec}${pinSpec}${latenessSpec}`;
     // Typed-contract delivery (P1): when the step declared inputs and the
     // contract flag + step agent are on, append the BOUND inputs/upstream
     // as a structured block AFTER the prose (never replacing it). This is
@@ -7997,7 +8002,7 @@ export async function executeStep(
       shouldCancel: () => isWorkflowRunCancelled(ctx.runId),
       maxRunTokens: 0, // Stage 4: workflow budget = run-level advisory only
       message: workflowMessageWithAnsweredInput(
-        `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}`,
+        `Workflow: ${ctx.workflow.name}\nStep: ${step.id}\n\n${promptedWithPatterns}${scheduledLatenessLeadInForRun(ctx.runId)}`,
         step.id,
         legacySuffix,
         ctx.awaitingInput,

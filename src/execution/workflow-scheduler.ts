@@ -393,8 +393,11 @@ function currentMinuteKey(now: Date): string {
 interface ScheduledFireResult {
   /** Names of workflows that matched and got enqueued this tick. */
   fired: string[];
-  /** Names of stale occurrences durably held before execution for a user
-   *  Resume/Skip decision. A held occurrence has not run any workflow step. */
+  /** Names whose run the queue answered `held`: Clem is rewriting a legacy
+   *  script step first (workflow-self-improvement.ts) and re-queues the run
+   *  when the rewrite passes. No workflow step has run. A MISSED occurrence
+   *  is never held for a human Resume/Skip any more: it fires, paced one
+   *  catch-up lineage at a time by the runner's admission. */
   held: string[];
   /** Names whose exact occurrence was durably recorded as non-executable after
    *  a deterministic readiness refusal. These are not catch-up decisions and
@@ -1009,24 +1012,26 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       );
     } catch { /* the workflow schedule store remains authoritative */ }
 
-    // Holding is zero model/execution work, but each durable run snapshot still
-    // costs file creation + fsync. Bound that control-plane burst without
-    // reviving the old one-executing-catch-up gate; the rest remain in
+    // Each durable run snapshot costs file creation + fsync, and the runner
+    // admits catch-up lineages one at a time anyway. Bound the per-tick burst
+    // of missed-occurrence materializations; the rest remain in
     // pendingByWorkflow and materialize on later ticks.
     if (isCatchupFire && catchupHoldAttempts >= MAX_CATCHUP_HOLDS_PER_TICK) {
       result.deferred.push(workflowName);
       logger.info(
         { workflow: workflowName, occurrenceAtMs: occurrence.atMs },
-        'Deferred catch-up recovery-card materialization to a later scheduler tick',
+        'Deferred catch-up run materialization to a later scheduler tick',
       );
       continue;
     }
     if (isCatchupFire) catchupHoldAttempts += 1;
 
-    // A stale occurrence is admitted only as zero-work held state, so existing
-    // execution pressure must not hide or discard the user's Resume/Skip
-    // decision. Parked/backpressure checks remain for live executable work.
-    if (!isCatchupFire) {
+    // Every occurrence, live or missed, goes through the same active-run
+    // checks: a run awaiting mutation reconciliation, a capability hold, a
+    // parked approval, or queue backpressure defers it exactly like a live
+    // fire. (Until 2026-09-01 a missed occurrence skipped these because it was
+    // only ever parked as a zero-work Resume/Skip card; now it is real work.)
+    {
       const activeRuns = countActiveRunsFor(workflowName, entryName);
       if (activeRuns.mutationBlocked > 0) {
         result.deduped.push(workflowName);
@@ -1144,6 +1149,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         isCatchupFire,
         occurrence.firstDueAtMs,
         occurrence.missed + 1,
+        now.getTime(),
       );
       if (queued.status === 'blocked_readiness') {
         const classification = scheduledReadinessBlockClassificationForRun(workflowName, queued);
@@ -1221,47 +1227,42 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
               catchupFire: isCatchupFire,
             },
           }
-        : isCatchupFire
-          ? {
-              source: 'workflow',
-              type: 'workflow_catchup_held',
-              workflowRunId: queued.id,
-              actor: 'workflow-scheduler',
-              payload: {
-                workflowName,
-                schedule,
-                source: 'schedule',
-                reason: 'awaiting_user_decision',
-                firstDueAtMs: occurrence.firstDueAtMs,
-                occurrenceAtMs: occurrence.atMs,
-                missedCount: occurrence.missed + 1,
-                queueStatus: queued.status,
-              },
-            }
-          : {
-              source: 'workflow',
-              type: 'workflow_trigger_fired',
-              workflowRunId: queued.id,
-              actor: 'workflow-scheduler',
-              payload: {
-                workflowName,
-                schedule,
-                missed,
-                source: 'schedule',
-                occurrenceAtMs: occurrence.atMs,
-                queueStatus: queued.status,
-              },
-            });
+        : {
+            source: 'workflow',
+            type: 'workflow_trigger_fired',
+            workflowRunId: queued.id,
+            actor: 'workflow-scheduler',
+            payload: {
+              workflowName,
+              schedule,
+              missed,
+              source: 'schedule',
+              occurrenceAtMs: occurrence.atMs,
+              queueStatus: queued.status,
+              // A missed occurrence fires late, on the record: how late and
+              // how many occurrences this one lineage stands for.
+              ...(isCatchupFire
+                ? {
+                    catchupFire: true,
+                    firstDueAtMs: occurrence.firstDueAtMs,
+                    missedCount: occurrence.missed + 1,
+                    lateMs: Math.max(0, now.getTime() - occurrence.atMs),
+                  }
+                : {}),
+            },
+          });
       try {
         recordProspectiveOutcome(
           prospectiveId,
-          isCatchupFire ? 'blocked' : 'rearmed',
+          'rearmed',
           {
             runId: queued.id,
             cueKey: prospectiveCueKey,
             missed,
             queueAccepted: true,
-            ...(isCatchupFire ? { reason: 'awaiting_user_catchup_decision' } : {}),
+            ...(isCatchupFire
+              ? { catchupFire: true, lateMs: Math.max(0, now.getTime() - occurrence.atMs) }
+              : {}),
           },
           now,
         );
@@ -1278,12 +1279,9 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         queued.status === 'duplicate'
           ? 'Scheduled workflow occurrence receipt replayed without creating another run'
           : isCatchupFire
-          ? 'Scheduled workflow catch-up held for a user Resume/Skip decision'
+          ? 'Scheduled workflow missed occurrence accepted late (it runs; catch-ups are paced one at a time)'
           : 'Scheduled workflow occurrence accepted',
       );
-      if (isCatchupFire && queued.status === 'held') {
-        emitCatchupHeldNotice(workflowName, occurrence.missed + 1, latestKey, queued.id);
-      }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err), workflow: workflowName },
@@ -1636,47 +1634,6 @@ function emitQueueBackpressureNotice(workflowName: string, pending: number): voi
 
 /** Tell the user a stale occurrence is waiting BEFORE any workflow step runs.
  * The run-id-stable notification survives restart without nagging every boot. */
-function emitCatchupHeldNotice(
-  workflowName: string,
-  missedCount: number,
-  scheduledMinuteKey: string,
-  runId: string,
-): void {
-  try {
-    const id = `system-workflow-catchup-held-${runId}`;
-    if (getNotification(id)) return;
-    addNotification({
-      id,
-      kind: 'system',
-      title: `Missed workflow waiting: "${workflowName}"`,
-      body:
-        `"${workflowName}" missed ${missedCount} scheduled occurrence${missedCount === 1 ? '' : 's'} while Clementine was unavailable. `
-        + 'No workflow steps have run. Open Tasks to review it, then Resume or Skip this missed run.',
-      createdAt: new Date().toISOString(),
-      read: false,
-      metadata: {
-        errorCategory: 'workflow_schedule_catchup_held',
-        workflow: workflowName,
-        workflowRunId: runId,
-        runId,
-        catchupHeld: true,
-        missedCount,
-        scheduledMinuteKey,
-        // Surfaces in the chat Needs-you strip + Inbox (2026-07-30 audit: three
-        // held morning workflows sat SILENT 13h — the hold was correct, the
-        // invisibility was the bug). The 24h auto-skip reaper is the backstop;
-        // this gives the user their decision window.
-        needsAttention: true,
-      },
-    });
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err), workflow: workflowName },
-      'Failed to emit held catch-up notice (best-effort, ignored)',
-    );
-  }
-}
-
 /** Queue with an occurrence-stable receipt. If the process dies after queue
  *  acceptance but before scheduler state commits, replay resolves to the same
  *  run instead of creating a second execution. */
@@ -1687,6 +1644,7 @@ function enqueueScheduledRun(
   catchupFire = false,
   catchupAdmissionAtMs = occurrenceAtMs,
   catchupMissedCount = 1,
+  decidedAtMs: number = Date.now(),
 ): QueueWorkflowRunResult & { id: string } {
   const queued = queueWorkflowRun(workflowName, {}, {
     source: 'schedule',
@@ -1704,9 +1662,17 @@ function enqueueScheduledRun(
       ? {
           catchupFire: true,
           catchupOccurrenceAtMs: catchupAdmissionAtMs,
-          holdForCatchupDecision: true,
           catchupFirstDueAtMs: catchupAdmissionAtMs,
+          catchupScheduledAtMs: occurrenceAtMs,
           catchupMissedCount,
+          // A missed occurrence RUNS. The runner admits catch-up lineages one
+          // at a time (the v3.0.1 anti-stampede is that pacing, not a human
+          // gate) and `resumed` is the disposition it executes — decided here
+          // by the scheduler instead of a Resume tap. Live 2026-09-01: the
+          // 16:00 review of a laptop that slept through 16:00 sat "waiting for
+          // Resume/Skip" for an hour with nothing wrong.
+          catchupDisposition: 'resumed' as const,
+          catchupDecidedAt: new Date(decidedAtMs).toISOString(),
         }
       : {}),
   });

@@ -10,9 +10,11 @@
  * unconditionally, so the held minutes fell out of the next tick's window and
  * were silently DROPPED. The stampede fix had become a data-loss bug. This
  * suite replays the real v3.0.1 incident shape through the real scheduler and
- * asserts every missed workflow becomes one durable Resume/Skip decision,
- * without entering execution. Resumed decisions are serialized by the runner's
- * independent catch-up admission proof.
+ * asserts every missed workflow becomes exactly one durable late run — queued,
+ * never a human Resume/Skip decision (2026-09-01: a laptop that slept through
+ * 16:00 left the 16:00 review "waiting for Resume/Skip" with nothing wrong).
+ * The anti-stampede lives in the runner's catch-up admission, which executes
+ * these lineages one at a time.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -97,7 +99,7 @@ const day1_0600 = new Date(2026, 6, 29, 6, 0);   // watermark-establishing tick
 const day2_0001 = new Date(2026, 6, 30, 0, 1);   // the incident boot: all three missed
 const plusMin = (d: Date, m: number) => new Date(d.getTime() + m * 60_000);
 
-test('the v3.0.1 incident, replayed end to end: every missed heavy is held and none enters execution', async () => {
+test('the v3.0.1 incident, replayed end to end: every missed heavy RUNS, one paced late run each, never a human decision', async () => {
   // The exact schedules from the live incident.
   seed('e2e-morning-prospect-prep', '0 8 * * *');
   seed('e2e-scorpion-facebook-trends', '30 7 * * *');
@@ -109,36 +111,40 @@ test('the v3.0.1 incident, replayed end to end: every missed heavy is held and n
 
   // Boot after downtime: all three windows (07:30, 08:00, 09:00) were missed.
   const t1 = await processWorkflowSchedules(day2_0001);
-  assert.deepEqual(t1.fired, [], 'a stale occurrence is never reported as fired');
+  assert.deepEqual(t1.held, [], 'a missed occurrence is never parked for a Resume/Skip tap');
   assert.deepEqual(
-    [...t1.held].sort(),
+    [...t1.fired].sort(),
     ['e2e-morning-prospect-prep', 'e2e-scorpion-facebook-trends', 'e2e-team-activity-slack'],
-    'each missed workflow gets one user-owned recovery decision',
+    'each missed workflow gets exactly one late run',
   );
-  const held = runRecords();
-  assert.equal(held.length, 3);
-  assert.ok(held.every((run) =>
-    run.status === 'awaiting_catchup_decision'
-    && run.catchupDisposition === 'held'
+  const runs = runRecords();
+  assert.equal(runs.length, 3);
+  assert.ok(runs.every((run) =>
+    run.status === 'queued'
+    && run.catchupFire === true
+    && run.catchupDisposition === 'resumed'
+    && run.catchupMissedCount === 1
+    && typeof run.catchupDecidedAt === 'string'
     && run.startedAt === undefined),
-  'no held catch-up can consume execution concurrency');
-  const heldEvents = listOperationalEvents({ limit: 100 }).filter((event) =>
-    event.type === 'workflow_catchup_held'
+  'a late run is an ordinary queued catch-up lineage; the runner admits those one at a time (the anti-stampede)');
+  const events = listOperationalEvents({ limit: 100 });
+  assert.equal(events.filter((event) => event.type === 'workflow_catchup_held').length, 0, 'nothing is held');
+  const fired = events.filter((event) =>
+    event.type === 'workflow_trigger_fired'
+    && (event.payload as { catchupFire?: boolean }).catchupFire === true
     && ['e2e-morning-prospect-prep', 'e2e-scorpion-facebook-trends', 'e2e-team-activity-slack']
       .includes(String((event.payload as { workflowName?: string }).workflowName)));
-  assert.equal(heldEvents.length, 3, 'telemetry says held, never fired');
-  const notices = loadNotifications().filter((notification) =>
-    notification.metadata?.catchupHeld === true
-    && ['e2e-morning-prospect-prep', 'e2e-scorpion-facebook-trends', 'e2e-team-activity-slack']
-      .includes(String(notification.metadata?.workflow)));
-  assert.equal(notices.length, 3);
-  assert.ok(notices.every((notification) =>
-    /No workflow steps have run/.test(notification.body)
-    && /Open Tasks/.test(notification.body)));
+  assert.equal(fired.length, 3, 'telemetry says fired late, with the lateness on the payload');
+  assert.ok(fired.every((event) => typeof (event.payload as { lateMs?: unknown }).lateMs === 'number'));
+  assert.equal(
+    loadNotifications().filter((notification) => notification.metadata?.catchupHeld === true).length,
+    0,
+    'no "waiting for you" card: the run reports back like any other',
+  );
 
   const settled = await processWorkflowSchedules(plusMin(day2_0001, 1));
-  assert.deepEqual(settled.held, [], 'durable scheduler receipts prevent repeated recovery cards');
-  assert.deepEqual(settled.fired, [], 'waiting for the user never starts work on a later tick');
+  assert.deepEqual(settled.fired, [], 'durable scheduler receipts prevent a second late run');
+  assert.deepEqual(settled.held, []);
 });
 
 test('a live-minute workflow is never delayed by catch-up traffic — even a still-running catch-up run', async () => {
@@ -151,29 +157,33 @@ test('a live-minute workflow is never delayed by catch-up traffic — even a sti
   const t = await processWorkflowSchedules(now);
   assert.ok(t.fired.includes('e2e-live-at-ten'),
     'the live-minute workflow fires on its exact minute regardless of catch-up traffic');
-  assert.deepEqual(t.held, ['e2e-missed-at-nine-thirty']);
+  assert.ok(t.fired.includes('e2e-missed-at-nine-thirty'), 'the missed one runs too, late and on the record');
+  assert.deepEqual(t.held, []);
   const byWorkflow = new Map(runRecords().map((run) => [run.workflow, run]));
   assert.equal(byWorkflow.get('e2e-live-at-ten')?.status, 'queued');
-  assert.equal(byWorkflow.get('e2e-missed-at-nine-thirty')?.status, 'awaiting_catchup_decision');
+  assert.equal(byWorkflow.get('e2e-live-at-ten')?.catchupFire, undefined, 'a live fire carries no catch-up lineage');
+  assert.equal(byWorkflow.get('e2e-missed-at-nine-thirty')?.status, 'queued');
+  assert.equal(byWorkflow.get('e2e-missed-at-nine-thirty')?.catchupDisposition, 'resumed');
 });
 
-test('held catch-ups survive later ticks and aging beyond the 24h discovery window', async () => {
+test('late runs survive later ticks and aging beyond the 24h discovery window without a second copy', async () => {
   seed('e2e-old-a', '0 8 29 7 *');
   seed('e2e-old-b', '0 9 29 7 *');
   const before = new Date(2026, 6, 28, 7, 0);
   const boot = new Date(2026, 6, 29, 10, 0);
   await processWorkflowSchedules(before);
   const first = await processWorkflowSchedules(boot);
-  assert.equal(first.held.length, 2);
-  assert.deepEqual(first.fired, []);
+  assert.deepEqual([...first.fired].sort(), ['e2e-old-a', 'e2e-old-b']);
+  assert.deepEqual(first.held, []);
 
   const aged = new Date(2026, 6, 31, 12, 0);
   const later = await processWorkflowSchedules(aged);
+  assert.deepEqual(later.fired, []);
   assert.deepEqual(later.held, []);
-  assert.equal(runRecords().filter((run) => run.catchupDisposition === 'held').length, 2);
+  assert.equal(runRecords().filter((run) => run.catchupDisposition === 'resumed').length, 2);
 });
 
-test('an executable catch-up cannot block materialization of new held decisions', async () => {
+test('a catch-up already running never stops new missed occurrences from being queued — the runner paces them', async () => {
   seed('e2e-cap-a', '0 8 * * *');
   seed('e2e-cap-b', '0 9 * * *');
   const before = new Date(2026, 6, 29, 7, 0);
@@ -190,8 +200,8 @@ test('an executable catch-up cannot block materialization of new held decisions'
     catchupOccurrenceAtMs: before.getTime(),
   }), 'utf-8');
   const result = await processWorkflowSchedules(boot);
-  assert.deepEqual([...result.held].sort(), ['e2e-cap-a', 'e2e-cap-b']);
-  assert.deepEqual(result.fired, []);
+  assert.deepEqual([...result.fired].sort(), ['e2e-cap-a', 'e2e-cap-b']);
+  assert.deepEqual(result.held, []);
 });
 
 test('a parked live-origin run freezes the next occurrence instead of consuming it', async () => {
@@ -208,9 +218,13 @@ test('a parked live-origin run freezes the next occurrence instead of consuming 
   assert.equal((await processWorkflowSchedules(nextDue)).fired.length, 0);
   writeFileSync(runPath, JSON.stringify({ ...run, status: 'completed' }, null, 2));
   const recovery = await processWorkflowSchedules(plusMin(nextDue, 1));
-  assert.deepEqual(recovery.fired, []);
-  assert.deepEqual(recovery.held, ['e2e-parked-live'],
-    'once the prior approval clears, the now-stale occurrence asks before execution');
+  assert.deepEqual(recovery.held, []);
+  assert.deepEqual(recovery.fired, ['e2e-parked-live'],
+    'once the prior approval clears, the now-stale occurrence runs (late, on the record) instead of asking');
+  const late = runRecords().find((candidate) => candidate.catchupFire === true);
+  assert.ok(late, 'the frozen occurrence became one late catch-up run');
+  assert.equal(late!.status, 'queued');
+  assert.equal(late!.catchupDisposition, 'resumed');
 });
 
 test('an occurrence receipt prevents a queue/state crash from duplicating a run', async () => {
@@ -234,9 +248,11 @@ test('an occurrence receipt prevents a queue/state crash from duplicating a run'
   const receiptEvents = listOperationalEvents({ limit: 200 }).filter((event) =>
     (event.payload as { workflowName?: string }).workflowName === 'e2e-receipted');
   assert.equal(
-    receiptEvents.filter((event) => event.type === 'workflow_catchup_held').length,
+    receiptEvents.filter((event) =>
+      event.type === 'workflow_trigger_fired'
+      && (event.payload as { catchupFire?: boolean }).catchupFire === true).length,
     1,
-    'a receipt replay cannot falsely announce a second held admission',
+    'a receipt replay cannot falsely announce a second late admission',
   );
   assert.equal(
     receiptEvents.filter((event) =>
@@ -248,8 +264,8 @@ test('an occurrence receipt prevents a queue/state crash from duplicating a run'
     loadNotifications().filter((notification) =>
       notification.metadata?.workflow === 'e2e-receipted'
       && notification.metadata?.catchupHeld === true).length,
-    1,
-    'the recovery notice is run-id stable across receipt replay',
+    0,
+    'a late run needs no "waiting for you" notice; its own report-back is the visibility',
   );
 });
 
@@ -307,39 +323,45 @@ test('oldest pending catch-up wins even when workflow file order points at a new
   await processWorkflowSchedules(new Date(2026, 6, 29, 7, 0));
 
   const result = await processWorkflowSchedules(new Date(2026, 6, 29, 10, 0));
-  assert.deepEqual(result.fired, []);
-  assert.deepEqual(result.held, ['z-older-occurrence', 'a-newer-occurrence'],
-    'held cards are materialized oldest-first even though neither executes');
+  assert.deepEqual(result.held, []);
+  assert.deepEqual(result.fired, ['z-older-occurrence', 'a-newer-occurrence'],
+    'late runs are materialized oldest-first; the runner then admits them in that order');
 });
 
-test('future live occurrences still fire while an older catch-up waits for a decision', async () => {
+test('future live occurrences still fire while an older catch-up is queued behind them', async () => {
   seed('a-recurring-first', '*/2 * * * *');
   seed('z-recurring-held', '*/2 * * * *');
   const before = new Date(2026, 6, 29, 9, 1);
   await processWorkflowSchedules(before);
 
   const recovery = await processWorkflowSchedules(new Date(2026, 6, 29, 9, 3));
-  assert.deepEqual([...recovery.held].sort(), ['a-recurring-first', 'z-recurring-held']);
+  assert.deepEqual(recovery.held, []);
+  assert.deepEqual([...recovery.fired].sort(), ['a-recurring-first', 'z-recurring-held'],
+    'the missed 09:02 occurrences run late');
   const live = await processWorkflowSchedules(new Date(2026, 6, 29, 9, 4));
   assert.deepEqual([...live.fired].sort(), ['a-recurring-first', 'z-recurring-held'],
-    'a held old occurrence does not pause or absorb a future on-time commitment');
+    'a queued late occurrence does not pause or absorb a future on-time commitment');
+  const records = runRecords();
+  assert.equal(records.filter((run) => run.catchupFire === true).length, 2);
+  assert.equal(records.filter((run) => run.catchupFire !== true).length, 2);
 });
 
-test('a pathological backlog materializes at most 20 held cards per tick without losing the rest', async () => {
+test('a pathological backlog materializes at most 20 late runs per tick without losing the rest', async () => {
   for (let i = 0; i < 22; i++) {
     seed(`e2e-bulk-${String(i).padStart(2, '0')}`, '0 8 29 7 *');
   }
   await processWorkflowSchedules(new Date(2026, 6, 28, 7, 0));
 
   const first = await processWorkflowSchedules(new Date(2026, 6, 29, 9, 0));
-  assert.equal(first.held.length, 20);
+  assert.equal(first.fired.length, 20);
+  assert.equal(first.held.length, 0);
   assert.equal(first.deferred.length, 2);
-  assert.equal(runRecords().filter((run) => run.catchupDisposition === 'held').length, 20);
+  assert.equal(runRecords().filter((run) => run.catchupDisposition === 'resumed').length, 20);
 
   const second = await processWorkflowSchedules(new Date(2026, 6, 29, 9, 1));
-  assert.equal(second.held.length, 2);
+  assert.equal(second.fired.length, 2);
   assert.equal(second.deferred.length, 0);
-  assert.equal(runRecords().filter((run) => run.catchupDisposition === 'held').length, 22,
+  assert.equal(runRecords().filter((run) => run.catchupDisposition === 'resumed').length, 22,
     'deferred means later, never dropped');
 });
 
