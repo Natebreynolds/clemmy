@@ -338,3 +338,47 @@ Read straight off the daemon log, the run records and `pmset -g log` — no DB o
   failed" every hour (audit defect 5's reaper never succeeds); the codex CLI probe fails on a broken
   `mcp_servers.openaiDeveloperDocs` entry in `~/.codex/config.toml` (harmless: the Codex brain uses
   OAuth, not the CLI).
+
+### Night (18:00–21:30 PT): "premium working state, no added latency, efficiency on every brain"
+Owner goal for the evening; daemon deliberately NOT restarted (tsx does not hot-reload) — everything
+below is on the branch, pinned, typecheck clean, and waits for the next `dev-up` to go live.
+- `ada734c6` scheduler: a missed occurrence RUNS late (queued `resumed`, paced by the runner) — no
+  Resume/Skip tap; lateness lead-in on the step prompt.
+- `86e3020d` self-improvement: 3-attempt budget per definition digest replaces the 6 h cooldown; drafts
+  kept as `.improvement-candidate-*`; prior attempts quoted to the next turn; `workflow_update` in an
+  improvement session stays enabled (the re-queued run is the smoke); console/dashboard doors answer a
+  hold honestly.
+- `cbd2bb20` **Claude cache + compaction (the two measured efficiency defects):** the transcript
+  breakpoint was placed BEFORE the harness's `role:'system'` packets were hoisted out of `messages`, so it
+  sat on a packet that was then removed — cachedInputTokens frozen at 12,924 on every frame while input
+  climbed to 97k (12% hit over 85 Sonnet requests). Hoist first; the breakpoint lands on the newest real
+  message. And in-flight compaction thresholds were multiplied by the model window (Sonnet 5's 1M →
+  160k trigger; GLM 82k), so the 27-read steps never compacted; thresholds are absolute now
+  (`inFlightCompactionThresholds`). Neither adds latency; both remove tokens per frame.
+- `2a607d7a` memory + brains: the nightly tool-choice audit no longer erases structural pins
+  (`workflow:<slug>:<step>` — "slack" in the slug had invalidated platform-49's proven GOOGLESHEETS_* pin on
+  07-31, 08-13, 08-21); daemon approval/restart/cron resumes no longer pin `MODELS.primary` over the
+  active brain (unleashed cron keeps the deep model).
+- `02763782` interrupted-mid-run (owner's item 2): a prose step's own dispatch ledger
+  (`readSessionDispatchEvidence` over logical calls / physical dispatches / settlements under
+  `workflow:<run>:<step>` incl. items) proves zero mutating/uncertain/open → the step re-runs; otherwise the
+  halt is typed `mutation_uncertain_awaiting_readback:` with the counts.
+- `081d2bbd` host + brains: exact-checkpoint re-entry budget (5) with one notice — the 1,006-re-entry loop
+  is bounded, HRS kept for restart/continue; CONTINUE exhaustion → typed resumable
+  `continue_marker_exhausted` (was a silent success); a plan-less refusal names its door
+  (tool_search → plan_task → work_call for a write); first-byte fallover/watchdog budgets scale +10 s per
+  10k input tokens above 20k, fallover kept strictly below the watchdog.
+- `7778f365` measure + GLM + JIT: native GLM/xAI streams record usage
+  (`stream_options.include_usage`, z.ai probed live); every workflow step lands `step_efficiency`
+  (frames, cache-hit share, tokens, largest prompt) on its run log and daemon log; the JIT read edge routes
+  reviewed-CLI identities (`salesforce_sf_soql_query`) through the live-read registry instead of the
+  Composio materializer.
+- **Journeys, measured not assumed:** the six previously red files run at `548741b5` (the other agent's
+  tip) and at tonight's tip show the SAME reds — nothing tonight regressed them. Note for the tag: the
+  hard-cut journey now carries 8 reds at `548741b5` (subtests 2,3,5,6,8,9,10,11; "Created workspace"
+  expected, a host refusal returned), not the 3 the morning declared — it moved during the afternoon's
+  gates 12–16, before the takeover.
+- **Not done tonight:** full `npm test` + journeys matrix with the daemon stopped (owner's call when
+  testing resumes); the Family Law sheet canary (needs the restart); a `runProductionHost` pin for the
+  live-read JIT route; the dead-end census as a weekly metric; hard-cut seam 4 (boot-recovery dispatch
+  lease); the 12 pre-existing journey reds.
