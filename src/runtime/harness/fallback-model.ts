@@ -37,6 +37,7 @@ import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
 import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
+import { sizedBrainFalloverFirstByteMs } from './model-stall-policy.js';
 
 const logger = pino({ name: 'clementine.fallback-model' });
 
@@ -925,8 +926,10 @@ export class FallbackModel implements Model {
       let sawModelActivity = false;
       let committedActionable = false;
       const pending: StreamEvent[] = [];
+      // Sized to this request's prompt (model-stall-policy.ts): a large
+      // prefill is not silence, and the budget stays under the sized watchdog.
       const firstContentDeadlineAt = !isLast && this.opts.firstByteTimeoutMs && this.opts.firstByteTimeoutMs > 0
-        ? Date.now() + this.opts.firstByteTimeoutMs
+        ? Date.now() + sizedBrainFalloverFirstByteMs(this.opts.firstByteTimeoutMs, req.input)
         : undefined;
       const preActionableDeadlineAt = !isLast
         && this.opts.preActionableTimeoutMs

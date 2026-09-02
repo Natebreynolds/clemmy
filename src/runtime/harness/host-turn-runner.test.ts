@@ -8217,7 +8217,7 @@ test('production host keeps the turn open for a CONTINUE marker and runs the pro
   );
 });
 
-test('production host bounds CONTINUE markers and then delivers the text as the answer', async () => {
+test('production host bounds CONTINUE markers and then stops typed, resumable, with the note as detail — never the note as the answer', async () => {
   const { MAX_HOST_CONTINUE_MARKER_CONTINUATIONS } = await import('./host-turn-runner.js');
   const fixture = acceptHostCanarySource('continue-marker-budget');
   const frames = Array.from({ length: MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1 }, (_, index) => (
@@ -8227,6 +8227,11 @@ test('production host bounds CONTINUE markers and then delivers the text as the 
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const outcome = await runProductionHostSteps(fixture, agent, 10);
-  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1, 'budget spent, then the frame stands');
-  assert.match(String(outcome.finalOutput), /CONTINUE: still going/);
+  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1, 'budget spent, then a typed stop');
+  assert.equal(outcome.terminal?.status, 'blocked');
+  assert.equal(outcome.terminal?.reason, 'continue_marker_exhausted');
+  assert.notEqual(outcome.terminal?.resumable, false, 'resumable: "continue" re-enters');
+  assert.match(String((outcome as { blockedDetail?: string }).blockedDetail ?? ''), /still going/);
+  assert.match(String(outcome.finalOutput), /without making the call/);
+  assert.doesNotMatch(String(outcome.finalOutput), /^CONTINUE:/);
 });

@@ -292,6 +292,7 @@ import {
   modelFirstByteStallMs,
   modelStreamStallMs,
   modelStreamStallRetries,
+  sizedFirstByteStallMs,
 } from './model-stall-policy.js';
 import { heldExecutionTextForInternalReason, isHostAuthorityHeldReason } from './public-presentation.js';
 // Lane wiring: the callable-surface oracle serves exact local schemas on this
@@ -14310,7 +14311,7 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
   // content has flowed, the longer modelStreamStallMs ceiling governs and a
   // stall is a hard failure (no replay — content was already emitted).
   const streamMs = modelStreamStallMs();
-  const firstByteMs = modelFirstByteStallMs();
+  const firstByteMs = sizedFirstByteStallMs(items);
   // The pre-content retry REPLAYS the run input. On the approval-resume path that
   // input is a RunState whose first act is an already-APPROVED, often
   // side-effecting tool — so a replay would fire that external write a SECOND

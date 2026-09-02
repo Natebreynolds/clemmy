@@ -91,7 +91,7 @@ const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
 export const MAX_HOST_CONTINUE_MARKER_CONTINUATIONS = 3;
 import {
   ModelStreamStalledError,
-  modelFirstByteStallMs,
+  sizedFirstByteStallMs,
   modelStreamStallMs,
   modelStreamStallRetries,
 } from './model-stall-policy.js';
@@ -2194,6 +2194,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let workflowStepResultContinuationsUsed = 0;
   let continueMarkerContinuationsUsed = 0;
   let pendingHostModelDirective: string | undefined;
+  let lastContinueMarkerNote: string | undefined;
   const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
     ? itemsOrState.noProgressCheckpoint
@@ -2258,7 +2259,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ?? (noProgressState?.lastConsequence?.stage
           ? boundedBlockedDetail(noProgressState.lastConsequence.stage)
           : undefined)
-      : undefined;
+      : reason === 'continue_marker_exhausted' && lastContinueMarkerNote
+        ? boundedBlockedDetail(lastContinueMarkerNote)
+        : undefined;
     const outcome: HostRunOutcome = {
       history,
       lastResponseId,
@@ -2445,7 +2448,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let killTimer: ReturnType<typeof setInterval> | undefined;
     let rejectCallerAbort: (() => void) | undefined;
     const streamMs = modelStreamStallMs();
-    const firstByteMs = modelFirstByteStallMs();
+    // Sized to the prompt: a 100k-token prefill is not a hang (model-stall-policy.ts).
+    const firstByteMs = sizedFirstByteStallMs(modelInput);
     let lastSemanticActivityAt = Date.now();
     let sawActionableActivity = false;
     const stall = new Promise<never>((_, reject) => {
@@ -3470,9 +3474,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         refusalIdentity.sessionId,
         refusalIdentity.sourceUserSeq,
       ).filter((operationId) => operationId !== name.toUpperCase());
+      // Live 2026-09-01: with no plan bound at all, the refusal named a
+      // category ("capability, effect, account, schema, or invoke binding")
+      // and no door; the model retried until the governor exhausted. Name the
+      // one walkable edge for each effect class.
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
-        : '';
+        : ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that is the door for a write no plan has bound. If it only reads: call tool_search and retry with the exact operation name it returns.';
       const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
       if (literalOperation) {
         return `Tool '${name}' was refused before dispatch because this step names the operation ${literalOperation} but the host did not provision it into this run's frozen catalog. Failed check: ${lastExactProductionMiss}. This is a host provisioning fault, not an argument error: no correction or substitute capability can be dispatched, and no local or external mutation was attempted.`;
@@ -6129,17 +6137,34 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           continue;
         }
       }
-      if (hostProduction && continueMarkerContinuationsUsed < MAX_HOST_CONTINUE_MARKER_CONTINUATIONS) {
+      if (hostProduction) {
         const decision = toOrchestratorDecision(admission.frame.text);
         // The bare CONTINUE: shape (turn-decision.ts): done:false,
         // awaiting_handoff_result, reply null, the note in reason. A narrated
         // envelope or an ASK: keeps its own reading.
-        if (
+        const bareContinue = Boolean(
           decision
           && decision.done === false
           && decision.nextAction === 'awaiting_handoff_result'
-          && decision.reply === null
-        ) {
+          && decision.reply === null,
+        );
+        if (bareContinue && continueMarkerContinuationsUsed >= MAX_HOST_CONTINUE_MARKER_CONTINUATIONS) {
+          // Budget spent on the same promise. Delivering the note as the
+          // answer was a silent success (the chat showed "ready to submit …"
+          // as the reply, nothing written). Typed, resumable, names the edge.
+          const note = (decision?.reason ?? '').replace(/\s+/g, ' ').trim();
+          lastContinueMarkerNote = note.slice(0, 400) || undefined;
+          history.push(...admission.frame.history);
+          if (step.responseId !== undefined) lastResponseId = step.responseId;
+          return blockedOutcome(
+            `I planned the next step ${MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1} times without making the call`
+              + (note ? ` (${note.slice(0, 300)})` : '')
+              + '. Nothing was written. Say "continue" and I will make those calls now, or tell me what to change.',
+            'continue_marker_exhausted',
+            true,
+          );
+        }
+        if (bareContinue && decision) {
           continueMarkerContinuationsUsed += 1;
           pendingHostModelDirective = [
             'CONTINUE HONORED — there is no next turn: this turn stays open until you stop calling tools.',

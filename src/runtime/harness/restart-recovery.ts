@@ -44,6 +44,7 @@ import {
   type TurnIdentity,
   type TurnOutcome,
 } from './turn-outcome.js';
+import pino from 'pino';
 import { addNotification } from '../notifications.js';
 import {
   readActiveWorkflowOriginGroup,
@@ -71,6 +72,46 @@ function enabled(): boolean {
 const AUTO_RESUME_MAX_PER_BOOT = 3;
 const EXACT_CHECKPOINT_RESUME_MAX_PER_PASS = 3;
 const AUTO_RESUME_MAX_AGE_MS = 2 * 60 * 60_000;
+
+/**
+ * Exact-checkpoint re-entry budget. The 15 s daemon tick re-dispatches every
+ * exact checkpoint it can list; a checkpoint whose host activation always ends
+ * in the same `recovery_pending` hold was an unbounded loop with no next edge
+ * (live 2026-09-01: 1,006 re-entries in 90 minutes on
+ * `host_model_batch_admission_unavailable`, until the daemon was restarted).
+ * The budget is a counter per (session, source, phase, frame) in this process:
+ * a new checkpoint (progress) starts a new count, a restart starts over, and
+ * exhaustion is a typed skip with ONE notice naming the edge — the durable
+ * HostRecoveryState and marker stay untouched, so a restart or the user's own
+ * "continue" retries it.
+ */
+export const EXACT_CHECKPOINT_REENTRY_BUDGET = 5;
+const logger = pino({ name: 'clementine.harness.restart-recovery' });
+const exactCheckpointReentries = new Map<string, number>();
+const exactCheckpointReentryNoticed = new Set<string>();
+
+export function exactCheckpointReentryKey(
+  sessionId: string,
+  descriptor: { sourceUserSeq: number; phase: string; frameCallIds: readonly string[] },
+): string {
+  return `${sessionId}:${descriptor.sourceUserSeq}:${descriptor.phase}:${descriptor.frameCallIds.join('|')}`;
+}
+
+/** Count one dispatch of the exact checkpoint `key`. */
+export function noteExactCheckpointReentry(key: string): { count: number; exhausted: boolean } {
+  const count = (exactCheckpointReentries.get(key) ?? 0) + 1;
+  exactCheckpointReentries.set(key, count);
+  return { count, exhausted: count >= EXACT_CHECKPOINT_REENTRY_BUDGET };
+}
+
+export function exactCheckpointReentryExhausted(key: string): boolean {
+  return (exactCheckpointReentries.get(key) ?? 0) >= EXACT_CHECKPOINT_REENTRY_BUDGET;
+}
+
+export function _resetExactCheckpointReentriesForTests(): void {
+  exactCheckpointReentries.clear();
+  exactCheckpointReentryNoticed.clear();
+}
 
 function autoResumeEnabled(): boolean {
   return (process.env.CLEMMY_CHAT_AUTO_RESUME ?? 'on').toLowerCase() !== 'off';
@@ -544,6 +585,7 @@ export interface RestartRecoveryRecord {
   /** Why auto-resume did NOT run (for the boot log / forensics). */
   autoResumeSkipped?:
     | 'disabled'
+    | 'reentry_budget'
     | 'no_dispatcher'
     | 'external_write'
     | 'too_old'
@@ -1228,6 +1270,14 @@ export function recoverInterruptedChatRuns(
     // GET attempts may not issue another provider read (or later write) after
     // the user cancelled it.
     else if (userStopped) record.autoResumeSkipped = 'user_stopped';
+    // A checkpoint this process has already dispatched BUDGET times and that
+    // came back each time is not retried on the next 15 s tick: typed skip,
+    // one notice, HRS/marker untouched (a restart or "continue" retries it).
+    else if (
+      exactCheckpointRecovery
+      && checkpointRecovery
+      && exactCheckpointReentryExhausted(exactCheckpointReentryKey(row.id, checkpointRecovery))
+    ) record.autoResumeSkipped = 'reentry_budget';
     // Exact private HostRecoveryState has already been admitted and owns no
     // model-selected retry. Applying the generic fan-out cap to it terminalized
     // the fourth crash-safe continuation and erased its only owner. Keep the cap
@@ -1310,6 +1360,42 @@ export function recoverInterruptedChatRuns(
     // If it could not be persisted, do not emit progress or dispatch from a
     // live-only selection that another process cannot observe.
     if (exactCheckpointRecovery && willAutoResume && !record.decisionRecorded) {
+      records.push(record);
+      continue;
+    }
+    if (record.autoResumeSkipped === 'reentry_budget' && checkpointRecovery) {
+      const key = exactCheckpointReentryKey(row.id, checkpointRecovery);
+      if (!exactCheckpointReentryNoticed.has(key)) {
+        exactCheckpointReentryNoticed.add(key);
+        logger.warn(
+          {
+            sessionId: row.id,
+            sourceUserSeq: checkpointRecovery.sourceUserSeq,
+            phase: checkpointRecovery.phase,
+            budget: EXACT_CHECKPOINT_REENTRY_BUDGET,
+          },
+          'exact checkpoint re-entry budget spent; it is retried after the next restart or the user\'s continue',
+        );
+        try {
+          addNotification({
+            id: `restart-recovery-reentry-${row.id}-${checkpointRecovery.sourceUserSeq}`,
+            kind: 'system',
+            title: 'Clem paused a task that kept stopping at the same point',
+            body: `The task in session ${row.id} came back to the same checkpoint (${checkpointRecovery.phase}) `
+              + `${EXACT_CHECKPOINT_REENTRY_BUDGET} times in a row. Nothing was lost and nothing was repeated: `
+              + 'it will be retried after the next Clementine restart, or ask Clem to continue it in that chat.',
+            createdAt: new Date(now()).toISOString(),
+            read: false,
+            metadata: {
+              sessionId: row.id,
+              reason: 'restart_recovery_reentry_budget',
+              sourceUserSeq: checkpointRecovery.sourceUserSeq,
+              phase: checkpointRecovery.phase,
+              needsAttention: true,
+            },
+          });
+        } catch { /* the durable decision row is the authority */ }
+      }
       records.push(record);
       continue;
     }
@@ -1468,6 +1554,9 @@ export function recoverInterruptedChatRuns(
     if (willAutoResume && dispatchResume && recoveryIdentity && acceptedInput !== null) {
       if (exactCheckpointRecovery) exactCheckpointResumes += 1;
       else genericAutoResumes += 1;
+      if (exactCheckpointRecovery && checkpointRecovery) {
+        noteExactCheckpointReentry(exactCheckpointReentryKey(row.id, checkpointRecovery));
+      }
       record.autoResumed = true;
       const sessionId = row.id;
       void dispatchResume({

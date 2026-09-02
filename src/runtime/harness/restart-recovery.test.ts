@@ -38,6 +38,13 @@ const {
   markRunInFlight,
   restartRecoveryPrimerPrefixForTests,
 } = await import('./restart-recovery.js');
+const {
+  EXACT_CHECKPOINT_REENTRY_BUDGET,
+  exactCheckpointReentryKey,
+  exactCheckpointReentryExhausted,
+  noteExactCheckpointReentry,
+  _resetExactCheckpointReentriesForTests,
+} = await import('./restart-recovery.js');
 
 test('exported markRunInFlight: arms + clears a CHAT session, skips non-chat, respects the kill-switch', () => {
   const chat = HarnessSession.create({ kind: 'chat', title: 'c' });
@@ -548,4 +555,22 @@ test('kill-switch off → no-op (marker preserved, nothing surfaced)', () => {
     if (prev === undefined) delete process.env.CLEMMY_CHAT_RESTART_RECOVERY;
     else process.env.CLEMMY_CHAT_RESTART_RECOVERY = prev;
   }
+});
+
+test('exact-checkpoint re-entry budget: the same checkpoint is dispatched a bounded number of times; progress (a new frame) starts fresh', () => {
+  // 2026-09-01: 1,006 re-entries in 90 minutes on one checkpoint, no exit.
+  _resetExactCheckpointReentriesForTests();
+  const key = exactCheckpointReentryKey('chat-1', { sourceUserSeq: 7, phase: 'admit', frameCallIds: ['c1', 'c2'] });
+  assert.equal(key, 'chat-1:7:admit:c1|c2');
+  assert.equal(exactCheckpointReentryExhausted(key), false);
+  for (let i = 1; i < EXACT_CHECKPOINT_REENTRY_BUDGET; i += 1) {
+    assert.deepEqual(noteExactCheckpointReentry(key), { count: i, exhausted: false });
+    assert.equal(exactCheckpointReentryExhausted(key), false, `attempt ${i} is still within budget`);
+  }
+  assert.deepEqual(noteExactCheckpointReentry(key), { count: EXACT_CHECKPOINT_REENTRY_BUDGET, exhausted: true });
+  assert.equal(exactCheckpointReentryExhausted(key), true);
+  const progressed = exactCheckpointReentryKey('chat-1', { sourceUserSeq: 7, phase: 'finalize', frameCallIds: ['c1', 'c2'] });
+  assert.equal(exactCheckpointReentryExhausted(progressed), false, 'a new checkpoint is a new count');
+  _resetExactCheckpointReentriesForTests();
+  assert.equal(exactCheckpointReentryExhausted(key), false, 'a restart starts over');
 });
