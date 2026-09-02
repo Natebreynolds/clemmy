@@ -1362,7 +1362,7 @@
           "bytes": 28268
         },
         "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 21729
+          "bytes": 23286
         },
         "src/memory/automatic-recall-opt-out.ts": {
           "bytes": 7083
@@ -1866,7 +1866,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 718452
+          "bytes": 719101
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -3843,7 +3843,7 @@
           "bytes": 28268
         },
         "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 21729
+          "bytes": 23286
         },
         "src/memory/automatic-recall-opt-out.ts": {
           "bytes": 7083
@@ -4347,7 +4347,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 718452
+          "bytes": 719101
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098

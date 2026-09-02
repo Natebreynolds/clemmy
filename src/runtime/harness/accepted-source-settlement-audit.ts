@@ -10,6 +10,7 @@
  * result boundary and carries the host's successful-business verdict or the
  * registry-authorized successful-authoring verdict.
  */
+import { classifyRuntimeToolEffect } from './tool-effect.js';
 import { listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { resolveWriteEvidence } from './work-report.js';
 
@@ -58,6 +59,14 @@ export interface AcceptedSourceSettlementAudit {
      * 2026-09-01: end-of-day, 18 prior successes on the SDK lane, blocked on
      * the host lane as "no business evidence" after completing every step). */
     successfulLocalMutations: number;
+    /** Successful non-mutating settlements (business or local). A declared
+     * write step that READ and found nothing to change is complete when its
+     * output satisfies its contract and no mutation was ever attempted
+     * (weekly-review with zero active goals, 2026-09-01). */
+    successfulReads: number;
+    /** Mutating settlements of any outcome: the step tried to change
+     * something. Present → "found nothing to change" can never apply. */
+    attemptedMutations: number;
     unrecoveredBusinessFailures: number;
     confirmedWrites: number;
     uncertainWrites: number;
@@ -215,6 +224,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
     successfulSdkBusinessResults: 0,
     successfulSdkAuthoringResults: 0,
     successfulLocalMutations: 0,
+    successfulReads: 0,
+    attemptedMutations: 0,
     unrecoveredBusinessFailures: 0,
     confirmedWrites: 0,
     uncertainWrites: 0,
@@ -271,7 +282,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
     // hygiene, memory, notify_user) unprovable on the host lane, while the
     // SDK lane's own `successfulAuthoringResult` marker let the identical
     // step pass — a brain-dependent gate.
-    const localMutations = db.prepare(`
+    const localSettlements = db.prepare(`
       SELECT s.logical_tool_call_id, l.tool_name, l.argument_digest,
              s.outcome_kind, s.execution_kind, s.mutating, s.requirement_id
       FROM logical_call_settlements s
@@ -280,8 +291,22 @@ export function auditAcceptedSourceSettlementTruth(input: {
        AND l.source_user_seq = s.source_user_seq
        AND l.logical_tool_call_id = s.logical_tool_call_id
       WHERE s.session_id = ? AND s.source_user_seq = ?
-        AND s.business_call = 0 AND s.mutating = 1 AND s.continues_requirement = 0
+        AND s.business_call = 0 AND s.continues_requirement = 0
     `).all(input.sessionId, input.sourceUserSeq) as SettlementRow[];
+    // The invocation seam records host_only calls (notify_user,
+    // memory_remember, plan_task) as non-mutating for lease recovery; for
+    // EVIDENCE they are the mutation the step declared. One classifier, no
+    // second vocabulary: ask the registry what the tool's effect is.
+    const localMutates = (row: SettlementRow): boolean => {
+      if (row.mutating === 1) return true;
+      try {
+        const effect = classifyRuntimeToolEffect(row.tool_name, {}).effect;
+        return effect === 'host_only' || effect === 'local_write' || effect === 'external_write' || effect === 'admin';
+      } catch {
+        return false;
+      }
+    };
+    const localMutations = localSettlements.filter(localMutates);
 
     const turnEvents = turnEventsForAcceptedSource(input.sessionId, input.sourceUserSeq);
     const successfulSdkBusinessResults = turnEvents.filter((event) =>
@@ -392,6 +417,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
       successfulSdkBusinessResults,
       successfulSdkAuthoringResults,
       successfulLocalMutations: localMutations.filter(succeeded).length,
+      successfulReads: [...settlements, ...localSettlements].filter((row) => succeeded(row) && !localMutates(row) && row.mutating === 0).length,
+      attemptedMutations: [...settlements.filter((row) => row.mutating === 1), ...localMutations].length,
       unrecoveredBusinessFailures: unrecovered.length,
       confirmedWrites: writeEvidence.confirmed.length,
       uncertainWrites: writeEvidence.uncertain.length,

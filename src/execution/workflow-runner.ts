@@ -8865,6 +8865,18 @@ export function settlementGuardedStepOutput(input: {
     requireEveryBusinessReadToSettle: sideEffect !== 'read' || !outputSatisfiesDeclaredContract,
   });
   if (audit.status === 'clean') return input.output;
+  // A declared write/send step that LOOKED and found nothing to change is
+  // complete: it settled at least one successful read, attempted no mutation
+  // at all, and its output satisfies its declared contract. Zero rows is a
+  // valid result for a write too (weekly-review with no active goals ran 13
+  // times into "no business evidence", 2026-09-01). A step that never looked,
+  // or that tried a write which failed, still owes its evidence.
+  if (
+    audit.status === 'no_business_evidence'
+    && outputSatisfiesDeclaredContract
+    && audit.facts.successfulReads > 0
+    && audit.facts.attemptedMutations === 0
+  ) return input.output;
   return {
     blocked: true,
     reason: `Step "${input.step.id}" is not complete yet: ${audit.reason}. Its captured output remains in the run record for recovery.`,
