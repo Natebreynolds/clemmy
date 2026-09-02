@@ -627,3 +627,25 @@ lane, which does not answer that fast under load. Not tonight's blocker; recorde
 
 **Voice.** One rubric line (shared by the lean and native rubrics) nudges the model to open like a colleague
 and never surface a harness refusal verbatim. Golden snapshots refreshed.
+
+## Gate 19 — weekly-review: an empty week is the summary (2026-09-02 06:50–07:10 UTC)
+
+Re-verified after 711061d7: morning-briefing GREEN (pinned goal validated). weekly-review had "failed 15 runs
+in a row" — three doors, none the model's fault:
+
+1. **Guard judged the raw shape.** assess_goals (write, contract `type: string`) read `goal_list`, found no
+   active goals, and submitted a structured `[]`/"(none)" through workflow_step_result. The settlement guard
+   verified the string contract against the ARRAY, so the "looked and found nothing" exit never applied.
+   *Fix (71bfe529):* a structured result renders as text for a string contract (one coercion, shared by the
+   settlement guard and the finalize gate).
+2. **Honest refusal on an empty week.** write_summary then blocked itself: "zero goals … cannot write a
+   truthful summary", while its own context showed one BLOCKED goal from July. The owner's prompt only spoke
+   of active goals. *Definition (vault, backed up `SKILL.md.pre-empty-week-2026-09-02.bak`):* assess_goals
+   also lists blocked goals when nothing is active; write_summary writes+sends the "nothing active this week"
+   note and asks whether to revive or close what is parked. Re-run: memory_remember + notify_user + a real
+   summary — the deliverable, sent.
+3. **A blocked goal read as a failed step.** The self-report scan counted `status: "blocked"` on the goal
+   RECORD as the step failing ("1 of 1 item report a failure"). *Fix (this commit):* the step's own block is
+   `blocked: true`; a record's status is data.
+
+Auto-heal had paused itself after the streak; one clean run resumes it.
