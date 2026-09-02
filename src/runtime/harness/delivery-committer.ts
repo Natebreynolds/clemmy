@@ -850,7 +850,7 @@ function repairArgumentsNeedsInputOutcome(
 /** Honest terminal for a host-side failure with a provably effect-free ledger.
  * Value-opaque like every host constant: no tool names, no model prose. */
 export const HOST_LOCAL_FAILURE_BLOCKED_TEXT =
-  'I hit a bounded internal host error. Any completed work and retained results remain preserved, and no uncertain external change is pending.';
+  'Something on my side failed while I was finishing this. Nothing was sent or changed, and what I already gathered is kept. Ask me again and I will retry.';
 
 /**
  * Ledger effect-truth for one accepted source: true only when the write ledger

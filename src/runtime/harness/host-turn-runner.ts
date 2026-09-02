@@ -396,7 +396,7 @@ export function aggregateHostPreparationRefusalProgress(
  * terminal presentation authority.
  */
 export const HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT =
-  'I stopped before any provider call because this operation is not authorized by the task\'s current execution authority. Nothing external was executed or changed. The task needs a fresh verified authority binding before this operation can continue.';
+  'I stopped before doing anything external: this step was not set up with permission to use its tool. That is a setup problem on my side, not a missing login or a disconnected account. Nothing was sent or changed. Run it again and I will retry; if it repeats, tell me and I will dig in.';
 
 export const HOST_MODEL_LIMIT_BLOCKED_TEXT =
   'I reached the bounded model-response limit before I could complete this task. I stopped at the durable checkpoint instead of asking you to manufacture a continuation.';
@@ -455,11 +455,15 @@ export const HOST_RESULT_CHECKPOINT_BLOCKED_TEXT =
 export const HOST_LOCAL_CONTINUATION_UNAVAILABLE_TEXT =
   'I could not durably finish this local step after a bounded internal retry. No uncertain external action is pending. Please retry this request.';
 
+// Plain voice (owner, 2026-09-01: "I would expect more conventional tone with
+// Clem"). These stay value-opaque — no tool names, no model prose — but they
+// read as a person saying what happened and what she needs. The machine
+// reason rides separately on the terminal (blockedReason/blockedDetail).
 export const HOST_NO_PROGRESS_BLOCKED_TEXT =
-  'I hit a bounded internal host error. Any completed work and retained results remain preserved, and no uncertain external change is pending.';
+  'I got stuck: I hit the same wall twice in a row, so I stopped rather than loop. Nothing was sent or changed, and everything I already gathered is kept. Tell me how you want to proceed, or ask me to try a different way.';
 
 export const HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT =
-  'I could not complete this step after bounded automatic recovery. The prior attempt has a known terminal result, and no uncertain external change is pending.';
+  'I could not finish this step: the same call kept ending the same way, so I stopped rather than repeat it. Nothing was sent or changed, and what I already gathered is kept. Point me at what to change and I will pick it back up.';
 
 function hostNoProgressBlockedText(state: NoProgressGovernorState | null): string {
   return state?.lastConsequence?.effectState === 'known_terminal'
