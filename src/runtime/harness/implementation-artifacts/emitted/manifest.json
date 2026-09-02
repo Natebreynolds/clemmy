@@ -2478,7 +2478,7 @@
           "bytes": 20321
         },
         "src/integrations/composio/client.ts": {
-          "bytes": 157612
+          "bytes": 158325
         },
         "src/tools/composio-schema-cache.ts": {
           "bytes": 30694
@@ -4968,7 +4968,7 @@
           "bytes": 20321
         },
         "src/integrations/composio/client.ts": {
-          "bytes": 157612
+          "bytes": 158325
         },
         "src/tools/composio-schema-cache.ts": {
           "bytes": 30694

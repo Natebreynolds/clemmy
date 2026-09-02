@@ -57,6 +57,16 @@ const DERIVED_USER_ID_PREFIX = 'clementine-';
 const RECONNECT_REQUIRED_RE =
   /ConnectedAccountEntityIdMismatch|connected account[^\n]{0,100}(?:user|entity)[ _-]?id[^\n]{0,80}(?:does not match|mismatch)|user[ _-]?id[^\n]{0,80}does not match[^\n]{0,80}provided user[ _-]?id|ToolRouterV2[_-]?NoActiveConnection|\bNoActiveConnection\b|\bno active connection\b|Auth[_ ]?Config[_ ]?AuthSchemeNotFound|\bAuthSchemeNotFound\b|unsupported OAuth2/i;
 const CONNECTIONS_TTL_MS = 60_000;
+/** How old a connected-account OBSERVATION may be and still count as current
+ * when PREPARING a business dispatch (peekCurrentConnectedToolkits). The list
+ * cache above stays 60 s and keeps SWR-refreshing in the background; this is
+ * only the window a prepared dispatch will accept, so a long multi-call run
+ * (Slack/Sheets, platform-49 dedupe, live 2026-09-02) is not refused
+ * "no current connected-account observation" minutes in while the toolkit is
+ * connected the whole time. A real disconnect still surfaces as a provider
+ * auth error on the actual call, and an API-key change clears the snapshot
+ * immediately regardless of this window. */
+const EXECUTION_OBSERVATION_TTL_MS = 900_000;
 const CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS = 15_000;
 const CATALOG_TTL_MS = 60 * 60_000;
 const BACKEND_VALUES = ['auto', 'sdk', 'cli'] as const;
@@ -3682,6 +3692,6 @@ export function peekConnectedToolkits(): ConnectedToolkit[] {
 export function peekCurrentConnectedToolkits(nowMs = Date.now()): ConnectedToolkit[] | null {
   if (!connectionsCache) return null;
   const age = nowMs - connectionsCache.at;
-  if (!Number.isFinite(age) || age < 0 || age >= CONNECTIONS_TTL_MS) return null;
+  if (!Number.isFinite(age) || age < 0 || age >= EXECUTION_OBSERVATION_TTL_MS) return null;
   return connectionsCache.data;
 }
