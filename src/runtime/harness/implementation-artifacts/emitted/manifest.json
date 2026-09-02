@@ -1470,7 +1470,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 47668
+          "bytes": 48084
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -1866,7 +1866,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 719881
+          "bytes": 721359
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -3951,7 +3951,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 47668
+          "bytes": 48084
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -4347,7 +4347,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 719881
+          "bytes": 721359
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
