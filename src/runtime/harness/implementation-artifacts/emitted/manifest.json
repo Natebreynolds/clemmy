@@ -1386,7 +1386,7 @@
           "bytes": 659
         },
         "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 19813
+          "bytes": 21641
         },
         "src/runtime/harness/host-model-result-receipt.ts": {
           "bytes": 22396
@@ -1875,7 +1875,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 723940
+          "bytes": 724887
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -3876,7 +3876,7 @@
           "bytes": 659
         },
         "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 19813
+          "bytes": 21641
         },
         "src/runtime/harness/host-model-result-receipt.ts": {
           "bytes": 22396
@@ -4365,7 +4365,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 723940
+          "bytes": 724887
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098

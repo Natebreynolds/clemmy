@@ -254,6 +254,17 @@ function publishRevalidatedObservation(
  * returned manifest ids later narrow (never widen) the accepted-source
  * planning/frozen catalog.
  */
+/** Revalidation refusals that mean "the provider changed this operation's
+ * definition", which the successor path settles by provisioning the live
+ * definition — as opposed to a connection or identity refusal it cannot. */
+function isSelectedDefinitionDriftCode(code: string): boolean {
+  return code === 'selected_definition_schema_drift'
+    || code === 'selected_definition_output_schema_drift'
+    || code === 'selected_definition_fingerprint_drift'
+    || code === 'selected_definition_operation_version_drift'
+    || code === 'selected_definition_semantic_contract_drift';
+}
+
 export async function prepareWorkflowStepExternalCatalog(input: {
   immutablePrompt: string;
   allowedTools: readonly string[];
@@ -367,7 +378,17 @@ export async function prepareWorkflowStepExternalCatalog(input: {
   if (selected.length > 0) {
     const revalidate = dependencies.revalidate ?? revalidateSelectedComposioDefinitions;
     let revalidated = await revalidate(selected.map(selectionFromManifest));
-    if (!revalidated.ok) {
+    // A DEFINITION DRIFT (input/output schema, fingerprint, or a non-label
+    // operation-version move) means the provider changed the operation the
+    // stored manifest describes. That is not a missing connection: the live
+    // definition is provisioned as the stored manifest's recorded successor
+    // and the successor is what gets revalidated — the same successor path a
+    // label-only move takes. Refusing here labeled Facebook trends' Apify scrape
+    // "not connected" on every run while Apify was connected (2026-09-02).
+    const driftOperationIds = !revalidated.ok && isSelectedDefinitionDriftCode(revalidated.refusal.code)
+      ? [revalidated.refusal.identifier]
+      : [];
+    if (!revalidated.ok && driftOperationIds.length === 0) {
       return {
         status: 'refused',
         reason: 'selected_definition_revalidation_refused',
@@ -382,10 +403,13 @@ export async function prepareWorkflowStepExternalCatalog(input: {
     // then select and revalidate the successor. Comparing the live definition
     // against the stale manifest instead refused every workflow naming the
     // operation as "not connected" forever (daily-standup, 2026-09-02).
-    const reboundOperationIds = selected
-      .filter((entry) => revalidated.ok
-        && revalidated.definitions.get(entry.manifest.operationId.toLowerCase())?.reboundFrom)
-      .map((entry) => entry.manifest.operationId);
+    const reboundOperationIds = [...new Set([
+      ...selected
+        .filter((entry) => revalidated.ok
+          && revalidated.definitions.get(entry.manifest.operationId.toLowerCase())?.reboundFrom)
+        .map((entry) => entry.manifest.operationId),
+      ...driftOperationIds,
+    ])];
     if (reboundOperationIds.length > 0) {
       if (!input.acceptedSource) {
         return {
@@ -436,6 +460,17 @@ export async function prepareWorkflowStepExternalCatalog(input: {
           detail: revalidated.refusal.code,
         };
       }
+    }
+    if (!revalidated.ok) {
+      // Unreachable by construction (a drift always enters the successor block
+      // above, which revalidates again and returns on refusal); kept as the
+      // typed refusal rather than a cast.
+      return {
+        status: 'refused',
+        reason: 'selected_definition_revalidation_refused',
+        operationId: revalidated.refusal.identifier,
+        detail: revalidated.refusal.code,
+      };
     }
     for (const entry of selected) {
       if (!publishRevalidatedObservation(

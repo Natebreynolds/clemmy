@@ -1020,3 +1020,68 @@ test('two current manifests for one operation are two accounts: the connection t
   }, dependencies);
   assert.deepEqual(unnamed, { status: 'refused', reason: 'ambiguous_current_manifest', operationId: 'OUTLOOK_LIST_EVENTS' });
 });
+
+// Facebook trends, live 2026-09-02: APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS refused
+// `selected_definition_schema_drift` on every run and the card said "connect
+// Apify" while Apify was connected. A definition drift takes the successor path.
+// (The fixture names a registry-known toolkit; the unit registry has no Apify.)
+test('a schema drift re-provisions the stored manifest as its recorded successor, then revalidates the successor', async () => {
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const stored = manifest('OUTLOOK_LIST_EVENTS', 'read');
+  const successor: CapabilityManifestV1 = attachSemanticContract({
+    ...stored,
+    manifestId: `${stored.manifestId}:successor`,
+    operationVersion: 'v20260902_01',
+    definitionFingerprint: digest('definition:OUTLOOK_LIST_EVENTS:drifted'),
+    delegatedFrom: stored.manifestId,
+  });
+  const store = createCapabilityManifestStore([stored]);
+  installCapabilityManifestStore(store);
+  const crossings = new Map<string, number>();
+  const factory = createHostCapabilityCatalogFactory([]);
+  installHostCapabilityCatalogFactory(factory);
+  const session = createSession({ kind: 'workflow', userId: 'workflow:test' });
+  const source = appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'facebook trends' },
+  });
+  let revalidations = 0;
+  let provisioned = 0;
+  const prepared = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: "Pull today's calendar with OUTLOOK_LIST_EVENTS.",
+    allowedTools: ['*'],
+    acceptedSource: { sessionId: session.id, sourceUserSeq: source.seq, acceptedInput: 'facebook trends' },
+  }, {
+    manifestStore: store,
+    catalogFactory: factory,
+    provisionExactOperations: async ({ operationIds }) => {
+      provisioned += 1;
+      assert.deepEqual(operationIds, ['OUTLOOK_LIST_EVENTS']);
+      assert.equal(store.supersede(stored.manifestId, successor).ok, true);
+      return { ok: true };
+    },
+    revalidate: async (selections) => {
+      revalidations += 1;
+      const selection = selections[0]!;
+      if (selection.definitionFingerprint === stored.definitionFingerprint) {
+        // The provider's live definition no longer matches the stored schema.
+        return { ok: false, refusal: { code: 'selected_definition_schema_drift', identifier: stored.operationId } };
+      }
+      assert.equal(selection.definitionFingerprint, successor.definitionFingerprint, 'the successor is what gets revalidated second');
+      return { ok: true, definitions: new Map([[successor.operationId.toLowerCase(), revalidated(successor)]]) };
+    },
+    refresh: (manifestIds) => {
+      for (const id of manifestIds) {
+        const exact = store.get(id);
+        assert.ok(exact);
+        factory.register(registered(exact!.manifest, crossings));
+      }
+    },
+    ready: () => true,
+  });
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  if (prepared.status !== 'ready') return;
+  assert.deepEqual(prepared.manifestIds, [successor.manifestId]);
+  assert.equal(provisioned, 1);
+  assert.equal(revalidations, 2);
+});

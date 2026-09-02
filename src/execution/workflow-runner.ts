@@ -1244,6 +1244,21 @@ export function catalogPreparationRefusalToCapabilityBlock(
 ): WorkflowCapabilityBlockedError {
   const tool = (refusal.operationId ?? '').trim();
   const why = [refusal.reason, refusal.detail].filter(Boolean).join(': ');
+  // A definition DRIFT that the successor path could not settle is not a
+  // missing connection: the toolkit is connected and the provider changed the
+  // operation. Say that, and park under the exact-schema reason the Inbox
+  // renders as "Exact action metadata needs review" — never "connect X"
+  // (Facebook trends / Apify, live 2026-09-02).
+  if (/drift/.test(refusal.detail ?? '')) {
+    return new WorkflowCapabilityBlockedError({
+      stepId: step.id,
+      tool: tool || `(${refusal.reason})`,
+      toolkit: tool ? exactSchemaToolkitLabel(tool) : 'provider',
+      reason: 'exact_schema_boundary_mismatch',
+      message: `Step "${step.id}" names ${tool || 'an operation'}; the toolkit is connected, but the provider changed this operation's definition and the exact refresh could not settle it (${why}). `
+        + 'No provider dispatch occurred; the run is parked and retried when the exact definition refreshes.',
+    });
+  }
   return new WorkflowCapabilityBlockedError({
     stepId: step.id,
     tool: tool || `(${refusal.reason})`,
