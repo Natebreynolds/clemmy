@@ -1137,6 +1137,13 @@ async function executePreparedWorkflowNodeCall(
     logicalCallId: kernel.logicalCallId,
     ...('physicalDispatchId' in kernel ? { physicalDispatchId: kernel.physicalDispatchId } : {}),
     ...('resultHandleId' in kernel ? { resultHandleId: kernel.resultHandleId } : {}),
-    result: kernel.result,
+    // The step receives the SAME value its evidence was just verified against:
+    // the provider payload (sealed-invoke and MCP envelopes unwrapped). The
+    // durable result handle still retains the raw envelope. Handing the step
+    // the envelope made every declared output contract unsatisfiable for a
+    // reviewed-CLI read — evidence passed on `stdout` while the contract
+    // failed "missing required output key stdout" on {result, complete}
+    // (Friday dashboard, 2026-09-02).
+    result: evidenceView.kind === 'provider_payload' ? evidenceView.payload : kernel.result,
   };
 }

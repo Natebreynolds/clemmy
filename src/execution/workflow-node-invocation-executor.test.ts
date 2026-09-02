@@ -697,7 +697,7 @@ test('one exact read crosses the immutable port once and replays its durable res
   assert.equal(eventlog.openEventLog().pragma('foreign_key_check').length, 0);
 });
 
-test('authored evidence paths use one exact MCP payload owner while durable results retain the envelope', async () => {
+test('authored evidence paths and the step result share one exact payload owner while durable results retain the envelope', async () => {
   const payload = { records: [{ id: 'record.mcp-evidence' }] };
   const cases: Array<{
     label: string;
@@ -781,7 +781,9 @@ test('authored evidence paths use one exact MCP payload owner while durable resu
     assert.equal(executed.ok, Boolean(scenario.expectedOwner), JSON.stringify(executed));
     if (executed.ok) {
       assert.equal(executed.status, 'completed', scenario.label);
-      assert.deepEqual(executed.result, scenario.result, scenario.label);
+      // The step receives the owner-projected payload — the value its
+      // evidence was verified against — never the transport envelope.
+      assert.deepEqual(executed.result, payload, scenario.label);
     } else {
       assert.equal(executed.phase, scenario.expectedPhase ?? 'evidence', scenario.label);
       if (executed.phase === 'evidence') {

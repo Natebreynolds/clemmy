@@ -516,7 +516,7 @@
           "bytes": 645
         },
         "src/runtime/harness/accepted-turn-call-authority.ts": {
-          "bytes": 184524
+          "bytes": 187770
         },
         "src/runtime/harness/logical-call-settlement-store.ts": {
           "bytes": 53555
@@ -1803,7 +1803,7 @@
           "bytes": 24685
         },
         "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 42502
+          "bytes": 43067
         },
         "src/spaces/canonical-entity-workspace-binding-contract.ts": {
           "bytes": 11860
@@ -1866,7 +1866,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 719101
+          "bytes": 719768
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -2997,7 +2997,7 @@
           "bytes": 645
         },
         "src/runtime/harness/accepted-turn-call-authority.ts": {
-          "bytes": 184524
+          "bytes": 187770
         },
         "src/runtime/harness/logical-call-settlement-store.ts": {
           "bytes": 53555
@@ -4284,7 +4284,7 @@
           "bytes": 24685
         },
         "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 42502
+          "bytes": 43067
         },
         "src/spaces/canonical-entity-workspace-binding-contract.ts": {
           "bytes": 11860
@@ -4347,7 +4347,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 719101
+          "bytes": 719768
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
