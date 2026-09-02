@@ -129,6 +129,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { HostInterruptState } from '../runtime/harness/host-turn-runner.js';
 import { approvalAuthorityMatchesToolCall } from '../runtime/harness/approval-authority.js';
 import {
+  nextWorkflowNodeAttempt,
   oneShotActivationAuthorizationDecisionDigest,
   type OneShotActivationAuthorization,
 } from '../runtime/harness/accepted-turn-call-authority.js';
@@ -2478,6 +2479,25 @@ function exactWorkflowCallIdentity(
   binding: unknown,
   partition?: WorkflowExactCallPartitionV1,
 ): WorkflowNodeCallExecutionIdentityV1 {
+  const nodeId = partition?.nodeId ?? step.id;
+  const workflowDigest = workflowDefinitionHash(ctx.workflow);
+  const bindingSnapshotDigest = workflowExactCallDigest('workflow-v3-runner-binding', binding);
+  const controlDigest = workflowExactCallDigest('workflow-v3-runner-control', {
+    workflowSlug: ctx.workflowSlug,
+    stepId: step.id,
+    dependsOn: step.dependsOn ?? [],
+    sideEffect: step.sideEffect ?? null,
+    requiresApproval: step.requiresApproval === true,
+    forEach: step.forEach ?? null,
+    operationId: step.call?.tool ?? null,
+    partition: partition
+      ? {
+          version: partition.version,
+          digest: partition.partitionDigest,
+          ordinal: partition.ordinal,
+        }
+      : null,
+  });
   return {
     workflowId: ctx.workflowSlug,
     // Catalog workflows do not yet carry an independent monotonic revision.
@@ -2486,29 +2506,28 @@ function exactWorkflowCallIdentity(
     // drift collide with the already-owned occurrence instead of opening a
     // second occurrence under a hash-derived pseudo revision.
     workflowRevision: 1,
-    workflowDigest: workflowDefinitionHash(ctx.workflow),
+    workflowDigest,
     runId: ctx.runId,
     runOccurrenceId: ctx.runId,
-    nodeId: partition?.nodeId ?? step.id,
-    nodeAttempt: 1,
-    invocationPlanDigest,
-    bindingSnapshotDigest: workflowExactCallDigest('workflow-v3-runner-binding', binding),
-    controlDigest: workflowExactCallDigest('workflow-v3-runner-control', {
-      workflowSlug: ctx.workflowSlug,
-      stepId: step.id,
-      dependsOn: step.dependsOn ?? [],
-      sideEffect: step.sideEffect ?? null,
-      requiresApproval: step.requiresApproval === true,
-      forEach: step.forEach ?? null,
-      operationId: step.call?.tool ?? null,
-      partition: partition
-        ? {
-            version: partition.version,
-            digest: partition.partitionDigest,
-            ordinal: partition.ordinal,
-          }
-        : null,
+    nodeId,
+    // Computed once per node execution (this is the only call site). A node
+    // re-executed with the same content address keeps its attempt (replay);
+    // one whose plan/binding/control changed since an earlier tick opens the
+    // next attempt instead of colliding with the old activation forever.
+    nodeAttempt: nextWorkflowNodeAttempt({
+      workflowId: ctx.workflowSlug,
+      workflowRevision: 1,
+      workflowDigest,
+      runId: ctx.runId,
+      runOccurrenceId: ctx.runId,
+      nodeId,
+      invocationPlanDigest,
+      bindingSnapshotDigest,
+      controlDigest,
     }),
+    invocationPlanDigest,
+    bindingSnapshotDigest,
+    controlDigest,
   };
 }
 

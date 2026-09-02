@@ -1229,6 +1229,94 @@ function exactOneShotAuthorizationRow(
 /** Generic same-database one-shot grant seam shared by workflow authority
  * kinds. The caller must invoke it inside the transaction that inserts its
  * activation and root; a successful result is not permission to commit later. */
+/**
+ * The attempt number a workflow node should arm under.
+ *
+ * - The same definition-side content address (workflow, plan, binding and
+ *   control digests) as a recorded attempt → that attempt, so the authority
+ *   replays it.
+ * - A changed content address whose latest recorded attempt closed WITHOUT a
+ *   body (blocked before any physical dispatch — a capability acquired between
+ *   ticks, a port that was not shipped yet) → the next attempt. Colliding with
+ *   that dead activation forever was the Friday dashboard's first SOQL read on
+ *   every retry ("workflow node attempt already has a different activation",
+ *   2026-09-02).
+ * - A changed content address whose latest attempt is still open or already
+ *   crossed a body → that attempt, so arming collides exactly as before: one
+ *   occurrence never opens a second physical call under drifted content.
+ *
+ * Unknown log state falls back to attempt 1, which every caller assumed before.
+ */
+export function nextWorkflowNodeAttempt(input: {
+  workflowId: string;
+  workflowRevision: number;
+  workflowDigest: string;
+  runId: string;
+  runOccurrenceId: string;
+  nodeId: string;
+  invocationPlanDigest: string;
+  bindingSnapshotDigest: string;
+  controlDigest: string;
+}): number {
+  type Row = {
+    node_attempt: number;
+    session_id: string;
+    source_event_seq: number;
+    workflow_digest: string;
+    invocation_plan_digest: string;
+    binding_snapshot_digest: string;
+    control_digest: string;
+  };
+  let db: HarnessDb;
+  let rows: Row[];
+  try {
+    db = openEventLog();
+    rows = db.prepare(`
+      SELECT node_attempt, session_id, source_event_seq, workflow_digest,
+             invocation_plan_digest, binding_snapshot_digest, control_digest
+        FROM workflow_node_invocation_activations
+       WHERE workflow_id = ? AND workflow_revision = ? AND run_id = ?
+         AND run_occurrence_id = ? AND node_id = ?
+       ORDER BY node_attempt ASC
+    `).all(
+      input.workflowId,
+      input.workflowRevision,
+      input.runId,
+      input.runOccurrenceId,
+      input.nodeId,
+    ) as Row[];
+  } catch {
+    return 1;
+  }
+  if (rows.length === 0) return 1;
+  const same = rows.find((row) =>
+    row.workflow_digest === input.workflowDigest
+    && row.invocation_plan_digest === input.invocationPlanDigest
+    && row.binding_snapshot_digest === input.bindingSnapshotDigest
+    && row.control_digest === input.controlDigest);
+  if (same) return same.node_attempt;
+  const latest = rows[rows.length - 1]!;
+  try {
+    const status = db.prepare(`
+      SELECT
+        (SELECT state FROM accepted_turn_call_authorities
+          WHERE session_id = ? AND source_user_seq = ?) AS state,
+        (SELECT COUNT(*) FROM physical_dispatches
+          WHERE session_id = ? AND source_user_seq = ?) AS bodies
+    `).get(
+      latest.session_id, latest.source_event_seq,
+      latest.session_id, latest.source_event_seq,
+    ) as { state: string | null; bodies: number } | undefined;
+    const closedWithoutBody = status !== undefined
+      && status.state !== null
+      && status.state !== 'open'
+      && status.bodies === 0;
+    return closedWithoutBody ? latest.node_attempt + 1 : latest.node_attempt;
+  } catch {
+    return latest.node_attempt;
+  }
+}
+
 export function consumeOneShotActivationAuthorizationInTransaction(
   db: ReturnType<typeof openEventLog>,
   authorization: OneShotActivationAuthorization,

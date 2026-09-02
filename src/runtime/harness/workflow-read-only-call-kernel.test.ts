@@ -1039,3 +1039,60 @@ test('forged ALS, direct ledger bypass, foreign plan and compute binding all ref
   if (computeResult.status === 'blocked') assert.equal(computeResult.zeroBody, true);
   assert.equal(compute.portBodies(), 0);
 });
+
+test('a node keeps its attempt for the same content address and opens the next attempt only past a zero-body close', async () => {
+  const installed = installCapability();
+  const base = {
+    workflowId: 'workflow.attempt-chooser',
+    workflowRevision: 1,
+    workflowDigest: digest('workflow:attempt-chooser'),
+    runId: 'run.attempt-chooser',
+    runOccurrenceId: 'occurrence.attempt-chooser',
+    nodeId: 'node.attempt-chooser',
+    invocationPlanDigest: installed.plan.bindingDigest,
+    bindingSnapshotDigest: digest('bindings:attempt-chooser'),
+    controlDigest: digest('control:attempt-chooser'),
+  };
+  const rebound = { ...base, bindingSnapshotDigest: digest('bindings:attempt-chooser:acquired') };
+  // Nothing recorded yet: attempt 1.
+  assert.equal(authority.nextWorkflowNodeAttempt(base), 1);
+  const first = arm(installed.plan, 'attempt-chooser', { nodeAttempt: 1 });
+  assert.equal(first.status, 'armed', JSON.stringify(first));
+  if (first.status !== 'armed') return;
+  // Same content on a later tick: the same attempt (the authority replays it).
+  assert.equal(authority.nextWorkflowNodeAttempt(base), 1);
+  // Drifted content while attempt 1 is still OPEN: collide, never a new attempt.
+  assert.equal(authority.nextWorkflowNodeAttempt(rebound), 1);
+  // Attempt 1 closes with zero body (blocked before any physical dispatch).
+  const aborted = new AbortController();
+  aborted.abort();
+  const blocked = await kernel.executeWorkflowReadOnlyCall({
+    activationId: first.ref.activationId,
+    invocationPlan: installed.plan,
+    args: { scope: 'current' },
+    signal: aborted.signal,
+  });
+  assert.equal(blocked.status, 'blocked');
+  assert.equal(installed.portBodies(), 0);
+  // Now the drifted content opens attempt 2, and arming it is not a conflict.
+  assert.equal(authority.nextWorkflowNodeAttempt(rebound), 2);
+  const second = arm(installed.plan, 'attempt-chooser', {
+    nodeAttempt: 2,
+    bindingSnapshotDigest: rebound.bindingSnapshotDigest,
+    logicalCallId: 'logical.attempt-chooser.2',
+  });
+  assert.equal(second.status, 'armed', JSON.stringify(second));
+  if (second.status !== 'armed') return;
+  // The first content address still maps to its own attempt.
+  assert.equal(authority.nextWorkflowNodeAttempt(base), 1);
+  // Attempt 2 crosses a real body; further drift collides with it (one
+  // occurrence never opens a second physical call under drifted content).
+  const completed = await kernel.executeWorkflowReadOnlyCall({
+    activationId: second.ref.activationId,
+    invocationPlan: installed.plan,
+    args: { scope: 'current' },
+  });
+  assert.equal(completed.status, 'completed', JSON.stringify(completed));
+  assert.equal(installed.portBodies(), 1);
+  assert.equal(authority.nextWorkflowNodeAttempt({ ...base, controlDigest: digest('control:other') }), 2);
+});
