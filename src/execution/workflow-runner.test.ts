@@ -65,6 +65,7 @@ const {
   runWithStepRetry,
   creationTestVerdict,
   shouldHaltResumeForSideEffect,
+  hostStepMutationProof,
   stepSideEffectClass,
   isPhantomStepCompletion,
   phantomBlockedOutput,
@@ -6243,6 +6244,38 @@ test('stepSideEffectClass: declared field wins, else heuristic', () => {
   assert.equal(stepSideEffectClass({ id: 'a', prompt: 'anything', sideEffect: 'send' }), 'send');
   assert.equal(stepSideEffectClass({ id: 'a', prompt: 'Send the outreach emails to the list.' }), 'send');
   assert.equal(stepSideEffectClass({ id: 'a', prompt: 'Read the leads from the sheet.' }), 'read');
+});
+
+test('host-lane resume proof: a prose step whose ledger shows no mutation re-runs; mutating, uncertain or open ledgers keep the halt; exact steps are not the ledger\'s business', () => {
+  const evidence = (over: Record<string, number>) => ({
+    sessions: 1, openLogicalCalls: 0, settledCalls: 3, mutatingSettlements: 0, uncertainSettlements: 0, physicalCrossings: 3, unsettledDispatches: 0, ...over,
+  });
+  const asked: string[] = [];
+  const reader = (sessionId: string) => {
+    asked.push(sessionId);
+    if (sessionId.endsWith(':reads')) return evidence({});
+    if (sessionId.endsWith(':save')) return evidence({ mutatingSettlements: 1 });
+    if (sessionId.endsWith(':send')) return evidence({ uncertainSettlements: 1 });
+    if (sessionId.endsWith(':open')) return evidence({ openLogicalCalls: 1 });
+    throw new Error('ledger unavailable');
+  };
+  const proof = hostStepMutationProof({
+    runId: 'r1',
+    steps: [
+      { id: 'reads', prompt: 'Read the sheet and post a digest.', sideEffect: 'write' },
+      { id: 'save', prompt: 'Write rows.', sideEffect: 'write' },
+      { id: 'send', prompt: 'Send.', sideEffect: 'send' },
+      { id: 'open', prompt: 'Write.', sideEffect: 'write' },
+      { id: 'exact', prompt: '', call: { tool: 'X', args: {} }, sideEffect: 'write' },
+      { id: 'broken', prompt: 'Write.', sideEffect: 'write' },
+    ] as never,
+    inFlightStepIds: new Set(['reads', 'save', 'send', 'open', 'exact', 'broken']),
+    alreadyProven: new Set(),
+  }, reader as never);
+  assert.deepEqual([...proof.proven], ['reads'], 'two settled reads and nothing else: safe to re-run');
+  assert.deepEqual([...proof.uncertain.keys()].sort(), ['open', 'save', 'send']);
+  assert.ok(!asked.some((id) => id.endsWith(':exact')), 'an exact call step keeps its own receipt ledger');
+  assert.ok(asked.every((id) => id.startsWith('workflow:r1:')), 'the ledger is asked under the step\'s host session id');
 });
 
 test('P0-3 halts crash-resume of an autonomous write/send step', () => {

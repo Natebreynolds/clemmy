@@ -71,6 +71,7 @@ const {
   HARNESS_DB_PATH,
   applyHarnessMigrationsThroughVersionForTests,
 } = await import('./eventlog.js');
+const { readSessionDispatchEvidence } = await import('./eventlog.js');
 const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 type EventType = import('./eventlog.js').EventType;
@@ -2838,4 +2839,57 @@ test('resetEventLog works under a temp home (this test) and the guard text names
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   assert.ok(sess.id, 'DB recreates cleanly after a permitted reset');
+});
+
+test('readSessionDispatchEvidence: a step session\'s own ledger says whether re-running it could repeat a mutation', () => {
+  resetEventLog();
+  createSession({ id: 'workflow:r1:main', kind: 'chat' });
+  createSession({ id: 'workflow:r1:save', kind: 'chat' });
+  createSession({ id: 'workflow:r1:main:item-1', kind: 'chat' });
+  closeEventLog();
+  const raw = new Database(HARNESS_DB_PATH);
+  raw.pragma('foreign_keys = OFF');
+  // The ledger's write triggers (open-parent, result handle, exact contract)
+  // guard the WRITERS; this pins the READER over the row shapes those writers
+  // leave behind, so the fixture rows go in without them.
+  for (const trigger of raw.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN ('logical_tool_calls', 'physical_dispatches', 'logical_call_settlements')",
+  ).all() as Array<{ name: string }>) {
+    raw.exec(`DROP TRIGGER IF EXISTS "${trigger.name}"`);
+  }
+  const D = 'a'.repeat(64);
+  raw.exec(`
+    INSERT INTO logical_tool_calls (session_id, source_user_seq, accepted_task_id, logical_tool_call_id, tool_name, argument_digest, raw_argument_digest, state, opened_at, settled_at)
+    VALUES ('workflow:r1:main', 1, 'task-main', 'c1', 'composio_execute_tool', '${D}', '${D}', 'settled', '2026-09-01T19:00:00Z', '2026-09-01T19:00:01Z'),
+           ('workflow:r1:main', 1, 'task-main', 'c2', 'composio_execute_tool', '${D}', '${D}', 'settled', '2026-09-01T19:00:02Z', '2026-09-01T19:00:03Z'),
+           ('workflow:r1:main:item-1', 1, 'task-item', 'c3', 'composio_execute_tool', '${D}', '${D}', 'open', '2026-09-01T19:00:04Z', NULL),
+           ('workflow:r1:save', 1, 'task-save', 'c4', 'composio_execute_tool', '${D}', '${D}', 'settled', '2026-09-01T19:00:05Z', '2026-09-01T19:00:06Z');
+    INSERT INTO physical_dispatches (session_id, source_user_seq, accepted_task_id, logical_tool_call_id, physical_dispatch_id, ordinal, relation, tool_name, argument_digest, state, started_at, start_event_id)
+    VALUES ('workflow:r1:main', 1, 'task-main', 'c1', 'd1', 1, 'primary', 'composio_execute_tool', '${D}', 'returned', '2026-09-01T19:00:00Z', 'ev-d1'),
+           ('workflow:r1:main', 1, 'task-main', 'c2', 'd2', 1, 'primary', 'composio_execute_tool', '${D}', 'returned', '2026-09-01T19:00:02Z', 'ev-d2'),
+           ('workflow:r1:main:item-1', 1, 'task-item', 'c3', 'd3', 1, 'primary', 'composio_execute_tool', '${D}', 'started', '2026-09-01T19:00:04Z', 'ev-d3'),
+           ('workflow:r1:save', 1, 'task-save', 'c4', 'd4', 1, 'primary', 'composio_execute_tool', '${D}', 'returned', '2026-09-01T19:00:05Z', 'ev-d4');
+    INSERT INTO logical_call_settlements (session_id, source_user_seq, logical_tool_call_id, protocol_version, semantic_digest, execution_kind, outcome_kind, outcome_evidence, business_call, mutating, continues_requirement, recovery_action, retry_same_candidate, eliminates_candidate, discovery_epoch_requested, requires_reconciliation, progress_claimed, physical_crossing_count, physical_crossings_digest, observer_lane, settlement_event_id, settled_at)
+    VALUES ('workflow:r1:main', 1, 'c1', 1, '${D}', 'provider_execution', 'succeeded', 'structured', 1, 0, 0, 'settle', 0, 0, 0, 0, 0, 1, '${D}', 'composio', 'ev-s1', '2026-09-01T19:00:01Z'),
+           ('workflow:r1:main', 1, 'c2', 1, '${D}', 'provider_execution', 'succeeded', 'structured', 1, 0, 0, 'settle', 0, 0, 0, 0, 0, 1, '${D}', 'composio', 'ev-s2', '2026-09-01T19:00:03Z'),
+           ('workflow:r1:save', 1, 'c4', 1, '${D}', 'provider_execution', 'uncertain_write', 'nominal', 1, 1, 0, 'reconcile_then_decide', 0, 0, 0, 1, 0, 1, '${D}', 'composio', 'ev-s4', '2026-09-01T19:00:06Z');
+  `);
+  raw.close();
+
+  // Two settled reads, nothing open: re-running this step repeats nothing.
+  assert.deepEqual(readSessionDispatchEvidence('workflow:r1:main'), {
+    sessions: 1, openLogicalCalls: 0, settledCalls: 2, mutatingSettlements: 0, uncertainSettlements: 0, physicalCrossings: 2, unsettledDispatches: 0,
+  });
+  // Its forEach item still has a call open and a dispatch without a verdict.
+  const withItems = readSessionDispatchEvidence('workflow:r1:main', { includeChildSessions: true });
+  assert.equal(withItems.sessions, 2);
+  assert.equal(withItems.openLogicalCalls, 1);
+  assert.equal(withItems.unsettledDispatches, 1);
+  // A mutating settlement that ended uncertain is the one honest reason to park.
+  const save = readSessionDispatchEvidence('workflow:r1:save');
+  assert.equal(save.mutatingSettlements, 1);
+  assert.equal(save.uncertainSettlements, 1);
+  assert.deepEqual(readSessionDispatchEvidence('workflow:r1:never'), {
+    sessions: 0, openLogicalCalls: 0, settledCalls: 0, mutatingSettlements: 0, uncertainSettlements: 0, physicalCrossings: 0, unsettledDispatches: 0,
+  });
 });

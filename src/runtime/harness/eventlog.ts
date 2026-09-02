@@ -4817,6 +4817,72 @@ export function countInFlightToolCallsForSessions(
  * The query is deliberately read-only and does not infer liveness. Lease truth
  * is projected by the caller from the exact attempt row returned here.
  */
+export interface SessionDispatchEvidence {
+  /** Distinct session ids the ledger knows under this id (and `:child` ids). */
+  sessions: number;
+  /** logical_tool_calls still `open`: a call began and never settled. */
+  openLogicalCalls: number;
+  settledCalls: number;
+  /** Settlements whose frozen contract was mutating (local or external write). */
+  mutatingSettlements: number;
+  /** Settlements that ended `uncertain_write` or still require reconciliation. */
+  uncertainSettlements: number;
+  /** Provider crossings the settlements account for (reads included). */
+  physicalCrossings: number;
+  /** physical_dispatches still `started`/`unknown`: I/O began, no verdict. */
+  unsettledDispatches: number;
+}
+
+/**
+ * What the durable dispatch ledger says one host session did. A workflow
+ * step's host turn runs under `workflow:<runId>:<stepId>` (forEach items under
+ * `…:<key>`), so a crash-resume can ask the ledger instead of guessing from
+ * the step's prose: zero open calls, zero unsettled dispatches and zero
+ * mutating/uncertain settlements means nothing this step did can be duplicated
+ * by running it again (live 2026-09-01: a noon run killed 80 s in by a daemon
+ * restart was parked "interrupted mid-run — NOT re-run" although its ledger
+ * held two settled reads and nothing else). Read-only over the v23/v24
+ * settlement spine (dispatch-ledger.ts, logical-call-settlement-store.ts).
+ */
+export function readSessionDispatchEvidence(
+  sessionId: string,
+  options: { includeChildSessions?: boolean } = {},
+): SessionDispatchEvidence {
+  const db = openEventLog();
+  const exact = sessionId.trim();
+  const like = options.includeChildSessions ? `${exact}:%` : exact;
+  const where = '(session_id = ? OR session_id LIKE ?)';
+  const count = (sql: string): number => {
+    const row = db.prepare(sql).get(exact, like) as { n?: number | null } | undefined;
+    return Number(row?.n ?? 0);
+  };
+  const sessionIds = new Set<string>();
+  for (const table of ['logical_tool_calls', 'physical_dispatches', 'logical_call_settlements']) {
+    const rows = db.prepare(`SELECT DISTINCT session_id AS id FROM ${table} WHERE ${where}`)
+      .all(exact, like) as Array<{ id: string }>;
+    for (const row of rows) sessionIds.add(row.id);
+  }
+  const settled = db.prepare(
+    `SELECT COUNT(*) AS n,
+            COALESCE(SUM(mutating), 0) AS mutating,
+            COALESCE(SUM(CASE WHEN outcome_kind = 'uncertain_write' OR requires_reconciliation = 1 THEN 1 ELSE 0 END), 0) AS uncertain,
+            COALESCE(SUM(physical_crossing_count), 0) AS crossings
+       FROM logical_call_settlements
+      WHERE ${where}`,
+  ).get(exact, like) as { n?: number; mutating?: number; uncertain?: number; crossings?: number } | undefined;
+  return {
+    sessions: sessionIds.size,
+    openLogicalCalls: count(`SELECT COUNT(*) AS n FROM logical_tool_calls WHERE ${where} AND state = 'open'`),
+    settledCalls: Number(settled?.n ?? 0),
+    mutatingSettlements: Number(settled?.mutating ?? 0),
+    uncertainSettlements: Number(settled?.uncertain ?? 0),
+    physicalCrossings: Number(settled?.crossings ?? 0),
+    unsettledDispatches: count(
+      `SELECT COUNT(*) AS n FROM physical_dispatches WHERE ${where} AND state IN ('started', 'unknown')`,
+    ),
+  };
+}
+
 export function listLatestActiveChatRunAttempts(
   options: { startedAtOrBefore: string; limit?: number },
 ): RunAttemptRecord[] {

@@ -27,10 +27,12 @@ import {
   listEvents as listHarnessEvents,
   openEventLog,
   preserveCurrentKillAndClearStale,
+  readSessionDispatchEvidence,
   recordRunAttemptUserInput,
   requestKill,
   updateSession as updateHarnessSession,
   type RunAttemptRef,
+  type SessionDispatchEvidence,
 } from '../runtime/harness/eventlog.js';
 import {
   auditAcceptedSourceSettlementTruth,
@@ -9370,6 +9372,56 @@ export function shouldHaltResumeForSideEffect(
   return null;
 }
 
+export interface HostStepMutationProofInput {
+  runId: string;
+  steps: ReadonlyArray<{ id: string; call?: unknown; transform?: unknown; deterministic?: unknown }>;
+  inFlightStepIds: ReadonlySet<string>;
+  alreadyProven?: ReadonlySet<string>;
+}
+
+export interface HostStepMutationProof {
+  /** Prose steps whose own dispatch ledger holds no open call, no unsettled
+   * dispatch and no mutating/uncertain settlement: re-running repeats nothing. */
+  proven: Set<string>;
+  /** Prose steps whose ledger shows a mutation or an unresolved dispatch. */
+  uncertain: Map<string, SessionDispatchEvidence>;
+}
+
+/**
+ * Host-lane resume proof. A prose (harness) step's host turn runs under the
+ * durable session `workflow:<runId>:<stepId>`; the dispatch ledger under that
+ * id is the evidence of what the step actually did before the crash. Exact
+ * `call:` steps keep their own receipt ledger; transform and legacy runner
+ * steps never dispatch through the host. An unreadable ledger proves nothing
+ * (conservative: the step stays halted).
+ */
+export function hostStepMutationProof(
+  input: HostStepMutationProofInput,
+  readEvidence: (sessionId: string, options: { includeChildSessions: boolean }) => SessionDispatchEvidence
+    = readSessionDispatchEvidence,
+): HostStepMutationProof {
+  const proven = new Set<string>();
+  const uncertain = new Map<string, SessionDispatchEvidence>();
+  for (const stepId of input.inFlightStepIds) {
+    if (input.alreadyProven?.has(stepId)) continue;
+    const step = input.steps.find((candidate) => candidate.id === stepId);
+    if (!step || step.call !== undefined || step.transform !== undefined || step.deterministic !== undefined) continue;
+    let evidence: SessionDispatchEvidence;
+    try {
+      evidence = readEvidence(`workflow:${input.runId}:${stepId}`, { includeChildSessions: true });
+    } catch {
+      continue;
+    }
+    const quiet = evidence.openLogicalCalls === 0
+      && evidence.unsettledDispatches === 0
+      && evidence.mutatingSettlements === 0
+      && evidence.uncertainSettlements === 0;
+    if (quiet) proven.add(stepId);
+    else uncertain.set(stepId, evidence);
+  }
+  return { proven, uncertain };
+}
+
 type GraphRuntimeWorkflowStep = WorkflowStepInput & {
   /** In-memory only. Never authored or serialized into SKILL.md. */
   __graphRuntimeAdded?: true;
@@ -10043,6 +10095,28 @@ async function executeWorkflow(
       if (exactProofStepId) provenNoDispatchStepIds.add(exactProofStepId);
     }
   }
+  // Host-lane proof (2026-09-01): a prose step's own durable dispatch ledger
+  // (logical calls, physical dispatches, settlements under
+  // `workflow:<run>:<step>`) proves what it did. Zero open calls, zero
+  // unsettled dispatches and zero mutating/uncertain settlements → nothing to
+  // duplicate: the step re-runs. Anything mutating or uncertain keeps the
+  // halt, typed below as the one allowed terminal: awaiting readback.
+  const hostProof = crashResume
+    ? hostStepMutationProof({
+        runId,
+        steps: executionWorkflow.steps as never,
+        inFlightStepIds: resume.inFlightStepIds,
+        alreadyProven: provenNoDispatchStepIds,
+      })
+    : { proven: new Set<string>(), uncertain: new Map<string, SessionDispatchEvidence>() };
+  for (const stepId of hostProof.proven) provenNoDispatchStepIds.add(stepId);
+  if (hostProof.proven.size > 0) {
+    appendWorkflowEvent(workflowSlug, runId, {
+      kind: 'step_advisory',
+      stepId: '(workflow)',
+      meta: { reason: 'resume_proven_no_mutation', stepIds: [...hostProof.proven] },
+    });
+  }
   const resumeHalt = shouldHaltResumeForSideEffect(
     executionWorkflow,
     resume,
@@ -10061,10 +10135,15 @@ async function executeWorkflow(
     },
   );
   if (resumeHalt) {
+    const uncertainEvidence = hostProof.uncertain.get(resumeHalt.stepId);
+    const ledgerClause = uncertainEvidence
+      ? ` Its own dispatch ledger shows ${uncertainEvidence.mutatingSettlements} mutating and ${uncertainEvidence.uncertainSettlements} uncertain settlement(s), ${uncertainEvidence.openLogicalCalls} call(s) still open and ${uncertainEvidence.unsettledDispatches} dispatch(es) without a verdict, so re-running could repeat a write.`
+      : '';
     throw new Error(
+      `${uncertainEvidence ? 'mutation_uncertain_awaiting_readback: ' : ''}` +
       `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +
       `${resumeHalt.cls === 'send' ? 'sent or published' : 'written'} some items. It was NOT automatically ` +
-      `re-run, to avoid duplicates. Review what it did, then re-run the workflow (or just that ` +
+      `re-run, to avoid duplicates.${ledgerClause} Review what it did, then re-run the workflow (or just that ` +
       `step) manually once you've confirmed it's safe. ` +
       `NOTE: this step's class was ${resumeHalt.declared ? `declared sideEffect: ${resumeHalt.cls}` : `INFERRED as "${resumeHalt.cls}" from its prose (no sideEffect declared)`}. ` +
       `If the step is actually read-only (scrape/fetch/query — safe to repeat), declare \`sideEffect: read\` on it ` +
