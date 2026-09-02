@@ -39,6 +39,14 @@ export interface RevalidatedComposioDefinition extends SelectedComposioDefinitio
   providerOperationVersion: string;
   invokePortId: string;
   definitionFingerprint: string;
+  /** Present when the provider moved only its operation-version LABEL: the
+   * input and output schemas are byte-identical to the selection and the
+   * selection's fingerprint is exactly the old-label fingerprint. The caller
+   * installs the live definition as the recorded successor of the old one.
+   * (A stored Outlook read carried version 20260828_00; the provider relabeled
+   * it; every workflow naming it refused "version drift" as "not connected"
+   * forever — 2026-09-02.) */
+  reboundFrom?: { providerOperationVersion: string; definitionFingerprint: string };
 }
 
 export type SelectedComposioRevalidationRefusalCode =
@@ -249,18 +257,14 @@ export async function revalidateSelectedComposioDefinitions(
         },
       };
     }
-    if (
+    // A moved operation-version label is decided below, once the live output
+    // schema and invoke port are known: label-only (schemas identical, the
+    // selection's fingerprint is exactly the old-label fingerprint) rebinds;
+    // anything else is drift.
+    const versionMoved = Boolean(
       selection.providerOperationVersion
-      && selection.providerOperationVersion !== operationVersion
-    ) {
-      return {
-        ok: false as const,
-        refusal: {
-          code: 'selected_definition_operation_version_drift' as const,
-          identifier: selection.identifier,
-        },
-      };
-    }
+      && selection.providerOperationVersion !== operationVersion,
+    );
     if (!Object.prototype.hasOwnProperty.call(exact, 'outputSchema')) {
       return {
         ok: false as const,
@@ -360,7 +364,32 @@ export async function revalidateSelectedComposioDefinitions(
         },
       };
     }
-    if (
+    let reboundFrom: RevalidatedComposioDefinition['reboundFrom'];
+    if (versionMoved) {
+      const previousFingerprint = selection.definitionFingerprint
+        ? fingerprintComposioProviderDefinition({
+            operationId: selection.identifier,
+            operationVersion: selection.providerOperationVersion!,
+            accountId: selection.accountIdentity,
+            invokePortId,
+            inputSchema: exact.schema,
+            outputSchema,
+          })
+        : null;
+      if (!previousFingerprint || previousFingerprint !== selection.definitionFingerprint) {
+        return {
+          ok: false as const,
+          refusal: {
+            code: 'selected_definition_operation_version_drift' as const,
+            identifier: selection.identifier,
+          },
+        };
+      }
+      reboundFrom = {
+        providerOperationVersion: selection.providerOperationVersion!,
+        definitionFingerprint: selection.definitionFingerprint!,
+      };
+    } else if (
       selection.definitionFingerprint
       && selection.definitionFingerprint !== definitionFingerprint
     ) {
@@ -384,6 +413,7 @@ export async function revalidateSelectedComposioDefinitions(
         providerOperationVersion: operationVersion,
         invokePortId,
         definitionFingerprint,
+        ...(reboundFrom ? { reboundFrom } : {}),
         ...(Object.prototype.hasOwnProperty.call(selection, 'verificationContract')
           ? { verificationContract: currentVerification ?? null }
           : {}),

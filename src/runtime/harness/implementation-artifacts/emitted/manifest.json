@@ -1167,7 +1167,7 @@
           "bytes": 5718
         },
         "src/integrations/composio/selected-definition-revalidation.ts": {
-          "bytes": 15702
+          "bytes": 17392
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
           "bytes": 43245
@@ -3654,7 +3654,7 @@
           "bytes": 5718
         },
         "src/integrations/composio/selected-definition-revalidation.ts": {
-          "bytes": 15702
+          "bytes": 17392
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
           "bytes": 43245

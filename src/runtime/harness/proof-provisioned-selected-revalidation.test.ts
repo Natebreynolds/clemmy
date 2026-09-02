@@ -826,6 +826,83 @@ test('selected provider output, version, full fingerprint, and invoke port drift
   }
 });
 
+test('a label-only operation-version move rebinds to the live definition instead of refusing forever', async () => {
+  // The stored selection is self-consistent for the OLD label: its fingerprint
+  // is exactly the old-label fingerprint over byte-identical schemas. The
+  // provider now reports a new label for the same definition (a stored
+  // Outlook read at 20260828_00 was relabeled; every workflow naming it refused
+  // 'version drift' as 'not connected' forever — 2026-09-02).
+  const storedVersion = '20260828_00';
+  const liveVersion = '20260901_03';
+  const invokePort = `port:cap:resolved:${SELECTED_A.toLowerCase()}:${SELECTED_A}`;
+  const storedFingerprint = providerIdentity.fingerprintComposioProviderDefinition({
+    operationId: SELECTED_A,
+    operationVersion: storedVersion,
+    accountId: CONNECTION_ID,
+    invokePortId: invokePort,
+    inputSchema: SCHEMA_A,
+    outputSchema: OUTPUT_A,
+  });
+  const liveFingerprint = providerIdentity.fingerprintComposioProviderDefinition({
+    operationId: SELECTED_A,
+    operationVersion: liveVersion,
+    accountId: CONNECTION_ID,
+    invokePortId: invokePort,
+    inputSchema: SCHEMA_A,
+    outputSchema: OUTPUT_A,
+  });
+  assert.ok(storedFingerprint && liveFingerprint && storedFingerprint !== liveFingerprint);
+  composio.__test__.setConnectedAccountsLoader(async () => [{
+    id: CONNECTION_ID,
+    status: 'ACTIVE',
+    user_id: 'selected-user',
+    toolkit: { slug: 'mega' },
+  }]);
+  schemas.resetToolSchemaCache();
+  schemas._setToolSchemaLoaderForTests(async () => ({
+    inputParameters: SCHEMA_A,
+    outputParameters: OUTPUT_A,
+    providerObservedAt: Date.now(),
+    providerOperationVersion: liveVersion,
+  }));
+
+  const revalidated = await selectedDefinitions.revalidateSelectedComposioDefinitions([{
+    identifier: SELECTED_A,
+    schemaDigest: digestSchema(SCHEMA_A),
+    accountIdentity: CONNECTION_ID,
+    outputSchemaDigest: digestSchema(OUTPUT_A),
+    providerOperationVersion: storedVersion,
+    invokePortId: invokePort,
+    definitionFingerprint: storedFingerprint!,
+  }]);
+  assert.equal(revalidated.ok, true, JSON.stringify(revalidated));
+  if (!revalidated.ok) return;
+  const definition = revalidated.definitions.get(SELECTED_A.toLowerCase());
+  assert.ok(definition);
+  assert.equal(definition.providerOperationVersion, liveVersion);
+  assert.equal(definition.definitionFingerprint, liveFingerprint);
+  assert.deepEqual(definition.reboundFrom, {
+    providerOperationVersion: storedVersion,
+    definitionFingerprint: storedFingerprint,
+  });
+
+  // The same schemas with a fingerprint that does NOT belong to the stored
+  // label is still drift: a relabel cannot launder an inconsistent selection.
+  const inconsistent = await selectedDefinitions.revalidateSelectedComposioDefinitions([{
+    identifier: SELECTED_A,
+    schemaDigest: digestSchema(SCHEMA_A),
+    accountIdentity: CONNECTION_ID,
+    outputSchemaDigest: digestSchema(OUTPUT_A),
+    providerOperationVersion: storedVersion,
+    invokePortId: invokePort,
+    definitionFingerprint: 'b'.repeat(64),
+  }]);
+  assert.deepEqual(inconsistent, {
+    ok: false,
+    refusal: { code: 'selected_definition_operation_version_drift', identifier: SELECTED_A },
+  });
+});
+
 test('legacy disclosure from account A cannot replay against a current account B definition', async () => {
   const currentAccount = 'connection-account-b';
   const staleAccount = 'connection-account-a';
