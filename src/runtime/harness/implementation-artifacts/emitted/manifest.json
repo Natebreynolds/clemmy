@@ -1479,7 +1479,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 48078
+          "bytes": 48039
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -3969,7 +3969,7 @@
           "bytes": 4725
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 48078
+          "bytes": 48039
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
