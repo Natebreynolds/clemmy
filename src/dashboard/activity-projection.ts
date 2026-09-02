@@ -51,6 +51,10 @@ import {
 import { listPending as listPendingHarnessApprovals } from '../runtime/harness/approval-registry.js';
 import { listBackgroundTasks, type BackgroundTaskRecord } from '../execution/background-tasks.js';
 import {
+  readWorkflowImprovement,
+  WORKFLOW_IMPROVEMENT_ATTEMPT_BUDGET,
+} from '../execution/workflow-self-improvement.js';
+import {
   deriveWorkflowTerminalOutcome,
   type WorkflowTerminalOutcome,
 } from '../execution/workflow-terminal-outcome.js';
@@ -715,8 +719,24 @@ function isBackgroundRunSession(session: SessionRow): boolean {
   return session.id.startsWith('background:');
 }
 
+/** A workflow rewrite session names the workflow and the attempt it is on, so
+ *  the row reads as work a person can follow rather than the prompt's first
+ *  line. `workflow-improvement:<slug>:<stamp>` is the lane's own session id. */
+function improvementHeadline(session: SessionRow): string | null {
+  const match = /^workflow-improvement:(.+):\d+$/.exec(session.id);
+  if (!match) return null;
+  const slug = match[1]!;
+  let attempt = 1;
+  try {
+    const request = readWorkflowImprovement(slug);
+    attempt = (request?.attempts?.length ?? 0) + 1;
+  } catch { /* the state file is optional */ }
+  return `Rewriting workflow "${slug}" into exact steps (attempt ${attempt} of ${WORKFLOW_IMPROVEMENT_ATTEMPT_BUDGET})`;
+}
+
 function chatHeadline(session: SessionRow): string {
-  return session.title?.trim() || session.objective?.trim() || 'Chat turn';
+  return improvementHeadline(session)
+    || session.title?.trim() || session.objective?.trim() || 'Chat turn';
 }
 
 /** The routing label a surface tags the row with — channel first, then the
@@ -842,6 +862,12 @@ function projectActivitySnapshotInternal(
         observedAt,
         revision: latestSeqFor(session.id),
         origin: chatOrigin(session),
+        // A host-run execution session (a workflow rewrite on the cron
+        // channel, a scheduled self-improvement turn) is never an ordinary
+        // reply: it skips the foreground dwell and shows the moment it starts.
+        ...(session.kind === 'execution'
+          ? { presentationLane: session.channel === 'cron' ? 'scheduled' as const : 'detached' as const }
+          : {}),
         ...(awaitingApproval.has(session.id) && !attempt.finishedAt
           ? { lifecycleHint: 'awaiting_approval' as SurfaceLifecycle }
           : {}),

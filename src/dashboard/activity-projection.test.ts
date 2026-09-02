@@ -691,3 +691,33 @@ test('an awaiting_input run carries its question so a surface can say what she w
   const fg = projectForegroundWorkingNowEntry(entry);
   assert.equal(Object.hasOwn(fg, 'detail'), false, 'foreground DTO grew prose');
 });
+
+// Live 2026-09-01 ("I have no idea what she's doing right now"): a workflow
+// rewrite ran as an execution-kind session on the cron channel for ten
+// minutes and no surface showed a row — Working Now only read chat-kind
+// sessions, behind a 90-second dwell. Work the user asked for shows the
+// moment it starts, named by the workflow and the attempt it is on.
+test('Working Now shows a workflow rewrite session the moment it starts, named by workflow and attempt', () => {
+  const slug = 'team-activity-slack-updates';
+  const session = createSession({
+    id: `workflow-improvement:${slug}:${Date.now()}`,
+    kind: 'execution',
+    channel: 'cron',
+    title: `Workflow self-improvement: "${slug}" (definition file: /vault/...)`,
+  });
+  const claim = claimRunAttemptLease({
+    sessionId: session.id,
+    runId: `workflow-improvement:v1:${slug}:${Date.now()}`,
+    ownerId: 'working-now-rewrite-test',
+    leaseMs: 30 * 60_000,
+    nowMs: Date.now(),
+  });
+  assert.equal(claim.claimed, true);
+
+  const workingNow = projectWorkingNowSnapshot({ observedAt: new Date().toISOString(), kinds: ['chat'], limit: 100 });
+  const row = workingNow.entries.find((entry) => entry.sessionId === session.id);
+  assert.ok(row, 'a just-started rewrite session must be visible without any dwell');
+  assert.equal(row?.presentationLane, 'scheduled');
+  assert.match(row?.headline ?? '', /Rewriting workflow "team-activity-slack-updates" into exact steps \(attempt 1 of 3\)/);
+  assert.doesNotMatch(row?.headline ?? '', /definition file/, 'the prompt\'s first line is not a headline');
+});

@@ -2454,7 +2454,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 316020
+          "bytes": 316447
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 42837
@@ -4935,7 +4935,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 316020
+          "bytes": 316447
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 42837

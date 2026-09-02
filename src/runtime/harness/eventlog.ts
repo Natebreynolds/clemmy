@@ -4899,9 +4899,16 @@ export function listLatestActiveChatRunAttempts(
       INNER JOIN sessions ON sessions.id = active.session_id
      WHERE active.finished_at IS NULL
        AND active.status = 'active'
-       AND active.started_at <= ?
-       AND sessions.kind = 'chat'
        AND sessions.id NOT LIKE 'background:%'
+       AND (
+         (sessions.kind = 'chat' AND active.started_at <= ?)
+         -- Host-run execution sessions (a workflow rewrite, a scheduled
+         -- self-improvement turn) are work the user asked for and cannot see
+         -- anywhere else; they show the moment they start, no dwell. Live
+         -- 2026-09-01: "I have no idea what she's doing right now" — an
+         -- 18th rewrite attempt ran ten minutes with no row anywhere.
+         OR sessions.kind = 'execution'
+       )
        AND NOT EXISTS (
          SELECT 1
            FROM run_attempts AS newer
