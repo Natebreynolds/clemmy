@@ -169,3 +169,36 @@ test('the omission word "null" is an absent optional key, JSON null for a requir
     { query: 'null' },
   );
 });
+
+// Live 2026-09-02 (grok-4.6, the platform-49 sheet cleanup): work_call
+// source_record_ids:[] was CORRECT for a fresh read with no lineage, but the
+// field is nullable with minItems 1, so [] failed validation — and the SDK
+// reports every parser failure as "Invalid JSON input for tool". The model was
+// told its valid JSON was broken, re-sent the same correct call, and the
+// no-progress governor ended the turn. An empty array IS the null the schema
+// already accepts.
+test('an empty array becomes null only when the schema rejects empty and accepts null', () => {
+  const schema = {
+    type: 'object',
+    required: ['source_record_ids', 'source_call_ids', 'keep_empty', 'not_nullable'],
+    properties: {
+      source_record_ids: { anyOf: [{ type: 'array', items: { type: 'string' }, minItems: 1 }, { type: 'null' }] },
+      source_call_ids: { anyOf: [{ type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 1 }, { type: 'null' }] },
+      // No minItems: an empty list is legal, so it must be left alone.
+      keep_empty: { anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] },
+      // Rejects empty but does NOT accept null: leave it so validation names it.
+      not_nullable: { type: 'array', items: { type: 'string' }, minItems: 1 },
+    },
+  };
+  const out = materializeStrictNullableFields({
+    source_record_ids: [], source_call_ids: [], keep_empty: [], not_nullable: [],
+  }, schema) as Record<string, unknown>;
+  assert.equal(out.source_record_ids, null, 'nullable + minItems>=1 + [] => null');
+  assert.equal(out.source_call_ids, null);
+  assert.deepEqual(out.keep_empty, [], 'a list that legally accepts [] is untouched');
+  assert.deepEqual(out.not_nullable, [], 'no null branch => leave it for validation to name');
+
+  // A populated list is never touched.
+  const populated = materializeStrictNullableFields({ source_record_ids: ['rec_1'] }, schema) as Record<string, unknown>;
+  assert.deepEqual(populated.source_record_ids, ['rec_1']);
+});

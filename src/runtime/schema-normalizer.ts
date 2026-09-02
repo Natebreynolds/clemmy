@@ -304,6 +304,21 @@ function schemaBranchForValue(schemaValue: unknown, value: unknown): unknown {
 /** Strings a compatible model emits to mean "no value". Exact words only. */
 const OMISSION_WORDS = new Set(['null', 'None', 'undefined', 'nil']);
 
+/** Does this schema's ARRAY branch reject an empty array (minItems >= 1)?
+ * Scans anyOf/oneOf branches the way schemaBranchForValue does. */
+function jsonSchemaArrayRejectsEmpty(schemaValue: unknown): boolean {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return false;
+  const schema = schemaValue as { type?: unknown; minItems?: unknown; anyOf?: unknown; oneOf?: unknown };
+  const isArrayBranch = schema.type === 'array'
+    || (Array.isArray(schema.type) && (schema.type as unknown[]).includes('array'));
+  if (isArrayBranch && typeof schema.minItems === 'number' && schema.minItems >= 1) return true;
+  for (const alternatives of [schema.anyOf, schema.oneOf]) {
+    if (!Array.isArray(alternatives)) continue;
+    if (alternatives.some((candidate) => jsonSchemaArrayRejectsEmpty(candidate))) return true;
+  }
+  return false;
+}
+
 export function materializeStrictNullableFields(value: unknown, schemaValue: unknown): unknown {
   const schema = schemaBranchForValue(schemaValue, value);
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return value;
@@ -353,6 +368,25 @@ export function materializeStrictNullableFields(value: unknown, schemaValue: unk
     if (typeof out[key] === 'string' && OMISSION_WORDS.has(out[key].trim())) {
       if (jsonSchemaAllowsNull(propertySchema)) { out[key] = null; continue; }
       if (!required.has(key)) { delete out[key]; continue; }
+    }
+    // The same omission spelled as an EMPTY ARRAY. A nullable list field that
+    // requires at least one item expresses "none" as null, but a model
+    // naturally serializes it as []. Live 2026-09-02 (grok-4.6, the
+    // platform-49 sheet cleanup): work_call source_record_ids:[] was correct
+    // for a fresh read with no lineage, failed minItems, and the SDK reports
+    // EVERY parser failure as "Invalid JSON input for tool" — so the model was
+    // told its valid JSON was broken, re-sent the same correct call, and the
+    // no-progress governor ended the turn. Coerce ONLY when [] would actually
+    // fail (schema accepts null AND requires >=1 item); a list that legitimately
+    // accepts [] is untouched.
+    if (
+      Array.isArray(out[key])
+      && (out[key] as readonly unknown[]).length === 0
+      && jsonSchemaAllowsNull(propertySchema)
+      && jsonSchemaArrayRejectsEmpty(propertySchema)
+    ) {
+      out[key] = null;
+      continue;
     }
     out[key] = materializeStrictNullableFields(out[key], propertySchema);
   }

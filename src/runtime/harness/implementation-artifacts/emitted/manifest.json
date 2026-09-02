@@ -333,7 +333,7 @@
           "bytes": 20061
         },
         "src/runtime/schema-normalizer.ts": {
-          "bytes": 17111
+          "bytes": 18961
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -2823,7 +2823,7 @@
           "bytes": 20061
         },
         "src/runtime/schema-normalizer.ts": {
-          "bytes": 17111
+          "bytes": 18961
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -5025,7 +5025,7 @@
           "bytes": 2569
         },
         "src/runtime/schema-normalizer.ts": {
-          "bytes": 17111
+          "bytes": 18961
         },
         "src/runtime/harness/mutation-verification-contract.ts": {
           "bytes": 33409
