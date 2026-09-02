@@ -37,6 +37,7 @@ const ports = await import('./production-capability-ports.js');
 const observations = await import('./independent-capability-observation.js');
 const manifests = await import('./capability-manifest.js');
 const capabilityIndex = await import('../../memory/capability-index.js');
+const transport = await import('./reviewed-cli-read-transport.js');
 
 test.after(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
@@ -452,4 +453,65 @@ test('nonzero, timeout, and oversized output retain one honest crossing and a bo
     }
     assert.equal(bodyCount(), before + 1, `${fixture.label} owns exactly one entered child body`);
   }
+});
+
+test('a failed reviewed-CLI process names its own fix: the provider\'s structured failure rides in the block reason', () => {
+  const base = {
+    version: 1 as const,
+    status: 'nonzero_exit' as const,
+    operationId: 'salesforce_sf_soql_query',
+    executableRealpath: '/usr/local/lib/sf/bin/sf',
+    argv: ['data', 'query', '--json', '--query', 'SELECT MAX(ActivityDate) FROM Task'],
+    exitCode: 1,
+    signal: null,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+  };
+  const structured = new transport.ReviewedCliProcessError({
+    ...base,
+    stdout: JSON.stringify({
+      status: 1,
+      name: 'MALFORMED_QUERY',
+      message: '\nType, COUNT(Id) touchCount, MAX(ActivityDate) lastActivity FROM\n     ^\nERROR at Row:1:Column:61\nfield ActivityDate does not support aggregate operator MAX',
+    }),
+    stderr: ' ›   Warning: @salesforce/cli update available from 2.130.9 to 2.149.9.\n',
+  });
+  assert.match(structured.message, /^reviewed CLI process nonzero_exit: MALFORMED_QUERY: /);
+  assert.match(structured.message, /field ActivityDate does not support aggregate operator MAX$/);
+  assert.ok(!/Warning:/.test(structured.message));
+
+  const stderrOnly = new transport.ReviewedCliProcessError({
+    ...base,
+    stdout: '',
+    stderr: ' ›   Warning: update available\nError (1): No authorization information found for nathan@example.com.\n',
+  });
+  assert.equal(
+    stderrOnly.message,
+    'reviewed CLI process nonzero_exit: Error (1): No authorization information found for nathan@example.com.',
+  );
+
+  const silent = new transport.ReviewedCliProcessError({ ...base, stdout: '', stderr: '' });
+  assert.equal(silent.message, 'reviewed CLI process nonzero_exit');
+});
+
+test('a reviewed-CLI observation is re-read at every crossing, so freshness is not a fuse lit at acquisition', async () => {
+  const acquired = await acquireCurrent('fresh');
+  assert.ok('manifest' in acquired && acquired.manifest, JSON.stringify(acquired));
+  const account = 'reviewed_cli:host';
+  const before = Date.now();
+  const first = observations.independentlyObserveCapability(operationId, account);
+  assert.ok(first && first.origin === 'independent', JSON.stringify(first));
+  assert.ok(first.observedAt >= before, 'first observation is stamped at the crossing, not at acquisition');
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  const later = Date.now();
+  const second = observations.independentlyObserveCapability(operationId, account);
+  assert.ok(second && second.origin === 'independent', JSON.stringify(second));
+  assert.ok(second.observedAt >= later, 'every crossing re-reads the CLI and stamps its own instant');
+  assert.ok(second.observedAt > first.observedAt);
+  assert.equal(second.definitionFingerprint, first.definitionFingerprint);
+  assert.equal(second.providerVersion, first.providerVersion);
+  assert.equal(
+    observations.observationIsFresh(second, later + observations.INDEPENDENT_OBSERVATION_FRESHNESS_MS - 1),
+    true,
+  );
 });

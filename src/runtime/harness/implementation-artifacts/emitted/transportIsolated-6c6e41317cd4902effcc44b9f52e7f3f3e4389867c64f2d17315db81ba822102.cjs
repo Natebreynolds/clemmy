@@ -47,6 +47,58 @@ var import_node_fs4 = require("node:fs");
 var import_node_os2 = __toESM(require("node:os"), 1);
 var import_node_path4 = __toESM(require("node:path"), 1);
 
+// src/runtime/security.ts
+function isPlaceholderSecret(value) {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  return normalized === "changeme" || normalized === "change-me" || normalized === "placeholder" || normalized === "secret" || normalized === "webhook_secret" || normalized.includes("replace_me") || normalized.includes("your_") || normalized.includes("example");
+}
+function isStrongLocalSecret(value) {
+  const trimmed = value.trim();
+  if (trimmed.length < 24) return false;
+  if (isPlaceholderSecret(trimmed)) return false;
+  return /[A-Za-z]/.test(trimmed) && /[0-9_-]/.test(trimmed);
+}
+function isSecretLikeKey(input) {
+  const normalized = String(input ?? "").replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!normalized) return false;
+  const words = new Set(normalized.split("_").filter(Boolean));
+  if (words.has("token") || words.has("tokens") || words.has("secret") || words.has("secrets") || words.has("password") || words.has("passwords") || words.has("passwd") || words.has("credential") || words.has("credentials") || words.has("authorization") || words.has("bearer") || words.has("jwt") || words.has("cookie") || normalized === "auth" || normalized === "proxy_authorization" || normalized === "set_cookie") {
+    return true;
+  }
+  const joined = `_${normalized}_`;
+  return joined.includes("_api_key_") || joined.includes("_private_key_") || joined.includes("_signing_key_") || joined.includes("_encryption_key_") || joined.includes("_access_key_") || normalized === "x_api_key" || normalized === "mcp_headers" || normalized === "mcp_env";
+}
+function redactSecretAssignments(input) {
+  const redactQuoted = input.replace(
+    /(["'])([^"'\r\n]{1,80})\1(\s*[:=]\s*)(["'])(.*?)\4/g,
+    (match, keyQuote, key, separator, valueQuote) => isSecretLikeKey(key) ? `${keyQuote}${key}${keyQuote}${separator}${valueQuote}[REDACTED]${valueQuote}` : match
+  );
+  return redactQuoted.replace(
+    /\b([A-Za-z][A-Za-z0-9_.-]{0,80})(\s*[:=]\s*)(?:(?:Bearer|Basic|Bot)\s+[A-Za-z0-9._~+/=-]+|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
+    (match, key, separator) => isSecretLikeKey(key) ? `${key}${separator}[REDACTED]` : match
+  );
+}
+function redactSensitiveText(input) {
+  let text = typeof input === "string" ? input : String(input ?? "");
+  if (!text) return text;
+  text = redactSecretAssignments(text);
+  text = text.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, (match) => `${match.slice(0, 10)}...REDACTED`);
+  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "Bearer [REDACTED]");
+  text = text.replace(/\bBot\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "Bot [REDACTED]");
+  text = text.replace(/([?&](?:token|access_token|refresh_token|api_key|secret)=)[^&#\s"']+/gi, "$1[REDACTED]");
+  text = text.replace(/((?:Authorization|authorization)\s*[:=]\s*)(?:Bearer|Bot)?\s*[A-Za-z0-9._~+/=-]{12,}/g, "$1[REDACTED]");
+  text = text.replace(
+    /((?:OPENAI|COMPOSIO|DISCORD|WEBHOOK|RECALL|CODEX|MCP|AUTH)[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)\s*[=:]\s*)("[^"]+"|'[^']+'|\S+)/gi,
+    "$1[REDACTED]"
+  );
+  text = text.replace(
+    /("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|secret|password|token|headers?)"\s*:\s*)("[^"]+"|\{[^}]*\}|\[[^\]]*\])/gi,
+    '$1"[REDACTED]"'
+  );
+  return text;
+}
+
 // src/runtime/harness/reviewed-cli-read-transport.ts
 var import_node_child_process = require("node:child_process");
 var import_node_crypto4 = require("node:crypto");
@@ -246,21 +298,6 @@ var import_node_fs = require("node:fs");
 var import_node_os = __toESM(require("node:os"), 1);
 var import_node_path = __toESM(require("node:path"), 1);
 var import_node_url = require("node:url");
-
-// src/runtime/security.ts
-function isPlaceholderSecret(value) {
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return true;
-  return normalized === "changeme" || normalized === "change-me" || normalized === "placeholder" || normalized === "secret" || normalized === "webhook_secret" || normalized.includes("replace_me") || normalized.includes("your_") || normalized.includes("example");
-}
-function isStrongLocalSecret(value) {
-  const trimmed = value.trim();
-  if (trimmed.length < 24) return false;
-  if (isPlaceholderSecret(trimmed)) return false;
-  return /[A-Za-z]/.test(trimmed) && /[0-9_-]/.test(trimmed);
-}
-
-// src/config.ts
 var __filename = (0, import_node_url.fileURLToPath)(import_meta_url);
 var __dirname = import_node_path.default.dirname(__filename);
 var PKG_DIR = import_node_path.default.resolve(__dirname, "..");
@@ -829,10 +866,38 @@ var REVIEWED_CLI_OUTPUT_SCHEMA = Object.freeze({
   ]),
   additionalProperties: false
 });
+var PROCESS_DIAGNOSTIC_MAX_CHARS = 240;
+function stripAnsiText(text) {
+  return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+}
+function reviewedCliProcessDiagnostic(outcome) {
+  const stdout = stripAnsiText(outcome.stdout ?? "").trim();
+  const stderr = stripAnsiText(outcome.stderr ?? "").trim();
+  let line = null;
+  if (stdout.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(stdout);
+      const message = typeof parsed.message === "string" ? parsed.message.trim() : "";
+      const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+      if (message) line = name ? `${name}: ${message}` : message;
+      else if (name) line = name;
+    } catch {
+    }
+  }
+  if (!line) {
+    const informative = stderr.split("\n").map((entry) => entry.replace(/^\s*›\s*/, "").trim()).filter((entry) => entry.length > 0 && !/^warning:/i.test(entry));
+    line = informative.at(-1) ?? null;
+  }
+  if (!line && stdout) line = stdout.split("\n").map((entry) => entry.trim()).filter(Boolean).at(-1) ?? null;
+  if (!line) return null;
+  const collapsed = redactSensitiveText(line.replace(/\s+/g, " ").trim());
+  return collapsed.length > PROCESS_DIAGNOSTIC_MAX_CHARS ? `${collapsed.slice(0, PROCESS_DIAGNOSTIC_MAX_CHARS - 1)}\u2026` : collapsed;
+}
 var ReviewedCliProcessError = class extends Error {
   outcome;
   constructor(outcome) {
-    super(`reviewed CLI process ${outcome.status}`);
+    const diagnostic = reviewedCliProcessDiagnostic(outcome);
+    super(diagnostic ? `reviewed CLI process ${outcome.status}: ${diagnostic}` : `reviewed CLI process ${outcome.status}`);
     this.name = "ReviewedCliProcessError";
     this.outcome = Object.freeze(outcome);
   }

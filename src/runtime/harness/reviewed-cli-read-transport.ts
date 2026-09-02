@@ -7,6 +7,7 @@
  * owns: the authority-sealed reviewed descriptor and executable bytes. It must
  * never import the manifest store, event log, or a native database binding.
  */
+import { redactSensitiveText } from '../security.js';
 import { execFile, type ExecFileException } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -65,11 +66,60 @@ export type ReviewedCliProcessOutcomeV1 = {
   stderrTruncated: boolean;
 };
 
+const PROCESS_DIAGNOSTIC_MAX_CHARS = 240;
+
+function stripAnsiText(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '');
+}
+
+/**
+ * The one bounded line that says WHY the process failed, so the block reason
+ * a run reports names its own fix instead of only "nonzero_exit". Prefers the
+ * provider's structured failure on stdout (sf --json: {name, message}), then
+ * the last stderr line that is not a CLI update warning, then stdout's last
+ * line. Secret-redacted, ANSI-stripped, capped. Absent when nothing was said.
+ */
+export function reviewedCliProcessDiagnostic(
+  outcome: Pick<ReviewedCliProcessOutcomeV1, 'stdout' | 'stderr'>,
+): string | null {
+  const stdout = stripAnsiText(outcome.stdout ?? '').trim();
+  const stderr = stripAnsiText(outcome.stderr ?? '').trim();
+  let line: string | null = null;
+  if (stdout.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(stdout) as Record<string, unknown>;
+      const message = typeof parsed.message === 'string' ? parsed.message.trim() : '';
+      const name = typeof parsed.name === 'string' ? parsed.name.trim() : '';
+      if (message) line = name ? `${name}: ${message}` : message;
+      else if (name) line = name;
+    } catch {
+      // not JSON — fall through to stderr / plain stdout
+    }
+  }
+  if (!line) {
+    const informative = stderr
+      .split('\n')
+      .map((entry) => entry.replace(/^\s*›\s*/, '').trim())
+      .filter((entry) => entry.length > 0 && !/^warning:/i.test(entry));
+    line = informative.at(-1) ?? null;
+  }
+  if (!line && stdout) line = stdout.split('\n').map((entry) => entry.trim()).filter(Boolean).at(-1) ?? null;
+  if (!line) return null;
+  const collapsed = redactSensitiveText(line.replace(/\s+/g, ' ').trim());
+  return collapsed.length > PROCESS_DIAGNOSTIC_MAX_CHARS
+    ? `${collapsed.slice(0, PROCESS_DIAGNOSTIC_MAX_CHARS - 1)}…`
+    : collapsed;
+}
+
 export class ReviewedCliProcessError extends Error {
   readonly outcome: ReviewedCliProcessOutcomeV1;
 
   constructor(outcome: ReviewedCliProcessOutcomeV1) {
-    super(`reviewed CLI process ${outcome.status}`);
+    const diagnostic = reviewedCliProcessDiagnostic(outcome);
+    super(diagnostic
+      ? `reviewed CLI process ${outcome.status}: ${diagnostic}`
+      : `reviewed CLI process ${outcome.status}`);
     this.name = 'ReviewedCliProcessError';
     this.outcome = Object.freeze(outcome);
   }

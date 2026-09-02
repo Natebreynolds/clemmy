@@ -384,7 +384,7 @@
           "bytes": 7287
         },
         "src/runtime/harness/independent-capability-observation.ts": {
-          "bytes": 15779
+          "bytes": 16222
         },
         "src/runtime/harness/production-capability-catalog.ts": {
           "bytes": 18326
@@ -1242,10 +1242,10 @@
           "bytes": 51961
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
-          "bytes": 12047
+          "bytes": 14185
         },
         "src/runtime/harness/production-reviewed-cli-read-carrier.ts": {
-          "bytes": 13776
+          "bytes": 14191
         },
         "src/runtime/harness/production-live-read-acquisition-registry.ts": {
           "bytes": 40209
@@ -2865,7 +2865,7 @@
           "bytes": 7287
         },
         "src/runtime/harness/independent-capability-observation.ts": {
-          "bytes": 15779
+          "bytes": 16222
         },
         "src/runtime/harness/production-capability-catalog.ts": {
           "bytes": 18326
@@ -3723,10 +3723,10 @@
           "bytes": 51961
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
-          "bytes": 12047
+          "bytes": 14185
         },
         "src/runtime/harness/production-reviewed-cli-read-carrier.ts": {
-          "bytes": 13776
+          "bytes": 14191
         },
         "src/runtime/harness/production-live-read-acquisition-registry.ts": {
           "bytes": 40209
@@ -4982,8 +4982,8 @@
       }
     },
     "transport": {
-      "file": "transport-e87474099f1b4dd31f1e8603944cff7b53a9356409cab75588659d18e70c155a.cjs",
-      "sha256": "e87474099f1b4dd31f1e8603944cff7b53a9356409cab75588659d18e70c155a",
+      "file": "transport-a8941a7a34b6af8b681da89de310cc28f6e5571906342fe3dafb0aec5079f547.cjs",
+      "sha256": "a8941a7a34b6af8b681da89de310cc28f6e5571906342fe3dafb0aec5079f547",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -5052,7 +5052,7 @@
           "bytes": 22207
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
-          "bytes": 12047
+          "bytes": 14185
         },
         "src/runtime/harness/implementation-artifacts/transport-entry.ts": {
           "bytes": 14988
@@ -5060,20 +5060,20 @@
       }
     },
     "transportIsolated": {
-      "file": "transportIsolated-878a7da57a5aea3e73a00eb978213ad0fa84173220f2171b16842cea07cdc322.cjs",
-      "sha256": "878a7da57a5aea3e73a00eb978213ad0fa84173220f2171b16842cea07cdc322",
+      "file": "transportIsolated-6c6e41317cd4902effcc44b9f52e7f3f3e4389867c64f2d17315db81ba822102.cjs",
+      "sha256": "6c6e41317cd4902effcc44b9f52e7f3f3e4389867c64f2d17315db81ba822102",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-isolated-support.ts": {
           "bytes": 149
+        },
+        "src/runtime/security.ts": {
+          "bytes": 6696
         },
         "src/shared/closed-canonical-json.ts": {
           "bytes": 7317
         },
         "src/shared/stable-json-digest.ts": {
           "bytes": 1267
-        },
-        "src/runtime/security.ts": {
-          "bytes": 6696
         },
         "src/config.ts": {
           "bytes": 29642
@@ -5091,7 +5091,7 @@
           "bytes": 22207
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
-          "bytes": 12047
+          "bytes": 14185
         },
         "src/runtime/harness/implementation-artifacts/transport-isolated-entry.ts": {
           "bytes": 7354
@@ -5099,5 +5099,5 @@
       }
     }
   },
-  "manifestDigest": "c4bdcd9d303deb07c15f0d1fd1bf5abd3658cc0223ff8c56dde229233fa48ceb"
+  "manifestDigest": "d9bdbf852e9f8732aed66fa37cdc548dcae51bd9dbcb4ff9c4f640baa8f86608"
 }
