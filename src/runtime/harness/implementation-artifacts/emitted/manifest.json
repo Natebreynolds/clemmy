@@ -2472,7 +2472,7 @@
           "bytes": 3283
         },
         "src/runtime/harness/execution-gate.ts": {
-          "bytes": 24747
+          "bytes": 27957
         },
         "src/runtime/harness/external-write-admission.ts": {
           "bytes": 20321
@@ -4962,7 +4962,7 @@
           "bytes": 3283
         },
         "src/runtime/harness/execution-gate.ts": {
-          "bytes": 24747
+          "bytes": 27957
         },
         "src/runtime/harness/external-write-admission.ts": {
           "bytes": 20321

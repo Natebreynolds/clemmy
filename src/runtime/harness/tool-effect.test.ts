@@ -315,13 +315,34 @@ test('unattested native MCP operations fail closed at the runtime effect boundar
       assert.equal(effect.dangerousWrite, true, name);
       assert.equal(effect.source, 'native_mcp', name);
     }
+    // Reads flow (open-clem-up 2026-08-29; census D1; live 2026-09-02): an
+    // unattested PROVIDER-SHAPED Composio slug whose verb is unambiguously a
+    // read (a read verb and NO send/dispatch/mutation verb) is a READ, not the
+    // conservative write the absent-manifest default used to force. This
+    // over-gated ordinary reads (a work_call carrying GOOGLESHEETS_BATCH_GET /
+    // SLACK_FETCH_CONVERSATION_HISTORY was refused as plan-bound). Native MCP
+    // names above are unchanged — a server slug is identity, never effect.
     assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
       tool_slug: 'OUTLOOK_LIST_MESSAGES', arguments: '{}',
-    }).effect, 'external_write');
+    }).effect, 'read');
     assert.equal(classifyRuntimeToolEffect('call_tool', {
       name: 'composio_execute_tool',
       args_json: JSON.stringify({ tool_slug: 'GOOGLESHEETS_BATCH_GET', arguments: '{}' }),
-    }).effect, 'external_write');
+    }).effect, 'read');
+    // The fail-closed floor still holds for every slug that is not an
+    // unambiguous read: a mutation verb (even alongside a read verb), a
+    // send, or a slug with no read verb at all stays external_write.
+    for (const slug of [
+      'OUTLOOK_SEND_EMAIL',
+      'GONG_GET_CALL_AND_UPDATE_CONTACT',
+      'GMAIL_MARK_AS_READ',
+      'GOOGLESHEETS_BATCH_UPDATE',
+      'ACME_DO_THING',
+    ]) {
+      assert.equal(classifyRuntimeToolEffect('composio_execute_tool', {
+        tool_slug: slug, arguments: '{}',
+      }).effect, 'external_write', slug);
+    }
   });
 });
 

@@ -132,6 +132,41 @@ const COMM_OBJECTS: ReadonlySet<string> = new Set([
 // no add-a-communication send verb.
 const DISPATCH_VERBS: ReadonlySet<string> = new Set(['CREATE', 'MAKE', 'RESPOND', 'POST']);
 
+/** Mutation verbs used ONLY to DISQUALIFY a read (fail-closed direction: adding
+ * a verb here makes more operations writes, never fewer). A read classification
+ * requires a read verb AND none of these anywhere in the operation, so a
+ * compound like GONG_GET_CALL_AND_UPDATE_CONTACT or GMAIL_MARK_AS_READ stays a
+ * write even though it also carries a read verb. */
+const READ_DISQUALIFYING_WRITE_VERBS: ReadonlySet<string> = new Set([
+  'UPDATE', 'DELETE', 'REMOVE', 'ADD', 'SET', 'MOVE', 'COPY', 'UPLOAD', 'MARK',
+  'ARCHIVE', 'TRASH', 'CLEAR', 'INSERT', 'PATCH', 'PUT', 'MERGE', 'RENAME',
+  'DUPLICATE', 'RESTORE', 'REFUND', 'CHARGE', 'CANCEL', 'APPROVE', 'REJECT',
+  'ASSIGN', 'COMPLETE', 'SUBSCRIBE', 'UNSUBSCRIBE', 'PURGE', 'REBOOT', 'ROTATE',
+  'TRANSACT', 'REACT', 'RUN', 'EXECUTE', 'TRIGGER', 'START', 'STOP', 'ENABLE',
+  'DISABLE', 'CONNECT', 'DISCONNECT', 'INVITE', 'SCHEDULE', 'BOOK', 'ORDER',
+  'PAY', 'TRANSFER', 'WRITE', 'EDIT', 'MODIFY', 'APPEND', 'REPLACE', 'CLOSE',
+  'OPEN', 'LOCK', 'UNLOCK', 'GRANT', 'REVOKE', 'INSTALL', 'UNINSTALL', 'DEPLOY',
+  'RESET', 'FLUSH', 'DROP', 'TRUNCATE', 'WIPE', 'KILL', 'TERMINATE', 'SUSPEND',
+  'RESUME', 'ACTIVATE', 'DEACTIVATE', 'REGISTER', 'UNREGISTER', 'IMPORT',
+  'UPSERT', 'SAVE', 'SUBMIT', 'APPLY', 'CONVERT', 'GENERATE', 'BUILD', 'CLONE',
+  'CLEAR', 'EMPTY', 'PROMOTE', 'DEMOTE', 'MUTE', 'UNMUTE', 'PIN', 'UNPIN',
+]);
+
+/** A provider-shaped Composio slug is an unambiguous READ iff it carries a read
+ * verb and NO send/dispatch/mutation verb. Used only as the absent-manifest
+ * default for a provider slug (never native MCP), so a real read a workflow or
+ * chat turn names before it is provisioned is not gated as a write. */
+function composioSlugIsUnambiguousRead(operationId: string): boolean {
+  if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(operationId)) return false;
+  const toolParts = operationId.split(/[_.]+/).filter(Boolean).slice(1);
+  if (!toolParts.some((token) => READ_VERBS.has(token))) return false;
+  return !toolParts.some((token) => (
+    IRREVERSIBLE_SEND_VERBS.has(token)
+    || DISPATCH_VERBS.has(token)
+    || READ_DISQUALIFYING_WRITE_VERBS.has(token)
+  ));
+}
+
 interface CanonicalExternalAction {
   /** Exact operation identity used only to reopen a sealed manifest. */
   operationId?: string;
@@ -327,8 +362,24 @@ function canonicalExternalActionWriteClassification(
   ) {
     return { mutating: false, classificationKnown: true };
   }
-  // A connected operation with no exact current effect contract stays a
-  // conservative mutation. GET/LIST/CREATE vocabulary is identity only.
+  // A read-verb provider operation with no exact contract is a READ, not a
+  // conservative mutation. The absent-manifest default-to-write is the
+  // documented seam that OVER-gates ordinary reads while under-gating sends
+  // (open-clem-up 2026-08-29; census D1; live 2026-09-02 a work_call carrying
+  // GOOGLESHEETS_BATCH_GET / SLACK_FETCH_CONVERSATION_HISTORY was classified
+  // external_write and refused as plan-bound though a read never needs a plan).
+  // The irreversible-send floor is UNCHANGED: isIrreversibleSendSlug uses the
+  // same leading-verb read test, and a SEND/PUBLISH/UPDATE/CLEAR/DELETE verb
+  // still falls through to the mutation default below. Gated to a
+  // provider-shaped Composio slug (single underscores, uppercase); a native
+  // MCP name is whatever the user called the server and is never effect proof.
+  // classificationKnown stays false: this is a safe default for the plan gate,
+  // not a proven-authority read.
+  if (operationId && composioSlugIsUnambiguousRead(operationId)) {
+    return { mutating: false, classificationKnown: false };
+  }
+  // A connected operation with no exact current effect contract and no read
+  // verb stays a conservative mutation.
   return { mutating: true, classificationKnown: false };
 }
 
