@@ -26,6 +26,7 @@ import assert from 'node:assert/strict';
 import type { AgentInputItem } from '@openai/agents';
 
 const { resetEventLog, createSession, writeToolOutput, getToolOutput, TOOL_OUTPUT_MAX_BYTES } = await import('./eventlog.js');
+const { inFlightCompactionThresholds } = await import('./compaction.js');
 const {
   clipOldToolResults,
   collapseOldCompletedToolPairs,
@@ -221,6 +222,31 @@ test('collapseOldCompletedToolPairs — skips old pairs that are not recallable 
   );
   assert.equal(remainingCallIds.has('call_0'), false);
   assert.equal(remainingCallIds.has('call_1'), true, 'unrecallable old pair should stay verbatim');
+});
+
+test('inFlightCompactionThresholds — absolute defaults (never scaled by the model window), env overrides win', () => {
+  // 2026-09-01: window-scaled thresholds (×5 on a 1M window) meant a 27-read
+  // step never compacted mid-turn and composed 58k-token prompts.
+  assert.deepEqual(inFlightCompactionThresholds(() => undefined), {
+    resultTriggerTokens: 32_000,
+    retainedResultBudgetTokens: 20_000,
+    minRetainPairs: 3,
+    maxRetainPairs: 8,
+  });
+  const env: Record<string, string> = {
+    CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS: '1000',
+    CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS: '600',
+    CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS: '1',
+    CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS: '2',
+  };
+  assert.deepEqual(inFlightCompactionThresholds((key) => env[key]), {
+    resultTriggerTokens: 1000,
+    retainedResultBudgetTokens: 600,
+    minRetainPairs: 1,
+    maxRetainPairs: 2,
+  });
+  // Garbage or non-positive overrides fall back to the defaults.
+  assert.equal(inFlightCompactionThresholds((key) => (key === 'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS' ? '-5' : 'x')).resultTriggerTokens, 32_000);
 });
 
 test('compactInFlightToolContext — deduplicates identical results below the pressure threshold without losing recall ids', () => {

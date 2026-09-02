@@ -97,6 +97,40 @@ const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
 const DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS = 20_000;
 const DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS = 3;
 const DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS = 8;
+
+export interface InFlightCompactionThresholds {
+  resultTriggerTokens: number;
+  retainedResultBudgetTokens: number;
+  minRetainPairs: number;
+  maxRetainPairs: number;
+}
+
+/**
+ * Mid-turn (in-flight) compaction thresholds. ABSOLUTE — never scaled by the
+ * routed model's context window. The reason to compact mid-turn is per-frame
+ * prefill latency and cache-miss cost, which grow with absolute prompt bytes,
+ * not with the share of a window in use. Scaling them by window (2026-08-05)
+ * meant Sonnet 5's 1M window needed 160k tokens of results before the first
+ * collapse and GLM's 512k needed 82k: the host lane never compacted the
+ * 27-read workflow steps that then composed 58k-token prompts and timed out
+ * on first byte (live 2026-09-01). Between-turn budgets still track the real
+ * window (compactionBudgetForModel); env overrides still win here.
+ */
+export function inFlightCompactionThresholds(
+  read: (key: string) => string | undefined = (key) => process.env[key],
+): InFlightCompactionThresholds {
+  const positive = (key: string, fallback: number): number => {
+    const raw = read(key);
+    const parsed = raw === undefined || raw === '' ? NaN : Number.parseInt(raw, 10);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+  };
+  return {
+    resultTriggerTokens: positive('CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS', DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS),
+    retainedResultBudgetTokens: positive('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS),
+    minRetainPairs: positive('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS),
+    maxRetainPairs: positive('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS),
+  };
+}
 const COMPACTION_SYSTEM_SUMMARY_PREFIXES = [
   '[summary of older completed tool activity]',
   '[summary of byte-identical completed tool activity]',

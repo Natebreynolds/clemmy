@@ -260,6 +260,39 @@ test('transcript caching: a large transcript gets a cache_control breakpoint on 
   assert.deepEqual(block.cache_control, { type: 'ephemeral' });
 });
 
+test('transcript caching: harness system packets are hoisted BEFORE the breakpoint pass, so the marker lands on the last real message', () => {
+  // Live 2026-09-01: the host lane appends role:'system' packets (context
+  // packet, memory primer, one-shot directive) after the transcript. Placing
+  // the breakpoint first put it on a packet that the hoist then removed from
+  // `messages` — no transcript ever cached; every frame re-billed 40–90k.
+  const big = 'lorem ipsum dolor sit amet '.repeat(1000);
+  const parsed = envelopeBody({
+    model: 'claude-sonnet-5',
+    system: 'Be helpful.',
+    messages: [
+      { role: 'user', content: big },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'c1', name: 'read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'rows' }] },
+      { role: 'system', content: 'context packet' },
+      { role: 'system', content: 'memory primer' },
+    ],
+    max_tokens: 100,
+  });
+  const msgs = parsed.messages as Array<Record<string, unknown>>;
+  assert.equal(msgs.length, 3, 'the packets left `messages`');
+  assert.ok(msgs.every((m) => m.role !== 'system'));
+  const last = msgs[msgs.length - 1]!;
+  const lastBlock = (last.content as Array<Record<string, unknown>>).at(-1)!;
+  assert.equal(lastBlock.type, 'tool_result');
+  assert.deepEqual(lastBlock.cache_control, { type: 'ephemeral' }, 'the transcript breakpoint is on the newest real message');
+  const sys = parsed.system as Array<Record<string, unknown>>;
+  const sysText = sys.map((b) => String(b.text)).join('\n');
+  assert.match(sysText, /context packet/);
+  assert.match(sysText, /memory primer/);
+  const markers = JSON.stringify(parsed).split('"cache_control"').length - 1;
+  assert.ok(markers >= 1 && markers <= 4, `Anthropic allows at most 4 markers, got ${markers}`);
+});
+
 test('transcript caching: a SMALL transcript is NOT breakpointed (below cacheMinTokens — a wasted marker)', () => {
   const parsed = envelopeBody({
     model: 'claude-opus-4-8',

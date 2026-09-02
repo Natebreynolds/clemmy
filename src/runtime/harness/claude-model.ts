@@ -121,6 +121,22 @@ export function applyClaudeEnvelope(
   if (typeof body === 'string') {
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
+      // Correctness (all models, independent of parity): Anthropic accepts a
+      // system prompt ONLY via the top-level `system` field — a role:'system'
+      // message inside `messages` is rejected by every Claude model EXCEPT Opus
+      // (verified: Opus 4.8 -> 200, Sonnet 4.6 -> 400 "role 'system' is not
+      // supported on this model"). The harness appends role:'system' directives
+      // to the turn input (valid for Codex/OpenAI), so hoist them into the system
+      // blocks here so the request is valid on EVERY Claude model, not just Opus.
+      //
+      // ORDER MATTERS FOR CACHING: this must run BEFORE the breakpoint pass.
+      // Hoisting after it left the transcript marker on the last role:'system'
+      // packet, which was then removed from `messages` — so every host-lane
+      // frame re-billed its whole transcript (live 2026-09-01: cachedInputTokens
+      // frozen at 12.9k on every frame while input climbed 38k→97k; 12% hit
+      // over 85 Sonnet requests; an 81k uncached frame took 88.8 s to first
+      // byte). Hoist first, then the breakpoint lands on the last REAL message.
+      hoistSystemMessagesIntoSystem(parsed);
       if (modelParityEnabled()) {
         // Parity path: identity-first system blocks + a cache_control breakpoint
         // on the stable prefix (G3), gated by the model's cacheMinTokens.
@@ -134,14 +150,6 @@ export function applyClaudeEnvelope(
         // API (which would 400 / pollute the prompt).
         parsed.system = withIdentityPrefix(restoreLegacySystem(parsed.system));
       }
-      // Correctness (all models, independent of parity): Anthropic accepts a
-      // system prompt ONLY via the top-level `system` field — a role:'system'
-      // message inside `messages` is rejected by every Claude model EXCEPT Opus
-      // (verified: Opus 4.8 -> 200, Sonnet 4.6 -> 400 "role 'system' is not
-      // supported on this model"). The harness appends role:'system' directives
-      // to the turn input (valid for Codex/OpenAI), so hoist them into the system
-      // blocks here so the request is valid on EVERY Claude model, not just Opus.
-      hoistSystemMessagesIntoSystem(parsed);
       // Sibling incompatibility, same rule (live 2026-08-25, workflow
       // continuation on claude-sonnet-5): Anthropic rejects an assistant-
       // terminal conversation on models without prefill support ("This model

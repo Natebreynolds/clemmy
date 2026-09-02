@@ -67,6 +67,7 @@ import {
 import { recoverSettledPlanTaskActivation } from './plan-task-post-settlement.js';
 import {
   compactInFlightToolContext,
+  inFlightCompactionThresholds,
   compactSessionIfNeeded,
   compactionBudgetForModel,
   checkpointGoalStage,
@@ -10380,18 +10381,17 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // model-facing old pairs with a recall ledger and retain a recent working
       // set. Every full output was durably parked by the tool-end hook first.
       if (inFlightCompactionEnabled()) {
-        // Defaults scale with the routed model's window (32K/20K were tuned for
-        // a 200K window; a 1M-window model was in-flight-compacting at 3% of its
-        // real capacity). Never scaled DOWN below the tuned defaults — small
-        // windows are protected by the between-turn budget above. Env overrides
-        // still win untouched.
-        const inFlightScale = Math.max(1, turnInputBudgetTokens / 200_000);
-        const compacted = compactInFlightToolContext(modelData.input, options.sessionId, {
-          resultTriggerTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS', Math.round(32_000 * inFlightScale)),
-          retainedResultBudgetTokens: positiveIntEnv('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', Math.round(20_000 * inFlightScale)),
-          minRetainPairs: positiveIntEnv('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', 3),
-          maxRetainPairs: positiveIntEnv('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', 8),
-        });
+        // Absolute thresholds, never scaled by the routed model's window: the
+        // reason to compact mid-turn is per-frame prefill latency and cache-miss
+        // cost, which grow with absolute prompt bytes. Scaling by window (Sonnet
+        // 5's 1M → a 160k trigger, GLM's 512k → 82k) meant the host lane never
+        // compacted the 27-read steps that then timed out on first byte (live
+        // 2026-09-01). Env overrides still win (inFlightCompactionThresholds).
+        const compacted = compactInFlightToolContext(
+          modelData.input,
+          options.sessionId,
+          inFlightCompactionThresholds((key) => getRuntimeEnv(key, '') || undefined),
+        );
         if (compacted.applied) {
           modelData = {
             input: compacted.nextItems,
