@@ -1892,11 +1892,10 @@ test('queueWorkflowRun: blocks production runs when required workflow capabiliti
   });
 
   const result = queueWorkflowRun('missing-script-flow', {});
-  // 2026-09-01: a legacy script step is no longer a dead end. The queue holds
-  // the run and records a self-improvement request; readiness evidence is
-  // still carried so the caller can see exactly why.
-  assert.equal(result.status, 'held');
-  assert.match(result.message, /rewriting that step/);
+  // A MISSING owner script is a plain readiness block that names the file;
+  // a present one runs (runners reinstated 2026-09-01).
+  assert.equal(result.status, 'blocked_readiness');
+  assert.doesNotMatch(result.message, /rewriting that step/);
   assert.equal(runFiles().length, 0);
   assert.equal(result.readiness?.ok, false);
   assert.equal(result.readiness?.blockers[0]?.kind, 'script');
@@ -2094,9 +2093,9 @@ test('queueWorkflowRun: step TRY readiness only checks the selected step', () =>
   assert.deepEqual(safeRecord.readiness?.blockers, []);
   assert.equal(safeRecord.readiness?.toolReadiness?.missingCount, 1, 'full plan evidence is kept even when TRY readiness is scoped');
   const broken = queueWorkflowRun('try-readiness-flow', {}, { targetStepId: 'broken', dedupe: false });
-  // The legacy script step is held for self-improvement instead of refused.
-  assert.equal(broken.status, 'held');
-  assert.match(broken.message, /rewriting that step/);
+  // The missing script blocks the selected step by name.
+  assert.equal(broken.status, 'blocked_readiness');
+  assert.doesNotMatch(broken.message, /rewriting that step/);
   assert.equal(broken.readiness?.ok, false);
   assert.equal(runFiles().length, 1);
 });

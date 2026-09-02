@@ -348,10 +348,6 @@ import {
   exactScheduledSendDefinitionEligibility,
   structuredCallSideEffectClass,
 } from './workflow-validator.js';
-import {
-  workflowRawSubprocessDeclarations,
-  workflowRawSubprocessRetirementReason,
-} from './workflow-raw-subprocess-policy.js';
 import { executeWorkflowTransform, validateWorkflowTransform } from './workflow-transform.js';
 import {
   recallWorkflowPatterns,
@@ -7247,22 +7243,6 @@ export async function executeStep(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
 ): Promise<unknown> {
-  // This must precede approvals, events, the primary loop attempt, and every
-  // body gateway. A loop probe is checked here too so we never perform the
-  // primary call and only then discover that its exit condition lacks
-  // represented execution authority.
-  // Raw subprocesses are a second effect kernel: their declared read/write
-  // label cannot prove what the process actually did. Keep them outside the
-  // exact workflow path until the work is represented by reviewed transforms
-  // and exact calls.
-  const retiredSubprocess = workflowRawSubprocessDeclarations(step)[0];
-  if (retiredSubprocess) {
-    throw new WorkflowHarnessBlockedSignal({
-      stepId: step.id,
-      sessionId: `workflow:${ctx.runId}:${step.id}`,
-      reason: workflowRawSubprocessRetirementReason(retiredSubprocess),
-    });
-  }
   // Reviewed pure computation is a closed executor of its own. Re-check the
   // complete authority shape at the runtime boundary so a hand-edited/corrupt
   // durable step cannot combine transform semantics with a model, tool,
@@ -7358,10 +7338,20 @@ export async function executeStep(
     await awaitDeclarativeStepApproval(ctx, step);
   }
 
-  // Legacy runner implementation remains temporarily for source inspection
-  // and migration tests. The fail-closed policy above makes it unreachable in
-  // production; exact calls and reviewed in-process primitives are the only
-  // supported execution lanes.
+  // 1. Deterministic runner — an OWNER-AUTHORED script in this workflow's own
+  //    scripts/ directory. Reinstated 2026-09-01 (owner: "legacy ones still
+  //    need to be able to run"): the 08-30 release retired this lane again
+  //    behind a rewrite the model was to perform, and that rewrite failed 17
+  //    times in one day on a 1,109-line runner while four live workflows sat
+  //    unrunnable. The 08-26 note stands: do not re-block this class without
+  //    a built replacement. What makes it safe is effects, not the method —
+  //    the path is fixed by the author and confined to scripts/
+  //    (resolveDeterministicRunner), the bytes are pinned to the admitted run
+  //    (assertAdmittedWorkflowCodeRevision; certifyWorkflowCode digests every
+  //    artifact), the interpreter is an allowlist (never a shell), the child
+  //    env is scrubbed of daemon secrets, wall clock and output are capped,
+  //    stdout/stderr are secret-redacted, and the step's declared side_effect
+  //    carries the same consent floor as any other step.
   if (step.deterministic?.runner) {
     assertAdmittedWorkflowCodeRevision(ctx);
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {

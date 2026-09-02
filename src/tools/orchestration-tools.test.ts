@@ -1529,7 +1529,7 @@ test('workflow_update accepts an inputs SCHEMA JSON string and updates def.input
   assert.deepEqual(readWorkflow('up-wf')!.data.inputs, { domain: { type: 'string' } });
 });
 
-test('workflow_update refuses a raw loopUntil probe runner without mutating the saved workflow', async () => {
+test('workflow_update accepts an owner-authored loopUntil probe runner', async () => {
   await workflowCreate()({
     name: 'loop-probe-update-wf',
     description: 'Poll an export until it is done.',
@@ -1546,12 +1546,11 @@ test('workflow_update refuses a raw loopUntil probe runner without mutating the 
     steps: [{ id: 'poll', prompt: 'Start or check the export job.', sideEffect: 'read', loopUntil }],
   });
 
-  assert.match(resultText(result), /NOT updated/i);
-  assert.match(resultText(result), /workflow_raw_subprocess_authority_unrepresented/);
+  assert.doesNotMatch(resultText(result), /NOT updated/i);
   assert.equal(
-    readWorkflow('loop-probe-update-wf')!.data.steps[0].loopUntil,
-    undefined,
-    'the invalid subprocess declaration never reaches durable workflow state',
+    readWorkflow('loop-probe-update-wf')!.data.steps[0].loopUntil?.probe?.runner,
+    'check-export-status.mjs',
+    'the owner-authored probe declaration is saved (reinstated 2026-09-01)',
   );
 });
 

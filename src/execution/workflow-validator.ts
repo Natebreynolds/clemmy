@@ -48,10 +48,6 @@ import {
   type WorkflowNodeArgumentSourceV1,
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
-import {
-  workflowRawSubprocessDeclarations,
-  workflowRawSubprocessRetirementReason,
-} from './workflow-raw-subprocess-policy.js';
 import { validateWorkflowTransform } from './workflow-transform.js';
 
 /**
@@ -1034,7 +1030,7 @@ export function exactScheduledSendCallEligibility(
 function checkDeterministicRunner(step: WorkflowStepShape): string | null {
   if (!step.deterministic) return null;
   const runner = typeof step.deterministic.runner === 'string' ? step.deterministic.runner.trim() : '';
-  if (!runner) return `Step "${step.id}" has deterministic config but no runner. Script runners are retired: express external work as exact \`call\` steps and pure computation as a \`transform\` step, then remove \`deterministic\`.`;
+  if (!runner) return `Step "${step.id}" has deterministic config but no runner. Name a script under this workflow's scripts/ directory, or express the work as exact \`call\` steps and a \`transform\`.`;
   if (runner.includes('..') || runner.startsWith('/') || /\s/.test(runner)) {
     return `Step "${step.id}" deterministic runner must be a relative scripts/ path with no inline arguments.`;
   }
@@ -1155,9 +1151,6 @@ export function validateWorkflowDefinition(
     if (deterministicIssue) {
       if (step.deterministic?.runner?.trim()) errors.push(deterministicIssue);
       else warnings.push(deterministicIssue);
-    }
-    for (const declaration of workflowRawSubprocessDeclarations(step)) {
-      errors.push(workflowRawSubprocessRetirementReason(declaration));
     }
     // A structured call step (or deterministic runner) needs no prompt — its
     // action is the tool call / script, not a model instruction.

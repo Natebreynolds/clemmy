@@ -186,7 +186,7 @@ test('authoritative readiness blockers stop certification before lifecycle actio
   assert.ok(cert.nextActions.includes('fix_blockers'));
 });
 
-test('deterministic syntax proof never substitutes for reviewed execution authority', () => {
+test('a present, syntax-valid owner runner certifies ready to run; a broken one is blocked', () => {
   const scriptsDir = path.join(WORKFLOWS_DIR, 'cert-wf', 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(path.join(scriptsDir, 'transform.mjs'), 'console.log(JSON.stringify({ ok: true }));\n', 'utf-8');
@@ -198,10 +198,9 @@ test('deterministic syntax proof never substitutes for reviewed execution author
   assert.equal(valid.code.ok, true);
   assert.equal(valid.code.readyCount, 1);
   assert.match(valid.code.bundleHash ?? '', /^[a-f0-9]{64}$/);
-  assert.equal(valid.state, 'blocked');
-  assert.equal(valid.canRun, false);
-  assert.ok(valid.blockingReasons.some((reason) =>
-    /workflow_raw_subprocess_authority_unrepresented|deterministic\.runner/i.test(reason)));
+  assert.equal(valid.state, 'ready_to_run');
+  assert.equal(valid.canRun, true);
+  assert.deepEqual(valid.blockingReasons, []);
 
   writeFileSync(path.join(scriptsDir, 'transform.mjs'), 'const = ;\n', 'utf-8');
   const invalid = certifyWorkflow(def({

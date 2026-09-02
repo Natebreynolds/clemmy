@@ -575,8 +575,8 @@ test('a held catch-up exposes readiness blockers and remains skippable when Resu
     assert.equal(readiness?.blockers?.[0]?.name, 'missing-merge.py');
     assert.match(
       readiness?.blockers?.[0]?.reason ?? '',
-      /workflow_raw_subprocess_authority_unrepresented/,
-      'raw subprocess declarations remain fail-closed even when their named file is absent',
+      /missing from scripts\//,
+      'a missing owner script blocks by presence (runners themselves run, reinstated 2026-09-01)',
     );
     assert.ok(card!.actions.includes('skip'), 'a readiness blocker never removes Skip');
 
@@ -2554,7 +2554,7 @@ test('POST /api/console/workflows/:name/run rejects missing inputs and dedupes f
   }
 });
 
-test('POST /api/console/workflows/:name/run holds a legacy script workflow for Clem\'s rewrite instead of claiming it started', async () => {
+test('POST /api/console/workflows/:name/run blocks a workflow whose runner script is missing, naming the file', async () => {
   const workflowName = 'Dashboard Run Readiness Block Flow';
   writeWorkflow('dashboard-run-readiness-block-flow', {
     name: workflowName,
@@ -2571,14 +2571,12 @@ test('POST /api/console/workflows/:name/run holds a legacy script workflow for C
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ inputs: {} }),
     });
-    assert.equal(res.status, 202);
-    const body = await res.json() as { queued?: boolean; held?: boolean; status?: string; message?: string; id?: string };
-    assert.equal(body.queued, false, 'nothing was queued, so the door never says "Started"');
-    assert.equal(body.held, true);
-    assert.equal(body.status, 'held');
-    assert.equal(body.id, undefined);
-    assert.match(body.message ?? '', /rewriting that step/);
-    assert.equal(workflowRunRecords(workflowName).length, 0, 'the run is re-queued by the rewrite, not now');
+    assert.equal(res.status, 409);
+    const body = await res.json() as { status?: string; readiness?: { blockers?: Array<{ kind: string; name: string }> } };
+    assert.equal(body.status, 'blocked_readiness');
+    assert.equal(body.readiness?.blockers?.[0]?.kind, 'script');
+    assert.equal(body.readiness?.blockers?.[0]?.name, 'missing.py');
+    assert.equal(workflowRunRecords(workflowName).length, 0, 'a readiness-blocked dashboard run is not queued');
   } finally {
     await h.close();
   }

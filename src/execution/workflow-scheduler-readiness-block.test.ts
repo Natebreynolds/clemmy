@@ -98,7 +98,7 @@ test('pure classifier separates deterministic readiness from transient enqueue f
   assert.equal(capability?.code, 'workflow_readiness_blocked');
 });
 
-test('Friday raw-runner schedule creates one migration-blocked occurrence and never false-catches-up', async () => {
+test('a schedule whose runner script is missing creates one readiness-blocked occurrence and never false-catches-up', async () => {
   writeWorkflow(WORKFLOW_SLUG, {
     name: WORKFLOW_SLUG,
     description: 'Read-only daily refresh of the Friday dashboard.',
@@ -125,13 +125,7 @@ test('Friday raw-runner schedule creates one migration-blocked occurrence and ne
       output: { type: 'object', required_keys: ['ok'] },
     }],
   });
-  const scriptsDir = path.join(WORKFLOWS_DIR, WORKFLOW_SLUG, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'refresh.mjs'),
-    'process.stdout.write(JSON.stringify({ok:true}));\n',
-    'utf-8',
-  );
+  // refresh.mjs is deliberately absent: a missing owner script is a readiness block.
 
   const drainKicks: string[][] = [];
   registerWorkflowRunDrainKick((ids) => drainKicks.push([...ids]));
@@ -150,7 +144,7 @@ test('Friday raw-runner schedule creates one migration-blocked occurrence and ne
   assert.equal(record.workflow, WORKFLOW_SLUG);
   assert.equal(record.workflowSlug, WORKFLOW_SLUG);
   assert.equal(record.startedAt, undefined);
-  assert.equal(record.catchupDisposition, undefined, 'migration is never a Resume/Skip catch-up');
+  assert.equal(record.catchupDisposition, undefined, 'a readiness block is never a Resume/Skip catch-up');
   assert.equal(record.catchupHeldAt, undefined);
   assert.deepEqual(record.scheduledReadinessBlock, {
     protocol: 'workflow_schedule_readiness_block_v1',
@@ -163,10 +157,8 @@ test('Friday raw-runner schedule creates one migration-blocked occurrence and ne
   };
   assert.equal(readiness.ok, false);
   assert.equal(readiness.blockers?.[0]?.name, 'refresh.mjs');
-  assert.match(
-    readiness.blockers?.[0]?.reason ?? '',
-    /workflow_raw_subprocess_authority_unrepresented/,
-  );
+  assert.match(readiness.blockers?.[0]?.reason ?? '', /missing from scripts\//);
+  assert.doesNotMatch(readiness.blockers?.[0]?.reason ?? '', /raw_subprocess/);
   const receipt = `workflow-schedule:v1:${WORKFLOW_SLUG}:${DUE.getTime()}`;
   assert.equal(readWorkflowTriggerReceiptAcceptance(receipt), record.id);
 
@@ -175,11 +167,10 @@ test('Friday raw-runner schedule creates one migration-blocked occurrence and ne
   assert.equal(notices.length, 1, 'one exact occurrence owns one notice');
   const notice = notices[0];
   assert.equal(notice.id, `system-workflow-readiness-blocked-${record.id}`);
-  assert.equal(notice.metadata?.errorCategory, 'workflow_schedule_migration_required');
+  assert.equal(notice.metadata?.errorCategory, 'workflow_schedule_readiness_blocked');
   assert.equal(notice.metadata?.provenNoDispatch, true);
   assert.equal(notice.metadata?.needsAttention, true);
-  assert.match(notice.body, /workflow_get/);
-  assert.match(notice.body, /workflow_update/);
+  assert.match(notice.body, /fix the listed definition or capability/);
   assert.match(notice.body, /not resumable/i);
   assert.doesNotMatch(notice.body, /Clementine was unavailable|Resume or Skip/i);
 
@@ -202,141 +193,3 @@ test('Friday raw-runner schedule creates one migration-blocked occurrence and ne
   );
 });
 
-test('boot reconciliation converts the exact pre-fix catch-up once and retires stale carriers only after replacement', async () => {
-  writeWorkflow(WORKFLOW_SLUG, {
-    name: WORKFLOW_SLUG,
-    description: 'Legacy Friday dashboard refresh.',
-    enabled: true,
-    trigger: {
-      schedule: '0 7 * * *',
-      timezone: 'America/Los_Angeles',
-      manual: true,
-    },
-    steps: [{
-      id: 'pull',
-      prompt: '',
-      deterministic: { runner: 'refresh.mjs' },
-      sideEffect: 'read',
-      output: { type: 'object', required_keys: ['ok'] },
-    }],
-  });
-  const scriptsDir = path.join(WORKFLOWS_DIR, WORKFLOW_SLUG, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  writeFileSync(
-    path.join(scriptsDir, 'refresh.mjs'),
-    'process.stdout.write(JSON.stringify({ok:true}));\n',
-    'utf-8',
-  );
-
-  // Recreate the exact short-lived scheduler shape: a receipt-bound missed
-  // occurrence was held even though readiness was deterministically red.
-  const receipt = `workflow-schedule:v1:${WORKFLOW_SLUG}:${DUE.getTime()}`;
-  const held = queueWorkflowRun(WORKFLOW_SLUG, {}, {
-    source: 'schedule',
-    dedupe: false,
-    catchupFire: true,
-    catchupOccurrenceAtMs: DUE.getTime(),
-    holdForCatchupDecision: true,
-    workflowSlug: WORKFLOW_SLUG,
-    catchupFirstDueAtMs: DUE.getTime(),
-    catchupMissedCount: 1,
-    triggerReceiptId: receipt,
-  });
-  assert.equal(held.status, 'held');
-  assert.ok(held.id);
-  assert.equal(held.readiness?.ok, false);
-  const heldRun = runRecords()[0];
-  assert.equal(heldRun.status, 'awaiting_catchup_decision');
-  assert.equal(heldRun.startedAt, undefined);
-
-  const enqueueId = `system-workflow-enqueue-failed-${WORKFLOW_SLUG}-2026-08-31`;
-  const catchupId = `system-workflow-catchup-held-${held.id}`;
-  addNotification({
-    id: enqueueId,
-    kind: 'workflow',
-    title: `Scheduled run of "${WORKFLOW_SLUG}" could not start`,
-    body: `The schedule failed: workflow_raw_subprocess_authority_unrepresented: refresh.mjs`,
-    createdAt: '2026-08-31T14:00:01.000Z',
-    read: false,
-    metadata: { errorCategory: 'workflow_enqueue_failed', workflow: WORKFLOW_SLUG },
-  });
-  addNotification({
-    id: catchupId,
-    kind: 'system',
-    title: `Missed workflow waiting: "${WORKFLOW_SLUG}"`,
-    body: 'No workflow steps have run. Resume or Skip this missed run.',
-    createdAt: '2026-08-31T14:01:00.000Z',
-    read: false,
-    metadata: {
-      errorCategory: 'workflow_schedule_catchup_held',
-      workflow: WORKFLOW_SLUG,
-      workflowRunId: held.id,
-      runId: held.id,
-      catchupHeld: true,
-      scheduledMinuteKey: '2026-08-31T07:00',
-      needsAttention: true,
-    },
-  });
-
-  // Current catalog drift is expected after the workflow is repaired. The old
-  // occurrence is authenticated by its immutable admitted snapshot, not by
-  // borrowing authority from the replacement definition.
-  writeWorkflow(WORKFLOW_SLUG, {
-    name: WORKFLOW_SLUG,
-    description: 'Migrated Friday dashboard refresh.',
-    enabled: true,
-    trigger: {
-      schedule: '0 7 * * *',
-      timezone: 'America/Los_Angeles',
-      manual: true,
-    },
-    steps: [{ id: 'read', prompt: 'Read the already-migrated dashboard state.', sideEffect: 'read' }],
-  });
-
-  const drainKicks: string[][] = [];
-  registerWorkflowRunDrainKick((ids) => drainKicks.push([...ids]));
-  const first = reconcileLegacyScheduledReadinessHolds();
-  assert.equal(first.inspected, 1);
-  assert.equal(first.migrated, 1);
-  assert.equal(first.failed, 0);
-  assert.deepEqual(first.migratedRunIds, [held.id]);
-  assert.deepEqual(drainKicks, [], 'state reconciliation never wakes workflow execution');
-
-  const migrated = runRecords()[0];
-  assert.equal(migrated.status, 'blocked_readiness');
-  assert.equal(migrated.catchupDisposition, undefined);
-  assert.equal(migrated.catchupHeldAt, undefined);
-  assert.equal(migrated.startedAt, undefined);
-  assert.deepEqual(migrated.scheduledReadinessBlock, {
-    protocol: 'workflow_schedule_readiness_block_v1',
-    blockedAt: heldRun.createdAt,
-    provenNoDispatch: true,
-  });
-  assert.equal(readWorkflowTriggerReceiptAcceptance(receipt), held.id);
-
-  const byId = new Map(loadNotifications().map((notification) => [notification.id, notification]));
-  const replacementId = `system-workflow-readiness-blocked-${held.id}`;
-  assert.equal(byId.get(replacementId)?.read, false);
-  assert.equal(byId.get(replacementId)?.metadata?.errorCategory, 'workflow_schedule_migration_required');
-  assert.equal(byId.get(catchupId)?.read, true);
-  assert.equal(byId.get(enqueueId)?.read, true);
-
-  const replay = reconcileLegacyScheduledReadinessHolds();
-  assert.equal(replay.migrated, 0);
-  assert.equal(replay.recovered, 1);
-  assert.equal(replay.failed, 0);
-  assert.equal(
-    loadNotifications().filter((notification) => notification.id === replacementId).length,
-    1,
-    'boot replay keeps one run-stable replacement notice',
-  );
-
-  // Even if the exact original minute is evaluated again, the receipt opens
-  // only the same non-executable record; it never becomes a catch-up or run.
-  const scheduledReplay = await processWorkflowSchedules(DUE);
-  assert.deepEqual(scheduledReplay.blocked, [WORKFLOW_SLUG]);
-  assert.deepEqual(scheduledReplay.fired, []);
-  assert.deepEqual(scheduledReplay.held, []);
-  assert.deepEqual(drainKicks, []);
-  assert.equal(runRecords().length, 1);
-});

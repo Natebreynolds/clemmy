@@ -3983,22 +3983,26 @@ test('warning-only stderr is retained as a diagnostic but never promoted to root
   assert.doesNotMatch(failure.message, /Reported reason: .*Warning/i);
 });
 
-test('a persisted raw runner is a typed zero-process refusal', async () => {
-  const slug = 'raw-runner-zero-process-refusal';
-  const runId = 'raw-runner-zero-process-refusal-run';
-  const marker = path.join(tmp, 'raw-runner-zero-process-spawned');
+test('a persisted owner-authored runner executes: the body runs and the step is recorded', async () => {
+  // Reinstated 2026-09-01 (owner: "legacy ones still need to be able to run").
+  // The 08-30 retirement refused every runner before spawn behind a model
+  // rewrite that failed 17 times in a day; four live workflows sat unrunnable.
+  const slug = 'owner-runner-executes';
+  const runId = 'owner-runner-executes-run';
+  const marker = path.join(tmp, 'owner-runner-spawned');
   const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
-    path.join(scriptsDir, 'fail.mjs'),
-    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned');\n`,
+    path.join(scriptsDir, 'pull.mjs'),
+    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); process.stdout.write(JSON.stringify({ summary: 'ok', leaked: process.env.CLEMENTINE_TEST_CANARY ?? null }) + '\\n');\n`,
     'utf-8',
   );
   const step = {
     id: 'pull',
     prompt: '',
     sideEffect: 'read',
-    deterministic: { runner: 'fail.mjs' },
+    deterministic: { runner: 'pull.mjs' },
+    output: { type: 'object', required_keys: ['summary'], non_empty: ['summary'] },
   };
   const ctx = {
     workflow: { name: slug, description: '', enabled: true, trigger: { manual: true }, steps: [step] },
@@ -4012,19 +4016,18 @@ test('a persisted raw runner is a typed zero-process refusal', async () => {
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
 
-  await assert.rejects(
-    () => executeStep(step as never, ctx),
-    (error: unknown) => {
-      assert.ok(error instanceof WorkflowHarnessBlockedSignal);
-      assert.match(
-        error.reason,
-        /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i,
-      );
-      return true;
-    },
-  );
-  assert.equal(existsSync(marker), false, 'the legacy subprocess body never starts');
-  assert.equal(readWorkflowEvents(slug, runId).some((event) => event.kind === 'step_started'), false);
+  process.env.CLEMENTINE_TEST_CANARY = 'daemon-environment-must-not-leak';
+  let output: unknown;
+  try {
+    output = await executeStep(step as never, ctx);
+  } finally {
+    delete process.env.CLEMENTINE_TEST_CANARY;
+  }
+  assert.equal(existsSync(marker), true, 'the owner-authored body ran');
+  assert.deepEqual(output, { summary: 'ok', leaked: null }, 'the child env is scrubbed of the daemon environment');
+  const kinds = readWorkflowEvents(slug, runId).map((event) => event.kind);
+  assert.ok(kinds.includes('step_started'));
+  assert.ok(kinds.includes('step_completed'));
 });
 
 test('deterministic workflow step now runs a .ts runner via the shared tsx interpreter', async () => {
@@ -5024,7 +5027,7 @@ test('failed-item retry seeding inherits upstream + completed items but not stal
   assert.equal(seededEvent?.meta?.inheritedItems, 2);
 });
 
-test('a raw external loop probe refuses before the primary model or provisional completion', async () => {
+test('a failed external loop probe never publishes provisional step completion', async () => {
   const prevWorkflowHarness = process.env.WORKFLOW_USE_HARNESS;
   const prevBridgeHarness = process.env.CLEMMY_HARNESS_WORKFLOW;
   const prevLegacyFallback = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
@@ -5033,12 +5036,11 @@ test('a raw external loop probe refuses before the primary model or provisional 
   process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = 'on';
   const workflowSlug = 'deferred-probe-completion';
   const runId = 'probe-failed-before-commit';
-  const marker = path.join(tmp, 'deferred-probe-process-started');
   const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
     path.join(scriptsDir, 'probe.mjs'),
-    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); console.log(JSON.stringify({ pending: true }));\n`,
+    'console.log(JSON.stringify({ pending: true }));\n',
     'utf-8',
   );
   const step = {
@@ -5052,7 +5054,6 @@ test('a raw external loop probe refuses before the primary model or provisional 
       until: { type: 'object', required_keys: ['done'] },
     },
   };
-  let primaryCalls = 0;
   const ctx = {
     workflow: {
       name: 'Deferred Probe Completion',
@@ -5065,7 +5066,7 @@ test('a raw external loop probe refuses before the primary model or provisional 
     runId,
     inputs: {},
     stepOutputs: {},
-    assistant: { respond: async () => { primaryCalls += 1; return { text: 'candidate output before probe' }; } },
+    assistant: { respond: async () => ({ text: 'candidate output before probe' }) },
     completedItems: new Map(),
     forEachFailures: [],
     qualityAdvisories: [],
@@ -5073,22 +5074,13 @@ test('a raw external loop probe refuses before the primary model or provisional 
   try {
     await assert.rejects(
       () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
-      (error: unknown) => {
-        assert.ok(error instanceof WorkflowHarnessBlockedSignal);
-        assert.match(
-          error.reason,
-          /workflow_raw_subprocess_authority_unrepresented.*loopUntil\.probe\.runner/i,
-        );
-        return true;
-      },
+      /loop probe did not satisfy/,
     );
     const events = readWorkflowEvents(workflowSlug, runId);
-    assert.equal(primaryCalls, 0, 'the primary model does not run before an unrepresentable exit gate');
-    assert.equal(existsSync(marker), false, 'the probe process never starts');
     assert.equal(
       events.some((event) => event.kind === 'step_completed' && event.stepId === step.id),
       false,
-      'an unrepresentable external exit condition owns no completion authority',
+      'an unsatisfied external exit condition owns no completion authority',
     );
     assert.equal(computeResumeState(workflowSlug, runId).completedSteps.has(step.id), false);
   } finally {
@@ -5098,15 +5090,17 @@ test('a raw external loop probe refuses before the primary model or provisional 
   }
 });
 
-test('a raw loop probe refuses before its primary exact call', async () => {
+// RESTORED again (2026-09-01): the 08-30 release re-pinned the retirement
+// here. Owner-authored probes run after the primary call; an unsatisfied
+// probe defers completion.
+test('a read-only structured call also defers completion until its external loop probe passes', async () => {
   const workflowSlug = 'deferred-call-probe-completion';
   const runId = 'call-probe-failed-before-commit';
-  const marker = path.join(tmp, 'deferred-call-probe-process-started');
   const scriptsDir = path.join(WORKFLOWS_DIR, workflowSlug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   writeFileSync(
     path.join(scriptsDir, 'probe.mjs'),
-    `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'spawned'); console.log(JSON.stringify({ pending: true }));\n`,
+    'console.log(JSON.stringify({ pending: true }));\n',
     'utf-8',
   );
   const step = {
@@ -5137,25 +5131,12 @@ test('a raw loop probe refuses before its primary exact call', async () => {
     forEachFailures: [],
     qualityAdvisories: [],
   } as unknown as Parameters<typeof executeStep>[1];
-  let primaryCalls = 0;
-  _setWorkflowCallNodeForTests(async () => {
-    primaryCalls += 1;
-    return { exportId: 'exp-1', status: 'pending' };
-  });
+  _setWorkflowCallNodeForTests(async () => ({ exportId: 'exp-1', status: 'pending' }));
   try {
     await assert.rejects(
       () => workflowRunnerInternalsForTest.runStepVerifiedAttempt(step as never, ctx),
-      (error: unknown) => {
-        assert.ok(error instanceof WorkflowHarnessBlockedSignal);
-        assert.match(
-          error.reason,
-          /workflow_raw_subprocess_authority_unrepresented.*loopUntil\.probe\.runner/i,
-        );
-        return true;
-      },
+      /loop probe did not satisfy/,
     );
-    assert.equal(primaryCalls, 0, 'the exact provider call does not cross before its exit gate is representable');
-    assert.equal(existsSync(marker), false, 'the probe process never starts');
     assert.equal(
       readWorkflowEvents(workflowSlug, runId)
         .some((event) => event.kind === 'step_completed' && event.stepId === step.id),

@@ -148,15 +148,17 @@ export function legacyRunnerDeclarations(definition: WorkflowDefinition): Workfl
 export function requestWorkflowImprovement(input: {
   slug: string;
   definition: WorkflowDefinition;
-  readiness: Pick<WorkflowRunReadinessCheck, 'blockers'>;
+  /** Optional: readiness at request time, kept on the record as evidence.
+   * Since 2026-09-01 an owner-authored runner RUNS; migration is asked for
+   * explicitly (chat, dashboard), never forced by a readiness refusal. */
+  readiness?: Pick<WorkflowRunReadinessCheck, 'blockers'>;
   source?: string;
   now?: () => number;
   stateFile?: string;
 }): { status: 'requested' | 'already_pending' | 'exhausted'; request: WorkflowImprovementRequest } | null {
-  const blockers = improvableReadinessBlockers(input.readiness);
-  if (blockers.length === 0) return null;
   const runners = legacyRunnerDeclarations(input.definition);
   if (runners.length === 0) return null;
+  const blockers = input.readiness ? improvableReadinessBlockers(input.readiness) : [];
   const now = input.now ?? Date.now;
   const state = readState(input.stateFile);
   const existing = state[input.slug];
@@ -271,8 +273,8 @@ function updateRequest(
 /** Human-facing one-liner the queue returns instead of a readiness refusal. */
 export function workflowImprovementHoldMessage(slug: string, runners: WorkflowImprovementRequest['runners']): string {
   const steps = [...new Set(runners.map((runner) => runner.stepId))].join(', ');
-  return `Workflow "${slug}" uses a legacy script step (${steps}) that Clementine no longer runs directly. `
-    + 'Clem is rewriting that step into exact steps now; the run starts automatically when the rewrite passes its checks, and you will be notified either way.';
+  return `Workflow "${slug}" uses a legacy script step (${steps}). `
+    + 'Clem is drafting exact steps to replace it; the script keeps running as-is until the draft passes its checks, and you will be notified either way.';
 }
 
 /** What the queue says once the attempt budget for this exact definition is

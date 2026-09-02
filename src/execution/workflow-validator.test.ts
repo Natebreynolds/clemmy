@@ -668,25 +668,15 @@ test('deterministic config without runner → warning', () => {
   );
 });
 
-test('raw deterministic and loop-probe subprocesses refuse until represented by shared exact authority', () => {
+test('owner-authored deterministic runners and loop probes validate (reinstated 2026-09-01)', () => {
   const deterministic = validateWorkflowDefinition({
     name: 'owner-deterministic-shape',
     description: 'Run the local helper.',
     enabled: true,
     trigger: { manual: true },
-    steps: [{
-      id: 'run_script',
-      prompt: 'Run the local helper.',
-      sideEffect: 'read',
-      deterministic: { runner: 'run.mjs' },
-    }],
+    steps: [{ id: 'run_script', prompt: '', sideEffect: 'read', deterministic: { runner: 'scripts/run.mjs' } }],
   });
-  assert.equal(deterministic.ok, false);
-  assert.ok(
-    deterministic.errors.some((error) => error.includes('workflow_raw_subprocess_authority_unrepresented')),
-    deterministic.errors.join('\n'),
-  );
-
+  assert.deepEqual(deterministic.errors, [], deterministic.errors.join('\n'));
   const loopProbe = validateWorkflowDefinition({
     name: 'owner-loop-probe-shape',
     description: 'Poll the current job state.',
@@ -696,38 +686,16 @@ test('raw deterministic and loop-probe subprocesses refuse until represented by 
       id: 'poll',
       prompt: 'Read the current job state.',
       sideEffect: 'read',
-      loopUntil: {
-        probe: { runner: 'probe.mjs' },
-        until: { type: 'object', required_keys: ['done'] },
-      },
+      loopUntil: { probe: { runner: 'probe.mjs' }, until: { type: 'object', required_keys: ['done'] } },
     }],
   });
-  assert.equal(loopProbe.ok, false);
-  assert.ok(
-    loopProbe.errors.some((error) => error.includes('workflow_raw_subprocess_authority_unrepresented')),
-    loopProbe.errors.join('\n'),
-  );
-});
-
-test('promptless raw subprocess declarations cannot bypass the retirement boundary', () => {
-  const result = validateWorkflowDefinition({
-    name: 'promptless-owner-shape',
-    description: 'A legacy promptless script step.',
-    enabled: true,
-    trigger: { manual: true },
-    steps: [{
-      id: 'run_script',
-      prompt: '',
-      sideEffect: 'read',
-      deterministic: { runner: 'scripts/run.mjs' },
-    }],
+  assert.deepEqual(loopProbe.errors.filter((error) => /raw_subprocess|retired/i.test(error)), []);
+  // The path rules still hold: outside scripts/ or with inline arguments is an error.
+  const escape = validateWorkflowDefinition({
+    name: 'escape-shape', description: 'x', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'run_script', prompt: '', sideEffect: 'read', deterministic: { runner: '../run.mjs' } }],
   });
-
-  assert.equal(result.ok, false);
-  assert.ok(
-    result.errors.some((error) => error.includes('workflow_raw_subprocess_authority_unrepresented')),
-    result.errors.join('\n'),
-  );
+  assert.equal(escape.ok, false);
 });
 
 test('tool slug catalog check — unknown slug → warning', () => {

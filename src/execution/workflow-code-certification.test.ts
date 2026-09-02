@@ -40,7 +40,7 @@ function script(slug: string, name: string, source: string): void {
   writeFileSync(path.join(dir, name), source, 'utf-8');
 }
 
-test('preserves an exact legacy bundle for migration without granting execution authority', () => {
+test('certifies an exact owner-authored bundle and the validator admits it', () => {
   script('code-cert', 'transform.mjs', 'const input = await new Promise((resolve) => resolve({ ok: true }));\nconsole.log(JSON.stringify(input));\n');
   const first = certifyWorkflowCode(workflow('transform.mjs'), 'code-cert');
 
@@ -51,10 +51,7 @@ test('preserves an exact legacy bundle for migration without granting execution 
   assert.match(first.artifacts[0].sha256 ?? '', /^[a-f0-9]{64}$/);
   assert.match(first.bundleHash ?? '', /^[a-f0-9]{64}$/);
   const validation = validateWorkflowDefinition(workflow('transform.mjs'));
-  assert.equal(validation.ok, false, 'byte certification is not execution admission');
-  assert.ok(validation.errors.some((error) => (
-    /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i.test(error)
-  )));
+  assert.deepEqual(validation.errors, [], 'an owner-authored runner validates (reinstated 2026-09-01)');
 
   script('code-cert', 'transform.mjs', 'console.log("changed");\n');
   const changed = certifyWorkflowCode(workflow('transform.mjs'), 'code-cert');

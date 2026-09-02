@@ -20,10 +20,6 @@ import {
   type WorkflowToolReadinessItem,
   type WorkflowToolReadinessKind,
 } from '../dashboard/workflow-execution-plan.js';
-import {
-  workflowRawSubprocessDeclarations,
-  workflowRawSubprocessRetirementReason,
-} from './workflow-raw-subprocess-policy.js';
 
 // Only capabilities we can authoritatively verify from LOCAL state hard-block a
 // run: a `usesSkill` whose skill is not installed, a `deterministic.runner`
@@ -122,35 +118,14 @@ export function checkWorkflowRunReadiness(
   const { targetStepId, ...planOptions } = options;
   const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, planOptions);
   const capabilityReadiness = partitionWorkflowReadiness(plan.toolReadiness.items, targetStepId);
-  // Script presence proves only that a body could be launched. It does not
-  // represent that body's filesystem/network/CLI/child-process effects in the
-  // shared capability kernel, so legacy declarations fail closed even when
-  // their files still exist. The files remain untouched for migration.
-  const rawSubprocessBlockers: WorkflowToolReadinessItem[] = def.steps
-    .flatMap((step) => workflowRawSubprocessDeclarations(step))
-    .filter((declaration) => !targetStepId || declaration.stepId === targetStepId)
-    .map((declaration) => ({
-      kind: 'script' as const,
-      name: declaration.runner,
-      status: 'missing' as const,
-      reason: workflowRawSubprocessRetirementReason(declaration),
-      stepIds: [declaration.stepId],
-      sources: [declaration.kind === 'deterministic.runner'
-        ? 'deterministic_runner' as const
-        : 'loop_probe_runner' as const],
-      evidence: [{
-        kind: 'script' as const,
-        name: declaration.runner,
-        status: 'missing' as const,
-        detail: 'execution authority unavailable; script body was not admitted',
-      }],
-    }));
+  // An owner-authored runner is ready when its script is present under the
+  // workflow's own scripts/ (the plan's 'script' items check that) and the
+  // run pins its bytes (assertAdmittedWorkflowCodeRevision). The 08-30
+  // retirement layer that failed every runner closed regardless of presence
+  // is gone (2026-09-01): four live workflows were unrunnable behind it.
   const resourceReadiness = requiredResourceReadiness(def);
   const blockers = [
-    ...capabilityReadiness.blockers.filter((item) => !(item.sources ?? []).some((source) => (
-      source === 'deterministic_runner' || source === 'loop_probe_runner'
-    ))),
-    ...rawSubprocessBlockers,
+    ...capabilityReadiness.blockers,
     ...resourceReadiness.blockers,
   ];
   const warnings = [...capabilityReadiness.warnings, ...resourceReadiness.warnings];

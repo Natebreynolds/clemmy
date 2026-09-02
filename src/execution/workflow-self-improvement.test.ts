@@ -97,32 +97,32 @@ test.after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-test('readiness refuses the legacy runner; the queue answers held and records one improvement request', () => {
+test('a present legacy runner runs; a missing one blocks by name; migration is an explicit request that dedupes while pending', () => {
   seedLegacyWorkflow();
   const entry = store.readWorkflow(SLUG)!;
   const check = readiness.checkWorkflowRunReadiness(entry.data, SLUG);
-  assert.equal(check.ok, false);
-  assert.ok(improvement.improvableReadinessBlockers(check).length > 0, JSON.stringify(check.blockers));
+  assert.equal(check.ok, true, JSON.stringify(check.blockers));
 
+  // Runners reinstated 2026-09-01: the queue runs it instead of holding it.
   const queued = queue.queueWorkflowRun(SLUG, {}, { source: 'dashboard', dedupe: false });
-  assert.equal(queued.status, 'held', JSON.stringify(queued));
-  assert.match(queued.message, /rewriting that step/);
+  assert.equal(queued.status, 'queued', JSON.stringify(queued));
+
+  // Migration is asked for, not forced: one request, deduped while pending.
+  const requested = improvement.requestWorkflowImprovement({ slug: SLUG, definition: entry.data, source: 'dashboard' });
+  assert.equal(requested?.status, 'requested');
   const request = improvement.readWorkflowImprovement(SLUG);
   assert.ok(request);
   assert.equal(request.status, 'pending');
   assert.equal(request.source, 'dashboard');
   assert.deepEqual(request.runners, [{ stepId: 'pull_activity', kind: 'deterministic.runner', runner: 'scripts/pull-activity.mjs' }]);
-
-  // A second ask while pending does not mint a second request.
-  const again = queue.queueWorkflowRun(SLUG, {}, { source: 'schedule', dedupe: false });
-  assert.equal(again.status, 'held');
+  const again = improvement.requestWorkflowImprovement({ slug: SLUG, definition: entry.data, source: 'schedule' });
+  assert.equal(again?.status, 'already_pending');
   assert.equal(improvement.listPendingWorkflowImprovements().length, 1);
 
-  // A capability/account blocker is not this lane's business.
+  // A workflow with no legacy runner has nothing to migrate.
   assert.equal(improvement.requestWorkflowImprovement({
     slug: 'other',
     definition: { name: 'other', steps: [{ id: 'a', prompt: 'read things' }] } as never,
-    readiness: { blockers: [{ kind: 'tool', name: 'x', reason: 'workflow_readiness_blocked: missing tool' } as never] },
     source: 'dashboard',
   }), null);
 });
@@ -139,7 +139,6 @@ test('the prompt names the script to read and the rules that keep intent', () =>
   assert.match(prompt, /\/\/ legacy runner/, 'the script bytes ride in the prompt so the turn spends no lookups paging them');
   assert.match(prompt, /workflow_update/);
   assert.match(prompt, /Preserve WHAT the workflow does/);
-  assert.match(prompt, /workflow_raw_subprocess_authority_unrepresented/);
 });
 
 test('the intent guard accepts a faithful rewrite and names every drift', () => {
@@ -260,13 +259,14 @@ test('three rejected rewrites on one unchanged definition exhaust the budget; th
   assert.ok(state.attempts!.every((attempt) => /trigger changed/.test(attempt.detail) && attempt.candidatePath));
   assert.equal(request()?.status, 'exhausted');
 
-  // The queue answers a person, not an engineer, and names the next edge.
-  const queued = queue.queueWorkflowRun(SLUG, {}, { source: 'chat', dedupe: false });
-  assert.equal(queued.status, 'blocked_readiness', JSON.stringify(queued));
-  assert.match(queued.message, /tried rewriting it 3 times/);
-  assert.match(queued.message, /last draft is saved at/);
-  assert.match(queued.message, /rewrite that step with you here/);
-  assert.doesNotMatch(queued.message, /workflow_raw_subprocess_authority_unrepresented/);
+  // The exhausted answer is for a person, not an engineer, and names the next edge.
+  const exhausted = improvement.workflowImprovementExhaustedMessage(SLUG, state);
+  assert.match(exhausted, /tried rewriting it 3 times/);
+  assert.match(exhausted, /last draft is saved at/);
+  assert.match(exhausted, /rewrite that step with you here/);
+  assert.doesNotMatch(exhausted, /workflow_raw_subprocess_authority_unrepresented/);
+  // And the workflow itself still runs on its owner-authored script meanwhile.
+  assert.equal(queue.queueWorkflowRun(SLUG, {}, { source: 'chat', dedupe: false }).status, 'queued');
 
   // The next turn is told what failed before, so it cannot repeat it blind.
   const prompt = improvement.buildWorkflowImprovementPrompt({ request: state, entry: store.readWorkflow(SLUG)! });

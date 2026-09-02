@@ -123,7 +123,7 @@ test('ready items are neither blockers nor warnings', () => {
 // A script's presence certifies stored bytes, not the filesystem/network/CLI
 // authority of the body it would launch. Legacy declarations therefore remain
 // inspectable but are never queue-ready, whether or not the file exists.
-test('deterministic.runner readiness is a typed authority refusal even when its script exists', () => {
+test('deterministic.runner readiness is the script\'s presence: present is ready, missing names the file', () => {
   const slug = 'owner-deterministic-readiness-shape';
   const scriptsDir = path.join(TMP_HOME, 'vault', '00-System', 'workflows', slug, 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
@@ -137,14 +137,7 @@ test('deterministic.runner readiness is a typed authority refusal even when its 
     steps: [{ id: 'refresh', prompt: '', sideEffect: 'read', deterministic: { runner: 'refresh.mjs' } }],
   };
   const present = checkWorkflowRunReadiness(withScript, slug);
-  assert.equal(present.ok, false);
-  assert.equal(present.blockers.length, 1);
-  assert.equal(present.blockers[0]?.kind, 'script');
-  assert.equal(present.blockers[0]?.name, 'refresh.mjs');
-  assert.match(
-    present.blockers[0]?.reason ?? '',
-    /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i,
-  );
+  assert.equal(present.ok, true, JSON.stringify(present.blockers));
 
   const missingScript: WorkflowDefinition = {
     ...withScript,
@@ -152,12 +145,10 @@ test('deterministic.runner readiness is a typed authority refusal even when its 
   };
   const blocked = checkWorkflowRunReadiness(missingScript, slug);
   assert.equal(blocked.ok, false);
+  assert.equal(blocked.blockers.length, 1);
   assert.equal(blocked.blockers[0]?.kind, 'script');
   assert.equal(blocked.blockers[0]?.name, 'does-not-exist.mjs');
-  assert.match(
-    blocked.blockers[0]?.reason ?? '',
-    /workflow_raw_subprocess_authority_unrepresented.*deterministic\.runner/i,
-  );
+  assert.doesNotMatch(blocked.blockers[0]?.reason ?? '', /raw_subprocess|migrat/i);
 });
 
 test('workflow readiness does not advertise the removed program executor', () => {

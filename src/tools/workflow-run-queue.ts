@@ -21,11 +21,6 @@ import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../executi
 import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
 import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import {
-  requestWorkflowImprovement,
-  workflowImprovementExhaustedMessage,
-  workflowImprovementHoldMessage,
-} from '../execution/workflow-self-improvement.js';
-import {
   buildWorkflowMutationContractSnapshot,
   isWorkflowMutationContractSnapshot,
   prepareWorkflowForWrite,
@@ -2529,37 +2524,6 @@ function queueWorkflowRunUnlocked(
     // readiness is red so the user can still Skip it; Resume rechecks the
     // current workflow and leaves the record held until blockers are fixed.
     persistReadinessBlock = !readiness.ok && scheduledReadinessBlock !== undefined;
-    if (!readiness.ok) {
-      // A legacy script step is not a dead end: Clem re-authors it herself
-      // (workflow-self-improvement.ts) and this run is re-queued when the
-      // rewrite passes its checks. A scheduled occurrence still persists its
-      // durable readiness block below so the schedule ledger stays honest.
-      const improvement = requestWorkflowImprovement({
-        slug: workflowEntry.name,
-        definition: workflowEntry.data,
-        readiness,
-        source: normalizedOptionalString(opts?.source) ?? 'manual',
-      });
-      if (improvement && !catchupHold && !persistReadinessBlock) {
-        if (improvement.status === 'exhausted') {
-          // Clem already spent her attempt budget on this exact definition.
-          // The user gets the plain reason, the draft and the next edge —
-          // never the readiness engineering text (live 2026-09-01: "run my
-          // slack team update" was answered with a migration lecture after a
-          // silent six-hour cooldown).
-          return {
-            status: 'blocked_readiness',
-            message: workflowImprovementExhaustedMessage(workflowEntry.name, improvement.request),
-            readiness,
-          };
-        }
-        return {
-          status: 'held',
-          message: workflowImprovementHoldMessage(workflowEntry.name, improvement.request.runners),
-          readiness,
-        };
-      }
-    }
     if (!readiness.ok && !catchupHold && !persistReadinessBlock) {
       return {
         status: 'blocked_readiness',
