@@ -197,7 +197,10 @@ export function advisoryRolesForProofEntry(input: {
 export interface ProofProvisionResult {
   registered: string[];
   refusal?: {
-    code: 'selected_definition_not_proven' | SelectedComposioRevalidationRefusalCode;
+    code:
+      | 'selected_definition_not_proven'
+      | 'proof_manifest_install_refused'
+      | SelectedComposioRevalidationRefusalCode;
     identifier: string;
   };
 }
@@ -497,6 +500,7 @@ export async function registerProofProvisionedCapabilities(identity: {
       const currentMatches = Boolean(
         currentDefinition
         && currentDefinition.operationId === slug
+        && currentDefinition.effect === effect
         && currentDefinition.providerVersion === COMPOSIO_PROVIDER_SURFACE_VERSION
         && currentDefinition.operationVersion === operationVersion
         && currentDefinition.definitionFingerprint === definitionFingerprint
@@ -527,7 +531,7 @@ export async function registerProofProvisionedCapabilities(identity: {
               semanticDefinitionFingerprint,
             })
           : canonicalResolvedCapabilityId(slug.toLowerCase(), accountId, 'composio');
-      const manifest: CapabilityManifestV1 = attachSemanticContract({
+      const built: CapabilityManifestV1 = attachSemanticContract({
         version: 1,
         manifestId: capabilityId,
         providerKind: 'composio',
@@ -634,10 +638,43 @@ export async function registerProofProvisionedCapabilities(identity: {
             ? ['evidence', readbackVerification.resourceFamily]
             : ['evidence'],
       });
+      // Identity is the PROVIDER definition (`currentMatches`: operation,
+      // effect, version, fingerprint, account, port, schema digests,
+      // verification, semantics). When it matches the installed manifest, the
+      // installed manifest IS the registration. Host-side decoration (behaviour
+      // hints, evidence kinds, roles) evolves with this builder and must never
+      // fork the durable identity under the same id: live 2026-09-01, 28 rows
+      // installed before behaviour hints existed made every fresh proof mint a
+      // different digest for the SAME id, the store refused it, and the
+      // registration was skipped silently — chat-lane reads of sheets, drive,
+      // outlook, salesforce and slack were dead while the discovery record
+      // claimed a digest nothing held.
+      const manifest: CapabilityManifestV1 = currentMatches && currentInstalled
+        ? currentInstalled.manifest
+        : built;
       const installed = currentInstalled && !currentMatches
         ? store.supersede(currentInstalled.manifest.manifestId, manifest)
         : store.install(manifest);
-      if (!installed.ok) continue;
+      if (!installed.ok) {
+        // Never silent: a proof the store cannot hold is a typed refusal the
+        // caller (tool_search, JIT read edge, plan freeze) reports as such.
+        logger.error(
+          {
+            slug,
+            capabilityId,
+            reason: installed.reason,
+            builtDigest: capabilityManifestDigest(manifest),
+            installedDigest: store.get(capabilityId)?.digest ?? null,
+            installedLifecycle: store.list()
+              .find((row) => row.manifest.manifestId === capabilityId)?.manifest.lifecycle.state ?? null,
+          },
+          'proof-provisioned manifest could not be installed — the capability is NOT registered',
+        );
+        return {
+          registered,
+          refusal: { code: 'proof_manifest_install_refused', identifier: slug },
+        };
+      }
       if (options.publicationGuard && !options.publicationGuard()) return { registered };
       if (currentInstalled && currentInstalled.manifest.manifestId !== capabilityId) {
         // Retire only the exact predecessor in this account lineage. Forgetting

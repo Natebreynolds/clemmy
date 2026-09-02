@@ -1176,7 +1176,7 @@
           "bytes": 15702
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
-          "bytes": 41391
+          "bytes": 43245
         },
         "src/runtime/harness/firecrawl-batch-scrape-schema-contract.ts": {
           "bytes": 3029
@@ -1272,7 +1272,7 @@
           "bytes": 67092
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 76697
+          "bytes": 77462
         },
         "src/tools/plan-tools.ts": {
           "bytes": 79825
@@ -3660,7 +3660,7 @@
           "bytes": 15702
         },
         "src/runtime/harness/proof-provisioned-catalog.ts": {
-          "bytes": 41391
+          "bytes": 43245
         },
         "src/runtime/harness/firecrawl-batch-scrape-schema-contract.ts": {
           "bytes": 3029
@@ -3756,7 +3756,7 @@
           "bytes": 67092
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 76697
+          "bytes": 77462
         },
         "src/tools/plan-tools.ts": {
           "bytes": 79825

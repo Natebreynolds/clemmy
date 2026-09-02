@@ -1388,6 +1388,22 @@ export async function provisionExactWorkflowProviderOperations(input: {
       detail: publication.value.refusal.code,
     };
   }
+  // "ok" means every requested operation is now a registered catalog entry.
+  // Live 2026-09-01: an empty registration with no refusal reported ok, the
+  // host re-ran its exact check against the same empty catalog, and the turn
+  // ended as a no-progress internal error with a log line saying ok: true.
+  const registeredOperations = new Set(publication.value.registered.map((capabilityId) => (
+    capabilityId.replace(/^cap:resolved:/u, '').split(':definition:')[0]?.toUpperCase() ?? ''
+  )));
+  const unregistered = operationIds.find((operation) => !registeredOperations.has(operation));
+  if (unregistered) {
+    return {
+      ok: false,
+      code: 'proof_provisioning_refused',
+      identifier: unregistered,
+      detail: 'not_registered',
+    };
+  }
   return { ok: true };
 }
 

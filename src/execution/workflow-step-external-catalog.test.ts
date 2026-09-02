@@ -523,7 +523,9 @@ test('exact workflow provisioner binds schema, account, and effect for reads and
     registerProof: async (_identity, options) => {
       registeredIdentifiers = options.allowedIdentifiers ?? [];
       registeredDigests = options.expectedSchemaDigests ?? [];
-      return { registered: [] };
+      return {
+        registered: (options.allowedIdentifiers ?? []).map((identifier) => `cap:resolved:${identifier.toLowerCase()}`),
+      };
     },
   });
 
@@ -802,4 +804,46 @@ test('rendered workflow data cannot nominate an external operation', async () =>
     ready: () => false,
   });
   assert.deepEqual(result, { status: 'none' });
+});
+
+test('exact workflow provisioner reports a requested operation that did not register as a refusal, never ok', async () => {
+  resetEventLog();
+  const acceptedInput = 'Use SLACK_RETRIEVE_DETAILED_USER_INFORMATION.';
+  const session = createSession({ kind: 'workflow', userId: 'workflow:exact-provider-unregistered' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: acceptedInput },
+  });
+  // Live 2026-09-01 (JIT read edge): the proof publisher skipped a manifest the
+  // durable store refused, returned an empty registration with no refusal, and
+  // the provisioner answered ok — the host re-checked the same empty catalog and
+  // the turn died as a no-progress internal error beside a log line saying ok.
+  const result = await provisionExactWorkflowProviderOperations({
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    acceptedInput,
+    operationIds: ['SLACK_RETRIEVE_DETAILED_USER_INFORMATION'],
+  }, {
+    materializeExact: async () => [{
+      toolkit: 'slack',
+      slug: 'SLACK_RETRIEVE_DETAILED_USER_INFORMATION',
+      name: 'SLACK_RETRIEVE_DETAILED_USER_INFORMATION',
+      score: 0,
+      inputParameters: { type: 'object' },
+    }],
+    freshConnections: async () => [{
+      slug: 'slack', connectionId: 'ca_slack_only', status: 'ACTIVE', accountEmail: 'only@example.com',
+    }],
+    recordResolution: () => {},
+    registerProof: async () => ({ registered: [] }),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'proof_provisioning_refused',
+    identifier: 'SLACK_RETRIEVE_DETAILED_USER_INFORMATION',
+    detail: 'not_registered',
+  });
 });
