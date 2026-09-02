@@ -975,7 +975,7 @@
           "bytes": 9730
         },
         "src/execution/workflow-step-effect.ts": {
-          "bytes": 2652
+          "bytes": 2715
         },
         "src/tools/composio-batch-validator.ts": {
           "bytes": 32535
@@ -2469,7 +2469,7 @@
           "bytes": 3283
         },
         "src/runtime/harness/execution-gate.ts": {
-          "bytes": 23419
+          "bytes": 24747
         },
         "src/runtime/harness/external-write-admission.ts": {
           "bytes": 20321
@@ -3462,7 +3462,7 @@
           "bytes": 9730
         },
         "src/execution/workflow-step-effect.ts": {
-          "bytes": 2652
+          "bytes": 2715
         },
         "src/tools/composio-batch-validator.ts": {
           "bytes": 32535
@@ -4956,7 +4956,7 @@
           "bytes": 3283
         },
         "src/runtime/harness/execution-gate.ts": {
-          "bytes": 23419
+          "bytes": 24747
         },
         "src/runtime/harness/external-write-admission.ts": {
           "bytes": 20321

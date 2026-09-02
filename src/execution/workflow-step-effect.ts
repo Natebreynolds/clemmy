@@ -30,22 +30,20 @@ export function structuredCallSideEffectClass(step: {
   const declared = step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send'
     ? step.sideEffect
     : undefined;
-  // The slug's evidence is the FLOOR; an author's label can only strengthen it
-  // (read → write → send), never downgrade it. A read verb is never a send —
-  // TWITTER_GET_POST reads a post; the send-slug regex alone read "POST" as a
-  // send (2026-09-02). A declared send on a non-send tool is still classified
-  // send so the send gate sees it and refuses it as direct_send_tool_required
-  // at validation — the author relabels; nothing crosses.
+  // KNOWN slug evidence is authoritative in both directions: a real send is a
+  // send whatever the label says, and a known read or reversible write is
+  // never a send whatever the label says (a stale `send` on CREATE_DRAFT is
+  // the 2026-07-20 draft trap). A label may strengthen a known read to a
+  // write — the author knows their call. A read verb is never a send:
+  // TWITTER_GET_POST reads a post; the send-slug regex alone read "POST" as
+  // a send (2026-09-02). Only an UNKNOWN carrier (a dynamic multiplexer)
+  // takes the label at face value, so a declared send reaches the send gate
+  // and is refused there as direct_send_tool_required.
   const evidence = composioSlugEffectEvidence(tool);
-  const floor: 'read' | 'write' | 'send' | 'unknown' = evidence === 'read'
-    ? 'read'
-    : isIrreversibleSendSlug(tool)
-      ? 'send'
-      : evidence === 'unknown'
-        ? 'unknown'
-        : 'write';
-  if (floor === 'send' || declared === 'send') return 'send';
-  if (floor === 'write') return 'write';
-  if (floor === 'read') return declared === 'write' ? 'write' : 'read';
-  return declared === 'read' ? 'read' : 'write';
+  if (evidence === 'read') return declared === 'write' || declared === 'send' ? 'write' : 'read';
+  if (isIrreversibleSendSlug(tool)) return 'send';
+  if (evidence === 'write') return 'write';
+  if (declared === 'read') return 'read';
+  if (declared === 'send') return 'send';
+  return 'write';
 }

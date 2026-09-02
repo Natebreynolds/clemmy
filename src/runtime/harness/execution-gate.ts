@@ -350,6 +350,26 @@ function canonicalExternalActionIsWrite(
  *  chokepoint classifier every dispatch lane routes through. A DRAFT is
  *  reversible; a SEND/PUBLISH/CALL verb is a send; a CREATE/MAKE/RESPOND/POST
  *  of a communication object is a send. Pure + exported. */
+
+const READ_VERBS: ReadonlySet<string> = new Set([
+  'GET', 'LIST', 'FETCH', 'SEARCH', 'FIND', 'READ', 'LOOKUP', 'RETRIEVE', 'QUERY',
+  'DESCRIBE', 'VIEW', 'SHOW', 'COUNT', 'CHECK',
+]);
+
+function leadingVerbIsRead(slug: string, parts: readonly string[]): boolean {
+  // Tool-name portion: after the last `__` (MCP server separator) when present;
+  // otherwise after the provider toolkit token (the first `_`-separated part).
+  const toolPortion = slug.includes('__') ? slug.slice(slug.lastIndexOf('__') + 2) : '';
+  const toolParts = toolPortion
+    ? toolPortion.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[-\s/]+/g, '_').toUpperCase().split(/[_.]+/).filter(Boolean)
+    : parts.slice(1);
+  for (const token of toolParts) {
+    if (READ_VERBS.has(token)) return true;
+    if (IRREVERSIBLE_SEND_VERBS.has(token) || DISPATCH_VERBS.has(token)) return false;
+  }
+  return false;
+}
+
 export function isIrreversibleSendSlug(slug: string): boolean {
   const normalized = slug
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
@@ -363,6 +383,12 @@ export function isIrreversibleSendSlug(slug: string): boolean {
   if (parts.includes('DRAFT') || parts.includes('DRAFTS')) {
     return parts.includes('SEND') || parts.includes('PUBLISH');
   }
+  // A read verb is never a send: TWITTER_GET_POST reads a post, GMAIL_GET_REPLY
+  // reads a reply. The floor is judged on the TOOL name only — after an MCP
+  // server segment (`mcp__server__tool`) or a provider toolkit prefix — so a
+  // read verb in a SERVER slug still cannot vouch for a destructive tool.
+  // The first token that is any known verb decides: read → never a send.
+  if (leadingVerbIsRead(slug, parts)) return false;
   if (parts.some((p) => IRREVERSIBLE_SEND_VERBS.has(p))) return true;
   return parts.some((p) => DISPATCH_VERBS.has(p)) && parts.some((p) => COMM_OBJECTS.has(p));
 }

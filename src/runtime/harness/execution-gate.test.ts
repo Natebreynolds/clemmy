@@ -113,6 +113,17 @@ test('isIrreversibleSendSlug: dispatch-verb + comm-object native sends are caugh
   }
 });
 
+test('isIrreversibleSendSlug: a read verb in the TOOL name is a floor — POST/REPLY as nouns are not sends', () => {
+  for (const s of ['TWITTER_GET_POST', 'LINKEDIN_LIST_POSTS', 'GMAIL_GET_REPLY', 'SLACK_FETCH_MESSAGE', 'MICROSOFT_TEAMS_GET_POST', 'mcp__social__get_post']) {
+    assert.equal(isIrreversibleSendSlug(s), false, `${s} reads; it is not a send`);
+  }
+  // The floor is judged on the TOOL name only: a read verb in the SERVER slug
+  // cannot vouch for a sending tool, and a real send stays a send.
+  for (const s of ['mcp__get_things__send_message', 'REDDIT_SUBMIT_POST', 'X_POST_TWEET', 'GMAIL_REPLY_TO_THREAD', 'LINKEDIN_CREATE_POST']) {
+    assert.equal(isIrreversibleSendSlug(s), true, `${s} must stay an irreversible send`);
+  }
+});
+
 test('isIrreversibleSendSlug: CALL as a noun (reads) is NOT a send — the bare verb was removed', () => {
   for (const s of ['VAPI_GET_CALL', 'mcp__vapi__get_call', 'TWILIO_LIST_CALLS', 'mcp__vapi__list_calls']) {
     assert.equal(isIrreversibleSendSlug(s), false, `${s} is a call READ, not a send`);
