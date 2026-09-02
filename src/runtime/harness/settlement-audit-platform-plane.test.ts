@@ -513,3 +513,61 @@ test('a parented reconciliation cannot settle a sibling reservation that reused 
     'a reused call id cannot map one reservation terminal onto every logical ambiguity',
   );
 });
+
+// Live 2026-09-01: end-of-day (18 prior successes on the SDK lane) completed
+// task hygiene, two task lists, a memory write and a notification on the host
+// lane, then was blocked as "no completed business settlement" — its declared
+// send step owes evidence, and its evidence is LOCAL. A brain-dependent gate.
+test('a declared write/send step whose only mutations are local has its evidence; a step with no mutation at all still owes it', () => {
+  const accepted = acceptedSource('local-mutation-evidence', 'end of day wrap-up');
+  const local = (id: string, toolName: string) => {
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: {
+        sessionId: accepted.sessionId,
+        sourceUserSeq: accepted.sourceUserSeq,
+        turn: accepted.turn,
+        acceptedTaskId: accepted.acceptedTaskId,
+        logicalToolCallId: `logical:${id}`,
+        physicalDispatchId: `dispatch:${id}`,
+        ordinal: 0,
+      },
+      tool: toolName,
+      args: { apply: true },
+    });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    assert.equal(dispatch.settlePhysicalDispatch({ identity: begun.identity, tool: toolName, outcome: 'returned' }).status, 'inserted');
+    assert.equal(settlements.commitLogicalCallSettlement({
+      identity: {
+        sessionId: accepted.sessionId,
+        sourceUserSeq: accepted.sourceUserSeq,
+        turn: accepted.turn,
+        acceptedTaskId: accepted.acceptedTaskId,
+        logicalToolCallId: `logical:${id}`,
+      },
+      contract: { toolName, args: { apply: true } },
+      execution: { kind: 'provider_execution' },
+      result: { payload: { ok: true } },
+      outcome: outcomes.classifyAttemptOutcome({ mutating: true, acknowledged: true, hostExecuted: true }),
+      recovery: { businessCall: false, mutating: true },
+      observer: { lane: 'byo', turn: accepted.turn },
+    }).status, 'committed');
+  };
+  const before = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(before.status, 'no_business_evidence', 'nothing happened yet: the declared mutation is still owed');
+
+  local('hygiene', 'task_hygiene');
+  local('remember', 'memory_remember');
+  const after = auditAcceptedSourceSettlementTruth({
+    sessionId: accepted.sessionId,
+    sourceUserSeq: accepted.sourceUserSeq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(after.status, 'clean', JSON.stringify(after));
+  assert.equal(after.facts.successfulLocalMutations, 2);
+  assert.equal(after.facts.successfulBusinessSettlements, 0);
+});

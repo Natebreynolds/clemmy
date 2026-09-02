@@ -52,6 +52,12 @@ export interface AcceptedSourceSettlementAudit {
      * canonical host boundary. Registry metadata—not SDK profile membership
      * or model tool-use summaries—defines this deliberately tiny class. */
     successfulSdkAuthoringResults: number;
+    /** Successful settlements of MUTATING calls that are not business calls:
+     * the task ledger, memory, a notification, a Workspace write. A declared
+     * write/send step whose work is local has its evidence here (live
+     * 2026-09-01: end-of-day, 18 prior successes on the SDK lane, blocked on
+     * the host lane as "no business evidence" after completing every step). */
+    successfulLocalMutations: number;
     unrecoveredBusinessFailures: number;
     confirmedWrites: number;
     uncertainWrites: number;
@@ -208,6 +214,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
     successfulBusinessSettlements: 0,
     successfulSdkBusinessResults: 0,
     successfulSdkAuthoringResults: 0,
+    successfulLocalMutations: 0,
     unrecoveredBusinessFailures: 0,
     confirmedWrites: 0,
     uncertainWrites: 0,
@@ -258,6 +265,22 @@ export function auditAcceptedSourceSettlementTruth(input: {
        AND l.logical_tool_call_id = s.logical_tool_call_id
       WHERE s.session_id = ? AND s.source_user_seq = ?
         AND s.business_call = 1 AND s.continues_requirement = 0
+    `).all(input.sessionId, input.sourceUserSeq) as SettlementRow[];
+    // Local mutations are evidence of declared work too. The business-only
+    // filter above made a send/write step whose tools are all local (task
+    // hygiene, memory, notify_user) unprovable on the host lane, while the
+    // SDK lane's own `successfulAuthoringResult` marker let the identical
+    // step pass — a brain-dependent gate.
+    const localMutations = db.prepare(`
+      SELECT s.logical_tool_call_id, l.tool_name, l.argument_digest,
+             s.outcome_kind, s.execution_kind, s.mutating, s.requirement_id
+      FROM logical_call_settlements s
+      JOIN logical_tool_calls l
+        ON l.session_id = s.session_id
+       AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+      WHERE s.session_id = ? AND s.source_user_seq = ?
+        AND s.business_call = 0 AND s.mutating = 1 AND s.continues_requirement = 0
     `).all(input.sessionId, input.sourceUserSeq) as SettlementRow[];
 
     const turnEvents = turnEventsForAcceptedSource(input.sessionId, input.sourceUserSeq);
@@ -368,6 +391,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       successfulBusinessSettlements: successful.length,
       successfulSdkBusinessResults,
       successfulSdkAuthoringResults,
+      successfulLocalMutations: localMutations.filter(succeeded).length,
       unrecoveredBusinessFailures: unrecovered.length,
       confirmedWrites: writeEvidence.confirmed.length,
       uncertainWrites: writeEvidence.uncertain.length,
@@ -408,6 +432,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       && facts.successfulBusinessSettlements === 0
       && facts.successfulSdkBusinessResults === 0
       && facts.successfulSdkAuthoringResults === 0
+      && facts.successfulLocalMutations === 0
       && facts.confirmedWrites === 0
     ) {
       return {

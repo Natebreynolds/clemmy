@@ -1362,7 +1362,7 @@
           "bytes": 28268
         },
         "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 20198
+          "bytes": 21729
         },
         "src/memory/automatic-recall-opt-out.ts": {
           "bytes": 7083
@@ -3843,7 +3843,7 @@
           "bytes": 28268
         },
         "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 20198
+          "bytes": 21729
         },
         "src/memory/automatic-recall-opt-out.ts": {
           "bytes": 7083
