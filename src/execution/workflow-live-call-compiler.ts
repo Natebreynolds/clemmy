@@ -215,6 +215,14 @@ function revalidateCurrentOperationCatalog(operationId: string): void {
  * compiler below still re-proves candidates, accounts and effect. Only reads
  * are acquired here; writes keep their authored/reviewed paths.
  */
+/** One acquisition per operation at a time. Six parallel Friday-dashboard
+ * steps each acquired salesforce_sf_soql_query at once (live 2026-09-01): the
+ * first installed it, and the other five saw the fresh install as an identity
+ * mismatch against their own nomination, superseded and revoked it, and the
+ * run parked on "no current capability" for a capability the host had just
+ * registered. Siblings now await the one in-flight acquisition and re-check. */
+const inFlightLiveReadAcquisitions = new Map<string, Promise<{ status: 'present' | 'acquired' | 'unavailable'; detail?: string }>>();
+
 export async function ensureLiveReadCapabilityForOperation(input: {
   ownerId: string;
   nodeId: string;
@@ -227,6 +235,27 @@ export async function ensureLiveReadCapabilityForOperation(input: {
   const factory = peekHostCapabilityCatalogFactory();
   if (!factory) return { status: 'unavailable', detail: 'no live host capability catalog is installed' };
   if (currentOperationCandidates(factory, input.operationId).length > 0) return { status: 'present' };
+  const key = input.operationId.trim().toLowerCase();
+  const inFlight = inFlightLiveReadAcquisitions.get(key);
+  if (inFlight) {
+    const settled = await inFlight;
+    if (currentOperationCandidates(factory, input.operationId).length > 0) return { status: 'present' };
+    return settled;
+  }
+  const own = acquireLiveReadCapabilityOnce(input, factory).finally(() => {
+    if (inFlightLiveReadAcquisitions.get(key) === own) inFlightLiveReadAcquisitions.delete(key);
+  });
+  inFlightLiveReadAcquisitions.set(key, own);
+  return own;
+}
+
+async function acquireLiveReadCapabilityOnce(input: {
+  ownerId: string;
+  nodeId: string;
+  operationId: string;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+}, factory: NonNullable<ReturnType<typeof peekHostCapabilityCatalogFactory>>): Promise<{ status: 'present' | 'acquired' | 'unavailable'; detail?: string }> {
   revalidateCurrentOperationCatalog(input.operationId);
   if (currentOperationCandidates(factory, input.operationId).length > 0) return { status: 'present' };
   const { createProductionLiveReadAcquisitionRegistry } = await import(

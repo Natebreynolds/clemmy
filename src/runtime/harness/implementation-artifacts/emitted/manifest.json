@@ -1785,7 +1785,7 @@
           "bytes": 20182
         },
         "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 18339
+          "bytes": 19797
         },
         "src/runtime/harness/reviewed-local-tool-carrier.ts": {
           "bytes": 340
@@ -4266,7 +4266,7 @@
           "bytes": 20182
         },
         "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 18339
+          "bytes": 19797
         },
         "src/runtime/harness/reviewed-local-tool-carrier.ts": {
           "bytes": 340
