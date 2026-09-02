@@ -398,3 +398,24 @@ goal … truly self-improve. I don't think it's fully wired in yet."
   capability block that parks and retries).
 - Dev daemon restarted 17:54 PT on 88c5a4b5 for the owner's mobile testing; the phone re-paired after one
   post-restart 401 and served 50 requests clean. The judge and the two workflow fixes need one more restart.
+
+### Later (18:30–19:10 PT): the first mobile turn, and the owner's simplicity bar
+Owner (after "Host error on the 1st run"): "the harness shouldn't be so overcomplicated that it would trip
+up a pseudo flagship source model" — GLM 5.3 must run the owner's tasks and existing/migrated workflows.
+- **What the first turn actually did** (read off a COPY of the eventlog): `tool_search` proved
+  `SLACK_FETCH_CONVERSATION_HISTORY` as a read; GLM then emitted a `work_call` whose inner
+  `composio_execute_tool` carried the ACTION arguments (`channel`, `limit`) where `tool_slug` belongs.
+  The host refused with `host_planned_work_call_requires_plan_sibling` — a wrong diagnosis (the plan
+  sibling was present) — and the turn ended as a host error on the phone.
+- `5ffed29b` typed the refusal (`host_work_call_inner_operation_unidentified`) so the directive names the
+  exact missing field instead of a sibling that exists.
+- `3971ef78` subtracts the hoop: when EXACTLY ONE Composio READ is proven this turn, the host binds the
+  missing `tool_slug`, wraps top-level action arguments into `arguments`, and serializes an
+  `arguments` object once — completed where the frame is built, so classification, dispatch, settlement
+  and the learned pin all see the working bytes (run N+1 starts from the shape that worked). Zero or
+  several proven reads, any proven write, a non-gateway inner name: no completion, the typed refusal
+  stands. Every disclosed business result now carries `example` — a literal call with only the action
+  arguments left to fill — and the carrier hint says args_json is ONE JSON string of
+  `{tool_slug, arguments: {…}}`.
+- Dev daemon restarted 19:08 PT on `3971ef78` (pid 22222). Pins: `composio-carrier-completion.test.ts`,
+  `tool-search-carrier-example.test.ts`; host-turn-runner (224), frame-policy and tool-search suites green.
