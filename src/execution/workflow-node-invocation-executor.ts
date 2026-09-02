@@ -264,7 +264,17 @@ export type ExecuteWorkflowNodeReadResult =
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const EXACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
-const MAX_CANONICAL_ARGUMENT_BYTES = 64_000;
+/**
+ * Sealed-call argument bound. Sized to what the transports on either side
+ * already accept — a reviewed-CLI read may return 1 MiB of stdout and a
+ * workspace dataset commit carries several such results in one argument —
+ * not to a chat-sized payload. 64 000 bytes refused the Friday dashboard's
+ * 75 KB `space_set_data` commit (2026-09-02) while real workspace datasets
+ * run past 500 KB; the bound exists to keep the canonical form finite, not to
+ * decide what a workflow may commit.
+ */
+const MAX_CANONICAL_ARGUMENT_BYTES = 8_000_000;
+const MAX_CANONICAL_ARGUMENT_NODES = 2_000_000;
 
 const preparedWorkflowNodeCallAuthorities = new WeakMap<
   object,
@@ -332,7 +342,7 @@ function freezeCanonical<T extends CanonicalJson>(value: T): T {
 function freezeClone<T>(value: T): Readonly<T> {
   return freezeCanonical(JSON.parse(closedCanonicalJson(value, {
     maxDepth: 32,
-    maxNodes: 20_000,
+    maxNodes: MAX_CANONICAL_ARGUMENT_NODES,
     maxStringBytes: MAX_CANONICAL_ARGUMENT_BYTES,
     maxTotalBytes: MAX_CANONICAL_ARGUMENT_BYTES,
   })) as CanonicalJson) as Readonly<T>;
@@ -341,7 +351,7 @@ function freezeClone<T>(value: T): Readonly<T> {
 function canonicalDigest(value: unknown): string {
   return sha256(closedCanonicalJson(value, {
     maxDepth: 32,
-    maxNodes: 20_000,
+    maxNodes: MAX_CANONICAL_ARGUMENT_NODES,
     maxStringBytes: MAX_CANONICAL_ARGUMENT_BYTES,
     maxTotalBytes: MAX_CANONICAL_ARGUMENT_BYTES,
   }));
@@ -760,7 +770,7 @@ function prepareWorkflowNodeCallBinding(
   try {
     canonicalBytes = closedCanonicalJson(compiled.args, {
       maxDepth: 32,
-      maxNodes: 20_000,
+      maxNodes: MAX_CANONICAL_ARGUMENT_NODES,
       maxStringBytes: MAX_CANONICAL_ARGUMENT_BYTES,
       maxTotalBytes: MAX_CANONICAL_ARGUMENT_BYTES,
     });
@@ -772,9 +782,18 @@ function prepareWorkflowNodeCallBinding(
   } catch (error) {
     if (
       error instanceof ClosedCanonicalJsonError
-      && (error.code === 'string_limit' || error.code === 'total_byte_limit')
+      && (error.code === 'string_limit' || error.code === 'total_byte_limit' || error.code === 'node_limit')
     ) {
-      return block('canonical_arguments_too_large', 'Compiled canonical arguments exceed the sealed-call byte limit.');
+      let approximateBytes = -1;
+      try {
+        approximateBytes = Buffer.byteLength(JSON.stringify(compiled.args), 'utf8');
+      } catch {
+        // unmeasurable; the message still names the bound
+      }
+      return block(
+        'canonical_arguments_too_large',
+        `Compiled canonical arguments exceed the sealed-call limit (${approximateBytes >= 0 ? `${approximateBytes} bytes` : 'unmeasurable size'}; limit ${MAX_CANONICAL_ARGUMENT_BYTES} bytes / ${MAX_CANONICAL_ARGUMENT_NODES} nodes).`,
+      );
     }
     return block(
       'canonical_arguments_invalid',

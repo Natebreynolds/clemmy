@@ -1100,7 +1100,7 @@ test('identity, plan, catalog, observation and typed-source blockers all prove z
       input: prepareInput({
         entry,
         plan: largePlan,
-        workflowInputs: { scope: { value: 'x'.repeat(64_100) } },
+        workflowInputs: { scope: { value: 'x'.repeat(8_000_100) } },
       }),
     },
   ];
