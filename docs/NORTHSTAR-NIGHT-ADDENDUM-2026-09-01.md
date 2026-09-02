@@ -483,3 +483,19 @@ tools to migrate workflows, or legacy ones still need to be able to run."
 - **Still owed (the "right tools" half):** a deterministic migration primitive the lane can call (extract
   `sf data query`/Composio ops from a runner into exact call steps + package transform; the model only
   names/reviews) and visibility of improvement sessions in Working Now with attempt N of 3.
+
+### Later (21:35–22:15 PT): "it failed to run a workflow that has been working for weeks"
+- **end-of-day (scheduled 17:00, 18 prior successes)** and the phone's "run my slack team activity update"
+  died on ONE class: GLM 5.3 serializes an omitted optional argument as the STRING "null" —
+  `task_list priority:"null"` (enum refusal → identical retry → governor), `workflow_get step:"null"`
+  ("both section and step"), `work_call source_call_ids:"null"` (read as settled lineage → plan-bound).
+  Fixed once (`e74598a0`) at `materializeStrictNullableFields`, the schema-aware seam every dispatch path
+  crosses: optional key → absent, required nullable → JSON null, required non-nullable → kept.
+- **Proof run 1** then completed every step (hygiene, two task lists, memory, notification, step result)
+  and was STILL marked blocked: "no completed business settlement or confirmed write" — the settlement
+  audit's evidence for a declared write/send step came from provider settlements or the Claude SDK lane's
+  own markers; a local-only step had evidence on Sonnet and none on GLM. Fixed (`901e0c58`): successful
+  local mutations count. Pins for both.
+- **Also landed:** Working Now shows host-run execution sessions immediately, named by workflow and
+  attempt (`eab3c531`); the migration primitive drafts exact steps from a runner's source and the rewrite
+  lane starts from that draft (`edb963ef`).
