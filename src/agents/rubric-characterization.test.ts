@@ -159,8 +159,8 @@ const GOLDEN = {
   // guard and fresh-action remains below its 5.5 KB stable-policy ceiling.
   instructions: { len: 31884, sha16: '0b5dbd98814a3bca' },
   native: { len: 30991, sha16: '10c57b280785f498' },
-  claudeBrain: { len: 8527, sha16: '663983956ba48fb5' },
-  lean: { len: 10533, sha16: '76bfa5879bab95b5' },
+  claudeBrain: { len: 8931, sha16: 'd628958eafd680ef' },
+  lean: { len: 10937, sha16: 'ea4567204fe1ed9e' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
