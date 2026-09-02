@@ -219,14 +219,26 @@ export function createProductionReviewedCliReadCarrier(): ProductionReviewedCliR
     const existing = resolveProductionPortsForManifest(manifest);
     if (existing) {
       const expectedArgv = [descriptor.executableRealpath, ...descriptor.argvPrefix];
-      if (
-        !isShippedInvoke(existing.invoke)
-        || typeof existing.observe !== 'function'
-        || !Array.isArray(existing.argv)
-        || existing.argv.length !== expectedArgv.length
-        || existing.argv.some((token, index) => token !== expectedArgv[index])
-      ) {
-        return { ok: false, reason: 'the exact reviewed CLI port is not a shipped implementation' };
+      // Say WHICH check failed and what the two sides were. Live 2026-09-01:
+      // the Friday dashboard's six SOQL reads died on this line six times with
+      // one opaque sentence and no way to tell a replaced binary from a stale
+      // port.
+      const failed = !isShippedInvoke(existing.invoke)
+        ? 'invoke_not_shipped'
+        : typeof existing.observe !== 'function'
+          ? 'observe_missing'
+          : !Array.isArray(existing.argv)
+            ? 'argv_missing'
+            : existing.argv.length !== expectedArgv.length
+              || existing.argv.some((token, index) => token !== expectedArgv[index])
+              ? 'argv_mismatch'
+              : null;
+      if (failed) {
+        const existingArgv = Array.isArray(existing.argv) ? existing.argv.join(' ') : '(none)';
+        return {
+          ok: false,
+          reason: `the exact reviewed CLI port is not a shipped implementation (${failed}; existing: ${existingArgv.slice(0, 200)}; expected: ${expectedArgv.join(' ').slice(0, 200)})`,
+        };
       }
       return { ok: true };
     }

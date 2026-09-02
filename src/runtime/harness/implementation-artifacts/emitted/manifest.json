@@ -1245,7 +1245,7 @@
           "bytes": 12047
         },
         "src/runtime/harness/production-reviewed-cli-read-carrier.ts": {
-          "bytes": 13130
+          "bytes": 13776
         },
         "src/runtime/harness/production-live-read-acquisition-registry.ts": {
           "bytes": 40209
@@ -3726,7 +3726,7 @@
           "bytes": 12047
         },
         "src/runtime/harness/production-reviewed-cli-read-carrier.ts": {
-          "bytes": 13130
+          "bytes": 13776
         },
         "src/runtime/harness/production-live-read-acquisition-registry.ts": {
           "bytes": 40209
