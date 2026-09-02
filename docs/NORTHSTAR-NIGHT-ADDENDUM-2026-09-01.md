@@ -1113,3 +1113,48 @@ still resolve. Deliberately not attempted in the same session as a tag.
 
 Related: the plan DSL validates `complete_source_receipt`, but no production
 path performs a real collection to satisfy it.
+
+## Gate 16 — the platform-49 block is a repeated-read loop, not pagination
+
+Two live runs on grok-4.6 against the real sheet and the real Slack channel
+correct the premise of gate 15.
+
+Run 1 took the open ask and let her choose her own path. She recalled memory,
+checked twice for an existing workflow before going ad-hoc, read the sheet with
+`GOOGLESHEETS_BATCH_GET` exactly as step 1 of the skill prescribes, then pulled
+the Slack channel. She issued `SLACK_FETCH_CONVERSATION_HISTORY` four times
+across four host turns and only two distinct results were ever retained. The
+terminal recorded both Slack reads as complete, not partial. The source was
+exhausted and she re-read it anyway, and the no-progress governor stopped her
+at its budget of three. The stop was typed and resumable, nothing was sent or
+changed, and the sheet was untouched.
+
+So the defect is that she re-issues a read whose identical result is already
+retained for the turn, and nothing tells her she already has it. The host
+already tracks `continuationRepeated` on the result handle, and
+composio-tools.ts (~4245) is the sanctioned seam for an out-of-band advisory,
+already used by `maybeFanoutAdvisory` and `maybeDiscoveryAdvisory` under a
+`!failure.failed && nestedDispatch !== true` guard. Handing back the retained
+handle with an explicit "you already have this" is a small, additive fix that
+costs none of the settlement-kernel risk described in gate 15.
+
+Run 2 steered her to work from retained data without re-reading Slack, and it
+passed cleanly. She found the only key collision in Log rows 2 to 33 and then
+applied judgment rather than deleting: rows 30, 31 and 32 collide only because
+all three bullets open with the same "Reposting client feedback" text, so they
+are three distinct bullets from one Slack post rather than copy-paste
+duplicates. She said exactly that, asked whether to keep all three or drop 31
+and 32, and held the sheet untouched pending an answer. The owner kept all
+three. That is clarify-before-an-external-write working as specified, in a
+conversational voice.
+
+Consequence for gate 15: host pagination remains unmounted and remains worth
+doing, but it is not what blocks this task, and the kernel risk should not be
+spent until a run actually produces a partial source.
+
+Also unresolved: the trajectory watcher mounted in e505332c did not
+demonstrably fire during a 22-tool-call live turn. No watcher or judge activity
+appears in the daemon log and no `goal_alignment_judged` event was emitted.
+Silence is the correct behavior when a run is on track, since the watcher only
+speaks on drift, so this is unverified rather than known-broken. It should be
+verified deliberately before anyone claims it is live.
