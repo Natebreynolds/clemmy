@@ -1080,6 +1080,48 @@ export function recordsAtRecordPath(payload: unknown, recordPath: string | null)
 }
 
 /** Pure host interpretation of raw provider result bytes. */
+
+/**
+ * A reviewed-CLI read settles as a process observation — `{version: 1,
+ * status, operationId, executableRealpath, argv, exitCode, stdout, stderr, …}`,
+ * usually inside the sealed `{result, complete: true}` invoke envelope. Its
+ * records live in the stdout JSON document, not in the observation: record
+ * discovery on the observation itself picked `argv` (seven tokens) as "the
+ * records" of every Friday-dashboard SOQL read (2026-09-02). Project from the
+ * parsed stdout with the exact path prefix so a redeemed record path resolves.
+ */
+function reviewedCliObservationPayload(result: unknown): {
+  payload: unknown;
+  pathPrefix: string;
+  success: boolean;
+  exitCode: number | null;
+} | null {
+  const sealed = exactSealedInvokeResult(result);
+  const observation = asRecord(sealed.status === 'valid' ? sealed.payload : result);
+  if (
+    !observation
+    || observation.version !== 1
+    || typeof observation.status !== 'string'
+    || typeof observation.operationId !== 'string'
+    || typeof observation.executableRealpath !== 'string'
+    || !Array.isArray(observation.argv)
+    || typeof observation.stdout !== 'string'
+  ) return null;
+  const exitCode = typeof observation.exitCode === 'number' ? observation.exitCode : null;
+  const success = observation.status === 'exited' && (exitCode === null || exitCode === 0);
+  const prefix = sealed.status === 'valid' ? 'result.stdout' : 'stdout';
+  const text = observation.stdout.trim();
+  if (!success) return { payload: null, pathPrefix: prefix, success, exitCode };
+  if (!text.startsWith('{') && !text.startsWith('[')) {
+    return { payload: null, pathPrefix: prefix, success, exitCode };
+  }
+  try {
+    return { payload: JSON.parse(text) as unknown, pathPrefix: prefix, success, exitCode };
+  } catch {
+    return { payload: null, pathPrefix: prefix, success, exitCode };
+  }
+}
+
 export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandleFacts {
   try {
     const mcp = exactMcpResultPayload(result);
@@ -1095,14 +1137,43 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
         cursor: null,
       };
     }
-    const interpreted = mcp ? mcp.payload : result;
+    const cli = reviewedCliObservationPayload(result);
+    const interpreted = cli ? cli.payload : mcp ? mcp.payload : result;
+    const pathPrefix = cli ? cli.pathPrefix : mcp?.pathPrefix ?? null;
     const envelope = asRecord(interpreted);
+    if (cli && !cli.success) {
+      return {
+        success: false,
+        recordPath: null,
+        recordCount: 0,
+        envelopeMeta: null,
+        completeness: 'unknown',
+        projectedRecords: [],
+        statusCode: cli.exitCode,
+        cursor: null,
+      };
+    }
+    if (cli && !envelope) {
+      // A reviewed-CLI read whose stdout is not a JSON document has no records
+      // to project; its evidence is the text itself, redeemable from the raw
+      // handle. Never count argv tokens as records.
+      return {
+        success: true,
+        recordPath: null,
+        recordCount: 0,
+        envelopeMeta: null,
+        completeness: 'unknown',
+        projectedRecords: [],
+        statusCode: cli.exitCode,
+        cursor: null,
+      };
+    }
     if (!envelope) {
       const records = Array.isArray(interpreted) ? interpreted : [];
       return {
         success: mcp?.isError !== true,
         recordPath: Array.isArray(interpreted)
-          ? prefixedRecordPath(mcp?.pathPrefix ?? null, '')
+          ? prefixedRecordPath(pathPrefix, '')
           : null,
         recordCount: records.length,
         envelopeMeta: null,
@@ -1143,7 +1214,7 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
 
     return {
       success,
-      recordPath: prefixedRecordPath(mcp?.pathPrefix ?? null, found?.path ?? null),
+      recordPath: prefixedRecordPath(pathPrefix, found?.path ?? null),
       recordCount: found?.records.length ?? 0,
       envelopeMeta: meta.value,
       completeness: !success || meta.malformed || pagination.malformed

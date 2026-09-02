@@ -429,7 +429,7 @@
           "bytes": 2135
         },
         "src/runtime/harness/result-facts.ts": {
-          "bytes": 43944
+          "bytes": 46694
         },
         "src/runtime/harness/result-handle.ts": {
           "bytes": 50327
@@ -2916,7 +2916,7 @@
           "bytes": 2135
         },
         "src/runtime/harness/result-facts.ts": {
-          "bytes": 43944
+          "bytes": 46694
         },
         "src/runtime/harness/result-handle.ts": {
           "bytes": 50327

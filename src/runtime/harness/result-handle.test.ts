@@ -925,3 +925,46 @@ test('SDK-shaped payloads (undefined props, class instances) persist and redeem'
     'the retained SDK-shaped result redeems to its one canonical JSON value',
   );
 });
+
+test('a reviewed-CLI observation projects its records from the stdout document, never from argv', () => {
+  const records = [
+    { attributes: { type: 'Opportunity' }, Id: '006A', Name: 'Alpha' },
+    { attributes: { type: 'Opportunity' }, Id: '006B', Name: 'Beta' },
+  ];
+  const observation = {
+    version: 1,
+    status: 'exited',
+    operationId: 'salesforce_sf_soql_query',
+    executableRealpath: '/usr/local/lib/sf/bin/sf',
+    argv: ['data', 'query', '--json', '--query', 'SELECT Id, Name FROM Opportunity', '--target-org', 'me'],
+    exitCode: 0,
+    signal: null,
+    stdout: JSON.stringify({ status: 0, result: { records, totalSize: 2, done: true } }),
+    stderr: ' ›   Warning: @salesforce/cli update available.\n',
+    stdoutTruncated: false,
+    stderrTruncated: false,
+  };
+  // Sealed invoke envelope (the production shape) — path prefix names the seal.
+  const sealed = resultFacts.deriveResultHandleFactsFromRaw({ result: observation, complete: true });
+  assert.equal(sealed.success, true);
+  assert.equal(sealed.recordPath, 'result.stdout.result.records');
+  assert.equal(sealed.recordCount, 2);
+  assert.deepEqual(sealed.projectedRecords.map((r) => (r as { Id: string }).Id), ['006A', '006B']);
+  // Bare observation — same records, bare prefix.
+  const bare = resultFacts.deriveResultHandleFactsFromRaw(observation);
+  assert.equal(bare.recordPath, 'stdout.result.records');
+  assert.equal(bare.recordCount, 2);
+  // A nonzero exit is not a success and projects nothing.
+  const failed = resultFacts.deriveResultHandleFactsFromRaw({
+    result: { ...observation, status: 'nonzero_exit', exitCode: 1, stdout: JSON.stringify({ status: 1, name: 'MALFORMED_QUERY', message: 'bad' }) },
+    complete: true,
+  });
+  assert.equal(failed.success, false);
+  assert.equal(failed.recordCount, 0);
+  assert.equal(failed.recordPath, null);
+  // Plain-text stdout: no records, and argv is never mistaken for them.
+  const text = resultFacts.deriveResultHandleFactsFromRaw({ result: { ...observation, stdout: 'three lines\nof text\nhere' }, complete: true });
+  assert.equal(text.success, true);
+  assert.equal(text.recordCount, 0);
+  assert.equal(text.recordPath, null);
+});
