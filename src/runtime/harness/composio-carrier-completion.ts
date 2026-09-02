@@ -36,6 +36,22 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
+/** A model sometimes wraps the real provider arguments in an extra envelope:
+ * `arguments: { "args": { channel, limit } }` (live 2026-09-02, GLM 5.3, a
+ * Slack read — the provider then reports "/channel missing"). If a decoded
+ * arguments object is exactly one `args`/`arguments` key wrapping an object,
+ * unwrap it once. Deterministic; a real operation whose sole parameter is
+ * literally named `args`/`arguments` and is an object is vanishingly rare and
+ * the unwrapped call still validates against the provider schema. */
+function unwrapDoubledArgsEnvelope(value: Record<string, unknown>): Record<string, unknown> {
+  const keys = Object.keys(value);
+  if (keys.length !== 1) return value;
+  const only = keys[0]!;
+  if (only !== 'args' && only !== 'arguments') return value;
+  const inner = asRecord(value[only]);
+  return inner ?? value;
+}
+
 function decodeInner(raw: unknown): Record<string, unknown> | null {
   if (typeof raw === 'string') {
     try { return asRecord(JSON.parse(raw)); } catch { return null; }
@@ -102,7 +118,7 @@ export function completeComposioCarrierArguments(
     let argumentsString: string | null;
     if (opArgs === null || opArgs === undefined) argumentsString = null;
     else if (typeof opArgs === 'string') argumentsString = opArgs;
-    else if (asRecord(opArgs)) argumentsString = JSON.stringify(opArgs);
+    else if (asRecord(opArgs)) argumentsString = JSON.stringify(unwrapDoubledArgsEnvelope(asRecord(opArgs)!));
     else return null;
     const completedInner: Record<string, unknown> = { tool_slug: bareSlug, arguments: argumentsString };
     const completedOuter: Record<string, unknown> = { name: GATEWAY_TAIL, args_json: JSON.stringify(completedInner) };
@@ -160,9 +176,18 @@ export function completeComposioCarrierArguments(
   if (argumentsValue === null || argumentsValue === undefined) {
     argumentsString = null;
   } else if (typeof argumentsValue === 'string') {
-    argumentsString = argumentsValue;
+    const decodedStr = decodeInner(argumentsValue);
+    const unwrappedStr = decodedStr ? unwrapDoubledArgsEnvelope(decodedStr) : null;
+    if (decodedStr && unwrappedStr !== decodedStr) {
+      argumentsString = JSON.stringify(unwrappedStr);
+      changes.push('extra args envelope unwrapped');
+    } else {
+      argumentsString = argumentsValue;
+    }
   } else if (asRecord(argumentsValue)) {
-    argumentsString = JSON.stringify(argumentsValue);
+    const unwrapped = unwrapDoubledArgsEnvelope(asRecord(argumentsValue)!);
+    if (unwrapped !== asRecord(argumentsValue)) changes.push('extra args envelope unwrapped');
+    argumentsString = JSON.stringify(unwrapped);
     changes.push('arguments object serialized once');
   } else {
     return null;

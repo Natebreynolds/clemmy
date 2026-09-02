@@ -140,3 +140,28 @@ test('a bare provider operation name in the carrier slot (GLM 5.3 cold-chat shap
   // A single-token name is not a provider slug.
   assert.equal(completeComposioCarrierArguments(JSON.stringify({ name: 'frobnicate', args_json: '{}' }), []), null);
 });
+
+test('an extra {args:{...}} envelope inside arguments is unwrapped once (GLM 5.3 Slack read)', () => {
+  const proven = [{ kind: 'composio', identifier: 'SLACK_FETCH_CONVERSATION_HISTORY', effectClass: 'read' }];
+  // The gateway form with the doubled envelope.
+  const wrapped = JSON.stringify({
+    name: 'composio_execute_tool',
+    args_json: JSON.stringify({ tool_slug: 'SLACK_FETCH_CONVERSATION_HISTORY', arguments: JSON.stringify({ args: { channel: 'C0BL9LLUSBD', limit: 20 } }) }),
+  });
+  const completed = completeComposioCarrierArguments(wrapped, proven);
+  assert.ok(completed);
+  const inner = JSON.parse((JSON.parse(completed!.argumentsJson) as { args_json: string }).args_json) as { arguments: string };
+  assert.deepEqual(JSON.parse(inner.arguments), { channel: 'C0BL9LLUSBD', limit: 20 }, 'the extra args envelope is gone');
+  assert.match(completed!.changes.join(' | '), /extra args envelope unwrapped/);
+
+  // A dotted bare name with the same doubled envelope as a top-level object.
+  const dotted = completeComposioCarrierArguments(JSON.stringify({ name: 'slack.fetch_conversation_history', args_json: { args: { channel: 'C1', limit: 5 } } }), []);
+  assert.ok(dotted);
+  const di = JSON.parse((JSON.parse(dotted!.argumentsJson) as { args_json: string }).args_json) as { arguments: string };
+  assert.deepEqual(JSON.parse(di.arguments), { channel: 'C1', limit: 5 });
+
+  // A real two-key arguments object is NOT unwrapped.
+  const real = completeComposioCarrierArguments(JSON.stringify({ name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: 'X', arguments: { channel: 'C1', limit: 5 } }) }), []);
+  const ri = JSON.parse((JSON.parse(real!.argumentsJson) as { args_json: string }).args_json) as { arguments: string };
+  assert.deepEqual(JSON.parse(ri.arguments), { channel: 'C1', limit: 5 });
+});
