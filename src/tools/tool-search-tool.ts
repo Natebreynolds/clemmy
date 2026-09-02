@@ -411,6 +411,19 @@ export type ToolSearchCandidateSourceKind =
  * operation identity is wrapped by a stable business carrier (for example an
  * action slug passed to a generic executor) without teaching that shape to the
  * broker itself. */
+/** A literal call the model can copy, with only the action arguments left to
+ * fill. Live 2026-09-01: an abstract hint ("inner name/args_json of
+ * work_call") plus a structured `invocation` object was not enough for GLM 5.3,
+ * which put the action arguments where tool_slug belongs. */
+export function renderCarrierInvocationExample(
+  carrier: string,
+  invocation: { name: string; fixedArgs?: Record<string, unknown>; payloadField?: string },
+): { tool: string; args: { name: string; args_json: string } } {
+  const payloadField = invocation.payloadField ?? 'arguments';
+  const inner = { ...(invocation.fixedArgs ?? {}), [payloadField]: { '<argument>': '<value>' } };
+  return { tool: carrier, args: { name: invocation.name, args_json: JSON.stringify(inner) } };
+}
+
 export interface ToolSearchBrokerCandidate {
   name: string;
   summary: string;
@@ -1283,7 +1296,8 @@ export function registerToolSearchTool(
         }
         if (exactCarrier) return dispatchHint(exactCarrier);
         if (opts.dispatchCarrierForName) {
-          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool.';
+          return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
+            + 'For a business result, args_json is ONE JSON string of {"tool_slug": "<the result name>", "arguments": {<the action arguments as an object>}} — copy the result\'s `example` and replace only the arguments; do not serialize the arguments object a second time.';
         }
         const fixedCarrier = opts.dispatchCarrier
           ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
@@ -1336,6 +1350,14 @@ export function registerToolSearchTool(
                 ? { carrier: opts.dispatchCarrier }
                 : {}),
           ...('invocation' in r && r.invocation ? { invocation: r.invocation } : {}),
+          ...('invocation' in r && r.invocation
+            ? { example: renderCarrierInvocationExample(
+                'carrier' in r && r.carrier
+                  ? r.carrier
+                  : (opts.dispatchCarrierForName?.(r.name) ?? opts.dispatchCarrier ?? 'work_call'),
+                r.invocation,
+              ) }
+            : {}),
       });
 
       const formatPage = (

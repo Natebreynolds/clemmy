@@ -156,6 +156,7 @@ import {
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
 import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
+import { completeComposioCarrierArguments } from './composio-carrier-completion.js';
 import {
   catalogOperationIdentitiesEqual,
   isPlainOrClementineLocalTool,
@@ -6469,7 +6470,38 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     try {
       const frameCalls = canonicalCalls.map((call) => {
         const tool = toolByName.get(call.name);
-        const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+        let argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+        // Complete a structurally wrong Composio carrier from facts the host
+        // already holds (composio-carrier-completion.ts): the one operation
+        // proven this turn, the `arguments` wrapper, one serialization. The
+        // completed bytes are what this frame classifies AND dispatches, so the
+        // settlement and the learned pin record the working shape.
+        if (
+          hostProduction
+          && tool
+          && (isPlainOrClementineLocalTool(call.name, 'work_call') || isPlainOrClementineLocalTool(call.name, 'call_tool'))
+        ) {
+          let provenEntries: ReturnType<typeof provenCapabilityEntriesForTurn> = [];
+          try {
+            const completionIdentity = exactHostIdentity();
+            provenEntries = provenCapabilityEntriesForTurn({
+              sessionId: completionIdentity.sessionId,
+              sourceUserSeq: completionIdentity.sourceUserSeq,
+            });
+          } catch { /* no accepted identity: nothing proven this turn */ }
+          const completed = completeComposioCarrierArguments(argumentsJson, provenEntries);
+          if (completed) {
+            argumentsJson = completed.argumentsJson;
+            (call as { argumentsJson: string }).argumentsJson = completed.argumentsJson;
+            hostTurnLogger.info({
+              sessionId: exactHostIdentity().sessionId,
+              callId: call.callId,
+              carrier: call.name,
+              toolSlug: completed.toolSlug,
+              changes: completed.changes,
+            }, 'host completed a Composio carrier from the turn\'s proven disclosure');
+          }
+        }
         const argumentsValue = parsedArgs(argumentsJson);
         // The fused frame is classified before plan_task has materialized its
         // selected catalog rows. At this scheduling-only edge, an exact
