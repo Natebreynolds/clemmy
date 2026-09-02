@@ -2998,6 +2998,8 @@ export interface RunTurnOptions {
   agent: Agent<any, any>;
   sessionId: string;
   input: string;
+  /** The surface's completion-judge opt-in, carried onto the host lane. */
+  judgeCompletion?: boolean;
   /** Caller-owned cancellation for this physical turn. The host maps it to
    * the same typed killed terminal as an observed kill request, while tool
    * deadlines and uncertain writes retain their distinct outcomes. */
@@ -5535,6 +5537,7 @@ async function runConversationWithinRuntimeConfig(
         agent: activeAgent,
         sessionId: options.sessionId,
         input: options.input,
+        judgeCompletion: options.judgeCompletion,
         sourceUserSeq,
         runAttemptId: options.runAttemptId,
         ...(options.deferToolCallsLimitTerminal
@@ -5988,6 +5991,7 @@ async function runConversationCore(
       agent: currentAgent,
       sessionId: options.sessionId,
       input: nextInput,
+      judgeCompletion: options.judgeCompletion,
       // Only the FIRST turn of the core inherits the node's warm; a
       // continuation turn has its own input and warms itself.
       ...(options.contextWarmedAtNode && stepIndex === 1 ? { contextWarmedAtNode: true } : {}),
@@ -10658,6 +10662,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     if (usesHostTurnEngine) {
       opts.hostTurnEngine = selectedTurnEngine;
       if (selectedTurnEngine === 'host_v1_read_only') opts.hostReadOnlyCanary = true;
+      // The completion judge follows the surface's opt-in onto the host lane
+      // (2026-09-01: it only ever ran in the legacy core, which host_v1 never
+      // enters — every live reply shipped unjudged).
+      opts.hostJudgeCompletion = options.judgeCompletion === true;
       opts.hostPreviousResponseId = session.previousResponseId();
     }
     // Hoisted so the post-turn auto-credit hook can read the recall runs the
@@ -10931,6 +10939,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 // ---------- resume after approval ----------
 
 export interface ResumePendingApprovalOptions {
+  /** The surface's completion-judge opt-in, carried onto the host lane. */
+  judgeCompletion?: boolean;
   agent: Agent<any, any>;
   sessionId: string;
   /** Durable outer request attempt. The resumed SDK state must retain the
@@ -11456,6 +11466,7 @@ export async function resumePendingApproval(
     if (usesHostTurnEngine) {
       opts.hostTurnEngine = selectedTurnEngine;
       if (selectedTurnEngine === 'host_v1_read_only') opts.hostReadOnlyCanary = true;
+      opts.hostJudgeCompletion = options.judgeCompletion === true;
       safeAppend({
         sessionId: options.sessionId,
         turn,

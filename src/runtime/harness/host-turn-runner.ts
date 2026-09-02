@@ -71,7 +71,17 @@ import {
   type DispatchLeaseRef,
 } from './dispatch-lease.js';
 import pino from 'pino';
-import { getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
+import { appendEvent, getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
+import * as approvalRegistry from './approval-registry.js';
+import { classifyMessageIntent } from '../../assistant/message-intent.js';
+import {
+  isPromiseShapedReply,
+  judgeObjectiveComplete,
+  shouldRunObjectiveJudge,
+  type ObjectiveJudgeVerdict,
+} from './objective-judge.js';
+import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
+import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import {
   isHostDurableContinuationPendingError,
   type HostDurableContinuationPendingError,
@@ -89,6 +99,27 @@ const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
  * for the calls it promised, a bounded number of times.
  */
 export const MAX_HOST_CONTINUE_MARKER_CONTINUATIONS = 3;
+
+/**
+ * Completion judge on the host lane. The objective judge — the independent,
+ * cross-family check of the final reply against the ORIGINAL request — lived
+ * only in the legacy core (loop.ts runConversationCore), which the host engine
+ * never enters, so every live host_v1 reply shipped unjudged (2026-09-01).
+ * Same gate (shouldRunObjectiveJudge), same judge (judgeObjectiveComplete,
+ * hedged across families), same bounded continuation: a NOT DONE verdict rides
+ * the one-shot directive channel and the turn keeps working; a done, failed-
+ * open or awaiting-user verdict completes. Test seam: _setHostObjectiveJudgeForTests.
+ */
+export const MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS = 2;
+type HostObjectiveJudge = typeof judgeObjectiveComplete;
+let hostObjectiveJudge: HostObjectiveJudge = judgeObjectiveComplete;
+export function _setHostObjectiveJudgeForTests(judge: HostObjectiveJudge | null): void {
+  hostObjectiveJudge = judge ?? judgeObjectiveComplete;
+}
+/** Host controls are not business evidence for the judge gate. */
+const HOST_JUDGE_CONTROL_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'tool_search', 'recall_tool_result', 'workflow_step_result', 'plan_task', 'ask_user_question', 'retry_host',
+]);
 import {
   ModelStreamStalledError,
   sizedFirstByteStallMs,
@@ -1688,6 +1719,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const hostTurnEngine = optionTurnEngine;
   const hostReadOnlyCanary = hostTurnEngine === 'host_v1_read_only';
   const hostProduction = hostTurnEngine === 'host_v1';
+  const hostJudgeCompletion = hostProduction
+    && (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true;
   const configuredHostApprovalId = (opts as { hostApprovalId?: unknown }).hostApprovalId;
   const configuredHostApprovalIds = (opts as { hostApprovalIds?: unknown }).hostApprovalIds;
   const hostApprovalIds = new Set<string>();
@@ -2195,6 +2228,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let continueMarkerContinuationsUsed = 0;
   let pendingHostModelDirective: string | undefined;
   let lastContinueMarkerNote: string | undefined;
+  let objectiveJudgeContinuations = 0;
   const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
     ? itemsOrState.noProgressCheckpoint
@@ -2274,6 +2308,130 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       ...(blockedDetail ? { blockedDetail } : {}),
     };
     return outcome;
+  };
+
+  /** The request this turn is judged against: the accepted source event's
+   * text, else the last user message of the initial input. */
+  const judgedObjective = (): string => {
+    try {
+      const identity = exactHostIdentity();
+      const accepted = listEvents(identity.sessionId, {
+        sinceSeq: identity.sourceUserSeq - 1,
+        types: ['user_input_received'],
+        limit: 1,
+      }).find((event) => event.seq === identity.sourceUserSeq);
+      const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText : '';
+      const text = display.trim() ? display : (typeof accepted?.data.text === 'string' ? accepted.data.text : '');
+      if (text.trim()) return text;
+    } catch { /* fall through to the initial input */ }
+    if (!Array.isArray(itemsOrState)) return '';
+    for (let index = itemsOrState.length - 1; index >= 0; index -= 1) {
+      const item = itemsOrState[index] as { role?: unknown; content?: unknown };
+      if (item.role !== 'user') continue;
+      if (typeof item.content === 'string' && item.content.trim()) return item.content;
+      if (Array.isArray(item.content)) {
+        const text = item.content
+          .map((part) => (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string'
+            ? (part as { text: string }).text
+            : ''))
+          .join('\n')
+          .trim();
+        if (text) return text;
+      }
+    }
+    return '';
+  };
+
+  /** Run the completion judge on a final reply. 'continue' means the judge
+   * asked for more work and the directive is armed; 'done' means deliver. */
+  const judgeHostCompletion = async (
+    replyText: string,
+    frameHistory: readonly AgentInputItem[],
+    responseId: string | undefined,
+  ): Promise<'continue' | 'done'> => {
+    const objective = judgedObjective();
+    if (!objective.trim()) return 'done';
+    const identity = exactHostIdentity();
+    const decision = toOrchestratorDecision(replyText);
+    const businessCalls = history.filter((item) => {
+      const row = item as { type?: unknown; name?: unknown };
+      return row.type === 'function_call' && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
+    });
+    let openApprovalCard = false;
+    try { openApprovalCard = approvalRegistry.listPending({ sessionId: identity.sessionId }).length > 0; } catch { /* no card */ }
+    // Same gate as the legacy core: a completion claim with NO business tool
+    // evidence, a promise-shaped reply, or a compound ask that one tool cannot
+    // certify — settled tool results are their own evidence otherwise.
+    const gate = shouldRunObjectiveJudge({
+      optIn: true,
+      actionIntent: classifyMessageIntent(objective).intent === 'action',
+      meaningfulToolEvidence: businessCalls.length > 0,
+      multiResultObjective: objectiveMayRequireMultipleResults(objective),
+      acceptedExecutionEvidence: false,
+      continuationsUsed: objectiveJudgeContinuations,
+      maxContinuations: MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS,
+      // A plain reply with no marker or envelope IS the done shape
+      // (turn-decision.ts returns null for it); ASK: keeps its own reading.
+      nextAction: decision?.nextAction ?? 'completed',
+      promiseShaped: isPromiseShapedReply(decision?.reply ?? replyText),
+      openApprovalCard,
+    });
+    if (!gate) return 'done';
+    const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
+    let verdict: ObjectiveJudgeVerdict;
+    try {
+      verdict = await hostObjectiveJudge(objective, judgedReply, {
+        skills: gatherSessionSkills(identity.sessionId),
+        toolCallSummary: summarizeToolCallsForJudge(identity.sessionId),
+      });
+    } catch (error) {
+      verdict = {
+        done: true,
+        reason: `judge threw — accepting completion: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300),
+        failedOpen: true,
+      };
+    }
+    const continuation = !verdict.done && !verdict.awaitingUser;
+    try {
+      appendEvent({
+        sessionId: identity.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'goal_alignment_judged',
+        data: {
+          lane: 'host_v1',
+          kind: 'completion',
+          fulfills: verdict.done,
+          reason: verdict.reason.slice(0, 600),
+          ...(verdict.failedOpen ? { failedOpen: true } : {}),
+          ...(verdict.selfJudge ? { selfJudge: true } : {}),
+          ...(verdict.awaitingUser ? { awaitingUser: true } : {}),
+          continuation,
+          continuationsUsed: objectiveJudgeContinuations,
+        },
+      });
+    } catch { /* telemetry never blocks the reply */ }
+    hostTurnLogger.info({
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+      done: verdict.done,
+      failedOpen: verdict.failedOpen === true,
+      selfJudge: verdict.selfJudge === true,
+      continuation,
+      reason: verdict.reason.slice(0, 200),
+    }, 'host completion judge');
+    if (!continuation) return 'done';
+    objectiveJudgeContinuations += 1;
+    // The reply stays in history (the model must see what it claimed); the
+    // judge's gaps ride the one-shot directive, never canonical history.
+    history.push(...frameHistory);
+    if (responseId !== undefined) lastResponseId = responseId;
+    pendingHostModelDirective = [
+      `COMPLETION JUDGE (an independent check of your last reply against the original request) says NOT DONE: ${verdict.reason.slice(0, 400)}`,
+      'Close these specific gaps now with tool calls and verifiable evidence, then give the final result.',
+      'If a part is genuinely impossible, say so with the concrete blocker instead of declaring done without it.',
+    ].join(' ');
+    return 'continue';
   };
 
   const recoveryOutcome = (input: {
@@ -6202,6 +6360,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           }, 'host kept the turn open for a CONTINUE marker');
           continue;
         }
+      }
+      if (hostJudgeCompletion) {
+        const judged = await judgeHostCompletion(admission.frame.text, admission.frame.history, step.responseId);
+        if (judged === 'continue') continue;
       }
       history.push(...admission.frame.history);
       if (step.responseId !== undefined) lastResponseId = step.responseId;

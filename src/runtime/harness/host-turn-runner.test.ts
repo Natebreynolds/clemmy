@@ -8250,3 +8250,124 @@ test('JIT read edge: a reviewed-CLI identity is recognised by shape, never a pro
   assert.equal(isReviewedLiveReadIdentity('composio'), false, 'a single word is neither');
   assert.equal(isReviewedLiveReadIdentity('Mixed_Case'), false);
 });
+
+
+// --- completion judge on the host lane (2026-09-01) ---
+function scriptedRecordingModel(responses: unknown[][]) {
+  let call = 0;
+  const requests: unknown[] = [];
+  return {
+    calls: () => call,
+    requests,
+    async getResponse(request: unknown) {
+      requests.push(request);
+      const output = responses[Math.min(call, responses.length - 1)]!;
+      call += 1;
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+        output,
+        responseId: `judged-resp-${call}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+}
+
+/** A real accepted source whose text is the request the judge measures against. */
+function acceptJudgedSource(label: string, text: string) {
+  const session = eventlog.createSession({ id: `host-judged-${++acceptedSerial}-${label}`, kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text },
+  });
+  const parent = {
+    sessionId: session.id,
+    sourceUserSeq: source.seq,
+    counter: new brackets.ToolCallsCounter(8),
+    behaviorScopeId: `${session.id}::turn:1`,
+  };
+  return { session, source, parent, context: { sessionId: session.id, sourceUserSeq: source.seq } };
+}
+
+function runJudgedHost(
+  fixture: ReturnType<typeof acceptJudgedSource>,
+  agent: Record<string, unknown>,
+  judgeCompletion: boolean,
+) {
+  return brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never,
+    agent as never,
+    [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+    { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: judgeCompletion } as never,
+  ));
+}
+
+test('production host runs the completion judge on a completion claim with no tool evidence and keeps working when it says NOT DONE (directive never in history)', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const verdicts = [
+    { done: false, reason: 'nothing was posted: no tool ran and no link is shown' },
+    { done: true, reason: 'the reply names the concrete blocker and hands over the draft' },
+  ];
+  const judged: Array<{ objective: string; reply: string }> = [];
+  _setHostObjectiveJudgeForTests(async (objective, reply) => {
+    judged.push({ objective, reply });
+    return verdicts.shift() ?? { done: true, reason: 'ok' };
+  });
+  try {
+    const fixture = acceptJudgedSource('judge-continue', 'Post the summary to the channel');
+    const model = scriptedRecordingModel([
+      [textMsg('Done: posted the summary to the channel.')],   // a claim with zero evidence — the silent-success shape
+      [textMsg('I could not post it: no channel tool is available in this session. Here is the summary text to paste.')],
+    ]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.match(String(outcome.finalOutput), /could not post it/, 'the judged claim was replaced by an honest, evidenced reply');
+    assert.equal(model.calls(), 2);
+    assert.equal(judged.length, 2, 'both candidate replies were judged');
+    assert.match(judged[0]!.objective, /Post the summary to the channel/);
+    assert.match(judged[0]!.reply, /posted the summary/);
+    const second = JSON.stringify(model.requests[1]);
+    assert.match(second, /COMPLETION JUDGE/, 'the NOT DONE verdict reached the model as a directive');
+    assert.match(second, /nothing was posted/);
+    assert.equal(JSON.stringify(outcome.history).includes('COMPLETION JUDGE'), false, 'the directive is a one-shot request layer, never canonical history');
+    assert.match(JSON.stringify(outcome.history), /Done: posted the summary/, 'the judged claim stays in history so the model sees what it said');
+    const judgedEvents = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+    assert.equal(judgedEvents.length, 2, 'each verdict is durable');
+    assert.equal(judgedEvents[0]!.data.fulfills, false);
+    assert.equal(judgedEvents[0]!.data.continuation, true);
+    assert.equal(judgedEvents[1]!.data.fulfills, true);
+  } finally {
+    _setHostObjectiveJudgeForTests(null);
+  }
+});
+
+test('the completion judge is bounded: after MAX continuations the reply stands; it never runs without opt-in or on a non-action ask', async () => {
+  const { _setHostObjectiveJudgeForTests, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } = await import('./host-turn-runner.js');
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => { judgeCalls += 1; return { done: false, reason: 'still nothing posted' }; });
+  try {
+    const stubbornFixture = acceptJudgedSource('judge-bounded', 'Post the summary to the channel');
+    const stubbornAgent = { model: stubModel([[textMsg('Done: posted the summary to the channel.')]]), tools: [] };
+    bindHostCanarySurface(stubbornFixture, stubbornAgent, []);
+    const stubborn = await runJudgedHost(stubbornFixture, stubbornAgent, true);
+    assert.equal(stubborn.finalOutput, 'Done: posted the summary to the channel.');
+    assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS, 'bounded continuations, then the reply stands');
+
+    judgeCalls = 0;
+    const noOptInFixture = acceptJudgedSource('judge-no-opt-in', 'Post the summary to the channel');
+    const noOptInAgent = { model: stubModel([[textMsg('Done: posted the summary to the channel.')]]), tools: [] };
+    bindHostCanarySurface(noOptInFixture, noOptInAgent, []);
+    const noOptIn = await runJudgedHost(noOptInFixture, noOptInAgent, false);
+    assert.equal(noOptIn.finalOutput, 'Done: posted the summary to the channel.');
+    assert.equal(judgeCalls, 0, 'no opt-in (workflow/cron surfaces): never judged');
+
+    const questionFixture = acceptJudgedSource('judge-question', 'What is the capital of France?');
+    const questionAgent = { model: stubModel([[textMsg('Paris.')]]), tools: [] };
+    bindHostCanarySurface(questionFixture, questionAgent, []);
+    const question = await runJudgedHost(questionFixture, questionAgent, true);
+    assert.equal(question.finalOutput, 'Paris.');
+    assert.equal(judgeCalls, 0, 'a question is conversation, not an unverified work claim');
+  } finally {
+    _setHostObjectiveJudgeForTests(null);
+  }
+});
