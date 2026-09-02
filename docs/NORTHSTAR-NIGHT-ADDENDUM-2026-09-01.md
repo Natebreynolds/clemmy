@@ -860,3 +860,42 @@ same sixteen, all reproduced at the 09-01 baseline. Dev daemon back on the same 
 
 Rule: a pin that assumes timer-phase adjacency is a candidate for the flake
 ledger, not for a wider timeout.
+
+## Gate 29 — the goal's four dimensions, measured and made visible (2026-09-02 04:40–05:30 PDT)
+
+The stop-hook restated the goal (persistent memory → intelligence, token
+efficiency, proactiveness, UI on desktop and mobile) and was right that the
+night's harness work had shown none of it as observable state. Three maps
+and one ledger query later:
+
+**Token efficiency (measured, same brain).** `model_route_outcomes` joined to
+`model_route_decisions` for workflow frames served by glm-5.2: 31,535 input
+tokens per frame on 08-31 (56 frames) → 22,965 after the wave (160 frames),
+a 27% cut per frame; platform-49 fell from 11.2 to 9.6 frames per run. The
+step efficiency advisory (`usageEfficiencyForSource`) already writes frames,
+cache-hit share, and largest prompt per step to the run's events.jsonl. What
+the ledger cannot show yet: a per-run reduction on the same workflow, because
+run→workflow linkage starts 08-31. Last night's standup step: 70,215 output
+tokens in 4 frames — the model hang the response wall (gate 26) now caps.
+
+**Memory compounds (b70ec044).** The proven-step pin writer only saw bare
+gateway calls; a provider call that crossed wrapped in work_call/call_tool
+(exactly the shape the host completes) was never pinned, so run N+1
+re-derived, re-stuttered, and re-refused. The writer now lifts both shapes.
+Still open, recorded: the pin is consumed as prose ("Try this FIRST"); the
+host-side executing path (`resolveWorkflowStepPinDispatch`) exists, is
+tested, and has zero production callers — wiring it is the next compounding
+step (run N+1 skips the derivation entirely). Workflow sessions never link
+to their predecessor (`cross_session_prefix` is Discord-only).
+
+**Proactive + UI (b70ec044).** One typed stop (capability gate) was fully
+built with buttons on both Inbox screens, but the Tasks board read only the
+mutation block (a gated run showed as Running) and no needs-you count
+counted it; a binding gap was a 409 at click time and nothing else. Now the
+board, the shared snapshot (notch, Discord), Slack App Home, and the mobile
+count all count both stop types; the board card carries a typed `nextEdge`
+(link button) to the exact Inbox gate or into Automate; the phone lists the
+gaps and Run now explains the stop.
+
+Rule: a stop that only exists as an HTTP status at click time is not a
+typed stop. Every stop is a row somewhere a count can read.
