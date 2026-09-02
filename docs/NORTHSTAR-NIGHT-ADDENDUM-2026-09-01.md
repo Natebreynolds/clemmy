@@ -499,3 +499,30 @@ tools to migrate workflows, or legacy ones still need to be able to run."
 - **Also landed:** Working Now shows host-run execution sessions immediately, named by workflow and
   attempt (`eab3c531`); the migration primitive drafts exact steps from a runner's source and the rewrite
   lane starts from that draft (`edb963ef`).
+
+### Later (22:00–22:45 PT): the fleet pass — every scheduled driver, first wall, class, fix
+Owner: "What other improvements against my goal do you want to make?" Answer ranked by evidence: over
+48h every scheduled workflow failed at least once; each first wall is a class.
+- **team-activity-slack-updates** — a locked step (`allowedTools`) never sealed a capability envelope;
+  the host refused it before the first model call (`capability_envelope_missing`) and chat relayed it as
+  "reconnect your Slack workspace?" → `3bb83a40` (locked steps seal exactly their surface).
+- **morning-briefing** — `notify_user` was registry `sideEffect: read`, so a send step whose whole job is
+  a notification settled with zero mutations → "no business evidence" → `eec1b322` (runtime effect
+  `host_only`; taxonomy class unchanged).
+- **scorpion-facebook-trends** — four walls in one step: FIRECRAWL_SCRAPE classified a write with no
+  manifest (census D1) and the JIT edge refused two-token slugs → `8a1e783d`; the toolkit cache was 46h
+  old and read as EMPTY so `firecrawl` was "not a toolkit" → `188bb3f9` (age is not identity);
+  `composio_search_tools` in `allowedTools` was uppercased into a phantom COMPOSIO_SEARCH_TOOLS
+  operation → capability block → extractor fix (local tool names and the platform plane are never
+  provisioned). The parked run resumed on the fix and passed step 1.
+- **daily-standup-email** — definition typo `OUTLOOK_OUTLOOK_SEND_EMAIL` → `OUTLOOK_SEND_EMAIL` (vault
+  edit with a backup beside it).
+- **weekly-review** — "claimed to write but never called its tool" ×13 was the named-workflow shortcut
+  reading the step's own "Workflow: weekly-review" prompt as a run request (fixed 08-31 `46fccea6`,
+  after the streak); re-run tonight to confirm.
+- **Voice** (`7d8922fc`, `f58a6abc`): the three host blocked texts and the queued-run reply now read as
+  a person: what happened, what is kept, what to do; the run id and Working Now are named.
+- **Open, recorded in memory:** the session reaper has failed hourly since ≤08-31 (`FOREIGN KEY
+  constraint failed` — ~10 tables restrict event deletion) so no old session is ever reaped and
+  harness.db sits at 1.2 GB; platform-49's 21 bad runs are mostly my own ~15 daemon restarts
+  interrupting scheduled runs (its 15:00 run succeeded and produced the sheet).
