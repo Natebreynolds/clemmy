@@ -202,9 +202,8 @@ test('a faithful improvement turn is applied, a drifting one is reverted byte-fo
     definition: store.readWorkflow(SLUG)!.data,
     readiness: readiness.checkWorkflowRunReadiness(store.readWorkflow(SLUG)!.data, SLUG),
     source: 'dashboard',
-    now: () => Date.now() + improvement.WORKFLOW_IMPROVEMENT_RETRY_COOLDOWN_MS + 1,
   });
-  assert.equal(fresh?.status, 'requested');
+  assert.equal(fresh?.status, 'requested', 'a failed attempt never cools the lane down; the budget is a counter');
   const reverted = await improvement.runWorkflowImprovement({
     request: fresh!.request,
     executeTurn: async () => {
@@ -220,6 +219,67 @@ test('a faithful improvement turn is applied, a drifting one is reverted byte-fo
   assert.equal(improvement.legacyRunnerDeclarations(restored.data).length, 1, 'the original definition is back');
   assert.deepEqual(restored.data.trigger, legacyDefinition().trigger);
   assert.equal(improvement.readWorkflowImprovement(SLUG)?.status, 'failed');
+});
+
+test('three rejected rewrites on one unchanged definition exhaust the budget; the queue then answers in plain words with the last draft; an edit resets it', async () => {
+  write.writeWorkflowAndSyncTriggers(SLUG, legacyDefinition());
+  const request = () => improvement.requestWorkflowImprovement({
+    slug: SLUG,
+    definition: store.readWorkflow(SLUG)!.data,
+    readiness: readiness.checkWorkflowRunReadiness(store.readWorkflow(SLUG)!.data, SLUG),
+    source: 'chat',
+  });
+  const drift = async (fresh: NonNullable<ReturnType<typeof request>>) => improvement.runWorkflowImprovement({
+    request: fresh.request,
+    executeTurn: async () => {
+      write.writeWorkflowAndSyncTriggers(SLUG, { ...legacyDefinition(), trigger: { manual: true }, steps: improvedSteps() } as never);
+      return { text: 'changed the schedule too' };
+    },
+    openScope: () => {},
+    closeScope: () => {},
+  });
+
+  // The previous test left one rejected attempt on these exact bytes; the
+  // budget counts from there. Keep drifting until Clem stops on her own.
+  let rounds = 0;
+  for (let round = 0; round < improvement.WORKFLOW_IMPROVEMENT_ATTEMPT_BUDGET; round += 1) {
+    const fresh = request();
+    if (fresh?.status === 'exhausted') break;
+    assert.equal(fresh?.status, 'requested', JSON.stringify(fresh));
+    const outcome = await drift(fresh!);
+    rounds += 1;
+    assert.equal(outcome.status, 'failed');
+    assert.ok(outcome.candidatePath && existsSync(outcome.candidatePath), 'the rejected draft is kept beside the backup');
+    assert.match(readFileSync(outcome.candidatePath!, 'utf8'), /pull_activity_calls/, 'the draft is what the turn wrote');
+    assert.match(outcome.summary, /draft is kept at/);
+  }
+  assert.ok(rounds >= 1);
+  const state = improvement.readWorkflowImprovement(SLUG)!;
+  assert.equal(state.status, 'failed');
+  assert.equal(state.attempts?.length, improvement.WORKFLOW_IMPROVEMENT_ATTEMPT_BUDGET);
+  assert.ok(state.attempts!.every((attempt) => /trigger changed/.test(attempt.detail) && attempt.candidatePath));
+  assert.equal(request()?.status, 'exhausted');
+
+  // The queue answers a person, not an engineer, and names the next edge.
+  const queued = queue.queueWorkflowRun(SLUG, {}, { source: 'chat', dedupe: false });
+  assert.equal(queued.status, 'blocked_readiness', JSON.stringify(queued));
+  assert.match(queued.message, /tried rewriting it 3 times/);
+  assert.match(queued.message, /last draft is saved at/);
+  assert.match(queued.message, /rewrite that step with you here/);
+  assert.doesNotMatch(queued.message, /workflow_raw_subprocess_authority_unrepresented/);
+
+  // The next turn is told what failed before, so it cannot repeat it blind.
+  const prompt = improvement.buildWorkflowImprovementPrompt({ request: state, entry: store.readWorkflow(SLUG)! });
+  assert.match(prompt, /Previous attempts on this exact definition/);
+  assert.match(prompt, /trigger changed/);
+  assert.match(prompt, /transform: <expression>/, 'the reference pattern\'s transform shape is spelled out');
+  assert.match(prompt, /forEach: "steps\.<id>\.output/, 'and the per-item read shape');
+
+  // An edit to the workflow (or its script) resets the budget.
+  write.writeWorkflowAndSyncTriggers(SLUG, { ...legacyDefinition(), description: 'Post the team activity summary (edited).' } as never);
+  const reset = request();
+  assert.equal(reset?.status, 'requested');
+  assert.deepEqual(reset?.request.attempts, []);
 });
 
 test('a request left running by a daemon that stopped mid-turn becomes pending again once its wall clock has elapsed', () => {

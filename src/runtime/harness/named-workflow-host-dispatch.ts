@@ -22,6 +22,7 @@ import {
   type UniqueEnabledWorkflowMatch,
 } from '../../tools/named-workflow-match.js';
 import { admitNamedWorkflowRunFromAcceptedSource } from '../../tools/admit-named-workflow-run.js';
+import { isWorkflowImprovementSessionId } from '../../execution/workflow-improvement-session.js';
 import {
   rehydrateConsumedClarificationContext,
   SEMANTIC_CLARIFICATION_RESOLVER_VERSION,
@@ -162,7 +163,7 @@ export function acceptedSourceIsWorkflowInternal(sessionId: string, sourceUserSe
   // read that as a run request, tried to queue the workflow from a system
   // session with no report-back target, and ended the turn before a single
   // authoring call. Host-internal sources never manufacture run authority.
-  if (sessionId.startsWith('workflow-improvement:')) return true;
+  if (isWorkflowImprovementSessionId(sessionId)) return true;
   if (getSession(sessionId)?.kind === 'workflow') return true;
   const accepted = listEvents(sessionId, {
     sinceSeq: sourceUserSeq - 1,

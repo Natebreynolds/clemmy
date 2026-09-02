@@ -2554,7 +2554,7 @@ test('POST /api/console/workflows/:name/run rejects missing inputs and dedupes f
   }
 });
 
-test('POST /api/console/workflows/:name/run blocks missing required workflow capabilities before queueing', async () => {
+test('POST /api/console/workflows/:name/run holds a legacy script workflow for Clem\'s rewrite instead of claiming it started', async () => {
   const workflowName = 'Dashboard Run Readiness Block Flow';
   writeWorkflow('dashboard-run-readiness-block-flow', {
     name: workflowName,
@@ -2571,18 +2571,14 @@ test('POST /api/console/workflows/:name/run blocks missing required workflow cap
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ inputs: {} }),
     });
-    assert.equal(res.status, 409);
-    const body = await res.json() as {
-      status?: string;
-      readiness?: { blockers?: Array<{ kind: string; name: string; status: string; stepIds: string[] }> };
-      executionPlan?: { toolReadiness?: { missingCount: number } };
-    };
-    assert.equal(body.status, 'blocked_readiness');
-    assert.equal(body.readiness?.blockers?.[0]?.kind, 'script');
-    assert.equal(body.readiness?.blockers?.[0]?.name, 'missing.py');
-    assert.deepEqual(body.readiness?.blockers?.[0]?.stepIds, ['merge']);
-    assert.equal(body.executionPlan?.toolReadiness?.missingCount, 1);
-    assert.equal(workflowRunRecords(workflowName).length, 0, 'readiness-blocked dashboard runs are not queued');
+    assert.equal(res.status, 202);
+    const body = await res.json() as { queued?: boolean; held?: boolean; status?: string; message?: string; id?: string };
+    assert.equal(body.queued, false, 'nothing was queued, so the door never says "Started"');
+    assert.equal(body.held, true);
+    assert.equal(body.status, 'held');
+    assert.equal(body.id, undefined);
+    assert.match(body.message ?? '', /rewriting that step/);
+    assert.equal(workflowRunRecords(workflowName).length, 0, 'the run is re-queued by the rewrite, not now');
   } finally {
     await h.close();
   }

@@ -2230,7 +2230,15 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         res.status(400).send('Workflow is not runnable from the dashboard.');
         return;
       }
-      queueWorkflowRun(name, {}, { source: 'dashboard', dedupe: false });
+      // The queue's answer rides back as the flash: a fire-and-forget redirect
+      // showed a green "ran" for a run that was held or refused (live
+      // 2026-09-01, the team Slack update).
+      const queued = queueWorkflowRun(name, {}, { source: 'dashboard', dedupe: false });
+      const token = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
+      redirectDashboard(res, token, queued.status === 'queued' || queued.status === 'duplicate'
+        ? { kind: 'success', text: queued.message || `Queued "${name}".` }
+        : { kind: 'error', text: queued.message || `"${name}" was not queued (${queued.status}).` });
+      return;
     }
     const token = typeof req.query.token === 'string' ? req.query.token : WEBHOOK_SECRET;
     redirectDashboard(res, token);

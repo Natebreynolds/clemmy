@@ -20,7 +20,11 @@ import { listWorkflows, type WorkflowDefinition } from '../memory/workflow-store
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
 import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
-import { requestWorkflowImprovement, workflowImprovementHoldMessage } from '../execution/workflow-self-improvement.js';
+import {
+  requestWorkflowImprovement,
+  workflowImprovementExhaustedMessage,
+  workflowImprovementHoldMessage,
+} from '../execution/workflow-self-improvement.js';
 import {
   buildWorkflowMutationContractSnapshot,
   isWorkflowMutationContractSnapshot,
@@ -2537,6 +2541,18 @@ function queueWorkflowRunUnlocked(
         source: normalizedOptionalString(opts?.source) ?? 'manual',
       });
       if (improvement && !catchupHold && !persistReadinessBlock) {
+        if (improvement.status === 'exhausted') {
+          // Clem already spent her attempt budget on this exact definition.
+          // The user gets the plain reason, the draft and the next edge —
+          // never the readiness engineering text (live 2026-09-01: "run my
+          // slack team update" was answered with a migration lecture after a
+          // silent six-hour cooldown).
+          return {
+            status: 'blocked_readiness',
+            message: workflowImprovementExhaustedMessage(workflowEntry.name, improvement.request),
+            readiness,
+          };
+        }
         return {
           status: 'held',
           message: workflowImprovementHoldMessage(workflowEntry.name, improvement.request.runners),

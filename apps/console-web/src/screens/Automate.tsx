@@ -92,9 +92,14 @@ export function Automate() {
   const run = async (name: string) => {
     setBusyName(name); setNotice(null);
     try {
-      const queued = await runWorkflow(name) as { id?: string } | undefined;
+      const queued = await runWorkflow(name) as { id?: string; held?: boolean; message?: string } | undefined;
       void qc.invalidateQueries({ queryKey: ['runs'] });
       void qc.invalidateQueries({ queryKey: ['wf-runs', name] });
+      if (queued?.held) {
+        // Clem is rewriting a legacy step first; the run starts by itself.
+        setNotice({ tone: 'info', text: queued.message ?? `"${name}" is being prepared; it starts by itself.` });
+        return;
+      }
       setOpenRun({ workflow: name, runId: queued?.id });
       setNotice({ tone: 'info', text: `Started "${name}".` });
     }

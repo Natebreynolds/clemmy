@@ -79,6 +79,7 @@ import {
   describeTurnScopedHold,
 } from './workflow-turn-scoped-hold.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
+import { isWorkflowImprovementSessionId } from '../execution/workflow-improvement-session.js';
 import {
   listEvents,
   getSession,
@@ -1939,7 +1940,15 @@ export function registerOrchestrationTools(server: McpServer): void {
       // fail. "It's set and working" must mean "I watched it run", never
       // "I read the config". Schedule/description-only edits never re-test.
       let reSmoke: { message: string } | null = null;
-      if (updatePrep.status !== 'readiness_gaps' && workflowUpdateNeedsVerification(entry.data, savedNext)) {
+      // Clem's own self-improvement turn edits an ENABLED workflow that was
+      // just asked to run; the improvement consumer re-queues that run the
+      // moment the code guard accepts the rewrite, and that run is the
+      // verification. Parking the rewrite disabled behind a creation test
+      // here made every faithful rewrite trip the guard's "enabled flag
+      // changed" and get reverted (live 2026-09-01, sixteen attempts in a row).
+      // Validity is still gated above; only the re-smoke is skipped.
+      const selfImprovementTurn = isWorkflowImprovementSessionId(getToolOutputContext()?.sessionId);
+      if (!selfImprovementTurn && updatePrep.status !== 'readiness_gaps' && workflowUpdateNeedsVerification(entry.data, savedNext)) {
         const updateVerification = prepareWorkflowVerification(savedNext, providedSmokeInputs);
         if (updateVerification.needsTest) {
           savedNext.enabled = false;

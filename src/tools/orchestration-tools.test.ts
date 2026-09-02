@@ -344,6 +344,48 @@ test('workflow_edit_step edits a disabled display-named workflow only at its can
   assert.equal(workflowRunFiles().length, 0, 'a disabled edit does not schedule a re-smoke');
 });
 
+test('workflow_update inside Clem\'s own self-improvement turn keeps an enabled workflow enabled and queues no creation test', async () => {
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const slug = 'improved-in-place';
+  writeWorkflow(slug, {
+    name: slug,
+    description: 'Read provider records without changing them.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{
+      id: 'fetch-records',
+      prompt: 'Fetch the first five records with Apify without changing them.',
+      allowedTools: ['composio_apify_*'],
+      sideEffect: 'read',
+    }],
+  });
+  const steps = [{
+    id: 'fetch-records',
+    prompt: 'Fetch the first ten records with Apify without changing them.',
+    allowedTools: ['composio_apify_*'],
+    sideEffect: 'read',
+  }];
+
+  // Outside an improvement session the same edit is parked for a re-smoke.
+  const outside = await workflowUpdate()({ name: slug, steps });
+  assert.match(resultText(outside), /DISABLED and started a creation test/);
+  assert.equal(readWorkflow(slug)!.data.enabled, false);
+  assert.equal(workflowRunFiles().length, 1, 'one creation test');
+  writeWorkflow(slug, { ...readWorkflow(slug)!.data, enabled: true } as never);
+  rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
+
+  const inside = await withToolOutputContext(
+    { sessionId: 'workflow-improvement:improved-in-place:1', callId: 'c1', toolName: 'workflow_update' },
+    () => workflowUpdate()({ name: slug, steps: [{ ...steps[0]!, prompt: 'Fetch the first twenty records with Apify without changing them.' }] }),
+  );
+  const text = resultText(inside);
+  assert.doesNotMatch(text, /DISABLED/);
+  assert.doesNotMatch(text, /creation test/);
+  assert.equal(readWorkflow(slug)!.data.enabled, true, 'the rewrite stays enabled: the re-queued run is its verification');
+  assert.match(readWorkflow(slug)!.data.steps[0]!.prompt ?? '', /first twenty records/);
+  assert.equal(workflowRunFiles().length, 0, 'no creation test was queued');
+});
+
 test('workflow_edit_step re-smokes an enabled display-named workflow under the same canonical slug', async () => {
   const slug = 'release-enabled-digest';
   const displayName = 'Release Enabled Digest';

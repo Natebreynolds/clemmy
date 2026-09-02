@@ -6192,6 +6192,10 @@ export function registerConsoleRoutes(
         res.status(409).json(workflowReadinessBlockedBody(queued.message, queued.readiness, { status: queued.status, dryRun, targetStepId }));
         return;
       }
+      if (queued.status === 'held') {
+        res.status(202).json({ queued: false, held: true, status: queued.status, message: queued.message, dryRun, targetStepId });
+        return;
+      }
       res.json({ queued: true, dryRun, id: queued.id, targetStepId });
       return;
     }
@@ -6214,6 +6218,14 @@ export function registerConsoleRoutes(
     }
     if (queued.status === 'blocked_readiness') {
       res.status(409).json(workflowReadinessBlockedBody(queued.message, queued.readiness, { status: queued.status, dryRun, targetStepId }));
+      return;
+    }
+    if (queued.status === 'held') {
+      // Clem is rewriting a legacy script step first (workflow-self-
+      // improvement.ts); the run starts by itself when the rewrite passes.
+      // Never `queued: true` with no id — that read as "Started" in the UI
+      // while nothing had been queued (live 2026-09-01).
+      res.status(202).json({ queued: false, held: true, status: queued.status, message: queued.message, dryRun, targetStepId });
       return;
     }
     res.json({ queued: queued.status !== 'duplicate', duplicate: queued.status === 'duplicate', dryRun, id: queued.id, targetStepId });
