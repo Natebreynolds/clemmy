@@ -621,7 +621,9 @@ the same non-send effects a scheduled run makes without asking. Sends keep their
 **Advisory, pre-existing.** The report-back flagged "the automated goal check couldn't run due to a judge
 error". `goal validation unavailable (judge error)` has been logged on every pinned-goal run since 08-15
 (team-activity, now Friday). The run does not re-run on an unverifiable verdict — correct — but the judge
-lane is silently dead. Not tonight's blocker; recorded.
+lane is silently dead: the recorded detail is `judge unavailable: judge timed out`; the boundary judge's
+default deadline is 25 s (`CLEMMY_BOUNDARY_JUDGE_TIMEOUT_MS`, judge-family.ts:80) against the Claude judge
+lane, which does not answer that fast under load. Not tonight's blocker; recorded with its lever.
 
 **Voice.** One rubric line (shared by the lean and native rubrics) nudges the model to open like a colleague
 and never surface a harness refusal verbatim. Golden snapshots refreshed.
