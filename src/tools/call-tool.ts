@@ -48,7 +48,7 @@ import {
   dispatchBatchItemTool,
   isMcpNamespacedTool,
 } from './inner-dispatch.js';
-import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead } from './tool-registry.js';
+import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolution.js';
@@ -885,7 +885,15 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         ) {
           return refuse({
             error: 'not_reachable',
-            detail: `"${requestedTarget}" is not a deferred callable tool on this turn's surface. Call a first-class tool directly, use tool_search for an available deferred tool, or use a connected external MCP tool as <server>__<tool>.${boundSourceCorrection(requestedTarget)}`,
+            // SAY THE EXACT CORRECTION, not a menu. Live 2026-09-02 (grok-4.6,
+            // platform-49 cleanup): the old prose said "use tool_search", the
+            // model wrapped tool_search in THIS carrier, was refused again, and
+            // the no-progress governor ended the turn. A first-class tool IS
+            // available this turn, just not through the carrier — name that
+            // exact move. An unknown name is a different problem and says so.
+            detail: isRegistryDeclaredTool(target)
+              ? `"${requestedTarget}" is a FIRST-CLASS tool on this turn: it is available, but not through this carrier. Call ${requestedTarget} DIRECTLY as its own tool call, with its own arguments, in your next response. Do not wrap it.${boundSourceCorrection(requestedTarget)}`
+              : `"${requestedTarget}" is not a tool on this turn's surface. Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to find the exact operation, then invoke that operation. A connected external MCP tool is named <server>__<tool>.${boundSourceCorrection(requestedTarget)}`,
           });
         }
         if (catalogPort && catalogManifest && catalogOperation) {
