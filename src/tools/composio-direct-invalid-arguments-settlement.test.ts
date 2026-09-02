@@ -202,8 +202,13 @@ async function assertExecutionWrapRefusal(input: unknown, callId: string, toolOv
 }
 
 test('a valid unknown-effect carrier remains behind EXECUTION_WRAP_REQUIRED with zero provider work', async () => {
+  // A genuinely UNKNOWN-effect provider slug (no read verb, no manifest) must
+  // wrap. OUTLOOK_LIST_MESSAGES used to stand in here, but a read-verb provider
+  // slug now classifies as a read (reads flow, 2026-09-02) and takes the read
+  // path instead of the mutation wrap — so the unknown-effect case uses a slug
+  // that carries no read verb and cannot be proven read.
   await assertExecutionWrapRefusal({
-    tool_slug: 'OUTLOOK_LIST_MESSAGES',
+    tool_slug: 'ACME_DO_THING',
     arguments: '{"folder":"inbox"}',
     connected_account_id: null,
   }, 'direct-composio-valid-unknown-effect');
