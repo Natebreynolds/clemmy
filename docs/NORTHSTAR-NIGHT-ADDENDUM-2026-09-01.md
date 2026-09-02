@@ -785,3 +785,16 @@ verbatim). Grouping by operation alone cannot tell accounts apart; the exact pro
 account by a connection id written in the accepted text. The step catalog now applies the same rule; no
 name stays ambiguous. Pinned. Three doors on one parked run — each typed, each one line of the same lesson:
 identity is (operation, account, definition), never a label, never a date.
+
+## Gate 25 — the read crossed; the send stuttered (2026-09-02 09:50 UTC, daily-standup)
+
+With gate 24's three doors open, the standup step read the calendar for real (`OUTLOOK_LIST_EVENTS`, four
+records retained) and then wrote `OUTLOOK_OUTLOOK_SEND_EMAIL` twice — a doubled toolkit prefix on the
+prepared `OUTLOOK_SEND_EMAIL` — and was refused `catalog_entry_or_manifest_missing` twice with the chat-lane
+ritual text; the governor stopped it. The definition is correct; the model stuttered; the host held every
+fact needed to repair it and did not.
+
+*Fix (this commit):* carrier completion (gate 23's seam) collapses a doubled toolkit prefix to the proven
+operation exactly as it binds a missing slug — no fuzzy matching, an unknown slug is still refused — and
+the pre-dispatch refusal inside a sealed step names the step's proven operations ("use one of those exactly")
+instead of prescribing tool_search → plan_task → work_call. Pinned.
