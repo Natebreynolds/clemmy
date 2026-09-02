@@ -382,3 +382,19 @@ below is on the branch, pinned, typecheck clean, and waits for the next `dev-up`
   testing resumes); the Family Law sheet canary (needs the restart); a `runProductionHost` pin for the
   live-read JIT route; the dead-end census as a weekly metric; hard-cut seam 4 (boot-recovery dispatch
   lease); the 12 pre-existing journey reds.
+
+### Late (21:30–18:15 PT next tick): the owner's "is the last two weeks real value" check
+Owner: "we have done things no other harness has done — measure and run parallel judges against an active
+goal … truly self-improve. I don't think it's fully wired in yet."
+- **Measured answer:** the objective judge (cross-family, hedged, bounded continuation) existed only in the
+  legacy core (`runConversationCore`), which the host engine never enters — every live turn is host_v1, so
+  every live reply shipped UNJUDGED. `494d3b66`: the same gate and judge now run on the host lane at
+  the final reply; NOT DONE rides the one-shot directive, bounded to 2, every verdict a durable
+  `goal_alignment_judged` (lane host_v1). Self-improvement IS wired for workflows (legacy script rewrite,
+  budgeted, drafts kept); "learns from corrections" is still the M14 gap (no metric).
+- **Two scheduled workflows failed on doors, fixed:** friday-dashboard's six SOQL reads refused
+  `completeness_evidence_missing:data` (reviewed-CLI evidence lives at `stdout`); daily-standup-email's
+  `OUTLOOK_OUTLOOK_SEND_EMAIL` threw a run error before its first model edge (now a typed, proven-pre-dispatch
+  capability block that parks and retries).
+- Dev daemon restarted 17:54 PT on 88c5a4b5 for the owner's mobile testing; the phone re-paired after one
+  post-restart 401 and served 50 requests clean. The judge and the two workflow fixes need one more restart.
