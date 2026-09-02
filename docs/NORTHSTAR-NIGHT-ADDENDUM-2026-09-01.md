@@ -696,3 +696,22 @@ c9f1042e in progress before any tag.
 consumer suites of the final change (execution-gate, step-effect, call-node, validator, runner,
 pending-action admission, composio-tools, batch-tools, call-tool: 532 results) were green before the commit.
 Dev daemon restored on the final commit. A complete third pass is owed before the tag.
+
+## Token efficiency — the cold surface, measured (2026-09-02 08:40 UTC)
+
+The competitive byte ledger journey fails at 21,722 bytes against a 16 KiB ceiling (pre-existing). Measured on
+a cold natural request, first model step:
+
+| part | bytes |
+|---|---|
+| instructions (lean action rubric) | 5,492 |
+| tool schemas (7 always-loaded) | 12,245 |
+| input (request + context snapshot) | 3,746 |
+| framing | 172 |
+
+The seven schemas: ask_user_question 3,247 · tool_output_query 2,199 · tool_search 1,835 · recall_tool_result
+1,761 · file_query 1,325 · call_tool 1,056 · memory_recall_all 814. Each is first-class by a live incident
+(ask_user_question: the model never searched for the ability to ask; file_query: one 322k result became 37
+recall pages). Hiding any of them behind discovery is the wrong trade. The 5.4 KB to the ceiling is in schema
+DESCRIPTIONS — the four largest carry incident-tuned prose that can be halved without losing the affordance.
+That is a prompt-level change with behavior pins to re-verify; decision owed, not taken tonight.
