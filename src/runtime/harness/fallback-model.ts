@@ -37,7 +37,10 @@ import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
 import { harnessRunContextStorage } from './brackets.js';
 import pino from 'pino';
-import { sizedBrainFalloverFirstByteMs } from './model-stall-policy.js';
+import {
+  sizedBrainFalloverFirstByteMs,
+  modelResponseWallMs,
+} from './model-stall-policy.js';
 
 const logger = pino({ name: 'clementine.fallback-model' });
 
@@ -87,6 +90,9 @@ export interface FallbackOptions {
    * budget (the loop's stall watchdog is its backstop). 0/undefined disables.
    */
   firstByteTimeoutMs?: number;
+  /** Absolute per-attempt wall (ms), activity or not; defaults to the policy's
+   * modelResponseWallMs(); 0 disables. */
+  responseWallMs?: number;
   /**
    * Absolute wall for an interactive foreground attempt to produce its first
    * actionable text/tool item. Unlike firstByteTimeoutMs, private reasoning
@@ -135,6 +141,16 @@ class FirstByteTimeoutError extends Error {
   constructor(public readonly ms: number) {
     super(`no first real stream content within ${ms}ms`);
     this.name = 'FirstByteTimeoutError';
+  }
+}
+
+/** One attempt outlived the absolute response wall, activity or not. Before
+ * any actionable content escaped it is safe to fall over; after, the caller
+ * gets a typed failure and its own retry budget decides. */
+export class ResponseWallExceededError extends Error {
+  constructor(public readonly ms: number, public readonly committedActionable: boolean) {
+    super(`model attempt exceeded the ${ms}ms response wall${committedActionable ? ' after actionable output' : ' before any actionable output'}`);
+    this.name = 'ResponseWallExceededError';
   }
 }
 
@@ -936,11 +952,15 @@ export class FallbackModel implements Model {
         && this.opts.preActionableTimeoutMs > 0
         ? Date.now() + this.opts.preActionableTimeoutMs
         : undefined;
+      const responseWallMs = this.opts.responseWallMs ?? modelResponseWallMs();
+      const responseDeadlineAt = responseWallMs > 0 ? Date.now() + responseWallMs : undefined;
       try {
         const it = chain[i].getModel().getStreamedResponse(req)[Symbol.asyncIterator]();
         while (true) {
-          const next = it.next();
-          next.catch(() => {}); // a lost timeout race must not throw unhandled
+          const rawNext = it.next();
+          rawNext.catch(() => {}); // a lost timeout race must not throw unhandled
+          const next = this.withResponseWall(rawNext, responseDeadlineAt, responseWallMs, () => committedActionable, () => cleanup(true));
+          next.catch(() => {});
           const preActionableNext = committedActionable
             ? next
             : this.withPreActionableTimeout(
@@ -1012,8 +1032,39 @@ export class FallbackModel implements Model {
     }
   }
 
+  /** Race one stream read against the attempt's absolute wall. */
+  private async withResponseWall<T>(
+    call: Promise<T>,
+    deadlineAt: number | undefined,
+    wallMs: number,
+    committed: () => boolean,
+    abort: () => void,
+  ): Promise<T> {
+    if (deadlineAt === undefined) return call;
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      abort();
+      throw new ResponseWallExceededError(wallMs, committed());
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        call,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new ResponseWallExceededError(wallMs, committed()));
+            abort();
+          }, remainingMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private isFalloverReason(err: unknown): boolean {
     return err instanceof FirstByteTimeoutError
+      || (err instanceof ResponseWallExceededError && !err.committedActionable)
       || err instanceof PreActionableTimeoutError
       || err instanceof PreContentStreamEndedError
       || this.shouldFallover(err);
@@ -1021,6 +1072,7 @@ export class FallbackModel implements Model {
 
   private falloverReason(err: unknown): string {
     if (err instanceof FirstByteTimeoutError) return 'first-content-timeout';
+    if (err instanceof ResponseWallExceededError) return 'response-wall-exceeded';
     if (err instanceof PreActionableTimeoutError) return 'pre-actionable-timeout';
     if (err instanceof PreContentStreamEndedError) return 'model.empty_completion';
     return normalizedModelFailureReason(err);

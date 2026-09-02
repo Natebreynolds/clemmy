@@ -109,3 +109,17 @@ export class ModelStreamStalledError extends Error {
     this.name = 'ModelStreamStalledError';
   }
 }
+
+/** Absolute wall for ONE model attempt, activity or not. The stream-stall and
+ * first-content walls only measure silence; a brain that keeps emitting
+ * private reasoning can hold a workflow step, its run and its pool slot
+ * indefinitely (daily-standup, 2026-09-02: "Still working inside turn 1"
+ * every three minutes for over ten). 0 disables. */
+export function modelResponseWallMs(): number {
+  const raw = Number.parseInt(
+    getRuntimeEnv('CLEMMY_MODEL_RESPONSE_WALL_MS', '900000') ?? '900000',
+    10,
+  );
+  if (!Number.isFinite(raw)) return 900_000;
+  return raw <= 0 ? 0 : raw;
+}

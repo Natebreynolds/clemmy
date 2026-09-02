@@ -839,7 +839,7 @@ export function registerToolSearchTool(
         .max(128)
         .nullable()
         .optional()
-        .describe('Required on the wire. For broad discovery, copy one exact unresolved role_key from the current capability card; if no unresolved role is listed, pass null. For an exact tool-name schema refresh, pass null. This keys discovery admission; it does not affect ranking or grant execution authority.'),
+        .describe('Required on the wire: one exact unresolved role_key from the current capability card, or null when none is listed or for an exact tool-name schema refresh. Keys admission only; never ranking or authority.'),
       limit: z
         .number()
         .int()
@@ -857,7 +857,7 @@ export function registerToolSearchTool(
         // Empty string is omitted — models emit "" for "no continuation"
         // (live 2026-08-29 GLM/Grok: min(1) 400'd the first discovery call).
         .default(null)
-        .describe('Opaque local next_cursor or schema_handles[*].cursor from a prior result in this durable session. Empty or JSON-null means the first page. Cursor reads survive broker restarts and never re-run provider discovery or mint new planning authority.'),
+        .describe('Opaque next_cursor or schema_handles[*].cursor from a prior result in this session; empty or null means the first page. Cursor reads never re-run discovery or mint authority.'),
     },
     async ({ query, role_key, limit, cursor }: {
       query: string;

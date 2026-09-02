@@ -3,7 +3,7 @@ import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
 import type { BoundaryJudgeRouting } from './debate-model.js';
-import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome } from './judge-family.js';
+import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome, goalJudgeTimeoutMs } from './judge-family.js';
 import { extractJsonCandidate } from './json-repair.js';
 
 /**
@@ -491,6 +491,7 @@ export async function runHedgedJudge<T>(
   parse: (finalOutput: unknown) => T | null,
   isPass: (value: T) => boolean,
   lane: JudgeMetricLane = 'completion',
+  opts: { timeoutMs?: number } = {},
 ): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
@@ -505,7 +506,11 @@ export async function runHedgedJudge<T>(
       if (value === null) throw new JudgeVerdictParseError('judge output did not parse');
       return value;
     };
-    const raced = await withJudgeHedge(attempt(routing), hedgeRouting ? attempt(hedgeRouting) : null);
+    const raced = await withJudgeHedge(
+      attempt(routing),
+      hedgeRouting ? attempt(hedgeRouting) : null,
+      opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {},
+    );
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
     if (raced.value !== null) {
       recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
@@ -530,12 +535,15 @@ async function runCompletionJudge(
   objective: string,
   assistantResponse: string,
   skillContext?: SkillExecutionContext,
+  judge: { lane?: JudgeMetricLane; timeoutMs?: number } = {},
 ): Promise<CompletionJudgeRun> {
   const run = await runHedgedJudge(
     JUDGE_SYSTEM_PROMPT,
     buildObjectiveJudgePrompt(objective, assistantResponse, skillContext),
     parseCompletionVerdict,
     (v) => v.done,
+    judge.lane ?? 'completion',
+    judge.timeoutMs ? { timeoutMs: judge.timeoutMs } : {},
   );
   return { verdict: run.value, failure: run.failure, routing: run.routing };
 }
@@ -642,6 +650,8 @@ export async function judgeGoalCriteriaStrict(
     prompt,
     (o) => parseCriteriaVerdicts(o, list.length),
     (v) => v.every((x) => x.pass),
+    'goal_fidelity',
+    { timeoutMs: goalJudgeTimeoutMs() },
   );
   if (!run.value) {
     throw new Error(
@@ -666,7 +676,12 @@ export async function judgeObjectiveCompleteStrict(
   if (!objective.trim() || !assistantResponse.trim()) {
     throw new Error('insufficient text to judge');
   }
-  const run = await runCompletionJudge(objective, assistantResponse, skillContext);
+  // The strict variant audits a finished run's goal: off every latency path,
+  // so it gets the goal deadline, not the 25 s boundary wall.
+  const run = await runCompletionJudge(objective, assistantResponse, skillContext, {
+    lane: 'goal_fidelity',
+    timeoutMs: goalJudgeTimeoutMs(),
+  });
   if (!run.verdict) {
     throw new Error(
       run.failure === 'timeout' ? 'judge timed out' : run.failure === 'invalid' ? 'judge output did not parse' : 'judge unavailable',

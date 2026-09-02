@@ -1281,3 +1281,54 @@ test('a silent cooldown never preselects away from the brain the USER pinned (Cl
     assert.equal(done?.response?.id, 'primary-tool-call');
   });
 }
+
+test('response wall: a brain that keeps "thinking" past the absolute wall before any actionable output falls over', async () => {
+  let rescueCalls = 0;
+  const thinker = model({
+    getStreamedResponse: async function* () {
+      yield { type: 'response_started' } as any;
+      // Private activity forever: every silence wall sees a live stream.
+      while (true) {
+        yield { type: 'model', event: { type: 'response.in_progress', sequence_number: 1 } } as any;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    },
+  });
+  const rescue = model({
+    getStreamedResponse: async function* () {
+      rescueCalls += 1;
+      yield { type: 'output_text_delta', delta: 'rescued past the wall' } as any;
+      yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+    },
+  });
+  const events = await collect(withModelFallback(
+    [target('thinker', thinker), target('rescue', rescue)],
+    { firstByteTimeoutMs: 10_000, responseWallMs: 40 },
+  ).getStreamedResponse(req()));
+  assert.equal(rescueCalls, 1, 'the wall falls over before any actionable output escaped');
+  assert.ok((events as any[]).some((e) => e.type === 'output_text_delta' && e.delta === 'rescued past the wall'));
+});
+
+test('response wall: after actionable output the wall is a typed failure, never a second brain', async () => {
+  let rescueCalls = 0;
+  const stuck = model({
+    getStreamedResponse: async function* () {
+      yield { type: 'output_text_delta', delta: 'first words' } as any;
+      await new Promise(() => {}); // never completes
+    },
+  });
+  const rescue = model({
+    getStreamedResponse: async function* () {
+      rescueCalls += 1;
+      yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+    },
+  });
+  await assert.rejects(
+    () => collect(withModelFallback(
+      [target('stuck', stuck), target('rescue', rescue)],
+      { firstByteTimeoutMs: 10_000, responseWallMs: 40 },
+    ).getStreamedResponse(req())),
+    /response wall.*after actionable output/,
+  );
+  assert.equal(rescueCalls, 0, 'actionable output already escaped: no duplicate brain');
+});

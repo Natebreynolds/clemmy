@@ -54,7 +54,7 @@ export const RECALL_TOOL_RESULT_SHAPE = {
     .int()
     .min(0)
     .optional()
-    .describe('Start character to read from (default 0). Use the "more remains — offset: N" hint from a prior call to page through a large payload.'),
+    .describe('Start character (default 0); use the "offset: N" hint from a prior call to page.'),
   max_chars: z
     .number()
     .int()
@@ -78,7 +78,7 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
       z.string().describe('Comma-separated field names — equivalent to the array form.'),
     ])
     .optional()
-    .describe('Only include these keys from each record/object (projection), e.g. ["subject","start"]. Omit for all fields.'),
+    .describe('Keys to keep from each record, e.g. ["subject","start"]; omit for all.'),
   filter_field: z.string().optional().describe('Keep only records where this field matches filter_contains/filter_equals.'),
   filter_contains: z.string().optional().describe('Substring match (case-insensitive) for filter_field.'),
   filter_equals: z.string().optional().describe('Exact match for filter_field.'),
@@ -106,10 +106,9 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
     [
-      'Retrieve the full verbatim output of a prior tool call by its call_id.',
-      'Use this whenever the conversation shows a `[clipped: …]` stub OR a `[digest: …]` footer carrying a call_id and you need a detail the shortened view dropped (URLs, IDs, exact figures, ranking positions, full records, etc.).',
-      'This reader is ALWAYS available to you inside a turn — the full payload is stored losslessly. Never tell the user the data is unavailable, that the reader "isn\'t exposed", or that a completed call is still pending: call this instead.',
-      'Returns up to 30KB of original output per call, starting at `offset` (default 0). When the result is bigger, the header says how much remains and the exact `offset` to pass next to continue paging. Counts against a per-turn budget of 3 calls / 60KB total — use sparingly; for a JSON list prefer tool_output_query, which pages records rather than raw chars.',
+      'Read the full verbatim output of a prior tool call by its call_id — whenever a `[clipped: …]` stub or `[digest: …]` footer names a call_id and you need a detail the shortened view dropped.',
+      'Always available inside a turn; the payload is stored losslessly, so never say the data is unavailable — call this.',
+      'Returns up to 30KB per call from `offset` (default 0); the header names the next offset when more remains. Per-turn budget: 3 calls / 60KB.',
       `Input is ONE JSON object, e.g. ${toolCallHint('recall_tool_result', { call_id: 'call_abc123' })}.`,
     ].join(' '),
     RECALL_TOOL_RESULT_SHAPE,
@@ -182,10 +181,9 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'tool_output_query',
     [
-      'Query a slice of a large prior tool output by its call_id, without loading the whole payload.',
-      'Use after you see a `[digest: …]` footer (or a `[clipped: …]` stub) naming a call_id and you need specific records the digest did not show.',
-      'This reader is ALWAYS available inside a turn — the full result is parked losslessly. Never claim the data is unavailable, the reader "isn\'t exposed", or that the call is still pending; call this to pull exactly the rows/fields you need.',
-      'For a JSON array result: filter rows, project fields, and paginate. For a JSON object: project top-level keys. Returns compact JSON plus a "showing X of N" header.',
+      'Query a slice of a large prior tool output by its call_id without loading it all — after a `[digest: …]` footer or `[clipped: …]` stub names a call_id and you need specific records.',
+      'Always available inside a turn; the result is parked losslessly, so never say the data is unavailable — call this.',
+      'JSON array: filter rows, project fields, paginate. JSON object: project top-level keys. Returns compact JSON plus a "showing X of N" header.',
       `Input is ONE JSON object, e.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
     ].join(' '),
     TOOL_OUTPUT_QUERY_SHAPE,

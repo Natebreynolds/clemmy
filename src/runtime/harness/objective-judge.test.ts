@@ -467,3 +467,20 @@ test('isBlockingDirectionSeekingQuestion: a retrieve answer plus an offer stays 
     'ask-first on an action turn still parks',
   );
 });
+
+test('the goal judge has its own deadline, off the 25 s boundary wall, and the env can move it', async () => {
+  const family = await import('./judge-family.js');
+  const prior = process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS;
+  try {
+    delete process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS;
+    assert.equal(family.goalJudgeTimeoutMs(), 90_000);
+    assert.ok(family.goalJudgeTimeoutMs() > family.boundaryJudgeTimeoutMs(), 'a post-run audit may wait longer than a chat gate');
+    process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS = '120000';
+    assert.equal(family.goalJudgeTimeoutMs(), 120_000);
+    process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS = '5';
+    assert.equal(family.goalJudgeTimeoutMs(), 90_000, 'a sub-second value falls back to the default');
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS;
+    else process.env.CLEMMY_GOAL_JUDGE_TIMEOUT_MS = prior;
+  }
+});

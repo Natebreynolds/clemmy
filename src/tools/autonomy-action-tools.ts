@@ -211,13 +211,13 @@ export function registerAutonomyActionTools(server: McpServer): void {
 
   server.tool(
     'ask_user_question',
-    'Pause and ask the user a clarifying question. Use ONLY when you genuinely cannot proceed without an answer — not for things you can decide yourself. The user is notified; your next cycle wakes up with their answer in the inbox. Optional contextExecutionId links the question to a tracked execution so you can resume that work the moment the answer arrives.',
+    'Ask the user one clarifying question when you genuinely cannot proceed without their answer (scope, target, format, a boundary only they decide). They are notified; your next cycle wakes with the answer in the inbox. Pass contextExecutionId when asking from inside a run so the answer routes back to it.',
     {
-      agentSlug: z.string().min(1).describe('Your own slug (e.g. "clementine"). Identifies whose inbox the answer routes back to.'),
+      agentSlug: z.string().min(1).describe('Your own slug, e.g. "clementine".'),
       question: z.string().min(8).max(1200),
       urgency: z.enum(['low', 'normal', 'high']).optional(),
       contextExecutionId: z.string().optional(),
-      contextSummary: z.string().max(600).optional().describe('One-sentence reminder of what you were working on so the user has context when they answer.'),
+      contextSummary: z.string().max(600).optional().describe('One sentence on what you were doing, for the user\'s context.'),
     },
     async ({ agentSlug, question, urgency, contextExecutionId, contextSummary }) => {
       const quality = validateCheckInQuestion(question, contextSummary);

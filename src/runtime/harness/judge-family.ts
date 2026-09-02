@@ -81,6 +81,16 @@ export function boundaryJudgeTimeoutMs(): number {
   return Number.isFinite(raw) && raw >= 1000 ? raw : 25000;
 }
 
+/** The GOAL judge runs after a workflow has already finished — off every
+ * latency path — yet it shared the 25 s boundary deadline and timed out on
+ * every large audit since mid-August ('judge unavailable: judge timed out',
+ * Friday dashboard 2026-09-02), silently downgrading each pinned goal to
+ * advisory. A post-run audit can afford a real deadline. */
+export function goalJudgeTimeoutMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_GOAL_JUDGE_TIMEOUT_MS', '90000') ?? '90000', 10);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 90000;
+}
+
 export async function withJudgeTimeout<T>(work: Promise<T>, timeoutMs = boundaryJudgeTimeoutMs()): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

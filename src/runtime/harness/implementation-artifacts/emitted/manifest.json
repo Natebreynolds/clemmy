@@ -624,7 +624,7 @@
           "bytes": 22825
         },
         "src/runtime/harness/judge-family.ts": {
-          "bytes": 20851
+          "bytes": 21429
         },
         "src/runtime/harness/model-wire-registry.ts": {
           "bytes": 22057
@@ -648,10 +648,10 @@
           "bytes": 5382
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 5035
+          "bytes": 5630
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 57580
+          "bytes": 59697
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -1272,7 +1272,7 @@
           "bytes": 2563
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 67092
+          "bytes": 66934
         },
         "src/tools/tool-search-provider-sources.ts": {
           "bytes": 77760
@@ -1518,7 +1518,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 198854
+          "bytes": 197215
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -2094,7 +2094,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 20128
+          "bytes": 19379
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -2151,7 +2151,7 @@
           "bytes": 5206
         },
         "src/tools/autonomy-action-tools.ts": {
-          "bytes": 26079
+          "bytes": 25943
         },
         "src/tools/browser-harness-tools.ts": {
           "bytes": 9090
@@ -2367,7 +2367,7 @@
           "bytes": 99820
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 47596
+          "bytes": 48158
         },
         "src/runtime/harness/pending-action-transition.ts": {
           "bytes": 16825
@@ -3111,7 +3111,7 @@
           "bytes": 22825
         },
         "src/runtime/harness/judge-family.ts": {
-          "bytes": 20851
+          "bytes": 21429
         },
         "src/runtime/harness/model-wire-registry.ts": {
           "bytes": 22057
@@ -3135,10 +3135,10 @@
           "bytes": 5382
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 5035
+          "bytes": 5630
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 57580
+          "bytes": 59697
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -3759,7 +3759,7 @@
           "bytes": 2563
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 67092
+          "bytes": 66934
         },
         "src/tools/tool-search-provider-sources.ts": {
           "bytes": 77760
@@ -4005,7 +4005,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 198854
+          "bytes": 197215
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -4581,7 +4581,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 20128
+          "bytes": 19379
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -4638,7 +4638,7 @@
           "bytes": 5206
         },
         "src/tools/autonomy-action-tools.ts": {
-          "bytes": 26079
+          "bytes": 25943
         },
         "src/tools/browser-harness-tools.ts": {
           "bytes": 9090
@@ -4854,7 +4854,7 @@
           "bytes": 99820
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 47596
+          "bytes": 48158
         },
         "src/runtime/harness/pending-action-transition.ts": {
           "bytes": 16825

@@ -323,6 +323,7 @@ function captureRequest(request: JsonRecord): void {
     - wireToolsMemberBytes;
   const input = wireInput.map(metricForInput);
   const tools = wireTools.map(metricForTool);
+  const rawTools = wireTools;
   const estimatedInstructionTokens = estimateTextOnlyTokens(
     typeof wire.instructions === 'string' ? wire.instructions : '',
   );
@@ -392,6 +393,7 @@ function captureRequest(request: JsonRecord): void {
       typeof wire.instructions === 'string' ? wire.instructions : '',
     ),
     tools,
+    rawTools,
     input,
   });
 }
@@ -595,6 +597,14 @@ test('competitive byte ledger: cold natural request stays below planning and dis
   // avoid logging prompt prose.  Digests/previews cover tool projections; the
   // normal journey independently proves the accepted text and exact refs.
   process.stdout.write(`\nMODEL_SURFACE_LEDGER ${json(report)}\n`);
+  if (process.env.CLEMMY_SURFACE_DUMP === '1') {
+    // Diagnostic only: the raw SDK definition of every first-step tool over
+    // 1.5 KB, so a byte ledger can be turned into a targeted trim.
+    for (const tool of foregroundCaptures[0]?.rawTools ?? []) {
+      const serialized = JSON.stringify(tool);
+      if (serialized.length > 1500) process.stdout.write(`\nMODEL_SURFACE_TOOL ${serialized}\n`);
+    }
+  }
   process.stdout.write(`MODEL_SURFACE_SUMMARY ${json({
     backgroundModelCandidates,
     totalCapturedRequests: captures.length,
