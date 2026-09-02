@@ -899,3 +899,43 @@ gaps and Run now explains the stop.
 
 Rule: a stop that only exists as an HTTP status at click time is not a
 typed stop. Every stop is a row somewhere a count can read.
+
+## Gate 30 — "why can't she just read, show, and ask before writing" (2026-09-02 06:30–07:50 PDT)
+
+The owner's exact ask, sent through the desktop chat route four times against
+the dev daemon: read the FL tab, count active Family Law prospects per geo in
+Salesforce, propose a new column, show it before writing. Every stop was the
+harness, never the model or the brain:
+
+1. **Run 1 — the plan DSL refused the host's own ids.** plan_task refused the
+   model's plan on a coverage/cardinality pairing the host can derive, and on a
+   154-char `cap:live:v1:…:reacquired:…` ref that tool_search had disclosed a
+   minute earlier (the id pattern stopped at 128). Fixed 7d47f805: one shared
+   work-id bound (512) across six sites; `validateWorkTopology` derives
+   each→single and producer→complete_set; plan_task and the rubric say what the
+   code already allowed — reads never need a plan.
+2. **Run 2 — a read-only plan refused as an incomplete write.** The model
+   planned exactly the validate-first shape ("no writes yet, just for your
+   review"); `plan_incomplete_missing_write` refused it because the request
+   wording implies a write, with repair text "do not execute a read-only
+   subset". Fixed 5faf8eb7: a wholly-read plan is a gather stage, admitted
+   with `writeDeferred:true`; the refusal now fires only on a bound-but-
+   unattested write. The send floor is unchanged.
+3. **Run 3 — reads flowed, then the harness declared the brain dead.** Twelve
+   `work_call` reads crossed with no plan (the sheet, then Salesforce schema
+   discovery, then counts). A 315 s think between frames hit the 300 s stall
+   watchdog → "transport stopped responding", retained checkpoint, no write.
+   Run 2 had also shown the 60 s pre-actionable wall benching grok for the run
+   ("known-unavailable brain skipped"). Fixed 2f79e43e: pre-actionable wall
+   off by default and never a benching reason; stall 300→600 s, first-byte
+   180→300 s; the pre-content stall retry is per frame.
+
+Owner's directive, verbatim intent: grok is chosen; all fallbacks stay
+options; "there is no reason grok should have stopped responding, it's our
+harness." Not changed: brain selection, the fallover chain, the 15 min
+response wall, the irreversible-send floor.
+
+Still visible in run 3 and worth its own gate: the model spent eight
+schema-discovery reads on Salesforce fields that the owner's canary notes
+already hold (`Business_Type__c INCLUDES ('Family Law')`, `Status__c`,
+`Active__c`). That is the memory-multiplier gap, not a wall.
