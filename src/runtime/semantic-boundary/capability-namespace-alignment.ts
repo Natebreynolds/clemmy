@@ -91,6 +91,20 @@ export function explicitCapabilityNamespaceConflict(input: {
   const selected = [...new Set(
     input.selectedNamespaceIds.map(normalizedNamespaceId).filter(Boolean),
   )].sort();
+  // A request that names TWO OR MORE adapters is explicitly cross-app, and this
+  // matcher only recognizes a namespace spelled the adapter's way — a user
+  // naming a sheet by its URL, or informally, is invisible to it. Enforcing
+  // strict scoping there refuses ordinary work with no exit: live 2026-09-02
+  // (platform-49 cleanup, "check Slack ... fix the Google Sheet" with a
+  // docs.google.com link) matched `slack` and `daily` but not `googlesheets`,
+  // so the one namespace the task had to write to was refused as a conflict,
+  // three times, until the no-progress governor ended the turn. No plan the
+  // model can write satisfies that.
+  //
+  // So: abstain once the ask names several adapters, and keep the strict guard
+  // exactly where it was built for — a SINGLE-adapter request that must not
+  // quietly fan out to an unnamed provider (ask for Outlook, get Slack).
+  if (requested.size > 1) return null;
   const conflict = selected.find((namespaceId) => !requested.has(namespaceId));
   return conflict
     ? {

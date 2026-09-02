@@ -2439,7 +2439,7 @@
           "bytes": 1152
         },
         "src/runtime/semantic-boundary/capability-namespace-alignment.ts": {
-          "bytes": 3744
+          "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
           "bytes": 157934
@@ -4929,7 +4929,7 @@
           "bytes": 1152
         },
         "src/runtime/semantic-boundary/capability-namespace-alignment.ts": {
-          "bytes": 3744
+          "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
           "bytes": 157934
