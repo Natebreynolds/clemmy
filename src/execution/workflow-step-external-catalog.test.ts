@@ -847,3 +847,32 @@ test('exact workflow provisioner reports a requested operation that did not regi
     detail: 'not_registered',
   });
 });
+
+// Live 2026-09-01: scorpion-facebook-trends' first step listed
+// composio_search_tools under allowedTools; the extractor uppercased it into a
+// phantom COMPOSIO_SEARCH_TOOLS "operation", provisioning refused it, and the
+// run parked on a capability block that named nothing real.
+test('lowercase local tool names in allowedTools and platform-plane tokens are not provider operations', async () => {
+  resetEventLog();
+  clearIndependentCapabilityObservations();
+  const store = createCapabilityManifestStore([]);
+  const factory = createHostCapabilityCatalogFactory();
+  const result = await prepareWorkflowStepExternalCatalog({
+    immutablePrompt: 'Find the official page. Use COMPOSIO_SEARCH_TOOLS to discover the exact scrape operation, then scrape it.',
+    allowedTools: ['composio_execute_tool', 'composio_search_tools'],
+    acceptedSource: {
+      sessionId: 'workflow:local-tool-names',
+      sourceUserSeq: 1,
+      acceptedInput: 'immutable workflow source',
+    },
+  }, {
+    manifestStore: store,
+    catalogFactory: factory,
+    provisionExactOperations: async () => {
+      assert.fail('a local tool name or a platform-plane token must never be provisioned as a provider operation');
+    },
+    revalidate: async () => ({ ok: true, definitions: new Map() }),
+    refresh: () => {},
+  });
+  assert.equal(result.status, 'none', JSON.stringify(result));
+});

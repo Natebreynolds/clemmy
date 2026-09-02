@@ -124,12 +124,15 @@ function explicitOperationTokens(input: {
   }
   for (const raw of input.allowedTools) {
     const value = raw.trim();
+    // An allowedTools entry is a provider operation only when the AUTHOR
+    // wrote it as one (uppercase slug). A lowercase local tool name such as
+    // composio_search_tools is Clementine's own tool; uppercasing it minted a
+    // phantom COMPOSIO_SEARCH_TOOLS "operation" that parked
+    // scorpion-facebook-trends on a capability block (2026-09-01).
+    if (!EXACT_EXTERNAL_OPERATION.test(value)) continue;
     const normalized = value.toUpperCase();
     const occurrence = promptOccurrences.get(normalized);
-    if (
-      EXACT_EXTERNAL_OPERATION.test(normalized)
-      && !(occurrence?.prohibited && !occurrence.positive)
-    ) tokens.add(normalized);
+    if (!(occurrence?.prohibited && !occurrence.positive)) tokens.add(normalized);
   }
   return tokens;
 }
@@ -267,6 +270,9 @@ export async function prepareWorkflowStepExternalCatalog(input: {
   const tokens = explicitOperationTokens(input);
   const operationIds = [...tokens].filter((token) => {
     const toolkit = registeredToolkitOfSlug(token).trim().toLowerCase();
+    // The platform plane (COMPOSIO_SEARCH_TOOLS, COMPOSIO_*) is discovery and
+    // control, never a business operation a workflow step provisions.
+    if (toolkit === 'composio') return false;
     return isRegisteredToolkitSlug(toolkit)
       && token.startsWith(`${toolkit.toUpperCase()}_`);
   }).sort();
