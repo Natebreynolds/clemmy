@@ -1122,21 +1122,29 @@ correct the premise of gate 15.
 Run 1 took the open ask and let her choose her own path. She recalled memory,
 checked twice for an existing workflow before going ad-hoc, read the sheet with
 `GOOGLESHEETS_BATCH_GET` exactly as step 1 of the skill prescribes, then pulled
-the Slack channel. She issued `SLACK_FETCH_CONVERSATION_HISTORY` four times
-across four host turns and only two distinct results were ever retained. The
-terminal recorded both Slack reads as complete, not partial. The source was
-exhausted and she re-read it anyway, and the no-progress governor stopped her
-at its budget of three. The stop was typed and resumable, nothing was sent or
-changed, and the sheet was untouched.
+the Slack channel. Across seven host turns she made 28 tool calls, of which
+only THREE were business calls: one `GOOGLESHEETS_BATCH_GET` and two
+`SLACK_FETCH_CONVERSATION_HISTORY`. Eleven were `tool_search`, one of which
+returned `ok:false`. The terminal recorded both Slack reads as complete, not
+partial. The no-progress governor stopped her at its budget of three. The stop
+was typed and resumable, nothing was sent or changed, the sheet was untouched.
 
-So the defect is that she re-issues a read whose identical result is already
-retained for the turn, and nothing tells her she already has it. The host
-already tracks `continuationRepeated` on the result handle, and
-composio-tools.ts (~4245) is the sanctioned seam for an out-of-band advisory,
-already used by `maybeFanoutAdvisory` and `maybeDiscoveryAdvisory` under a
-`!failure.failed && nestedDispatch !== true` guard. Handing back the retained
-handle with an explicit "you already have this" is a small, additive fix that
-costs none of the settlement-kernel risk described in gate 15.
+So the dominant failure is DISCOVERY, not reading. She spent roughly forty
+percent of her calls searching for a tool, got at least one empty search, and
+never reached the step that needed it. Her two reads both succeeded and both
+retained cleanly. The governor is measuring the symptom correctly: seven turns
+produced three business calls and no credited progress.
+
+The next step is to capture what she was actually searching for. Tool-call
+arguments are not journaled to the event stream, so the failing query is not
+recoverable from the eventlog today; only `ok:false` survives. Journaling the
+`tool_search` query and its result count on failure is the cheap prerequisite
+to fixing this, and it is strictly additive telemetry.
+
+An earlier revision of this gate asserted a repeated-read loop and prescribed a
+retained-result advisory. That was wrong on the numbers. There were two Slack
+reads, not four, and they returned two distinct results. Search, not reading,
+is where the budget went.
 
 Run 2 steered her to work from retained data without re-reading Slack, and it
 passed cleanly. She found the only key collision in Log rows 2 to 33 and then
