@@ -806,3 +806,21 @@ spoke. The neutral registry now knows provider gateway names (each provider regi
 completes a direct call by lifting it into the wrapper form; with no proven entries the kernel hands the
 completers the frozen scope's operation ids; the refusal names the same scope. Pinned. Fresh standup run is
 the proof (it emails the owner only).
+
+## Gate 26 — a step's model turn has no clock (2026-09-02 10:12–10:25 UTC, daily-standup, open)
+
+On the fresh run after gate 25 the step's byo model called discovery once (`composio_search_tools`),
+answered twice without its required structured result (host retained the step: attempt 1 and 2 of 2), and
+then went silent: `heartbeat active_turn_check_in … preset: unlimited … "Still working inside turn 1."`
+every three minutes, no model request settling, no tool call, for over ten minutes. A hung provider
+request inside a workflow step with an unlimited preset hangs the step, the run, and its bounded-pool slot
+indefinitely — a dead end with no typed stop.
+
+Not fixed tonight; queued behind the tag: a workflow step's model turn needs a bounded no-response budget
+(the turn's own clock, not the heartbeat) that ends in a typed, resumable stop and one retry with the
+retained work — the same shape the no-progress governor already gives a repeating wall.
+
+Standing after this chain: the standup's catalog preparation, account selection, calendar read and the
+send-slug repair are all fixed and pinned (gates 24–25); the live send has not yet been observed because
+the last two live attempts ended in model behavior (a stutter that is now repaired; then this hang).
+The 8 AM scheduled run is the next proof.
