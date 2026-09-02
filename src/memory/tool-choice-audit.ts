@@ -47,9 +47,20 @@ export interface PollutionHit {
  * already-invalidated records. Never flags on an empty toolkit list (the caller
  * guards, but be defensive).
  */
+/** A structural intent key — a workflow step's pin (`workflow:<slug>:<step>`)
+ * or a frozen graph node — is proven by a settled crossing, never by a sentence
+ * that names a toolkit. The lexical cross-service rule read the "slack" inside
+ * `workflow:platform-49-slack-channel-review:main` as a toolkit claim and
+ * erased that step's proven GOOGLESHEETS_* write pin three nights running
+ * (07-31, 08-13, 08-21): run N+1 rediscovered its write every time. */
+export function isStructuralToolChoiceIntent(intent: string): boolean {
+  return /^(?:workflow|graph-node):/.test(intent);
+}
+
 export function detectToolChoicePollution(record: ToolChoiceRecord, knownToolkits: string[]): PollutionHit | null {
   const choice = record.choice;
   if (!choice || choice.kind !== 'composio') return null;
+  if (isStructuralToolChoiceIntent(record.intent)) return null;
   const id = choice.identifier;
   if (knownToolkits.length > 0 && isCrossServiceToolkitMismatch(record.intent, id, knownToolkits)) {
     return { intent: record.intent, identifier: id, reason: 'cross_service_mismatch' };

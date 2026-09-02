@@ -752,7 +752,10 @@ async function runCronJob(
       runId: cronRunId,
       channel: 'cron',
       message: prompt,
-      model: job.mode === 'unleashed' ? MODELS.deep : MODELS.primary,
+      // An unleashed job deliberately asks for the deep model; an ordinary job
+      // names no model so the bridge resolves the ACTIVE brain role instead of
+      // the env primary (which overrode the user's brain switch, 2026-09-01).
+      ...(job.mode === 'unleashed' ? { model: MODELS.deep } : {}),
       maxWallClockMs: cronBudgetMs,
     });
 
@@ -2427,7 +2430,9 @@ export async function startDaemon(
         // The stable run family resolves to source.runAttemptId, so neither
         // brain inserts a sibling attempt/source.
         runId: source.runId,
-        model: MODELS.primary,
+        // No explicit model: the bridge resolves the ACTIVE brain role. Pinning
+        // MODELS.primary here routed every approval resume to the env primary
+        // (a rate-limited Codex on 2026-09-01) over the user's brain switch.
       }, (req) => assistant.respond(req));
     });
   } catch (err) {
@@ -2509,7 +2514,9 @@ export async function startDaemon(
         channel: restart.channel ?? restart.surface,
         message: restart.acceptedInput,
         sourceUserSeq: restart.sourceUserSeq,
-        model: MODELS.primary,
+        // No explicit model: the bridge resolves the ACTIVE brain role (same
+        // subtraction as the improvement consumer; a restart resume on a
+        // rate-limited env primary fell over before it began, 2026-09-01).
       }, (req) => assistant.respond(req));
     } finally {
       interruptedChatResumesInFlight.delete(key);

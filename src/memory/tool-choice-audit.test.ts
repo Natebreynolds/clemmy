@@ -51,6 +51,24 @@ test('detect: non-composio and invalidated records are skipped', () => {
   assert.equal(detectToolChoicePollution({ intent: 'x', choice: null, fallbacks: [], body: '', filePath: '' }, ['dataforseo']), null);
 });
 
+test('detect: a structural intent key (workflow step pin, frozen graph node) is never read as a toolkit claim', () => {
+  // 2026-09-01: the nightly audit erased platform-49's proven GOOGLESHEETS_* pin
+  // three times because the workflow slug contains "slack".
+  assert.equal(
+    detectToolChoicePollution(rec('workflow:platform-49-slack-channel-review:main', 'GOOGLESHEETS_BATCH_UPDATE'), ['slack', 'googlesheets']),
+    null,
+  );
+  assert.equal(
+    detectToolChoicePollution(rec('graph-node:collect-then-construct:write', 'AIRTABLE_LIST_RECORDS'), ['dataforseo', 'airtable']),
+    null,
+  );
+  // A prose intent still gets the lexical rule.
+  assert.equal(
+    detectToolChoicePollution(rec('post the slack channel review', 'GOOGLESHEETS_BATCH_UPDATE'), ['slack', 'googlesheets'])?.reason,
+    'cross_service_mismatch',
+  );
+});
+
 test('detect: empty known-toolkit list never triggers the cross-service rule', () => {
   // cross-service needs a baseline; with none, only the async-taskpost rule can fire
   assert.equal(detectToolChoicePollution(rec('pull dataforseo ranked keywords', 'AIRTABLE_LIST_RECORDS'), []), null);
