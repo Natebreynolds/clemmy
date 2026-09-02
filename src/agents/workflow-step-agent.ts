@@ -635,16 +635,20 @@ export async function buildWorkflowStepAgent(
     outputGuardrails: harnessOutputGuardrails,
   });
   bindAgentMcpToolScope(agent, externalMcpScope);
-  // Explicitly locked/exact/result-only steps have no call_tool acquisition
-  // path and intentionally stay on their physical exact surface. Unbound
-  // schema-on-demand steps seal the complete post-blocklist universe, then
-  // bind revision 1 to only the active schemas plus dispatcher.
-  if (schemaOnDemand) {
+  // Every step seals a capability envelope: the host engine refuses any turn
+  // that carries tools without one (`capability_envelope_missing`). Unbound
+  // schema-on-demand steps seal the complete post-blocklist universe and bind
+  // revision 1 to the active schemas plus dispatcher; an explicitly locked /
+  // exact / result-only step seals exactly its locked surface and admits no
+  // acquisition. Live 2026-09-01: team-activity-slack-updates' send step
+  // (allowedTools: composio_execute_tool) was refused before its first model
+  // call, and the chat relayed it as "reconnect your Slack workspace?".
+  {
     try {
       const budgetSettings = getHarnessBudgetSettings();
       const universeByName = new Map<string, SealableToolLike>();
       for (const toolRef of [
-        ...capabilityUniverseTools,
+        ...(schemaOnDemand ? capabilityUniverseTools : []),
         ...tools,
       ] as unknown as SealableToolLike[]) {
         const name = typeof toolRef.name === 'string' ? toolRef.name : '';
@@ -673,7 +677,9 @@ export async function buildWorkflowStepAgent(
       if (sealed.ok) {
         bindAgentCapabilityEnvelope(agent, sealed.envelope);
         bindAgentCapabilityRevision(agent, sealed.revision);
-        admitBuiltinAcquisition = (targetName) => appendAgentCapabilityBinding(agent, targetName);
+        if (schemaOnDemand) {
+          admitBuiltinAcquisition = (targetName) => appendAgentCapabilityBinding(agent, targetName);
+        }
       } else {
         // eslint-disable-next-line no-console
         console.warn(`[workflow-step] capability universe refused to seal: ${sealed.errors.join('; ')}`);

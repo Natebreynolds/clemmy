@@ -470,3 +470,23 @@ test('buildWorkflowStepAgent: final output stays plain text even if the old reve
     delete process.env.CLEMMY_WORKFLOW_STEP_PLAINTEXT_DECISION;
   }
 });
+
+// Live 2026-09-01: team-activity-slack-updates' send step (allowedTools:
+// composio_execute_tool) was refused before its first model call with
+// `capability_envelope_missing` — the host requires an envelope for any turn
+// that carries tools, and only schema-on-demand steps sealed one. The chat
+// relayed it as "reconnect your Slack workspace?".
+test('an explicitly locked step seals an envelope covering exactly its surface and admits no acquisition', async () => {
+  const agent = await buildWorkflowStepAgent({
+    sessionId: 'workflow-locked-envelope-test',
+    userInput: 'Post the exact upstream summary to the fixed channel.',
+    lockTools: ['composio_execute_tool'],
+  });
+  const envelope = boundAgentCapabilityEnvelope(agent);
+  const revision = boundAgentCapabilityRevision(agent);
+  assert.ok(envelope, 'a locked step must bind a capability envelope or the host refuses the turn');
+  assert.ok(revision, 'a locked step must bind its active revision');
+  const activeNames = agent.tools.map((toolRef) => toolRef.name).sort();
+  assert.deepEqual([...revision!.bound].sort(), activeNames, 'the revision binds exactly the locked surface');
+  assert.deepEqual(envelope!.capabilities.map((capability) => capability.name).sort(), activeNames, 'the universe is the locked surface, nothing wider');
+});

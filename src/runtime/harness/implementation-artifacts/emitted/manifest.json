@@ -1338,7 +1338,7 @@
           "bytes": 9466
         },
         "src/agents/workflow-step-agent.ts": {
-          "bytes": 34006
+          "bytes": 34374
         },
         "src/execution/trace-to-workflow.ts": {
           "bytes": 24642
@@ -3819,7 +3819,7 @@
           "bytes": 9466
         },
         "src/agents/workflow-step-agent.ts": {
-          "bytes": 34006
+          "bytes": 34374
         },
         "src/execution/trace-to-workflow.ts": {
           "bytes": 24642
