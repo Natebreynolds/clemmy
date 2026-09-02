@@ -323,8 +323,15 @@ export function createProductionReviewedCliReadCarrier(): ProductionReviewedCliR
     loadShippedImplementations().registerIsolatedObservation(liveObservation);
     // Do not refresh-then-adopt: production transport refresh deletes the
     // seeded observation first, and a stale shipped artifact that cannot
-    // re-read CLI bytes then returns null. Adopt the seeded live identity.
-    return adoptObservedCapabilityIdentity(expected);
+    // re-read CLI bytes then returns null. Adopt the seeded live identity,
+    // and give admission a LIVE re-observer: every later crossing re-reads
+    // the CLI descriptor and executable bytes now, so freshness is real
+    // instead of a 60-second fuse lit at acquisition.
+    return adoptObservedCapabilityIdentity(expected, () => {
+      const live = observeReviewedCliReadTransport(expected.operationId, expected.accountId);
+      if (!live) throw new Error('reviewed CLI transport cannot be observed now');
+      return live;
+    });
   };
 
   return Object.freeze({

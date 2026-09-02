@@ -397,13 +397,22 @@ export async function refreshIndependentCapabilityObservation(input: {
  * the expected identity. A transport with nothing observed yields null, and the
  * capability stays unready.
  */
-export function adoptObservedCapabilityIdentity(expected: {
-  operationId: string;
-  accountId: string;
-  definitionFingerprint: string;
-  providerVersion: string;
-  operationVersion: string;
-}): IndependentCapabilityObservation | null {
+export function adoptObservedCapabilityIdentity(
+  expected: {
+    operationId: string;
+    accountId: string;
+    definitionFingerprint: string;
+    providerVersion: string;
+    operationVersion: string;
+  },
+  /**
+   * Live re-observer for later crossings. Without it the adopted snapshot is
+   * the only thing admission can re-read, so every crossing more than
+   * INDEPENDENT_OBSERVATION_FRESHNESS_MS after acquisition refused with
+   * live_observation_stale (every Friday-dashboard SOQL step, 2026-09-02).
+   */
+  observe?: IndependentObservationRegistration['observe'],
+): IndependentCapabilityObservation | null {
   let observerImplementationId: string;
   try {
     observerImplementationId = shippedObserverImplementationId();
@@ -417,7 +426,10 @@ export function adoptObservedCapabilityIdentity(expected: {
     return null;
   }
   if (!observed || observed.origin !== 'independent') return null;
-  observations.set(keyOf(observed.operationId, observed.accountId), { snapshot: observed });
+  observations.set(
+    keyOf(observed.operationId, observed.accountId),
+    observe ? { snapshot: observed, observe } : { snapshot: observed },
+  );
   return observed;
 }
 
