@@ -841,3 +841,22 @@ same sixteen, all reproduced at the 09-01 baseline. Dev daemon back on the same 
   "never claim unavailable" kept): cold first step 21,722 → 19,393 B; ask_user_question 3,247 → 1,809. The byte
   ledger journey gains `CLEMMY_SURFACE_DUMP=1`. The last 3 KB to 16 KiB is the lean action rubric (5,492 B) and
   the context snapshot (3,163 B) — a product decision, not a trim.
+
+## Gate 28 — the final full pass on the wave tip (2026-09-02 04:10 PDT)
+
+`npm test` on 120a11fa: 14,201 tests, 14,197 pass, 3 fail, 1 skipped.
+
+- `discovery-role-budget` — the trimmed `role_key` describe dropped the
+  admission-contract phrases the provider-facing schema pin requires.
+  Real regression of gate 27's byte trim; fixed in cd11196e by restoring the
+  phrases inside a shorter sentence set (the byte savings stay).
+- `host-tool-invocation` "due parallel read bodies return before the first
+  durable settlement continuation" (4 timers due in one timers phase) and
+  `project-run-tools` "historical guest-job rows" (`settle()` before the
+  child's exit handler) — both pass alone and passed on the previous two
+  full passes under load (fulltest5, fulltest10). Load-timing in tests no
+  commit of this wave touched. Not weakened; noted here so the next pass
+  that trips one is judged against this record rather than re-diagnosed.
+
+Rule: a pin that assumes timer-phase adjacency is a candidate for the flake
+ledger, not for a wider timeout.
