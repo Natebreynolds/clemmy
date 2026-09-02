@@ -33,6 +33,16 @@ export const REVIEWED_CLI_READ_ACCOUNT = 'reviewed_cli:host' as const;
 export const REVIEWED_CLI_READ_CARRIER = 'reviewed-cli-config' as const;
 export const REVIEWED_CLI_ARGUMENT_COMPILER_ID = 'host:reviewed-cli-structured-argv:v1' as const;
 
+/** The path that proves a settled live read produced a terminal result: a
+ * provider gateway answers `{ data }`; a reviewed CLI's settled value is its
+ * ReviewedCliProcessOutcomeV1, whose evidence is `stdout` (sf's JSON lands
+ * there as text). Keyed on the argument compiler, the identity both lanes
+ * already carry. Live 2026-09-01: six SOQL reads crossed and were refused
+ * `completeness_evidence_missing:data`. */
+export function liveReadCompletenessEvidencePaths(argumentCompilerId: string): readonly string[] {
+  return argumentCompilerId === REVIEWED_CLI_ARGUMENT_COMPILER_ID ? ['stdout'] : ['data'];
+}
+
 const MAX_DESCRIPTORS = 1_000;
 const MAX_ARGUMENTS = 128;
 const MAX_PREFIX_TOKENS = 128;

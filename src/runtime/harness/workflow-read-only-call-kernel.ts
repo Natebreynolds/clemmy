@@ -9,6 +9,7 @@
  * physical / settlement spine only after workflow_v3_call is durable.
  */
 import { createHash } from 'node:crypto';
+import { liveReadCompletenessEvidencePaths } from './reviewed-cli-read-config.js';
 
 import {
   armWorkflowReadOnlyCallAuthority,
@@ -1394,7 +1395,10 @@ export function acquireWorkflowReadOnlyOperationAuthority(input: {
       // observation; it does not redeem per-path evidence the way the typed
       // executor lane does, so the contract stays minimal and truthful.
       evidence: { requiredPaths: [], nonEmptyPaths: [], minItems: {} },
-      completeness: { kind: 'terminal_result', evidencePaths: ['data'] },
+      completeness: {
+        kind: 'terminal_result',
+        evidencePaths: [...liveReadCompletenessEvidencePaths(identity.argumentCompiler.id)],
+      },
       continuation: { kind: 'none' },
     });
     invocationPlan = plan;

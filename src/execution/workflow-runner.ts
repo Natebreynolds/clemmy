@@ -1232,6 +1232,29 @@ function exactSchemaCapabilityError(
   });
 }
 
+/** A step whose authored operation cannot be provisioned into the frozen
+ * catalog (wrong operation name, toolkit not connected) is a typed,
+ * proven-pre-dispatch capability block — the same park the provider gateway
+ * uses — never a thrown run error. Live 2026-09-01: daily-standup-email named
+ * OUTLOOK_OUTLOOK_SEND_EMAIL, no such definition existed, and the run ended
+ * `error`, unresumable, before its first model edge. */
+export function catalogPreparationRefusalToCapabilityBlock(
+  step: Pick<WorkflowStepInput, 'id'>,
+  refusal: { reason: string; operationId?: string; detail?: string },
+): WorkflowCapabilityBlockedError {
+  const tool = (refusal.operationId ?? '').trim();
+  const why = [refusal.reason, refusal.detail].filter(Boolean).join(': ');
+  return new WorkflowCapabilityBlockedError({
+    stepId: step.id,
+    tool: tool || `(${refusal.reason})`,
+    toolkit: tool ? exactSchemaToolkitLabel(tool) : 'provider',
+    reason: 'not-connected',
+    message: `Step "${step.id}" names ${tool || 'an operation'} but its exact definition could not be provisioned (${why}). `
+      + 'Either the toolkit is not connected or the operation name is wrong. No provider dispatch occurred; '
+      + 'the run is parked and retried when the capability appears, or fix the step\'s operation name.',
+  });
+}
+
 function isExactSchemaCapabilityReason(
   reason: WorkflowCapabilityBlockReason,
 ): reason is Extract<WorkflowCapabilityBlockReason, `exact_schema_${string}`> {
@@ -4859,12 +4882,7 @@ async function runStepViaHarness(
       deadlineAt: stepDeadlineAt,
     });
     if (preparedExternalCatalog.status === 'refused') {
-      throw new Error([
-        `workflow step "${step.id}" exact external catalog preparation refused`,
-        preparedExternalCatalog.reason,
-        preparedExternalCatalog.operationId,
-        preparedExternalCatalog.detail,
-      ].filter(Boolean).join(':'));
+      throw catalogPreparationRefusalToCapabilityBlock(step, preparedExternalCatalog);
     }
     const acceptedCatalogScope = preparedExternalCatalog.status === 'ready'
       ? {

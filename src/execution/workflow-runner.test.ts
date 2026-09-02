@@ -66,6 +66,7 @@ const {
   creationTestVerdict,
   shouldHaltResumeForSideEffect,
   hostStepMutationProof,
+  catalogPreparationRefusalToCapabilityBlock,
   stepSideEffectClass,
   isPhantomStepCompletion,
   phantomBlockedOutput,
@@ -6276,6 +6277,25 @@ test('host-lane resume proof: a prose step whose ledger shows no mutation re-run
   assert.deepEqual([...proof.uncertain.keys()].sort(), ['open', 'save', 'send']);
   assert.ok(!asked.some((id) => id.endsWith(':exact')), 'an exact call step keeps its own receipt ledger');
   assert.ok(asked.every((id) => id.startsWith('workflow:r1:')), 'the ledger is asked under the step\'s host session id');
+});
+
+test('an unprovisionable authored operation parks the run as a typed capability block, never a thrown run error', () => {
+  // 2026-09-01: daily-standup-email named OUTLOOK_OUTLOOK_SEND_EMAIL; the run ended `error` before its first model edge.
+  const block = catalogPreparationRefusalToCapabilityBlock(
+    { id: 'send' },
+    { reason: 'exact_operation_provisioning_refused', operationId: 'OUTLOOK_OUTLOOK_SEND_EMAIL', detail: 'exact_definition_unavailable' },
+  );
+  assert.equal(block.stepId, 'send');
+  assert.equal(block.tool, 'OUTLOOK_OUTLOOK_SEND_EMAIL');
+  assert.equal(block.toolkit, 'outlook');
+  assert.equal(block.reason, 'not-connected', 'a recoverable reason: the capability reaper retries this same run');
+  assert.equal(block.provenNoDispatch, true);
+  assert.match(block.message, /OUTLOOK_OUTLOOK_SEND_EMAIL/);
+  assert.match(block.message, /operation name is wrong/);
+  assert.match(block.message, /No provider dispatch occurred/);
+  const nameless = catalogPreparationRefusalToCapabilityBlock({ id: 's' }, { reason: 'too_many_explicit_operations' });
+  assert.equal(nameless.toolkit, 'provider');
+  assert.match(nameless.message, /too_many_explicit_operations/);
 });
 
 test('P0-3 halts crash-resume of an autonomous write/send step', () => {

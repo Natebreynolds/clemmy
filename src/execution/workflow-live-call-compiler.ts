@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { liveReadCompletenessEvidencePaths } from '../runtime/harness/reviewed-cli-read-config.js';
 
 import {
   createWorkflowNodeInvocationPlan,
@@ -409,7 +410,10 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
       },
       arguments: argumentContract,
       evidence: { requiredPaths: [], nonEmptyPaths: [], minItems: {} },
-      completeness: { kind: 'terminal_result', evidencePaths: ['data'] },
+      completeness: {
+        kind: 'terminal_result',
+        evidencePaths: [...liveReadCompletenessEvidencePaths(identity.argumentCompiler.id)],
+      },
       continuation: { kind: 'none' },
     });
     return { ok: true, plan, identity: Object.freeze({ ...identity }) };
