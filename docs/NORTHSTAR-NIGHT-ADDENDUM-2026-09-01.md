@@ -419,3 +419,41 @@ up a pseudo flagship source model" — GLM 5.3 must run the owner's tasks and ex
   `{tool_slug, arguments: {…}}`.
 - Dev daemon restarted 19:08 PT on `3971ef78` (pid 22222). Pins: `composio-carrier-completion.test.ts`,
   `tool-search-carrier-example.test.ts`; host-turn-runner (224), frame-policy and tool-search suites green.
+
+### Later (19:20–21:10 PT): "simplify read vs write once and for all" — the subtraction
+Owner, after the second mobile failure: "fix the root cause here and not think of a patch … We need to
+simplify read vs write, this has been a struggle for 2 weeks … make sure we aren't adding on top of the
+complex harness but removing what needs to be removed."
+- **Root cause of the second failure** (`e89e20ce`): the durable manifest store and the proof builder
+  disagreed about the identity of the same operation. 28 rows installed before 08-30 (15 reads, 13 writes:
+  sheets search/batch_update/update_values, drive find_file, outlook query/search/calendar, salesforce
+  account fetch, slack history) predate `behaviorHints` derivation; every fresh proof minted a different
+  digest under the SAME id, `store.install` refused it, and registration `continue`d silently — no factory
+  entry, no log, a discovery record claiming a digest nothing held, a JIT re-provision answering ok with
+  nothing registered. This was the "simple workflows still failing" class since the release; the workflow
+  lane escaped because it binds the durable manifest as-is. Fix: identity is the provider definition; when
+  it matches, the installed manifest IS the registration; a refused manifest is a typed, logged refusal;
+  the JIT provisioner answers ok only when every requested operation registered.
+- **Census** (agent, 954 lines, `scratchpad/rw-census.md`): four effect oracles (slug verb heuristic,
+  runtime classifier, sealed manifest, authored `sideEffect`) and TWELVE effect vocabularies; the manifest
+  is minted FROM the heuristic; one read classified six times on its way to dispatch with the proven read
+  winning at two; sixteen places where two authorities disagree; a chat read lane with no production
+  importer (read-lane-adapters/chat/read-lane, ~2.2k lines).
+- **Removed tonight** (`673fcf41`, `THE READ BAR`): from the read path — the discovery record's nine-digest
+  replay, the planning card's digest replay, a second dispatchability predicate, the durable-store
+  lifecycle/digest gate, base/`:definition:` lineage arithmetic. What remains is the whole read bar: the
+  sealed manifest says read, the row is a current callable entry for that operation, and the account
+  matches when the proof names one; only a REVOKED manifest (disconnect) refuses. Writes keep every gate.
+- **Removed tonight** (one decision per call; one step-effect classifier): the frame decides each call's
+  effect once and scheduling/admission/approval arming read it (three re-classifications deleted per
+  call); the two `structuredCallSideEffectClass` copies (validator vs enforce, D3) became one leaf where
+  `send` is a property of the operation, never a label.
+- **Next removals, in value order** (not tonight): (1) `unknown` effect collapses to the WRITE bar (plan +
+  consent) instead of a refusal terminal — chat refuses `effect_unknown`, workflows collapse to read,
+  workers to write (D6); (2) one Composio effect oracle — `classifyComposio` with no manifest falls to a
+  second heuristic that fails closed to write while the seed heuristic says read (D1), and workers use the
+  seed alone (D13); (3) delete the dead chat read lane (~2.2k lines + 5 tests, one closeout test to
+  re-home); (4) three read-acquisition machines → one (proof-provisioned catalog ×966 lines; live-read
+  registry + materializer + MCP carrier ×3.8k); (5) twelve effect vocabularies → `read | write | admin`
+  with `send` as risk. Six `exactProductionHostCall` re-proofs per call are edge re-validation by design;
+  collapse only with a pin per edge.
