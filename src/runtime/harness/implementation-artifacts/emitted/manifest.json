@@ -1521,7 +1521,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 197215
+          "bytes": 198429
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -4011,7 +4011,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 197215
+          "bytes": 198429
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291

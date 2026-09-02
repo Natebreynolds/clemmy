@@ -36,6 +36,7 @@ import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js'
 import { getProactivityPolicySnapshot } from './proactivity-policy.js';
 import { appendAgentCapabilityBinding, bindAgentCapabilityEnvelope, bindAgentCapabilityRevision, sealAgentCapabilityUniverse, type SealableToolLike } from './capability-envelope.js';
 import { composioStandingPolicyCapabilityHints } from '../integrations/composio/standing-policy-adapter.js';
+import { isComposioEnabled, peekCurrentConnectedToolkits, listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
 import type { Tool } from '@openai/agents';
 import {
@@ -1860,6 +1861,24 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     });
   })();
   const carrierWork = Boolean(actionWork || hostFreshPlanning);
+  // Warm the connected-account observation once at the turn boundary for an
+  // action turn. The prepared dispatch path reads peekCurrentConnectedToolkits
+  // synchronously and, by design, cannot load account inventory inline (the
+  // no-hidden-read invariant); so a COLD action turn whose model goes straight
+  // to a read work_call without a discovery call finds the snapshot null once
+  // it has aged past its execution window, and every read refuses
+  // "no current connected-account observation" (live 2026-09-02, GLM 5.3, a
+  // Slack/Sheets read ~22 min after the last fetch). This awaited refresh is
+  // honest and BEFORE any business row — it does exactly what a discovery call
+  // would. Best-effort and only when the snapshot is actually absent, so a
+  // warm turn adds nothing.
+  if (carrierWork) {
+    try {
+      if (isComposioEnabled() && peekCurrentConnectedToolkits() === null) {
+        await listUsableConnectedToolkits({ requireFresh: true });
+      }
+    } catch { /* transient refresh failure keeps last-good; the dispatch path still gates */ }
+  }
   const workCallLocalSchemaNames = carrierWork
     ? new Set(getLocalToolSchemas().keys())
     : new Set<string>();
