@@ -777,3 +777,11 @@ definition against the stale durable manifest. A rebound operation is now routed
 which installs the live definition as the recorded successor of the stored manifest (the catalog's existing
 supersede path); the successor is selected, revalidated and observed. Pinned in
 workflow-step-external-catalog.test.ts. The parked run resumes at boot as the proof.
+
+**Gate 24, third door (this commit).** With the successor installed, the step refused
+`ambiguous_current_manifest`: two current manifests for `OUTLOOK_LIST_EVENTS`, one per Outlook connection (a
+legacy row on `ca_uDzr…`, the provisioned one on `ca_T9pDCuTalAI3` — the connection the step prompt names
+verbatim). Grouping by operation alone cannot tell accounts apart; the exact provisioner already resolves an
+account by a connection id written in the accepted text. The step catalog now applies the same rule; no
+name stays ambiguous. Pinned. Three doors on one parked run — each typed, each one line of the same lesson:
+identity is (operation, account, definition), never a label, never a date.
