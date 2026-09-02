@@ -2736,7 +2736,32 @@ function throwExactWorkflowKernelBlock(
 type WorkflowV3SystemAuthorizationPolicy =
   | 'declarative_gate_approved'
   | 'scheduled_workflow_authority'
+  | 'manual_run_authority'
   | 'scheduled_send_authority';
+
+/** Run sources a person initiates: the console/desktop run button, the
+ * mobile run door, and a chat dispatch ("run my Friday dashboard"). */
+const HUMAN_INITIATED_RUN_SOURCES = new Set(['console', 'dashboard', 'mobile', 'chat', 'dispatch', 'discord']);
+
+/**
+ * A person asked for THIS run. That is at least the authority an accepted
+ * schedule occurrence carries, so the same non-send effects a scheduled run
+ * makes without a second approval are made here too (a reversible workspace
+ * dataset commit parked every manual Friday-dashboard run on "Approve exact
+ * local_write call space_set_data", 2026-09-02). Sends keep their floor.
+ */
+function exactHumanRunAuthority(
+  workflowSlug: string,
+  runId: string,
+): { ok: true; source: string } | { ok: false; reason: string } {
+  const rec = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  if (!rec || rec.id !== runId || rec.workflowSlug !== workflowSlug) {
+    return { ok: false, reason: 'run_record_unavailable' };
+  }
+  const source = typeof rec.source === 'string' ? rec.source : '';
+  if (!HUMAN_INITIATED_RUN_SOURCES.has(source)) return { ok: false, reason: 'run_source_not_human' };
+  return { ok: true, source };
+}
 
 /**
  * Project an already-proven workflow policy into the v3 kernel's exact
@@ -2910,6 +2935,15 @@ async function resolveWorkflowBareCallV3Consent(
         'scheduled_workflow_authority',
       );
     }
+  }
+  if (prepared.binding.effect !== 'host_only' && exactHumanRunAuthority(ctx.workflowSlug, ctx.runId).ok) {
+    return mintWorkflowPolicyV3Authorization(
+      step,
+      sessionId,
+      prepared,
+      proof,
+      'manual_run_authority',
+    );
   }
   return awaitExactWorkflowV3Authorization(step, ctx, sessionId, prepared, proof);
 }

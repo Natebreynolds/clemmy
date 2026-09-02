@@ -142,3 +142,79 @@ test('one accepted scheduled workflow-v3 call updates an existing active Workspa
   assert.equal(reconciled.contentDigest, first.contentDigest);
 });
 
+test('a human-initiated run makes the same reversible workspace commit a scheduled run makes, without a second approval', async () => {
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  ports.clearProductionCapabilityPorts();
+  observations.clearIndependentCapabilityObservations();
+
+  const args = {
+    slug: 'friday-style-dashboard-manual',
+    source_id: 'dashboard',
+    data_json: JSON.stringify({ summary: { pipeline: '$98,000' }, rows: [{ id: 'opp-50' }] }),
+  };
+  spaces.spaceStore.save({
+    id: args.slug,
+    title: 'Friday-style dashboard (manual run)',
+    status: 'active',
+    viewEntry: 'view/index.html',
+    viewContent: '<!doctype html><title>Friday-style dashboard (manual run)</title>',
+    dataSources: [],
+    actions: [],
+  });
+  const observed = carrier.observeReviewedLocalTool('space_set_data');
+  assert.ok(observed);
+  const manifest = carrier.reviewedLocalCapabilityManifest(observed);
+  assert.ok(manifest);
+  assert.equal(ports.registerFixtureCapabilityPort(
+    ports.productionPortIdentityFromManifest(manifest),
+    {
+      invoke: adapters.invokeForSealedManifest(manifest),
+      reconcile: adapters.reconcileForSealedManifest(manifest),
+    },
+  ).ok, true);
+
+  const step: WorkflowStepInput = {
+    id: 'refresh_dashboard',
+    prompt: '',
+    sideEffect: 'write',
+    call: { tool: 'space_set_data', args },
+  };
+  const workflow: WorkflowDefinition = {
+    name: 'reviewed-workspace-dataset-manual',
+    description: 'Commit one reviewed dashboard dataset from a run a person asked for.',
+    enabled: true,
+    trigger: { schedule: '0 7 * * *', timezone: 'UTC' },
+    inputs: {},
+    steps: [step],
+  };
+  const persisted = workflowStore.writeWorkflow(workflow.name, workflow);
+  // The console run button: no schedule receipt, a person asked for this run.
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    source: 'console',
+    workflowSlug: persisted.name,
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  assert.ok(queued.id);
+  const ctx = {
+    workflow: persisted.data,
+    workflowSlug: persisted.name,
+    runId: queued.id,
+    inputs: {},
+    stepOutputs: {},
+    assistant: new Proxy({}, { get: () => { throw new Error('model fallback was consulted'); } }),
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof runner.executeStep>[1];
+
+  const first = await runner.executeStep(step, ctx) as { created: boolean };
+  assert.equal(first.created, true);
+  const grants = approvals.listPending({ sessionId: `workflow:${queued.id}:${step.id}`, status: 'any' });
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0]?.resolver, 'system:workflow-manual_run_authority');
+  const replay = await runner.executeStep(step, ctx);
+  assert.deepEqual(replay, first);
+});
+
