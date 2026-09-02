@@ -693,8 +693,8 @@ Journeys after 752f8975: 155/171, the same sixteen, all reproduced at the 09-01 
 c9f1042e in progress before any tag.
 
 **Third full run (c9f1042e), 08:00 UTC:** interrupted from outside twice (2,447 and 446 results, zero failures
-each). **Completed 08:46 UTC on 9b9a2fa4: 14,192 tests, 14,191 pass, 0 fail, 1 skipped.** Journeys re-run
-follows; the dev daemon returns on the same commit afterward.
+each). **Completed 08:46 UTC on 9b9a2fa4: 14,192 tests, 14,191 pass, 0 fail, 1 skipped.** Journeys on the same
+commit: 155/171 — the identical sixteen, all reproduced at the 09-01 baseline. Dev daemon back on the same commit.
 
 ## Token efficiency — the cold surface, measured (2026-09-02 08:40 UTC)
 
