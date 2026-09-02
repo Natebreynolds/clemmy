@@ -647,8 +647,11 @@
         "src/execution/transient-error.ts": {
           "bytes": 5382
         },
+        "src/runtime/harness/model-stall-policy.ts": {
+          "bytes": 5035
+        },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 57312
+          "bytes": 57580
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -663,7 +666,7 @@
           "bytes": 4749
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 35815
+          "bytes": 37806
         },
         "src/runtime/harness/model-roles.ts": {
           "bytes": 22982
@@ -678,13 +681,10 @@
           "bytes": 3588
         },
         "src/runtime/harness/byo-model.ts": {
-          "bytes": 41318
+          "bytes": 42705
         },
         "src/runtime/harness/fault-inject.ts": {
           "bytes": 3080
-        },
-        "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 2896
         },
         "src/runtime/harness/router-model.ts": {
           "bytes": 19380
@@ -750,7 +750,7 @@
           "bytes": 13609
         },
         "src/runtime/harness/reviewed-cli-read-config.ts": {
-          "bytes": 21591
+          "bytes": 22207
         },
         "src/runtime/harness/catalog-reviewed-cli-reconcile.ts": {
           "bytes": 7801
@@ -793,6 +793,9 @@
         },
         "src/runtime/harness/dispatch-lease.ts": {
           "bytes": 20200
+        },
+        "src/runtime/harness/skill-execution.ts": {
+          "bytes": 16140
         },
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
@@ -865,9 +868,6 @@
         },
         "src/runtime/harness/grounding-gate.ts": {
           "bytes": 41010
-        },
-        "src/runtime/harness/skill-execution.ts": {
-          "bytes": 16140
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48474
@@ -1010,6 +1010,9 @@
         "src/execution/workflow-run-readiness.ts": {
           "bytes": 17742
         },
+        "src/execution/workflow-improvement-session.ts": {
+          "bytes": 723
+        },
         "src/runtime/sandboxed-script.ts": {
           "bytes": 9882
         },
@@ -1026,7 +1029,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 24628
+          "bytes": 32345
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -1227,7 +1230,7 @@
           "bytes": 6354
         },
         "src/runtime/harness/named-workflow-host-dispatch.ts": {
-          "bytes": 10094
+          "bytes": 10188
         },
         "src/memory/account-alias-store.ts": {
           "bytes": 7927
@@ -1387,6 +1390,9 @@
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
           "bytes": 47898
+        },
+        "src/execution/workflow-scheduled-lateness.ts": {
+          "bytes": 2655
         },
         "src/execution/goal-validate.ts": {
           "bytes": 14928
@@ -1779,7 +1785,7 @@
           "bytes": 20182
         },
         "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 18156
+          "bytes": 18339
         },
         "src/runtime/harness/reviewed-local-tool-carrier.ts": {
           "bytes": 340
@@ -1791,7 +1797,7 @@
           "bytes": 18394
         },
         "src/runtime/harness/workflow-read-only-call-kernel.ts": {
-          "bytes": 54523
+          "bytes": 54689
         },
         "src/runtime/harness/workflow-paginated-read-kernel.ts": {
           "bytes": 24685
@@ -1860,10 +1866,10 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 712346
+          "bytes": 718607
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 143354
+          "bytes": 144098
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10927
@@ -2121,7 +2127,7 @@
           "bytes": 5520
         },
         "src/tools/workflow-run-queue.ts": {
-          "bytes": 153918
+          "bytes": 154565
         },
         "src/execution/workflow-awaiting-input.ts": {
           "bytes": 12681
@@ -2202,7 +2208,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 300637
+          "bytes": 312699
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2217,13 +2223,13 @@
           "bytes": 49482
         },
         "src/runtime/harness/restart-recovery.ts": {
-          "bytes": 65556
+          "bytes": 69778
         },
         "src/runtime/harness/token-estimator.ts": {
           "bytes": 4626
         },
         "src/runtime/harness/compaction.ts": {
-          "bytes": 52013
+          "bytes": 53752
         },
         "src/runtime/harness/verify-delivered.ts": {
           "bytes": 16840
@@ -2265,7 +2271,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 664406
+          "bytes": 664865
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2349,7 +2355,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 42764
+          "bytes": 43329
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -2448,7 +2454,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 312761
+          "bytes": 316020
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 44364
@@ -3122,8 +3128,11 @@
         "src/execution/transient-error.ts": {
           "bytes": 5382
         },
+        "src/runtime/harness/model-stall-policy.ts": {
+          "bytes": 5035
+        },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 57312
+          "bytes": 57580
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -3138,7 +3147,7 @@
           "bytes": 4749
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 35815
+          "bytes": 37806
         },
         "src/runtime/harness/model-roles.ts": {
           "bytes": 22982
@@ -3153,13 +3162,10 @@
           "bytes": 3588
         },
         "src/runtime/harness/byo-model.ts": {
-          "bytes": 41318
+          "bytes": 42705
         },
         "src/runtime/harness/fault-inject.ts": {
           "bytes": 3080
-        },
-        "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 2896
         },
         "src/runtime/harness/router-model.ts": {
           "bytes": 19380
@@ -3225,7 +3231,7 @@
           "bytes": 13609
         },
         "src/runtime/harness/reviewed-cli-read-config.ts": {
-          "bytes": 21591
+          "bytes": 22207
         },
         "src/runtime/harness/catalog-reviewed-cli-reconcile.ts": {
           "bytes": 7801
@@ -3268,6 +3274,9 @@
         },
         "src/runtime/harness/dispatch-lease.ts": {
           "bytes": 20200
+        },
+        "src/runtime/harness/skill-execution.ts": {
+          "bytes": 16140
         },
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
@@ -3340,9 +3349,6 @@
         },
         "src/runtime/harness/grounding-gate.ts": {
           "bytes": 41010
-        },
-        "src/runtime/harness/skill-execution.ts": {
-          "bytes": 16140
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48474
@@ -3485,6 +3491,9 @@
         "src/execution/workflow-run-readiness.ts": {
           "bytes": 17742
         },
+        "src/execution/workflow-improvement-session.ts": {
+          "bytes": 723
+        },
         "src/runtime/sandboxed-script.ts": {
           "bytes": 9882
         },
@@ -3501,7 +3510,7 @@
           "bytes": 3323
         },
         "src/execution/workflow-self-improvement.ts": {
-          "bytes": 24628
+          "bytes": 32345
         },
         "src/execution/workflow-call-receipts.ts": {
           "bytes": 64063
@@ -3702,7 +3711,7 @@
           "bytes": 6354
         },
         "src/runtime/harness/named-workflow-host-dispatch.ts": {
-          "bytes": 10094
+          "bytes": 10188
         },
         "src/memory/account-alias-store.ts": {
           "bytes": 7927
@@ -3862,6 +3871,9 @@
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
           "bytes": 47898
+        },
+        "src/execution/workflow-scheduled-lateness.ts": {
+          "bytes": 2655
         },
         "src/execution/goal-validate.ts": {
           "bytes": 14928
@@ -4254,7 +4266,7 @@
           "bytes": 20182
         },
         "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 18156
+          "bytes": 18339
         },
         "src/runtime/harness/reviewed-local-tool-carrier.ts": {
           "bytes": 340
@@ -4266,7 +4278,7 @@
           "bytes": 18394
         },
         "src/runtime/harness/workflow-read-only-call-kernel.ts": {
-          "bytes": 54523
+          "bytes": 54689
         },
         "src/runtime/harness/workflow-paginated-read-kernel.ts": {
           "bytes": 24685
@@ -4335,10 +4347,10 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 712346
+          "bytes": 718607
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 143354
+          "bytes": 144098
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10927
@@ -4596,7 +4608,7 @@
           "bytes": 5520
         },
         "src/tools/workflow-run-queue.ts": {
-          "bytes": 153918
+          "bytes": 154565
         },
         "src/execution/workflow-awaiting-input.ts": {
           "bytes": 12681
@@ -4677,7 +4689,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 300637
+          "bytes": 312699
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4692,13 +4704,13 @@
           "bytes": 49482
         },
         "src/runtime/harness/restart-recovery.ts": {
-          "bytes": 65556
+          "bytes": 69778
         },
         "src/runtime/harness/token-estimator.ts": {
           "bytes": 4626
         },
         "src/runtime/harness/compaction.ts": {
-          "bytes": 52013
+          "bytes": 53752
         },
         "src/runtime/harness/verify-delivered.ts": {
           "bytes": 16840
@@ -4740,7 +4752,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 664406
+          "bytes": 664865
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4824,7 +4836,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 42764
+          "bytes": 43329
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -4923,7 +4935,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 312761
+          "bytes": 316020
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 44364
@@ -5037,7 +5049,7 @@
           "bytes": 7660
         },
         "src/runtime/harness/reviewed-cli-read-config.ts": {
-          "bytes": 21591
+          "bytes": 22207
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
           "bytes": 12047
@@ -5076,7 +5088,7 @@
           "bytes": 7660
         },
         "src/runtime/harness/reviewed-cli-read-config.ts": {
-          "bytes": 21591
+          "bytes": 22207
         },
         "src/runtime/harness/reviewed-cli-read-transport.ts": {
           "bytes": 12047
