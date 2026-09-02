@@ -6184,6 +6184,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     } else try {
       step = await runOneModelStep(modelInput, instructions, modelStepSchemas);
       ranModelStep = true;
+      // A frame that produced output restores the pre-content stall retry: the
+      // budget bounds ONE frame's silence, not the whole turn (live 2026-09-02:
+      // a 12-read turn spent its single retry early and the next long think
+      // became 'transport stopped responding').
+      remainingPreContentStallRetries = modelStreamStallRetries();
     } catch (error) {
       // Match loop.ts: a pre-content stall with no paid request in flight is
       // retryable. Swallowing it as blockedOutcome killed the rescue brain

@@ -651,10 +651,10 @@
           "bytes": 5382
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 5630
+          "bytes": 6005
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 59697
+          "bytes": 59910
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -2217,7 +2217,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 316365
+          "bytes": 316719
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3141,10 +3141,10 @@
           "bytes": 5382
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 5630
+          "bytes": 6005
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 59697
+          "bytes": 59910
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -4707,7 +4707,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 316365
+          "bytes": 316719
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505

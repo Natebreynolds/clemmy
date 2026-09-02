@@ -650,7 +650,10 @@ export function clearRateLimitedBrainsForTest(): void {
 
 function silentFailureReason(err: unknown): string | null {
   if (err instanceof FirstByteTimeoutError) return 'first-byte-timeout';
-  if (err instanceof PreActionableTimeoutError) return 'pre-actionable-timeout';
+  // A pre-actionable wall is a UX pace choice, not evidence the brain is dead:
+  // it must not bench the user's chosen brain for the rest of the run (live
+  // 2026-09-02: one 60 s wall hit benched grok-4.6 for every later frame).
+  if (err instanceof PreActionableTimeoutError) return null;
   if (err instanceof PreContentStreamEndedError) return 'model.empty_completion';
   const kind = normalizedModelFailureReason(err);
   return kind === 'model.transport_timeout' || kind === 'model.empty_completion' ? kind : null;

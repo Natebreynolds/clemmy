@@ -60,7 +60,7 @@ const IMPORT_EXCEPTIONS: Record<string, string[]> = {
   // bounded canonical digest of that grammar. Zod and the shared closed-JSON
   // encoder are pure, deterministic validation/encoding seams: neither reads
   // runtime state nor reverses a dependency into the harness or a provider.
-  'work-topology.ts': ['zod', '../../shared/closed-canonical-json.js'],
+  'work-topology.ts': ['zod', '../../shared/closed-canonical-json.js', '../../shared/work-id.js'],
 };
 
 const AMBIENT_FORBIDDEN = ['process.env', 'Date.now', 'Math.random', 'fetch('];

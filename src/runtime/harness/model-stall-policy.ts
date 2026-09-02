@@ -3,10 +3,10 @@ import { getRuntimeEnv } from '../../config.js';
 /** Shared finite wall for an active model response. */
 export function modelStreamStallMs(): number {
   const raw = Number.parseInt(
-    getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_MS', '300000') ?? '300000',
+    getRuntimeEnv('CLEMMY_MODEL_STREAM_STALL_MS', '600000') ?? '600000',
     10,
   );
-  if (!Number.isFinite(raw)) return 300_000;
+  if (!Number.isFinite(raw)) return 600_000;
   return raw <= 0 ? 0 : raw;
 }
 
@@ -16,7 +16,7 @@ export function modelStreamStallMs(): number {
 export function modelFirstByteStallMs(): number {
   const ceiling = modelStreamStallMs();
   const raw = Number.parseInt(
-    getRuntimeEnv('CLEMMY_MODEL_FIRST_BYTE_STALL_MS', '180000') ?? '180000',
+    getRuntimeEnv('CLEMMY_MODEL_FIRST_BYTE_STALL_MS', '300000') ?? '300000',
     10,
   );
   if (!Number.isFinite(raw) || raw <= 0) return ceiling;
@@ -71,10 +71,15 @@ export function sizedBrainFalloverFirstByteMs(baseMs: number, input: unknown): n
  * Background/workflow/worker lanes do not opt into this policy. */
 export function modelInteractivePreActionableMs(): number {
   const raw = Number.parseInt(
-    getRuntimeEnv('CLEMMY_MODEL_INTERACTIVE_PRE_ACTIONABLE_MS', '60000') ?? '60000',
+    getRuntimeEnv('CLEMMY_MODEL_INTERACTIVE_PRE_ACTIONABLE_MS', '0') ?? '0',
     10,
   );
-  if (!Number.isFinite(raw)) return 60_000;
+  // OFF by default (live 2026-09-02): the owner's chosen brain (grok-4.6, a
+  // reasoning model whose thinking is not streamed) was declared 'unavailable'
+  // at 60 s while it was still thinking, then benched for the run. A brain the
+  // user chose gets its thinking time; true silence is still bounded by the
+  // first-byte fallover budget and the stall watchdog. Set >0 to re-arm.
+  if (!Number.isFinite(raw)) return 0;
   return raw <= 0 ? 0 : raw;
 }
 
