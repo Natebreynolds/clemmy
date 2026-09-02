@@ -104,29 +104,40 @@ function throwingRunner(): EventEmitter {
   return runner;
 }
 
-function readOnlyFileDraft(capabilityRef: string) {
+// A read op plus a write op bound to a capability the host has NOT attested.
+// A wholly-read plan is now admitted as a gather stage (plan-tools change
+// 2026-09-02); the missing-write refusal fires only on a broken write binding,
+// which is what these governor-recovery regressions exercise.
+function readThenUnattestedWriteDraft(readRef: string) {
   return {
     criteria: ['Read the source before creating the requested output file.'],
     cardinality: null,
     destination: null,
     topology: {
       version: 1,
-      operations: [{
-        id: 'read_source',
-        effect: 'read',
-        coverage: 'single',
-        dependsOn: [],
-        dataFrom: [],
-        cardinality: { kind: 'once' },
-      }],
+      operations: [
+        {
+          id: 'read_source',
+          effect: 'read',
+          coverage: 'single',
+          dependsOn: [],
+          dataFrom: [],
+          cardinality: { kind: 'once' },
+        },
+        {
+          id: 'create_output',
+          effect: 'local_write',
+          dependsOn: ['read_source'],
+          dataFrom: ['read_source'],
+          cardinality: { kind: 'once' },
+        },
+      ],
       universes: [],
     },
-    bindings: [{
-      operationId: 'read_source',
-      role: 'source',
-      capabilityRef,
-      evidence: ['tool_result'],
-    }],
+    bindings: [
+      { operationId: 'read_source', role: 'source', capabilityRef: readRef, evidence: ['tool_result'] },
+      { operationId: 'create_output', role: 'sink', capabilityRef: 'cap:local:deferred_write:create', evidence: ['tool_result'] },
+    ],
     deliverables: [{ id: 'source_evidence', kind: 'evidence' }],
     evidenceRequirements: ['tool_result'],
   };
@@ -370,7 +381,7 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
           responseId: 'card-repair-incomplete-plan',
           output: [functionCall('card-repair-incomplete-plan', 'plan_task', {
             preamble: 'I’ll read the source and create the output now.',
-            draft: readOnlyFileDraft('cap:local:write_file:create'),
+            draft: readThenUnattestedWriteDraft('cap:local:write_file:create'),
           })],
         };
       }
@@ -469,7 +480,7 @@ test('an empty-card missing-write recovery exposes one search, then newly disclo
           responseId: 'search-repair-incomplete-plan',
           output: [functionCall('search-repair-incomplete-plan', 'plan_task', {
             preamble: 'I’ll read the source and create the output now.',
-            draft: readOnlyFileDraft('cap:local:user_profile_read:read'),
+            draft: readThenUnattestedWriteDraft('cap:local:user_profile_read:read'),
           })],
         };
       }

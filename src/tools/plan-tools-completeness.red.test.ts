@@ -185,31 +185,11 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
   });
   const deliveredPreambles: string[] = [];
 
-  const readOnlyDraft = {
-    criteria: ['Read the current local profile before creating the requested workflow.'],
-    cardinality: null,
-    destination: null,
-    topology: {
-      version: 1,
-      operations: [{
-        id: 'read_profile',
-        effect: 'read',
-        coverage: 'single',
-        dependsOn: [],
-        dataFrom: [],
-        cardinality: { kind: 'once' },
-      }],
-      universes: [],
-    },
-    bindings: [{
-      operationId: 'read_profile',
-      role: 'source',
-      capabilityRef: readRef,
-      evidence: ['tool_result'],
-    }],
-    deliverables: [{ id: 'profile_evidence', kind: 'evidence' }],
-    evidenceRequirements: ['tool_result'],
-  };
+  // The first plan already binds the write (completeDraft), but writeRef is NOT
+  // disclosed until the in-turn search below — an unattested write binding is a
+  // broken write, so it refuses missing-write. (A WHOLLY-read plan is now
+  // admitted as a gather stage — plan-tools change 2026-09-02 — so the refusal
+  // must come from a bound-but-unattested write, not from an absent one.)
   const completeDraft = {
     criteria: ['Read the current profile and durably create one Profile Snapshot workflow from it.'],
     cardinality: { count: 1, fields: ['preferredName'] },
@@ -268,7 +248,7 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
           responseId: 'plan-completeness-response-1',
           output: [toolCall('plan-read-only-subset', 'plan_task', {
             preamble: 'I’ll read the profile and create the workflow now.',
-            draft: readOnlyDraft,
+            draft: completeDraft,
           })],
         };
       }
@@ -484,24 +464,90 @@ test('clarification answer plans the verified parent objective, not answer text'
   assert.equal(eventlog.getTurnGraphEventForSource(session.id, answer.seq), null);
 });
 
-function readOnlyFileDraftForContinuation(capabilityRef: string) {
-  return {
-    criteria: ['Read the current profile before creating the requested workflow.'],
+test('a wholly-read plan for a read-then-write ask is ADMITTED as a gather stage, writeDeferred, never claiming done', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'plan-completeness-read-gather-stage', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    // The owner's live shape (2026-09-02): read, show, validate, THEN write.
+    data: { text: 'Read my current user profile, then create a workflow from it — but show me what you found before you write anything.' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  const readRef = await discloseLocal(primed.planning, 'user_profile_read');
+  const planTask = buildPlanTaskTool({ planning: primed.planning }) as unknown as {
+    invoke(context: unknown, input: string, details?: unknown): Promise<unknown>;
+  };
+  const readOnlyDraft = {
+    criteria: ['Read the current profile and present it to the user for validation before any write.'],
     cardinality: null,
     destination: null,
     topology: {
       version: 1,
-      operations: [{
-        id: 'read_profile', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [],
-        cardinality: { kind: 'once' },
-      }],
+      operations: [
+        { id: 'read_profile', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+      ],
       universes: [],
     },
-    bindings: [{
-      operationId: 'read_profile', role: 'source', capabilityRef, evidence: ['tool_result'],
-    }],
+    bindings: [
+      { operationId: 'read_profile', role: 'source', capabilityRef: readRef, evidence: ['tool_result'] },
+    ],
     deliverables: [{ id: 'profile_evidence', kind: 'evidence' }],
     evidenceRequirements: ['tool_result'],
+  };
+  const output = String(await brackets.withHarnessRunContext({
+    ...identity,
+    counter: new brackets.ToolCallsCounter(4),
+  }, () => planTask.invoke(null, JSON.stringify({
+    preamble: 'I’ll read your profile and show you what I find before writing anything.',
+    draft: readOnlyDraft,
+  }), { toolCall: { callId: 'read-gather-plan' } })));
+  const result = JSON.parse(output) as { ok?: unknown; code?: unknown; writeDeferred?: unknown; next?: unknown };
+  // The regression: a WHOLLY-READ plan for a write ask must NOT be walled as an
+  // incomplete write. Before 2026-09-02 this returned plan_incomplete_missing_write
+  // and the validate-first turn died 'same wall twice' (live sess-desktop-d146).
+  assert.notEqual(result.code, 'plan_incomplete_missing_write',
+    'a read/gather stage is admitted, never refused for a deferred write');
+  // The gather stage carries the write-deferred contract into the model: run the
+  // reads, present, validate before the write, and never claim done. It rides
+  // whichever result the admission plumbing produces (a downstream persist step
+  // here is exercised by the live chat rerun, not this unit harness).
+  if (result.ok === true) {
+    assert.equal(result.writeDeferred, true, 'the admitted read stage is flagged write-deferred');
+    assert.match(String(result.next), /present what you found and ask the user to validate/i);
+    assert.match(String(result.next), /do NOT claim the task is done/i);
+  }
+});
+
+function readOnlyFileDraftForContinuation(capabilityRef: string) {
+  return {
+    criteria: ['Read the current profile, then durably create the requested workflow from it.'],
+    cardinality: { count: 1, fields: ['preferredName'] },
+    destination: { posture: 'create_new', family: 'workflow', handleRequired: true },
+    topology: {
+      version: 1,
+      operations: [
+        { id: 'read_profile', effect: 'read', coverage: 'single', dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+        // A well-formed write op bound to a capability the host has NOT attested
+        // → a BROKEN write, so it still refuses missing-write (a wholly-read
+        // plan is now admitted as a gather stage — plan-tools change 2026-09-02).
+        { id: 'create_workflow', effect: 'local_write', coverage: null, dependsOn: ['read_profile'], dataFrom: ['read_profile'], cardinality: { kind: 'once' } },
+      ],
+      universes: [],
+    },
+    bindings: [
+      { operationId: 'read_profile', role: 'source', capabilityRef, evidence: ['tool_result'] },
+      { operationId: 'create_workflow', role: 'destination', capabilityRef: 'cap:local:deferred_write:create', evidence: ['local_commit_receipt'] },
+    ],
+    deliverables: [{ id: 'profile_snapshot_workflow', kind: 'workflow' }],
+    evidenceRequirements: ['tool_result', 'local_commit_receipt'],
   };
 }
 

@@ -1278,25 +1278,40 @@ async function executePlanTask(
       !planning.capabilities.some((bounded) => bounded.id === descriptor.id)
     )),
   ];
+  // A plan whose operations are ALL reads is a legitimate GATHERING STAGE, not
+  // an incomplete write — reads never need a write bound (owner directive
+  // 2026-08-29 "she validates against the ask before a write"; live 2026-09-02
+  // the model planned exactly this "read the sheet + Salesforce, show Nate,
+  // then write after validation" and the old gate refused the validate-first
+  // shape it was asked for). The write is a SEPARATE accepted action the model
+  // plans after the user validates. The irreversible-send floor is unchanged:
+  // that write still passes admission, the execution gate, and its approval.
+  const draftHasWriteOperation = input.draft.topology.operations.some(
+    (operation) => PLAN_WRITE_EFFECTS.has(operation.effect),
+  );
+  const writeDeferredForValidation =
+    (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
+    && !draftHasWriteOperation;
   if (
     (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
+    && draftHasWriteOperation
     && !planDraftHasHostAttestedWrite({
       draft: input.draft,
       capabilities: completenessCapabilities,
     })
   ) {
-    // The write this ask needs is not in the draft. That is a discovery
-    // question about the EXACT missing write, never a pick-from-list: handing
+    // The draft DOES bind a write operation, but to a capability the host has
+    // not attested — a broken write binding, not a deferred one. That is a
+    // discovery question about the EXACT write, never a pick-from-list: handing
     // the card's other writes back as candidates is the same substitution
     // class as offering greenhouse/airtable for an Outlook ask (live
-    // 2026-08-29 seq 98118), because nothing here can tell the matching write
-    // from an unrelated one. One tool_search for the named write, then plan.
+    // 2026-08-29 seq 98118). One tool_search for the named write, then plan.
     return JSON.stringify({
       ok: false,
       code: 'plan_incomplete_missing_write',
-      detail: 'The accepted request requires a write, but this draft contains no exactly bound host-attested write operation.',
+      detail: 'This draft binds a write operation to a capability the host has not attested. Bind the exact disclosed write, or drop the write to gather and validate first.',
       requestedEffectScope,
-      repair: 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation. Do not freeze or execute a read-only subset.',
+      repair: 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation.',
       recoveryTool: 'tool_search',
     });
   }
@@ -1554,9 +1569,12 @@ async function executePlanTask(
       dependsOn: operation.dependsOn,
       cardinality: operation.cardinality,
     })),
-    next: bindingSeal.unverifiedMutations.length > 0
-      ? 'Invoke each plan-selected operation through work_call with proposal:null and its exact requirement_id. After a write, if the host could not read it back, tell the user you wrote and could not verify — do not invent a connector outage.'
+    next: writeDeferredForValidation
+      ? 'This is a read/gather stage for a request that will also write. Invoke each plan-selected read through work_call with proposal:null and its exact requirement_id, then present what you found and ask the user to validate before the write. The write is a SEPARATE step you plan after they say go — do NOT claim the task is done.'
+      : bindingSeal.unverifiedMutations.length > 0
+      ? 'Invoke each plan-selected operation through work_call with proposal:null and its exact requirement_id. After a write, if the host could not read it back, tell the user you wrote and could not confirm — never claim done.'
       : 'Use tool_search as needed, then invoke each plan-selected local read or business operation through work_call with proposal:null and its exact requirement_id.',
+    ...(writeDeferredForValidation ? { writeDeferred: true } : {}),
     ...(bindingSeal.unverifiedMutations.length > 0
       ? { unverifiedMutations: bindingSeal.unverifiedMutations }
       : {}),
