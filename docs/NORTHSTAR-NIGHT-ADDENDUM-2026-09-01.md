@@ -825,5 +825,5 @@ send-slug repair are all fixed and pinned (gates 24–25); the live send has not
 the last two live attempts ended in model behavior (a stutter that is now repaired; then this hang).
 The 8 AM scheduled run is the next proof.
 
-**Final full pass on aae535bf (03:34 PT): 14,198 tests, 14,197 pass, 0 fail, 1 skipped.** Journeys follow; the
-dev daemon returns on the same commit afterward.
+**Final full pass on aae535bf (03:34 PT): 14,198 tests, 14,197 pass, 0 fail, 1 skipped.** Journeys: 155/171 — the
+same sixteen, all reproduced at the 09-01 baseline. Dev daemon back on the same commit at 03:44 PT.
