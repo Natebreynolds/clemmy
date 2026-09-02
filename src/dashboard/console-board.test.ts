@@ -3719,3 +3719,83 @@ test('a blocked task card speaks plain voice, not runtime reconciliation jargon'
     await h.close();
   }
 });
+
+// The board reads the capability block (2026-09-02): a run stopped on a proven
+// capability gate used to show as "Running" because section 5 read only the
+// mutation block. It is a Needs You card with a typed next edge to the exact
+// Inbox gate — never a bare status word.
+test('GET /api/console/board puts a capability-gated run in Needs you with a next edge to the exact Inbox gate', async () => {
+  const workflowSlug = 'board-capability-gate-wf';
+  const runId = 'sched-capgate-0001';
+  writeWorkflow(workflowSlug, {
+    name: workflowSlug,
+    description: 'capability gate test workflow',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'pull', prompt: 'Pull the data.' }],
+  } as never);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: workflowSlug,
+    status: 'blocked_capability',
+    createdAt: new Date().toISOString(),
+    capabilityBlock: {
+      stepId: 'pull', tool: 'GOOGLESHEETS_BATCH_GET', toolkit: 'googlesheets', reason: 'ambiguous-account',
+      message: 'Two Google accounts can read this sheet.', state: 'blocked', provenNoDispatch: true, retryCount: 1,
+    },
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'pull' });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: Array<BoardCard & { progressHint?: string; nextEdge?: { label: string; href: string } }> };
+    const card = body.cards.find((c) => c.id === `wf:${workflowSlug}:${runId}`);
+    assert.ok(card, 'the pending-workflow card is present');
+    assert.equal(card!.column, 'needs_you');
+    assert.equal(card!.status, 'blocked_capability');
+    assert.match(card!.progressHint ?? '', /Choose an exact account/);
+    assert.match(card!.progressHint ?? '', /stopped before anything was sent/);
+    assert.equal(card!.nextEdge?.href, `/inbox?tab=needs&select=${encodeURIComponent(`workflow-${runId}-capability-googlesheets`)}`);
+    assert.deepEqual(card!.actions, ['cancel']);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /api/console/board shows a scheduled workflow with an unbound required resource as a Needs you card linking to Automate', async () => {
+  writeWorkflow('board-unbound-sheet', {
+    name: 'board-unbound-sheet',
+    description: 'refresh the pipeline sheet',
+    enabled: true,
+    trigger: { schedule: '0 7 * * 1-5' },
+    steps: [{ id: 'refresh', prompt: 'Refresh it.' }],
+    resources: { sheet: { id: 'sheet', kind: 'sheet', label: 'Pipeline sheet', required: true } },
+  } as never);
+  writeWorkflow('board-unbound-manual', {
+    name: 'board-unbound-manual',
+    description: 'manual',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'refresh', prompt: 'Refresh it.' }],
+    resources: { sheet: { id: 'sheet', kind: 'sheet', required: true } },
+  } as never);
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: Array<BoardCard & { progressHint?: string; nextEdge?: { label: string; href: string } }> };
+    const card = body.cards.find((c) => c.id === 'wf-binding:board-unbound-sheet');
+    assert.ok(card, 'the scheduled unbound workflow has a card');
+    assert.equal(card!.column, 'needs_you');
+    assert.equal(card!.status, 'needs_binding');
+    assert.match(card!.progressHint ?? '', /Won't run on its schedule until you bind: Pipeline sheet/);
+    assert.equal(card!.nextEdge?.href, '/automate?workflow=board-unbound-sheet');
+    assert.ok(!body.cards.some((c) => c.id === 'wf-binding:board-unbound-manual'), 'a manual workflow with the same gap is not a stop');
+  } finally {
+    await h.close();
+  }
+});

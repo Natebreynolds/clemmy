@@ -67,6 +67,7 @@ export function Workflows() {
             <span>{wf.stepCount} steps</span>
             {wf.schedule ? <span>cron: {wf.schedule}</span> : null}
             {wf.requiresInput ? <span class="workflow-row-tag">needs input</span> : null}
+            {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-tag">needs binding</span> : null}
             {wf.lastRunAt ? <span>last: {relativeTime(wf.lastRunAt)}</span> : null}
           </div>
         </button>
@@ -100,6 +101,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const requiredMissing = (info?.inputs ?? [])
     .filter((input) => input.required && !(inputValues[input.key] ?? '').trim())
     .map((input) => input.key);
+  const bindingGaps = workflow.resourceGaps ?? [];
 
   async function trigger() {
     if (triggering) return;
@@ -234,14 +236,20 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
           </div>
         ) : null}
 
+        {bindingGaps.length > 0 ? (
+          <div class="global-error" role="status">
+            Won't run until you bind: {bindingGaps[0]}{bindingGaps.length > 1 ? ` (+${bindingGaps.length - 1} more)` : ''}
+          </div>
+        ) : null}
         <div class="workflow-actions">
           <button
             class="btn"
-            disabled={triggering || !workflow.enabled || requiredMissing.length > 0}
+            disabled={triggering || !workflow.enabled || requiredMissing.length > 0 || bindingGaps.length > 0}
             onClick={trigger}
           >
             {triggering ? 'Queuing…'
               : !workflow.enabled ? 'Disabled'
+                : bindingGaps.length > 0 ? 'Needs a binding (set it on your Mac)'
                 : requiredMissing.length > 0 ? `Needs: ${requiredMissing.join(', ')}`
                   : 'Run now'}
           </button>

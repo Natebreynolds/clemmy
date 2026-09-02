@@ -7909,3 +7909,52 @@ test('rememberProvenWorkflowStepTool records the corrected invocation template, 
   assert.ok(!toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin refused only', 'update_sheet')),
     'a step whose only provider call was refused learns nothing');
 });
+
+// Ever-learning (2026-09-02): the live standup step crossed its send wrapped in
+// work_call after the host completed the stuttered slug. The pin writer only
+// saw bare gateway calls, so the working shape was never learned and the next
+// run re-derived it. A wrapped carrier now pins exactly like a bare one.
+test('rememberProvenWorkflowStepTool learns a provider call that crossed wrapped in work_call, and ignores a wrapped local tool', () => {
+  const toolChoices = learnedPinToolChoices;
+  const { workflowStepPinIntent } = learnedPinBindings;
+  const inner = JSON.stringify({ tool_slug: 'FIXTURE_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'nate@example.com', subject: 'Daily Standup', body: 'x' }) });
+  const wrapped = JSON.stringify({ name: 'composio_execute_tool', args_json: inner, requirement_id: 'send_standup' });
+  const sessionId = 'workflow:learned-pin-wrapped:send';
+  harnessEventlog.createSession({ id: sessionId, kind: 'workflow', channel: 'workflow' });
+  harnessEventlog.appendEvent({
+    sessionId, turn: 1, role: 'agent', type: 'tool_called',
+    data: { tool: 'work_call', callId: 'wrapped-1', arguments: wrapped },
+  });
+  harnessEventlog.appendEvent({
+    sessionId, turn: 1, role: 'agent', type: 'tool_returned',
+    data: { tool: 'work_call', callId: 'wrapped-1', result: '{"successful":true,"data":{"id":"AAMk"}}' },
+  });
+  // A later wrapped LOCAL call that also succeeded must not shadow the provider pin.
+  harnessEventlog.appendEvent({
+    sessionId, turn: 1, role: 'agent', type: 'tool_called',
+    data: { tool: 'work_call', callId: 'local-2', arguments: JSON.stringify({ name: 'read_file', args_json: '{"path":"notes.md"}' }) },
+  });
+  harnessEventlog.appendEvent({
+    sessionId, turn: 1, role: 'agent', type: 'tool_returned',
+    data: { tool: 'work_call', callId: 'local-2', result: 'ok' },
+  });
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId, workflowName: 'Learned Pin wrapped', stepId: 'send' });
+  const record = toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin wrapped', 'send'));
+  assert.ok(record, 'the wrapped provider call is pinned');
+  assert.equal(record?.choice.identifier, 'FIXTURE_OUTLOOK_SEND_EMAIL');
+  assert.match(record?.choice.invocationTemplate ?? '', /Daily Standup/, 'the template is the inner provider arguments');
+
+  const localOnly = 'workflow:learned-pin-wrapped-local:send';
+  harnessEventlog.createSession({ id: localOnly, kind: 'workflow', channel: 'workflow' });
+  harnessEventlog.appendEvent({
+    sessionId: localOnly, turn: 1, role: 'agent', type: 'tool_called',
+    data: { tool: 'work_call', callId: 'local-only', arguments: JSON.stringify({ name: 'read_file', args_json: '{"path":"notes.md"}' }) },
+  });
+  harnessEventlog.appendEvent({
+    sessionId: localOnly, turn: 1, role: 'agent', type: 'tool_returned',
+    data: { tool: 'work_call', callId: 'local-only', result: 'ok' },
+  });
+  workflowRunnerInternalsForTest.rememberProvenWorkflowStepTool({ sessionId: localOnly, workflowName: 'Learned Pin wrapped local', stepId: 'send' });
+  assert.ok(!toolChoices.peekToolChoice(workflowStepPinIntent('Learned Pin wrapped local', 'send')),
+    'a wrapper around a local tool is not a provider pin');
+});

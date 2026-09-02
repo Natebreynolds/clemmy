@@ -21,6 +21,8 @@
 import { listPending as listPendingHarnessApprovals } from '../runtime/harness/approval-registry.js';
 import { listOperationalEvents } from '../runtime/operational-telemetry.js';
 import { listBackgroundTasks } from '../execution/background-tasks.js';
+import { listPendingRuns } from '../execution/workflow-events.js';
+import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
 import {
   projectActivitySnapshot,
   shouldSurfaceInWorkingNow,
@@ -279,6 +281,7 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
     + safe(() => listPlanProposals({ status: 'all' }).filter(planProposalNeedsUserInput).length, 0)
     + safe(() => listBackgroundTasks({ status: 'blocked' }).length, 0)
     + safe(() => listBackgroundTasks({ status: 'awaiting_continue' }).length, 0)
+    + countWorkflowStops()
     + stalledCount;
 
   return {
@@ -295,6 +298,20 @@ export function buildActivitySnapshot(now: Date = new Date()): ActivitySnapshot 
       failed: failedRecent.length,
     },
   };
+}
+
+/**
+ * Runs stopped on a proven capability gate plus scheduled workflows that cannot
+ * run until a resource is bound. Both are waiting on the owner, so every surface
+ * that says "waiting on you" (board, notch, Slack, Discord, mobile) counts them.
+ * Before 2026-09-02 neither was counted anywhere: a stopped run was a silent
+ * non-event. Fail-open: a read error counts as zero, never throws.
+ */
+export function countWorkflowStops(): number {
+  let count = 0;
+  try { count += listPendingRuns().filter((run) => run.runStatus === 'blocked_capability').length; } catch { /* zero */ }
+  try { count += listWorkflowBindingStops().filter((stop) => stop.scheduled).length; } catch { /* zero */ }
+  return count;
 }
 
 /** Compact human elapsed, e.g. "12m", "3h", "2d". Small shared formatter so the

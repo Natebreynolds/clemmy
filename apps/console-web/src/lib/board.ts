@@ -74,6 +74,8 @@ export interface BoardCard {
   continueMode?: BoardContinueMode;
   approvalId?: string;
   nextSafeAction?: string;
+  /** Typed next edge for a stopped run: label + in-app href. */
+  nextEdge?: { label: string; href: string };
   contentPreview?: ApprovalContentPreview;
   /** Exact durable action behind an approval card. This is display-only;
    * the action route still validates the card/action/session backlink. */

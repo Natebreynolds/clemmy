@@ -1218,10 +1218,10 @@
           "bytes": 13386
         },
         "src/execution/workflow-resource-binding.ts": {
-          "bytes": 23577
+          "bytes": 25532
         },
         "src/execution/workflow-certification.ts": {
-          "bytes": 14396
+          "bytes": 12661
         },
         "src/runtime/workflow-origin-authority.ts": {
           "bytes": 1769
@@ -1872,7 +1872,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 721672
+          "bytes": 723940
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098
@@ -3705,10 +3705,10 @@
           "bytes": 13386
         },
         "src/execution/workflow-resource-binding.ts": {
-          "bytes": 23577
+          "bytes": 25532
         },
         "src/execution/workflow-certification.ts": {
-          "bytes": 14396
+          "bytes": 12661
         },
         "src/runtime/workflow-origin-authority.ts": {
           "bytes": 1769
@@ -4359,7 +4359,7 @@
           "bytes": 4245
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 721672
+          "bytes": 723940
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 144098

@@ -124,6 +124,8 @@ import { recallMemory } from '../memory/recall-memory.js';
 import { listActiveFacts } from '../memory/facts.js';
 type ConsolidatedFactKind = 'user' | 'project' | 'feedback' | 'reference';
 import { listWorkflows } from '../memory/workflow-store.js';
+import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
+import { workflowResourceBindingGaps } from '../execution/workflow-resource-binding.js';
 import { readWorkflowEvents } from '../execution/workflow-events.js';
 import {
   deriveWorkflowTerminalOutcome,
@@ -2519,11 +2521,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
       const approvals = approvalRows.length;
       const plans = planRows.length;
+      // Scheduled workflows that cannot run until a resource is bound (capability
+      // gates already arrive here as needs-attention notifications).
+      let bindingStops = 0;
+      try { bindingStops = listWorkflowBindingStops().filter((stop) => stop.scheduled).length; } catch { /* zero */ }
       const workspaceChoices = chooserRows.length;
       const questions = questionRows.length;
       const trustProposals = trustRows.length;
       res.json({
-        needsYou: questions + approvals + plans + workspaceChoices + trustProposals + notificationNeedsYou,
+        needsYou: questions + approvals + plans + workspaceChoices + trustProposals + notificationNeedsYou + bindingStops,
         questions,
         approvals,
         plans,
@@ -4230,6 +4236,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   // ─── Workflows (list + trigger + recent runs + events) ───────────
 
+  // Pure over the definition — cheap enough for the list (certification is not).
+  const safeResourceGaps = (def: Parameters<typeof workflowResourceBindingGaps>[0]): string[] => {
+    try { return workflowResourceBindingGaps(def); } catch { return []; }
+  };
+
   router.get('/api/workflows', requireMobileSession, (_req, res) => {
     try {
       const entries = listWorkflows().sort((a, b) => a.data.name.localeCompare(b.data.name));
@@ -4244,6 +4255,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           stepCount: entry.data.steps.length,
           schedule: entry.data.trigger?.schedule ?? null,
           requiresInput: Object.keys(entry.data.inputs ?? {}).length > 0,
+          resourceGaps: safeResourceGaps(entry.data),
           lastRunId: last?.id ?? null,
           lastRunStatus: last?.status ?? null,
           lastRunOutcome: last?.terminalOutcome ?? null,

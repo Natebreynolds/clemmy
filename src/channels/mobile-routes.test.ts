@@ -4636,3 +4636,37 @@ test('mobile chat cancel resolves the receipt the send path actually wrote', asy
     void send;
   } finally { await h.close(); }
 });
+
+// The list route carries the binding gaps (2026-09-02): a required resource that
+// is still unbound means the workflow cannot run, and the phone must say so
+// instead of offering a Run now that 409s. Pure over the definition, so it is
+// cheap enough for the list (certification stays on the detail route).
+test('GET /m/api/workflows lists each workflow\'s unbound required resources so the phone can show the stop', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Binding gaps phone');
+    writeWorkflow('mobile-unbound-sheet', {
+      name: 'mobile-unbound-sheet',
+      description: 'refresh the pipeline sheet',
+      enabled: true,
+      trigger: { schedule: '0 7 * * 1-5' },
+      steps: [{ id: 'refresh', prompt: 'Refresh it.' }],
+      resources: { sheet: { id: 'sheet', kind: 'sheet', label: 'Pipeline sheet', required: true } },
+    } as never);
+    writeWorkflow('mobile-no-resources', {
+      name: 'mobile-no-resources',
+      description: 'plain',
+      enabled: true,
+      trigger: { manual: true },
+      steps: [{ id: 'go', prompt: 'Go.' }],
+    } as never);
+    const res = await fetch(`${h.url}/m/api/workflows`, { headers: { cookie } });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { workflows: Array<{ name: string; resourceGaps?: string[] }> };
+    const unbound = body.workflows.find((w) => w.name === 'mobile-unbound-sheet');
+    const plain = body.workflows.find((w) => w.name === 'mobile-no-resources');
+    assert.ok(unbound && plain, 'both workflows are listed');
+    assert.ok((unbound!.resourceGaps ?? []).some((gap) => gap.startsWith('Pipeline sheet:')), 'the unbound resource is named');
+    assert.deepEqual(plain!.resourceGaps, [], 'no resources, no gaps');
+  } finally { await h.close(); }
+});

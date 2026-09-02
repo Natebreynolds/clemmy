@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
-import { buildWorkflowResourceBindingReport } from './workflow-resource-binding.js';
+import { buildWorkflowResourceBindingReport, workflowResourceBindingGaps } from './workflow-resource-binding.js';
 
 function def(overrides: Partial<WorkflowDefinition>): WorkflowDefinition {
   return {
@@ -105,4 +105,21 @@ test('Workspace resource is locally bound by its stable slug without an external
   assert.equal(report.proposals[0].status, 'bound');
   assert.equal(report.proposals[0].recommended?.kind, 'workspace');
   assert.equal(report.proposals[0].recommended?.status, 'ready');
+});
+
+test('workflowResourceBindingGaps names each required resource without a surface or a selector, and nothing for optional or bound ones', () => {
+  const def = {
+    name: 'gaps-fixture',
+    description: 'fixture',
+    steps: [{ id: 'read', prompt: 'read' }],
+    resources: {
+      sheet: { id: 'sheet', kind: 'sheet', label: 'Pipeline sheet', required: true },
+      notes: { id: 'notes', kind: 'document', required: false },
+    },
+  } as unknown as WorkflowDefinition;
+  const gaps = workflowResourceBindingGaps(def);
+  assert.ok(gaps.some((gap) => gap.startsWith('Pipeline sheet:') && /execution surface/.test(gap)), 'surface gap is named');
+  assert.ok(gaps.some((gap) => gap.startsWith('Pipeline sheet:') && /bind a concrete spreadsheet, tab, or sheet URL/.test(gap)), 'selector gap is named');
+  assert.ok(!gaps.some((gap) => gap.startsWith('notes:')), 'an optional resource never gaps');
+  assert.deepEqual(workflowResourceBindingGaps({ ...def, resources: {} } as WorkflowDefinition), []);
 });

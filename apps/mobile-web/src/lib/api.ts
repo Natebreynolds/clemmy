@@ -1054,6 +1054,8 @@ export interface MobileWorkflow {
   stepCount: number;
   schedule: string | null;
   requiresInput: boolean;
+  /** Required resources still unbound: the workflow cannot run until these are set. */
+  resourceGaps?: string[];
   lastRunId: string | null;
   lastRunStatus: string | null;
   lastRunOutcome: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled' | null;

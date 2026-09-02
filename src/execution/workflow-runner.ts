@@ -5887,6 +5887,8 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
 // without importing this high-level runner. Imported for internal step-retry
 // use + re-exported for back-compat with existing importers.
 import { isAuthRecoverableError, isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
+import { isRegisteredCarrierGateway } from '../runtime/harness/carrier-completion.js';
+import { isPlainOrClementineLocalTool } from '../runtime/harness/runtime-tool-identity.js';
 export { isTransientStepError };
 
 /**
@@ -6143,6 +6145,29 @@ function resultIsHostDispositionMarker(result: string | undefined): boolean {
  * corrective header, and a gate refusal returns refusal prose — every one of
  * those is excluded before "last" is chosen.
  */
+/** A proven provider call may have crossed as the bare gateway or wrapped in
+ * one of the host's two exec primitives. Both are pin candidates. */
+function isProvenCarrierToolName(tool: unknown): tool is string {
+  return typeof tool === 'string' && (
+    isRegisteredCarrierGateway(tool)
+    || isPlainOrClementineLocalTool(tool, 'work_call')
+    || isPlainOrClementineLocalTool(tool, 'call_tool')
+  );
+}
+
+/** Lift a bare or wrapped provider carrier to the one {tool_slug, arguments}
+ * shape the pin records — the bytes that actually crossed, after any host
+ * completion. A wrapper around anything but the gateway lifts to nothing. */
+function liftProvenCarrierCall(tool: unknown, rawArgs: unknown): { tool_slug?: string; arguments?: unknown } | undefined {
+  if (!isProvenCarrierToolName(tool) || typeof rawArgs !== 'string') return undefined;
+  const outer = JSON.parse(rawArgs) as Record<string, unknown>;
+  if (isRegisteredCarrierGateway(tool)) return outer as { tool_slug?: string; arguments?: unknown };
+  if (typeof outer.name !== 'string' || !isRegisteredCarrierGateway(outer.name)) return undefined;
+  if (typeof outer.args_json === 'string') return JSON.parse(outer.args_json) as { tool_slug?: string; arguments?: unknown };
+  if (outer.args && typeof outer.args === 'object' && !Array.isArray(outer.args)) return outer.args as { tool_slug?: string; arguments?: unknown };
+  return undefined;
+}
+
 function rememberProvenWorkflowStepTool(input: {
   sessionId: string;
   workflowName: string;
@@ -6153,28 +6178,37 @@ function rememberProvenWorkflowStepTool(input: {
       typeof e.data?.result === 'string' ? e.data.result : undefined
     );
     const returned = listHarnessEvents(input.sessionId, { types: ['tool_returned'] })
-      .filter((e) => e.data?.tool === 'composio_execute_tool'
+      .filter((e) => isProvenCarrierToolName(e.data?.tool)
         // Deterministic checks FIRST (review: prose-based
         // evidenceLooksFailedOrBlocked let every real composio failure
         // through — the step pinned a FAILED tool as proven).
         && !resultIsHostDispositionMarker(resultText(e))
         && !renderedComposioResultLooksFailed(resultText(e))
         && !evidenceLooksFailedOrBlocked(resultText(e)));
-    const lastOk = returned[returned.length - 1];
-    const callId = lastOk?.data?.callId;
-    if (!callId) return;
-    const call = listHarnessEvents(input.sessionId, { types: ['tool_called'] })
-      .find((e) => e.data?.callId === callId);
-    const rawArgs = typeof call?.data?.arguments === 'string' ? call.data.arguments : undefined;
-    const parsed = rawArgs ? JSON.parse(rawArgs) as { tool_slug?: string; arguments?: string } : undefined;
+    if (returned.length === 0) return;
+    const calls = listHarnessEvents(input.sessionId, { types: ['tool_called'] });
+    // The LAST provider call that crossed clean — whether it crossed as the
+    // bare gateway or wrapped in one of the host's exec primitives (the shape
+    // the host completes from the proven disclosure). Ever-learning (2026-09-02):
+    // a wrapped carrier was invisible here, so the completed shape was never
+    // pinned and the next run re-derived, re-stuttered, and re-refused it.
+    let parsed: { tool_slug?: string; arguments?: unknown } | undefined;
+    for (let index = returned.length - 1; index >= 0 && !parsed?.tool_slug; index -= 1) {
+      const callId = returned[index]?.data?.callId;
+      const call = callId ? calls.find((e) => e.data?.callId === callId) : undefined;
+      try { parsed = liftProvenCarrierCall(call?.data?.tool, call?.data?.arguments); } catch { parsed = undefined; }
+    }
     if (!parsed?.tool_slug) return;
+    const template = typeof parsed.arguments === 'string'
+      ? parsed.arguments
+      : parsed.arguments && typeof parsed.arguments === 'object' ? JSON.stringify(parsed.arguments) : undefined;
     rememberToolChoice({
       intent: workflowStepPinIntent(input.workflowName, input.stepId),
       description: `Proven tool for workflow "${input.workflowName}" step "${input.stepId}"`,
       choice: {
         kind: 'composio',
         identifier: parsed.tool_slug,
-        invocationTemplate: stripBakedConnectionId(parsed.arguments?.slice(0, 800)),
+        invocationTemplate: stripBakedConnectionId(template?.slice(0, 800)),
         testEvidence: `step completed with a non-blocked structured result (run session ${input.sessionId.slice(0, 40)})`,
       },
     });

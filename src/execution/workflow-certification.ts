@@ -9,7 +9,7 @@ import {
   type WorkflowDryRunSimulation,
 } from './workflow-dry-run-simulation.js';
 import { classifyWorkflowExecutionMode, type WorkflowExecutionMode, type WorkflowCodifyCandidate } from './workflow-execution-mode.js';
-import { resourceHasSurface, resourceHasSelector } from './workflow-resource-binding.js';
+import { workflowResourceBindingGaps } from './workflow-resource-binding.js';
 import {
   certifyWorkflowCode,
   type WorkflowCodeCertification,
@@ -260,62 +260,6 @@ function actionLabel(action: WorkflowCertificationAction): string {
 // "bound?" predicates (surface + selector) are the SAME ones the runtime
 // resource-binding report uses — imported, not re-derived, so there is one
 // definition of what makes a resource bound. See [[workflow-resource-binding]].
-function workflowResourceBindingGaps(def: WorkflowDefinition): string[] {
-  const gaps: string[] = [];
-  const resources = Object.entries(def.resources ?? {});
-  for (const [fallbackId, resource] of resources) {
-    if (!resource || resource.required === false) continue;
-    const label = resource.label?.trim() || resource.id || fallbackId;
-    if (!resourceHasSurface(resource, def)) {
-      gaps.push(`${label}: choose a connector, CLI, MCP server, or URL-backed execution surface for this ${resource.kind} resource.`);
-    }
-    if (!resourceHasSelector(resource, def)) {
-      gaps.push(`${label}: bind a concrete ${resourceSelectorName(resource.kind)}.`);
-    }
-  }
-  return gaps;
-}
-
-function resourceSelectorName(kind: string): string {
-  switch (kind) {
-    case 'account':
-    case 'email_account':
-      return 'account or connection';
-    case 'sheet':
-      return 'spreadsheet, tab, or sheet URL';
-    case 'document':
-      return 'document id or URL';
-    case 'folder':
-      return 'folder id or path';
-    case 'channel':
-      return 'channel';
-    case 'campaign':
-      return 'account/campaign scope';
-    case 'analytics_property':
-      return 'analytics property';
-    case 'database':
-      return 'database';
-    case 'table':
-      return 'table';
-    case 'repository':
-      return 'repository';
-    case 'calendar':
-      return 'calendar';
-    case 'webhook':
-      return 'webhook URL or path';
-    case 'api':
-      return 'API base URL or named endpoint';
-    case 'cli':
-      return 'CLI command/profile';
-    case 'project':
-      return 'project name or path';
-    case 'workspace':
-      return 'Workspace slug';
-    default:
-      return 'resource id, name, URL, or scope';
-  }
-}
-
 export function renderWorkflowCertification(cert: WorkflowCertification): string {
   const lines: string[] = [
     `Workflow certification: ${cert.label}`,

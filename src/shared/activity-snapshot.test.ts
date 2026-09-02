@@ -139,3 +139,55 @@ test('the running-now projection includes the workflow kind', async () => {
     'a live workflow run is exactly what "running N things" exists to count',
   );
 });
+
+// Typed stops count as "waiting on you" (2026-09-02): a run stopped on a proven
+// capability gate and a scheduled workflow that cannot run until a resource is
+// bound were both silent non-events on every surface before this.
+test('needsYou counts a run stopped on a capability gate and a scheduled workflow with an unbound required resource', async () => {
+  const { countWorkflowStops } = await import('./activity-snapshot.js');
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const { writeFileSync } = await import('node:fs');
+  const before = buildActivitySnapshot().needsYou.count;
+  assert.equal(countWorkflowStops(), 0, 'no stops yet');
+
+  // A scheduled workflow whose required sheet is unbound: the schedule would
+  // keep skipping it silently.
+  writeWorkflow('unbound-sheet-refresh', {
+    name: 'unbound-sheet-refresh',
+    description: 'refresh the pipeline sheet',
+    enabled: true,
+    trigger: { schedule: '0 7 * * 1-5' },
+    steps: [{ id: 'refresh', prompt: 'Refresh it.' }],
+    resources: { sheet: { id: 'sheet', kind: 'sheet', label: 'Pipeline sheet', required: true } },
+  } as never);
+  // The same gap on a manual workflow is not a stop: nothing is skipping it.
+  writeWorkflow('unbound-manual', {
+    name: 'unbound-manual',
+    description: 'manual',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'refresh', prompt: 'Refresh it.' }],
+    resources: { sheet: { id: 'sheet', kind: 'sheet', required: true } },
+  } as never);
+  assert.equal(countWorkflowStops(), 1, 'one scheduled binding stop');
+
+  // A live run whose record says blocked_capability (proven no dispatch).
+  const runId = 'snap-capability-0001';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'unbound-manual',
+    status: 'blocked_capability',
+    createdAt: new Date().toISOString(),
+    capabilityBlock: { stepId: 'refresh', tool: 'GOOGLESHEETS_BATCH_GET', toolkit: 'googlesheets', reason: 'ambiguous-account', state: 'blocked', provenNoDispatch: true },
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent('unbound-manual', runId, { kind: 'run_started' });
+  appendWorkflowEvent('unbound-manual', runId, { kind: 'step_started', stepId: 'refresh' });
+  assert.equal(countWorkflowStops(), 2, 'plus one capability-gated run');
+
+  const snap = buildActivitySnapshot();
+  assert.equal(snap.needsYou.count, before + 2, 'the shared snapshot carries both stops');
+  assert.equal(snap.counts.needsYou, snap.needsYou.count);
+});

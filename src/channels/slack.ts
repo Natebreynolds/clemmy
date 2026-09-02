@@ -54,7 +54,7 @@ import { queueBackgroundTaskApprovalResolution, listBackgroundTasks, createBackg
 import { getMemoryHealthSummary } from '../memory/facts.js';
 import { consolidateFact } from '../memory/reflection.js';
 import { getNotification, markNotificationRead, requeueNotificationDelivery } from '../runtime/notifications.js';
-import { buildActivitySnapshot, formatElapsed, formatNextRun, type RunningNowItem } from '../shared/activity-snapshot.js';
+import { buildActivitySnapshot, countWorkflowStops, formatElapsed, formatNextRun, type RunningNowItem } from '../shared/activity-snapshot.js';
 import { actionBus } from '../runtime/action-bus.js';
 import { presentApproval, type ApprovalPresentationContext } from '../runtime/approval-summary.js';
 import { HarnessSession } from '../runtime/harness/session.js';
@@ -249,7 +249,7 @@ function buildAppHomeBlocks(): KnownBlock[] {
   const goals = safe(() => listActiveGoalContracts(), [] as Array<{ originatingRequest?: string }>);
   const mem = safe(() => getMemoryHealthSummary(), { activeFacts: 0, pinned: 0, byKind: {} as Record<string, number>, newest: null, recallHitRate: null });
 
-  const needsYou = approvals.length + questions.length + goalDrafts.length + plansNeedInput.length + blockedTasks.length;
+  const needsYou = approvals.length + questions.length + goalDrafts.length + plansNeedInput.length + blockedTasks.length + countWorkflowStops();
   const today = new Date().toISOString().slice(0, 10);
   const doneToday = doneAll.filter((t) => (t.completedAt ?? t.updatedAt ?? '').slice(0, 10) === today).length;
 

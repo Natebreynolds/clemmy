@@ -91,6 +91,7 @@ import {
 } from '../memory/workflow-store.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
 import { extractArchitectDiff } from './architect-diff.js';
+import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
 import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue, type WorkflowEvent } from '../execution/workflow-events.js';
 import { normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { getGuestRun, killGuestRun, listGuestRuns, type GuestRunJob } from '../execution/guest-run-jobs.js';
@@ -2355,6 +2356,13 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** The same three human labels the Automate drawer uses for a capability gate. */
+function workflowCapabilityGateTitle(reason: unknown): string {
+  if (reason === 'ambiguous-account') return 'Choose an exact account';
+  if (reason === 'exact_schema_refresh_unavailable' || reason === 'exact_schema_boundary_mismatch') return 'Exact action metadata needs review';
+  return 'Connection needs attention';
+}
+
 function projectWorkflowMutationBlock(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const row = value as Record<string, unknown>;
@@ -2812,6 +2820,13 @@ function consoleFocusView(row: FocusRow): ConsoleFocusView {
 }
 
 /** One normalized card on the Tasks board (see GET /api/console/board). */
+/** A typed next edge: the ONE place the user can supply what a stopped run
+ *  is waiting on. Rendered as a link button, never as prose. */
+interface BoardNextEdge {
+  label: string;
+  href: string;
+}
+
 interface BoardCard {
   id: string;
   sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest';
@@ -2836,6 +2851,7 @@ interface BoardCard {
   continueMode?: BoardContinueMode;
   approvalId?: string;
   nextSafeAction?: string;
+  nextEdge?: BoardNextEdge;
   /** Slice 2: the draft body + image of a CONTENT approval (a post/email), so it
    *  is reviewed in place in the Approvals card instead of a one-line summary. */
   contentPreview?: ApprovalContentPreview;
@@ -11911,12 +11927,14 @@ export function registerConsoleRoutes(
       for (const pending of listPendingRuns()) {
         let reservedProjectRoot = false;
         let pendingMutationBlock: Record<string, unknown> | undefined;
+        let pendingCapabilityBlock: Record<string, unknown> | undefined;
         const pendingRecordPath = workflowRunRecordPathForConsole(pending.runId);
         if (pendingRecordPath && fs.existsSync(pendingRecordPath)) {
           try {
             const raw = JSON.parse(fs.readFileSync(pendingRecordPath, 'utf-8')) as Record<string, unknown>;
             reservedProjectRoot = isReservedProjectWorkflowRunRecord(raw);
             pendingMutationBlock = projectWorkflowMutationBlock(raw.mutationBlock);
+            pendingCapabilityBlock = projectWorkflowCapabilityBlock(raw.capabilityBlock);
           } catch {
             // A malformed queue record gets only the ordinary minimal card; no
             // catalog recovery projection is derived from unreadable bytes.
@@ -11936,7 +11954,19 @@ export function registerConsoleRoutes(
             }
           : workflowRunRecovery(pending.workflowName, pending.runId);
         const mutationBlocked = pending.runStatus === 'blocked_mutation';
-        const column: BoardColumnId = mutationBlocked
+        // A run stopped on a proven capability gate is waiting on the user
+        // (the Inbox card holds the exact resolution). Before 2026-09-02 the
+        // board read only the mutation block, so this run showed as "Running".
+        const capabilityBlocked = pending.runStatus === 'blocked_capability';
+        const capabilityGate = capabilityBlocked
+          ? {
+              stepId: String(pendingCapabilityBlock?.stepId ?? pending.inFlightStepId ?? 'unknown'),
+              toolkit: String(pendingCapabilityBlock?.toolkit ?? 'tool'),
+              title: workflowCapabilityGateTitle(pendingCapabilityBlock?.reason),
+              message: typeof pendingCapabilityBlock?.message === 'string' ? pendingCapabilityBlock.message : '',
+            }
+          : undefined;
+        const column: BoardColumnId = mutationBlocked || capabilityBlocked
           ? 'needs_you'
           : pending.inFlightStepId ? 'running' : 'queued';
         // A parked run is waiting on a human (approval consumption), not
@@ -11950,19 +11980,30 @@ export function registerConsoleRoutes(
           column,
           status: mutationBlocked
             ? 'blocked_mutation'
+            : capabilityBlocked ? 'blocked_capability'
             : parked ? 'parked' : pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
           progressHint: mutationBlocked
             ? `Provider outcome needs reconciliation for step ${String(pendingMutationBlock?.stepId ?? pending.inFlightStepId ?? 'unknown')}; the call was not sent again`
+            : capabilityGate
+            ? `${capabilityGate.title} — step ${capabilityGate.stepId} stopped before anything was sent${capabilityGate.message ? `: ${capabilityGate.message}` : ''}`
             : parked
             ? `Waiting for your approval on step ${pending.inFlightStepId ?? 'the gated step'}`
             : pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
           sessionId: null,
           ageMs: ageMs(pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
-          actions: mutationBlocked
+          actions: mutationBlocked || capabilityBlocked
             ? ['cancel']
             : recovery.failureSummary?.retryable ? ['retry_failed_items', 'cancel'] : ['cancel'],
-          primaryAction: mutationBlocked ? 'none' : recovery.primaryAction,
+          primaryAction: mutationBlocked || capabilityBlocked ? 'none' : recovery.primaryAction,
+          ...(capabilityGate
+            ? {
+                nextEdge: {
+                  label: 'Open the Needs You gate',
+                  href: `/inbox?tab=needs&select=${encodeURIComponent(`workflow-${pending.runId}-capability-${capabilityGate.toolkit.toLowerCase()}`)}`,
+                },
+              }
+            : {}),
           continueMode: mutationBlocked ? 'none' : recovery.continueMode,
           nextSafeAction: mutationBlocked
             ? 'Reconcile the exact provider outcome. This same run resumes only from a committed ledger replay; never retry the send blindly.'
@@ -11975,6 +12016,29 @@ export function registerConsoleRoutes(
             runId: pending.runId,
             ...(pendingMutationBlock ? { mutationBlock: pendingMutationBlock } : {}),
           },
+        });
+      }
+
+      // 5b) Scheduled workflows that cannot run until a resource is bound. The
+      //    schedule keeps skipping them silently; the board says so and links
+      //    to the one place the binding is made.
+      for (const stop of listWorkflowBindingStops()) {
+        if (!stop.scheduled) continue;
+        cards.push({
+          id: `wf-binding:${stop.slug}`,
+          sourceKind: 'workflow',
+          title: stop.workflow,
+          column: 'needs_you',
+          status: 'needs_binding',
+          progressHint: `Won't run on its schedule until you bind: ${stop.gaps[0]}${stop.gaps.length > 1 ? ` (+${stop.gaps.length - 1} more)` : ''}`,
+          sessionId: null,
+          ageMs: 0,
+          updatedAt: new Date(now).toISOString(),
+          actions: [],
+          primaryAction: 'none',
+          continueMode: 'none',
+          nextEdge: { label: 'Bind it in Automate', href: `/automate?workflow=${encodeURIComponent(stop.slug)}` },
+          raw: { slug: stop.slug, gaps: stop.gaps.slice(0, 6) },
         });
       }
 

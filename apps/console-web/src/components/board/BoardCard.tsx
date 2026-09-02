@@ -5,6 +5,7 @@
  * progress hint.
  */
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useDraggable } from '@dnd-kit/core';
 import { CSS } from '@dnd-kit/utilities';
 import { Radio, Archive, Check, X, RotateCcw, Play, ExternalLink } from 'lucide-react';
@@ -190,6 +191,18 @@ export function BoardCard({
 
       {card.nextSafeAction && (
         <p className="mt-2 line-clamp-2 text-caption text-faint">{card.nextSafeAction}</p>
+      )}
+
+      {card.nextEdge && (
+        <Link
+          to={card.nextEdge.href}
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="mt-2 inline-flex items-center gap-1 text-caption font-semibold text-fg underline underline-offset-2"
+        >
+          {card.nextEdge.label}
+          <ExternalLink className="h-3 w-3" aria-hidden />
+        </Link>
       )}
 
       {isCatchup && catchupReadiness.blocked && (
