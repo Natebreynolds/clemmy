@@ -968,6 +968,9 @@
         "src/runtime/mcp-config.ts": {
           "bytes": 9730
         },
+        "src/execution/workflow-step-effect.ts": {
+          "bytes": 2492
+        },
         "src/tools/composio-batch-validator.ts": {
           "bytes": 32535
         },
@@ -993,7 +996,7 @@
           "bytes": 21326
         },
         "src/execution/workflow-validator.ts": {
-          "bytes": 81172
+          "bytes": 79838
         },
         "src/execution/workflow-objective-judge.ts": {
           "bytes": 12380
@@ -1005,7 +1008,7 @@
           "bytes": 7879
         },
         "src/execution/workflow-enforce.ts": {
-          "bytes": 41137
+          "bytes": 39694
         },
         "src/dashboard/workflow-execution-plan.ts": {
           "bytes": 53778
@@ -2211,7 +2214,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 313176
+          "bytes": 313988
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3452,6 +3455,9 @@
         "src/runtime/mcp-config.ts": {
           "bytes": 9730
         },
+        "src/execution/workflow-step-effect.ts": {
+          "bytes": 2492
+        },
         "src/tools/composio-batch-validator.ts": {
           "bytes": 32535
         },
@@ -3477,7 +3483,7 @@
           "bytes": 21326
         },
         "src/execution/workflow-validator.ts": {
-          "bytes": 81172
+          "bytes": 79838
         },
         "src/execution/workflow-objective-judge.ts": {
           "bytes": 12380
@@ -3489,7 +3495,7 @@
           "bytes": 7879
         },
         "src/execution/workflow-enforce.ts": {
-          "bytes": 41137
+          "bytes": 39694
         },
         "src/dashboard/workflow-execution-plan.ts": {
           "bytes": 53778
@@ -4695,7 +4701,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 313176
+          "bytes": 313988
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505

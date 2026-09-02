@@ -22,13 +22,14 @@
  * surface as soft signals the user can override.
  */
 import { COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
+import { structuredCallSideEffectClass } from './workflow-step-effect.js';
+export { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
   getCachedToolSchema,
   liveComposioSchemaFingerprint,
 } from '../tools/composio-schema-cache.js';
 import { validateArgsAgainstSchema } from '../tools/composio-batch-validator.js';
 import { matchToolChoicesForStep, type ToolChoiceRecord } from '../memory/tool-choice-store.js';
-import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { parseWorkflowInterval } from '../shared/workflow-interval.js';
 import {
@@ -717,29 +718,6 @@ export function stepLooksMultiItemWithoutForEach(step: WorkflowStepShape): boole
   if (stepLooksIntentionalAggregateBatch(step)) return false;
   if (!MULTI_ITEM_PROMPT_RE.test(step.prompt) || !SERIAL_WORK_RE.test(step.prompt)) return false;
   return true;
-}
-
-/** CALL-2b: a call step's side-effect class for validation — declared sideEffect
- *  wins, else derived from the tool slug (mirrors callToolSideEffectClass in the
- *  runner; kept local to avoid a validator→runner import cycle). */
-export function structuredCallSideEffectClass(step: WorkflowStepShape): 'read' | 'write' | 'send' {
-  const t = (step.call?.tool ?? '');
-  // A real SEND slug can NEVER be downgraded by an explicit sideEffect — the
-  // canonical predicate is checked FIRST so an author labeling a VAPI_CREATE_CALL
-  // node `sideEffect: read`/`write` cannot skip the SEND-CALL GATE (2026-07-09
-  // re-hunt author-side vector). For non-sends the declared class still wins —
-  // authors know their read-only calls best.
-  const evidence = composioSlugEffectEvidence(t);
-  if (evidence === 'read') {
-    return step.sideEffect === 'write' || step.sideEffect === 'send' ? step.sideEffect : 'read';
-  }
-  if (isIrreversibleSendSlug(t) || step.sideEffect === 'send') return 'send';
-  // No verb evidence either way (noun-shaped API slug such as
-  // SLACK_CONVERSATIONS_HISTORY): an author-declared read wins so a genuinely
-  // read-only workflow keeps validating. Affirmative write evidence and real
-  // send slugs above can never be downgraded (fold 2026-07-17 final-wave #4).
-  if (evidence === 'unknown' && step.sideEffect === 'read') return 'read';
-  return 'write';
 }
 
 export type ExactScheduledSendIneligibility =

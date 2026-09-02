@@ -144,3 +144,19 @@ test('NEGATIVE: Composio gateway classifies from the inner catalog, not occupanc
   assert.match(fn, /classifyBareCurrentCatalogCapability\(slug\)/);
   assert.match(fn, /if \(registered\.matched\) return registered\.decision/);
 });
+
+// ONE effect decision per call (2026-09-01 census: a read was classified six
+// times and the proven read won at two). The frame decides once; scheduling,
+// admission and approval arming read that decision, classifying only as a
+// fallback for a call the frame never saw.
+test('re-break (iii): scheduling, admission and approval arming read the frame\'s one decision', () => {
+  const src = readFileSync(HOST, 'utf8');
+  assert.match(src, /let currentFrameEffects = new Map<string, RuntimeToolEffect>\(\)/);
+  assert.match(src, /currentFrameEffects = new Map\(frameCalls\.map\(/, 'the frame publishes its decision');
+  const admission = src.slice(src.indexOf('let admittedEffect: RuntimeToolEffect ='), src.indexOf('let canaryRefusal = readOnlyCanaryRefusal('));
+  assert.match(admission, /currentFrameEffects\.get\(call\.callId\)/, 'admission reads the frame decision');
+  const scheduling = src.slice(src.indexOf("if (!argumentsValue) return 'barrier';"), src.indexOf("executeCallAttempt,"));
+  assert.match(scheduling, /currentFrameEffects\.get\(call\.callId\)/, 'scheduling reads the frame decision (a proven read is parallel)');
+  const arming = src.slice(src.indexOf('const runtimeEffect = '), src.indexOf('const quantifiedWorkerControl = Boolean('));
+  assert.match(arming, /currentFrameEffects\.get\(call\.callId\)/, 'approval arming reads the frame decision');
+});

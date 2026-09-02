@@ -3004,6 +3004,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   };
 
   let lastExactProductionMiss = '';
+  // ONE effect decision per call. The frame decides each call's effect once
+  // (the proven read wins over the spelling classifier, host-model-frame
+  // materialization below) and every later checkpoint — scheduling,
+  // admission, approval arming — reads that decision instead of
+  // re-classifying. Census 2026-09-01: one read was classified six times and
+  // the proven read won at only two of them, so a read the classifier called
+  // a write still serialized as a barrier and armed consent as 'unknown'.
+  let currentFrameEffects = new Map<string, RuntimeToolEffect>();
   // One JIT read-provisioning attempt per carried operation per turn.
   const jitReadProvisionAttempted = new Set<string>();
   const exactProductionHostCall = (
@@ -3731,9 +3739,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const tool = toolByName.get(call.name);
     const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
     const parsedArguments = parsedArgs(argumentsJson);
-    let admittedEffect: RuntimeToolEffect = parsedArguments
-      ? classifyRuntimeToolEffect(call.name, parsedArguments).effect
-      : 'unknown';
+    let admittedEffect: RuntimeToolEffect = currentFrameEffects.get(call.callId)
+      ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
     let canaryRefusal = readOnlyCanaryRefusal(
       call.name,
       parsedArguments,
@@ -4354,7 +4361,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
         const argumentsValue = parsedArgs(argumentsJson);
         if (!argumentsValue) return 'barrier';
-        const effect = classifyRuntimeToolEffect(call.name, argumentsValue).effect;
+        const effect = currentFrameEffects.get(call.callId)
+          ?? classifyRuntimeToolEffect(call.name, argumentsValue).effect;
         return effect === 'read' || effect === 'compute' ? 'parallel' : 'barrier';
       },
       executeCallAttempt,
@@ -6483,6 +6491,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ),
         };
       });
+      currentFrameEffects = new Map(frameCalls.map((frameCall) => [frameCall.callId, frameCall.effect]));
       frameDisposition = classifyHostModelFrame({
         calls: frameCalls,
         planActivated: hostProduction
@@ -6757,9 +6766,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           break;
         }
       }
-      const runtimeEffect = parsedArguments
-        ? classifyRuntimeToolEffect(call.name, parsedArguments).effect
-        : 'unknown';
+      const runtimeEffect = currentFrameEffects.get(call.callId)
+        ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
       const quantifiedWorkerControl = Boolean(
         !canaryRefusal
         && hostProduction

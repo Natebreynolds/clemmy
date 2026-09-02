@@ -1,12 +1,11 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
+import { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
   validateWorkflowDefinition,
   type WorkflowFrontmatter,
   type WorkflowStepShape,
 } from './workflow-validator.js';
-import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
-import { composioSlugEffectEvidence } from '../integrations/composio/slug-effect.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
 import {
@@ -116,29 +115,6 @@ export function stepLooksLikeIrreversibleSend(prompt: string): boolean {
   return IRREVERSIBLE_SEND_RE.test(p) || PUBLISH_RE.test(p);
 }
 
-function structuredCallSideEffectClass(
-  call: { tool?: string } | undefined,
-  declaredSideEffect?: string,
-): 'read' | 'write' | 'send' {
-  const t = call?.tool ?? '';
-  if (!t) return 'read';
-  const evidence = composioSlugEffectEvidence(t);
-  if (evidence === 'read') return 'read';
-  // Delegate the send determination to the ONE canonical predicate so this
-  // RUNTIME classifier agrees with the validator (workflow-validator.ts already
-  // uses isIrreversibleSendSlug). The old regex missed CALL/DIAL/OUTBOUND/
-  // MAKE+CALL/RESPOND+EVENT (VAPI_CREATE_CALL, TWILIO_MAKE_OUTBOUND_CALL,
-  // GOOGLECALENDAR_RESPOND_TO_EVENT), so the unattended-scheduled auto-approve
-  // carve-out reclassified those as 'write' and fired them with no consent
-  // (2026-07-09 re-hunt: workflow call-node lane).
-  if (isIrreversibleSendSlug(t)) return 'send';
-  if (evidence === 'write') return 'write';
-  // No verb evidence either way (noun-shaped API slug): an author-declared
-  // read wins — affirmative write/send evidence above can never be downgraded,
-  // but mere unfamiliarity must not break existing declared-read workflows
-  // (fold 2026-07-17 final-wave review #4). Undeclared stays a conservative write.
-  return declaredSideEffect === 'read' ? 'read' : 'write';
-}
 
 // A step that WRITES to the outside world (creates/updates/deletes a record,
 // sheet, file, event, message) — broader than a pure send. Used by the
@@ -155,7 +131,7 @@ const EXTERNAL_WRITE_RE =
  * read/fetch/query step does not.
  */
 export function stepLooksMutating(step: { prompt?: string; sideEffect?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string } }): boolean {
-  if (step.call?.tool && structuredCallSideEffectClass(step.call, step.sideEffect) !== 'read') return true;
+  if (step.call?.tool && structuredCallSideEffectClass(step) !== 'read') return true;
   if (step.sideEffect === 'read') return false;
   if (step.sideEffect === 'write' || step.sideEffect === 'send') return true;
   if (step.requiresApproval === true || step.requires_approval === true) return true;
@@ -203,7 +179,7 @@ export function classifyStepSideEffect(step: {
   // agrees with the validator (an author labeling a VAPI_CREATE_CALL node
   // `sideEffect: read` must not skip the gate — 2026-07-09 re-hunt author-side).
   if (step.call?.tool) {
-    const callClass = structuredCallSideEffectClass(step.call, step.sideEffect);
+    const callClass = structuredCallSideEffectClass(step);
     if (callClass === 'send') return 'send';
     // A NON-send slug (e.g. *_CREATE_DRAFT) is a `write` — a stale `sideEffect: send`
     // label must NOT fabricate it back into a send. That trapped a draft-only step
@@ -214,7 +190,7 @@ export function classifyStepSideEffect(step: {
     if (callClass === 'write') return 'write';
   }
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
-  if (step.call?.tool) return structuredCallSideEffectClass(step.call, step.sideEffect);
+  if (step.call?.tool) return structuredCallSideEffectClass(step);
   if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
   if (stepLooksMutating(step)) return 'write';
   if ((step.allowedTools?.length ?? 0) > 0 || step.usesSkill || step.forEach) return 'read';
@@ -300,7 +276,7 @@ export function stepIsTestableRead(
 ): boolean {
   if (stepLooksMutating(step)) return false;
   if (!stepReachesExternalTools(step)) return false;
-  if (step.call?.tool && structuredCallSideEffectClass(step.call) === 'read') return true;
+  if (step.call?.tool && structuredCallSideEffectClass({ call: step.call }) === 'read') return true;
   return READ_INTENT_RE.test(step.prompt ?? '') || (step.allowedTools ?? []).length > 0 || !!step.usesSkill || !!step.forEach;
 }
 
@@ -441,7 +417,7 @@ export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
       );
       continue;
     }
-    if (step.call?.tool && structuredCallSideEffectClass(step.call, step.sideEffect) !== 'read') {
+    if (step.call?.tool && structuredCallSideEffectClass(step) !== 'read') {
       errors.push(
         `Step "${step.id}" declares loop_until on a mutating structured call. Exact-call receipts bind one mutation per run/step slot, so a second loop attempt cannot safely dispatch. Remove loop_until or split the mutation from a separate read-only polling step.`,
       );
