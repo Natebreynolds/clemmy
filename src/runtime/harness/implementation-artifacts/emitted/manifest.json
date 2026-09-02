@@ -807,7 +807,7 @@
           "bytes": 2482
         },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 5508
+          "bytes": 8989
         },
         "src/runtime/harness/carrier-completion.ts": {
           "bytes": 953
@@ -3297,7 +3297,7 @@
           "bytes": 2482
         },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 5508
+          "bytes": 8989
         },
         "src/runtime/harness/carrier-completion.ts": {
           "bytes": 953

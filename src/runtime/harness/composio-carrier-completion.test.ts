@@ -109,3 +109,34 @@ test('a sealed step calls the gateway directly: the frozen scope stands in for p
   const exact = JSON.stringify({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}' });
   assert.equal(registry.completeDirectCarrierArguments('composio_execute_tool', exact, frozen), null);
 });
+
+test('a bare provider operation name in the carrier slot (GLM 5.3 cold-chat shape) is normalized to the gateway form', () => {
+  // Live 2026-09-02: GLM called work_call with name "googlesheets.batch_get"
+  // (dotted, lowercase) and the host returned not_reachable. The host knows
+  // this operation; it should route it. Effect/plan gating still applies to
+  // the routed call — this only fixes the NAME format.
+  const dotted = JSON.stringify({ name: 'googlesheets.batch_get', args_json: JSON.stringify({ spreadsheet_id: '1abc', ranges: ['FL!A1:Z100'] }) });
+  const completed = completeComposioCarrierArguments(dotted, []);
+  assert.ok(completed, 'a dotted bare op name is normalized without needing a proven entry');
+  assert.equal(completed!.toolSlug, 'GOOGLESHEETS_BATCH_GET');
+  const outer = JSON.parse(completed!.argumentsJson) as { name: string; args_json: string };
+  assert.equal(outer.name, 'composio_execute_tool', 'rewritten into the gateway carrier');
+  const inner = JSON.parse(outer.args_json) as { tool_slug: string; arguments: string };
+  assert.equal(inner.tool_slug, 'GOOGLESHEETS_BATCH_GET');
+  assert.deepEqual(JSON.parse(inner.arguments), { spreadsheet_id: '1abc', ranges: ['FL!A1:Z100'] });
+
+  // A dotted name with a doubled toolkit stutter collapses too.
+  const stutter = completeComposioCarrierArguments(JSON.stringify({ name: 'outlook.outlook_send_email', args_json: '{"to":"x"}' }), []);
+  assert.equal(stutter!.toolSlug, 'OUTLOOK_SEND_EMAIL');
+  // An UNDERSCORED lowercase op (ambiguous with a local tool) is normalized
+  // only when proven this turn — not guessed.
+  assert.equal(completeComposioCarrierArguments(JSON.stringify({ name: 'googlesheets_batch_get', args_json: '{}' }), []), null);
+  assert.ok(completeComposioCarrierArguments(JSON.stringify({ name: 'googlesheets_batch_get', args_json: '{}' }),
+    [{ kind: 'composio', identifier: 'GOOGLESHEETS_BATCH_GET', effectClass: 'read' }]));
+
+  // A local/namespaced carrier name is never treated as a bare provider op.
+  assert.equal(completeComposioCarrierArguments(JSON.stringify({ name: 'read_file', args_json: '{}' }), []), null);
+  assert.equal(completeComposioCarrierArguments(JSON.stringify({ name: 'mcp__outlook__list_messages', args_json: '{}' }), []), null);
+  // A single-token name is not a provider slug.
+  assert.equal(completeComposioCarrierArguments(JSON.stringify({ name: 'frobnicate', args_json: '{}' }), []), null);
+});

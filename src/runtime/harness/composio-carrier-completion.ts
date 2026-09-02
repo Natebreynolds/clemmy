@@ -43,13 +43,75 @@ function decodeInner(raw: unknown): Record<string, unknown> | null {
   return asRecord(raw);
 }
 
+/** A well-formed Composio operation slug: TOOLKIT_OPERATION, uppercase, single
+ * underscores. */
+const COMPOSIO_SLUG_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
+
+/** Normalize a bare operation NAME a model put in the carrier's `name` slot
+ * (live 2026-09-02, GLM 5.3 cold chat: `googlesheets.batch_get`,
+ * `slack.fetch_conversation_history`) to the canonical Composio slug —
+ * uppercase, dots/spaces/hyphens to underscores, a doubled leading toolkit
+ * collapsed. Returns null unless the result is a well-formed slug. The host
+ * knows this operation; it should route it, not refuse it. Effect gating and
+ * the write/send plan floor still apply to the routed call. */
+function normalizeBareCompositeOperationName(
+  name: unknown,
+  provenIdentifiers: ReadonlySet<string>,
+): string | null {
+  if (typeof name !== 'string') return null;
+  const raw = name.trim();
+  if (!raw || raw === GATEWAY_TAIL || raw.endsWith(`_${GATEWAY_TAIL}`)) return null;
+  // A namespaced/local carrier (mcp__server__tool, work_call, call_tool) is
+  // never a bare provider op — leave it alone.
+  if (raw.includes('__') || raw === 'work_call' || raw === 'call_tool') return null;
+  const upper = raw.replace(/[.\s/-]+/g, '_').toUpperCase().replace(/^([A-Z0-9]+)_\1_/, '$1_');
+  if (!COMPOSIO_SLUG_RE.test(upper)) return null;
+  // A DOTTED name (`googlesheets.batch_get`) is unambiguously a provider
+  // operation reference — a local tool never uses dots — so normalize it even
+  // when nothing was proven this turn (the gateway/effect/plan path still
+  // gates the routed call). An UNDERSCORED lowercase name (`read_file`,
+  // `space_history`) is ambiguous with a local tool, so it is normalized ONLY
+  // when it matches an operation actually proven or frozen this turn.
+  if (raw.includes('.')) return upper;
+  return provenIdentifiers.has(upper) ? upper : null;
+}
+
 export function completeComposioCarrierArguments(
   outerArgumentsJson: string,
   provenEntries: readonly ProvenCompletionEntry[],
 ): CarrierCompletion | null {
   let outer: Record<string, unknown> | null;
   try { outer = asRecord(JSON.parse(outerArgumentsJson)); } catch { return null; }
-  if (!outer || !isComposioGatewayName(outer.name)) return null;
+  if (!outer) return null;
+  if (!isComposioGatewayName(outer.name)) {
+    // The model named a provider operation directly in the carrier `name`
+    // slot, in a non-canonical format the host could not resolve
+    // ("not_reachable"). If it normalizes to a well-formed Composio slug,
+    // rewrite the carrier into the gateway form and let the ordinary
+    // gateway/effect/plan path take it. Anything else is left for the
+    // ordinary refusal.
+    const bareProven = new Set(
+      provenEntries
+        .filter((entry) => (entry.kind === 'composio' || entry.kind === 'frozen_scope') && typeof entry.identifier === 'string')
+        .map((entry) => entry.identifier.trim().toUpperCase())
+        .filter(Boolean),
+    );
+    const bareSlug = normalizeBareCompositeOperationName(outer.name, bareProven);
+    if (!bareSlug) return null;
+    const opArgs = 'args_json' in outer ? outer.args_json : ('args' in outer ? outer.args : undefined);
+    let argumentsString: string | null;
+    if (opArgs === null || opArgs === undefined) argumentsString = null;
+    else if (typeof opArgs === 'string') argumentsString = opArgs;
+    else if (asRecord(opArgs)) argumentsString = JSON.stringify(opArgs);
+    else return null;
+    const completedInner: Record<string, unknown> = { tool_slug: bareSlug, arguments: argumentsString };
+    const completedOuter: Record<string, unknown> = { name: GATEWAY_TAIL, args_json: JSON.stringify(completedInner) };
+    return {
+      argumentsJson: JSON.stringify(completedOuter),
+      toolSlug: bareSlug,
+      changes: [`carrier name "${String(outer.name)}" normalized to the composio operation ${bareSlug} and wrapped for the gateway`],
+    };
+  }
   const usedArgsAlias = !('args_json' in outer) && 'args' in outer;
   const inner = decodeInner('args_json' in outer ? outer.args_json : outer.args);
   if (!inner) return null;
