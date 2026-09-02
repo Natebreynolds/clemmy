@@ -56,6 +56,15 @@
         "src/runtime/mcp-declared-effects.ts": {
           "bytes": 3715
         },
+        "src/runtime/harness/mutation-verification-contract.ts": {
+          "bytes": 33409
+        },
+        "src/integrations/composio/operation-semantics.ts": {
+          "bytes": 17040
+        },
+        "src/integrations/composio/slug-effect.ts": {
+          "bytes": 15157
+        },
         "src/runtime/sqlite-statement-cache.ts": {
           "bytes": 1887
         },
@@ -152,9 +161,6 @@
         "src/runtime/semantic-boundary/project-checked-semantics.ts": {
           "bytes": 11376
         },
-        "src/runtime/harness/mutation-verification-contract.ts": {
-          "bytes": 33409
-        },
         "src/runtime/harness/provider-read-evidence.ts": {
           "bytes": 14906
         },
@@ -226,12 +232,6 @@
         },
         "src/memory/procedure-validity.ts": {
           "bytes": 8649
-        },
-        "src/integrations/composio/operation-semantics.ts": {
-          "bytes": 17040
-        },
-        "src/integrations/composio/slug-effect.ts": {
-          "bytes": 15157
         },
         "src/memory/capability-effect-scope.ts": {
           "bytes": 8863
@@ -1269,7 +1269,7 @@
           "bytes": 67092
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 77462
+          "bytes": 77760
         },
         "src/tools/plan-tools.ts": {
           "bytes": 79825
@@ -2463,7 +2463,7 @@
           "bytes": 3283
         },
         "src/runtime/harness/execution-gate.ts": {
-          "bytes": 22477
+          "bytes": 23419
         },
         "src/runtime/harness/external-write-admission.ts": {
           "bytes": 20321
@@ -2537,6 +2537,15 @@
         "src/runtime/mcp-declared-effects.ts": {
           "bytes": 3715
         },
+        "src/runtime/harness/mutation-verification-contract.ts": {
+          "bytes": 33409
+        },
+        "src/integrations/composio/operation-semantics.ts": {
+          "bytes": 17040
+        },
+        "src/integrations/composio/slug-effect.ts": {
+          "bytes": 15157
+        },
         "src/runtime/sqlite-statement-cache.ts": {
           "bytes": 1887
         },
@@ -2633,9 +2642,6 @@
         "src/runtime/semantic-boundary/project-checked-semantics.ts": {
           "bytes": 11376
         },
-        "src/runtime/harness/mutation-verification-contract.ts": {
-          "bytes": 33409
-        },
         "src/runtime/harness/provider-read-evidence.ts": {
           "bytes": 14906
         },
@@ -2707,12 +2713,6 @@
         },
         "src/memory/procedure-validity.ts": {
           "bytes": 8649
-        },
-        "src/integrations/composio/operation-semantics.ts": {
-          "bytes": 17040
-        },
-        "src/integrations/composio/slug-effect.ts": {
-          "bytes": 15157
         },
         "src/memory/capability-effect-scope.ts": {
           "bytes": 8863
@@ -3750,7 +3750,7 @@
           "bytes": 67092
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 77462
+          "bytes": 77760
         },
         "src/tools/plan-tools.ts": {
           "bytes": 79825
@@ -4944,7 +4944,7 @@
           "bytes": 3283
         },
         "src/runtime/harness/execution-gate.ts": {
-          "bytes": 22477
+          "bytes": 23419
         },
         "src/runtime/harness/external-write-admission.ts": {
           "bytes": 20321

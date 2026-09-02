@@ -1256,8 +1256,12 @@ export async function provisionExactWorkflowProviderOperations(input: {
   const requests: ExactMaterializationRequest[] = [];
   for (const operation of operationIds) {
     const toolkit = registeredToolkitOfSlug(operation).trim().toLowerCase();
+    // A provider action is TOOLKIT_ACTION with one or more action tokens:
+    // FIRECRAWL_SCRAPE and FIRECRAWL_SEARCH are real operations. The old
+    // three-token minimum refused them as "invalid" before any lookup (live
+    // 2026-09-01: scorpion-facebook-trends died on its first read twice).
     if (
-      !/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){2,}$/.test(operation)
+      !/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(operation)
       || !isRegisteredToolkitSlug(toolkit)
       || !operation.startsWith(`${toolkit.toUpperCase()}_`)
     ) {

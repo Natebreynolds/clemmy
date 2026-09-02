@@ -32,6 +32,7 @@
  */
 
 import { declaredMcpToolEffect, type DeclaredMcpToolEffect } from '../mcp-declared-effects.js';
+import { composioSlugHasCuratedReadRule } from '../../integrations/composio/slug-effect.js';
 import {
   currentManifestOperationContract,
 } from './current-manifest-operation-semantics.js';
@@ -310,6 +311,22 @@ function canonicalExternalActionWriteClassification(
     return { mutating: true, classificationKnown: true };
   }
   if (declaredEffect?.readOnly === true) return { mutating: false, classificationKnown: true };
+  // A CURATED provider read rule (documented semantics, the research job
+  // families) is exact provider knowledge, not verb inference: it is the same
+  // authority that seeds the manifest's effect when one is minted. Without
+  // this, every unproven curated read classified as a write at the frame
+  // (census 2026-09-01, D1) and a work_call carrying it was refused as
+  // plan-bound. Generic GET/LIST/CREATE vocabulary stays identity only.
+  // Only a provider-shaped Composio slug (single underscores, uppercase):
+  // a native MCP name is whatever the user called the server and is never
+  // effect proof, however read-shaped it looks.
+  if (
+    operationId
+    && /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(operationId)
+    && composioSlugHasCuratedReadRule(operationId)
+  ) {
+    return { mutating: false, classificationKnown: true };
+  }
   // A connected operation with no exact current effect contract stays a
   // conservative mutation. GET/LIST/CREATE vocabulary is identity only.
   return { mutating: true, classificationKnown: false };
