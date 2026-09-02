@@ -692,10 +692,9 @@ verb in a SERVER slug still cannot vouch for a sending tool (that pin is kept).
 Journeys after 752f8975: 155/171, the same sixteen, all reproduced at the 09-01 baseline. Third full run on
 c9f1042e in progress before any tag.
 
-**Third full run (c9f1042e), 08:00 UTC:** interrupted from outside at 2,447 results with zero failures; the
-consumer suites of the final change (execution-gate, step-effect, call-node, validator, runner,
-pending-action admission, composio-tools, batch-tools, call-tool: 532 results) were green before the commit.
-Dev daemon restored on the final commit. A complete third pass is owed before the tag.
+**Third full run (c9f1042e), 08:00 UTC:** interrupted from outside twice (2,447 and 446 results, zero failures
+each). **Completed 08:46 UTC on 9b9a2fa4: 14,192 tests, 14,191 pass, 0 fail, 1 skipped.** Journeys re-run
+follows; the dev daemon returns on the same commit afterward.
 
 ## Token efficiency — the cold surface, measured (2026-09-02 08:40 UTC)
 
