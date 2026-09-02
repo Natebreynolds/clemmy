@@ -770,3 +770,10 @@ rebinds to the live label (`reboundFrom` recorded) and the proof-provisioned cat
 definition as the recorded successor of the old manifest through its existing supersede path. An
 inconsistent selection or a schema change is still drift. Pinned. The parked standup run retries on the
 restarted daemon as the proof (it emails the owner only).
+
+**Gate 24, second door (this commit).** With the label rebind in place the parked standup retried and moved one
+door: `selected_definition_observation_refused` — the workflow step catalog compared the live (rebound)
+definition against the stale durable manifest. A rebound operation is now routed through exact provisioning,
+which installs the live definition as the recorded successor of the stored manifest (the catalog's existing
+supersede path); the successor is selected, revalidated and observed. Pinned in
+workflow-step-external-catalog.test.ts. The parked run resumes at boot as the proof.
