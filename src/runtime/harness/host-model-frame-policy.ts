@@ -29,7 +29,11 @@ export type HostModelFrameRefusal =
   | 'fresh_plan_sibling_requires_proposal_free_work_carrier'
   | 'fresh_plan_sibling_must_be_read_compute'
   | 'fresh_plan_sibling_requires_dependency_root'
-  | 'host_planned_work_call_requires_plan_sibling';
+  | 'host_planned_work_call_requires_plan_sibling'
+  /** The carrier's inner operation could not even be identified (a
+   * composio_execute_tool with no tool_slug, an empty inner name): a
+   * malformed call, never a plan-shaped mutation. */
+  | 'host_work_call_inner_operation_unidentified';
 
 export type HostModelFrameDisposition =
   | { kind: 'ordinary' }
@@ -221,12 +225,26 @@ export function classifyHostModelFrame(input: {
     // sole, structurally exact once-mutation may ask the host to compile that
     // same contract above; every other mutation/unknown shape still fails
     // closed before call admission.
-    if (!input.planActivated && input.calls.some((call) => (
-      call.proposalFreeWorkCarrier
-      && call.effect !== 'read'
-      && call.effect !== 'compute'
-    ))) {
-      return { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' };
+    if (!input.planActivated) {
+      const planBound = input.calls.find((call) => (
+        call.proposalFreeWorkCarrier
+        && call.effect !== 'read'
+        && call.effect !== 'compute'
+      ));
+      if (planBound) {
+        // Live 2026-09-01 ("last three Slack messages", GLM 5.3): the inner
+        // composio_execute_tool carried no tool_slug, so no operation and no
+        // effect could be identified. Calling that "requires a plan sibling"
+        // sent the model looking for a plan_task it did not have; it retried
+        // the identical call and the governor stopped the turn. A call whose
+        // operation is unidentified is refused as exactly that.
+        return {
+          kind: 'refused',
+          reason: planBound.effect === 'unknown' && planBound.effectiveName === null
+            ? 'host_work_call_inner_operation_unidentified'
+            : 'host_planned_work_call_requires_plan_sibling',
+        };
+      }
     }
     return { kind: 'ordinary' };
   }

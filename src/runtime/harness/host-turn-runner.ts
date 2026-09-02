@@ -100,6 +100,23 @@ const hostTurnLogger = pino({ name: 'clementine.harness.host-turn-runner' });
  */
 export const MAX_HOST_CONTINUE_MARKER_CONTINUATIONS = 3;
 
+/** The text a refused call frame hands back to the model. The `before
+ * dispatch (<token>)` shape is what the no-progress projection keys its stage
+ * on, so a corrected retry is progress and an identical one is the loop
+ * floor. A refusal that names only a category is a dead end: the model cannot
+ * repair what it cannot see (live 2026-09-01: "requires plan sibling" for a
+ * malformed read carrier). */
+export function hostFrameRefusalDirective(reason: HostModelFrameRefusal): string {
+  const base = `The host refused this exact call frame before dispatch (${reason}). No tool body was entered.`;
+  if (reason === 'host_work_call_inner_operation_unidentified') {
+    return `${base} The work_call carried an inner call whose operation the host could not identify. For composio_execute_tool the inner args_json MUST be {"tool_slug":"<the exact slug tool_search disclosed>","arguments":"<the action arguments as one JSON string>"}; any other inner name must be a non-empty exact operation name. Retry the same work_call once with that exact shape; nothing else changes.`;
+  }
+  if (reason === 'host_planned_work_call_requires_plan_sibling') {
+    return `${base} A write or send through work_call needs its plan: call plan_task naming this operation first. A read never needs a plan, so if this was a read, check that the inner operation name and arguments are exact and retry.`;
+  }
+  return base;
+}
+
 /**
  * Completion judge on the host lane. The objective judge — the independent,
  * cross-family check of the final reply against the ORIGINAL request — lived
@@ -201,6 +218,7 @@ import { expectedTaskFor } from './resolution-ledger.js';
 import {
   classifyHostModelFrame,
   type HostModelFrameDisposition,
+  type HostModelFrameRefusal,
 } from './host-model-frame-policy.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import { loadShippedImplementations } from './shipped-implementation-identity.js';
@@ -6513,8 +6531,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const paired = pairLocallyRefusedFrame(
         canonicalCalls,
         false,
-        new Map([[canonicalCalls[0]!.callId,
-          `The host refused this exact call frame before dispatch (${frameDisposition.reason}). No tool body was entered.`]]),
+        new Map([[canonicalCalls[0]!.callId, hostFrameRefusalDirective(frameDisposition.reason)]]),
       );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,

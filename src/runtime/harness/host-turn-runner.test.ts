@@ -8371,3 +8371,20 @@ test('the completion judge is bounded: after MAX continuations the reply stands;
     _setHostObjectiveJudgeForTests(null);
   }
 });
+
+
+test('a refused call frame tells the model the real defect and the exact repair shape, keeping the stage token the governor keys on', async () => {
+  const { hostFrameRefusalDirective } = await import('./host-turn-runner.js');
+  const malformed = hostFrameRefusalDirective('host_work_call_inner_operation_unidentified');
+  assert.match(malformed, /before dispatch \(host_work_call_inner_operation_unidentified\)/, 'the projection parses the stage from this token');
+  assert.match(malformed, /"tool_slug":"<the exact slug tool_search disclosed>"/);
+  assert.match(malformed, /"arguments":"<the action arguments as one JSON string>"/);
+  assert.match(malformed, /Retry the same work_call once/);
+  const planBound = hostFrameRefusalDirective('host_planned_work_call_requires_plan_sibling');
+  assert.match(planBound, /call plan_task naming this operation first/);
+  assert.match(planBound, /A read never needs a plan/);
+  assert.equal(
+    hostFrameRefusalDirective('host_control_requires_sole_call_frame'),
+    'The host refused this exact call frame before dispatch (host_control_requires_sole_call_frame). No tool body was entered.',
+  );
+});

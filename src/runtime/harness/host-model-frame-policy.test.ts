@@ -215,3 +215,23 @@ test('sole once-mutation stays eligible when strict materialization injects null
     );
   }
 });
+
+
+test('a proposal-free work_call whose inner operation cannot be identified is refused as malformed, never as "requires a plan sibling"', () => {
+  // Live 2026-09-01: GLM 5.3 called work_call → composio_execute_tool with
+  // {channel, limit} as args_json — no tool_slug, no arguments wrapper — for
+  // a proven Slack READ. The unwrap yields no effective name and effect
+  // unknown; "requires plan sibling" was a wrong diagnosis with no door.
+  assert.deepEqual(classifyHostModelFrame({
+    calls: [work({ effectiveName: null, effect: 'unknown', argumentsValue: { name: 'composio_execute_tool', args_json: '{"channel":"C0BL9LLUSBD","limit":5}' } })],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  }), { kind: 'refused', reason: 'host_work_call_inner_operation_unidentified' });
+  // An identified-but-unknown effect (the operation is named, its effect is
+  // not provable) is still the plan-bound mutation case.
+  assert.deepEqual(classifyHostModelFrame({
+    calls: [work({ effectiveName: 'SOME_PROVIDER_ACTION', effect: 'unknown' })],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  }), { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' });
+});

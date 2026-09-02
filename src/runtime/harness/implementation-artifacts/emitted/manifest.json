@@ -2181,7 +2181,7 @@
           "bytes": 22213
         },
         "src/runtime/harness/host-model-frame-policy.ts": {
-          "bytes": 11267
+          "bytes": 12196
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 4009
@@ -2208,7 +2208,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 312699
+          "bytes": 314065
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4662,7 +4662,7 @@
           "bytes": 22213
         },
         "src/runtime/harness/host-model-frame-policy.ts": {
-          "bytes": 11267
+          "bytes": 12196
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 4009
@@ -4689,7 +4689,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 312699
+          "bytes": 314065
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
