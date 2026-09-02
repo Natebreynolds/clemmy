@@ -17,6 +17,7 @@
  */
 import {
   registerCarrierCompleter,
+  registerCarrierGatewayPredicate,
   type CarrierCompletion,
   type ProvenCompletionEntry,
 } from './carrier-completion-registry.js';
@@ -55,9 +56,11 @@ export function completeComposioCarrierArguments(
 
   const changes: string[] = [];
   let toolSlug = typeof inner.tool_slug === 'string' ? inner.tool_slug.trim() : '';
+  // Proven this turn (chat disclosure) or frozen into the step's scope (a
+  // sealed workflow step names its operations before the model speaks).
   const provenIdentifiers = new Set(
     provenEntries
-      .filter((entry) => entry.kind === 'composio' && typeof entry.identifier === 'string')
+      .filter((entry) => (entry.kind === 'composio' || entry.kind === 'frozen_scope') && typeof entry.identifier === 'string')
       .map((entry) => entry.identifier.trim().toUpperCase())
       .filter(Boolean),
   );
@@ -117,3 +120,4 @@ export function completeComposioCarrierArguments(
 
 // Register with the provider-neutral registry the host kernel's seam consults.
 registerCarrierCompleter(completeComposioCarrierArguments);
+registerCarrierGatewayPredicate(isComposioGatewayName);

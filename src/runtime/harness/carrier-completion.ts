@@ -10,7 +10,10 @@
  */
 export {
   completeCarrierArguments,
+  completeDirectCarrierArguments,
+  isRegisteredCarrierGateway,
   registerCarrierCompleter,
+  registerCarrierGatewayPredicate,
   type CarrierCompleter,
   type CarrierCompletion,
   type ProvenCompletionEntry,

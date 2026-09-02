@@ -37,3 +37,37 @@ export function completeCarrierArguments(
   }
   return null;
 }
+
+const gatewayPredicates: Array<(toolName: string) => boolean> = [];
+
+/** A provider registers how to recognize its own gateway tool name (the
+ * direct carrier a sealed workflow step calls), without the kernel naming it. */
+export function registerCarrierGatewayPredicate(predicate: (toolName: string) => boolean): void {
+  if (!gatewayPredicates.includes(predicate)) gatewayPredicates.push(predicate);
+}
+
+export function isRegisteredCarrierGateway(toolName: string): boolean {
+  return gatewayPredicates.some((predicate) => predicate(toolName));
+}
+
+/** Complete a DIRECT gateway call (`tool = <gateway>`, `args = <inner>`), the
+ * shape a sealed workflow step uses, by lifting it into the wrapper form the
+ * completers understand and lowering the result back. */
+export function completeDirectCarrierArguments(
+  toolName: string,
+  argumentsJson: string,
+  provenEntries: readonly ProvenCompletionEntry[],
+): CarrierCompletion | null {
+  const completed = completeCarrierArguments(
+    JSON.stringify({ name: toolName, args_json: argumentsJson }),
+    provenEntries,
+  );
+  if (!completed) return null;
+  try {
+    const outer = JSON.parse(completed.argumentsJson) as { args_json?: unknown };
+    if (typeof outer.args_json !== 'string') return null;
+    return { ...completed, argumentsJson: outer.args_json };
+  } catch {
+    return null;
+  }
+}

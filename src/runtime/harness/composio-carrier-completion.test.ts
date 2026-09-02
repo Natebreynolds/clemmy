@@ -88,3 +88,24 @@ test('a doubled toolkit prefix on a proven operation is completed to that operat
   });
   assert.equal(completeComposioCarrierArguments(unknown, proven), null);
 });
+
+test('a sealed step calls the gateway directly: the frozen scope stands in for proven entries and the inner args come back completed', async () => {
+  const registry = await import('./carrier-completion-registry.js');
+  await import('./carrier-completion.js');
+  assert.equal(registry.isRegisteredCarrierGateway('composio_execute_tool'), true);
+  assert.equal(registry.isRegisteredCarrierGateway('work_call'), false);
+  const frozen = [
+    { kind: 'frozen_scope', identifier: 'OUTLOOK_LIST_EVENTS' },
+    { kind: 'frozen_scope', identifier: 'OUTLOOK_SEND_EMAIL' },
+  ];
+  const direct = JSON.stringify({ tool_slug: 'OUTLOOK_OUTLOOK_SEND_EMAIL', arguments: JSON.stringify({ to_email: 'nate@example.com', subject: 'Daily Standup', body: 'x' }) });
+  const completed = registry.completeDirectCarrierArguments('composio_execute_tool', direct, frozen);
+  assert.ok(completed);
+  assert.equal(completed!.toolSlug, 'OUTLOOK_SEND_EMAIL');
+  const inner = JSON.parse(completed!.argumentsJson) as { tool_slug: string; arguments: string };
+  assert.equal(inner.tool_slug, 'OUTLOOK_SEND_EMAIL');
+  assert.equal(JSON.parse(inner.arguments).subject, 'Daily Standup');
+  // Exact already: nothing to complete.
+  const exact = JSON.stringify({ tool_slug: 'OUTLOOK_SEND_EMAIL', arguments: '{}' });
+  assert.equal(registry.completeDirectCarrierArguments('composio_execute_tool', exact, frozen), null);
+});

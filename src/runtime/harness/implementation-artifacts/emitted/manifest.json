@@ -801,13 +801,13 @@
           "bytes": 774
         },
         "src/runtime/harness/carrier-completion-registry.ts": {
-          "bytes": 1131
+          "bytes": 2482
         },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 5234
+          "bytes": 5508
         },
         "src/runtime/harness/carrier-completion.ts": {
-          "bytes": 854
+          "bytes": 953
         },
         "src/tools/structural-control-lookup.ts": {
           "bytes": 2380
@@ -2214,7 +2214,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 315516
+          "bytes": 316365
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3288,13 +3288,13 @@
           "bytes": 774
         },
         "src/runtime/harness/carrier-completion-registry.ts": {
-          "bytes": 1131
+          "bytes": 2482
         },
         "src/runtime/harness/composio-carrier-completion.ts": {
-          "bytes": 5234
+          "bytes": 5508
         },
         "src/runtime/harness/carrier-completion.ts": {
-          "bytes": 854
+          "bytes": 953
         },
         "src/tools/structural-control-lookup.ts": {
           "bytes": 2380
@@ -4701,7 +4701,7 @@
           "bytes": 39834
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 315516
+          "bytes": 316365
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505

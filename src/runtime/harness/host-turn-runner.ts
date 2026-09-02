@@ -156,7 +156,11 @@ import {
   type TrustedRuntimeEffectCarrier,
 } from './tool-effect.js';
 import { provenCapabilityEntriesForTurn } from './capability-resolution.js';
-import { completeCarrierArguments } from './carrier-completion.js';
+import {
+  completeCarrierArguments,
+  completeDirectCarrierArguments,
+  isRegisteredCarrierGateway,
+} from './carrier-completion.js';
 import {
   catalogOperationIdentitiesEqual,
   isPlainOrClementineLocalTool,
@@ -3624,15 +3628,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // chat-lane ritual it cannot perform.
       const provenOperations = boundOperations.length > 0
         ? []
-        : [...new Set(
-            provenCapabilityEntriesForTurn({
+        : [...new Set([
+            ...provenCapabilityEntriesForTurn({
               sessionId: refusalIdentity.sessionId,
               sourceUserSeq: refusalIdentity.sourceUserSeq,
             })
               .filter((entry) => typeof entry.identifier === 'string')
-              .map((entry) => entry.identifier.trim().toUpperCase())
-              .filter((operationId) => operationId && operationId !== name.toUpperCase()),
-          )];
+              .map((entry) => entry.identifier.trim().toUpperCase()),
+            ...(currentAcceptedSourceCatalogManifestScope()?.operationIds ?? []),
+          ].filter((operationId) => operationId && operationId !== name.toUpperCase()))];
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
         : provenOperations.length > 0
@@ -6456,12 +6460,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // proven this turn, the `arguments` wrapper, one serialization. The
         // completed bytes are what this frame classifies AND dispatches, so the
         // settlement and the learned pin record the working shape.
+        const directGateway = isRegisteredCarrierGateway(call.name);
         if (
           hostProduction
           && tool
-          && (isPlainOrClementineLocalTool(call.name, 'work_call') || isPlainOrClementineLocalTool(call.name, 'call_tool'))
+          && (isPlainOrClementineLocalTool(call.name, 'work_call') || isPlainOrClementineLocalTool(call.name, 'call_tool') || directGateway)
         ) {
-          let provenEntries: ReturnType<typeof provenCapabilityEntriesForTurn> = [];
+          let provenEntries: Array<{ kind: string; identifier: string; effectClass?: string }> = [];
           try {
             const completionIdentity = exactHostIdentity();
             provenEntries = provenCapabilityEntriesForTurn({
@@ -6469,7 +6474,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               sourceUserSeq: completionIdentity.sourceUserSeq,
             });
           } catch { /* no accepted identity: nothing proven this turn */ }
-          const completed = completeCarrierArguments(argumentsJson, provenEntries);
+          if (provenEntries.length === 0) {
+            // A sealed workflow step: its operations were frozen into the
+            // accepted-source scope before the model spoke. Those are what a
+            // stuttered or slug-less carrier completes to.
+            const scope = currentAcceptedSourceCatalogManifestScope();
+            if (scope) {
+              provenEntries = [...scope.operationIds].map((identifier) => ({ kind: 'frozen_scope', identifier }));
+            }
+          }
+          const completed = directGateway
+            ? completeDirectCarrierArguments(call.name, argumentsJson, provenEntries)
+            : completeCarrierArguments(argumentsJson, provenEntries);
           if (completed) {
             argumentsJson = completed.argumentsJson;
             (call as { argumentsJson: string }).argumentsJson = completed.argumentsJson;
