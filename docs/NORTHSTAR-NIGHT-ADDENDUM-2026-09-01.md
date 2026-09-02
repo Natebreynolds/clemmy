@@ -736,3 +736,21 @@ re-run manually (it posts to the team).
 **Carrier note.** end-of-week-team-sales-snapshot's manual run door answered 409 (dry run passes); scheduled
 Friday 16:30, last real run 08-28 blocked on "not authorized" — same authority class as the reads fixed tonight;
 to verify Friday.
+
+## Gate 23 — a sealed step that corrects itself has nowhere to go (2026-09-02 09:05–09:13 UTC, facebook-trends)
+
+The prompt names the exact call (`APIFY_RUN_ACTOR_SYNC_GET_DATASET_ITEMS`, `input.startUrls`). The model sent
+`input: {}`; Apify's error named its own fix ("Field input.startUrls is required") — good. The model then
+corrected the field but on a SIBLING operation (`APIFY_RUN_ACTOR_SYNC`), which the step's sealed envelope had
+never proven → refused pre-dispatch `catalog_entry_or_manifest_missing`, and the refusal told a sealed step to
+"call tool_search, then plan_task, then work_call" — a ritual a locked step cannot perform (it tried:
+`provider_carried_local_control_route_missing`). Two identical walls → the governor stopped. Typed and honest,
+but a dead end with no next edge on the step's own surface.
+
+Harness class, not fixed tonight (queued first for the morning):
+1. In a sealed step, a carrier naming a sibling operation of an already-proven toolkit should be JIT-provisioned
+   and admitted under the step's declared effect — the read edge already does this for reads; extend it to the
+   step's declared write class.
+2. The pre-dispatch refusal copy must be lane-aware: inside a sealed step it should say "use
+   <proven operation> with <required field>" (the host knows both), never prescribe chat-lane discovery.
+The definition is correct as written; not edited.
