@@ -698,6 +698,53 @@ function negativeStringEnvelope(result: unknown): { errorCode?: string | number 
   return null;
 }
 
+/**
+ * The mirror of `negativeStringEnvelope`, and the reason it has to exist.
+ *
+ * "A string payload never settles success" is right about PROSE and wrong about
+ * a serialized envelope. `negativeStringEnvelope` already parses a JSON string
+ * to settle `successful: false`, so an envelope that says it failed was trusted
+ * while the byte-identical envelope saying it succeeded was not. One polarity
+ * got the treatment; the other never did.
+ *
+ * Live 2026-09-03: thirteen consecutive provider calls returned
+ * `{"error": null, "successful": true, ...}` with real data and a billed cost,
+ * crossed the carrier as rendered text, and every one settled
+ * unknown/execution_failed — evidence class `nominal`, because the structure
+ * was there and nothing read it. The provider was fine; the model was told its
+ * tool was down, and the paid results were discarded.
+ *
+ * Deliberately strict, because the 2026-08-26 gauntlet (~249 calls settling
+ * succeeded off bare strings) is the reason the blanket rule exists:
+ *   - the payload must PARSE as a JSON object, not merely contain one;
+ *   - `successful`/`success`/`ok` must be EXACTLY true, never truthy;
+ *   - an accompanying non-null `error` disqualifies it — a contradicted
+ *     envelope is not a success;
+ *   - every nominal marker above still wins, since this only fills
+ *     `envelopeSuccessful` when nothing else has decided.
+ * Prose still settles nothing.
+ */
+export function positiveStringEnvelope(result: unknown): boolean {
+  for (const candidate of stringCandidates(result)) {
+    const text = candidate.trim();
+    if (!text.startsWith('{') || Buffer.byteLength(text, 'utf8') > STRING_ENVELOPE_MAX_BYTES) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    const envelope = record(parsed);
+    if (!envelope) continue;
+    const successful = envelope.successful ?? envelope.success ?? envelope.ok;
+    if (successful !== true) continue;
+    const error = envelope.error;
+    if (error !== undefined && error !== null && error !== '') continue;
+    return true;
+  }
+  return false;
+}
+
 function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAttemptInput & {
   sessionId: string; sourceUserSeq: number;
 } {
@@ -905,6 +952,11 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
       extracted.executionFailed = true;
     } else if (laundered === null && extracted.envelopeSuccessful === undefined) {
       const negative = negativeStringEnvelope(input.result);
+      if (!negative && positiveStringEnvelope(input.result)) {
+        // A serialized envelope that states its own success, with no
+        // contradicting error. See positiveStringEnvelope.
+        extracted.envelopeSuccessful = true;
+      }
       if (negative) {
         extracted.envelopeSuccessful = false;
         if (negative.errorCode !== undefined) extracted.envelopeErrorCode = negative.errorCode;
