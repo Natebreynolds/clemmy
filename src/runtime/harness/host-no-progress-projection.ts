@@ -147,12 +147,15 @@ function sortedSnapshot(
  * carry an effect-authority token. Prior authority is cumulative inside the
  * governor, so this bounds the snapshot, never the memory of what was seen. */
 const MAX_DISCLOSED_WRITE_REF_TOKENS = 8;
+/** Same bound, same reason, for reads. See the read-ref block below. */
+const MAX_DISCLOSED_READ_REF_TOKENS = 8;
 
 function eventCapabilityTokens(
   events: readonly EventRow[],
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
   const disclosedWriteRefs: string[] = [];
+  const disclosedReadRefs: string[] = [];
   for (const event of events) {
     if (event.type === 'capability_resolution') {
       // Resolution entries are candidate alternatives, even when their
@@ -197,6 +200,29 @@ function eventCapabilityTokens(
         tokens.effect.add(token('effect', 'citable_discovery_effect', ['write']));
         disclosedWriteRefs.push(...writeRefs);
       }
+      // The identical gain for READS, and for the identical reason. Only the
+      // one-off 'citable_discovery_available' token above was credited for a
+      // read disclosure, so every search after the first counted as nothing —
+      // and a task whose work is reading (query a CRM, pull SEO data, find a
+      // template) has no writes to earn credit with until the very end.
+      //
+      // Live 2026-09-03: a cold five-prospect outbound task spent ten
+      // tool_searches learning three unfamiliar toolkits, gained authority for
+      // exactly one of them, exhausted the governor, and was terminated after
+      // 118 seconds having executed nothing at all. That is the BLANK-STATE
+      // case by definition — a new user has nothing proven, so every one of
+      // their tasks is this one.
+      //
+      // Cumulative and distinct, exactly like writes: re-disclosing a ref the
+      // governor already holds is still no gain, so a model re-running the same
+      // search converges on the budget as before. Only genuinely new capability
+      // counts.
+      const readRefs = capabilities.flatMap((candidate) => {
+        const row = record(candidate);
+        const capabilityRef = nonEmptyString(row?.capabilityRef);
+        return capabilityRef !== null && row?.effectClass === 'read' ? [capabilityRef] : [];
+      });
+      if (readRefs.length > 0) disclosedReadRefs.push(...readRefs);
       continue;
     }
 
@@ -233,6 +259,14 @@ function eventCapabilityTokens(
     .slice(0, MAX_DISCLOSED_WRITE_REF_TOKENS);
   for (const capabilityRef of recentWriteRefs) {
     tokens.effect.add(token('effect', 'citable_write_ref', [capabilityRef]));
+  }
+  // A newly citable READ is an operation the turn could not name before, so it
+  // belongs to operation authority rather than effect authority — discovering
+  // a query grants no power to change anything.
+  const recentReadRefs = [...new Set(disclosedReadRefs.reverse())]
+    .slice(0, MAX_DISCLOSED_READ_REF_TOKENS);
+  for (const capabilityRef of recentReadRefs) {
+    tokens.operation.add(token('operation', 'citable_read_ref', [capabilityRef]));
   }
 }
 

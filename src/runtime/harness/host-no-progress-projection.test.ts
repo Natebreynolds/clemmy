@@ -1732,3 +1732,55 @@ test('a mixed frame and a failed read keep their metered class', () => {
   }
   failed.close();
 });
+
+// A cold, read-heavy task is the BLANK-STATE case: a new user has nothing
+// proven, so every search is a first search. Live 2026-09-03: a five-prospect
+// outbound task (Salesforce + DataForSEO + an email skill, none of them warm)
+// spent ten tool_searches, earned authority for only the FIRST, exhausted the
+// governor and was terminated after 118 seconds having executed nothing.
+// Writes already got this treatment on 2026-09-01; reads never did.
+test('each newly citable READ is authority progress, and re-disclosing one is not', () => {
+  const identity = accepted('cold-read-discovery');
+  const disclose = (capabilities: Record<string, unknown>[]) => appendEvent({
+    sessionId: identity.sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'capability_discovered',
+    data: { sourceUserSeq: identity.sourceUserSeq, capabilities },
+  });
+
+  disclose([{ identifier: 'soql', capabilityRef: 'cap:live:soql', effectClass: 'read' }]);
+  const first = projectHostNoProgressAuthority(identity);
+  assert.equal(first.status, 'ok');
+  if (first.status !== 'ok') return;
+
+  // A DIFFERENT toolkit's read is a capability the turn could not name before.
+  disclose([{ identifier: 'seo', capabilityRef: 'cap:live:dataforseo_rank', effectClass: 'read' }]);
+  const second = projectHostNoProgressAuthority(identity);
+  assert.equal(second.status, 'ok');
+  if (second.status !== 'ok') return;
+  assert.ok(
+    second.authority.operation.length > first.authority.operation.length,
+    'discovering a second unfamiliar toolkit is progress, not a stalled retry',
+  );
+  const governor = initializeNoProgressGovernor({ taskKey: 'cold', authority: first.authority });
+  const decision = observeNoProgress(governor, {
+    taskKey: 'cold',
+    attemptClass: 'authority_acquisition',
+    authority: second.authority,
+  });
+  assert.equal(decision.action, 'continue');
+  assert.equal(decision.reason, 'authority_progress');
+
+  // Re-disclosing what the governor already holds stays no gain, so a model
+  // re-running the same search still converges on the budget.
+  disclose([{ identifier: 'soql', capabilityRef: 'cap:live:soql', effectClass: 'read' }]);
+  const repeat = projectHostNoProgressAuthority(identity);
+  assert.equal(repeat.status, 'ok');
+  if (repeat.status !== 'ok') return;
+  assert.deepEqual(repeat.authority.operation, second.authority.operation,
+    're-disclosure is cumulative, never a fresh gain');
+
+  // Reads never grant effect authority — discovering a query cannot change anything.
+  assert.deepEqual(second.authority.effect, first.authority.effect);
+});
