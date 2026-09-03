@@ -18,6 +18,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
+import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { textResult } from './shared.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogLexically, type RankedCatalogEntry } from '../agents/tool-catalog.js';
@@ -1425,6 +1426,40 @@ export function registerToolSearchTool(
             };
           }
         };
+        // REDUNDANT-DISCOVERY ADVISORY, delivered INSIDE the envelope.
+        //
+        // discovery-advisory.ts catches "searching one toolkit over and over
+        // with progressively narrowed reformulations before committing", but it
+        // was wired only to composio_search_tools / composio_list_tools — never
+        // to tool_search, the lane the model actually uses. Live 2026-09-03 run
+        // 27: five narrowing searches converging on a slug that does not exist,
+        // while thirteen dispatchable operations from that toolkit sat in
+        // results already returned. Zero business calls.
+        //
+        // It is a FIELD, not appended prose. Concatenating it corrupted this
+        // JSON payload ("Unexpected non-whitespace character after JSON") —
+        // exactly what the nestedDispatch guard on the fan-out advisory exists
+        // to prevent. Structured signals ride the structure.
+        //
+        // The toolkit is derived from the rows returned, so no provider name
+        // enters the code and the signal stays behavioural.
+        const advisoryToolkit = (() => {
+          for (const row of rows) {
+            try {
+              const slug = registeredToolkitOfSlug(row.name).trim().toLowerCase();
+              if (slug) return slug;
+            } catch { /* a built-in with no toolkit is not a discovery loop */ }
+          }
+          return '';
+        })();
+        const discoveryAdvisory = page === 1 && advisoryToolkit
+          ? maybeDiscoveryAdvisory({
+              kind: 'search',
+              toolkit: advisoryToolkit,
+              signature: query,
+              sessionId: continuationSessionId,
+            })
+          : null;
         const render = (): string => JSON.stringify({
           query,
           ...(role_key ? { role_key } : {}),
@@ -1441,6 +1476,7 @@ export function registerToolSearchTool(
           ...(unavailable.length > 0 ? { unavailable } : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
           hint,
+          ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
           ...(nextCursor ? {
             next_cursor: nextCursor,
             continuation_hint: 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
@@ -1492,6 +1528,7 @@ export function registerToolSearchTool(
       // after call_tool successfully dispatches it; promoting all three schema
       // previews made ordinary sessions grow their first-class surface on every
       // search even when two suggestions were never used.
+
       return textResult(text);
     },
   );
