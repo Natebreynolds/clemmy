@@ -224,9 +224,11 @@ test('collapseOldCompletedToolPairs — skips old pairs that are not recallable 
   assert.equal(remainingCallIds.has('call_1'), true, 'unrecallable old pair should stay verbatim');
 });
 
-test('inFlightCompactionThresholds — absolute defaults (never scaled by the model window), env overrides win', () => {
+test('inFlightCompactionThresholds — absolute on a non-caching wire, env overrides win', () => {
   // 2026-09-01: window-scaled thresholds (×5 on a 1M window) meant a 27-read
-  // step never compacted mid-turn and composed 58k-token prompts.
+  // step never compacted mid-turn and composed 58k-token prompts. That fix is
+  // preserved exactly for every wire without a prompt cache — including an
+  // unknown/absent id, which resolves to the registry's conservative default.
   assert.deepEqual(inFlightCompactionThresholds(() => undefined), {
     resultTriggerTokens: 32_000,
     retainedResultBudgetTokens: 20_000,
@@ -247,6 +249,43 @@ test('inFlightCompactionThresholds — absolute defaults (never scaled by the mo
   });
   // Garbage or non-positive overrides fall back to the defaults.
   assert.equal(inFlightCompactionThresholds((key) => (key === 'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS' ? '-5' : 'x')).resultTriggerTokens, 32_000);
+});
+
+test('inFlightCompactionThresholds — a caching wire scales, a non-caching wire does not', async () => {
+  const { inFlightPromptCacheScale } = await import('./compaction.js');
+
+  // The 2026-09-01 regression was measured on these. They must not move.
+  for (const id of ['grok-4.6', 'glm-5.2', 'gpt-5.6', 'kimi-k3']) {
+    assert.equal(inFlightPromptCacheScale(id), 1, `${id} caches nothing — stay absolute`);
+    assert.deepEqual(inFlightCompactionThresholds(() => undefined, id), {
+      resultTriggerTokens: 32_000,
+      retainedResultBudgetTokens: 20_000,
+      minRetainPairs: 3,
+      maxRetainPairs: 8,
+    }, `${id} must keep the absolute thresholds byte-identically`);
+  }
+
+  // Sonnet 5 caches from 2048 tokens on a 1M window. Collapsing its prefix
+  // rewrites what the provider already cached: live 2026-09-03 the collapse
+  // took uncached input from 5,160 to 35,529 on the very next call.
+  const sonnet = inFlightCompactionThresholds(() => undefined, 'claude-sonnet-5');
+  assert.ok(inFlightPromptCacheScale('claude-sonnet-5') > 1, 'a caching wire scales');
+  assert.ok(
+    sonnet.resultTriggerTokens > 32_000,
+    `a cached prefix is not cheaper to rebuild (got ${sonnet.resultTriggerTokens})`,
+  );
+  // Retain pairs are counts, not token budgets — they never scale.
+  assert.equal(sonnet.minRetainPairs, 3);
+  assert.equal(sonnet.maxRetainPairs, 8);
+
+  // An explicit operator override still wins on every wire.
+  assert.equal(
+    inFlightCompactionThresholds(
+      (key) => (key === 'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS' ? '9000' : undefined),
+      'claude-sonnet-5',
+    ).resultTriggerTokens,
+    9000,
+  );
 });
 
 test('compactInFlightToolContext — deduplicates identical results below the pressure threshold without losing recall ids', () => {

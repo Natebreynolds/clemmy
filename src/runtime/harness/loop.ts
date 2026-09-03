@@ -10386,16 +10386,20 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       // model-facing old pairs with a recall ledger and retain a recent working
       // set. Every full output was durably parked by the tool-end hook first.
       if (inFlightCompactionEnabled()) {
-        // Absolute thresholds, never scaled by the routed model's window: the
-        // reason to compact mid-turn is per-frame prefill latency and cache-miss
-        // cost, which grow with absolute prompt bytes. Scaling by window (Sonnet
-        // 5's 1M → a 160k trigger, GLM's 512k → 82k) meant the host lane never
-        // compacted the 27-read steps that then timed out on first byte (live
-        // 2026-09-01). Env overrides still win (inFlightCompactionThresholds).
+        // Absolute on a wire with no prompt cache — the 2026-09-01 fix for
+        // GLM/grok 27-read steps that composed 58k prompts and timed out on
+        // first byte. Window-scaled on a wire that DOES cache, where collapsing
+        // the prefix turns a cache hit into a full cold prefill: live
+        // 2026-09-03 on Sonnet 5 it fired three times and caused ~126k of the
+        // run's ~139k uncached tokens. See inFlightCompactionThresholds.
+        // Env overrides still win.
         const compacted = compactInFlightToolContext(
           modelData.input,
           options.sessionId,
-          inFlightCompactionThresholds((key) => getRuntimeEnv(key, '') || undefined),
+          inFlightCompactionThresholds(
+            (key) => getRuntimeEnv(key, '') || undefined,
+            routedModelIdForBudget,
+          ),
         );
         if (compacted.applied) {
           modelData = {

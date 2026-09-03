@@ -10,7 +10,8 @@ import {
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { effectiveContextWindow } from './model-window-observations.js';
+import { effectiveContextWindow, windowScaleForModel } from './model-window-observations.js';
+import { resolveModelCapability } from './model-wire-registry.js';
 import { toolCallHint } from './tool-call-hint.js';
 
 /**
@@ -105,28 +106,73 @@ export interface InFlightCompactionThresholds {
   maxRetainPairs: number;
 }
 
+/** Window scale for mid-turn compaction: 1 unless the routed wire caches the
+ * prompt, because collapsing a cached prefix costs more prefill than it saves. */
+export function inFlightPromptCacheScale(routedModelId?: string | null): number {
+  try {
+    if (!resolveModelCapability(routedModelId).supportsPromptCache) return 1;
+    return windowScaleForModel(routedModelId);
+  } catch {
+    return 1;
+  }
+}
+
 /**
- * Mid-turn (in-flight) compaction thresholds. ABSOLUTE — never scaled by the
- * routed model's context window. The reason to compact mid-turn is per-frame
- * prefill latency and cache-miss cost, which grow with absolute prompt bytes,
- * not with the share of a window in use. Scaling them by window (2026-08-05)
- * meant Sonnet 5's 1M window needed 160k tokens of results before the first
- * collapse and GLM's 512k needed 82k: the host lane never compacted the
- * 27-read workflow steps that then composed 58k-token prompts and timed out
- * on first byte (live 2026-09-01). Between-turn budgets still track the real
- * window (compactionBudgetForModel); env overrides still win here.
+ * Mid-turn (in-flight) compaction thresholds.
+ *
+ * The reason to compact mid-turn is per-frame prefill cost, which grows with
+ * absolute prompt bytes — so on a wire with NO prompt cache these stay
+ * absolute. Window-scaling them (2026-08-05) meant GLM's 512k needed 82k
+ * tokens of results before the first collapse, so the host lane never
+ * compacted the 27-read workflow steps that then composed 58k-token prompts
+ * and timed out on first byte (live 2026-09-01).
+ *
+ * On a wire that DOES cache the prompt, the same arithmetic runs backwards:
+ * collapsing results rewrites the prefix, so the next call re-prefills from
+ * scratch. Live 2026-09-03, platform-49 run 6 on Sonnet 5 (1M window,
+ * cacheMin 2048) — each collapse turned a cache hit into a cold prefill:
+ *
+ *     03:04:29  input 63,071  cached 57,911  uncached  5,160
+ *     03:04:29  → collapse fires at the absolute 32k result trigger
+ *     03:04:36  input 47,816  cached 12,287  uncached 35,529   (7x more)
+ *
+ * It fired three times; ~126k of the run's ~139k uncached tokens were the
+ * cache busts it caused. It cost latency and money to save 15k of prompt, and
+ * the collapsed results were the data the model then died trying to recall.
+ *
+ * So the trigger is gated on the ROUTED WIRE's cache support, which the
+ * registry already owns. Non-caching wires (grok, GLM, gpt, kimi — every brain
+ * the 2026-09-01 fix was measured on) keep today's absolute thresholds
+ * byte-identically. Caching wires (the Claude family) scale with the real
+ * window, the same `windowScaleForModel` its neighbours already use
+ * (fanoutDigestThreshold, envelopeDigestMax, recall slices).
+ *
+ * Between-turn budgets still track the real window (compactionBudgetForModel);
+ * env overrides still win here.
  */
 export function inFlightCompactionThresholds(
   read: (key: string) => string | undefined = (key) => process.env[key],
+  routedModelId?: string | null,
 ): InFlightCompactionThresholds {
   const positive = (key: string, fallback: number): number => {
     const raw = read(key);
     const parsed = raw === undefined || raw === '' ? NaN : Number.parseInt(raw, 10);
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
   };
+  // 1 on a non-caching wire (byte-identical to the absolute defaults), the
+  // real window ratio on a caching one. An unknown id resolves to the
+  // registry's conservative default, whose supportsPromptCache is false — so
+  // "unknown" fails safe onto the absolute thresholds.
+  const cacheScale = inFlightPromptCacheScale(routedModelId);
   return {
-    resultTriggerTokens: positive('CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS', DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS),
-    retainedResultBudgetTokens: positive('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS),
+    resultTriggerTokens: positive(
+      'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS',
+      Math.round(DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS * cacheScale),
+    ),
+    retainedResultBudgetTokens: positive(
+      'CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS',
+      Math.round(DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS * cacheScale),
+    ),
     minRetainPairs: positive('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS),
     maxRetainPairs: positive('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS),
   };
