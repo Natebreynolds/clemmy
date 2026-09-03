@@ -7119,7 +7119,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     /* Retain the legacy direct/effective policy assertion as a consistency
      * check for registry classes not yet migrated to hostModelFrameClass. */
-    let soleControls: Array<{ call: CanonicalHostCall; carried: boolean }>;
+    let soleControls: Array<{ call: CanonicalHostCall; carried: boolean; effective: string | null }>;
     try {
       soleControls = canonicalCalls.flatMap((call) => {
         const tool = toolByName.get(call.name);
@@ -7131,7 +7131,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           : null;
         const effectivePolicy = effective ? hostControlFrameFor(effective) : null;
         return directPolicy === 'sole' || effectivePolicy === 'sole'
-          ? [{ call, carried: directPolicy !== 'sole' }]
+          ? [{ call, carried: directPolicy !== 'sole', effective }]
           : [];
       });
     } catch (error) {
@@ -7154,11 +7154,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       continue;
     }
     if (soleControls.some((entry) => entry.carried)) {
+      const carriedControlOperation = soleControls.find((entry) => entry.carried)?.effective
+        ?? 'that host control';
       const paired = pairLocallyRefusedFrame(
         canonicalCalls,
         false,
         new Map([[canonicalCalls[0]!.callId,
-          'The host refused an indirect control carrier before dispatch (host_control_requires_direct_first_class_call). No tool body was entered.']]),
+          // Naming the error without naming the repair is a dead end: the
+          // model re-issued the IDENTICAL wrapped frame and exhausted the
+          // budget. Live 2026-09-03, two consecutive runs died here with a
+          // CORRECT multi-step plan body wrapped in an ordinary carrier. The
+          // proposal was right; only the envelope was wrong, and nothing in
+          // the refusal said which envelope to use instead.
+          `The host refused an indirect control carrier before dispatch (host_control_requires_direct_first_class_call). No tool body was entered. `
+          + `${carriedControlOperation} is a first-class host control: issue it DIRECTLY as its own top-level tool call, never wrapped in call_tool or work_call. `
+          + `Your arguments were not the problem — re-issue the SAME arguments now as a direct ${carriedControlOperation} call.`]]),
       );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
