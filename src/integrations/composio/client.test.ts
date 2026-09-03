@@ -894,6 +894,35 @@ test('selectToolkitConnection: active-tier beats createdAt (a fresh INITIATED re
   assert.equal(out.kind === 'resolved' && out.connectionId, 'ca_active');
 });
 
+// ── first use of an API-key toolkit ─────────────────────────────────────────
+// A mailbox identity hint leaks across toolkits within a session (an Outlook
+// address established for the drafts leg reaches the DataForSEO leg). A
+// keyed toolkit has no accountEmail, so the hint can never match, and the
+// sole-connection resolution below the hint branch was unreachable. Live
+// 2026-09-03 run 15: DATAFORSEO_* came back account_selection_required with
+// accountChoices ["ca_l2E9qngGijNQ"] — one opaque option — and the run stopped
+// having executed nothing.
+test('selectToolkitConnection: a sole keyed connection resolves despite a mailbox hint it cannot match', () => {
+  const out = selectToolkitConnection(
+    'DATAFORSEO_LIST_DOMAIN_ANALYTICS_TECHNOLOGIES',
+    [{ slug: 'dataforseo', connectionId: 'ca_keyed', status: 'ACTIVE' }],
+    'someone@corp.example',
+  );
+  assert.deepEqual(out, { kind: 'resolved', connectionId: 'ca_keyed' });
+});
+
+// The protection this must not weaken: a candidate that HAS an address which
+// differs from the recalled one is the only shape in which a wrong pick is
+// possible, and it still asks.
+test('selectToolkitConnection: a sole MAILBOX connection that contradicts the hint still asks', () => {
+  const out = selectToolkitConnection(
+    'OUTLOOK_SEND_EMAIL',
+    [{ slug: 'outlook', connectionId: 'ca_other', status: 'ACTIVE', accountEmail: 'other@corp.example' }],
+    'recalled@corp.example',
+  );
+  assert.equal(out.kind, 'identity-absent');
+});
+
 test('selectToolkitConnection: two DISTINCT mailboxes with no hint → ambiguous (ASK), never a silent pick', () => {
   const out = selectToolkitConnection('OUTLOOK_SEND_EMAIL', [
     { slug: 'outlook', connectionId: 'ca_work', status: 'ACTIVE', accountEmail: 'work@site.example' },

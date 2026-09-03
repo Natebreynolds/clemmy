@@ -94,3 +94,29 @@ test('providers keep their membership boost — visibility is not the fix', () =
     'the provider membership boost must remain unconditional on a planning turn',
   );
 });
+
+// ── the window, not the rank ────────────────────────────────────────────────
+// The tier design only decides among candidates that REACH the ranker. The
+// per-source truncation runs before scoring, so a broad query that fills the
+// window with provider rows evicts an acquired live read whose boost would
+// have won. Live 2026-09-03 run 15: "run shell command Salesforce sf CLI query
+// prospects" returned 20 provider rows and zero salesforce_sf_soql_query,
+// while run 13's "run shell command salesforce sf cli" found it — same sealed
+// descriptor, same machine, two extra words.
+test('an acquired live read survives a window flooded by provider rows', () => {
+  const src = readFileSync(SRC, 'utf8');
+  const truncation = src.slice(
+    src.indexOf('const sourced = candidates'),
+    src.indexOf('.slice(0, TOOL_SEARCH_WINDOW_RESULTS);', src.indexOf('const sourced = candidates')),
+  );
+  assert.ok(
+    truncation.includes('isAcquiredLiveReadCandidate'),
+    'acquired candidates must be carried past the per-source truncation, '
+    + 'or broker volume decides what the ranker sees',
+  );
+  // and the bound must still be applied, so a source cannot return unbounded rows
+  assert.ok(
+    src.includes('].slice(0, TOOL_SEARCH_WINDOW_RESULTS);'),
+    'the window must stay bounded',
+  );
+});

@@ -977,14 +977,37 @@ export function registerToolSearchTool(
                   `${source.kind} answered after the tool_search deadline.`,
                 );
               }
-              return candidates
+              // Truncating BEFORE scoring let a source's own ordering decide
+              // what the ranker is ever allowed to see. The tier design above
+              // (acquired [3,4] strictly over connected provider [2,3]) then
+              // only ranks the survivors, so a broker answering a broad query
+              // with a full window of provider rows evicts the acquired live
+              // read that the design says must win — it "never entered the
+              // window to be ranked at all", the same shape as the 2026-08-28
+              // workspace incident one tier up.
+              //
+              // Live 2026-09-03 run 15: "run shell command Salesforce sf CLI
+              // query prospects" returned twenty APIFY_/DATAFORSEO_/OPENAI_/
+              // OUTLOOK_ rows and zero salesforce_sf_soql_query, while the
+              // SAME sealed descriptor answered run 13's narrower "run shell
+              // command salesforce sf cli". Two extra words in an otherwise
+              // correct query silently lost a capability that was present,
+              // connected and hash-verified, and the run did no work.
+              //
+              // Acquired rows are carried past the truncation instead. The
+              // window stays bounded at TOOL_SEARCH_WINDOW_RESULTS, and
+              // relevance still orders the survivors downstream.
+              const sourced = candidates
                 .filter((candidate) => candidate.name.trim() && candidate.summary.trim())
-                .slice(0, TOOL_SEARCH_WINDOW_RESULTS)
                 .map((candidate) => ({
                   ...candidate,
                   summary: candidate.summary.trim().slice(0, 600),
                   sourceKind: source.kind,
                 }));
+              return [
+                ...sourced.filter((candidate) => isAcquiredLiveReadCandidate(candidate)),
+                ...sourced.filter((candidate) => !isAcquiredLiveReadCandidate(candidate)),
+              ].slice(0, TOOL_SEARCH_WINDOW_RESULTS);
             } catch (error) {
               const code: CandidateSourceUnavailableCode = error instanceof CandidateSourceUnavailableError
                 ? error.code

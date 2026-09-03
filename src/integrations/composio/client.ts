@@ -3495,6 +3495,22 @@ export function selectToolkitConnection(
   if (wantEmail.includes('@')) {
     const hit = distinct.find((d) => d.email === wantEmail);
     if (hit) return { kind: 'resolved', connectionId: hit.connectionId, identity: hit.email };
+    // A mailbox hint can only CONTRADICT a candidate that has a mailbox. An
+    // API-key toolkit (DataForSEO, Apify, Firecrawl, ...) carries no account
+    // email, so a sole such connection is not "the recalled mailbox is gone" —
+    // there is nothing to choose between and nothing to get wrong. Withholding
+    // it made the FIRST use of every non-mailbox toolkit demand a selection
+    // whose only option was an opaque connection id: live 2026-09-03 run 15
+    // searched well, got DATAFORSEO_* rows back stamped
+    // account_selection_required with accountChoices ["ca_..."], and stopped
+    // having executed nothing.
+    //
+    // The wrong-mailbox protection is untouched. It exists for the case where
+    // a candidate HAS an address that differs from the recalled one, which is
+    // the only shape in which a wrong pick is possible; that path still asks.
+    if (distinct.length === 1 && !distinct[0]!.email) {
+      return { kind: 'resolved', connectionId: distinct[0]!.connectionId };
+    }
     return { kind: 'identity-absent', want: wantEmail, candidates: distinct }; // recalled mailbox gone → ASK, never fall through
   }
 
