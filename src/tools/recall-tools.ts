@@ -5,7 +5,7 @@ import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
-import { extractCompleteJsonObjects, extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 
@@ -236,39 +236,20 @@ export function registerRecallTools(server: McpServer): void {
           `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be queried as authoritative data.`,
         );
       }
-      let parsed: unknown;
-      let recoveredClippedArrayPrefix = false;
-      try { parsed = JSON.parse(row.output); } catch {
-        // Very common footgun: the parked output is a run_shell_command wrapper
-        // (`exit_code:/stdout:/stderr:`) around a `--json` payload (sf, gh, aws…),
-        // so a whole-string JSON.parse fails even though the data IS structured.
-        // Extract and query the embedded stdout JSON instead of bouncing to
-        // recall_tool_result — which returns raw text the model must re-parse,
-        // the exact slow path that turned a Salesforce team pull into a
-        // multi-turn detour.
-        const shell = parseShellToolOutput(row.output);
-        if (shell?.stdout_json !== undefined) {
-          parsed = shell.stdout_json;
-        } else {
-          // A useful CLI invocation may print a help/status preamble and then a
-          // complete JSON value (for example `--help && list --json`). Recover
-          // the balanced value instead of forcing a raw-recall/model-reparse
-          // round trip. The extractor returns only text that JSON.parse accepts.
-          const embedded = shell ? extractJsonCandidate(shell.stdout) : null;
-          if (embedded) {
-            parsed = JSON.parse(embedded) as unknown;
-          } else if (shell?.stdout.includes('[')) {
-            const completeObjects = extractCompleteJsonObjects(shell.stdout, 200);
-            if (completeObjects.length === 0) {
-              return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
-            }
-            parsed = completeObjects;
-            recoveredClippedArrayPrefix = true;
-          } else {
-            return textResult(`Tool output "${callId}" is not JSON — use recall_tool_result to read it as text.`);
-          }
-        }
+      // One canonical recovery for every reader of a parked output. The store
+      // may hold the provider payload PLUS harness prose (composio route
+      // notes, a recall preamble), so a bare JSON.parse is not the question.
+      const recovered = parseStoredToolOutputJson(row.output, { shell: parseShellToolOutput });
+      if (!recovered) {
+        // Say what is true: recovery failed. Never tell the model its own
+        // valid JSON "is not JSON" — it obeys, comes back, and burns the turn.
+        return textResult(
+          `No JSON value could be recovered from tool output "${callId}" (${row.output.length.toLocaleString()} chars). `
+          + 'It is text, not structured data — use recall_tool_result to read it.',
+        );
       }
+      let parsed: unknown = recovered.value;
+      const recoveredClippedArrayPrefix = recovered.partialArrayPrefix === true;
 
       // One canonical spelling past this line: the widened string form
       // ("subject,start") becomes the same array the documented form produces.

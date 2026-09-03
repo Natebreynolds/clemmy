@@ -1,6 +1,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import { projectToolOutputValueForAutomaticAuthority, resolveToolOutputForAuthority } from './eventlog.js';
 import { parseShellToolOutput } from '../../tools/inner-dispatch.js';
+import { parseStoredToolOutputJson } from './json-repair.js';
 import { gatherTrustedEvidence } from './trusted-evidence.js';
 
 /** Kill-switch for the dispatch-time resolution wiring (the primitive itself is
@@ -97,12 +98,12 @@ export function extractByPath(value: unknown, path?: string): unknown {
 /** Parse a parked tool output as JSON, transparently unwrapping the
  *  `run_shell_command` `exit_code:/stdout:` wrapper around a `--json` payload. */
 function parseParkedOutput(raw: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    const shell = parseShellToolOutput(raw);
-    return shell?.stdout_json;
-  }
+  // Same canonical recovery tool_output_query uses. A parked output may carry
+  // harness prose around the provider payload (route notes, a recall
+  // preamble); a bare JSON.parse rejects data that is demonstrably JSON, and a
+  // reference that "cannot resolve" from a payload it could read is a
+  // fabricated dead end.
+  return parseStoredToolOutputJson(raw, { shell: parseShellToolOutput })?.value;
 }
 
 function countLeaves(value: unknown): number {

@@ -236,3 +236,82 @@ export function conformsToJsonSchemaShape(
 
   return { ok: violations.length === 0, violations };
 }
+
+/** How a stored tool output's JSON value was recovered. */
+export type StoredToolOutputJsonVia = 'exact' | 'shell_stdout' | 'shell_embedded' | 'embedded' | 'shell_objects';
+
+export interface StoredToolOutputJson {
+  value: unknown;
+  via: StoredToolOutputJsonVia;
+  /** Only a complete-object PREFIX of a clipped array was recoverable. */
+  partialArrayPrefix?: boolean;
+}
+
+export interface StoredToolOutputShell {
+  stdout: string;
+  stdout_json?: unknown;
+}
+
+/**
+ * Recover the JSON value from a STORED tool output.
+ *
+ * The parked record is not always the provider's bare payload: the harness
+ * appends its own prose to it on the way in — composio route notes
+ * (`[account-route] …`, `[sender-verify] …`), constraint banners, and
+ * `recall_tool_result`'s own `Recalled chars A–B of N • tool=… ` preamble.
+ * A whole-string `JSON.parse` therefore fails on a payload that IS JSON, and
+ * every reader had its own ladder that stopped short of noticing.
+ *
+ * Live 2026-09-03 (platform-49 run 6, Sonnet 5): `tool_output_query` told the
+ * model its own valid JSON "is not JSON — use recall_tool_result", the model
+ * obeyed, came back for the next handle, got the same falsehood, and the
+ * no-progress governor killed the run after 894K input tokens with every byte
+ * it needed already in hand. A reader that lies about the data is worse than
+ * one that errors.
+ *
+ * Precedence preserves each caller's previous behavior exactly and only ADDS
+ * the raw-embedded step, so no shape that resolved before resolves differently.
+ */
+export function parseStoredToolOutputJson(
+  raw: string,
+  options: { shell?: (raw: string) => StoredToolOutputShell | null | undefined } = {},
+): StoredToolOutputJson | null {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  try {
+    return { value: JSON.parse(raw) as unknown, via: 'exact' };
+  } catch { /* fall through to recovery */ }
+
+  const shell = options.shell?.(raw) ?? null;
+  // A run_shell_command wrapper (`exit_code:/stdout:/stderr:`) around a
+  // `--json` payload (sf, gh, aws…): the data is structured, the envelope is not.
+  if (shell?.stdout_json !== undefined) {
+    return { value: shell.stdout_json, via: 'shell_stdout' };
+  }
+  if (shell) {
+    const embeddedStdout = extractJsonCandidate(shell.stdout);
+    if (embeddedStdout !== null) {
+      try {
+        return { value: JSON.parse(embeddedStdout) as unknown, via: 'shell_embedded' };
+      } catch { /* keep looking */ }
+    }
+  }
+
+  // THE ADDED STEP: a complete JSON value carrying harness prose before or
+  // after it. `extractJsonCandidate` does a string-aware balanced scan, so a
+  // leading preamble and a trailing note both fall away.
+  const embedded = extractJsonCandidate(raw);
+  if (embedded !== null) {
+    try {
+      return { value: JSON.parse(embedded) as unknown, via: 'embedded' };
+    } catch { /* keep looking */ }
+  }
+
+  // Last resort: a clipped array — recover the complete objects written so far.
+  if (shell?.stdout.includes('[')) {
+    const objects = extractCompleteJsonObjects(shell.stdout, 200);
+    if (objects.length > 0) {
+      return { value: objects, via: 'shell_objects', partialArrayPrefix: true };
+    }
+  }
+  return null;
+}

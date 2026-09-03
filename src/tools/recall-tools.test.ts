@@ -247,7 +247,14 @@ test('tool_output_query still bounces genuinely non-JSON output to recall_tool_r
     { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
     () => query({ call_id: 'call_txt' }),
   );
-  assert.match(res.content[0].text, /is not JSON — use recall_tool_result/);
+  // Genuinely non-JSON text still routes to recall_tool_result — but the
+  // message states what is TRUE (recovery found no JSON value) rather than
+  // asserting the output "is not JSON", which was a falsehood whenever the
+  // payload was JSON carrying harness prose (live 2026-09-03, platform-49
+  // run 6: the model obeyed that falsehood twice and the run died).
+  assert.match(res.content[0].text, /No JSON value could be recovered/);
+  assert.match(res.content[0].text, /use recall_tool_result to read it/);
+  assert.doesNotMatch(res.content[0].text, /is not JSON/);
 });
 
 test('tool_output_query bounds an unfiltered large-object response (no full-payload context dump)', async () => {
