@@ -6337,6 +6337,34 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             historyDelta,
           });
           if (attempt.status === 'ok') {
+            // VISIBILITY: a pre-dispatch refusal recorded NOTHING — no
+            // tool_called, no arguments, no reason — so a run that died here
+            // could not be diagnosed from the ledger at all. Live 2026-09-03:
+            // run 26 ended on host_disposition:refused_pre_dispatch after 14
+            // successful searches and left no trace of what was refused, and a
+            // scheduled workflow hit the same blind spot that morning. The
+            // detail already exists (it is handed to the last-word turn below);
+            // it was simply never written down. Journal it with the frame so
+            // the next failure is one query instead of an hour of inference.
+            const refusedStage = attempt.consequence?.stage;
+            if (typeof refusedStage === 'string' && refusedStage.startsWith('host_disposition:refused')) {
+              journalHostGuide('refused_pre_dispatch', {
+                stage: refusedStage,
+                recoveryToolNames: attempt.consequence?.recoveryToolNames ?? [],
+                refusalDetail: lastHostRefusalDetail(history),
+                calls: historyDelta.slice(0, 8).map((entry) => {
+                  const row = entry as unknown as Record<string, unknown>;
+                  const call = (row.call ?? row) as Record<string, unknown>;
+                  return {
+                    name: typeof call.name === 'string' ? call.name : null,
+                    callId: typeof call.callId === 'string' ? call.callId : null,
+                    argumentsJson: typeof call.argumentsJson === 'string'
+                      ? call.argumentsJson.slice(0, 1000)
+                      : null,
+                  };
+                }),
+              });
+            }
             // Advance exactly once, and only after every call in the delta has
             // a committed paired result. Arbitrary new call/result handles do
             // not appear in the authority projection.
