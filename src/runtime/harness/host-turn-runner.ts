@@ -512,29 +512,6 @@ function hostNoProgressBlockedText(state: NoProgressGovernorState | null): strin
     : HOST_NO_PROGRESS_BLOCKED_TEXT;
 }
 
-/**
- * The reply for a governor terminal that lands on a COMPLETED model answer.
- *
- * The governor may refuse to grant new user-input/approval authority from
- * prose — that gate is real. Deleting what the model wrote is a separate act,
- * and it is the defect the owner named: "The model should always own the
- * response, not the harness. Those are harness replies and that tells me the
- * model wasn't given a path to completion."
- *
- * Live 2026-09-03, platform-49 run 6: the model finished its reads, wrote a
- * 616-token answer, and the host replaced it with "I got stuck: I hit the same
- * wall twice in a row" and committed delivered:false. Her findings were never
- * shown and never stored. The turn is still blocked and still non-resumable —
- * only the words are hers. An empty/whitespace answer keeps the host copy,
- * because then there genuinely are no words to hand over.
- */
-function modelOwnedTerminalText(
-  modelText: string | undefined,
-  state: NoProgressGovernorState | null,
-): string {
-  const spoken = typeof modelText === 'string' ? modelText.trim() : '';
-  return spoken.length > 0 ? spoken : hostNoProgressBlockedText(state);
-}
 
 export const HOST_PROGRESS_PROJECTION_BLOCKED_TEXT =
   'I couldn\'t verify whether this task made progress, so I stopped before another model or tool step. Please retry this turn.';
@@ -6596,12 +6573,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (noProgressRecovery === 'ask_user') {
         // Exact user-input authority belongs to one canonical
         // ask_user_question call. Prose cannot substitute a broader question
-        // or publish before the call boundary validates options and purpose.
-        // But withholding AUTHORITY is not a reason to delete the model's
-        // WORDS: the turn stays blocked and non-resumable, and the reply is
-        // what she actually wrote.
+        // or publish before the call boundary validates options and purpose —
+        // publishing it would manufacture an ungated ask the user then answers.
+        // GUIDE, NOT GATE: say what is missing once, rather than replacing an
+        // answer she wrote with harness prose she never wrote.
+        history.push(...admission.frame.history);
+        if (step.responseId !== undefined) lastResponseId = step.responseId;
+        if (tryLastWordTurn('control_no_progress_exhausted', [
+          'this turn can only end through the exact ask_user_question call —'
+          + ' prose cannot carry the question, its options, or its purpose',
+        ])) {
+          continue;
+        }
         return blockedOutcome(
-          modelOwnedTerminalText(admission.frame.text, noProgressState),
+          hostNoProgressBlockedText(noProgressState),
           'control_no_progress_exhausted',
           false,
         );
@@ -6614,9 +6599,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ) {
           // A known terminal may be explained once, but it cannot convert
           // itself into new user work or resumable authority. Same rule as
-          // above: refuse the authority, keep the model's words.
+          // above: name the constraint once before the harness answers.
+          history.push(...admission.frame.history);
+          if (step.responseId !== undefined) lastResponseId = step.responseId;
+          if (tryLastWordTurn('control_no_progress_exhausted', [
+            'this task already has a known outcome, so a new question or'
+            + ' approval request cannot come out of it — say what you found in'
+            + ' plain words instead',
+          ])) {
+            continue;
+          }
           return blockedOutcome(
-            modelOwnedTerminalText(admission.frame.text, noProgressState),
+            hostNoProgressBlockedText(noProgressState),
             'control_no_progress_exhausted',
             false,
           );

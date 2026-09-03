@@ -8572,16 +8572,17 @@ test('a permanently unadmittable frame spends one shared budget and stops with a
 });
 
 // Live 2026-09-03, platform-49 run 6 (Sonnet 5): the model finished its reads,
-// wrote a 616-token answer, and the host committed delivered:false with
-// "I got stuck: I hit the same wall twice in a row" — its own prose. Her
-// findings were never shown and never stored. Refusing to grant user-input
-// AUTHORITY from prose is a real gate; deleting her WORDS is a separate act,
-// and it is the one the owner named: the model owns the response.
-test('a governor terminal on a completed answer keeps the model\'s words, not harness prose', async () => {
+// answered in prose, and the host committed delivered:false with its own copy
+// ("I got stuck: I hit the same wall twice in a row") — she was never told what
+// the recovery contract actually required. Publishing her prose instead is NOT
+// the fix: in this state the prose IS an ask, and publishing it manufactures an
+// ungated question the user answers, restarting the loop (pinned by
+// host-no-progress-governor.integration.test.ts). She gets told once instead.
+test('ask_user recovery guides a prose answer instead of silently answering for it', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   try {
-    const fixture = acceptHostCanarySource('governor-terminal-keeps-model-words');
+    const fixture = acceptHostCanarySource('governor-terminal-offers-last-word');
     const accountChoices = ['work@corp.example', 'personal@example.net'];
     const planTool = brackets.wrapToolForHarness({
       type: 'function',
@@ -8600,23 +8601,26 @@ test('a governor terminal on a completed answer keeps the model\'s words, not ha
     });
     const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
 
-    // The findings the model actually wrote. It answers in PROSE instead of the
-    // canonical ask_user_question call, so the recovery contract refuses to
-    // grant awaiting-user-input authority — the frame lands as `completed`.
-    const SPOKEN = 'I compared the Log tab against the channel. Rows 12 and 19 are true '
-      + 'duplicates, row 27 matches nothing in Slack, and two threads from the covered '
-      + 'window never made it in. Rows 30–32 I left alone as you said. Want me to fix these?';
+    const directives: string[] = [];
     let modelCalls = 0;
     const model = {
       calls: () => modelCalls,
-      async getResponse() {
+      async getResponse(request: { input?: unknown; instructions?: unknown }) {
         modelCalls += 1;
+        directives.push(JSON.stringify(request.input ?? '') + String(request.instructions ?? ''));
+        if (modelCalls === 1) {
+          return {
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+            output: [toolCall('account-plan', 'plan_task', fusedPlanArgs('external_write'))],
+            responseId: `offers-last-word-${modelCalls}`,
+          };
+        }
+        // Prose in a state that requires the canonical call — twice, so the
+        // budget of exactly one last-word turn is spent and then terminal.
         return {
           usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
-          output: modelCalls === 1
-            ? [toolCall('account-plan', 'plan_task', fusedPlanArgs('external_write'))]
-            : [textMsg(SPOKEN)],
-          responseId: `keeps-model-words-${modelCalls}`,
+          output: [textMsg('Tell me whatever account details you have and ask me to continue.')],
+          responseId: `offers-last-word-${modelCalls}`,
         };
       },
       getStreamedResponse: testModelStream,
@@ -8627,8 +8631,18 @@ test('a governor terminal on a completed answer keeps the model\'s words, not ha
 
     const outcome = await runProductionHostSteps(fixture, agent, 6);
 
-    // The gate still holds: blocked, non-resumable, no new user-input authority.
-    assert.equal(outcome.terminal?.status, 'blocked');
+    // She is TOLD what the state requires, exactly once, before any terminal.
+    const lastWord = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+      .filter((event) => event.data.kind === 'last_word_turn');
+    assert.equal(lastWord.length, 1, 'exactly one last-word turn is offered');
+    assert.equal(lastWord[0]?.data.reason, 'control_no_progress_exhausted');
+    assert.ok(
+      directives.some((seen) => seen.includes('ask_user_question call')),
+      'the directive must name the exact call the state requires',
+    );
+
+    // The invariant still holds: ask-shaped prose is never published, and no
+    // user-input authority is minted from it.
     assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
     assert.equal(outcome.terminal?.resumable, false);
     assert.equal(
@@ -8636,13 +8650,11 @@ test('a governor terminal on a completed answer keeps the model\'s words, not ha
       0,
       'prose must not mint user-input authority',
     );
-
-    // ...and the reply is HERS.
-    const finalText = String(outcome.finalOutput);
-    assert.ok(finalText.includes('Rows 12 and 19 are true duplicates'),
-      `the model's findings must survive the terminal, got: ${finalText.slice(0, 240)}`);
-    assert.doesNotMatch(finalText, /I hit the same wall twice in a row/,
-      'harness prose must not replace an answer the model actually wrote');
+    assert.notEqual(
+      String(outcome.finalOutput),
+      'Tell me whatever account details you have and ask me to continue.',
+      'an ungated ask must never become the published reply',
+    );
   } finally {
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;

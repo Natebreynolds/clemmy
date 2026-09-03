@@ -846,7 +846,13 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
         context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
       } as never,
     ));
-    assert.equal(modelCalls, 1);
+    // A malformed ask CALL is refused on the spot — one model step, unchanged.
+    // A completed PROSE answer is different: it cannot carry the question,
+    // options and purpose, so instead of answering for the model with harness
+    // copy the host names the exact call this state requires and gives it one
+    // last-word turn (2026-09-03). That turn is a real model step, so this one
+    // case makes 2. Every invariant below is unchanged.
+    assert.equal(modelCalls, fixtureCase.label === 'completed-prose' ? 2 : 1);
     const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
     if (fixtureCase.exact) {
       assert.equal(outcome.terminal, undefined, JSON.stringify({
@@ -966,7 +972,9 @@ test('stop-factual recovery cannot manufacture an ask or resumable terminal', as
         context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
       } as never,
     ));
-    assert.equal(modelCalls, 1);
+    // One guiding last-word turn before the harness answers (2026-09-03); the
+    // model repeats the same ask-shaped reply, so the typed terminal stands.
+    assert.equal(modelCalls, 2);
     assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
     assert.equal(outcome.terminal?.resumable, false);
     assert.equal(outcome.finalOutput, HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT);
