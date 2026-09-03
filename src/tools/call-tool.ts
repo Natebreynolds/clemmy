@@ -824,7 +824,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       ) {
         return refuse({
           error: 'not_reachable',
-          detail: `"${requestedTarget}" is not a registry-declared control or read on this turn. Invoke business/provider WRITES through work_call.`,
+          // "WRITES through work_call" reads as writes-ONLY, so a model holding
+          // a disclosed READ rules the carrier out and has nowhere left to go.
+          // Live 2026-09-03: a correct reviewed-CLI SOQL read was attempted
+          // through run_shell_command, refused with this text, and the turn
+          // ended asking the user how to proceed — while the exact operation
+          // tool_search had disclosed was reachable through work_call the whole
+          // time, which is how the same read succeeded on an earlier run.
+          detail: `"${requestedTarget}" is not a registry-declared control or read on this turn.`
+            + ` If tool_search disclosed an exact operation for this step, invoke it through work_call — READS included, not writes only:`
+            + ` work_call {"name":"<the exact operation tool_search returned>","args_json":"<its arguments as ONE JSON string>"}.`,
         });
       }
 
