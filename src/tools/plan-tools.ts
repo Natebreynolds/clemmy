@@ -1306,6 +1306,12 @@ async function executePlanTask(
   const writeDeferredForValidation =
     (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
     && !draftHasWriteOperation;
+  // A write blocked purely on WHICH connected account to use is not a
+  // discovery problem: no amount of tool_search resolves it, because the
+  // ambiguity is a question for the user at the write boundary.
+  // `accountSelection` is non-null exactly when a CITED write is waiting on a
+  // connected-account choice — computed above, reused here.
+  const accountBlockedWriteInDraft = accountSelection !== null;
   if (
     (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
     && draftHasWriteOperation
@@ -1325,8 +1331,18 @@ async function executePlanTask(
       code: 'plan_incomplete_missing_write',
       detail: 'This draft binds a write operation to a capability the host has not attested. Bind the exact disclosed write, or drop the write to gather and validate first.',
       requestedEffectScope,
-      repair: 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation.',
-      recoveryTool: 'tool_search',
+      // The detail names TWO doors; the repair used to name only the first,
+      // and when the write is unbindable that is the impossible one. Live
+      // 2026-09-03 run 24: the cited mail-draft write could not be bound because
+      // two connected mailboxes make it account_selection_required, so "search
+      // for the write" could never succeed — while the gathering-stage door the
+      // comment above describes was open the whole time. Name the achievable
+      // door first when the blocked write is waiting on an account choice
+      // rather than on discovery.
+      repair: accountBlockedWriteInDraft
+        ? 'The write you bound is waiting on an account choice, so it cannot be bound yet. Plan the READ operations only and call plan_task again — an all-read draft is a legitimate gathering stage. Do the gathering, then plan the write as a separate accepted action once the account is settled.'
+        : 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation.',
+      recoveryTool: accountBlockedWriteInDraft ? 'plan_task' : 'tool_search',
     });
   }
   const lineage = collectConstructLineageCompleteness(input.draft);
