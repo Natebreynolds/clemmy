@@ -74,6 +74,7 @@ import { actionControlAdmittedForTaskState, actionControlContextFor, actionTopol
 import { buildCallTool, type BuildCallToolOptions, type BuiltinCapabilityAdmissionResult } from '../tools/call-tool.js';
 import { buildWorkCall, type BuildWorkCallOptions } from '../tools/work-call.js';
 import { buildPlanTaskTool } from '../tools/plan-tools.js';
+import { isHostOnlyActionControl } from '../tools/tool-registry.js';
 import { uniqueWorkflowRunRequest } from '../tools/named-workflow-match.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
@@ -3420,7 +3421,20 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // first-class-wrap fallback that avoids the not_reachable loop.
       const dispatcherOptions: BuildCallToolOptions = {
         reachableBuiltinNames: carrierWork ? workCallBuiltinNames : discoverableNames,
-        firstClassNames: carrierWork ? new Set<string>() : firstClassNames,
+        // Emptying this wholesale removed the "first-class-wrap fallback"
+        // the comment above promises. A host-local control that IS on this
+        // turn's surface stays visible so a wrapped call to it dispatches
+        // instead of looping on not_reachable: live 2026-09-03 runs 23 and 25
+        // both wrapped the planning control, were told "call it directly", and
+        // hit the refusal ceiling with a correct plan.
+        //
+        // Filtered from `firstClassNames` — the ACTUAL surface — so a dormant
+        // control that was deliberately subtracted stays excluded and keeps its
+        // own authority checks. Business tools are untouched and still belong
+        // to work_call.
+        firstClassNames: carrierWork
+          ? new Set([...firstClassNames].filter((name) => isHostOnlyActionControl(name)))
+          : firstClassNames,
         deniedNames: excludes,
         mcpToolScope,
         // The dispatcher is built before the agent exists; the gate cell is

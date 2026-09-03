@@ -644,6 +644,21 @@ export function actionControlAdmittedForTaskState(
  * the control role. `actionTopologyRoleFor` deliberately maps unknown/foreign
  * names to business; callers building a control-only carrier additionally need
  * positive registry membership so a future unknown can never enter that lane. */
+/**
+ * A control whose entire execution is host-local (runtimeEffect: 'host_only').
+ *
+ * Distinct from isRegisteredActionControl, which also covers provider carriers
+ * — those must stay on work_call so the control dispatcher never becomes a
+ * second unbound business carrier.
+ */
+export function isHostOnlyActionControl(toolName: string): boolean {
+  return TOOL_REGISTRY.some((declaration) => (
+    declaration.name === toolName
+    && declaration.actionTopologyRole === 'control'
+    && declaration.runtimeEffect === 'host_only'
+  ));
+}
+
 export function isRegisteredActionControl(toolName: string): boolean {
   return TOOL_REGISTRY.some((declaration) => (
     declaration.name === toolName
