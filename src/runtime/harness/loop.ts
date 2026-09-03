@@ -9197,6 +9197,13 @@ async function withActiveTurnHeartbeat<T>(
   work: () => Promise<T>,
 ): Promise<T> {
   const timer = setInterval(() => {
+    // "Still working" every few minutes says nothing: it fires on its own timer
+    // and reads no progress, so a person cannot tell thinking from wedged. When
+    // the transport can see the brain's own reasoning, say what it is working
+    // on instead. Claude's thinking deltas never reach the SDK as events, so
+    // claude-model.ts reads them off the wire into the run context.
+    const thinking = harnessRunContextStorage.getStore()?.latestModelThinking;
+    const working = typeof thinking === 'string' ? thinking.replace(/\s+/gu, ' ').trim() : '';
     safeAppend({
       sessionId: opts.sessionId,
       turn: opts.turn,
@@ -9207,7 +9214,10 @@ async function withActiveTurnHeartbeat<T>(
         stage: opts.stage,
         preset: opts.budget.preset,
         unlimited: opts.budget.unlimited,
-        message: `Still working inside turn ${opts.turn}.`,
+        ...(working ? { thinking: working.slice(-280) } : {}),
+        message: working
+          ? `Still working inside turn ${opts.turn} — ${working.slice(-160)}`
+          : `Still working inside turn ${opts.turn}.`,
       },
     });
   }, opts.checkInMs);

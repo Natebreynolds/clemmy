@@ -13,6 +13,7 @@ import {
   ClaudeTransportRoutingModel,
   rawClaudeUsageFields,
   withRawClaudeUsageRecording,
+  extractClaudeThinkingText,
 } from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
@@ -343,4 +344,42 @@ test('envelope: an assistant-terminal conversation gains one neutral user contin
     messages: [{ role: 'user', content: 'do the work' }],
   }) }, 'sk-ant-oat01-x').body as string);
   assert.equal(untouched.messages.length, 1, 'a user-terminal conversation is left alone');
+});
+
+// Anthropic streams extended thinking as `thinking_delta` SSE events, but the
+// aisdk adapter accumulates them into a local block and emits NO stream event
+// (@openai/agents-extensions, `case 'reasoning-delta'`). The harness therefore
+// could not tell a brain thinking hard from a dead one, and the fallover
+// layer's first-content timeout — which it skips entirely once activity is
+// seen — benched Sonnet 5 at 154,898 ms mid-reconciliation with no provider
+// error (live 2026-09-03, platform-49 run 7). We own the fetch, so the liveness
+// signal is read off the wire.
+test('thinking deltas are recoverable from the raw Anthropic SSE', () => {
+  const sse = [
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,'
+      + '"delta":{"type":"thinking_delta","thinking":"Comparing row 6 against "}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,'
+      + '"delta":{"type":"thinking_delta","thinking":"the 08/27 thread."}}',
+    '',
+  ].join('\n');
+  assert.equal(extractClaudeThinkingText(sse), 'Comparing row 6 against the 08/27 thread.');
+});
+
+test('thinking extraction survives escapes and ignores non-thinking deltas', () => {
+  const escaped = 'data: {"delta":{"type":"thinking_delta",'
+    + '"thinking":"row 9 says \\"last 24 months\\"\\nnext: dates"}}';
+  assert.equal(extractClaudeThinkingText(escaped), 'row 9 says "last 24 months"\nnext: dates');
+
+  // Ordinary output text is NOT thinking and must not be captured.
+  const textDelta = 'data: {"delta":{"type":"text_delta","text":"Here is what I found"}}';
+  assert.equal(extractClaudeThinkingText(textDelta), '');
+
+  // A chunk cut mid-escape yields nothing rather than throwing; the next chunk
+  // carries it.
+  assert.doesNotThrow(() => extractClaudeThinkingText(
+    'data: {"delta":{"type":"thinking_delta","thinking":"trailing \\',
+  ));
 });

@@ -1241,6 +1241,11 @@ export interface HarnessRunContext {
    * Reasoning is buffered until text/tool output makes the attempt replay-unsafe,
    * but the outer stream watchdog still needs to know the model is alive. */
   privateModelActivityAt?: number;
+  /** The most recent slice of the brain's own reasoning, when the transport can
+   *  see it (Claude's thinking deltas are read off the wire — the SDK adapter
+   *  emits no event for them). Bounded to a short tail: it exists to prove the
+   *  brain is working and to let the turn say so, never as a durable record. */
+  latestModelThinking?: string;
   /** A compatibility adapter is currently paying for one provider request while
    * buffering its non-streaming completion into an SDK-compatible synthetic
    * stream. No Runner event can exist during that interval, so the outer

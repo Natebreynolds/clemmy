@@ -967,6 +967,7 @@ export class FallbackModel implements Model {
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
+      const attemptStartedAt = Date.now();
       let sawModelActivity = false;
       let committedActionable = false;
       const pending: StreamEvent[] = [];
@@ -1062,7 +1063,10 @@ export class FallbackModel implements Model {
         if (!committedActionable && !callerAborted && (harnessDeadline || this.isFalloverReason(err)) && !isLast) {
           falloverReason = this.falloverReason(err);
           this.noteFalloverInFlight();
-          this.logFallover(chain, i, err);
+          this.logFallover(chain, i, err, {
+            sawModelActivity,
+            elapsedMs: Date.now() - attemptStartedAt,
+          });
           continue;
         }
         if (callerAborted && !committedActionable && !isLast && this.isFalloverReason(err)) {
@@ -1179,7 +1183,19 @@ export class FallbackModel implements Model {
     } catch { /* telemetry only — the rescue brain still owns the turn */ }
   }
 
-  private logFallover(chain: FallbackTarget[], i: number, err: unknown): void {
+  /** `diagnostics` answers the only question this line is ever read to answer:
+   *  was the brain we just benched actually SILENT, or was it alive and
+   *  thinking? A first-content timeout looks identical either way in the log,
+   *  and the distinction decides whether the budget is wrong or the brain is.
+   *  Live 2026-09-03: Sonnet 5 was benched at 154,898 ms mid-reconciliation
+   *  with no provider error, and the answer could not be recovered afterwards
+   *  because nothing recorded it. */
+  private logFallover(
+    chain: FallbackTarget[],
+    i: number,
+    err: unknown,
+    diagnostics: { sawModelActivity?: boolean; elapsedMs?: number } = {},
+  ): void {
     const reason = this.falloverReason(err);
     this.recordFalloverRouteInSessionLedger(chain[i], chain[i + 1], reason, false);
     logger.warn(
@@ -1187,6 +1203,12 @@ export class FallbackModel implements Model {
         from: chain[i].label,
         to: chain[i + 1].label,
         reason,
+        ...(diagnostics.sawModelActivity === undefined
+          ? {}
+          : { sawModelActivity: diagnostics.sawModelActivity }),
+        ...(Number.isFinite(diagnostics.elapsedMs)
+          ? { elapsedMs: Math.round(diagnostics.elapsedMs!) }
+          : {}),
       },
       'brain unavailable — falling over to the next brain',
     );
@@ -1284,10 +1306,27 @@ export class FallbackModel implements Model {
       return await Promise.race([
         call,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
+          // Private reasoning IS liveness. Some transports cannot express it as
+          // a stream event — Anthropic's thinking deltas are swallowed by the
+          // SDK adapter and are read off the wire instead (claude-model.ts) —
+          // so this window re-arms whenever the run context shows the brain
+          // worked since the window opened, exactly as the host stall watchdog
+          // does. It stays bounded: only CONTINUING activity extends it, and the
+          // attempt-absolute pre-actionable deadline and the response wall are
+          // unmoved. Live 2026-09-03: Sonnet 5 was benched at 154,898 ms
+          // mid-reconciliation while it was demonstrably thinking.
+          let windowOpenedAt = Date.now();
+          const fire = (): void => {
+            const workedAt = harnessRunContextStorage.getStore()?.privateModelActivityAt ?? 0;
+            if (workedAt > windowOpenedAt) {
+              windowOpenedAt = Date.now();
+              timer = setTimeout(fire, ms);
+              return;
+            }
             reject(new FirstByteTimeoutError(ms));
             abort();
-          }, remainingMs);
+          };
+          timer = setTimeout(fire, remainingMs);
         }),
       ]);
     } finally {

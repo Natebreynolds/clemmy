@@ -1332,3 +1332,66 @@ test('response wall: after actionable output the wall is a typed failure, never 
   );
   assert.equal(rescueCalls, 0, 'actionable output already escaped: no duplicate brain');
 });
+
+// A brain whose transport CANNOT express reasoning as a stream event is not
+// silent. Anthropic's thinking deltas are swallowed by the aisdk adapter, so
+// claude-model.ts reads them off the wire and stamps privateModelActivityAt.
+// Before this, the first-content window fired on a brain that was demonstrably
+// working: live 2026-09-03, Sonnet 5 was benched at 154,898 ms in the middle of
+// the reconciliation step with no provider error logged at all.
+test('first-byte window re-arms while the brain is provably reasoning off-stream', async () => {
+  const { withHarnessRunContext } = await import('./brackets.js');
+  let rescueCalls = 0;
+  const context: Record<string, unknown> = { sessionId: 'reasoning-liveness' };
+
+  // Emits nothing for well past the first-byte window, but stamps private
+  // activity throughout — exactly what the Claude wire tap does.
+  const thinking = model({ getStreamedResponse: async function* () {
+    for (let tick = 0; tick < 6; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      context.privateModelActivityAt = Date.now();
+    }
+    yield { type: 'output_text_delta', delta: 'answer after thinking' } as never;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'rescued' } as never;
+  } });
+
+  const out = await withHarnessRunContext(context as never, () => collect(
+    withModelFallback(
+      [target('thinking', thinking), target('rescue', rescue)],
+      { firstByteTimeoutMs: 40 },
+    ).getStreamedResponse(req()),
+  ));
+
+  assert.equal(rescueCalls, 0, 'a brain proving it is working must not be benched');
+  assert.ok((out as Array<{ delta?: string }>).some((e) => e.delta === 'answer after thinking'));
+});
+
+test('first-byte window still fires when nothing proves the brain is working', async () => {
+  const { withHarnessRunContext } = await import('./brackets.js');
+  let rescueCalls = 0;
+  // Same shape, but never stamps activity — the bound must still hold.
+  const silent = model({ getStreamedResponse: async function* (request: any) {
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, 5_000);
+      request?.signal?.addEventListener?.('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
+    });
+    yield { type: 'response_done', response: { output: [] } } as never;
+  } });
+  const rescue = model({ getStreamedResponse: async function* () {
+    rescueCalls += 1;
+    yield { type: 'output_text_delta', delta: 'rescued' } as never;
+  } });
+
+  const out = await withHarnessRunContext({ sessionId: 'no-liveness' } as never, () => collect(
+    withModelFallback(
+      [target('silent', silent), target('rescue', rescue)],
+      { firstByteTimeoutMs: 40 },
+    ).getStreamedResponse(req()),
+  ));
+
+  assert.equal(rescueCalls, 1, 'genuine silence must still fall over');
+  assert.ok((out as Array<{ delta?: string }>).some((e) => e.delta === 'rescued'));
+});

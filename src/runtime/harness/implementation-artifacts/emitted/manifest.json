@@ -2223,7 +2223,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 340503
+          "bytes": 342054
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4719,7 +4719,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 340503
+          "bytes": 342054
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505

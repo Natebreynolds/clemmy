@@ -448,6 +448,76 @@ export async function logClaudeResponseUsage(stream: ReadableStream<Uint8Array>)
 
 /** Custom fetch enforcing the OAuth billing guarantee + identity envelope, plus
  *  (parity-on) a bounded undici dispatcher so a stalled edge can't hang a turn. */
+/** Anthropic streams extended thinking as `thinking_delta` SSE events, but the
+ * aisdk adapter accumulates those deltas into a local block and emits NO stream
+ * event for them (@openai/agents-extensions ai-sdk, `case 'reasoning-delta'`).
+ * The harness therefore cannot tell a brain that is thinking hard from one that
+ * is dead: `sawModelActivity` never flips, so the fallover layer's first-content
+ * timeout — which is otherwise skipped entirely once activity is seen — fires on
+ * a perfectly healthy brain.
+ *
+ * Live 2026-09-03, platform-49 run 7: Sonnet 5 was benched at 154,898 ms in the
+ * middle of the reconciliation step with no provider error logged at all, and
+ * the turn fell through Codex (rate-limited) to GLM.
+ *
+ * We own the fetch, so read the liveness signal straight off the wire. This is
+ * the same shape as `activeBufferedProviderRequestInFlight()`, which already
+ * exempts a known-in-flight buffered request from the same timeout (the
+ * GLM/MiniMax fix of 2026-08-29): a provider we can SEE working is not silence.
+ */
+const CLAUDE_THINKING_SNIPPET_MAX = 400;
+
+async function watchClaudeThinkingForLiveness(
+  stream: ReadableStream<Uint8Array>,
+  context: { privateModelActivityAt?: number; latestModelThinking?: string } | undefined,
+): Promise<void> {
+  if (!context) {
+    void stream.cancel().catch(() => {});
+    return;
+  }
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  // Only the tail is retained: a carry big enough to span a delta split across
+  // chunks, never the whole reasoning trace.
+  let carry = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const text = carry + decoder.decode(value, { stream: true });
+      if (text.includes('thinking_delta')) {
+        context.privateModelActivityAt = Date.now();
+        const snippet = extractClaudeThinkingText(text);
+        if (snippet) {
+          context.latestModelThinking = snippet.slice(-CLAUDE_THINKING_SNIPPET_MAX);
+        }
+      }
+      carry = text.slice(-2_000);
+    }
+  } catch {
+    // Liveness is best-effort: a torn tee must never disturb the real stream.
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+}
+
+/** Pull the human-readable thinking out of one or more `thinking_delta` SSE
+ *  payloads. Deliberately tolerant: a partial chunk yields nothing. */
+export function extractClaudeThinkingText(chunk: string): string {
+  const parts: string[] = [];
+  const re = /"type"\s*:\s*"thinking_delta"\s*,\s*"thinking"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(chunk)) !== null) {
+    try {
+      parts.push(JSON.parse(`"${match[1]}"`) as string);
+    } catch {
+      // A delta split mid-escape: skip it, the next chunk carries it.
+    }
+  }
+  return parts.join('');
+}
+
 export function makeClaudeFetch(): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     assertLiveModelTransportAllowed('Claude Messages API');
@@ -481,6 +551,22 @@ export function makeClaudeFetch(): typeof fetch {
         return new Response(forSdk, { status: res.status, statusText: res.statusText, headers: res.headers });
       } catch {
         return res; // tee failed before locking → return the original untouched
+      }
+    }
+    // Liveness tap: extended thinking never reaches the harness as a stream
+    // event, so read it off the wire (see watchClaudeThinkingForLiveness). The
+    // run context is captured HERE, inside the caller's async scope — the
+    // watcher runs detached and would otherwise see no store.
+    if (res.ok && res.body) {
+      const liveness = harnessRunContextStorage.getStore();
+      if (liveness) {
+        try {
+          const [forSdk, forWatch] = res.body.tee();
+          void watchClaudeThinkingForLiveness(forWatch, liveness);
+          return new Response(forSdk, { status: res.status, statusText: res.statusText, headers: res.headers });
+        } catch {
+          return res; // tee failed before locking → return the original untouched
+        }
       }
     }
     return res;
