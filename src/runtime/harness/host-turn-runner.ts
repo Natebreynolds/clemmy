@@ -506,6 +506,26 @@ export const HOST_NO_PROGRESS_BLOCKED_TEXT =
 export const HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT =
   'I could not finish this step: the same call kept ending the same way, so I stopped rather than repeat it. Nothing was sent or changed, and what I already gathered is kept. Point me at what to change and I will pick it back up.';
 
+/** Best-effort `file:line` of the caller that authored a terminal.
+ *
+ * Several blocked reasons are emitted from multiple branches (7 sites share
+ * control_no_progress_exhausted), so the reason alone cannot say WHICH gate
+ * fired — localizing one on 2026-09-03 took a durable-ledger dig instead of a
+ * grep. Read from the stack rather than hand-labelled at each site, so it
+ * cannot drift as the file moves. Diagnostics only: never parsed, never
+ * user-visible, and any failure here is swallowed.
+ */
+function terminalCallerSite(depth = 3): string | undefined {
+  try {
+    const frames = (new Error().stack ?? '').split('\n');
+    const frame = frames[depth] ?? '';
+    const match = /([\w.-]+\.(?:ts|js)):(\d+):\d+/.exec(frame);
+    return match ? `${match[1]}:${match[2]}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function hostNoProgressBlockedText(state: NoProgressGovernorState | null): string {
   return state?.lastConsequence?.effectState === 'known_terminal'
     ? HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT
@@ -2440,7 +2460,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         : undefined;
     // Never silent by construction: every blocked terminal names its reason
     // in the process log (live 2026-09-02: a stalled turn ended with no line).
-    hostTurnLogger.warn({ reason, resumable, ...(blockedDetail ? { blockedDetail } : {}) }, 'host blocked terminal');
+    const site = terminalCallerSite();
+    hostTurnLogger.warn({
+      reason,
+      resumable,
+      ...(site ? { site } : {}),
+      ...(blockedDetail ? { blockedDetail } : {}),
+    }, 'host blocked terminal');
     const outcome: HostRunOutcome = {
       history,
       lastResponseId,
@@ -6787,6 +6813,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
+      // NOT guided (attempted 2026-09-03, reverted): offering a last-word turn
+      // here means `continue`, and the next iteration re-derives the model
+      // surface from the FULL catalog — the narrow recovery surface is exactly
+      // what stops a third discovery crossing, and the extra step widened it
+      // (host-no-progress-governor.integration.test.ts "repeated discovery gets
+      // one control-only recovery and no third discovery crossing" caught it).
+      // Guiding this site needs the recovery surface to persist across the
+      // extra step first; the invariant outranks the guidance.
       return blockedOutcome(
         hostNoProgressBlockedText(noProgressState),
         'control_no_progress_exhausted',
