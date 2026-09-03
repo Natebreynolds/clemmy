@@ -75,6 +75,12 @@ import {
   revokeDispatchLeaseBeforeRecovery,
   type DispatchLeaseRef,
 } from './dispatch-lease.js';
+import {
+  EXACT_CHECKPOINT_REENTRY_BUDGET,
+  exactCheckpointFrameCallIds,
+  exactCheckpointReentryKey,
+  noteExactCheckpointReentry,
+} from './exact-checkpoint-reentry.js';
 import pino from 'pino';
 import { appendEvent, getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -508,6 +514,9 @@ function hostNoProgressBlockedText(state: NoProgressGovernorState | null): strin
 
 export const HOST_PROGRESS_PROJECTION_BLOCKED_TEXT =
   'I couldn\'t verify whether this task made progress, so I stopped before another model or tool step. Please retry this turn.';
+
+export const HOST_CHECKPOINT_ADMISSION_EXHAUSTED_BLOCKED_TEXT =
+  'I kept coming back to the same saved checkpoint and it would not reopen, so I stopped instead of retrying it forever. Nothing was sent or changed, and the work I already did is kept. Ask me again and I will start this step fresh.';
 
 export const HOST_DUPLICATE_MODEL_CALL_BLOCKED_TEXT =
   'The model repeated an already-committed tool call identifier. I kept the first durable result and stopped before preparing or executing the duplicate. Retry this request from the saved checkpoint; no second effect was started.';
@@ -2569,6 +2578,36 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     return 'continue';
   };
 
+  /**
+   * Spend one unit of the exact-checkpoint retry budget for this frame, and
+   * say whether it is now exhausted.
+   *
+   * Every entry point that can re-enter a held checkpoint converges here: the
+   * 15 s scanner, this runner's own immediate re-entry in loop.ts, and the
+   * legacy approval-resume admission. Counting a caller's DISPATCH instead of
+   * the failed attempt bounded only the scanner and left the other two looping
+   * (live 09-01/09-02: 1,054, 1,006 and 454 re-entries under a budget of 5).
+   * The key is the scanner's key exactly — same session, source, phase and
+   * frame call ids — so both owners spend one shared count.
+   */
+  const spendCheckpointRetryBudget = (
+    frameHistory: readonly AgentInputItem[],
+    phase: 'admit' | 'finalize',
+  ): { count: number; exhausted: boolean } => {
+    try {
+      const identity = exactHostIdentity();
+      return noteExactCheckpointReentry(exactCheckpointReentryKey(identity.sessionId, {
+        sourceUserSeq: identity.sourceUserSeq,
+        phase,
+        frameCallIds: exactCheckpointFrameCallIds(frameHistory),
+      }));
+    } catch {
+      // No exact identity means no durable checkpoint to loop on. Never let
+      // the bookkeeping itself decide a terminal.
+      return { count: 0, exhausted: false };
+    }
+  };
+
   const recoveryOutcome = (input: {
     phase: Exclude<HostRecoveryPhase, 'continue'>;
     baseHistory: AgentInputItem[];
@@ -2578,10 +2617,38 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     acceptedModelBatchRef?: AcceptedModelBatchRef;
     stepIndexOverride?: number;
     reason: string;
+    /** Set false ONLY for a hold that is pending BY DESIGN and advances on its
+     * own durable cursor (a paging async read re-enters the same key while
+     * genuinely progressing). Every other hold is a failed retry and is
+     * bounded: defaulting to bounded means a new failure reason added later
+     * cannot silently reintroduce an unbounded loop. */
+    boundedRetry?: boolean;
   }): RunOutcome => {
     const identity = exactHostIdentity();
     if (input.phase === 'finalize' && !input.acceptedModelBatchRef) {
       throw new HostCallAuthorityBoundaryError('checkpoint_recovery_batch_ref_missing');
+    }
+    // A hold invites the next caller back for this exact frame. When the
+    // underlying state can never advance the invitation never converges, so
+    // past the shared budget this becomes a typed terminal instead: a blocked
+    // outcome carries no serializedRecoveryState, and loop.ts re-enters only
+    // `outcome.hold && outcome.serializedRecoveryState`.
+    if (input.boundedRetry !== false) {
+      const spend = spendCheckpointRetryBudget(input.frameHistory, input.phase);
+      if (spend.exhausted) {
+        hostTurnLogger.error({
+          reason: input.reason,
+          phase: input.phase,
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          attempt: spend.count,
+          budget: EXACT_CHECKPOINT_REENTRY_BUDGET,
+        }, 'exact checkpoint retry budget spent; stopping with a typed terminal');
+        return blockedOutcome(
+          HOST_CHECKPOINT_ADMISSION_EXHAUSTED_BLOCKED_TEXT,
+          'exact_checkpoint_admission_exhausted',
+        );
+      }
     }
     const state = new HostRecoveryState(
       identity.sessionId,
@@ -5555,11 +5622,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let admitted = admitAcceptedModelBatch(request);
       if (admitted.status === 'unavailable') admitted = admitAcceptedModelBatch(request);
       if (admitted.status !== 'admitted' && admitted.status !== 'existing') {
+        const spend = spendCheckpointRetryBudget(request.frameHistory, 'admit');
         hostTurnLogger.error({
           status: admitted.status,
           reason: 'reason' in admitted ? admitted.reason : 'accepted model batch has no reference',
+          attempt: spend.count,
+          budget: EXACT_CHECKPOINT_REENTRY_BUDGET,
         },
           'legacy paused frame could not be pre-admitted before approval resume');
+        // Same shared budget as the common path above: this entry point reaches
+        // the identical failure without passing through preAdmitAcceptedToolFrame.
+        if (spend.exhausted) {
+          return blockedOutcome(
+            HOST_CHECKPOINT_ADMISSION_EXHAUSTED_BLOCKED_TEXT,
+            'exact_checkpoint_admission_exhausted',
+          );
+        }
         return approvalRecoveryOutcome('host_model_batch_admission_unavailable');
       }
       resumedAcceptedFrame = { ref: admitted.admission };
@@ -7406,6 +7484,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         frameHistory: admission.frame.history,
         responseId: step.responseId,
         reason: 'durable_async_read_continuation_pending',
+        // A paging read re-enters the same key on purpose and advances on its
+        // own durable claim cursor. It is progress, not a stuck retry.
+        boundedRetry: false,
       });
     }
     const resultCommitBlock = commitAdmittedToolFrame({

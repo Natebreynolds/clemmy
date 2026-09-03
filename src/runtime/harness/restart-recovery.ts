@@ -45,6 +45,13 @@ import {
   type TurnOutcome,
 } from './turn-outcome.js';
 import pino from 'pino';
+import {
+  EXACT_CHECKPOINT_REENTRY_BUDGET,
+  claimExactCheckpointReentryNotice,
+  exactCheckpointFrameCallIds,
+  exactCheckpointReentryExhausted,
+  exactCheckpointReentryKey,
+} from './exact-checkpoint-reentry.js';
 import { addNotification } from '../notifications.js';
 import {
   readActiveWorkflowOriginGroup,
@@ -73,45 +80,20 @@ const AUTO_RESUME_MAX_PER_BOOT = 3;
 const EXACT_CHECKPOINT_RESUME_MAX_PER_PASS = 3;
 const AUTO_RESUME_MAX_AGE_MS = 2 * 60 * 60_000;
 
-/**
- * Exact-checkpoint re-entry budget. The 15 s daemon tick re-dispatches every
- * exact checkpoint it can list; a checkpoint whose host activation always ends
- * in the same `recovery_pending` hold was an unbounded loop with no next edge
- * (live 2026-09-01: 1,006 re-entries in 90 minutes on
- * `host_model_batch_admission_unavailable`, until the daemon was restarted).
- * The budget is a counter per (session, source, phase, frame) in this process:
- * a new checkpoint (progress) starts a new count, a restart starts over, and
- * exhaustion is a typed skip with ONE notice naming the edge — the durable
- * HostRecoveryState and marker stay untouched, so a restart or the user's own
- * "continue" retries it.
- */
-export const EXACT_CHECKPOINT_REENTRY_BUDGET = 5;
+/* The exact-checkpoint re-entry budget moved to ./exact-checkpoint-reentry.js
+ * so the host runner can share one Map with this scanner without an import
+ * cycle (restart-recovery -> delivery-committer -> host-turn-runner). It is
+ * re-exported here because this module was its only public home. */
+export {
+  EXACT_CHECKPOINT_REENTRY_BUDGET,
+  exactCheckpointFrameCallIds,
+  exactCheckpointReentryExhausted,
+  exactCheckpointReentryKey,
+  noteExactCheckpointReentry,
+  _resetExactCheckpointReentriesForTests,
+} from './exact-checkpoint-reentry.js';
+
 const logger = pino({ name: 'clementine.harness.restart-recovery' });
-const exactCheckpointReentries = new Map<string, number>();
-const exactCheckpointReentryNoticed = new Set<string>();
-
-export function exactCheckpointReentryKey(
-  sessionId: string,
-  descriptor: { sourceUserSeq: number; phase: string; frameCallIds: readonly string[] },
-): string {
-  return `${sessionId}:${descriptor.sourceUserSeq}:${descriptor.phase}:${descriptor.frameCallIds.join('|')}`;
-}
-
-/** Count one dispatch of the exact checkpoint `key`. */
-export function noteExactCheckpointReentry(key: string): { count: number; exhausted: boolean } {
-  const count = (exactCheckpointReentries.get(key) ?? 0) + 1;
-  exactCheckpointReentries.set(key, count);
-  return { count, exhausted: count >= EXACT_CHECKPOINT_REENTRY_BUDGET };
-}
-
-export function exactCheckpointReentryExhausted(key: string): boolean {
-  return (exactCheckpointReentries.get(key) ?? 0) >= EXACT_CHECKPOINT_REENTRY_BUDGET;
-}
-
-export function _resetExactCheckpointReentriesForTests(): void {
-  exactCheckpointReentries.clear();
-  exactCheckpointReentryNoticed.clear();
-}
 
 function autoResumeEnabled(): boolean {
   return (process.env.CLEMMY_CHAT_AUTO_RESUME ?? 'on').toLowerCase() !== 'off';
@@ -143,15 +125,7 @@ function checkpointRecoveryDescriptor(
       || parsed.phase === 'continue'
       ? parsed.phase
       : null;
-    const frameCallIds = Array.isArray(parsed.frameHistory)
-      ? parsed.frameHistory.flatMap((item) => {
-          if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
-          const row = item as Record<string, unknown>;
-          return row.type === 'function_call' && typeof row.callId === 'string' && row.callId.trim()
-            ? [row.callId.trim()]
-            : [];
-        })
-      : [];
+    const frameCallIds = exactCheckpointFrameCallIds(parsed.frameHistory);
     return parsed.__clemHostRecovery === 1
       && parsed.sessionId === sessionId
       && phase !== null
@@ -1365,8 +1339,7 @@ export function recoverInterruptedChatRuns(
     }
     if (record.autoResumeSkipped === 'reentry_budget' && checkpointRecovery) {
       const key = exactCheckpointReentryKey(row.id, checkpointRecovery);
-      if (!exactCheckpointReentryNoticed.has(key)) {
-        exactCheckpointReentryNoticed.add(key);
+      if (claimExactCheckpointReentryNotice(key)) {
         logger.warn(
           {
             sessionId: row.id,
@@ -1554,9 +1527,13 @@ export function recoverInterruptedChatRuns(
     if (willAutoResume && dispatchResume && recoveryIdentity && acceptedInput !== null) {
       if (exactCheckpointRecovery) exactCheckpointResumes += 1;
       else genericAutoResumes += 1;
-      if (exactCheckpointRecovery && checkpointRecovery) {
-        noteExactCheckpointReentry(exactCheckpointReentryKey(row.id, checkpointRecovery));
-      }
+      // Counting happens where the admission FAILS (host-turn-runner's
+      // accepted-batch admission), not here where one caller dispatches. This
+      // scanner is only one of the entry points that reach that failure — the
+      // runner's own immediate re-entry and the legacy approval-resume path
+      // reach it too, and neither passes through here. Counting dispatches
+      // instead of failures let the budget be bypassed entirely (live
+      // 2026-09-01/09-02: 1,006 and 454 re-entries under a budget of 5).
       record.autoResumed = true;
       const sessionId = row.id;
       void dispatchResume({

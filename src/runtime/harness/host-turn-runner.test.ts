@@ -8476,3 +8476,97 @@ test('a refused call frame tells the model the real defect and the exact repair 
     'The host refused this exact call frame before dispatch (host_control_requires_sole_call_frame). No tool body was entered.',
   );
 });
+
+// A held checkpoint is an INVITATION to come back for this exact frame, and
+// three separate entry points accept it: the 15 s scanner, the runner's own
+// immediate re-entry in loop.ts, and the legacy approval-resume path. When the
+// admission can never succeed again the invitation never converges — live
+// 2026-09-01/09-02: 1,054, 1,006 and 454 re-entries under a budget of 5,
+// because the budget counted one caller's DISPATCH instead of the failure.
+test('a permanently unadmittable frame spends one shared budget and stops with a typed terminal', async () => {
+  const {
+    EXACT_CHECKPOINT_REENTRY_BUDGET,
+    exactCheckpointFrameCallIds,
+    exactCheckpointReentryExhausted,
+    exactCheckpointReentryKey,
+    _resetExactCheckpointReentriesForTests,
+  } = await import('./exact-checkpoint-reentry.js');
+  _resetExactCheckpointReentriesForTests();
+
+  const fixture = acceptHostCanarySource('checkpoint-admission-exhausted');
+  let bodies = 0;
+  const configured = {
+    type: 'function',
+    name: 'stuck_frame_fixture',
+    description: 'admission boundary fixture',
+    parameters: { type: 'object', properties: {} },
+    needsApproval: async () => false,
+    invoke: async () => { bodies += 1; return 'must not run'; },
+  };
+  // One clamped response: every attempt re-emits the byte-identical frame, so
+  // every attempt derives the same re-entry key.
+  const model = stubModel([[toolCall('stuck-frame-call', 'stuck_frame_fixture', {})]]);
+  const agent = { model, tools: [configured] };
+  bindHostCanarySurface(fixture, agent, [configured]);
+
+  const db = eventlog.openEventLog();
+  const trigger = `reject_batch_admission_${fixture.session.id.replace(/[^A-Za-z0-9]/gu, '_')}`;
+  const sessionId = fixture.session.id.replaceAll("'", "''");
+  db.exec(`
+    CREATE TEMP TRIGGER ${trigger}
+    BEFORE INSERT ON accepted_model_batch_admissions
+    WHEN NEW.session_id = '${sessionId}'
+    BEGIN
+      SELECT RAISE(ABORT, 'fixture admission unavailable');
+    END
+  `);
+  const outcomes: Array<Awaited<ReturnType<typeof runProductionHost>>> = [];
+  try {
+    for (let attempt = 0; attempt < EXACT_CHECKPOINT_REENTRY_BUDGET; attempt += 1) {
+      outcomes.push(await runProductionHost(fixture, agent));
+    }
+  } finally {
+    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+
+  // Within budget the frame stays privately owned: a hold, a durable recovery
+  // state, no public terminal. That behavior is deliberate and must not change.
+  for (const [index, outcome] of outcomes.slice(0, -1).entries()) {
+    assert.equal(outcome.terminal, undefined, `attempt ${index + 1} authored a terminal too early`);
+    assert.deepEqual(outcome.hold, { owner: 'host', wake: 'recovery', reason: 'recovery_pending' });
+    assert.ok(outcome.serializedRecoveryState, `attempt ${index + 1} dropped its recovery state`);
+  }
+
+  // The last attempt is the next edge: a typed terminal, and NO recovery state
+  // — loop.ts re-enters only `outcome.hold && outcome.serializedRecoveryState`,
+  // so the immediate re-entry and the scanner both stop here.
+  const final = outcomes.at(-1)!;
+  assert.equal(final.terminal?.status, 'blocked');
+  assert.equal(final.terminal?.reason, 'exact_checkpoint_admission_exhausted');
+  assert.equal(final.hold, undefined, 'an exhausted checkpoint must not invite another re-entry');
+  assert.equal(final.serializedRecoveryState, undefined);
+  assert.ok(
+    typeof final.finalOutput === 'string' && final.finalOutput.length > 0,
+    'the user is told the task stopped',
+  );
+  assert.equal(bodies, 0, 'no tool body ran while admission was failing');
+
+  // Convergence: the budget the RUNNER spent is the exact budget the 15 s
+  // scanner reads. It rebuilds the key from the serialized blob, so derive it
+  // that way here — if the two derivations ever drift, the budget silently
+  // stops binding and the storm returns.
+  const blob = JSON.parse(outcomes[0]!.serializedRecoveryState!) as Record<string, unknown>;
+  assert.equal(blob.__clemHostRecovery, 1);
+  const scannerKey = exactCheckpointReentryKey(fixture.session.id, {
+    sourceUserSeq: Number(blob.sourceUserSeq),
+    phase: String(blob.phase),
+    frameCallIds: exactCheckpointFrameCallIds(blob.frameHistory),
+  });
+  assert.deepEqual(exactCheckpointFrameCallIds(blob.frameHistory), ['stuck-frame-call']);
+  assert.equal(
+    exactCheckpointReentryExhausted(scannerKey),
+    true,
+    'the scanner must see the budget the runner spent, under its own key derivation',
+  );
+  _resetExactCheckpointReentriesForTests();
+});
