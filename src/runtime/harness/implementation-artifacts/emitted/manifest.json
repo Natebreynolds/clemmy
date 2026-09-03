@@ -800,6 +800,9 @@
         "src/runtime/harness/dispatch-lease.ts": {
           "bytes": 20200
         },
+        "src/runtime/harness/exact-checkpoint-reentry.ts": {
+          "bytes": 3563
+        },
         "src/runtime/harness/skill-execution.ts": {
           "bytes": 16140
         },
@@ -2220,7 +2223,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 335443
+          "bytes": 339358
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2235,7 +2238,7 @@
           "bytes": 49464
         },
         "src/runtime/harness/restart-recovery.ts": {
-          "bytes": 69778
+          "bytes": 68717
         },
         "src/runtime/harness/token-estimator.ts": {
           "bytes": 4626
@@ -3293,6 +3296,9 @@
         "src/runtime/harness/dispatch-lease.ts": {
           "bytes": 20200
         },
+        "src/runtime/harness/exact-checkpoint-reentry.ts": {
+          "bytes": 3563
+        },
         "src/runtime/harness/skill-execution.ts": {
           "bytes": 16140
         },
@@ -4713,7 +4719,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 335443
+          "bytes": 339358
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4728,7 +4734,7 @@
           "bytes": 49464
         },
         "src/runtime/harness/restart-recovery.ts": {
-          "bytes": 69778
+          "bytes": 68717
         },
         "src/runtime/harness/token-estimator.ts": {
           "bytes": 4626
