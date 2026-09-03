@@ -512,6 +512,30 @@ function hostNoProgressBlockedText(state: NoProgressGovernorState | null): strin
     : HOST_NO_PROGRESS_BLOCKED_TEXT;
 }
 
+/**
+ * The reply for a governor terminal that lands on a COMPLETED model answer.
+ *
+ * The governor may refuse to grant new user-input/approval authority from
+ * prose — that gate is real. Deleting what the model wrote is a separate act,
+ * and it is the defect the owner named: "The model should always own the
+ * response, not the harness. Those are harness replies and that tells me the
+ * model wasn't given a path to completion."
+ *
+ * Live 2026-09-03, platform-49 run 6: the model finished its reads, wrote a
+ * 616-token answer, and the host replaced it with "I got stuck: I hit the same
+ * wall twice in a row" and committed delivered:false. Her findings were never
+ * shown and never stored. The turn is still blocked and still non-resumable —
+ * only the words are hers. An empty/whitespace answer keeps the host copy,
+ * because then there genuinely are no words to hand over.
+ */
+function modelOwnedTerminalText(
+  modelText: string | undefined,
+  state: NoProgressGovernorState | null,
+): string {
+  const spoken = typeof modelText === 'string' ? modelText.trim() : '';
+  return spoken.length > 0 ? spoken : hostNoProgressBlockedText(state);
+}
+
 export const HOST_PROGRESS_PROJECTION_BLOCKED_TEXT =
   'I couldn\'t verify whether this task made progress, so I stopped before another model or tool step. Please retry this turn.';
 
@@ -6573,8 +6597,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // Exact user-input authority belongs to one canonical
         // ask_user_question call. Prose cannot substitute a broader question
         // or publish before the call boundary validates options and purpose.
+        // But withholding AUTHORITY is not a reason to delete the model's
+        // WORDS: the turn stays blocked and non-resumable, and the reply is
+        // what she actually wrote.
         return blockedOutcome(
-          hostNoProgressBlockedText(noProgressState),
+          modelOwnedTerminalText(admission.frame.text, noProgressState),
           'control_no_progress_exhausted',
           false,
         );
@@ -6586,9 +6613,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           || decision?.nextAction === 'awaiting_approval'
         ) {
           // A known terminal may be explained once, but it cannot convert
-          // itself into new user work or resumable authority.
+          // itself into new user work or resumable authority. Same rule as
+          // above: refuse the authority, keep the model's words.
           return blockedOutcome(
-            hostNoProgressBlockedText(noProgressState),
+            modelOwnedTerminalText(admission.frame.text, noProgressState),
             'control_no_progress_exhausted',
             false,
           );

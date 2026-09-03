@@ -8570,3 +8570,81 @@ test('a permanently unadmittable frame spends one shared budget and stops with a
   );
   _resetExactCheckpointReentriesForTests();
 });
+
+// Live 2026-09-03, platform-49 run 6 (Sonnet 5): the model finished its reads,
+// wrote a 616-token answer, and the host committed delivered:false with
+// "I got stuck: I hit the same wall twice in a row" — its own prose. Her
+// findings were never shown and never stored. Refusing to grant user-input
+// AUTHORITY from prose is a real gate; deleting her WORDS is a separate act,
+// and it is the one the owner named: the model owns the response.
+test('a governor terminal on a completed answer keeps the model\'s words, not harness prose', async () => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  try {
+    const fixture = acceptHostCanarySource('governor-terminal-keeps-model-words');
+    const accountChoices = ['work@corp.example', 'personal@example.net'];
+    const planTool = brackets.wrapToolForHarness({
+      type: 'function',
+      name: 'plan_task',
+      description: 'Admit the model-authored plan.',
+      parameters: { type: 'object', additionalProperties: true },
+      needsApproval: async () => false,
+      invoke: async () => JSON.stringify({
+        ok: false,
+        code: 'account_selection_required',
+        detail: 'Outlook Send Email is the matching write; ask which connected account to use.',
+        question: 'Which connected account should I use?',
+        accountChoices,
+        repair: 'Ask the user which exact connected account to use. Do not pick a substitute write.',
+      }),
+    });
+    const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
+
+    // The findings the model actually wrote. It answers in PROSE instead of the
+    // canonical ask_user_question call, so the recovery contract refuses to
+    // grant awaiting-user-input authority — the frame lands as `completed`.
+    const SPOKEN = 'I compared the Log tab against the channel. Rows 12 and 19 are true '
+      + 'duplicates, row 27 matches nothing in Slack, and two threads from the covered '
+      + 'window never made it in. Rows 30–32 I left alone as you said. Want me to fix these?';
+    let modelCalls = 0;
+    const model = {
+      calls: () => modelCalls,
+      async getResponse() {
+        modelCalls += 1;
+        return {
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          output: modelCalls === 1
+            ? [toolCall('account-plan', 'plan_task', fusedPlanArgs('external_write'))]
+            : [textMsg(SPOKEN)],
+          responseId: `keeps-model-words-${modelCalls}`,
+        };
+      },
+      getStreamedResponse: testModelStream,
+    };
+    const tools = [planTool, questionTool];
+    const agent = { model, tools, toolUseBehavior: userChoiceToolUseBehavior };
+    bindHostCanarySurface(fixture, agent, tools);
+
+    const outcome = await runProductionHostSteps(fixture, agent, 6);
+
+    // The gate still holds: blocked, non-resumable, no new user-input authority.
+    assert.equal(outcome.terminal?.status, 'blocked');
+    assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
+    assert.equal(outcome.terminal?.resumable, false);
+    assert.equal(
+      eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length,
+      0,
+      'prose must not mint user-input authority',
+    );
+
+    // ...and the reply is HERS.
+    const finalText = String(outcome.finalOutput);
+    assert.ok(finalText.includes('Rows 12 and 19 are true duplicates'),
+      `the model's findings must survive the terminal, got: ${finalText.slice(0, 240)}`);
+    assert.doesNotMatch(finalText, /I hit the same wall twice in a row/,
+      'harness prose must not replace an answer the model actually wrote');
+  } finally {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
