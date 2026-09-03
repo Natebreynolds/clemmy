@@ -654,7 +654,7 @@
           "bytes": 7425
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 63394
+          "bytes": 65442
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -2286,7 +2286,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 665228
+          "bytes": 665953
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2370,7 +2370,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 43329
+          "bytes": 47000
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -2385,7 +2385,7 @@
           "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 240658
+          "bytes": 241013
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -3150,7 +3150,7 @@
           "bytes": 7425
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 63394
+          "bytes": 65442
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -4782,7 +4782,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 665228
+          "bytes": 665953
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4866,7 +4866,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 43329
+          "bytes": 47000
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -4881,7 +4881,7 @@
           "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 240658
+          "bytes": 241013
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
