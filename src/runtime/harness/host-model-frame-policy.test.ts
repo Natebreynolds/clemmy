@@ -124,11 +124,6 @@ test('fresh plan frame refuses every unsafe ordering, cardinality, carrier, effe
         : call),
       reason: 'fresh_plan_sibling_requires_dependency_root',
     },
-    {
-      label: 'carried plan',
-      calls: [work({ effectiveName: 'plan_task' })],
-      reason: 'host_control_requires_direct_first_class_call',
-    },
   ];
   for (const fixture of cases) {
     const result = classifyHostModelFrame({
@@ -234,4 +229,20 @@ test('a proposal-free work_call whose inner operation cannot be identified is re
     planActivated: false,
     allowFreshPlanReadFusion: true,
   }), { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' });
+});
+
+// A carried control is that control. The policy used to refuse a frame whose
+// direct name was ordinary but whose effective name was a control, while
+// computing that effective identity one line above — so it discarded a plan it
+// had already understood. Three live runs on 2026-09-03 died there carrying a
+// correct plan body. The standing gate is validate-before-write, not envelope
+// shape.
+test('a carried control is classified as that control, not refused', () => {
+  const result = classifyHostModelFrame({
+    calls: [work({ effectiveName: 'plan_task' })],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  });
+  assert.notEqual(result.kind, 'refused',
+    'the host already resolved the effective identity; refusing discards it');
 });

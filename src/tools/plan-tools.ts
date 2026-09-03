@@ -77,6 +77,7 @@ import { uniqueWorkflowRunRequest } from './named-workflow-match.js';
 import { acceptedSourceIsWorkflowInternal } from '../runtime/harness/named-workflow-host-dispatch.js';
 import {
   accountSelectionForCitedWrite,
+  citedLegsUnblockedByAccount,
   thisTurnSearchAccountSelectionBlockers,
 } from './tool-search-provider-sources.js';
 import {
@@ -1245,11 +1246,24 @@ async function executePlanTask(
   // returned the matching write with account_selection_required; admitting
   // against the index card then called it undisclosed and offered
   // greenhouse/airtable (live 2026-08-29 seq 98118). Ask. Do not substitute.
+  const citedCapabilityRefs = input.draft.bindings.map((binding) => binding.capabilityRef);
+  const accountBlockers = thisTurnSearchAccountSelectionBlockers({ sessionId, sourceUserSeq });
   const accountSelection = accountSelectionForCitedWrite({
-    citedRefs: input.draft.bindings.map((binding) => binding.capabilityRef),
-    blockers: thisTurnSearchAccountSelectionBlockers({ sessionId, sourceUserSeq }),
+    citedRefs: citedCapabilityRefs,
+    blockers: accountBlockers,
   });
-  if (accountSelection) {
+  // ...but the question belongs to the LEG that needs the account, not to the
+  // whole plan. Live 2026-09-03 run 21: a five-step chain whose only ambiguous
+  // leg was the final Outlook write was refused here, so a pure Salesforce READ
+  // could not start until the user said where emails go three steps later. That
+  // inverts read -> work -> write. When other legs are clear, freeze the plan
+  // and let the account question arrive at the write, where it is answerable
+  // with the work in hand.
+  const unblockedLegs = citedLegsUnblockedByAccount({
+    citedRefs: citedCapabilityRefs,
+    blockers: accountBlockers,
+  });
+  if (accountSelection && unblockedLegs.length === 0) {
     // The recovery projection deliberately admits at most five exact choices.
     // Keep the producer inside that same closed boundary so a large connected
     // account set still becomes one precise question instead of a factual stop.

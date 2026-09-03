@@ -738,6 +738,31 @@ export function accountSelectionForCitedWrite(input: {
   return { name: matches[0]!.name, choices: [...matches[0]!.choices] };
 }
 
+/**
+ * Cited legs that are NOT waiting on an account choice.
+ *
+ * An account question belongs to the leg that needs the account, not to the
+ * whole plan. Live 2026-09-03 run 21: a five-step chain whose only ambiguous
+ * leg was the final Outlook write was refused at plan-freeze, so a pure
+ * Salesforce READ could not start until the user answered where emails go
+ * three steps later. The reads do not depend on that answer.
+ *
+ * When every cited leg is blocked there is nothing to get on with, and the
+ * caller still refuses and asks — which is the substitution guard the
+ * 2026-08-29 incident installed (a single cited write, no other work).
+ */
+export function citedLegsUnblockedByAccount(input: {
+  citedRefs: readonly string[];
+  blockers: ReadonlyArray<{ name: string; choices: readonly string[] }>;
+}): string[] {
+  return input.citedRefs
+    .map((ref) => ref.trim())
+    .filter(Boolean)
+    .filter((ref) => !input.blockers.some((blocker) => (
+      blocker.choices.length > 0 && citationMatchesDisclosedOperation(ref, blocker.name)
+    )));
+}
+
 export function accountSelectionBlockersFromSearchResult(
   result: unknown,
 ): Array<{ name: string; choices: string[] }> {

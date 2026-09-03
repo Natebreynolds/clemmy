@@ -21,7 +21,6 @@ export interface HostModelFrameCall {
 }
 
 export type HostModelFrameRefusal =
-  | 'host_control_requires_direct_first_class_call'
   | 'host_control_requires_sole_call_frame'
   | 'fresh_plan_already_activated'
   | 'fresh_plan_must_be_first'
@@ -180,16 +179,26 @@ export function classifyHostModelFrame(input: {
   planActivated: boolean;
   allowFreshPlanReadFusion: boolean;
 }): HostModelFrameDisposition {
-  const decorated = input.calls.map((call) => ({
-    call,
-    directClass: declaredFrameClass(call.name),
-    effectiveClass: declaredFrameClass(call.effectiveName),
-  }));
-  if (decorated.some((entry) => (
-    entry.directClass === 'ordinary' && entry.effectiveClass !== 'ordinary'
-  ))) {
-    return { kind: 'refused', reason: 'host_control_requires_direct_first_class_call' };
-  }
+  // A CARRIED CONTROL IS THAT CONTROL. This used to refuse a frame whose direct
+  // name was ordinary but whose effective name was a control — while computing
+  // that effective identity one line above. The host already knew the model
+  // meant plan_task, with its arguments attached, and threw the frame away over
+  // the envelope. Three consecutive live runs on 2026-09-03 died there, each
+  // carrying a correct multi-step plan.
+  //
+  // Nothing downstream needs the refusal: `standalone_control` has no consumer
+  // that keys on the direct name, and call_tool already resolves its inner
+  // target through inner-dispatch. So classify by what the call MEANS and let
+  // it run. The standing gate is validate-before-write, not envelope shape.
+  const decorated = input.calls.map((call) => {
+    const directClass = declaredFrameClass(call.name);
+    const effectiveClass = declaredFrameClass(call.effectiveName);
+    return {
+      call,
+      directClass: directClass === 'ordinary' ? effectiveClass : directClass,
+      effectiveClass,
+    };
+  });
 
   const controls = decorated.filter((entry) => entry.directClass !== 'ordinary');
   const freshPlans = controls.filter((entry) => entry.directClass === 'fresh_plan_barrier');

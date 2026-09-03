@@ -150,22 +150,6 @@ export function hostFrameRefusalDirective(
   if (reason === 'host_planned_work_call_requires_plan_sibling') {
     return `${base} A write or send through work_call needs its plan: call plan_task naming this operation first.${offending}${exactReadDoor}`;
   }
-  if (reason === 'host_control_requires_direct_first_class_call') {
-    // This reason had NO branch and fell through to the bare `base`, which
-    // names the error and no door. Live 2026-09-03: three consecutive runs
-    // wrapped a control in an ordinary carrier, read a refusal that did not
-    // say which envelope to use, re-issued the IDENTICAL frame, and died at
-    // the two-refusal ceiling — each time carrying a CORRECT plan body. The
-    // proposal was right and only the envelope was wrong.
-    //
-    // `exactReadDoor` is deliberately NOT appended here: it teaches the
-    // work_call carrier, which is the very wrapping being refused.
-    const named = context?.offendingOperation?.trim();
-    const control = named ? `"${named}"` : 'the control you named';
-    const direct = named ? `a direct ${named} call` : 'a direct top-level call';
-    return `${base} ${control} is a first-class host control: issue it DIRECTLY as its own top-level tool call, never wrapped in call_tool or work_call.`
-      + ` Your arguments were not the problem — re-issue the SAME arguments now as ${direct}.`;
-  }
   return base;
 }
 
@@ -7158,33 +7142,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         false,
         new Map([[canonicalCalls[0]!.callId,
           `The host could not revalidate the exact control frame (${detail}). No tool body was entered.`]]),
-      );
-      const resultCommitBlock = commitAdmittedToolFrame({
-        acceptedFrame,
-        frameHistory: admission.frame.history,
-        resultItems: paired.resultItems,
-        responseId: step.responseId,
-      });
-      if (resultCommitBlock) return resultCommitBlock;
-      recordZeroCrossingRefusal(paired.frameDigest);
-      continue;
-    }
-    if (soleControls.some((entry) => entry.carried)) {
-      const carriedControlOperation = soleControls.find((entry) => entry.carried)?.effective
-        ?? 'that host control';
-      const paired = pairLocallyRefusedFrame(
-        canonicalCalls,
-        false,
-        new Map([[canonicalCalls[0]!.callId,
-          // Naming the error without naming the repair is a dead end: the
-          // model re-issued the IDENTICAL wrapped frame and exhausted the
-          // budget. Live 2026-09-03, two consecutive runs died here with a
-          // CORRECT multi-step plan body wrapped in an ordinary carrier. The
-          // proposal was right; only the envelope was wrong, and nothing in
-          // the refusal said which envelope to use instead.
-          `The host refused an indirect control carrier before dispatch (host_control_requires_direct_first_class_call). No tool body was entered. `
-          + `${carriedControlOperation} is a first-class host control: issue it DIRECTLY as its own top-level tool call, never wrapped in call_tool or work_call. `
-          + `Your arguments were not the problem — re-issue the SAME arguments now as a direct ${carriedControlOperation} call.`]]),
       );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
