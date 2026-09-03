@@ -72,7 +72,8 @@ import {
 } from '../runtime/harness/capability-manifest.js';
 import { resolveProductionPortsForManifest } from '../runtime/harness/production-capability-ports.js';
 import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
-import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { isIrreversibleSendSlug, classifyCanonicalExternalEffect } from '../runtime/harness/execution-gate.js';
+import { toolHasConsentPath } from './gated-mutating-tools.js';
 import {
   validateIrreversibleSendPayload,
 } from '../runtime/harness/grounding-gate.js';
@@ -819,7 +820,23 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         options.controlOnlyBuiltins
         && (
           isMcpNamespacedTool(target)
-          || !(isRegisteredActionControl(target) || isRegistryDeclaredRead(target))
+          // A LOCAL tool with a consent path is offered and validated, never
+          // withheld. run_shell_command declares sideEffect: 'write' because a
+          // shell command CAN write, so it was absent from action turns entirely
+          // and a read-shaped command — a diff, a count, a local query — had
+          // nowhere to run at all. Being asked about is the standing gate; being
+          // invisible is not a gate, it is a missing capability.
+          //
+          // Scoped to LOCAL effects deliberately: admitting every consent-path
+          // tool would let provider/business writes ride the control dispatcher,
+          // making it a second unbound business carrier — that is work_call's
+          // job, and action-control-surface.test.ts pins it.
+          || !(
+            isRegisteredActionControl(target)
+            || isRegistryDeclaredRead(target)
+            || (toolHasConsentPath(target)
+              && !classifyCanonicalExternalEffect(target, resolvedArgs).external)
+          )
         )
       ) {
         return refuse({

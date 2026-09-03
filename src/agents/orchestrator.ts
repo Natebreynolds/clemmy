@@ -1947,7 +1947,23 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           'work_call',
           ...(hostFreshPlanning ? ['plan_task'] : []),
         ])]
-      : options.allowedToolNames;
+      // A planning control the host ADVERTISES must be callable. The structural
+      // lookup tells the model plan_task exists and describes it; staging it
+      // behind business discovery meant tool_search disclosed a control that the
+      // dispatch wall then refused as "not a configured harness-bounded tool"
+      // (live 2026-09-03 run 22 — the plan body was correct, the control simply
+      // was not on the surface it had just been shown on).
+      //
+      // Nothing is protected by withholding it: plan_task with no citable
+      // capability is refused by plan ADMISSION, which is a substantive check
+      // that names what is missing, rather than a surface-timing accident.
+      // Array.isArray guard: `undefined` here means NO allowlist — everything
+      // stays available — so appending to it would convert "no restriction"
+      // into a restrictive list of one and strip the hot-set run control of a
+      // uniquely named saved workflow. Only extend a list that already exists.
+      : hostFreshPlanning && Array.isArray(options.allowedToolNames)
+        ? [...new Set([...options.allowedToolNames, 'plan_task'])]
+        : options.allowedToolNames;
   // Prior-input retrieval here exists only to recover MCP/JIT scope. It is not
   // the provider transcript: runTurn still supplies the normal conversation
   // history to the model. An exact plain proof has no MCP/JIT scope to recover.

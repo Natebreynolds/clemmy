@@ -1970,10 +1970,6 @@ test('fresh-plan model frames refuse unsafe siblings before any plan or sibling 
           toolCall('sibling-2', 'work_call', fusedWorkArgs()),
         ],
       },
-      {
-        label: 'carried-plan',
-        calls: [toolCall('carried-plan', 'work_call', fusedWorkArgs('plan_task'))],
-      },
     ];
     for (const fixtureCase of cases) {
       await t.test(fixtureCase.label, async () => {
@@ -8659,4 +8655,33 @@ test('ask_user recovery guides a prose answer instead of silently answering for 
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
   }
+});
+
+// A CARRIED CONTROL IS THAT CONTROL — it used to sit in the fused-refusal
+// fixtures above, asserting the plan body must NOT run. The policy computed the
+// effective identity and then refused the frame over its envelope, discarding a
+// plan it had already understood; three live runs on 2026-09-03 died there
+// carrying a correct plan body. It now runs.
+//
+// SEAM, recorded rather than hidden: the nested path does not emit its own
+// durable settlement for a control, so the host settles the non-mutating result
+// and warns ("nested-owned local control returned without its own durable
+// settlement"). That is benign for a control — nothing mutates — but a direct
+// call and a carried call do not settle identically, and that difference is
+// worth closing rather than forgetting.
+test('a carried control executes instead of being replanned', async (t) => {
+  const { classifyHostModelFrame } = await import('./host-model-frame-policy.js');
+  const result = classifyHostModelFrame({
+    calls: [{
+      callId: 'carried-plan',
+      name: 'work_call',
+      effectiveName: 'plan_task',
+      effect: 'compute',
+      proposalFreeWorkCarrier: false,
+    } as never],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  });
+  t.diagnostic(`carried control disposition: ${result.kind}`);
+  assert.notEqual(result.kind, 'refused');
 });

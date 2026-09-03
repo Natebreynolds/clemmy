@@ -121,6 +121,25 @@ export type GatedInvokableTool = Tool<unknown> & {
   description?: string;
 };
 
+/**
+ * A tool that has a CONSENT PATH — it can be offered and validated rather than
+ * withheld.
+ *
+ * Owner direction 2026-09-03: "clem needs bash, shell anything needed to work
+ * within the local environment", and "the only gate we should have and its a
+ * simple one is validate before a write". run_shell_command is declared
+ * sideEffect: 'write' because a shell command CAN write, so on action turns it
+ * was not merely gated — it was absent, and a read-shaped command (a diff, a
+ * count, a query) had nowhere to run. Live 2026-09-03: a sheet/Slack
+ * reconciliation reached for a shell to compute the diff and found no door.
+ *
+ * Membership here means "ask, then run", which is the standing gate. It does
+ * not weaken it: the consent decision still happens before anything executes.
+ */
+export function toolHasConsentPath(toolName: string): boolean {
+  return Object.hasOwn(getGatedToolSchemas(), toolName.trim());
+}
+
 export function gatedMutationsEnabled(): boolean {
   return (process.env.CLEMENTINE_MCP_GATED_MUTATIONS ?? '').trim().toLowerCase() === 'on';
 }
