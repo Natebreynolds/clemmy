@@ -6813,14 +6813,28 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
-      // NOT guided (attempted 2026-09-03, reverted): offering a last-word turn
-      // here means `continue`, and the next iteration re-derives the model
-      // surface from the FULL catalog — the narrow recovery surface is exactly
-      // what stops a third discovery crossing, and the extra step widened it
-      // (host-no-progress-governor.integration.test.ts "repeated discovery gets
-      // one control-only recovery and no third discovery crossing" caught it).
-      // Guiding this site needs the recovery surface to persist across the
-      // extra step first; the invariant outranks the guidance.
+      // NOT guided. Attempted TWICE on 2026-09-03 and reverted both times; the
+      // pin "repeated discovery gets one control-only recovery and no third
+      // discovery crossing" caught each attempt. Recording what actually
+      // blocks it so the next attempt starts further along:
+      //
+      //   1. Offering a last-word turn here means `continue`, and this site's
+      //      recovery surface admits sole-control frames — tool_search among
+      //      them — so the extra step permits a third discovery crossing.
+      //   2. Handing that step an EMPTY tool surface does not fix it either:
+      //      the `if (noProgressRecoveryOnly)` block below re-derives
+      //      modelStepSchemas after the per-step reset, and the step AFTER the
+      //      last word returns to the full catalog.
+      //
+      // A correct fix needs the recovery surface (or a tool-free one) to
+      // persist across the extra step AND the turn to end on that step's
+      // answer, not merely to withhold tools once. That is a control-flow
+      // change to the loop, not a guard at this site.
+      //
+      // The cost of leaving it: a cold multi-family task terminates here with
+      // harness prose, never having been told which tools this state permits
+      // (live 2026-09-03, the five-prospect run died here twice). The
+      // invariant still outranks the guidance.
       return blockedOutcome(
         hostNoProgressBlockedText(noProgressState),
         'control_no_progress_exhausted',
