@@ -9193,6 +9193,12 @@ async function withActiveTurnHeartbeat<T>(
     budget: ReturnType<typeof getHarnessBudgetSettings>;
     checkInMs: number;
     stage: 'turn' | 'approval_resume';
+    /** The brain's latest reasoning, when the transport can see it. Injected
+     *  rather than read from AsyncLocalStorage: this interval is armed BEFORE
+     *  withHarnessRunContext is entered (it wraps the work), so getStore()
+     *  inside the tick returns undefined and the heartbeat would silently stay
+     *  generic forever. */
+    thinking?: () => string | undefined;
   },
   work: () => Promise<T>,
 ): Promise<T> {
@@ -9202,7 +9208,8 @@ async function withActiveTurnHeartbeat<T>(
     // the transport can see the brain's own reasoning, say what it is working
     // on instead. Claude's thinking deltas never reach the SDK as events, so
     // claude-model.ts reads them off the wire into the run context.
-    const thinking = harnessRunContextStorage.getStore()?.latestModelThinking;
+    let thinking: string | undefined;
+    try { thinking = opts.thinking?.(); } catch { thinking = undefined; }
     const working = typeof thinking === 'string' ? thinking.replace(/\s+/gu, ' ').trim() : '';
     safeAppend({
       sessionId: opts.sessionId,
@@ -10697,6 +10704,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         budget: heartbeatBudget,
         checkInMs: heartbeatMs,
         stage: 'turn',
+        thinking: () => harnessCtx?.latestModelThinking,
       },
       async () => {
         // Budget raised 3×60KB → 5×150KB via env (2026-07-08): the morning

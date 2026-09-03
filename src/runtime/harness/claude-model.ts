@@ -467,7 +467,7 @@ export async function logClaudeResponseUsage(stream: ReadableStream<Uint8Array>)
  */
 const CLAUDE_THINKING_SNIPPET_MAX = 400;
 
-async function watchClaudeThinkingForLiveness(
+export async function watchClaudeThinkingForLiveness(
   stream: ReadableStream<Uint8Array>,
   context: { privateModelActivityAt?: number; latestModelThinking?: string } | undefined,
 ): Promise<void> {

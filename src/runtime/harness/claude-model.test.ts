@@ -14,6 +14,7 @@ import {
   rawClaudeUsageFields,
   withRawClaudeUsageRecording,
   extractClaudeThinkingText,
+  watchClaudeThinkingForLiveness,
 } from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
@@ -382,4 +383,54 @@ test('thinking extraction survives escapes and ignores non-thinking deltas', () 
   assert.doesNotThrow(() => extractClaudeThinkingText(
     'data: {"delta":{"type":"thinking_delta","thinking":"trailing \\',
   ));
+});
+
+test('the wire tap stamps liveness and the reasoning tail onto the run context', async () => {
+  const encoder = new TextEncoder();
+  const chunks = [
+    'event: message_start\ndata: {"type":"message_start"}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+      + '"delta":{"type":"thinking_delta","thinking":"Row 6 is Brian\'s answer, "}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+      + '"delta":{"type":"thinking_delta","thinking":"not Spencer\'s request."}}\n\n',
+  ];
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+
+  const context: { privateModelActivityAt?: number; latestModelThinking?: string } = {};
+  const before = Date.now();
+  await watchClaudeThinkingForLiveness(stream, context);
+
+  assert.ok(
+    (context.privateModelActivityAt ?? 0) >= before,
+    'a thinking delta must prove the brain is working — this is the signal the '
+    + 'fallover layer uses to NOT bench it',
+  );
+  assert.match(String(context.latestModelThinking), /not Spencer's request\./);
+});
+
+test('the wire tap ignores a stream with no thinking, and never throws without a context', async () => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        'event: content_block_delta\ndata: {"delta":{"type":"text_delta","text":"answer"}}\n\n',
+      ));
+      controller.close();
+    },
+  });
+  const context: { privateModelActivityAt?: number; latestModelThinking?: string } = {};
+  await watchClaudeThinkingForLiveness(stream, context);
+  assert.equal(context.privateModelActivityAt, undefined, 'ordinary output is not private reasoning');
+  assert.equal(context.latestModelThinking, undefined);
+
+  // No run context (a call outside a harness turn) must cancel cleanly.
+  const orphan = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(encoder.encode('data: {}\n\n')); controller.close(); },
+  });
+  await assert.doesNotReject(() => watchClaudeThinkingForLiveness(orphan, undefined));
 });
