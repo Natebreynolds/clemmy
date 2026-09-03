@@ -216,7 +216,7 @@
           "bytes": 13335
         },
         "src/integrations/composio/standing-policy-compiler.ts": {
-          "bytes": 12360
+          "bytes": 12854
         },
         "src/memory/db.ts": {
           "bytes": 132982
@@ -651,16 +651,16 @@
           "bytes": 5382
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 6005
+          "bytes": 7425
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 59910
+          "bytes": 63394
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
         },
         "src/runtime/model-route-metrics.ts": {
-          "bytes": 29210
+          "bytes": 29510
         },
         "src/runtime/harness/route-policy.ts": {
           "bytes": 21217
@@ -690,7 +690,7 @@
           "bytes": 3080
         },
         "src/runtime/harness/router-model.ts": {
-          "bytes": 19380
+          "bytes": 21754
         },
         "src/runtime/semantic-boundary/plan-grounding.ts": {
           "bytes": 14843
@@ -790,6 +790,9 @@
         },
         "src/runtime/harness/retained-work-terminal.ts": {
           "bytes": 7713
+        },
+        "src/runtime/harness/carrier-reader.ts": {
+          "bytes": 12370
         },
         "src/runtime/harness/accepted-source-catalog-scope.ts": {
           "bytes": 2643
@@ -1107,7 +1110,7 @@
           "bytes": 24219
         },
         "src/memory/incident-narrative.ts": {
-          "bytes": 1577
+          "bytes": 1581
         },
         "src/memory/memory-quality.ts": {
           "bytes": 7087
@@ -1281,10 +1284,10 @@
           "bytes": 66979
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 77760
+          "bytes": 77763
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 81383
+          "bytes": 81384
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -1695,7 +1698,7 @@
           "bytes": 43374
         },
         "src/runtime/harness/claude-agent-brain.ts": {
-          "bytes": 205571
+          "bytes": 205566
         },
         "src/runtime/harness/response-route.ts": {
           "bytes": 2404
@@ -2217,7 +2220,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 320754
+          "bytes": 335443
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2280,7 +2283,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 664865
+          "bytes": 665157
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2379,7 +2382,7 @@
           "bytes": 8581
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 239958
+          "bytes": 240658
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -2478,7 +2481,7 @@
           "bytes": 20321
         },
         "src/integrations/composio/client.ts": {
-          "bytes": 158325
+          "bytes": 158855
         },
         "src/tools/composio-schema-cache.ts": {
           "bytes": 30694
@@ -2706,7 +2709,7 @@
           "bytes": 13335
         },
         "src/integrations/composio/standing-policy-compiler.ts": {
-          "bytes": 12360
+          "bytes": 12854
         },
         "src/memory/db.ts": {
           "bytes": 132982
@@ -3141,16 +3144,16 @@
           "bytes": 5382
         },
         "src/runtime/harness/model-stall-policy.ts": {
-          "bytes": 6005
+          "bytes": 7425
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 59910
+          "bytes": 63394
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
         },
         "src/runtime/model-route-metrics.ts": {
-          "bytes": 29210
+          "bytes": 29510
         },
         "src/runtime/harness/route-policy.ts": {
           "bytes": 21217
@@ -3180,7 +3183,7 @@
           "bytes": 3080
         },
         "src/runtime/harness/router-model.ts": {
-          "bytes": 19380
+          "bytes": 21754
         },
         "src/runtime/semantic-boundary/plan-grounding.ts": {
           "bytes": 14843
@@ -3280,6 +3283,9 @@
         },
         "src/runtime/harness/retained-work-terminal.ts": {
           "bytes": 7713
+        },
+        "src/runtime/harness/carrier-reader.ts": {
+          "bytes": 12370
         },
         "src/runtime/harness/accepted-source-catalog-scope.ts": {
           "bytes": 2643
@@ -3597,7 +3603,7 @@
           "bytes": 24219
         },
         "src/memory/incident-narrative.ts": {
-          "bytes": 1577
+          "bytes": 1581
         },
         "src/memory/memory-quality.ts": {
           "bytes": 7087
@@ -3771,10 +3777,10 @@
           "bytes": 66979
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 77760
+          "bytes": 77763
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 81383
+          "bytes": 81384
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -4185,7 +4191,7 @@
           "bytes": 43374
         },
         "src/runtime/harness/claude-agent-brain.ts": {
-          "bytes": 205571
+          "bytes": 205566
         },
         "src/runtime/harness/response-route.ts": {
           "bytes": 2404
@@ -4707,7 +4713,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 320754
+          "bytes": 335443
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4770,7 +4776,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 664865
+          "bytes": 665157
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4869,7 +4875,7 @@
           "bytes": 8581
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 239958
+          "bytes": 240658
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -4968,7 +4974,7 @@
           "bytes": 20321
         },
         "src/integrations/composio/client.ts": {
-          "bytes": 158325
+          "bytes": 158855
         },
         "src/tools/composio-schema-cache.ts": {
           "bytes": 30694

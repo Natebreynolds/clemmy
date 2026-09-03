@@ -904,6 +904,17 @@ export function resetComposioClient(): void {
   invalidateComposioCliStatusCache();
 }
 
+/** Test seam: install an exact connected-toolkit snapshot (or clear it) so
+ *  code that reads the connection registry synchronously — standing-policy
+ *  toolkit bindings, execution-preparation views — can be exercised without a
+ *  provider. Production never calls this. */
+export function _setConnectedToolkitsSnapshotForTests(data: ConnectedToolkit[] | null): void {
+  connectionsGeneration += 1;
+  connectionsInflight = null;
+  connectionsCache = data ? { at: Date.now(), data } : null;
+  lastGoodConnections = data;
+}
+
 export function clearConnectedToolkitsCache(): void {
   invalidateConnectedAccountSnapshot();
   // A new/changed connection can expose a toolkit's tools for the first time.

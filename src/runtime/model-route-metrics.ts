@@ -579,11 +579,14 @@ class ModelRouteMetricsModel implements Model {
         ...(usage.promptCacheUsage ? { promptCacheUsage: usage.promptCacheUsage } : {}),
       },
     }, this.db);
-    if (status === 'failed' && !this.db) {
+    // A cancelled call is journaled too: the host stall watchdog retires an
+    // attempt by aborting it, and that was invisible — a turn that sat 600s
+    // and died recorded no failure anywhere (live 2026-09-02).
+    if ((status === 'failed' || status === 'cancelled') && !this.db) {
       recordOperationalEvent({
         source: 'model',
         type: 'model_call_failed',
-        severity: 'error',
+        severity: status === 'cancelled' ? 'warn' : 'error',
         sessionId: this.context.sessionId,
         workflowRunId: this.context.workflowRunId,
         workflowNodeRunId: this.context.workflowNodeId,
@@ -592,6 +595,7 @@ class ModelRouteMetricsModel implements Model {
         actor: 'model-route-metrics',
         payload: {
           ...metadata,
+          status,
           role: this.context.role,
           intent: this.context.intent,
           resolvedModel: this.context.resolvedModel,

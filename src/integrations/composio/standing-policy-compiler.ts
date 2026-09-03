@@ -7,6 +7,8 @@ import {
   type StandingPolicyDescriptorBody,
 } from '../../memory/policy-enforcement.js';
 
+import { peekConnectedToolkits } from './client.js';
+
 export const COMPOSIO_STANDING_POLICY_ADAPTER_ID = 'composio' as const;
 export const COMPOSIO_STANDING_POLICY_COMPILER_VERSION = 1 as const;
 
@@ -43,14 +45,21 @@ function baseBody(content: string): Omit<StandingPolicyDescriptorBody,
   };
 }
 
+/** A policy binds to any CONNECTED toolkit its text names — never to a list
+ * of toolkit names compiled into the harness. The connection registry is the
+ * authority for what exists; the user's words are the authority for what the
+ * policy is about. */
 function promptToolkitBindings(content: string): StandingPolicyDescriptorBody['bindings'] {
   const bindings: StandingPolicyDescriptorBody['bindings'] = [];
   const text = content.toLowerCase();
-  if (/\boutlook\b/.test(text)) {
-    bindings.push({ adapterId: COMPOSIO_STANDING_POLICY_ADAPTER_ID, kind: 'toolkit', value: 'outlook' });
-  }
-  if (/\bsalesforce\b/.test(text)) {
-    bindings.push({ adapterId: COMPOSIO_STANDING_POLICY_ADAPTER_ID, kind: 'toolkit', value: 'salesforce' });
+  const seen = new Set<string>();
+  for (const toolkit of peekConnectedToolkits()) {
+    const slug = (toolkit.slug ?? '').trim().toLowerCase();
+    if (!slug || seen.has(slug) || !/^[a-z][a-z0-9_-]{1,}$/.test(slug)) continue;
+    const mentioned = new RegExp(`\\b${slug.replace(/[-_]/g, '[-_ ]?')}\\b`, 'i').test(text);
+    if (!mentioned) continue;
+    seen.add(slug);
+    bindings.push({ adapterId: COMPOSIO_STANDING_POLICY_ADAPTER_ID, kind: 'toolkit', value: slug });
   }
   return bindings;
 }

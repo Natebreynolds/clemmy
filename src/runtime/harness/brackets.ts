@@ -1259,6 +1259,16 @@ export interface HarnessRunContext {
    *  envelopes, recall budgets) scale their tuned-for-200K defaults to the
    *  window actually available — absent ⇒ consumers keep the tuned default. */
   routedModelId?: string;
+  /** The USER's own stop authority for the current model step — the caller
+   *  signal plus the kill latch. A harness deadline abort is NOT this signal:
+   *  it retires one attempt. The fallback boundary links a RESCUE attempt to
+   *  this, so a rescue started after a watchdog abort is still cancellable by
+   *  the person (model-stall-policy.ts: isHarnessDeadlineAbortReason). */
+  callerCancelSignal?: AbortSignal;
+  /** Stamped by the fallback boundary the moment it switches brains. The host
+   *  watchdog reads it after retiring a stalled attempt: a switch in flight
+   *  earns an activity-refreshed grace; no switch means reject within seconds. */
+  modelFalloverInFlightAt?: number;
   /** Warn-advisory dedupe: (action:rule:tool) tuples already logged as
    *  guardrail_tripped events this run context (2026-07-24 feed-spam fix). */
   guardrailAdvisoryLogged?: Set<string>;

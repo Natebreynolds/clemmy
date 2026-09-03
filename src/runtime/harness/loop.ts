@@ -14382,8 +14382,11 @@ const defaultRunRunner: RunRunnerFn = async (runner, agent, items, opts) => {
     const dispatchRecoveryBaseline = dispatchLease
       ? captureDispatchRecoveryLedgerBaseline(dispatchLease.sessionId)
       : undefined;
+    // The caller's own stop authority rides the attempt context so a rescue
+    // brain started after a deadline abort stays cancellable by the person
+    // (fallback-model.ts linkAbort; the host lane does the same per step).
     const physicalAttemptContext = parentHarnessContext && dispatchLease
-      ? { ...parentHarnessContext, dispatchLease }
+      ? { ...parentHarnessContext, dispatchLease, ...(callerSignal ? { callerCancelSignal: callerSignal } : {}) }
       : parentHarnessContext;
     try {
       result = physicalAttemptContext

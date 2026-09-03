@@ -876,22 +876,29 @@ test('production host keeps the no-progress recovery directive out of the exact 
   const model = stubModel([
     [toolCall('checkpoint-before-recovery', recovery.name, {})],
     [toolCall('checkpoint-during-recovery', recovery.name, {})],
-    [textMsg('must not outrun the no-progress governor')],
+    // GUIDE, NOT GATE (2026-09-02): when the governor exhausts, the host
+    // hands the reply to the model once instead of answering for it. A plain
+    // answer here is the model's own last word and completes the turn.
+    [textMsg('I could not find a way to run that step; here is what I have so far.')],
   ]);
   const agent = { model, tools: [recovery] };
   bindHostCanarySurface(fixture, agent, [recovery]);
 
   const outcome = await runProductionHost(fixture, agent);
 
-  assert.deepEqual(outcome.terminal, {
-    status: 'blocked',
-    reason: 'control_no_progress_exhausted',
-    resumable: false,
-  });
+  assert.notEqual(outcome.terminal?.status, 'blocked',
+    'the model was given the last word and took it — no harness-authored terminal');
+  assert.match(String(outcome.finalOutput), /here is what I have so far/,
+    'the reply is the model\'s own words');
   assert.doesNotMatch(String(outcome.finalOutput), /checkpoint|reconcil/i,
     'ordinary host bookkeeping is never rendered as a user-facing effect failure');
-  assert.equal(model.calls(), 2, 'the exact one-shot recovery runs before the governor stops');
+  assert.equal(model.calls(), 3, 'the exact one-shot recovery, then the governor hands the model its last word');
   assert.equal(bodies, 0, 'neither unowned fixture crosses its body boundary');
+  assert.ok(
+    eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+      .some((event) => event.data.kind === 'last_word_turn'),
+    'the last-word hand-off is journaled',
+  );
   const rows = eventlog.openEventLog().prepare(`
     SELECT admission.batch_ordinal, admission.call_ids_json,
            checkpoint.disposition, checkpoint.history_item_count
@@ -4302,6 +4309,64 @@ test('a pre-content host model stall retries within its exact budget before beco
     else process.env.CLEMMY_MODEL_STREAM_STALL_MS = prior;
     if (priorRetries === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
     else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = priorRetries;
+  }
+});
+
+test('a stalled host model step is rescued by the next brain instead of dying (fallover survives the watchdog)', async () => {
+  // Live 2026-09-02: the watchdog aborted the same controller whose signal
+  // rode the model request, the fallback boundary read that as the user
+  // cancelling, and an 11-minute silent turn died with two healthy brains in
+  // the chain. Now the watchdog RETIRES the attempt with a typed deadline
+  // reason and keeps the step open while the next brain takes it.
+  const prior = process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+  const priorRetries = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+  const priorGrace = process.env.CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS;
+  process.env.CLEMMY_MODEL_STREAM_STALL_MS = '40';
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '0';
+  process.env.CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS = '5000';
+  const { withModelFallback } = await import('./fallback-model.js');
+  let stalledAborts = 0;
+  let rescueCalls = 0;
+  const stalled = {
+    async getResponse(request: { signal?: AbortSignal }) {
+      return await new Promise<never>((_resolve, reject) => {
+        request.signal?.addEventListener('abort', () => {
+          stalledAborts += 1;
+          reject(request.signal?.reason ?? new Error('aborted'));
+        }, { once: true });
+      });
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const rescue = {
+    async getResponse() {
+      rescueCalls += 1;
+      return { usage: {}, output: [textMsg('rescued by the next brain')] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const model = withModelFallback([
+    { label: 'stalled', getModel: () => stalled as never },
+    { label: 'rescue', getModel: () => rescue as never },
+  ]);
+  try {
+    const outcome = await hostRunRunner(
+      throwingRunner() as never,
+      { model, tools: [] } as never,
+      [] as never,
+      { maxTurns: 8 },
+    );
+    assert.equal(stalledAborts, 1, 'the stalled attempt was retired exactly once');
+    assert.equal(rescueCalls, 1, 'the next brain took the step');
+    assert.notEqual(outcome.terminal?.status, 'blocked', 'the step completed on the rescue brain');
+    assert.match(String(outcome.finalOutput), /rescued by the next brain/);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_MS;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_MS = prior;
+    if (priorRetries === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = priorRetries;
+    if (priorGrace === undefined) delete process.env.CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS;
+    else process.env.CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS = priorGrace;
   }
 });
 
@@ -7955,18 +8020,25 @@ test('a no-progress terminal carries the last host refusal check as bounded bloc
       [sameCall('catalog-miss-1')],
       [sameCall('catalog-miss-2')],
       [sameCall('catalog-miss-3')],
+      // GUIDE, NOT GATE (2026-09-02): the governor hands the model one
+      // last-word turn before terminalizing. A model that repeats the same
+      // miss even then gets the typed terminal — with the detail.
+      [sameCall('catalog-miss-4')],
       [textMsg('must not outrun the no-progress governor')],
     ]);
     const agent = { model, tools: [carrier] };
     bindHostCanarySurface(fixture, agent, [carrier]);
 
-    const outcome = await runProductionHost(fixture, agent);
+    // One more step than before: the last-word turn is a real model step.
+    const outcome = await runProductionHostSteps(fixture, agent, 10);
 
     assert.deepEqual(outcome.terminal, {
       status: 'blocked',
       reason: 'control_no_progress_exhausted',
       resumable: false,
-    }, JSON.stringify(outcome.terminal));
+    }, JSON.stringify({ terminal: outcome.terminal, calls: model.calls(), finalOutput: String(outcome.finalOutput).slice(0, 200) }));
+    assert.ok(model.calls() >= 3 && model.calls() <= 4,
+      `the misses, one last word spent on another miss, then the typed terminal (calls=${model.calls()})`);
     assert.equal(
       hostBlockedTerminalDetail(outcome),
       'catalog_entry_or_manifest_missing:candidates=0:proven=none',
@@ -8220,14 +8292,17 @@ test('production host keeps the turn open for a CONTINUE marker and runs the pro
 test('production host bounds CONTINUE markers and then stops typed, resumable, with the note as detail — never the note as the answer', async () => {
   const { MAX_HOST_CONTINUE_MARKER_CONTINUATIONS } = await import('./host-turn-runner.js');
   const fixture = acceptHostCanarySource('continue-marker-budget');
-  const frames = Array.from({ length: MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1 }, (_, index) => (
+  // GUIDE, NOT GATE (2026-09-02): once the budget is spent the host hands the
+  // model one last-word turn. A model that writes CONTINUE even then gets the
+  // typed stop — so the fixture carries one extra marker.
+  const frames = Array.from({ length: MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 2 }, (_, index) => (
     [textMsg(`CONTINUE: still going ${index}`)]
   ));
   const model = stubModel(frames);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const outcome = await runProductionHostSteps(fixture, agent, 10);
-  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1, 'budget spent, then a typed stop');
+  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 2, 'budget spent, one last word offered, then a typed stop');
   assert.equal(outcome.terminal?.status, 'blocked');
   assert.equal(outcome.terminal?.reason, 'continue_marker_exhausted');
   assert.notEqual(outcome.terminal?.resumable, false, 'resumable: "continue" re-enters');
@@ -8377,12 +8452,25 @@ test('a refused call frame tells the model the real defect and the exact repair 
   const { hostFrameRefusalDirective } = await import('./host-turn-runner.js');
   const malformed = hostFrameRefusalDirective('host_work_call_inner_operation_unidentified');
   assert.match(malformed, /before dispatch \(host_work_call_inner_operation_unidentified\)/, 'the projection parses the stage from this token');
-  assert.match(malformed, /"tool_slug":"<the exact slug tool_search disclosed>"/);
-  assert.match(malformed, /"arguments":"<the action arguments as one JSON string>"/);
-  assert.match(malformed, /Retry the same work_call once/);
+  // The exact carrier is shown as the model must emit it: args_json is a JSON
+  // STRING, so its inner quotes are escaped in the example.
+  assert.ok(malformed.includes('\\"tool_slug\\":\\"<slug>\\"'), malformed);
+  assert.match(malformed, /ONE JSON string/);
   const planBound = hostFrameRefusalDirective('host_planned_work_call_requires_plan_sibling');
   assert.match(planBound, /call plan_task naming this operation first/);
-  assert.match(planBound, /A read never needs a plan/);
+  assert.match(planBound, /If this was a read, put the exact operation tool_search disclosed under tool_slug/);
+  // A refusal is a DOOR, not a category (2026-09-02): with the turn's proof in
+  // hand it names the proven reads the model may call without a plan, the
+  // exact carrier, and the operation it could not prove.
+  const withProof = hostFrameRefusalDirective('host_planned_work_call_requires_plan_sibling', {
+    provenReads: ['GOOGLESHEETS_BATCH_GET', 'SLACK_FETCH_CONVERSATION_HISTORY'],
+    offendingOperation: 'googlesheets.batch_get',
+  });
+  assert.match(withProof, /before dispatch \(host_planned_work_call_requires_plan_sibling\)/, 'the stage token survives');
+  assert.match(withProof, /PROVEN READS this turn and need no plan/);
+  assert.match(withProof, /GOOGLESHEETS_BATCH_GET, SLACK_FETCH_CONVERSATION_HISTORY/);
+  assert.match(withProof, /could not prove "googlesheets\.batch_get" as a read/);
+  assert.ok(withProof.includes('\\"tool_slug\\":\\"<one of those>\\"'), withProof);
   assert.equal(
     hostFrameRefusalDirective('host_control_requires_sole_call_frame'),
     'The host refused this exact call frame before dispatch (host_control_requires_sole_call_frame). No tool body was entered.',

@@ -31,11 +31,36 @@ test('unsupported prose remains sealed prompt guidance, never pretend dispatch e
   assert.deepEqual(policy.directives, []);
 });
 
-test('non-executable provider rules retain sealed prompt-only toolkit bindings', () => {
+test('non-executable provider rules bind the CONNECTED toolkits they name — never a list compiled into the harness', async () => {
+  // Owner rule (2026-09-02): the harness holds no toolkit names. A policy
+  // binds to whichever connected toolkit its own words name; the connection
+  // registry is the authority for what exists.
+  const { _setConnectedToolkitsSnapshotForTests } = await import('./client.js');
   const source = 'Route all Outlook sends through the shared compliance mailbox.';
-  const policy = compileComposioStandingPolicy(source);
-  assert.equal(policy.deterministic, false);
-  assert.deepEqual(policy.directives, []);
-  assert.deepEqual(policy.bindings, [{ adapterId: 'composio', kind: 'toolkit', value: 'outlook' }]);
-  assert.ok(parseStandingPolicyDescriptor(JSON.stringify(policy), source));
+  try {
+    _setConnectedToolkitsSnapshotForTests([
+      { slug: 'outlook', connectionId: 'ca_test_outlook', status: 'ACTIVE' },
+      { slug: 'googlesheets', connectionId: 'ca_test_sheets', status: 'ACTIVE' },
+    ]);
+    const policy = compileComposioStandingPolicy(source);
+    assert.equal(policy.deterministic, false);
+    assert.deepEqual(policy.directives, []);
+    assert.deepEqual(policy.bindings, [{ adapterId: 'composio', kind: 'toolkit', value: 'outlook' }],
+      'only the connected toolkit the text names is bound');
+    assert.ok(parseStandingPolicyDescriptor(JSON.stringify(policy), source));
+
+    // A toolkit that is NOT connected is never bound, however familiar its name.
+    _setConnectedToolkitsSnapshotForTests([{ slug: 'googlesheets', connectionId: 'ca_test_sheets', status: 'ACTIVE' }]);
+    assert.deepEqual(compileComposioStandingPolicy(source).bindings, []);
+
+    // A connected toolkit with a multi-word slug is recognized however the
+    // text spells it.
+    _setConnectedToolkitsSnapshotForTests([{ slug: 'google_sheets', connectionId: 'ca_test_gs', status: 'ACTIVE' }]);
+    assert.deepEqual(
+      compileComposioStandingPolicy('Never overwrite the Google Sheets log tab.').bindings,
+      [{ adapterId: 'composio', kind: 'toolkit', value: 'google_sheets' }],
+    );
+  } finally {
+    _setConnectedToolkitsSnapshotForTests(null);
+  }
 });

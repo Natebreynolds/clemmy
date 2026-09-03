@@ -1,6 +1,6 @@
 /**
  * Incident-narrative quarantine (2026-07-31 live poison): reflection turned a
- * bad afternoon into durable character — "Nate's tool environment is
+ * bad afternoon into durable character — "the user's tool environment is
  * persistently unreliable, with expired Composio connections…" — and that
  * remembered PREJUDICE primed the very misdiagnosis it described ("Salesforce
  * expired, reconnect Composio") months later. A complaint about a MOMENT must

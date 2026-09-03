@@ -1281,7 +1281,7 @@ async function executePlanTask(
   // A plan whose operations are ALL reads is a legitimate GATHERING STAGE, not
   // an incomplete write — reads never need a write bound (owner directive
   // 2026-08-29 "she validates against the ask before a write"; live 2026-09-02
-  // the model planned exactly this "read the sheet + Salesforce, show Nate,
+  // the model planned exactly this "read the sheet + the CRM, show the user,
   // then write after validation" and the old gate refused the validate-first
   // shape it was asked for). The write is a SEPARATE accepted action the model
   // plans after the user validates. The irreversible-send floor is unchanged:

@@ -36,6 +36,7 @@ import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { addNotification } from '../notifications.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { isHarnessDeadlineAbortReason } from './model-stall-policy.js';
 import pino from 'pino';
 import {
   sizedBrainFalloverFirstByteMs,
@@ -648,8 +649,20 @@ export function clearRateLimitedBrainsForTest(): void {
   rateLimitedBrains.clear();
 }
 
+/** True when this attempt was retired by the host's own stall watchdog — on
+ * the request signal's reason, the thrown error, or its cause. */
+function harnessDeadlineRetired(request: ModelRequest, err: unknown): boolean {
+  const reason = (request as { signal?: AbortSignal }).signal?.reason;
+  return isHarnessDeadlineAbortReason(reason)
+    || isHarnessDeadlineAbortReason(err)
+    || isHarnessDeadlineAbortReason((err as { cause?: unknown } | null)?.cause);
+}
+
 function silentFailureReason(err: unknown): string | null {
   if (err instanceof FirstByteTimeoutError) return 'first-byte-timeout';
+  // The host watchdog retired this brain for silence: demote it for the rest
+  // of the run so the rescue — and any narration — lands on a healthy brain.
+  if (isHarnessDeadlineAbortReason(err)) return 'host-stall-watchdog';
   // A pre-actionable wall is a UX pace choice, not evidence the brain is dead:
   // it must not bench the user's chosen brain for the rest of the run (live
   // 2026-09-02: one 60 s wall hit benched grok-4.6 for every later frame).
@@ -854,6 +867,13 @@ export class FallbackModel implements Model {
     if (silentFailureReason(err)) this.opts.runSilencedLabels?.add(label);
   }
 
+  /** Tell the host watchdog a switch is in flight, so a retired attempt earns
+   *  its rescue an activity-refreshed grace instead of an immediate reject. */
+  private noteFalloverInFlight(): void {
+    const context = harnessRunContextStorage.getStore();
+    if (context) context.modelFalloverInFlightAt = Date.now();
+  }
+
   /** Sticky-mark a brain whose failure was an auth failure (dead until re-auth
    *  or cooldown). Called on EVERY auth-class error — including the last brain's
    *  — so the very next request routes around it. */
@@ -896,7 +916,8 @@ export class FallbackModel implements Model {
         return result;
       } catch (err) {
         cleanup(true); // release a hung request
-        const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true;
+        const harnessDeadline = harnessDeadlineRetired(request, err);
+        const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true && !harnessDeadline;
         this.markIfAuthDead(chain, i, err);
         this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
@@ -911,10 +932,14 @@ export class FallbackModel implements Model {
             + 'Reconnect it (Settings → Models) and resend — I will not switch to a different brain you did not choose.',
           );
         }
-        if (!callerAborted && this.isFalloverReason(err) && !isLast) {
+        if (!callerAborted && (harnessDeadline || this.isFalloverReason(err)) && !isLast) {
           falloverReason = this.falloverReason(err);
+          this.noteFalloverInFlight();
           this.logFallover(chain, i, err);
           continue;
+        }
+        if (callerAborted && !isLast && this.isFalloverReason(err)) {
+          logger.warn({ brain: chain[i].label, reason: this.falloverReason(err) }, 'brain failed after caller abort — not switching brains');
         }
         if (err instanceof PreContentStreamEndedError && !callerAborted) {
           throw emptyCompletionBoundary(chain[i].label, err, err.sawModelActivity);
@@ -1014,18 +1039,34 @@ export class FallbackModel implements Model {
         return; // streamed to completion
       } catch (err) {
         cleanup(true); // release a hung brain
-        const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true;
+        const harnessDeadline = harnessDeadlineRetired(request, err);
+        const callerAborted = (request as { signal?: AbortSignal }).signal?.aborted === true && !harnessDeadline;
         this.markIfAuthDead(chain, i, err);
         this.rememberRunSilent(chain[i].label, err);
         recordBrainSilentFailure(chain[i].label, err, { sessionId: this.opts.sessionId, workflowRunId: this.opts.workflowRunId });
         markBrainRateLimited(chain[i].label, err);
+        // The pinned-brain credential edge is the user's to fix, on the
+        // streamed path exactly as on the buffered one: never silently
+        // substitute a brain they did not choose (the guard existed only in
+        // getResponse; host_v1 always streams, so it never applied live).
+        if (!committedActionable && !callerAborted && isAuthDeadReason(err) && isUserPinnedBrain(chain[i].label)) {
+          const detail = err instanceof Error ? err.message : String(err);
+          throw new Error(
+            `${chain[i].label} could not authenticate (${detail.slice(0, 200)}). `
+            + 'Reconnect it (Settings → Models) and resend — I will not switch to a different brain you did not choose.',
+          );
+        }
         // Switch only if NO ACTIONABLE content reached the Runner (metadata and
         // private reasoning were buffered), the caller did not cancel, and a
-        // next brain exists.
-        if (!committedActionable && !callerAborted && this.isFalloverReason(err) && !isLast) {
+        // next brain exists. A harness deadline is not the caller cancelling.
+        if (!committedActionable && !callerAborted && (harnessDeadline || this.isFalloverReason(err)) && !isLast) {
           falloverReason = this.falloverReason(err);
+          this.noteFalloverInFlight();
           this.logFallover(chain, i, err);
           continue;
+        }
+        if (callerAborted && !committedActionable && !isLast && this.isFalloverReason(err)) {
+          logger.warn({ brain: chain[i].label, reason: this.falloverReason(err) }, 'brain failed after caller abort — not switching brains');
         }
         if (err instanceof PreContentStreamEndedError && !callerAborted) {
           throw emptyCompletionBoundary(chain[i].label, err, err.sawModelActivity);
@@ -1066,6 +1107,9 @@ export class FallbackModel implements Model {
   }
 
   private isFalloverReason(err: unknown): boolean {
+    // Explicit: the stall error's message says "timed out" and its name is not
+    // a transport class, so classifyModelError reads it as runtime.unknown.
+    if (isHarnessDeadlineAbortReason(err)) return true;
     return err instanceof FirstByteTimeoutError
       || (err instanceof ResponseWallExceededError && !err.committedActionable)
       || err instanceof PreActionableTimeoutError
@@ -1074,6 +1118,7 @@ export class FallbackModel implements Model {
   }
 
   private falloverReason(err: unknown): string {
+    if (isHarnessDeadlineAbortReason(err)) return 'host-stall-watchdog';
     if (err instanceof FirstByteTimeoutError) return 'first-content-timeout';
     if (err instanceof ResponseWallExceededError) return 'response-wall-exceeded';
     if (err instanceof PreActionableTimeoutError) return 'pre-actionable-timeout';
@@ -1287,10 +1332,18 @@ export class FallbackModel implements Model {
    *  timeout (or the caller cancelling) actually releases the hung request. */
   private linkAbort(request: ModelRequest): { request: ModelRequest; cleanup: (aborted: boolean) => void } {
     const controller = new AbortController();
-    const parent = (request as { signal?: AbortSignal }).signal;
-    const onParentAbort = () => controller.abort();
+    const original = (request as { signal?: AbortSignal }).signal;
+    // A parent already retired by the host's stall watchdog must not abort the
+    // RESCUE at birth — every attempt after that abort was stillborn (live
+    // 2026-09-02). The rescue links to the user's own cancel authority
+    // instead, so a person's stop still cancels it.
+    const deadlineRetired = original?.aborted === true && isHarnessDeadlineAbortReason(original.reason);
+    const parent = deadlineRetired
+      ? harnessRunContextStorage.getStore()?.callerCancelSignal
+      : original;
+    const onParentAbort = () => controller.abort(parent?.reason);
     if (parent) {
-      if (parent.aborted) controller.abort();
+      if (parent.aborted) controller.abort(parent.reason);
       else parent.addEventListener('abort', onParentAbort, { once: true });
     }
     return {

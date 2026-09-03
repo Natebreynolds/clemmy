@@ -20,6 +20,9 @@ import { CodexModelProvider } from './codex-model.js';
 import { getByoModel } from './byo-model.js';
 import {
   assertUnambiguousModelRouting,
+  configuredByoProvidersForModel,
+  getByoProviders,
+  providerToBackendConfig,
   resolveByoProviderForModel,
   resolveDeclaredByoProviderForModel,
 } from './byo-providers.js';
@@ -300,6 +303,48 @@ export class RouterModelProvider implements ModelProvider {
   /** Build the cross-provider fallover chain: the primary first, then every OTHER
    *  connected brain (deduped by provider), most-reliable first. Lazy targets —
    *  a fallback brain is only constructed if reached. */
+  /**
+   * Every OTHER configured BYO backend, as a rescue for this primary. The chain
+   * used to treat all BYO backends as one bucket — appended only when the
+   * primary was NOT BYO — so a grok primary could never fall over to GLM even
+   * with both backends live in memory (2026-09-02). The primary's own provider
+   * is excluded; the user's pinned choice is never swapped by this list, it
+   * only gains somewhere to go when it dies. Lazy: an unreached sibling is
+   * never constructed. Capped so six connected providers do not build a
+   * six-deep chain.
+   */
+  private byoSiblingTargets(primary: { provider: BrainProvider; label: string }): FallbackTarget[] {
+    if ((getRuntimeEnv('CLEMMY_BRAIN_FALLOVER_BYO_SIBLINGS', 'on') ?? 'on').trim().toLowerCase() === 'off') return [];
+    let owners = new Set<string>();
+    try {
+      owners = new Set(configuredByoProvidersForModel(primary.label).map((provider) => provider.id));
+    } catch {
+      // An identity collision means the primary's owner is ambiguous; fall
+      // back to excluding by base URL below.
+    }
+    let primaryBaseUrl = '';
+    try {
+      primaryBaseUrl = (resolveByoProviderForModel(primary.label)?.baseURL ?? '').trim().toLowerCase();
+    } catch { /* no resolvable primary backend */ }
+    const targets: FallbackTarget[] = [];
+    for (const provider of getByoProviders()) {
+      if (targets.length >= 2) break;
+      if (owners.has(provider.id)) continue;
+      if (primaryBaseUrl && provider.baseURL.trim().toLowerCase() === primaryBaseUrl) continue;
+      const modelId = provider.modelIds[0];
+      if (!modelId || modelId === primary.label) continue;
+      const backend = providerToBackendConfig(provider);
+      if (!backend.configured) continue;
+      targets.push({
+        label: `byo:${provider.id}:${modelId}`,
+        provider: 'byo',
+        model: modelId,
+        getModel: () => this.resolveByoModel(modelId, backend),
+      });
+    }
+    return targets;
+  }
+
   private buildBrainChain(primary: { model: Model; provider: BrainProvider; label: string }): FallbackTarget[] {
     const chain: FallbackTarget[] = [{
       label: primary.label,
@@ -320,6 +365,8 @@ export class RouterModelProvider implements ModelProvider {
     if (getModelRoutingMode() === 'all_in') {
       const workerScope = Boolean(harnessRunContextStorage.getStore()?.guardrailScopeId);
       if (workerScope) return chain;
+      // Sibling BYO backends first: all_in means subscriptions are last resort.
+      if (primary.provider === 'byo') chain.push(...this.byoSiblingTargets(primary));
       if (primary.provider !== 'codex' && this.codexAvailable()) {
         const model = codexRescueModelId();
         chain.push({
@@ -373,6 +420,8 @@ export class RouterModelProvider implements ModelProvider {
         getModel: () => this.resolveByoModel(model, byo),
       });
     }
+    // A BYO primary gets its sibling BYO backends as rescues too.
+    if (primary.provider === 'byo') chain.push(...this.byoSiblingTargets(primary));
     return chain;
   }
 }

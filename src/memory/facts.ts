@@ -2294,7 +2294,7 @@ export function decayAndEvictFacts(options: DecayOptions = {}): DecayResult {
  * so the harness has to heal it where it is observed.
  *
  * The id is REPLACED rather than the fact retired, because the id was never
- * the point: "use the Scorpion calendar connection" is the durable intent and
+ * the point: "use the <client> calendar connection" is the durable intent and
  * only its machine spelling went stale. supersedeFact carries the pin across,
  * so a user's pinned preference survives the correction instead of being
  * silently dropped.

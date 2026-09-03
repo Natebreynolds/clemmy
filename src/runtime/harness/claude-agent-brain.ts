@@ -843,10 +843,10 @@ function mergeClaudeRunEvidence(
 function renderArtifactVerificationPrompt(artifacts: readonly RunArtifact[]): string {
   const rows = artifacts.map((artifact) => {
     if (artifact.kind === 'google_doc') {
-      return `- Google Doc document_id=${artifact.resourceId}: call GOOGLEDOCS_GET_DOCUMENT_PLAINTEXT (or the connected exact get-document-by-id equivalent) with exactly that document_id.`;
+      return `- Document document_id=${artifact.resourceId}: call the connected provider's exact get-document-by-id read (tool_search names it; never a search or list) with exactlythat document_id.`;
     }
-    if (artifact.kind === 'resource' && artifact.provider === 'googlesheets') {
-      return `- Google Sheet spreadsheet_id=${artifact.resourceId}: call GOOGLESHEETS_BATCH_GET (or the connected exact spreadsheet/range getter equivalent) with exactly that spreadsheet_id, the exact constructor range covering its header and rows, and valueRenderOption=UNFORMATTED_VALUE.`;
+    if (artifact.kind === 'resource' && artifact.provider) {
+      return `- ${artifact.provider} resource id=${artifact.resourceId}: call that provider's exact get-by-id read (tool_search names it; never a search or list) with exactlythat spreadsheet_id, the exact constructor range covering its header and rows, and valueRenderOption=UNFORMATTED_VALUE.`;
     }
     return `- Netlify site_id=${artifact.resourceId}: call run_shell_command once with netlify api getSite --data '{"site_id":"${artifact.resourceId}"}'.`;
   });

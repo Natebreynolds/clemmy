@@ -1166,3 +1166,79 @@ appears in the daemon log and no `goal_alignment_judged` event was emitted.
 Silence is the correct behavior when a run is on track, since the watcher only
 speaks on drift, so this is unverified rather than known-broken. It should be
 verified deliberately before anyone claims it is live.
+
+## Gate 17 — read anything the model outputs; guide, don't gate (2026-09-02 night)
+
+Run 4 of the Platform 49 cleanup (session `sess-desktop-7e6195295f22059e7fa1d040`,
+seq 119716, grok-4.6) was reconstructed from durable records, not timing:
+`operational-telemetry.db` (per-call `model_call_started/completed`),
+`harness.db` (`model_request_provenance`, `host_model_result_receipts`,
+`logical_tool_calls`), the session event log and the daemon log.
+
+| step | grok returned | harness did |
+|---|---|---|
+| 1 (24s) | 289 tok → 5 tool calls | all admitted, settled, journaled |
+| 2 (57s) | 635 tok → `[workflow_get, work_call]` | **both refused pre-dispatch** (`host_planned_work_call_requires_plan_sibling`, `retry_mode: replan`); no logical call; no event; no log |
+| 3 (10s) | 297 tok → `[work_call]` | refused again, same reason |
+| 4 (600s+) | nothing | watchdog abort at 600s, recorded `cancelled` (invisible), harness-authored terminal |
+
+The refused call was a READ of the sheet `tool_search` had just proven
+(`GOOGLESHEETS_BATCH_GET`, `effectClass: read`). The directive it got named no
+door ("check that the inner operation name and arguments are exact") and was
+attached to the sibling `workflow_get`, not the `work_call` that caused it.
+Ruled out with evidence: key contention (the concurrent scheduled workflow ran
+on glm-5.3; zero failures/cooldowns/fallovers since 22:56), the buffered
+non-streaming path, and a model-side "stall" as the primary cause.
+
+The owner's two reads organized the fix: "the model should always own the
+response, not the harness" and "the harness should be able to read anything
+the model outputs — we are trying to get structured outputs from each model
+that is going to respond different."
+
+**Shipped:**
+- `carrier-reader.ts` — one tolerant reader for any carrier dialect (bare,
+  dotted, gateway-prefixed, mcp-prefixed, doubled envelopes, arguments under
+  `args_json`/`args`/`arguments`/`input`/`params`, direct calls by slug),
+  resolved against the turn's PROVEN entries (exact identity, then unique
+  affix). A proven read is rebuilt into the canonical gateway carrier and
+  re-proven by the same descent; the dispatcher still re-proves operation,
+  account, schema and effect. Shape is never the gate; proof is. 16 dialects
+  of one read pinned in `carrier-reader.test.ts`.
+- `hostFrameRefusalDirective` now takes the turn's proof: it names the proven
+  reads that need no plan, the exact carrier, and the operation it could not
+  prove. The directive lands on the offending call; `counts_refusal` too.
+- Every pre-dispatch refusal is journaled (`guardrail_tripped` /
+  `frame_refused`, with the raw carrier shape) and logged; `blockedOutcome`
+  logs every blocked reason; a watchdog `cancelled` now records
+  `model_call_failed` (status cancelled) so a killed step is visible.
+- One last-word turn before a resumable harness terminal: governor
+  exhaustion, a second consecutive frame refusal, CONTINUE-marker exhaustion.
+  The model gets what the host observed and three exits — answer, ask one
+  question, or name the exact blocked call. Exactly once; the next exhaustion
+  is terminal. Safety floors (`tool_effect_uncertain`, duplicate committed
+  call, write verification) never get it.
+- Fallover survives the watchdog: `isHarnessDeadlineAbortReason` (narrow —
+  `ModelStreamStalledError` only) so `callerAborted` excludes a harness
+  deadline; `isFalloverReason` includes it explicitly (it classified
+  `runtime.unknown`); `linkAbort` links a deadline-retired rescue to the new
+  `HarnessRunContext.callerCancelSignal` instead of the dead parent; the host
+  watchdog ESCALATES (abort, re-arm) and grants a stamped rescue an
+  activity-refreshed grace (`CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS`, 120s; no
+  rescue ⇒ reject within 5s). Pinned end to end in `host-stall-fallover.test.ts`
+  and a host-runner integration test.
+- A BYO primary gets its sibling BYO backends as rescues (`byoSiblingTargets`,
+  cap 2, pinned brain never swapped); the pinned-auth guard now applies on the
+  streamed path too.
+- Pin sweep: `promptToolkitBindings` binds any CONNECTED toolkit the text
+  names; the brain's verification prompt names "the connected exact getter"
+  instead of slugs; owner names scrubbed from comments; and a ratchet test
+  (`no-hardcoded-provider-pins.test.ts`) fails any new production file that
+  names provider operations, or any existing one that gains them.
+
+**Not tonight (recorded, not lost):** the streaming allowlist inversion,
+`production-capability-adapters` SHEET_*/calendar pins and the
+`operation-semantics` tables (need replacements from connect-time definitions
+and procedural memory), host-compiled plans from intent for writes, the
+legacy-lane watchdog escalation mirror, and Phase 2 (auto-continue from a
+clean terminal, paging-as-progress, machine-usable checkpoint, host pagination
+mount).

@@ -359,7 +359,7 @@ function accountSourceMentionCannotSelect(text: string, start: number): boolean 
  * Exact connected addresses are closed-set identities, but their grammatical
  * role still matters. An attendee/recipient may itself be one of the user's
  * connected mailboxes (the live canary invited the personal mailbox from the
- * Scorpion mailbox), so mere occurrence can never select source authority.
+ * a client's mailbox), so mere occurrence can never select source authority.
  */
 function connectedEmailsNamedAsSource(input: {
   text: string;
@@ -466,7 +466,7 @@ export function sessionEstablishedConnectedAccountEmail(input: {
 }
 
 /** A reply to an offered mailbox list may name the address, or uniquely name
- * the domain ("My scorpion email please" vs breakthroughcoaching). Live
+ * the domain ("My <client> email please" vs the user's own domain). Live
  * 2026-08-29 seq 98720 answered the host question that way; the next Outlook
  * search still withheld the write and re-asked. */
 export function uniqueConnectedAccountFromSelectionReply(input: {

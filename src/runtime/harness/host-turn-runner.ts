@@ -55,6 +55,11 @@ import {
 } from './attempt-settlement.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
+import {
+  canonicalGatewayCarrier,
+  readModelCarrier,
+  resolveProvenOperation,
+} from './carrier-reader.js';
 import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
   KillRequested,
@@ -115,13 +120,29 @@ export const MAX_HOST_CONTINUE_MARKER_CONTINUATIONS = 3;
  * floor. A refusal that names only a category is a dead end: the model cannot
  * repair what it cannot see (live 2026-09-01: "requires plan sibling" for a
  * malformed read carrier). */
-export function hostFrameRefusalDirective(reason: HostModelFrameRefusal): string {
+export function hostFrameRefusalDirective(
+  reason: HostModelFrameRefusal,
+  /** What the host actually knows, so the refusal is a door and not a category:
+   * the reads proven this turn (which need no plan) and the operation the
+   * model named that could not be proven. Live 2026-09-02 (grok-4.6): "check
+   * that the inner operation name and arguments are exact" named no door, the
+   * model retried the same call, and the turn died. */
+  context?: { provenReads?: readonly string[]; offendingOperation?: string | null },
+): string {
   const base = `The host refused this exact call frame before dispatch (${reason}). No tool body was entered.`;
+  const provenReads = [...new Set((context?.provenReads ?? []).map((id) => id.trim()).filter(Boolean))].slice(0, 12);
+  const exactReadDoor = provenReads.length > 0
+    ? ` These operations are PROVEN READS this turn and need no plan — call ONE of them exactly: ${provenReads.join(', ')}.`
+      + ' Exact carrier: work_call {"name":"composio_execute_tool","args_json":"{\\"tool_slug\\":\\"<one of those>\\",\\"arguments\\":\\"<that operation\'s arguments as ONE JSON string>\\"}"}.'
+    : ' If this was a read, put the exact operation tool_search disclosed under tool_slug and its arguments as ONE JSON string under arguments: work_call {"name":"composio_execute_tool","args_json":"{\\"tool_slug\\":\\"<slug>\\",\\"arguments\\":\\"<JSON string>\\"}"}.';
+  const offending = context?.offendingOperation?.trim()
+    ? ` The host could not prove "${context.offendingOperation.trim()}" as a read this turn.`
+    : '';
   if (reason === 'host_work_call_inner_operation_unidentified') {
-    return `${base} The work_call carried an inner call whose operation the host could not identify. For composio_execute_tool the inner args_json MUST be {"tool_slug":"<the exact slug tool_search disclosed>","arguments":"<the action arguments as one JSON string>"}; any other inner name must be a non-empty exact operation name. Retry the same work_call once with that exact shape; nothing else changes.`;
+    return `${base} The work_call carried an inner call whose operation the host could not identify.${exactReadDoor}`;
   }
   if (reason === 'host_planned_work_call_requires_plan_sibling') {
-    return `${base} A write or send through work_call needs its plan: call plan_task naming this operation first. A read never needs a plan, so if this was a read, check that the inner operation name and arguments are exact and retry.`;
+    return `${base} A write or send through work_call needs its plan: call plan_task naming this operation first.${offending}${exactReadDoor}`;
   }
   return base;
 }
@@ -149,6 +170,7 @@ const HOST_JUDGE_CONTROL_TOOL_NAMES: ReadonlySet<string> = new Set([
 import {
   ModelStreamStalledError,
   sizedFirstByteStallMs,
+  modelStallFalloverGraceMs,
   modelStreamStallMs,
   modelStreamStallRetries,
 } from './model-stall-policy.js';
@@ -2311,6 +2333,71 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     });
     throw error;
   };
+  /**
+   * GUIDE, NOT GATE — one last-word turn before a resumable harness terminal.
+   *
+   * A harness-authored terminal means the model was never given a path to
+   * completion (live 2026-09-02: two pre-dispatch refusals, then a dead turn,
+   * then prose the model never wrote). Before the host ends a turn for a
+   * resumable, non-safety reason it hands the reply to the model ONCE, with
+   * what it observed and three exits. The next exhaustion is terminal. Safety
+   * floors (uncertain external effect, duplicate committed call, write
+   * verification) never get this turn: they are the verifiable hard gates.
+   */
+  let lastWordTurnUsed = false;
+  let consecutiveFrameRefusals = 0;
+  /** The refusal check behind a RETIRED frame, captured before its
+   *  diagnostic-less receipts hide it — so the terminal can still say why. */
+  let lastRetiredFrameRefusalDetail: string | undefined;
+  const LAST_WORD_EXCLUDED_REASONS: ReadonlySet<string> = new Set([
+    'tool_effect_uncertain',
+    'model_reused_committed_call_id',
+    'write_committed_verification_pending',
+    'write_verification_retry_pending',
+  ]);
+  const journalHostGuide = (kind: string, data: Record<string, unknown>): void => {
+    if (!hostProduction) return;
+    try {
+      const identity = exactHostIdentity();
+      appendEvent({
+        sessionId: identity.sessionId,
+        turn: 0,
+        role: 'system',
+        type: 'guardrail_tripped',
+        data: { kind, sourceUserSeq: identity.sourceUserSeq, ...data },
+      });
+    } catch { /* telemetry never blocks the turn */ }
+  };
+  const retainedWorkSummary = (): string => {
+    if (!hostProduction) return '';
+    try {
+      const identity = exactHostIdentity();
+      return renderFailureWithRetainedWork({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        fallbackText: '',
+      }).trim().slice(0, 1200);
+    } catch {
+      return '';
+    }
+  };
+  const tryLastWordTurn = (reason: string, observed: readonly string[]): boolean => {
+    if (!hostProduction || lastWordTurnUsed || LAST_WORD_EXCLUDED_REASONS.has(reason)) return false;
+    lastWordTurnUsed = true;
+    const retained = retainedWorkSummary();
+    const directive = [
+      `HOST CHECKPOINT (${reason}) — the harness will not re-ask again after this. You own the reply now.`,
+      observed.length > 0 ? `Observed: ${observed.join(' | ').slice(0, 1500)}` : '',
+      retained,
+      'Do exactly ONE of: (1) answer the user in plain words with what you already have; (2) ask the user ONE specific question; (3) name the single exact tool call you are blocked on (tool + arguments) and stop.',
+      'Do not repeat a refused call unchanged, and do not describe internal errors — speak to the user.',
+    ].filter(Boolean).join(' ');
+    pendingHostModelDirective = [pendingHostModelDirective, directive].filter(Boolean).join(' ');
+    journalHostGuide('last_word_turn', { reason, observed: observed.slice(0, 8) });
+    hostTurnLogger.warn({ reason, observed: observed.slice(0, 4) }, 'host handed the reply to the model before a terminal');
+    return true;
+  };
+
   const blockedOutcome = (
     text = HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT,
     reason = 'durable_stop_and_explain',
@@ -2334,12 +2421,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // last consequence stage) rides along as bounded machine detail.
     const blockedDetail = reason === 'control_no_progress_exhausted'
       ? lastHostRefusalDetail(history)
+        ?? lastRetiredFrameRefusalDetail
         ?? (noProgressState?.lastConsequence?.stage
           ? boundedBlockedDetail(noProgressState.lastConsequence.stage)
           : undefined)
       : reason === 'continue_marker_exhausted' && lastContinueMarkerNote
         ? boundedBlockedDetail(lastContinueMarkerNote)
         : undefined;
+    // Never silent by construction: every blocked terminal names its reason
+    // in the process log (live 2026-09-02: a stalled turn ended with no line).
+    hostTurnLogger.warn({ reason, resumable, ...(blockedDetail ? { blockedDetail } : {}) }, 'host blocked terminal');
     const outcome: HostRunOutcome = {
       history,
       lastResponseId,
@@ -2645,6 +2736,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     };
     if (signal?.aborted) callerAbort();
     else signal?.addEventListener('abort', callerAbort, { once: true });
+    // The USER's own stop authority for this step: the caller signal plus the
+    // kill latch. The watchdog's deadline abort below is NOT this — it retires
+    // one attempt so the fallback boundary can rescue the step on another
+    // brain, and that rescue stays cancellable by the person through here.
+    const cancelAuthority = new AbortController();
+    const cancelAuthorityFromCaller = (): void => {
+      if (!cancelAuthority.signal.aborted) cancelAuthority.abort(signal?.reason);
+    };
+    if (signal?.aborted) cancelAuthorityFromCaller();
+    else signal?.addEventListener('abort', cancelAuthorityFromCaller, { once: true });
+    if (ambient) {
+      ambient.callerCancelSignal = cancelAuthority.signal;
+      ambient.modelFalloverInFlightAt = 0;
+    }
 
     let stallTimer: ReturnType<typeof setInterval> | undefined;
     let killTimer: ReturnType<typeof setInterval> | undefined;
@@ -2652,8 +2757,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const streamMs = modelStreamStallMs();
     // Sized to the prompt: a 100k-token prefill is not a hang (model-stall-policy.ts).
     const firstByteMs = sizedFirstByteStallMs(modelInput);
+    const falloverGraceMs = modelStallFalloverGraceMs();
+    // How long the host waits after retiring an attempt for the fallback
+    // boundary to stamp that a rescue started. No stamp ⇒ nothing to wait for.
+    const FALLOVER_SWITCH_DETECT_MS = 5_000;
     let lastSemanticActivityAt = Date.now();
     let sawActionableActivity = false;
+    let escalatedAt = 0;
+    let escalatedError: ModelStreamStalledError | undefined;
     const stall = new Promise<never>((_, reject) => {
       if (streamMs <= 0) return;
       const preContentMs = firstByteMs > 0 ? firstByteMs : streamMs;
@@ -2676,14 +2787,43 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const windowMs = sawActionableActivity || bufferedProviderRequestInFlight
           ? streamMs
           : preContentMs;
-        if (Date.now() - observedActivityAt < windowMs) return;
-        const error = new ModelStreamStalledError(
-          Math.max(1, Math.round(windowMs / 1000)),
-          !sawActionableActivity,
-          bufferedProviderRequestInFlight,
-        );
-        if (!controller.signal.aborted) controller.abort(error);
-        reject(error);
+        if (escalatedAt === 0) {
+          if (Date.now() - observedActivityAt < windowMs) return;
+          // ESCALATE, do not reject: abort the stalled attempt with a typed
+          // deadline reason so the fallback boundary can switch brains, then
+          // keep this step alive while a rescue is in flight. Rejecting in the
+          // same tick as the abort orphaned every rescue (live 2026-09-02: an
+          // 11-minute silent turn with two healthy brains never consulted).
+          const error = new ModelStreamStalledError(
+            Math.max(1, Math.round(windowMs / 1000)),
+            !sawActionableActivity,
+            bufferedProviderRequestInFlight,
+          );
+          escalatedError = error;
+          escalatedAt = Date.now();
+          hostTurnLogger.error({
+            seconds: error.seconds,
+            preContent: error.preContent,
+            bufferedProviderRequestInFlight,
+            falloverGraceMs,
+          }, 'host model step stalled — retiring the attempt so the brain chain can rescue it');
+          if (!controller.signal.aborted) controller.abort(error);
+          if (falloverGraceMs <= 0) reject(error);
+          return;
+        }
+        const switched = (ambient?.modelFalloverInFlightAt ?? 0) > escalatedAt;
+        if (!switched) {
+          if (Date.now() - escalatedAt > FALLOVER_SWITCH_DETECT_MS) {
+            hostTurnLogger.error({ seconds: escalatedError?.seconds }, 'no rescue brain took the stalled model step');
+            reject(escalatedError!);
+          }
+          return;
+        }
+        // A rescue is streaming: its activity refreshes the clock. Only its
+        // own silence, past the grace, ends the step.
+        if (Date.now() - Math.max(observedActivityAt, escalatedAt) < falloverGraceMs) return;
+        hostTurnLogger.error({ falloverGraceMs }, 'rescue brain stalled after the watchdog retired the first attempt');
+        reject(escalatedError!);
       }, tickMs);
     });
     const killed = new Promise<never>((_, reject) => {
@@ -2693,6 +2833,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           if (!isKillRequested(ambient.sessionId, killTarget)) return;
           const error = new KillRequested(ambient.sessionId);
           if (!controller.signal.aborted) controller.abort(error);
+          if (!cancelAuthority.signal.aborted) cancelAuthority.abort(error);
           reject(error);
         } catch {
           // The kill poll is best-effort; the exact lease remains the hard
@@ -2765,6 +2906,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (stallTimer) clearInterval(stallTimer);
       if (killTimer) clearInterval(killTimer);
       signal?.removeEventListener('abort', callerAbort);
+      signal?.removeEventListener('abort', cancelAuthorityFromCaller);
       if (rejectCallerAbort) signal?.removeEventListener('abort', rejectCallerAbort);
     }
   };
@@ -5987,7 +6129,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     let modelStepSchemas: readonly unknown[] = schemas;
     let permittedNoProgressRecoveryToolNames: ReadonlySet<string> | null = null;
-    // TRAJECTORY WATCHER — the mid-run "is this still the thing Nate asked
+    // TRAJECTORY WATCHER — the mid-run "is this still the thing the user asked
     // for?" check. It has existed for a while but only in the legacy core
     // (loop.ts) and the workflow lane, and a live chat turn runs host_v1 which
     // never enters either — so a turn that drifted at tool-call 3 burned the
@@ -6102,11 +6244,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             });
             noProgressState = decision.state;
             if (decision.action === 'terminalize') {
-              return blockedOutcome(
-                hostNoProgressBlockedText(decision.state),
-                'control_no_progress_exhausted',
-                false,
-              );
+              // GUIDE, NOT GATE: the model gets one last-word turn with what
+              // the governor observed before the harness ends the turn with
+              // prose the model never wrote. The next exhaustion is terminal.
+              const lastRefusal = lastHostRefusalDetail(history);
+              if (tryLastWordTurn('control_no_progress_exhausted', [
+                `the no-progress governor exhausted its budget (${decision.state.lastConsequence?.stage ?? 'no consequence stage'})`,
+                ...(lastRefusal ? [`last refusal: ${lastRefusal}`] : []),
+              ])) {
+                noProgressRecoveryOnly = false;
+                noProgressRecoveryDirectiveWritten = false;
+              } else {
+                return blockedOutcome(
+                  hostNoProgressBlockedText(decision.state),
+                  'control_no_progress_exhausted',
+                  false,
+                );
+              }
             }
             if (decision.action === 'reconcile') {
               return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
@@ -6435,6 +6589,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           lastContinueMarkerNote = note.slice(0, 400) || undefined;
           history.push(...admission.frame.history);
           if (step.responseId !== undefined) lastResponseId = step.responseId;
+          // GUIDE, NOT GATE: one last-word turn before the harness answers
+          // for the model. A further bare CONTINUE after it is terminal.
+          if (tryLastWordTurn('continue_marker_exhausted', [
+            `you wrote CONTINUE ${MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1} times without making the call`
+              + (note ? ` (${note.slice(0, 200)})` : ''),
+          ])) {
+            continue;
+          }
           return blockedOutcome(
             `I planned the next step ${MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1} times without making the call`
               + (note ? ` (${note.slice(0, 300)})` : '')
@@ -6535,6 +6697,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (retiredZeroCrossingFrames.has(canonicalFrameDigest)) {
       // A semantically repeated frame with fresh ids takes the ordinary
       // admitted/receipt path. Reused ids were already stopped above.
+      // The retired receipts carry no diagnostic, so capture the refusal check
+      // the model actually saw BEFORE they land in history (say why).
+      lastRetiredFrameRefusalDetail = lastHostRefusalDetail(history) ?? lastRetiredFrameRefusalDetail;
       const paired = pairLocallyRefusedFrame(canonicalCalls, true);
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
@@ -6543,9 +6708,41 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         responseId: step.responseId,
       });
       if (resultCommitBlock) return resultCommitBlock;
+      // GUIDE, NOT GATE: after the model's last word, an exact repeat of a
+      // retired frame is the typed terminal WITH its detail — never harness
+      // prose passed off as a completed answer.
+      if (lastWordTurnUsed) {
+        return blockedOutcome(
+          hostNoProgressBlockedText(noProgressState),
+          'control_no_progress_exhausted',
+          false,
+        );
+      }
       return await completedOutcome(capabilityUnavailableTextFor(canonicalCalls));
     }
     let frameDisposition: HostModelFrameDisposition;
+    // What the host proved this turn — the ONLY authority a carrier's shape is
+    // read against (chat disclosure), or the operations a sealed workflow step
+    // froze into its scope before the model spoke. Computed once per frame so
+    // the refusal directive can name the proven reads too.
+    let turnProvenEntries: Array<{ kind: string; identifier: string; effectClass?: string }> = [];
+    if (hostProduction) {
+      try {
+        const completionIdentity = exactHostIdentity();
+        turnProvenEntries = provenCapabilityEntriesForTurn({
+          sessionId: completionIdentity.sessionId,
+          sourceUserSeq: completionIdentity.sourceUserSeq,
+        });
+      } catch { /* no accepted identity: nothing proven this turn */ }
+      if (turnProvenEntries.length === 0) {
+        try {
+          const scope = currentAcceptedSourceCatalogManifestScope();
+          if (scope) {
+            turnProvenEntries = [...scope.operationIds].map((identifier) => ({ kind: 'frozen_scope', identifier }));
+          }
+        } catch { /* no sealed scope either */ }
+      }
+    }
     try {
       const frameCalls = canonicalCalls.map((call) => {
         const tool = toolByName.get(call.name);
@@ -6561,23 +6758,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           && tool
           && (isPlainOrClementineLocalTool(call.name, 'work_call') || isPlainOrClementineLocalTool(call.name, 'call_tool') || directGateway)
         ) {
-          let provenEntries: Array<{ kind: string; identifier: string; effectClass?: string }> = [];
-          try {
-            const completionIdentity = exactHostIdentity();
-            provenEntries = provenCapabilityEntriesForTurn({
-              sessionId: completionIdentity.sessionId,
-              sourceUserSeq: completionIdentity.sourceUserSeq,
-            });
-          } catch { /* no accepted identity: nothing proven this turn */ }
-          if (provenEntries.length === 0) {
-            // A sealed workflow step: its operations were frozen into the
-            // accepted-source scope before the model spoke. Those are what a
-            // stuttered or slug-less carrier completes to.
-            const scope = currentAcceptedSourceCatalogManifestScope();
-            if (scope) {
-              provenEntries = [...scope.operationIds].map((identifier) => ({ kind: 'frozen_scope', identifier }));
-            }
-          }
+          const provenEntries = turnProvenEntries;
           const completed = directGateway
             ? completeDirectCarrierArguments(call.name, argumentsJson, provenEntries)
             : completeCarrierArguments(argumentsJson, provenEntries);
@@ -6593,7 +6774,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             }, 'host completed a provider carrier from the turn\'s proven disclosure');
           }
         }
-        const argumentsValue = parsedArgs(argumentsJson);
+        let argumentsValue = parsedArgs(argumentsJson);
         // The fused frame is classified before plan_task has materialized its
         // selected catalog rows. At this scheduling-only edge, an exact
         // same-source discovery receipt may therefore be the sole current
@@ -6601,9 +6782,44 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // as the production call boundary; plan activation and the last-edge
         // exactProductionHostCall still re-open the full catalog/manifest/
         // account/schema/port identity before any provider dispatch.
-        const provenRead = argumentsValue
+        let provenRead = argumentsValue
           ? provenTurnReadDescent(call.name, argumentsValue, tool)
           : null;
+        // READ ANYTHING THE MODEL OUTPUTS; RESOLVE IT AGAINST PROOF. Every
+        // brain spells a carrier differently. When the exact descent above did
+        // not recognize the shape, read it tolerantly (carrier-reader.ts) and
+        // resolve the operation it names against the turn's proven entries. A
+        // proven READ is rebuilt into the canonical gateway carrier and
+        // re-proven by the same descent — shape was never the gate, proof is,
+        // and the dispatcher below still re-proves operation, account, schema
+        // and effect before any provider I/O. Live 2026-09-02 (grok-4.6): a
+        // proven sheet read in an unrecognized shape was refused twice as
+        // "needs a plan" and the turn died.
+        if (
+          !provenRead
+          && hostProduction
+          && tool
+          && (isPlainOrClementineLocalTool(call.name, 'work_call') || isPlainOrClementineLocalTool(call.name, 'call_tool') || directGateway)
+        ) {
+          const carrier = readModelCarrier(call.name, argumentsValue ?? argumentsJson);
+          const resolved = resolveProvenOperation(carrier.operation, turnProvenEntries);
+          if (resolved && resolved.effectClass === 'read') {
+            const canonical = canonicalGatewayCarrier(argumentsValue, resolved.identifier, carrier.arguments);
+            argumentsJson = directGateway ? canonical.innerJson : canonical.argumentsJson;
+            (call as { argumentsJson: string }).argumentsJson = argumentsJson;
+            argumentsValue = parsedArgs(argumentsJson);
+            hostTurnLogger.info({
+              callId: call.callId,
+              carrier: call.name,
+              operation: resolved.identifier,
+              match: resolved.match,
+              shape: carrier.shape,
+            }, 'host read a provider carrier against the turn\'s proof');
+            provenRead = argumentsValue
+              ? provenTurnReadDescent(call.name, argumentsValue, tool)
+              : null;
+          }
+        }
         const effectiveName = provenRead?.effectiveName ?? (argumentsValue
           ? unwrapRuntimeEffectiveToolIdentity(call.name, argumentsValue).toolName
           : null);
@@ -6649,13 +6865,48 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
+      consecutiveFrameRefusals += 1;
+      journalHostGuide('frame_refused', {
+        reason: 'frame_materialization_failed',
+        detail,
+        calls: canonicalCalls.map((call) => ({
+          callId: call.callId,
+          name: call.name,
+          argumentsJson: call.argumentsJson.slice(0, 2000),
+        })),
+        consecutiveFrameRefusals,
+      });
+      hostTurnLogger.warn({ detail, calls: canonicalCalls.map((call) => call.name) }, 'host could not materialize a call frame');
+      if (consecutiveFrameRefusals >= 2) {
+        tryLastWordTurn('frame_refused', [`the host could not materialize ${consecutiveFrameRefusals} consecutive call frames (${detail})`]);
+      }
       continue;
     }
     if (frameDisposition.kind === 'refused') {
+      const reason = frameDisposition.reason;
+      // The directive lands on the call that CAUSED the refusal (live
+      // 2026-09-02: a two-call frame was refused for its work_call and the
+      // explanation was attached to the sibling workflow_get).
+      const workCallReason = reason === 'host_planned_work_call_requires_plan_sibling'
+        || reason === 'host_work_call_inner_operation_unidentified';
+      const offending = (workCallReason
+        ? canonicalCalls.find((call) => isPlainOrClementineLocalTool(call.name, 'work_call'))
+        : undefined) ?? canonicalCalls[0]!;
+      let offendingOperation: string | null = null;
+      try {
+        const offendingArgs = parsedArgs(offending.argumentsJson);
+        offendingOperation = offendingArgs
+          ? unwrapRuntimeEffectiveToolIdentity(offending.name, offendingArgs).toolName
+          : null;
+      } catch { /* diagnostic only */ }
+      const provenReads = turnProvenEntries
+        .filter((entry) => entry.effectClass === 'read')
+        .map((entry) => entry.identifier);
       const paired = pairLocallyRefusedFrame(
         canonicalCalls,
         false,
-        new Map([[canonicalCalls[0]!.callId, hostFrameRefusalDirective(frameDisposition.reason)]]),
+        new Map([[offending.callId, hostFrameRefusalDirective(reason, { provenReads, offendingOperation })]]),
+        new Set([offending.callId]),
       );
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
@@ -6665,6 +6916,36 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
+      consecutiveFrameRefusals += 1;
+      // Journaled with the RAW shape, so the next unknown dialect is learned
+      // from one run instead of reconstructed from receipts.
+      journalHostGuide('frame_refused', {
+        reason,
+        retryMode: 'replan',
+        offendingCallId: offending.callId,
+        offendingOperation,
+        provenReads: provenReads.slice(0, 12),
+        calls: canonicalCalls.map((call) => ({
+          callId: call.callId,
+          name: call.name,
+          argumentsJson: call.argumentsJson.slice(0, 2000),
+        })),
+        consecutiveFrameRefusals,
+      });
+      hostTurnLogger.warn({
+        reason,
+        offendingCallId: offending.callId,
+        offendingOperation,
+        calls: canonicalCalls.map((call) => call.name),
+        consecutiveFrameRefusals,
+      }, 'host refused a call frame before dispatch');
+      if (consecutiveFrameRefusals >= 2) {
+        tryLastWordTurn('frame_refused', [
+          `the host refused ${consecutiveFrameRefusals} consecutive call frames before dispatch (${reason})`,
+          ...(offendingOperation ? [`the operation you named, "${offendingOperation}", is not proven this turn`] : []),
+          ...(provenReads.length > 0 ? [`proven reads this turn: ${provenReads.slice(0, 12).join(', ')}`] : []),
+        ]);
+      }
       continue;
     }
     if (frameDisposition.kind === 'host_owned_single_action_plan') {
@@ -6791,6 +7072,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         }
         continue;
       }
+      // A frame that executed is progress: the refusal streak ends here.
+      consecutiveFrameRefusals = 0;
       const finalOutput = await finalOutputFromToolBehavior(frame.returned);
       if (finalOutput !== undefined) return await completedOutcome(finalOutput);
       continue;

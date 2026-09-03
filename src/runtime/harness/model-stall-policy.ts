@@ -128,3 +128,35 @@ export function modelResponseWallMs(): number {
   if (!Number.isFinite(raw)) return 900_000;
   return raw <= 0 ? 0 : raw;
 }
+
+/**
+ * A harness deadline retired ONE model attempt. It is not the user cancelling:
+ * the brain chain must stay free to rescue the step on another brain.
+ *
+ * The host stall watchdog aborts the same AbortController whose signal rides
+ * the model request, so inside the fallback boundary that abort was
+ * indistinguishable from a person pressing stop and the `!callerAborted` guard
+ * barred the switch (live 2026-09-02: an 11-minute silent turn, two healthy
+ * brains in the chain, no fallover). Deliberately narrow — a kill or a bare
+ * AbortError stays a user cancel.
+ */
+export function isHarnessDeadlineAbortReason(reason: unknown): reason is ModelStreamStalledError {
+  return reason instanceof ModelStreamStalledError;
+}
+
+/**
+ * After the watchdog retires a stalled attempt, how long a RESCUE brain may
+ * stay silent before the host gives up on the step. Activity-refreshed, and
+ * only consulted once the fallback boundary has stamped that a switch is in
+ * flight — with no rescue at all the host rejects within seconds, so this
+ * never adds minutes to a hopeless turn. 0 disables (reject at the first stall,
+ * the pre-2026-09-02 behavior).
+ */
+export function modelStallFalloverGraceMs(): number {
+  const raw = Number.parseInt(
+    getRuntimeEnv('CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS', '120000') ?? '120000',
+    10,
+  );
+  if (!Number.isFinite(raw)) return 120_000;
+  return raw <= 0 ? 0 : raw;
+}
