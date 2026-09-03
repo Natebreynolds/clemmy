@@ -649,7 +649,26 @@ function durableSourceAccountAliasSelection(input: {
   // A non-empty, source-grammatical label that neither the fresh connected
   // identities nor durable alias memory recognize must not disappear into a
   // prior-session/default-account fallback.
-  if (!foundSavedAlias) return { kind: 'unusable' };
+  //
+  // ...but only where a SOURCE ACCOUNT is a real concept. The hazard this
+  // guards is sending as the wrong identity, which requires candidates that
+  // HAVE identities. A keyed toolkit authenticates with an API key and carries
+  // no account email, so an unrecognized alias says nothing about it and must
+  // not withhold it.
+  //
+  // Live 2026-09-03: "draft me all the emails using my outbound email skill"
+  // matched `using my <phrase>` before the resource word `email`, yielding the
+  // labelish "outbound" — a description of a SKILL read as an account name.
+  // No alias by that name exists, so every toolkit in the turn was stamped
+  // account_selection_required: DataForSEO and Airtable included, neither of
+  // which has a mailbox. The run reached no business call. Mailbox-bearing
+  // toolkits still gate here, which is the case where a wrong pick is possible.
+  const toolkitHasAccountIdentities = input.relevantLiveConnections.some((connection) => (
+    normalizedAccountEmail(connection.accountEmail).includes('@')
+  ));
+  if (!foundSavedAlias) {
+    return toolkitHasAccountIdentities ? { kind: 'unusable' } : { kind: 'none' };
+  }
   if (nominations.size !== 1) return { kind: 'unusable' };
   return [...nominations.values()][0]!;
 }
