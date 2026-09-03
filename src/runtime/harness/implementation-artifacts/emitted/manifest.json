@@ -132,7 +132,7 @@
           "bytes": 25880
         },
         "src/runtime/harness/json-repair.ts": {
-          "bytes": 9400
+          "bytes": 12618
         },
         "src/runtime/harness/multi-item-intent.ts": {
           "bytes": 25729
@@ -2103,7 +2103,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 21430
+          "bytes": 20449
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -2223,7 +2223,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 339358
+          "bytes": 340503
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2244,7 +2244,7 @@
           "bytes": 4626
         },
         "src/runtime/harness/compaction.ts": {
-          "bytes": 53752
+          "bytes": 55801
         },
         "src/runtime/harness/verify-delivered.ts": {
           "bytes": 16840
@@ -2286,7 +2286,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 665157
+          "bytes": 665228
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2382,7 +2382,7 @@
           "bytes": 16825
         },
         "src/runtime/harness/tool-output-reference.ts": {
-          "bytes": 8581
+          "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
           "bytes": 240658
@@ -2628,7 +2628,7 @@
           "bytes": 25880
         },
         "src/runtime/harness/json-repair.ts": {
-          "bytes": 9400
+          "bytes": 12618
         },
         "src/runtime/harness/multi-item-intent.ts": {
           "bytes": 25729
@@ -4599,7 +4599,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 21430
+          "bytes": 20449
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -4719,7 +4719,7 @@
           "bytes": 39870
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 339358
+          "bytes": 340503
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4740,7 +4740,7 @@
           "bytes": 4626
         },
         "src/runtime/harness/compaction.ts": {
-          "bytes": 53752
+          "bytes": 55801
         },
         "src/runtime/harness/verify-delivered.ts": {
           "bytes": 16840
@@ -4782,7 +4782,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 665157
+          "bytes": 665228
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4878,7 +4878,7 @@
           "bytes": 16825
         },
         "src/runtime/harness/tool-output-reference.ts": {
-          "bytes": 8581
+          "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
           "bytes": 240658
