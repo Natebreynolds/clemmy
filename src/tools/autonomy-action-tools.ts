@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { addNotification } from '../runtime/notifications.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
-import { appendEvent, getSession } from '../runtime/harness/eventlog.js';
+import { appendConversationCheckIn, appendEvent, getSession, listEvents } from '../runtime/harness/eventlog.js';
 import { closeCheckIn, createCheckIn, validateCheckInQuestion } from '../agents/check-ins.js';
 import { answerExactCheckIn, listActionableCheckIns } from '../execution/inbox-questions.js';
 import { proposeCheckInTemplate } from '../agents/check-in-proposals.js';
@@ -206,6 +206,55 @@ export function registerAutonomyActionTools(server: McpServer): void {
           : { source: 'notify_user_tool' },
       });
       return textResult(`Notification queued: ${id}`);
+    },
+  );
+
+  server.tool(
+    'check_in',
+    [
+      'Tell the user what you have found or what you are doing, mid-task, WITHOUT stopping.',
+      'It lands in the conversation, so they can walk away and read it whenever they come back.',
+      'Use it when the picture changes — a first finding, a surprise, a stretch of slow work,',
+      'or a judgement call you made. One or two sentences, in your own words.',
+      'This is not a question (use ask_user_question) and not an alert (use notify_user);',
+      'nothing is interrupted and nothing waits on it.',
+    ].join(' '),
+    { note: z.string().min(1).max(600) },
+    async ({ note }) => {
+      const ctx = getToolOutputContext();
+      const sessionId = ctx?.sessionId;
+      const sourceUserSeq = ctx?.sourceUserSeq;
+      if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+        // Outside a turn there is no thread to speak into. Say so plainly
+        // rather than inventing a destination.
+        return textResult('No open conversation to check in on — nothing was posted.');
+      }
+      const source = listEvents(sessionId, {
+        sinceSeq: (sourceUserSeq as number) - 1,
+        types: ['user_input_received'],
+        limit: 1,
+      }).find((event) => event.seq === sourceUserSeq);
+      if (!source) {
+        return textResult('No open conversation to check in on — nothing was posted.');
+      }
+      try {
+        const result = appendConversationCheckIn({
+          source: { id: source.id, seq: source.seq, sessionId, turn: source.turn },
+          text: note,
+        });
+        if (!result.inserted) {
+          // Never let her believe she spoke when she did not.
+          return textResult(
+            'Check-in not posted: this turn has already used its check-ins. '
+            + 'Save the rest for your final answer.',
+          );
+        }
+        return textResult('Check-in posted to the conversation.');
+      } catch (err) {
+        return textResult(
+          `Check-in not posted: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     },
   );
 

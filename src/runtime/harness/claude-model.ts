@@ -574,27 +574,28 @@ export function makeClaudeFetch(): typeof fetch {
     if (res.status >= 400) {
       void persistClaudeErrorTrace(res.clone(), body, res.status);
     }
-    // Diagnostics only: tee the body so we can read usage without disturbing the
-    // stream the SDK consumes. Entirely skipped when the debug flag is off.
-    if (debug && res.ok && res.body) {
-      try {
-        const [forSdk, forLog] = res.body.tee();
-        void logClaudeResponseUsage(forLog);
-        return new Response(forSdk, { status: res.status, statusText: res.statusText, headers: res.headers });
-      } catch {
-        return res; // tee failed before locking → return the original untouched
-      }
-    }
-    // Liveness tap: extended thinking never reaches the harness as a stream
-    // event, so read it off the wire (see watchClaudeThinkingForLiveness). The
-    // run context is captured HERE, inside the caller's async scope — the
-    // watcher runs detached and would otherwise see no store.
+    // Two independent readers may want this body: the liveness tap (always,
+    // when a run context exists) and the wire-usage log (only under the debug
+    // flag). They are teed together on purpose — an earlier version returned
+    // from the debug branch first, which silently disabled the liveness tap for
+    // the whole run whenever diagnostics were on. That turned a debugging
+    // session into a false negative: platform-49 run 9 read
+    // `sawModelActivity=false` with no stream-event kind and looked like proof
+    // the provider was silent, when the tap had simply never been reached.
     if (res.ok && res.body) {
       const liveness = harnessRunContextStorage.getStore();
-      if (liveness) {
+      if (liveness || debug) {
         try {
-          const [forSdk, forWatch] = res.body.tee();
-          void watchClaudeThinkingForLiveness(forWatch, liveness);
+          const [forSdk, forReaders] = res.body.tee();
+          if (liveness && debug) {
+            const [forWatch, forLog] = forReaders.tee();
+            void watchClaudeThinkingForLiveness(forWatch, liveness);
+            void logClaudeResponseUsage(forLog);
+          } else if (liveness) {
+            void watchClaudeThinkingForLiveness(forReaders, liveness);
+          } else {
+            void logClaudeResponseUsage(forReaders);
+          }
           return new Response(forSdk, { status: res.status, statusText: res.statusText, headers: res.headers });
         } catch {
           return res; // tee failed before locking → return the original untouched

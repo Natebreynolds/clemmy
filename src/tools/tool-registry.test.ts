@@ -306,6 +306,9 @@ test('workerBlockedToolNames (F1 + collision/commit vectors) == deriveWorkerBloc
   const f2 = new Set<string>([
     ...WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
     'notify_user',
+    // A check-in speaks into the conversation; a worker has none, so its note
+    // would land in the parent's thread without the parent's judgement.
+    'check_in',
     'run_batch',
     'request_approval',
     'pending_action_queue',

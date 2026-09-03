@@ -133,6 +133,11 @@ function workerBlockedToolNames(): Set<string> {
     _workerBlockedToolNames = new Set<string>([
       ...WORKFLOW_STEP_BLOCKED_TOOL_NAMES,
       'notify_user',
+      // A check-in speaks into the CONVERSATION, and a worker has none — its
+      // note would land in the parent's thread without the parent's judgement
+      // about whether it was worth saying. The conversational parent owns what
+      // the user hears, same rule as notify_user above.
+      'check_in',
       // A worker composes one exact mutation payload; only the conversational
       // parent may aggregate, freeze, approve, and commit it. Keeping commit
       // primitives off this surface makes the capability envelope agree with

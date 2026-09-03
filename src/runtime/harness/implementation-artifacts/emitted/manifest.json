@@ -99,7 +99,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 89339
+          "bytes": 89729
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -117,7 +117,7 @@
           "bytes": 674
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 43675
+          "bytes": 45647
         },
         "src/assistant/request-segments.ts": {
           "bytes": 4916
@@ -654,7 +654,7 @@
           "bytes": 7425
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 65442
+          "bytes": 65908
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -1278,7 +1278,7 @@
           "bytes": 4111
         },
         "src/agents/tool-catalog.ts": {
-          "bytes": 16323
+          "bytes": 16692
         },
         "src/tools/registry.ts": {
           "bytes": 2563
@@ -1443,7 +1443,7 @@
           "bytes": 18466
         },
         "src/agents/sub-agents.ts": {
-          "bytes": 28390
+          "bytes": 28704
         },
         "src/tools/batch-shape-directive.ts": {
           "bytes": 4176
@@ -2160,7 +2160,7 @@
           "bytes": 5206
         },
         "src/tools/autonomy-action-tools.ts": {
-          "bytes": 25943
+          "bytes": 28087
         },
         "src/tools/browser-harness-tools.ts": {
           "bytes": 9090
@@ -2370,7 +2370,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 47007
+          "bytes": 48785
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -2385,7 +2385,7 @@
           "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 241013
+          "bytes": 241346
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -2469,7 +2469,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 316447
+          "bytes": 320799
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 42837
@@ -2595,7 +2595,7 @@
           "bytes": 23571
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 89339
+          "bytes": 89729
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 45010
@@ -2613,7 +2613,7 @@
           "bytes": 674
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 43675
+          "bytes": 45647
         },
         "src/assistant/request-segments.ts": {
           "bytes": 4916
@@ -3150,7 +3150,7 @@
           "bytes": 7425
         },
         "src/runtime/harness/fallback-model.ts": {
-          "bytes": 65442
+          "bytes": 65908
         },
         "src/runtime/harness/prompt-cache-observation.ts": {
           "bytes": 11653
@@ -3774,7 +3774,7 @@
           "bytes": 4111
         },
         "src/agents/tool-catalog.ts": {
-          "bytes": 16323
+          "bytes": 16692
         },
         "src/tools/registry.ts": {
           "bytes": 2563
@@ -3939,7 +3939,7 @@
           "bytes": 18466
         },
         "src/agents/sub-agents.ts": {
-          "bytes": 28390
+          "bytes": 28704
         },
         "src/tools/batch-shape-directive.ts": {
           "bytes": 4176
@@ -4656,7 +4656,7 @@
           "bytes": 5206
         },
         "src/tools/autonomy-action-tools.ts": {
-          "bytes": 25943
+          "bytes": 28087
         },
         "src/tools/browser-harness-tools.ts": {
           "bytes": 9090
@@ -4866,7 +4866,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 47007
+          "bytes": 48785
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -4881,7 +4881,7 @@
           "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 241013
+          "bytes": 241346
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -4965,7 +4965,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 316447
+          "bytes": 320799
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 42837
@@ -5012,8 +5012,8 @@
       }
     },
     "transport": {
-      "file": "transport-bc4b69db0513309ad7abae4a1c580b7aae2f4da6ca8ad1bc100a4fa556f2d67b.cjs",
-      "sha256": "bc4b69db0513309ad7abae4a1c580b7aae2f4da6ca8ad1bc100a4fa556f2d67b",
+      "file": "transport-4277e299ac8dae87fe521c730d4b6e7ac63ef3dd3daac7d81594ec16e04d2f1a.cjs",
+      "sha256": "4277e299ac8dae87fe521c730d4b6e7ac63ef3dd3daac7d81594ec16e04d2f1a",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -5055,7 +5055,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 89339
+          "bytes": 89729
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -5129,5 +5129,5 @@
       }
     }
   },
-  "manifestDigest": "ffa25cef877e843995891f79b9ee01d1e7546edb24567d4a8dc77e313e1d874a"
+  "manifestDigest": "0e27ee63de4677093eb738c78c11f7110aea280f0d12b07261c9b595f5f6e6fd"
 }

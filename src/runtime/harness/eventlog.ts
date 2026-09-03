@@ -13,6 +13,7 @@ import {
   projectHarnessEventForPublic,
   publicAsyncWorkDispatchedData,
   publicConversationPreambleData,
+  publicConversationCheckInData,
 } from './public-presentation.js';
 import { toolOutputLooksSuccessful } from './tool-evidence.js';
 import { pruneProviderRequestEchoes } from './provider-read-evidence.js';
@@ -114,6 +115,15 @@ export const EVENT_TYPES = [
   // requires the bound first-class plan_task logical call to settle
   // successfully; the receipt alone grants no work or effect authority.
   'conversation_preamble_delivered',
+  // Clem's own mid-task check-in, in her words, landing IN THREAD. The
+  // preamble above speaks once BEFORE the work; this speaks DURING it, as
+  // many times as the work warrants, so a person who walks away can reopen
+  // the session and read what happened while they were gone. Presentation
+  // only: it carries no terminal status, outcome, need, approval or effect
+  // authority, and it is bounded per turn so a looping model cannot flood a
+  // conversation. It is deliberately NOT a notification — a check-in is
+  // ambient progress in the thread, not an interruption.
+  'conversation_check_in',
   // Mid-run steering (2026-08-07): a user message that arrived while the
   // session had an active attempt — delivered to the model at the next
   // tool-result boundary instead of superseding the running work.
@@ -1342,6 +1352,9 @@ export function insertInternalEventInTransaction(
   }
   if (input.type === 'conversation_preamble') {
     throw new Error('conversation_preamble must use the exact-source CAS writer');
+  }
+  if (input.type === 'conversation_check_in') {
+    throw new Error('conversation_check_in must use the exact-source check-in writer');
   }
   const id = randomUUID();
   const now = nowIso();
@@ -2955,6 +2968,9 @@ export function appendEvent(input: AppendEventInput): EventRow {
   if (input.type === 'conversation_preamble') {
     throw new Error('conversation_preamble must use the exact-source CAS writer');
   }
+  if (input.type === 'conversation_check_in') {
+    throw new Error('conversation_check_in must use the exact-source check-in writer');
+  }
   const db = openEventLog();
   const id = randomUUID();
   const now = nowIso();
@@ -3248,6 +3264,88 @@ export function appendEvent(input: AppendEventInput): EventRow {
     }
   }
   return publishPersistedEvent(event);
+}
+
+export interface AppendConversationCheckInInput {
+  /** Exact persisted human source, re-read and validated by the writer. A
+   *  session-global "latest input" is never accepted as ownership. */
+  source: Pick<EventRow, 'id' | 'seq' | 'sessionId' | 'turn'>;
+  text: string;
+}
+
+export interface AppendConversationCheckInResult {
+  event: EventRow | null;
+  /** False when the per-turn cap is already spent. The caller is told so it
+   *  can say so plainly rather than believing it spoke. */
+  inserted: boolean;
+  reason?: 'cap_reached';
+}
+
+/** How many check-ins one turn may put in a thread. A check-in is ambient
+ *  progress, so the cap exists to stop a looping model from turning a
+ *  conversation into a log — not to ration honest updates. */
+export const MAX_CONVERSATION_CHECK_INS_PER_TURN = 12;
+
+/**
+ * Append one of Clem's own mid-task check-ins, bound to the exact real user
+ * source that started the turn.
+ *
+ * Unlike the preamble this is deliberately NOT content-addressed-once: the
+ * whole point is that several land across a long task so someone who walked
+ * away can reopen the session and read what happened. The preamble's other
+ * guarantees are kept — the source must be the exact real (non-synthetic) user
+ * input, the row is authored by Clem and parented to that source, and the text
+ * must pass the public-presentation floor before it is stored.
+ */
+export function appendConversationCheckIn(
+  input: AppendConversationCheckInInput,
+): AppendConversationCheckInResult {
+  const candidate = publicConversationCheckInData({
+    version: 1,
+    kind: 'check_in',
+    sourceUserSeq: input.source.seq,
+    text: input.text,
+  });
+  if (!candidate) throw new Error('conversation check-in is not safe public text');
+
+  const db = openEventLog();
+  const tx = db.transaction((): AppendConversationCheckInResult => {
+    const rawSource = db.prepare('SELECT * FROM events WHERE seq = ?').get(input.source.seq) as RawEventRow | undefined;
+    if (!rawSource) throw new Error(`conversation check-in source event ${input.source.seq} is missing`);
+    const source = rowToEvent(rawSource);
+    if (
+      source.id !== input.source.id
+      || source.sessionId !== input.source.sessionId
+      || source.turn !== input.source.turn
+      || source.type !== 'user_input_received'
+      || source.role !== 'user'
+      || source.data.synthetic === true
+    ) {
+      throw new Error('conversation check-in requires the exact real user source, turn, and parent');
+    }
+
+    const spent = (db.prepare(
+      `SELECT COUNT(*) AS count
+         FROM events
+        WHERE session_id = ?
+          AND type = 'conversation_check_in'
+          AND json_extract(data_json, '$.sourceUserSeq') = ?`,
+    ).get(source.sessionId, source.seq) as { count: number }).count;
+    if (spent >= MAX_CONVERSATION_CHECK_INS_PER_TURN) {
+      return { event: null, inserted: false, reason: 'cap_reached' };
+    }
+
+    const id = randomUUID();
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO events
+         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+       VALUES (?, ?, ?, 'Clem', 'conversation_check_in', ?, ?, ?)`,
+    ).run(id, source.sessionId, source.turn, source.id, JSON.stringify(candidate), now);
+    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    return { event: rowToEvent(inserted), inserted: true };
+  });
+  return tx();
 }
 
 export interface AppendConversationPreambleOnceInput {

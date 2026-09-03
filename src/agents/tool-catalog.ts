@@ -58,6 +58,12 @@ export interface CatalogEntry {
  */
 export const TOOL_SEARCH_ALWAYS_LOADED: ReadonlySet<string> = new Set([
   'ask_user_question',
+  // Asking and TELLING are the same channel, and only half of it was
+  // first-class: she could interrupt with a question on any turn, but keeping
+  // the user in the loop cost a discovery round mid-task, so it never
+  // happened. A person who walks away from a long task should be able to come
+  // back and read what she found while they were gone.
+  'check_in',
   'memory_recall_all',
   'recall_tool_result',
   // Query a big stored result / document instead of paging it. Same recall

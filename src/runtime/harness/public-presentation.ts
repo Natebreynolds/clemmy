@@ -208,6 +208,42 @@ export function publicConversationPreambleData(
   };
 }
 
+export interface PublicConversationCheckInData extends Record<string, unknown> {
+  version: 1;
+  kind: 'check_in';
+  sourceUserSeq: number;
+  text: string;
+}
+
+const PUBLIC_CONVERSATION_CHECK_IN_KEYS: ReadonlySet<string> = new Set([
+  'version', 'kind', 'sourceUserSeq', 'text',
+]);
+/** A check-in is a sentence or two, not a report. The cap is deliberately
+ *  tighter than the preamble's: many of these land in one thread. */
+const MAX_PUBLIC_CONVERSATION_CHECK_IN_CHARS = 600;
+
+/** Clem's own mid-task words, validated for a public surface exactly as the
+ *  preamble is: a closed key set, no control characters, bounded length. It
+ *  carries no status, outcome or authority — only what she wants to say. */
+export function publicConversationCheckInData(
+  data: Record<string, unknown>,
+): PublicConversationCheckInData | null {
+  if (Object.keys(data).some((key) => !PUBLIC_CONVERSATION_CHECK_IN_KEYS.has(key))) return null;
+  const sourceUserSeq = data.sourceUserSeq;
+  if (
+    data.version !== 1
+    || data.kind !== 'check_in'
+    || !Number.isSafeInteger(sourceUserSeq)
+    || Number(sourceUserSeq) <= 0
+    || typeof data.text !== 'string'
+  ) return null;
+  let safeText: string;
+  try { safeText = assertPublicPresentationText(data.text); } catch { return null; }
+  if (!safeText.trim()) return null;
+  if (safeText.length > MAX_PUBLIC_CONVERSATION_CHECK_IN_CHARS || safeText.includes('\0')) return null;
+  return { version: 1, kind: 'check_in', sourceUserSeq: Number(sourceUserSeq), text: safeText };
+}
+
 function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -697,6 +733,14 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         return null;
       }
       return publicConversationPreambleData(data);
+    case 'conversation_check_in':
+      // Same event-level floor as the preamble: bound to its source, authored
+      // by Clem, on a real turn. A malformed generic row must never reach a
+      // thread just because its payload resembles the closed shape.
+      if (!event.parentEventId || event.role !== 'Clem' || !Number.isSafeInteger(event.turn) || event.turn < 0) {
+        return null;
+      }
+      return publicConversationCheckInData(data);
     case 'async_work_dispatched':
       return publicAsyncWorkDispatchedData(data);
     case 'awaiting_user_input': {
