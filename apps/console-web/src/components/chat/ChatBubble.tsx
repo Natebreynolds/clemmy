@@ -242,6 +242,24 @@ export function ChatBubble({
     return <DelegatedWorkCard message={message} delegated={message.delegated} />;
   }
 
+  // A check-in is Clem talking WHILE she works — not the answer. It reads as a
+  // quieter aside so a returning reader can scan what happened without
+  // mistaking any of it for the result they were waiting on.
+  if (message.checkIn) {
+    return (
+      <div className="flex gap-3">
+        <DogMark size={28} className="mt-0.5 self-start opacity-50" />
+        <div className="min-w-0 max-w-[80%] flex-1">
+          <div className="rounded-lg rounded-tl-sm border border-dashed border-border bg-surface/60 px-4 py-2">
+            <p className="whitespace-pre-wrap text-body leading-relaxed text-muted">
+              {linkify(message.text)}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const thinking = message.status === 'thinking';
   const live = thinking || Boolean(message.workflowLive);
   const pendingAction = message.approval?.pendingAction;

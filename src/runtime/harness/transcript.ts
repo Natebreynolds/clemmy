@@ -58,7 +58,14 @@ export function humanHarnessText(value: unknown, fallback = ''): string {
  */
 export function reconstructHarnessTranscript(sessionId: string, limit = 1000): UnifiedSessionTurn[] {
   const events = listEvents(sessionId, {
-    types: ['user_input_received', 'conversation_completed', 'conversation_superseded'],
+    types: [
+      'user_input_received',
+      'conversation_completed',
+      'conversation_superseded',
+      // Her mid-task words replay too: the point of a check-in is that
+      // someone who walked away can reopen the session and read it.
+      'conversation_check_in',
+    ],
     limit,
   });
   // Pair each `conversation_superseded` marker with the nearest preceding
@@ -107,6 +114,21 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       event,
       userText: event.data.synthetic === true ? '' : publicUserInputText(event.data),
     });
+  }
+
+  // Her check-ins, grouped by the source turn they belong to. The writer binds
+  // each one to its exact real user source, so this needs no heuristics.
+  const checkInsBySource = new Map<string, UnifiedSessionTurn[]>();
+  for (const event of events) {
+    if (event.type !== 'conversation_check_in') continue;
+    const text = typeof event.data.text === 'string' ? event.data.text.trim() : '';
+    const exactSeq = positiveSeq(event.data.sourceUserSeq);
+    if (!text || exactSeq === null) continue;
+    const key = sourceKey(event.sessionId, exactSeq);
+    if (!sources.has(key)) continue;
+    const list = checkInsBySource.get(key) ?? [];
+    list.push({ role: 'assistant', text, createdAt: event.createdAt, checkIn: true });
+    checkInsBySource.set(key, list);
   }
 
   // Pair typed terminals by the exact accepted event and elect the durable
@@ -206,6 +228,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         order: source.event.seq,
         turns: [
           ...userTurns,
+          ...(checkInsBySource.get(source.key) ?? []),
           {
             role: 'assistant',
             text: assistant.text,
@@ -215,7 +238,13 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         ],
       });
     } else if (userTurns.length > 0) {
-      unpaired.push({ order: source.event.seq, turns: userTurns });
+      // No reply yet — the turn is still running. This is exactly the case the
+      // feature exists for: reopening mid-task must show what she has said so
+      // far, not an empty wait.
+      unpaired.push({
+        order: source.event.seq,
+        turns: [...userTurns, ...(checkInsBySource.get(source.key) ?? [])],
+      });
     }
   }
   settled.sort((left, right) => left.order - right.order);

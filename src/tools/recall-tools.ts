@@ -6,6 +6,7 @@ import { windowScaleForModel } from '../runtime/harness/model-window-observation
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
 import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
+import { listToolOutputCallIds } from '../runtime/harness/eventlog.js';
 import { describeJsonShape, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 
@@ -124,6 +125,54 @@ export function normalizeFieldsInput(raw: unknown): string[] | undefined {
   return undefined;
 }
 
+/** Levenshtein distance, bounded — we only care whether two ids are a slip apart. */
+function editDistanceWithin(a: string, b: string, max: number): number | null {
+  if (Math.abs(a.length - b.length) > max) return null;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    const row = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const value = Math.min(prev[j]! + 1, row[j - 1]! + 1, prev[j - 1]! + cost);
+      row.push(value);
+      if (value < best) best = value;
+    }
+    if (best > max) return null;
+    prev = row;
+  }
+  const distance = prev[b.length]!;
+  return distance <= max ? distance : null;
+}
+
+/**
+ * The exact correction for a call_id that does not exist.
+ *
+ * The harness knows every real id, so a transposition should be answered with
+ * the right one rather than a dead end. Live 2026-09-03, platform-49 run 10:
+ * the model asked for `toulu_016PctF8QXsnvKo5ZKasu1ri` (a two-letter swap of
+ * `toolu_…`), got a bare "no tool output found", and spent the rest of the turn
+ * recovering. Run 5 proved the opposite works — an exact correction repaired the
+ * very next frame.
+ */
+export function nearestToolOutputCallId(
+  wanted: string,
+  known: readonly string[],
+): string | null {
+  const target = wanted.trim();
+  if (!target) return null;
+  // Same length class only, and at most two edits: a genuine typo, never a
+  // guess at a different result.
+  let best: { id: string; distance: number } | null = null;
+  for (const candidate of known) {
+    if (candidate === target) return null;
+    const distance = editDistanceWithin(target, candidate, 2);
+    if (distance === null) continue;
+    if (!best || distance < best.distance) best = { id: candidate, distance };
+  }
+  return best ? best.id : null;
+}
+
 export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
@@ -229,7 +278,13 @@ export function registerRecallTools(server: McpServer): void {
       }
       const row = getToolOutput(ctx.sessionId, callId);
       if (!row) {
-        return textResult(`No tool output found for call_id "${callId}" in this session.`);
+        const suggestion = nearestToolOutputCallId(callId, listToolOutputCallIds(ctx.sessionId));
+        return textResult(
+          suggestion
+            ? `No tool output found for call_id "${callId}". Did you mean "${suggestion}"? `
+              + 'Re-run this query with that exact id.'
+            : `No tool output found for call_id "${callId}" in this session.`,
+        );
       }
       if (row.truncatedAtWrite) {
         return textResult(

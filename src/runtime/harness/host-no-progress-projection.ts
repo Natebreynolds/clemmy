@@ -916,6 +916,21 @@ function settlementConsequence(input: {
  * Classify one already-committed history delta by durable topology/effect
  * facts. Tool/provider vocabulary and argument text are deliberately ignored.
  */
+/** Readers of THIS turn's own parked tool output. Paging a result the turn
+ *  already fetched is consuming evidence it paid for, not a fresh attempt at an
+ *  unsolved problem.
+ *
+ *  Deliberately just these two. `file_query` reads a stored DOCUMENT, and
+ *  repeating it is a genuine dependency-lookup stall the governor should meter
+ *  (pinned by host-turn-runner's "consequence-free dependency lookup" test).
+ *  `memory_recall_all` repeated is its own known stall shape — live 2026-08-31
+ *  run 3 spent nineteen recall calls going nowhere. Widening this set is how a
+ *  paging exemption quietly becomes a licence to loop. */
+const TURN_LOCAL_RESULT_READERS: ReadonlySet<string> = new Set([
+  'recall_tool_result',
+  'tool_output_query',
+]);
+
 export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
   historyDelta: readonly unknown[];
 }, database: Database.Database = openEventLog()): HostNoProgressAttemptProjection {
@@ -1017,6 +1032,33 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
           recoveryToolNames: refusedCarrierNames,
         }),
       };
+    }
+
+    // Reading back the turn's OWN parked results is PROGRESS, not a metered
+    // attempt. Both live failures of this run shape died here: the frame fell
+    // through every branch above to 'dependency_lookup' (metered), so two
+    // consecutive successful pages of a 28.5 KB result exhausted the governor
+    // and the turn was terminated while she was mid-reconciliation — doing
+    // exactly what the harness told her to do with data she had already
+    // fetched (2026-09-03, platform-49 runs 6 and 10; run 10 was carried end
+    // to end by the pinned brain and still died here).
+    //
+    // Deliberately narrow: EVERY call in the frame must be a turn-local result
+    // reader AND every matched settlement must have succeeded. A read that
+    // failed, or a frame mixing a reader with real work, keeps its old class.
+    // A pure paging loop remains bounded by maxTurns, the per-turn tool-call
+    // limit, and the runner's repeated-frame retirement — the governor is not
+    // the only thing standing between us and a loop, and it was the only thing
+    // standing between us and finishing.
+    if (
+      calls.length > 0
+      && calls.every((call) => TURN_LOCAL_RESULT_READERS.has(call.name))
+      && matchedSettlements.length > 0
+      && matchedSettlements.every(({ settlement }) => (
+        settlement.outcome_kind === 'succeeded' || settlement.outcome_kind === 'empty_result'
+      ))
+    ) {
+      return { status: 'ok', attemptClass: 'task_work' };
     }
 
     const discovery = listEvents(identity.sessionId, {

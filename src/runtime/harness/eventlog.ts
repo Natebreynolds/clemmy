@@ -6743,6 +6743,21 @@ export function reapStaleSessions(maxAgeDays?: number): number {
   return deleted;
 }
 
+/** The call ids this session has parked output for, newest first.
+ *  Used to turn "no such call_id" into the exact correction: the harness knows
+ *  every real id, so a one-character slip should be answered with the right
+ *  one, not a dead end. */
+export function listToolOutputCallIds(sessionId: string, limit = 60): string[] {
+  const db = openEventLog();
+  const rows = db.prepare(
+    `SELECT call_id FROM tool_outputs
+      WHERE session_id = ?
+      ORDER BY created_at DESC, call_id ASC
+      LIMIT ?`,
+  ).all(sessionId, Math.max(1, Math.min(500, Math.floor(limit)))) as Array<{ call_id: string }>;
+  return rows.map((row) => row.call_id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+}
+
 export function getToolOutput(sessionId: string, callId: string): ToolOutputRecord | null {
   const db = openEventLog();
   return db.transaction(() => readCanonicalOutput(db, sessionId, callId))();

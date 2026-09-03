@@ -2103,7 +2103,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 20449
+          "bytes": 22688
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -2220,7 +2220,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 39870
+          "bytes": 42117
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 342054
@@ -2370,7 +2370,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 48785
+          "bytes": 48911
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -2469,7 +2469,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 320799
+          "bytes": 321524
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 42837
@@ -4599,7 +4599,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 20449
+          "bytes": 22688
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -4716,7 +4716,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 39870
+          "bytes": 42117
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 342054
@@ -4866,7 +4866,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 48785
+          "bytes": 48911
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -4965,7 +4965,7 @@
           "bytes": 86844
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 320799
+          "bytes": 321524
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 42837

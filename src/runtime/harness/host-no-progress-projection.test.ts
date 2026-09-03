@@ -1643,3 +1643,92 @@ test('a full frame of keyed refusals stays within the governor stage bound', () 
   assert.ok(stage.length < 192, `stage token must satisfy the governor bound (${stage.length})`);
   assert.equal(projected.consequence?.recoveryToolNames.length, 8);
 });
+
+// Reading back the turn's OWN parked results is progress, not a metered
+// attempt. Live 2026-09-03, platform-49 run 10: the pinned brain carried the
+// whole task (16 calls, zero fallovers), paged a 28.5 KB result it had already
+// fetched, and the governor terminated it mid-reconciliation because two
+// consecutive successful reads fell through to 'dependency_lookup'.
+function readerSettlementDb(
+  entries: Array<{ callId: string; sessionId: string; sourceUserSeq: number; outcome?: string }>,
+) {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE logical_call_settlements (
+      logical_tool_call_id TEXT NOT NULL,
+      observer_call_id TEXT,
+      execution_kind TEXT NOT NULL,
+      outcome_kind TEXT NOT NULL,
+      recovery_action TEXT NOT NULL,
+      business_call INTEGER NOT NULL,
+      mutating INTEGER NOT NULL,
+      requires_reconciliation INTEGER NOT NULL,
+      physical_crossing_count INTEGER NOT NULL,
+      host_crossing_count INTEGER,
+      outcome_detail TEXT,
+      session_id TEXT NOT NULL,
+      source_user_seq INTEGER NOT NULL
+    );
+  `);
+  const insert = db.prepare(`
+    INSERT INTO logical_call_settlements
+      (logical_tool_call_id, observer_call_id, execution_kind, outcome_kind,
+       recovery_action, business_call, mutating, requires_reconciliation,
+       physical_crossing_count, host_crossing_count, session_id, source_user_seq)
+    VALUES (?, ?, 'local_execution', ?, 'settle', 0, 0, 0, 0, 1, ?, ?)
+  `);
+  for (const entry of entries) {
+    insert.run(entry.callId, entry.callId, entry.outcome ?? 'succeeded', entry.sessionId, entry.sourceUserSeq);
+  }
+  return db;
+}
+
+test('paging the turn\'s own parked result is progress, not a metered attempt', () => {
+  const identity = accepted('recall-progress');
+  const db = readerSettlementDb([
+    { callId: 'call-recall', sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq },
+  ]);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('call-recall', 'recall_tool_result'), result('call-recall', 'recall_tool_result')],
+  }, db);
+  assert.deepEqual(projected, { status: 'ok', attemptClass: 'task_work' },
+    'reading evidence the turn already paid for is work, not a stalled retry');
+  db.close();
+});
+
+test('a mixed frame and a failed read keep their metered class', () => {
+  const identity = accepted('recall-mixed');
+  // A reader beside real work is not a pure read — it keeps the old class.
+  const mixed = readerSettlementDb([
+    { callId: 'r1', sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq },
+    { callId: 'w1', sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq },
+  ]);
+  const projectedMixed = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('r1', 'recall_tool_result'), result('r1', 'recall_tool_result'),
+      call('w1', 'some_other_tool'), result('w1', 'some_other_tool'),
+    ],
+  }, mixed);
+  assert.equal(projectedMixed.status, 'ok');
+  if (projectedMixed.status === 'ok') {
+    assert.notEqual(projectedMixed.attemptClass, 'task_work',
+      'a reader beside real work must not launder the frame into progress');
+  }
+  mixed.close();
+
+  // A read that FAILED is a stalled retry like any other.
+  const failed = readerSettlementDb([
+    { callId: 'r2', sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, outcome: 'failed' },
+  ]);
+  const projectedFailed = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('r2', 'tool_output_query'), result('r2', 'tool_output_query')],
+  }, failed);
+  assert.equal(projectedFailed.status, 'ok');
+  if (projectedFailed.status === 'ok') {
+    assert.notEqual(projectedFailed.attemptClass, 'task_work', 'a failed read is not progress');
+  }
+  failed.close();
+});

@@ -98,6 +98,10 @@ export interface ChatMessage {
   /** Host-dispatched workflow is still running after the ACK settled the
    *  foreground turn. Keeps the activity strip live on this same bubble. */
   workflowLive?: boolean;
+  /** Clem's own mid-task check-in, not a turn reply. It lands while the work is
+   *  still running so someone who walks away can reopen the session and read
+   *  what happened. Rendered as an aside, never as the answer. */
+  checkIn?: boolean;
 }
 
 export type ChatApprovalDecision = 'approve' | 'reject';
@@ -150,6 +154,25 @@ export function chatDecisionIntent(
 /** Preserve every independently addressable approval emitted during one live
  * turn. Approval bursts must not overwrite the single streaming assistant
  * bubble: each card gets its own stable key and duplicate SSE replay is inert. */
+/** Insert one of Clem's mid-task check-ins into the thread, ahead of the reply
+ *  bubble she is still working on. Keyed by event seq so replaying the session
+ *  (the whole point — walk away, come back) cannot duplicate it. */
+export function appendCheckIn(
+  messages: readonly ChatMessage[],
+  event: HarnessEvent,
+  liveAssistantId: string,
+): ChatMessage[] {
+  const d = (event.data ?? {}) as Record<string, unknown>;
+  const text = typeof d.text === 'string' ? d.text.trim() : '';
+  if (!text) return messages as ChatMessage[];
+  const id = `check-in-${event.seq}`;
+  if (messages.some((message) => message.id === id)) return messages as ChatMessage[];
+  const entry: ChatMessage = { id, role: 'assistant', text, status: 'complete', checkIn: true };
+  const liveAt = messages.findIndex((message) => message.id === liveAssistantId);
+  if (liveAt < 0) return [...messages, entry];
+  return [...messages.slice(0, liveAt), entry, ...messages.slice(liveAt)];
+}
+
 export function appendLiveApprovalCard(
   messages: readonly ChatMessage[],
   event: HarnessEvent,
@@ -1327,6 +1350,8 @@ export function useChat(options?: UseChatOptions) {
       patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined });
     } else if (ev.type === 'approval_requested') {
       setMessages((prev) => appendLiveApprovalCard(prev, ev));
+    } else if (ev.type === 'conversation_check_in') {
+      setMessages((prev) => appendCheckIn(prev, ev, assistantId));
     } else if (ev.type === 'conversation_preamble') {
       const text = typeof d.text === 'string' ? d.text.trim() : '';
       if (text) {

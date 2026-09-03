@@ -435,3 +435,27 @@ test('normalizeFieldsInput: one canonical spelling, junk-tolerant, never a phant
   assert.equal(normalizeFieldsInput(undefined), undefined);
   assert.equal(normalizeFieldsInput(null), undefined);
 });
+
+// Live 2026-09-03, platform-49 run 10: the model asked for
+// `toulu_016PctF8QXsnvKo5ZKasu1ri` — a two-letter transposition of `toolu_…` —
+// and got a bare "no tool output found". The harness knew every real id. Run 5
+// proved the opposite: an exact correction repaired the very next frame.
+test('a near-miss call_id gets the exact correction, not a dead end', async () => {
+  const { nearestToolOutputCallId } = await import('./recall-tools.js');
+  const known = [
+    'toolu_016PctF8QXsnvKo5ZKasu1ri',
+    'toolu_01ZZZZZZZZZZZZZZZZZZZZZZ',
+  ];
+  // The exact slip from the live run.
+  assert.equal(
+    nearestToolOutputCallId('toulu_016PctF8QXsnvKo5ZKasu1ri', known),
+    'toolu_016PctF8QXsnvKo5ZKasu1ri',
+  );
+  // An id that already exists needs no correction.
+  assert.equal(nearestToolOutputCallId('toolu_016PctF8QXsnvKo5ZKasu1ri', known), null);
+  // A genuinely different id is never "corrected" into someone else's result —
+  // guessing a DIFFERENT result is worse than saying it is missing.
+  assert.equal(nearestToolOutputCallId('call_completely_unrelated_9', known), null);
+  assert.equal(nearestToolOutputCallId('', known), null);
+  assert.equal(nearestToolOutputCallId('toolu_016PctF8QXsnvKo5ZKasu1ri', []), null);
+});

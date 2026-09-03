@@ -170,6 +170,10 @@ export interface UnifiedSessionTurn {
    *  decisions must resolve this id through the proposal API, never through a
    *  generic conversational "approve" turn. */
   planProposalId?: string;
+  /** Clem's own mid-task check-in rather than a turn reply. Present on reopen
+   *  so someone who walked away can read what happened while they were gone —
+   *  including on a turn that is still running and has no reply yet. */
+  checkIn?: boolean;
   /** A2 (v2.3.0): a STILL-PENDING approval attached to this turn, so a
    *  reopened chat renders the actionable approve/execute card — not just
    *  the prose that told the user a card exists somewhere else. */
