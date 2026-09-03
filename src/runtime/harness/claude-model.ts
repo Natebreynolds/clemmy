@@ -469,7 +469,11 @@ const CLAUDE_THINKING_SNIPPET_MAX = 400;
 
 export async function watchClaudeThinkingForLiveness(
   stream: ReadableStream<Uint8Array>,
-  context: { privateModelActivityAt?: number; latestModelThinking?: string } | undefined,
+  context: {
+    privateModelActivityAt?: number;
+    latestModelThinking?: string;
+    latestProviderStreamEvent?: string;
+  } | undefined,
 ): Promise<void> {
   if (!context) {
     void stream.cancel().catch(() => {});
@@ -486,8 +490,23 @@ export async function watchClaudeThinkingForLiveness(
       if (done) break;
       if (!value) continue;
       const text = carry + decoder.decode(value, { stream: true });
-      if (text.includes('thinking_delta')) {
+      // ANY provider stream traffic is liveness. Silence had three different
+      // meanings — reasoning, queued-but-healthy, and genuinely dead — and the
+      // harness collapsed all three into "dead". Live 2026-09-03 run 8: a 200
+      // response held open for 152 s produced ~190 output tokens (no thinking:
+      // Anthropic counts thinking INSIDE output tokens) and never returned a
+      // non-2xx — there is no claude-error-trace on disk at all. That is a
+      // provider that had not started, not a brain that had died, and benching
+      // it cost a Codex call and a full GLM re-run of finished work.
+      // Only CONTINUING traffic extends the window (the re-arm compares against
+      // when the window opened), so one early message_start cannot hold a turn
+      // open and a dead socket still falls over.
+      const kind = claudeStreamEventKind(text);
+      if (kind) {
         context.privateModelActivityAt = Date.now();
+        context.latestProviderStreamEvent = kind;
+      }
+      if (text.includes('thinking_delta')) {
         const snippet = extractClaudeThinkingText(text);
         if (snippet) {
           context.latestModelThinking = snippet.slice(-CLAUDE_THINKING_SNIPPET_MAX);
@@ -500,6 +519,19 @@ export async function watchClaudeThinkingForLiveness(
   } finally {
     try { reader.releaseLock(); } catch { /* already released */ }
   }
+}
+
+/** The most telling SSE event kind in this chunk, or null when it carries none.
+ *  Named rather than boolean so a log can say WHICH kind of silence this was:
+ *  'ping' (provider holding the connection, not yet generating) reads very
+ *  differently from 'thinking_delta' (reasoning) or 'content_block_delta'
+ *  (answering), and the three deserve different responses. */
+export function claudeStreamEventKind(chunk: string): string | null {
+  for (const kind of ['thinking_delta', 'content_block_delta', 'message_delta', 'content_block_start', 'message_start', 'ping']) {
+    if (chunk.includes(kind)) return kind;
+  }
+  // Any other SSE frame still proves the socket is being written to.
+  return /^\s*(?:event|data):/mu.test(chunk) ? 'stream_frame' : null;
 }
 
 /** Pull the human-readable thinking out of one or more `thinking_delta` SSE

@@ -15,6 +15,7 @@ import {
   withRawClaudeUsageRecording,
   extractClaudeThinkingText,
   watchClaudeThinkingForLiveness,
+  claudeStreamEventKind,
 } from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
@@ -413,7 +414,7 @@ test('the wire tap stamps liveness and the reasoning tail onto the run context',
   assert.match(String(context.latestModelThinking), /not Spencer's request\./);
 });
 
-test('the wire tap ignores a stream with no thinking, and never throws without a context', async () => {
+test('the wire tap treats ordinary output as liveness but not as reasoning', async () => {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -423,14 +424,45 @@ test('the wire tap ignores a stream with no thinking, and never throws without a
       controller.close();
     },
   });
-  const context: { privateModelActivityAt?: number; latestModelThinking?: string } = {};
+  const context: {
+    privateModelActivityAt?: number;
+    latestModelThinking?: string;
+    latestProviderStreamEvent?: string;
+  } = {};
   await watchClaudeThinkingForLiveness(stream, context);
-  assert.equal(context.privateModelActivityAt, undefined, 'ordinary output is not private reasoning');
-  assert.equal(context.latestModelThinking, undefined);
+  assert.ok(context.privateModelActivityAt, 'any provider traffic proves the socket is being written to');
+  assert.equal(context.latestProviderStreamEvent, 'content_block_delta');
+  assert.equal(context.latestModelThinking, undefined, 'ordinary output is not reasoning');
 
   // No run context (a call outside a harness turn) must cancel cleanly.
   const orphan = new ReadableStream<Uint8Array>({
     start(controller) { controller.enqueue(encoder.encode('data: {}\n\n')); controller.close(); },
   });
   await assert.doesNotReject(() => watchClaudeThinkingForLiveness(orphan, undefined));
+});
+
+// Silence had three meanings and the harness collapsed them into "dead". The
+// kind is what tells them apart after the fact: a provider holding the socket
+// open without generating (run 8: a 200 held 152 s, ~190 output tokens, no
+// non-2xx ever written to disk) is not a brain that died.
+test('a keepalive-only stream is liveness, and names itself as a keepalive', async () => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'));
+      controller.close();
+    },
+  });
+  const context: { privateModelActivityAt?: number; latestProviderStreamEvent?: string } = {};
+  await watchClaudeThinkingForLiveness(stream, context);
+  assert.ok(context.privateModelActivityAt, 'a keepalive proves the provider is still there');
+  assert.equal(context.latestProviderStreamEvent, 'ping');
+});
+
+test('stream event kinds rank the most telling frame, and nothing is not liveness', () => {
+  assert.equal(claudeStreamEventKind('data: {"delta":{"type":"thinking_delta"}}'), 'thinking_delta');
+  assert.equal(claudeStreamEventKind('event: ping\ndata: {"type":"ping"}'), 'ping');
+  assert.equal(claudeStreamEventKind('event: whatever\ndata: {}'), 'stream_frame');
+  assert.equal(claudeStreamEventKind('   '), null, 'no frame is not liveness');
+  assert.equal(claudeStreamEventKind('half a chunk with no frame yet'), null);
 });

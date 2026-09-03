@@ -1066,6 +1066,8 @@ export class FallbackModel implements Model {
           this.logFallover(chain, i, err, {
             sawModelActivity,
             elapsedMs: Date.now() - attemptStartedAt,
+            lastProviderStreamEvent:
+              harnessRunContextStorage.getStore()?.latestProviderStreamEvent,
           });
           continue;
         }
@@ -1194,7 +1196,13 @@ export class FallbackModel implements Model {
     chain: FallbackTarget[],
     i: number,
     err: unknown,
-    diagnostics: { sawModelActivity?: boolean; elapsedMs?: number } = {},
+    diagnostics: {
+      sawModelActivity?: boolean;
+      elapsedMs?: number;
+      /** 'ping' means the provider held the socket without starting; absent
+       *  means nothing was ever written. Those are different failures. */
+      lastProviderStreamEvent?: string;
+    } = {},
   ): void {
     const reason = this.falloverReason(err);
     this.recordFalloverRouteInSessionLedger(chain[i], chain[i + 1], reason, false);
@@ -1208,6 +1216,9 @@ export class FallbackModel implements Model {
           : { sawModelActivity: diagnostics.sawModelActivity }),
         ...(Number.isFinite(diagnostics.elapsedMs)
           ? { elapsedMs: Math.round(diagnostics.elapsedMs!) }
+          : {}),
+        ...(diagnostics.lastProviderStreamEvent
+          ? { lastProviderStreamEvent: diagnostics.lastProviderStreamEvent }
           : {}),
       },
       'brain unavailable — falling over to the next brain',

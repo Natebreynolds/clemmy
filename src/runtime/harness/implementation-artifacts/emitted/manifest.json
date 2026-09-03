@@ -2286,7 +2286,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 665953
+          "bytes": 666425
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2370,7 +2370,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 47000
+          "bytes": 47007
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820
@@ -4782,7 +4782,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 665953
+          "bytes": 666425
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4866,7 +4866,7 @@
           "bytes": 69887
         },
         "src/runtime/harness/claude-model.ts": {
-          "bytes": 47000
+          "bytes": 47007
         },
         "src/runtime/harness/debate-model.ts": {
           "bytes": 99820

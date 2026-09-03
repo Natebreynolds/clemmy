@@ -1246,6 +1246,11 @@ export interface HarnessRunContext {
    *  emits no event for them). Bounded to a short tail: it exists to prove the
    *  brain is working and to let the turn say so, never as a durable record. */
   latestModelThinking?: string;
+  /** The last provider stream event kind observed on the wire ('ping',
+   *  'thinking_delta', 'content_block_delta', …). Diagnostics: it is what
+   *  distinguishes a provider that has not started from a brain that has died,
+   *  which the harness previously collapsed into one verdict. */
+  latestProviderStreamEvent?: string;
   /** A compatibility adapter is currently paying for one provider request while
    * buffering its non-streaming completion into an SDK-compatible synthetic
    * stream. No Runner event can exist during that interval, so the outer
