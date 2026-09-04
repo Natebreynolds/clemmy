@@ -5813,6 +5813,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          maxRunTokens: runTokenCeiling,
 	          runTokenBaseline,
 	          message: workerMessage,
+	          // `message` is a private host directive that contains orchestration
+	          // and reporting instructions. Keep the accepted user authority on
+	          // the literal task request so catalog/account parsing, memory, and
+	          // replay cannot mistake phrases such as "from the user" in our own
+	          // wrapper for a connected-account nomination.
+	          displayMessage: task.prompt,
 	          runId: run.id,
 	          shouldCancel: () => {
 	            if (Date.now() > wallClockDeadlineMs) {

@@ -1400,12 +1400,14 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   const task = createBackgroundTask({ title: 'Finish follow-up', prompt: 'finish the follow-up sequence', originSessionId: origin.id, model: 'claude-sonnet-5' });
 
   let workerPromptSeen = '';
+  let acceptedDisplaySeen = '';
   const stubAssistant = {
     getRuntime() {
       return {} as never;
     },
-    async respond(request: { message: string; sessionId: string }) {
+    async respond(request: { message: string; displayMessage?: string; sessionId: string }) {
       workerPromptSeen = request.message;
+      acceptedDisplaySeen = request.displayMessage ?? '';
       return { text: 'Done — follow-up sequence completed and verified.', sessionId: request.sessionId, stoppedReason: 'success' as const };
     },
   };
@@ -1425,6 +1427,11 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   assert.match(workerPromptSeen, /Clementine's data directory is not the user workspace/);
   assert.match(workerPromptSeen, /list_files\(directory=\.\.\.\), read_file\(path=\.\.\.\), and run_shell_command\(cwd=\.\.\.\)/);
   assert.match(workerPromptSeen, new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(
+    acceptedDisplaySeen,
+    task.prompt,
+    'framework worker instructions stay private while accepted user authority remains the original request',
+  );
   const updated = getBackgroundTask(task.id);
   assert.equal(updated?.status, 'done');
   assert.equal(updated?.requestedModel, 'claude-sonnet-5');
