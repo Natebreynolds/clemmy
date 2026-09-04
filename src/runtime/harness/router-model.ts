@@ -25,6 +25,7 @@ import {
   providerToBackendConfig,
   resolveByoProviderForModel,
   resolveDeclaredByoProviderForModel,
+  resolveEffectiveProviderForModel,
 } from './byo-providers.js';
 import { ClaudeModelProvider, claudeHarnessModelSupportsTools } from './claude-model.js';
 import { resolveProvider } from './model-wire-registry.js';
@@ -66,6 +67,9 @@ export interface RouterModelProviderOptions {
   codex?: SyncModelProvider;
   claude?: SyncModelProvider;
   resolveByoModel?: typeof getByoModel;
+  /** Canonical wire-provider classifier. Injectable only so route tests can
+   * exercise connected-provider decisions without reading a real auth vault. */
+  resolveEffectiveProvider?: (modelId: string) => BrainProvider;
   codexAvailable?: () => boolean;
   claudeAvailable?: () => boolean;
 }
@@ -141,6 +145,7 @@ export class RouterModelProvider implements ModelProvider {
   private readonly codex: SyncModelProvider;
   private readonly claude: SyncModelProvider;
   private readonly resolveByoModel: typeof getByoModel;
+  private readonly resolveEffectiveProvider: (modelId: string) => BrainProvider;
   private readonly codexAvailable: () => boolean;
   private readonly claudeAvailable: () => boolean;
 
@@ -148,6 +153,7 @@ export class RouterModelProvider implements ModelProvider {
     this.codex = options.codex ?? new CodexModelProvider();
     this.claude = options.claude ?? new ClaudeModelProvider();
     this.resolveByoModel = options.resolveByoModel ?? getByoModel;
+    this.resolveEffectiveProvider = options.resolveEffectiveProvider ?? resolveEffectiveProviderForModel;
     this.codexAvailable = options.codexAvailable ?? codexModelsAvailable;
     this.claudeAvailable = options.claudeAvailable ?? claudeModelsAvailable;
   }
@@ -258,35 +264,36 @@ export class RouterModelProvider implements ModelProvider {
     const name = requested || MODELS.primary;
     assertUnambiguousModelRouting(name, mode);
 
-    if (mode === 'all_in') {
-      const declaredBackend = resolveDeclaredByoProviderForModel(name);
-      const backend = declaredBackend ?? resolveByoProviderForModel(name) ?? byo;
-      if (!backend.configured) throw new Error('BYO all-in mode is enabled, but no BYO backend is configured.');
-      const id = !declaredBackend && resolveProvider(name) !== 'byo' ? (backend.primaryId || name) : name;
-      logger.debug({ requested: name, routedTo: id, backend: 'byo' }, 'route (all_in)');
-      return { model: this.resolveByoModel(id, backend), provider: 'byo', label: id };
-    }
-
-    // Exact ownership declared by a named BYO provider beats model-id regexes.
-    // This is how an OpenAI-compatible endpoint can intentionally serve a model
-    // called `gpt-4o` or `claude-*` without being mistaken for a subscription.
-    const declaredBackend = resolveDeclaredByoProviderForModel(name);
-    if (declaredBackend?.configured) {
-      logger.debug({ requested: name, backend: 'byo', provider: declaredBackend.providerLabel }, 'route (declared owner)');
-      return { model: this.resolveByoModel(name, declaredBackend), provider: 'byo', label: name };
-    }
-
-    switch (resolveProvider(name)) {
+    // Provider selection has ONE truth. In particular, the canonical classifier
+    // honors an explicit connected Claude id even while the ambient default is
+    // BYO all-in. The old router reimplemented all-in first and silently changed
+    // `claude-sonnet-5` into the BYO primary after workflow/session resolution
+    // had already selected Claude, so route metadata said Claude while GLM was
+    // billed. Keep all-in's fallback-to-primary behavior only when the canonical
+    // classifier actually chose BYO (disconnected/stale built-in ids included).
+    const effectiveProvider = this.resolveEffectiveProvider(name);
+    switch (effectiveProvider) {
       case 'claude':
         logger.debug({ requested: name, backend: 'claude' }, 'route');
         return { model: this.claude.getModel(name), provider: 'claude', label: name };
       case 'byo': {
-        const backend = resolveByoProviderForModel(name) ?? byo;
+        // Exact ownership declared by a named BYO provider beats model-id
+        // regexes. This is how an OpenAI-compatible endpoint can intentionally
+        // serve a model called `gpt-4o` or `claude-*` without being mistaken for
+        // a subscription. An undeclared built-in-shaped id in all-in still
+        // collapses to the configured BYO primary, preserving the dead-seat
+        // guard for ambient/stale defaults.
+        const declaredBackend = resolveDeclaredByoProviderForModel(name);
+        const backend = declaredBackend ?? resolveByoProviderForModel(name) ?? byo;
         if (!backend.configured) {
           throw new Error(`Model ${name} resolves to a BYO/OpenAI-compatible backend, but no BYO backend is configured.`);
         }
-        logger.debug({ requested: name, backend: 'byo' }, 'route');
-        return { model: this.resolveByoModel(name, backend), provider: 'byo', label: name };
+        const id = mode === 'all_in' && !declaredBackend && resolveProvider(name) !== 'byo'
+          ? (backend.primaryId || name)
+          : name;
+        logger.debug({ requested: name, routedTo: id, backend: 'byo', provider: backend.providerLabel },
+          mode === 'all_in' ? 'route (all_in)' : 'route');
+        return { model: this.resolveByoModel(id, backend), provider: 'byo', label: id };
       }
       case 'codex':
       default:
