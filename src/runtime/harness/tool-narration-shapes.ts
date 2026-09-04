@@ -21,9 +21,12 @@ export function looksLikeToolCallShape(text: string): boolean {
     // wrapper tag ("<system>Tool call: …</system>").
     /(^|\n)\s*(?:<\/?[a-z][a-z0-9_-]*>\s*)?\*{0,2}\s*tool(?:[\s_-]*call)?\s*:\s*\*{0,2}\s*[a-z_"]/i.test(t)
     // Bracketed tool reference printed as the answer: "[Tool: OUTLOOK_GET_…]", "[Calling X]".
-    || /(^|\n)\s*\[\s*(?:tool|calling|using|invoking|call)\b[^\]]*\]/i.test(t)
+    // Some provider transcript adapters prefix the same protocol with its
+    // speaker (live: "[assistant tool call: work_call ...]"). The speaker does
+    // not make an unexecuted call safe to publish or persist.
+    || /(^|\n)\s*\[\s*(?:(?:assistant|model)\s+)?(?:tool|calling|using|invoking|call)\b[^\]]*\]/i.test(t)
     // Tagged markers: "<tool_call>", "[tool_call]".
-    || /(^|\n)\s*[<\[]\s*tool[\s_-]*call\b/i.test(t)
+    || /(^|\n)\s*[<\[]\s*(?:(?:assistant|model)\s+)?tool[\s_-]*call\b/i.test(t)
     || /(^|\n)\s*function\s*\n?\s*\{/.test(t)
     || /System:\s*tool result/i.test(t)
     // Bare tool-call-shaped JSON: {"command"/"tool_slug"/"tool_name"/"arguments": …}.
