@@ -79,7 +79,6 @@ import { uniqueWorkflowRunRequest } from '../tools/named-workflow-match.js';
 import {
   disclosePrimaryModelPlanningCapabilities,
   inspectPrimaryModelPlanningReadCapability,
-  inspectPrimaryModelPlanningSingleActionCapability,
   snapshotPrimaryModelPlanningContext,
   type HostFreshPlanningContextV1,
 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
@@ -3492,18 +3491,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                   operationId: request.operationId,
                 })
               ),
-              hostSingleActionPlanCapabilityResolver: (request) => (
-                inspectPrimaryModelPlanningSingleActionCapability({
-                  authority: hostFreshPlanning.authority,
-                  identity: {
-                    sessionId: request.sessionId,
-                    sourceUserSeq: request.sourceUserSeq,
-                  },
-                  capabilityRef: request.requirementId,
-                  operationId: request.operationId,
-                  effect: request.effect,
-                })
-              ),
             } : {}),
             catalogIdentifiers: [...workCallBuiltinNames],
             destinationFamily: frozenDestinationFamily,
@@ -3547,7 +3534,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ? frozenContract
             ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null.'
             : hostFreshPlanning
-              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If any required ref is absent, use `tool_search` first; its exact results disclose capabilityRef values without business I/O. When the request is exactly one fully specified, dependency-free, cardinality-once action, emit that one proposal-free `work_call` alone; the host compiles its existing durable one-action contract without another model-authored plan. For compound, dependent, multi-action, ambiguous, each/set, admin, destructive, or unknown-effect work, keep ownership of the topology and call `plan_task` first. It may stand alone, or be followed in that same frame by exactly one proposal-free `work_call` for a dependency-root read/compute operation from the draft. After activation, route every plan-selected local read and business operation through proposal-free `work_call`; keep unrelated graph-neutral reads on `call_tool`. Reads never need approval.'
+              ? '[tool-catalog] Full tool access. The planning card contains only exact live refs. If a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. A sole identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision; chat does not compile a hidden plan for it. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for compound topology, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
               : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null.'
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
@@ -3601,18 +3588,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             operationId: request.operationId,
           })
         ),
-        hostSingleActionPlanCapabilityResolver: (request) => (
-          inspectPrimaryModelPlanningSingleActionCapability({
-            authority: hostFreshPlanning.authority,
-            identity: {
-              sessionId: request.sessionId,
-              sourceUserSeq: request.sourceUserSeq,
-            },
-            capabilityRef: request.requirementId,
-            operationId: request.operationId,
-            effect: request.effect,
-          })
-        ),
       } : {}),
       catalogIdentifiers: [...workCallBuiltinNames],
       destinationFamily: frozenDestinationFamily,
@@ -3661,7 +3636,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
           ].filter(Boolean).join('\n')
         : hostFreshPlanning
-          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search`; search is metadata/schema discovery only and returns exact citable capabilityRef values. If the request is exactly one fully specified, dependency-free, cardinality-once local_write or external_write, emit exactly one proposal-free `work_call` alone after resolution. The host compiles that sole action through the existing durable plan_task kernel; do not author plan prose for it. You still own readiness and all compound judgment: for dependent, multi-action, ambiguous, each/set, admin, destructive, or unknown-effect work, call `plan_task` first with a brief settled conversational preamble and one compact provider-neutral draft. It may stand alone. To save one foreground step, it may instead have exactly one sibling after it in the same frame: the proposal-free `work_call` bound to a dependency-root read/compute operation declared in that draft. Never combine plan_task with search, writes, admin/unknown effects, dependent work, or additional calls. After activation, plan_task disappears and the proposal-free work_call plus run_worker surfaces remain. Direct conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) do not need plan_task.'
+          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search`; search is metadata/schema discovery only and returns exact citable capabilityRef values. Run safe reads progressively while reasoning. Emit one identified proposal-free `work_call` directly for a sole action; its existing tool-edge allow/deny/ask decision owns consent and dispatch, and chat does not compile a hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Keep ownership of broader topology: use explicit `plan_task` for multiple actions, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work. Direct conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) do not need plan_task.'
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,

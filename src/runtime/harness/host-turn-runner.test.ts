@@ -6661,150 +6661,6 @@ test('production host pairs an unplanned connected external write back for repai
   }
 });
 
-test('a proposal-free planned carrier refuses alone before plan activation, including external writes', async (t) => {
-  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
-  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
-  const priorPorts = productionPorts.listProductionCapabilityPorts();
-  process.env.HARNESS_TOOL_BRACKETS = 'on';
-
-  const cases = [
-    { label: 'email', operationId: 'GMAIL_SEND_EMAIL', args: { to: 'owner@example.test', subject: 'Review', body: 'Please review.' } },
-    { label: 'delete', operationId: 'GOOGLEDRIVE_DELETE_FILE', args: { file_id: 'file-1' } },
-    { label: 'share', operationId: 'GOOGLEDRIVE_ADD_FILE_SHARING_PREFERENCE', args: { file_id: 'file-1', email: 'reader@example.test', role: 'reader' } },
-    { label: 'update', operationId: 'GOOGLESHEETS_UPDATE_ROW', args: { spreadsheet_id: 'sheet-1', row_number: 2, values: [['changed']] } },
-    {
-      label: 'named-existing',
-      operationId: 'GOOGLESHEETS_BATCH_UPDATE',
-      args: { spreadsheet_id: 'sheet-existing', requests: [{ updateCells: {} }] },
-      destination: { family: 'workbook', posture: 'named_existing' as const },
-    },
-    { label: 'unknown-write', operationId: 'FIXTURE_UNKNOWN_WRITE', args: { opaque: 'mutation' } },
-  ] as const;
-
-  try {
-    for (const [index, input] of cases.entries()) {
-      await t.test(input.label, async () => {
-        const fixture = acceptHostCanarySource(`planned-${input.label}`);
-        const fingerprint = (index + 5).toString(16).repeat(64);
-        const manifest = capabilityManifests.attachSemanticContract({
-          version: 1,
-          manifestId: `cap:fixture:planned-${input.label}`,
-          providerKind: 'composio',
-          operationId: input.operationId,
-          providerIdentity: `composio:${input.label}`,
-          providerVersion: '2026-08-23',
-          operationVersion: '1',
-          definitionFingerprint: fingerprint,
-          effect: 'external_write',
-          ...('destination' in input ? { destination: input.destination } : {}),
-          accountId: `account:${input.label}:owner`,
-          idempotency: { required: true, policy: 'key_before_dispatch' },
-          reconciliation: { supported: true, policy: 'provider_lookup' },
-          outputContract: { kind: 'mutation_receipt' },
-          evidenceContract: { kinds: ['receipt'], readbackRequired: true },
-          provenance: {
-            issuer: 'host-turn-runner:test',
-            issuedAt: '2026-08-23T00:00:00.000Z',
-            trusted: true,
-          },
-          lifecycle: { state: 'current' },
-          advisoryRoles: ['destination'],
-        });
-        let providerBodies = 0;
-        const invoke = async () => {
-          providerBodies += 1;
-          return { successful: true };
-        };
-        const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
-        factory.register({
-          capabilityId: manifest.manifestId,
-          toolName: manifest.operationId,
-          schemaVersion: manifest.operationVersion,
-          schemaDigest: manifest.definitionFingerprint,
-          effect: manifest.effect,
-          ...('destination' in input ? { destination: input.destination } : {}),
-          account: manifest.accountId,
-          manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
-          providerKind: manifest.providerKind,
-          liveFingerprint: manifest.definitionFingerprint,
-          manifest,
-          invoke,
-        });
-        capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
-        productionPorts.clearProductionCapabilityPorts();
-        assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
-          productionPorts.productionPortIdentityFromManifest(manifest),
-          { invoke },
-        ), { ok: true });
-
-        const planned = workCallTools.buildWorkCall({
-          requireHostPlan: true,
-          reachableBuiltinNames: new Set(['composio_execute_tool']),
-          firstClassNames: new Set<string>(),
-          catalogIdentifiers: [input.operationId],
-          settlementLane: 'byo',
-        });
-        const carrier = brackets.wrapToolForHarness(planned as never);
-        assert.equal(workCallTools.isHostPlanRequiredWorkCall(carrier), true,
-          'the opaque planned-work marker survives harness wrapping');
-        const callId = `planned-${input.label}-call`;
-        const model = stubModel([
-          [toolCall(callId, 'work_call', {
-            requirement_id: 'mutation-once',
-            universe_item_id: null,
-            universe_selector: null,
-            seal_amendment: null,
-            name: 'composio_execute_tool',
-            args_json: JSON.stringify({
-              tool_slug: input.operationId,
-              arguments: JSON.stringify(input.args),
-              connected_account_id: null,
-            }),
-          })],
-          [textMsg(`continued without unplanned ${input.label}`)],
-        ]);
-        const agent = { model, tools: [carrier] };
-        bindHostCanarySurface(fixture, agent, [carrier]);
-
-        const paused = await runProductionHost(fixture, agent);
-        assert.equal(paused.hasInterruptions, undefined, JSON.stringify(paused));
-        assert.equal(paused.terminal, undefined, JSON.stringify(paused));
-        assert.equal(paused.finalOutput, `continued without unplanned ${input.label}`);
-        assert.equal(model.calls(), 2);
-        assert.deepEqual(
-          paused.history
-            .filter((item) => (item as { type?: string }).type === 'function_call_result')
-            .map((item) => (item as { callId?: string }).callId),
-          [callId],
-        );
-        assert.deepEqual(dispositionMarkers(paused.history), [{
-          disposition: 'refused_pre_dispatch',
-          effect: 'none',
-          retry: 'replan',
-          requiresReconciliation: false,
-        }]);
-        assert.equal(providerBodies, 0, 'pre-plan work_call has no approval or provider edge');
-        const db = eventlog.openEventLog();
-        for (const table of ['logical_tool_calls', 'physical_dispatches']) {
-          assert.equal((db.prepare(`
-            SELECT COUNT(*) AS n FROM ${table}
-             WHERE session_id = ? AND source_user_seq = ?
-          `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0,
-          `${input.label}:${table}`);
-        }
-      });
-    }
-  } finally {
-    productionPorts.clearProductionCapabilityPorts();
-    for (const prior of priorPorts) {
-      productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
-    }
-    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
-    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
-    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
-  }
-});
-
 test('production host refuses a preaccepted turn-graph hybrid before model, logical, or physical execution', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
@@ -8527,8 +8383,9 @@ test('a refused call frame tells the model the real defect and the exact repair 
   assert.ok(malformed.includes('\\"tool_slug\\":\\"<slug>\\"'), malformed);
   assert.match(malformed, /ONE JSON string/);
   const planBound = hostFrameRefusalDirective('host_planned_work_call_requires_plan_sibling');
-  assert.match(planBound, /call plan_task naming this operation first/);
-  assert.match(planBound, /If this was a read, put the exact operation tool_search disclosed under tool_slug/);
+  assert.match(planBound, /not the configured proposal-free work_call carrier/);
+  assert.match(planBound, /copy its literal carrier example/);
+  assert.match(planBound, /cannot inherit the configured tool's host provenance/);
   // A refusal is a DOOR, not a category (2026-09-02): with the turn's proof in
   // hand it names the proven reads the model may call without a plan, the
   // exact carrier, and the operation it could not prove.
@@ -8537,10 +8394,10 @@ test('a refused call frame tells the model the real defect and the exact repair 
     offendingOperation: 'googlesheets.batch_get',
   });
   assert.match(withProof, /before dispatch \(host_planned_work_call_requires_plan_sibling\)/, 'the stage token survives');
-  assert.match(withProof, /PROVEN READS this turn and need no plan/);
-  assert.match(withProof, /GOOGLESHEETS_BATCH_GET, SLACK_FETCH_CONVERSATION_HISTORY/);
   assert.match(withProof, /could not prove "googlesheets\.batch_get" as a read/);
-  assert.ok(withProof.includes('\\"tool_slug\\":\\"<one of those>\\"'), withProof);
+  assert.doesNotMatch(withProof, /PROVEN READS this turn/,
+    'a known write refusal must not send the model sideways into unrelated reads');
+  assert.match(withProof, /not the configured proposal-free work_call carrier/);
   assert.equal(
     hostFrameRefusalDirective('host_control_requires_sole_call_frame'),
     'The host refused this exact call frame before dispatch (host_control_requires_sole_call_frame). No tool body was entered.',

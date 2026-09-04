@@ -407,15 +407,3 @@ test('a bound collection admits generated current catalog sources independent of
     },
   }), null, 'a catalog-shaped copy without the factory currentness attestation is inert');
 });
-
-test('sole-action frame policy mirrors every host-planned work_call schema field (8810 connection pin)', async () => {
-  // Strict materialization injects JSON null for each required+nullable key
-  // of HostPlannedWorkCallInputSchema BEFORE classifyHostModelFrame runs. A
-  // schema field the policy does not list makes exactSingleActionMutation
-  // return null for every sole once-mutation, so schema growth alone can
-  // silently disable the lane. The two sets must stay byte-identical.
-  const { HostPlannedWorkCallInputSchema } = await import('./work-call.js');
-  const { SINGLE_ACTION_WORK_CALL_FIELDS } = await import('../runtime/harness/host-model-frame-policy.js');
-  const schemaFields = Object.keys(HostPlannedWorkCallInputSchema.shape).sort();
-  assert.deepEqual([...SINGLE_ACTION_WORK_CALL_FIELDS].sort(), schemaFields);
-});

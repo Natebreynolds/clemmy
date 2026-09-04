@@ -135,100 +135,83 @@ test('fresh plan frame refuses every unsafe ordering, cardinality, carrier, effe
   }
 });
 
-test('proposal-free read/compute is ordinary without a graph while mutation and unknown stay plan-bound', () => {
-  assert.deepEqual(classifyHostModelFrame({ calls: [work()], planActivated: false, allowFreshPlanReadFusion: true }), {
-    kind: 'ordinary',
-  });
-  assert.deepEqual(classifyHostModelFrame({
-    calls: [work({ effect: 'compute' })],
-    planActivated: false,
-    allowFreshPlanReadFusion: true,
-  }), {
-    kind: 'ordinary',
-  });
-  for (const effect of ['local_write', 'external_write', 'admin', 'unknown'] as const) {
-    assert.deepEqual(classifyHostModelFrame({
-      calls: [work({ effect })],
-      planActivated: false,
-      allowFreshPlanReadFusion: true,
-    }), {
-      kind: 'refused',
-      reason: 'host_planned_work_call_requires_plan_sibling',
-    }, effect);
-  }
-  assert.deepEqual(classifyHostModelFrame({ calls: [work()], planActivated: true, allowFreshPlanReadFusion: true }), {
-    kind: 'ordinary',
-  });
-  assert.deepEqual(classifyHostModelFrame({ calls: [plan()], planActivated: true, allowFreshPlanReadFusion: true }), {
-    kind: 'refused',
-    reason: 'fresh_plan_already_activated',
-  });
-});
-
-test('sole once-mutation stays eligible when strict materialization injects null lineage keys (8810)', () => {
-  // Strict schema materialization emits every required+nullable key of the
-  // host-planned work_call transport as JSON null before this policy runs.
-  // Live 2026-08-31: two new lineage keys arrived as nulls, the field mirror
-  // lacked them, and every sole Workspace write was refused
-  // host_planned_work_call_requires_plan_sibling until the governor
-  // terminalized the turn.
-  const materialized = (overrides: Record<string, unknown> = {}): HostModelFrameCall => work({
-    callId: 'save',
-    effectiveName: 'space_save',
-    effect: 'local_write',
+test('identified proposal-free calls remain ordinary until the exact tool edge', () => {
+  const materializedWrite = work({
+    callId: 'write',
+    effectiveName: 'GOOGLESHEETS_UPDATE_VALUES_BATCH',
+    effect: 'external_write',
     argumentsValue: {
-      requirement_id: 'cap:local:space_save:reversible',
+      requirement_id: 'cap:resolved:update-values',
       universe_item_id: null,
       universe_selector: null,
       seal_amendment: null,
       source_call_ids: null,
       source_record_ids: null,
-      name: 'space_save',
-      args_json: '{"slug":"proof","title":"Proof"}',
-      ...overrides,
+      name: 'composio_execute_tool',
+      args_json: '{"tool_slug":"GOOGLESHEETS_UPDATE_VALUES_BATCH","arguments":{}}',
     },
   });
-  assert.deepEqual(
-    classifyHostModelFrame({ calls: [materialized()], planActivated: false, allowFreshPlanReadFusion: true }),
-    {
-      kind: 'host_owned_single_action_plan',
-      call: materialized(),
-      requirementId: 'cap:local:space_save:reversible',
-      effect: 'local_write',
-    },
-  );
-  // Non-null lineage means the call depends on settled work; the sole-action
-  // lane never compiles a dependent write.
-  for (const lineage of [
-    { source_call_ids: ['call_1'] },
-    { source_record_ids: ['https://example.test/a'] },
+  for (const call of [
+    work(),
+    work({ effect: 'compute' }),
+    work({ effectiveName: 'LOCAL_WRITE_ACTION', effect: 'local_write' }),
+    materializedWrite,
+    work({
+      effectiveName: 'EXTERNAL_WRITE_FROM_RESULT',
+      effect: 'external_write',
+      argumentsValue: {
+        requirement_id: 'cap:resolved:external-write-from-result',
+        universe_item_id: null,
+        universe_selector: null,
+        seal_amendment: null,
+        source_call_ids: ['settled-read-call'],
+        source_record_ids: null,
+        name: 'business_tool',
+        args_json: '{"record_id":"record-1"}',
+      },
+    }),
+    work({ effectiveName: 'ADMIN_ACTION', effect: 'admin' }),
+    work({ effectiveName: 'SOME_PROVIDER_ACTION', effect: 'unknown' }),
   ]) {
-    assert.deepEqual(
-      classifyHostModelFrame({ calls: [materialized(lineage)], planActivated: false, allowFreshPlanReadFusion: true }),
-      { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' },
-      JSON.stringify(lineage),
-    );
+    assert.deepEqual(classifyHostModelFrame({
+      calls: [call],
+      planActivated: false,
+      allowFreshPlanReadFusion: true,
+    }), { kind: 'ordinary' }, call.effectiveName ?? 'unidentified');
   }
+
+  assert.deepEqual(classifyHostModelFrame({
+    calls: [work({ proposalFreeWorkCarrier: false })],
+    planActivated: false,
+    allowFreshPlanReadFusion: true,
+  }), {
+    kind: 'refused',
+    reason: 'host_planned_work_call_requires_plan_sibling',
+  }, 'an unmarked work_call lookalike retains no configured-tool provenance');
+
+  assert.deepEqual(classifyHostModelFrame({
+    calls: [plan()],
+    planActivated: true,
+    allowFreshPlanReadFusion: true,
+  }), { kind: 'refused', reason: 'fresh_plan_already_activated' });
 });
 
-
-test('a proposal-free work_call whose inner operation cannot be identified is refused as malformed, never as "requires a plan sibling"', () => {
-  // Live 2026-09-01: GLM 5.3 called work_call → composio_execute_tool with
-  // {channel, limit} as args_json — no tool_slug, no arguments wrapper — for
-  // a proven Slack READ. The unwrap yields no effective name and effect
-  // unknown; "requires plan sibling" was a wrong diagnosis with no door.
+test('only an unidentified unknown proposal-free carrier is refused at frame classification', () => {
   assert.deepEqual(classifyHostModelFrame({
-    calls: [work({ effectiveName: null, effect: 'unknown', argumentsValue: { name: 'composio_execute_tool', args_json: '{"channel":"C0BL9LLUSBD","limit":5}' } })],
+    calls: [work({
+      effectiveName: null,
+      effect: 'unknown',
+      argumentsValue: {
+        name: 'composio_execute_tool',
+        args_json: '{"channel":"C0BL9LLUSBD","limit":5}',
+      },
+    })],
     planActivated: false,
     allowFreshPlanReadFusion: true,
-  }), { kind: 'refused', reason: 'host_work_call_inner_operation_unidentified' });
-  // An identified-but-unknown effect (the operation is named, its effect is
-  // not provable) is still the plan-bound mutation case.
-  assert.deepEqual(classifyHostModelFrame({
-    calls: [work({ effectiveName: 'SOME_PROVIDER_ACTION', effect: 'unknown' })],
-    planActivated: false,
-    allowFreshPlanReadFusion: true,
-  }), { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' });
+  }), {
+    kind: 'refused',
+    reason: 'host_work_call_inner_operation_unidentified',
+  });
 });
 
 // A carried control is that control. The policy used to refuse a frame whose

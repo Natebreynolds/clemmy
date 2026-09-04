@@ -44,82 +44,7 @@ export type HostModelFrameDisposition =
       prePlanEffect: 'read' | 'compute';
       requirementId: string;
     }
-  | {
-      /** Scheduling eligibility only. The runner must still reopen the exact
-       * configured work_call's opaque, source-bound disclosure capability and
-       * compile through plan_task before this call receives any authority. */
-      kind: 'host_owned_single_action_plan';
-      call: HostModelFrameCall;
-      requirementId: string;
-      effect: 'local_write' | 'external_write';
-    }
   | { kind: 'refused'; reason: HostModelFrameRefusal };
-
-/** Every key the host-planned work_call transport schema can materialize.
- *
- * Strict materialization injects `null` for each absent required+nullable
- * key BEFORE this policy classifies the frame, so this set must mirror
- * `HostPlannedWorkCallInputSchema.shape` exactly: a schema field missing here
- * silently disables the sole-action lane (every dependency-free once-mutation
- * is refused `host_planned_work_call_requires_plan_sibling`, then the
- * no-progress governor terminalizes the turn). The mirror is pinned by
- * `work-call-inner-schema.test.ts`; a field added to the schema must be
- * added here with its sole-action rule below. */
-export const SINGLE_ACTION_WORK_CALL_FIELDS: ReadonlySet<string> = new Set([
-  'requirement_id',
-  'universe_item_id',
-  'universe_selector',
-  'seal_amendment',
-  'source_call_ids',
-  'source_record_ids',
-  'name',
-  'args_json',
-]);
-
-function exactSingleActionMutation(
-  call: HostModelFrameCall,
-): { requirementId: string; effect: 'local_write' | 'external_write' } | null {
-  if (
-    !call.proposalFreeWorkCarrier
-    || !isPlainOrClementineLocalTool(call.name, 'work_call')
-    || (call.effect !== 'local_write' && call.effect !== 'external_write')
-    || !call.effectiveName
-    || call.effectiveName !== call.effectiveName.trim()
-    || !call.argumentsValue
-  ) return null;
-  const value = call.argumentsValue;
-  if (
-    Object.keys(value).some((key) => !SINGLE_ACTION_WORK_CALL_FIELDS.has(key))
-    || Object.prototype.hasOwnProperty.call(value, 'proposal')
-    || (value.universe_item_id !== undefined && value.universe_item_id !== null)
-    || (value.universe_selector !== undefined && value.universe_selector !== null)
-    || (value.seal_amendment !== undefined && value.seal_amendment !== null)
-    // A dependency-free once-action has no source lineage: nominated source
-    // calls or records mean the call depends on settled work and must be
-    // compiled through plan_task, not the sole-action lane.
-    || (value.source_call_ids !== undefined && value.source_call_ids !== null)
-    || (value.source_record_ids !== undefined && value.source_record_ids !== null)
-  ) return null;
-  const requirementId = typeof value.requirement_id === 'string'
-    ? value.requirement_id.trim()
-    : '';
-  const innerName = typeof value.name === 'string' ? value.name.trim() : '';
-  const argsJson = typeof value.args_json === 'string' ? value.args_json : '';
-  if (
-    !requirementId.startsWith('cap:')
-    || requirementId !== value.requirement_id
-    || !innerName
-    || innerName !== value.name
-    || !argsJson
-  ) return null;
-  try {
-    const args = JSON.parse(argsJson) as unknown;
-    if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
-  } catch {
-    return null;
-  }
-  return { requirementId, effect: call.effect };
-}
 
 function declaredFrameClass(name: string | null): HostModelFrameClass {
   if (!name) return 'ordinary';
@@ -216,31 +141,19 @@ export function classifyHostModelFrame(input: {
     if (directWorkCallLookalike) {
       return { kind: 'refused', reason: 'host_planned_work_call_requires_plan_sibling' };
     }
-    if (!input.planActivated && input.calls.length === 1) {
-      const exact = exactSingleActionMutation(input.calls[0]!);
-      if (exact) {
-        return {
-          kind: 'host_owned_single_action_plan',
-          call: input.calls[0]!,
-          requirementId: exact.requirementId,
-          effect: exact.effect,
-        };
-      }
-    }
     // A proposal-free carrier is also the only foreground door for an exact
     // live provider read. Reads/compute do not acquire graph authority merely
     // by crossing that carrier: the inner dispatcher still re-proves the
     // current operation, account, schema and effect under the host root. A
-    // sole, structurally exact once-mutation may ask the host to compile that
-    // same contract above; every other mutation/unknown shape still fails
-    // closed before call admission.
+    // mutation follows that same ordinary frame path: allow/deny/ask belongs
+    // at the exact tool edge, not in a chat-side graph compiler.
     if (!input.planActivated) {
-      const planBound = input.calls.find((call) => (
+      const unidentified = input.calls.find((call) => (
         call.proposalFreeWorkCarrier
-        && call.effect !== 'read'
-        && call.effect !== 'compute'
+        && call.effect === 'unknown'
+        && call.effectiveName === null
       ));
-      if (planBound) {
+      if (unidentified) {
         // Live 2026-09-01 ("last three Slack messages", GLM 5.3): the inner
         // composio_execute_tool carried no tool_slug, so no operation and no
         // effect could be identified. Calling that "requires a plan sibling"
@@ -249,9 +162,7 @@ export function classifyHostModelFrame(input: {
         // operation is unidentified is refused as exactly that.
         return {
           kind: 'refused',
-          reason: planBound.effect === 'unknown' && planBound.effectiveName === null
-            ? 'host_work_call_inner_operation_unidentified'
-            : 'host_planned_work_call_requires_plan_sibling',
+          reason: 'host_work_call_inner_operation_unidentified',
         };
       }
     }

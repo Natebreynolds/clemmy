@@ -153,7 +153,7 @@ const MAX_DISCLOSED_READ_REF_TOKENS = 8;
 /**
  * A successful exact-schema refresh is different from broad catalog walking:
  * it re-proves the one operation/account the model is about to call. The live
- * one-action lane used to throw that progress away because
+ * direct tool-edge lane used to throw that progress away because
  * `capability_resolution` rows are (correctly) ignored when they are merely a
  * bucket of alternatives. The no-progress reducer then replaced the business
  * surface with planning-only tools immediately after the exact refresh that

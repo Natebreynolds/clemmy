@@ -148,7 +148,8 @@ export function hostFrameRefusalDirective(
     return `${base} The work_call carried an inner call whose operation the host could not identify.${exactReadDoor}`;
   }
   if (reason === 'host_planned_work_call_requires_plan_sibling') {
-    return `${base} A write or send through work_call needs its plan: call plan_task naming this operation first.${offending}${exactReadDoor}`;
+    return `${base} This was not the configured proposal-free work_call carrier.${offending}`
+      + ' Re-open the exact tool_search result and copy its literal carrier example; a lookalike call cannot inherit the configured tool\'s host provenance.';
   }
   return base;
 }
@@ -214,9 +215,7 @@ import { tryHostDispatchNamedWorkflow } from './named-workflow-host-dispatch.js'
 import {
   prepareHostWorkCall,
   resolveHostPlanningReadCapability,
-  resolveHostSingleActionPlanCapability,
 } from '../../tools/work-call-mode.js';
-import { hostSingleActionPlanTaskInput } from '../../tools/plan-tools.js';
 import {
   acceptedTurnCallAuthorityFor,
   armHostCallAuthority,
@@ -5272,112 +5271,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     { kind: 'fresh_plan_then_root_read' }
   >;
 
-  type HostOwnedSingleActionFrame = Extract<
-    HostModelFrameDisposition,
-    { kind: 'host_owned_single_action_plan' }
-  >;
-
-  const activatedSingleActionRequirement = (
-    frame: HostOwnedSingleActionFrame,
-  ): boolean => {
-    try {
-      const identity = exactHostIdentity();
-      if (
-        !actionExpectedWorkRequired(identity)
-        || !settledFreshPlanControl(identity)
-      ) return false;
-      const loaded = loadExpectedWorkContract(identity.sessionId, identity.sourceUserSeq);
-      if (loaded.status !== 'ok' || loaded.contract.operations.length !== 1) return false;
-      const operation = loaded.contract.operations[0]!;
-      return operation.id === frame.requirementId
-        && operation.effect === frame.effect
-        && operation.dependsOn.length === 0
-        && operation.dataFrom.length === 0
-        && operation.cardinality.kind === 'once';
-    } catch {
-      return false;
-    }
-  };
-
-  /** Compile the sole exact Auto candidate by invoking the configured
-   * plan_task object as an internal control. The synthetic result never enters
-   * model history; its ordinary durable logical settlement/preamble/activation
-   * receipts are the only facts that may phase the host surface. */
-  const activateHostOwnedSingleActionPlan = async (
-    frame: HostOwnedSingleActionFrame,
-  ): Promise<boolean> => {
-    const workTool = toolByName.get(frame.call.name);
-    const outerArgs = frame.call.argumentsValue;
-    if (!workTool || !outerArgs || !freshPlanControlConfigured()) return false;
-    const identity = exactHostIdentity();
-    const resolved = await resolveHostSingleActionPlanCapability(workTool, {
-      sessionId: identity.sessionId,
-      sourceUserSeq: identity.sourceUserSeq,
-      requirementId: frame.requirementId,
-      operationId: frame.call.effectiveName ?? '',
-      effect: frame.effect,
-      outerArgs,
-    });
-    if (!resolved) return false;
-    const planInput = hostSingleActionPlanTaskInput(resolved);
-    if (!planInput) return false;
-    const planTool = toolByName.get('plan_task');
-    if (!planTool) return false;
-    const logicalToolCallId = `host-auto-plan-${createHash('sha256')
-      .update(JSON.stringify({
-        version: 1,
-        sessionId: identity.sessionId,
-        sourceUserSeq: identity.sourceUserSeq,
-        capabilityRef: resolved.capabilityRef,
-        operationId: resolved.operationId,
-        effect: resolved.effect,
-      }), 'utf8')
-      .digest('hex')}`;
-    const planCall: CanonicalHostCall = {
-      callId: logicalToolCallId,
-      name: 'plan_task',
-      argumentsJson: JSON.stringify(planInput),
-    };
-    let planReady = false;
-    try {
-      const exactPlan = exactProductionHostCall(
-        planCall.name,
-        planInput,
-        planCall.argumentsJson,
-        planTool,
-        planCall.callId,
-        runContext,
-        {
-          toolCall: {
-            type: 'function_call',
-            callId: planCall.callId,
-            name: planCall.name,
-            arguments: planCall.argumentsJson,
-          },
-        },
-      );
-      planReady = Boolean(
-        exactPlan
-        && exactPlan.effect === 'host_only'
-        && exactPlan.boundary === 'host_owned_local',
-      );
-      if (planReady && typeof planTool.needsApproval === 'function') {
-        planReady = await planTool.needsApproval(
-          runContext,
-          planInput,
-          planCall.callId,
-        ) !== true;
-      }
-    } catch {
-      planReady = false;
-    }
-    if (!planReady) return false;
-    const attempt = await executeCallAttempt(planCall);
-    return attempt.status === 'returned'
-      && !attempt.value.hostRefusal
-      && activatedSingleActionRequirement(frame);
-  };
-
   const activatedRootRequirement = (
     frame: FreshPlanReadFrame,
     exact: ExactProductionHostCall,
@@ -7294,27 +7187,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ]);
       }
       continue;
-    }
-    if (frameDisposition.kind === 'host_owned_single_action_plan') {
-      const activated = hostProduction
-        ? await activateHostOwnedSingleActionPlan(frameDisposition)
-        : false;
-      if (!activated) {
-        const paired = pairLocallyRefusedFrame(canonicalCalls);
-        const resultCommitBlock = commitAdmittedToolFrame({
-          acceptedFrame,
-          frameHistory: admission.frame.history,
-          resultItems: paired.resultItems,
-          responseId: step.responseId,
-        });
-        if (resultCommitBlock) return resultCommitBlock;
-        recordZeroCrossingRefusal(paired.frameDigest);
-        continue;
-      }
-      // From here onward the original model call uses the ordinary common
-      // preparation/consent/lease/execution path under the newly activated
-      // durable graph. The hidden control result is intentionally not history.
-      frameDisposition = { kind: 'ordinary' };
     }
     /* Retain the legacy direct/effective policy assertion as a consistency
      * check for registry classes not yet migrated to hostModelFrameClass. */

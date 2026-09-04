@@ -314,68 +314,6 @@ export const PlanTaskInputSchema = z.object({
 
 export type PlanTaskInput = z.infer<typeof PlanTaskInputSchema>;
 
-/** Deterministic host projection for the sole-action Auto lane. It carries no
- * authority of its own: the returned bytes are invoked through the configured
- * plan_task tool, whose ordinary source/catalog/admission/seal path remains
- * the only graph/work-contract compiler. Compound work is intentionally not
- * representable here. */
-export function hostSingleActionPlanTaskInput(input: {
-  capabilityRef: string;
-  operationId: string;
-  effect: 'local_write' | 'external_write';
-  descriptor: HostCapabilityDescriptorV1;
-}): PlanTaskInput | null {
-  if (
-    input.capabilityRef !== input.descriptor.id
-    || input.effect !== input.descriptor.effect
-    || input.capabilityRef !== input.capabilityRef.trim()
-    || input.operationId !== input.operationId.trim()
-  ) return null;
-  const deliverableId = `auto_deliverable_${createHash('sha256')
-    .update(`${input.capabilityRef}\0${input.operationId}`, 'utf8')
-    .digest('hex')
-    .slice(0, 24)}`;
-  const candidate = {
-    preamble: 'I’ll carry out that exact requested action now.',
-    draft: {
-      criteria: ['Complete the accepted request with one exact action and retain its durable result.'],
-      cardinality: null,
-      destination: input.descriptor.destinationPosture
-        ? {
-            posture: input.descriptor.destinationPosture,
-            family: input.descriptor.deliverableKind,
-            handleRequired: input.descriptor.handleRequired,
-          }
-        : null,
-      topology: {
-        version: 1 as const,
-        operations: [{
-          id: input.capabilityRef,
-          effect: input.effect,
-          coverage: null,
-          dependsOn: [],
-          dataFrom: [],
-          cardinality: { kind: 'once' as const },
-        }],
-        universes: [],
-      },
-      bindings: [{
-        operationId: input.capabilityRef,
-        role: input.descriptor.destinationPosture ? 'destination' : 'action',
-        capabilityRef: input.capabilityRef,
-        evidence: [...input.descriptor.evidenceKinds],
-      }],
-      deliverables: [{
-        id: deliverableId,
-        kind: input.descriptor.deliverableKind,
-      }],
-      evidenceRequirements: [...input.descriptor.evidenceKinds],
-    },
-  };
-  const parsed = PlanTaskInputSchema.safeParse(candidate);
-  return parsed.success ? parsed.data : null;
-}
-
 function settledPreamble(raw: string): string {
   const text = raw.trim();
   if (!text || text.length > MAX_PREAMBLE_CHARS) {

@@ -5,7 +5,6 @@ import type { ConversationPreambleDeliveryCallback, TaskContinuationContext } fr
 import { effectiveTurnObjective } from './turn-control.js';
 import {
   copyHostPlanningReadCapabilityResolver,
-  copyHostSingleActionPlanCapabilityResolver,
   copyHostWorkCallPreparer,
   isHostPlanRequiredWorkCall,
 } from '../../tools/work-call-mode.js';
@@ -4742,7 +4741,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
     const wrapped = { ...tool, invoke: wrappedInvoke } as T;
     copyToolLocalInputInvalidityAttestation(tool, wrapped);
     copyHostPlanningReadCapabilityResolver(tool, wrapped);
-    copyHostSingleActionPlanCapabilityResolver(tool, wrapped);
     copyHostWorkCallPreparer(tool, wrapped);
     copyTerminalPhysicalDispatchOwnership(tool, wrapped);
     return attestHarnessBoundTool(wrapped) as T;
@@ -5092,7 +5090,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
   };
   const wrapped = { ...tool, execute: wrappedExecute } as T;
   copyHostPlanningReadCapabilityResolver(tool, wrapped);
-  copyHostSingleActionPlanCapabilityResolver(tool, wrapped);
   copyHostWorkCallPreparer(tool, wrapped);
   copyTerminalPhysicalDispatchOwnership(tool, wrapped);
   return attestHarnessBoundTool(wrapped) as T;

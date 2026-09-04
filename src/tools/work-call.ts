@@ -118,14 +118,11 @@ import {
 import {
   markHostPlanRequiredWorkCall,
   registerHostPlanningReadCapabilityResolver,
-  registerHostSingleActionPlanCapabilityResolver,
   registerHostWorkCallPreparer,
   type HostPlanningReadCapabilityResolver,
-  type HostSingleActionPlanCapabilityResolver,
   type HostWorkCallPreparationRequest,
   type HostWorkCallPreparationResult,
 } from './work-call-mode.js';
-
 export { isHostPlanRequiredWorkCall } from './work-call-mode.js';
 
 const IdSchema = WorkTopologyIdSchema;
@@ -1245,10 +1242,6 @@ export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'around
    * foreground model's bounded planning card. Final execution authority stays
    * in the host runner and its current catalog/manifest checks. */
   hostPlanningReadCapabilityResolver?: HostPlanningReadCapabilityResolver;
-  /** Opaque source-bound resolver used only when the model emits one sole,
-   * exact, dependency-free once mutation. The host still compiles via the
-   * configured plan_task control before ordinary preparation/execution. */
-  hostSingleActionPlanCapabilityResolver?: HostSingleActionPlanCapabilityResolver;
 }
 
 export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeContextValue> {
@@ -1260,7 +1253,6 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     requireHostPlan = false,
     hostPlanningReady,
     hostPlanningReadCapabilityResolver,
-    hostSingleActionPlanCapabilityResolver,
     ...dispatcherOptions
   } = options;
   const frozenAuthority = formatFrozenWorkCallDescription({
@@ -1854,7 +1846,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       'Invoke one plan-selected local read or business tool under the frozen semantic work contract.',
       frozenAuthority
         ?? (requireHostPlan
-          ? 'This is the proposal-free foreground carrier. An exact live read/compute may run alone without creating a graph. One sole, fully specified, dependency-free, cardinality-once local_write or external_write may run alone after exact capability disclosure; the host compiles it through the existing plan_task contract before admitting this call. Compound, dependent, each/set, ambiguous, admin, destructive, and unknown-effect work still requires a model-authored plan. The sanctioned same-frame plan sibling remains limited to a dependency-root read/compute requirement. After activation, bind one exact requirement_id normally.'
+          ? 'This is the proposal-free foreground carrier. Exact calls are decided at the tool edge by the existing allow/deny/ask and dispatch path; this carrier does not compile a hidden plan_task. Pass source_call_ids only when arguments consume or copy one settled result\'s bytes; a read used only for ordering, a condition, or a decision is not content lineage. Compound, each/set, ambiguous, admin, destructive, and unknown-effect work still follows the explicit planning surface.'
           : [
               'If the host already froze a contract, pass proposal:null and bind the exact requirement id. Otherwise the FIRST call provides the complete provider-neutral proposal plus the first requirement binding.',
               'The proposal describes only effects, dependencies, coverage, cardinality and universes—never tool names, providers, services or slugs.',
@@ -1870,11 +1862,9 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     isEnabled: async () => {
       if (!requireHostPlan) return true;
       const context = harnessRunContextStorage.getStore();
-      // Visibility is not authority. The host exposes this one compact schema
-      // so the primary model can emit the sanctioned sole-action Auto frame or
-      // plan+root-read frame. Visibility grants nothing: frame policy plus the
-      // configured object's opaque disclosure resolver admit only the narrow
-      // former shape, and the execution body still requires a durable plan.
+      // Visibility is not authority. The host exposes this compact carrier
+      // only when the exact accepted-source identity is present. The tool-edge
+      // consent and dispatch path still owns every business-call decision.
       const exactIdentityPresent = Boolean(
         context?.sessionId
         && Number.isSafeInteger(context.sourceUserSeq)
@@ -2179,12 +2169,6 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     registerHostPlanningReadCapabilityResolver(
       built as object,
       hostPlanningReadCapabilityResolver,
-    );
-  }
-  if (hostSingleActionPlanCapabilityResolver) {
-    registerHostSingleActionPlanCapabilityResolver(
-      built as object,
-      hostSingleActionPlanCapabilityResolver,
     );
   }
   return requireHostPlan
