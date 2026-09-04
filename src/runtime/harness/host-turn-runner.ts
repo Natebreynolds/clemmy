@@ -309,6 +309,7 @@ import {
   acceptedModelBatchHistoryDigest,
   admitAcceptedModelBatch,
   finalizeAcceptedModelBatch,
+  recoverAcceptedModelBatchForRestart,
   reopenAcceptedModelBatch,
   type AcceptedModelBatchRef,
 } from './accepted-model-batch-checkpoint.js';
@@ -5527,6 +5528,73 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
     : undefined;
   let recoveredAcceptedFrame: OpenAcceptedToolFrame | undefined;
+  // REBASE BEFORE REPLAY. `history` was seeded from the recovery blob, which is
+  // frozen at the moment the hold was taken. When a checkpoint COMMITTED after
+  // that freeze, the live history no longer digests to the sealed bytes, and
+  // the chain trigger requires `prior.history_digest = NEW.pre_history_digest`.
+  // Every subsequent admission then aborts with "model batch admission requires
+  // the exact prior balanced checkpoint" — and because the blob is frozen, each
+  // retry is byte-identical, so the shared budget is spent in under a second
+  // and the turn dies at exact_checkpoint_admission_exhausted.
+  //
+  // Measured live 2026-09-04 (sess-desktop-39e2f90dbbaed162d18bd3b6, seq 105):
+  //   admission (105,1).pre_history_digest = a8fa85815144   (what the blob froze)
+  //   checkpoint(105,1).history_digest     = 3a9dd2a43f93   (what ordinal 2 needs)
+  // Leg 1's own six-batch chain was flawless, so this is intra-turn, not a
+  // cross-leg or parking failure. The finalize and approval resume paths
+  // already rebase exactly this way; only the admit path did not.
+  //
+  // A naive rebase would be UNSAFE: the checkpoint contains the committed
+  // results of calls the frozen frame may also carry, so replaying it would run
+  // them twice. `recoverAcceptedModelBatchForRestart` re-verifies the evidence
+  // and fails closed with `reconciliation_required` when any admitted call may
+  // have crossed the physical effect boundary; on top of that we compare the
+  // frame's own callIds against the checkpoint and only ever replay a frame
+  // that is wholly absent from it.
+  if (recoveredToolFrame) {
+    const identity = exactHostIdentity();
+    const recovered = recoverAcceptedModelBatchForRestart({
+      sessionId: identity.sessionId,
+      sourceUserSeq: identity.sourceUserSeq,
+    });
+    if (recovered.status === 'reconciliation_required') {
+      return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+    }
+    if (
+      recovered.status === 'ready'
+      && acceptedModelBatchHistoryDigest(history) !== recovered.checkpoint.historyDigest
+    ) {
+      const committedCallIds = new Set(
+        recovered.checkpoint.history.flatMap((item) => {
+          const row = item as unknown as { type?: unknown; callId?: unknown };
+          return row.type === 'function_call' && typeof row.callId === 'string'
+            ? [row.callId]
+            : [];
+        }),
+      );
+      const frameCallIds = recoveredToolFrame.calls.map((call) => call.callId);
+      const alreadyCommitted = frameCallIds.filter((id) => committedCallIds.has(id)).length;
+      // Partially committed is the one shape we must never guess at: some calls
+      // ran, some did not, and nothing here can tell which side of the boundary
+      // the rest landed on. Keep the existing fail-closed answer.
+      if (alreadyCommitted > 0 && alreadyCommitted < frameCallIds.length) {
+        return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
+      }
+      history.splice(0, history.length, ...recovered.checkpoint.history);
+      lastResponseId = recovered.checkpoint.lastResponseId ?? lastResponseId;
+      const frameIsAlreadyDurable = frameCallIds.length > 0
+        && alreadyCommitted === frameCallIds.length;
+      journalHostGuide('admit_recovery_rebased', {
+        rebasedToBatchOrdinal: recovered.checkpoint.batchOrdinal,
+        frameCallCount: frameCallIds.length,
+        alreadyCommitted,
+        discardedFrame: frameIsAlreadyDurable,
+      });
+      // The frame is already durable in the checkpoint. Replaying it would
+      // re-execute committed calls; the turn continues from the checkpoint.
+      if (frameIsAlreadyDurable) recoveredToolFrame = undefined;
+    }
+  }
   if (recoveredToolFrame) {
     const preAdmission = preAdmitAcceptedToolFrame({
       frameHistory: recoveredToolFrame.history,
