@@ -3423,11 +3423,19 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // built later and the dispatcher needs them now. Registry-derived and
       // filtered to host-only controls below, so this can only ever admit a
       // host-local control — never a business tool.
-      const structuralControlNames: readonly string[] = carrierWork && hostFreshPlanning
+      const structuralControlNames: readonly string[] = hostFreshPlanning
         ? ['plan_task']
         : [];
       const dispatcherOptions: BuildCallToolOptions = {
-        reachableBuiltinNames: carrierWork ? workCallBuiltinNames : discoverableNames,
+        // Structural controls belong in BOTH reachability sets, on BOTH turn
+        // kinds. call-tool.ts refuses when the target is in neither
+        // reachableBuiltinNames nor firstClassNames; widening only the latter,
+        // and only under carrierWork, left the non-carrier turn refusing a
+        // wrapped plan_task exactly as before — verified live three times.
+        reachableBuiltinNames: new Set([
+          ...(carrierWork ? workCallBuiltinNames : discoverableNames),
+          ...structuralControlNames,
+        ]),
         // Emptying this wholesale removed the "first-class-wrap fallback"
         // the comment above promises. A host-local control that IS on this
         // turn's surface stays visible so a wrapped call to it dispatches
