@@ -9,7 +9,7 @@
  * normalized request digest used by prompt-cache observation.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import type { ModelRequest } from '@openai/agents';
+import type { AgentInputItem, ModelRequest } from '@openai/agents';
 import { openMemoryDb } from '../../memory/db.js';
 import {
   persistAuthorityEncryptedPayload,
@@ -22,6 +22,7 @@ import {
 } from './eventlog-schema.js';
 import {
   conversationPreambleDeliveryRequest,
+  getToolOutput,
   listEvents,
   openEventLog,
 } from './eventlog.js';
@@ -48,7 +49,11 @@ import {
   logicalModelResultProjectionReceiptFromRow,
   logicalModelResultProjectionReceiptMatchesItem,
   logicalModelResultProjectionReceiptRowsForCall,
+  type LogicalModelResultProjectionReceipt,
 } from './logical-model-result-projection-receipt.js';
+import {
+  describeCanonicalClippedToolResult,
+} from './compaction.js';
 
 export const MODEL_REQUEST_PROVENANCE_VERSION = 1 as const;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -427,6 +432,71 @@ function uniqueVisibleFunctionResults(value: unknown): VisibleFunctionResult[] {
   return results.sort((left, right) => left.callId.localeCompare(right.callId));
 }
 
+/** A Layer-1 stub is a presentation of an immutable settled result, not a new
+ * result. Prove that presentation from three existing durable owners:
+ *
+ *  - the exact model-result receipt still matches the losslessly parked bytes
+ *    when the deterministic clip transform is reversed;
+ *  - the tool-output row proves the original call/tool/character count and is
+ *    the recall target named by the stub;
+ *  - a later host `condenser_applied` event accounts for every visible stub
+ *    carrying this clip timestamp.
+ *
+ * An arbitrary shortened/tampered result has none of that conjunction and
+ * remains a provenance refusal. */
+function trustedCompactedLogicalResultMatches(input: {
+  sessionId: string;
+  result: VisibleFunctionResult;
+  receipt: LogicalModelResultProjectionReceipt;
+  visibleResults: readonly VisibleFunctionResult[];
+}): boolean {
+  const clipped = describeCanonicalClippedToolResult(input.result.item as AgentInputItem);
+  if (!clipped || clipped.toolName === null) return false;
+  const clippedAtMs = Date.parse(clipped.clippedAt);
+  const receiptAtMs = Date.parse(input.receipt.recordedAt);
+  if (
+    !Number.isFinite(clippedAtMs)
+    || !Number.isFinite(receiptAtMs)
+    || receiptAtMs > clippedAtMs
+  ) return false;
+
+  const retained = getToolOutput(input.sessionId, clipped.callId);
+  if (
+    !retained
+    || retained.truncatedAtWrite
+    || retained.tool !== clipped.toolName
+    || retained.output.length !== clipped.originalChars
+  ) return false;
+
+  const originalBase = { ...input.result.item } as Record<string, unknown>;
+  delete originalBase.__clipped;
+  delete originalBase.__clippedMeta;
+  const originalCandidates = [
+    { ...originalBase, output: { type: 'text', text: retained.output } },
+    { ...originalBase, output: retained.output },
+  ] as AgentInputItem[];
+  if (!originalCandidates.some((candidate) => (
+    logicalModelResultProjectionReceiptMatchesItem(input.receipt, candidate)
+  ))) return false;
+
+  const visibleAtTimestamp = input.visibleResults.filter((candidate) => (
+    describeCanonicalClippedToolResult(candidate.item as AgentInputItem)?.clippedAt
+      === clipped.clippedAt
+  )).length;
+  if (visibleAtTimestamp < 1) return false;
+  return listEvents(input.sessionId, { types: ['condenser_applied'] }).some((event) => {
+    const eventAtMs = Date.parse(event.createdAt);
+    const layer1 = event.data.layer1;
+    if (!layer1 || typeof layer1 !== 'object' || Array.isArray(layer1)) return false;
+    const row = layer1 as Record<string, unknown>;
+    return Number.isFinite(eventAtMs)
+      && eventAtMs >= clippedAtMs
+      && row.applied === true
+      && Number.isSafeInteger(row.clipped)
+      && Number(row.clipped) >= visibleAtTimestamp;
+  });
+}
+
 function acceptedBatchAdmissionCountForResult(input: {
   db: ReturnType<typeof openEventLog>;
   sessionId: string;
@@ -762,7 +832,8 @@ function buildManifest(input: {
 
   const settledResults: SettlementRef[] = [];
   const hostResults: HostResultRef[] = [];
-  for (const result of uniqueVisibleFunctionResults(input.request.input)) {
+  const visibleResults = uniqueVisibleFunctionResults(input.request.input);
+  for (const result of visibleResults) {
     const settlements = db.prepare(`
       SELECT session_id, source_user_seq, logical_tool_call_id,
              protocol_version, semantic_digest, execution_kind, outcome_kind,
@@ -856,10 +927,15 @@ function buildManifest(input: {
         || projectionReceipt.callNamespace !== result.callNamespace
         || projectionReceipt.settlementLogicalToolCallId !== settlementLogicalToolCallId
         || projectionReceipt.settlementSemanticDigest !== settlement.semantic_digest
-        || !logicalModelResultProjectionReceiptMatchesItem(
+        || (!logicalModelResultProjectionReceiptMatchesItem(
           projectionReceipt,
           result.item as never,
-        )
+        ) && !trustedCompactedLogicalResultMatches({
+          sessionId: input.sessionId,
+          result,
+          receipt: projectionReceipt,
+          visibleResults,
+        }))
       ) throw new ModelRequestProvenanceError('logical_result_projection_mismatch');
     } else if (acceptedBatchAdmissionCountForResult({
       db,
@@ -1267,10 +1343,15 @@ function validateManifestSources(input: {
         || projectionReceipt.callNamespace !== result.callNamespace
         || projectionReceipt.settlementLogicalToolCallId !== ref.logicalToolCallId
         || projectionReceipt.settlementSemanticDigest !== settlement.semantic_digest
-        || !logicalModelResultProjectionReceiptMatchesItem(
+        || (!logicalModelResultProjectionReceiptMatchesItem(
           projectionReceipt,
           result.item as never,
-        )
+        ) && !trustedCompactedLogicalResultMatches({
+          sessionId: ref.sessionId,
+          result,
+          receipt: projectionReceipt,
+          visibleResults: results,
+        }))
         || (manifestCitesProjection
           && (
             ref.projectionReceiptId !== projectionReceipt.receiptId

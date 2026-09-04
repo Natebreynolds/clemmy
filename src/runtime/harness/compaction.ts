@@ -193,13 +193,75 @@ export function _setCompactionSummarizerForTests(
   summarizerTurnForTests = fn;
 }
 
-const CLIP_PLACEHOLDER = (
+export const canonicalToolResultClipPlaceholder = (
   toolName: string | null,
   chars: number,
   callId: string,
   iso: string,
 ): string =>
   `[clipped: ${toolName ?? 'tool'} returned ${chars} chars at ${iso} — ${toolCallHint('recall_tool_result', { call_id: callId })} returns the full output]`;
+
+export interface CanonicalClippedToolResult {
+  callId: string;
+  toolName: string | null;
+  originalChars: number;
+  clippedAt: string;
+}
+
+/** Parse only the exact deterministic Layer-1 result shape emitted below.
+ * This is syntax, not authority: a caller must still prove the immutable
+ * settlement/receipt, the recallable original bytes, and the durable
+ * `condenser_applied` event before treating the projection as host-compacted. */
+export function describeCanonicalClippedToolResult(
+  item: AgentInputItem,
+): CanonicalClippedToolResult | null {
+  const row = item as Record<string, unknown>;
+  if (
+    row.type !== 'function_call_result'
+    || row.status !== 'completed'
+    || row.__clipped !== true
+    || typeof row.callId !== 'string'
+    || !row.callId
+    || (row.name !== undefined && typeof row.name !== 'string')
+    || !row.output
+    || typeof row.output !== 'object'
+    || Array.isArray(row.output)
+    || !row.__clippedMeta
+    || typeof row.__clippedMeta !== 'object'
+    || Array.isArray(row.__clippedMeta)
+  ) return null;
+  const output = row.output as Record<string, unknown>;
+  const meta = row.__clippedMeta as Record<string, unknown>;
+  if (
+    Object.keys(output).sort().join('|') !== 'text|type'
+    || output.type !== 'text'
+    || typeof output.text !== 'string'
+    || Object.keys(meta).sort().join('|') !== 'at|bytes|callId|tool'
+    || (meta.tool !== null && typeof meta.tool !== 'string')
+    || !Number.isSafeInteger(meta.bytes)
+    || Number(meta.bytes) < 400
+    || meta.callId !== row.callId
+    || typeof meta.at !== 'string'
+  ) return null;
+  const clippedAt = meta.at;
+  try {
+    if (new Date(clippedAt).toISOString() !== clippedAt) return null;
+  } catch {
+    return null;
+  }
+  const toolName = typeof row.name === 'string' ? row.name : null;
+  const originalChars = Number(meta.bytes);
+  if (
+    meta.tool !== toolName
+    || output.text !== canonicalToolResultClipPlaceholder(
+      toolName,
+      originalChars,
+      row.callId,
+      clippedAt,
+    )
+  ) return null;
+  return { callId: row.callId, toolName, originalChars, clippedAt };
+}
 
 // Cheap, fast model for summarization. The fast tier is gpt-5.4-mini (or
 // equivalent) — summarization is straightforward and doesn't need the
@@ -301,6 +363,7 @@ export function clipOldToolResults(
   items: AgentInputItem[],
   retainTurns: number = DEFAULT_LAYER1_RETAIN_TURNS,
   opts?: CompactionOptions,
+  sessionId?: string,
 ): number {
   if (items.length === 0) return 0;
 
@@ -328,12 +391,19 @@ export function clipOldToolResults(
 
     const callId = typeof item.callId === 'string' ? item.callId : null;
     if (!callId) continue; // can't clip what we can't recall
+    if (!recallableToolOutputExists(sessionId, callId)) continue;
 
     const output = item.output as { type?: string; text?: string } | string | undefined;
     let originalText = '';
     if (typeof output === 'string') {
       originalText = output;
-    } else if (output && typeof output === 'object' && typeof output.text === 'string') {
+    } else if (
+      output
+      && typeof output === 'object'
+      && output.type === 'text'
+      && typeof output.text === 'string'
+      && Object.keys(output).every((key) => key === 'type' || key === 'text')
+    ) {
       originalText = output.text;
     } else {
       continue; // empty output; nothing to clip
@@ -347,7 +417,7 @@ export function clipOldToolResults(
     // if present, otherwise null.
     const toolName = typeof item.name === 'string' ? item.name : null;
 
-    const stub = CLIP_PLACEHOLDER(toolName, originalText.length, callId, iso);
+    const stub = canonicalToolResultClipPlaceholder(toolName, originalText.length, callId, iso);
     // Mutate in-place. Keep structure shape (output.type === 'text')
     // so downstream serializer (codex-model.ts:481) renders it verbatim.
     item.output = { type: 'text', text: stub };
@@ -1233,7 +1303,7 @@ export async function compactSessionIfNeeded(
     || beforeTokens > budget * l1Frac
     || (items.length > itemThreshold && beforeTokens > budget * l1ItemMinFrac);
   if (layer1Trigger) {
-    const clipped = clipOldToolResults(nextItems, retainTurns, opts);
+    const clipped = clipOldToolResults(nextItems, retainTurns, opts, session.id);
     const collapsed = collapseOldCompletedToolPairs(nextItems, retainToolPairs, session.id);
     nextItems = collapsed.nextItems;
     result.layer1.applied = clipped > 0 || collapsed.collapsed > 0;

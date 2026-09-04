@@ -31,6 +31,9 @@ const settlements = await import('./logical-call-settlement-store.js');
 const outcomes = await import('./attempt-outcome.js');
 const projections = await import('./logical-model-result-projection-receipt.js');
 const hostResults = await import('./host-model-result-receipt.js');
+const compaction = await import('./compaction.js');
+const provenance = await import('./model-request-provenance.js');
+const promptCache = await import('./prompt-cache-observation.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -248,6 +251,93 @@ function structuredResult(input: {
   } as AgentInputItem;
 }
 
+function textResult(input: {
+  callId: string;
+  toolName: string;
+  text: string;
+}): AgentInputItem {
+  return {
+    type: 'function_call_result',
+    callId: input.callId,
+    name: input.toolName,
+    status: 'completed',
+    output: { type: 'text', text: input.text },
+  } as AgentInputItem;
+}
+
+function modelRequest(input: {
+  task: AcceptedFixture;
+  callId: string;
+  toolName: string;
+  result: AgentInputItem;
+}) {
+  return {
+    systemInstructions: 'Stable host policy.',
+    input: [
+      { role: 'user', content: input.task.text } as AgentInputItem,
+      ...frame({ callId: input.callId, toolName: input.toolName }),
+      input.result,
+    ],
+    modelSettings: {},
+    tools: [],
+    toolsExplicitlyProvided: true,
+    outputType: 'text',
+    handoffs: [],
+    tracing: false,
+  };
+}
+
+function compactedProjectionFixture(
+  label: string,
+  eventMode: 'valid' | 'absent' | 'wrong_count' = 'valid',
+) {
+  const task = accept(label);
+  const callId = `clipped-${serial}`;
+  const toolName = 'session_history';
+  const admission = admit({ task, callId, toolName });
+  settleRead({ task, logicalToolCallId: callId, toolName });
+  const originalText = `durable-${label}-result `.repeat(80);
+  const original = textResult({ callId, toolName, text: originalText });
+  const receipt = projections.recordLogicalModelResultProjectionReceipt({
+    admission,
+    resultItem: original,
+  });
+  assert.equal(receipt.status, 'recorded', JSON.stringify(receipt));
+  eventlog.writeToolOutput({ sessionId: task.sessionId, callId, tool: toolName, output: originalText });
+
+  const clipped = structuredClone(original) as AgentInputItem;
+  const retainedSentinel = textResult({
+    callId: `retain-${callId}`,
+    toolName,
+    text: 'small recent result',
+  });
+  const clippedAt = new Date().toISOString();
+  assert.equal(compaction.clipOldToolResults(
+    [clipped, retainedSentinel],
+    1,
+    { now: () => clippedAt },
+  ), 1);
+  assert.ok(compaction.describeCanonicalClippedToolResult(clipped));
+  if (eventMode !== 'absent') {
+    eventlog.appendEvent({
+      sessionId: task.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'condenser_applied',
+      data: {
+        layer1: {
+          applied: true,
+          clipped: eventMode === 'valid' ? 1 : 0,
+          collapsedToolPairs: 0,
+        },
+        layer2: { applied: false, removedItems: 0, summaryItems: 0 },
+        layer3: { applied: false, forkRequested: false },
+      },
+    });
+  }
+  return { task, callId, toolName, clipped, clippedAt, originalText };
+}
+
 test('logical projection receipts are exact, idempotent, immutable metadata with namespace lineage', () => {
   const task = accept('direct logical projection');
   const callId = 'logical-visible-call';
@@ -308,6 +398,91 @@ test('logical projection receipts are exact, idempotent, immutable metadata with
       WHERE receipt_id = ?`).run(first.receipt.receiptId),
     /immutable/,
   );
+});
+
+test('trusted local compaction preserves settled lineage without accepting forged result bytes', () => {
+  const valid = compactedProjectionFixture('trusted local compaction');
+  // A later idempotent cache/recovery write may refresh this timestamp. The
+  // immutable receipt match—not cache chronology—owns the original bytes.
+  const refreshed = eventlog.openEventLog().prepare(`
+    UPDATE tool_outputs SET created_at = ?
+    WHERE session_id = ? AND call_id = ?
+  `).run(
+    new Date(Date.parse(valid.clippedAt) + 1_000).toISOString(),
+    valid.task.sessionId,
+    valid.callId,
+  );
+  assert.equal(refreshed.changes, 1);
+  const request = modelRequest({ ...valid, result: valid.clipped });
+  const recorded = provenance.recordModelRequestDispatchProvenance({
+    sessionId: valid.task.sessionId,
+    sourceUserSeq: valid.task.sourceUserSeq,
+    request: request as never,
+    hostProjection: promptCache.canonicalPromptCacheRequest(request as never),
+  });
+  assert.equal(recorded.removedOptionalLayer, null);
+  assert.equal(provenance.projectModelRequestProvenance(recorded.record.recordId).status, 'ok');
+
+  const tamperedText = structuredClone(valid.clipped) as AgentInputItem;
+  const tamperedOutput = (tamperedText as unknown as {
+    output: { text: string };
+  }).output;
+  tamperedOutput.text += ' forged';
+  const tamperedTextRequest = modelRequest({ ...valid, result: tamperedText });
+  assert.throws(
+    () => provenance.recordModelRequestDispatchProvenance({
+      sessionId: valid.task.sessionId,
+      sourceUserSeq: valid.task.sourceUserSeq,
+      request: tamperedTextRequest as never,
+      hostProjection: promptCache.canonicalPromptCacheRequest(tamperedTextRequest as never),
+    }),
+    (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+      && error.code === 'logical_result_projection_mismatch',
+    'changing the compacted bytes must not inherit the immutable result receipt',
+  );
+
+  const forgedLength = structuredClone(valid.clipped) as AgentInputItem;
+  const forgedRow = forgedLength as unknown as {
+    callId: string;
+    name: string;
+    output: { text: string };
+    __clippedMeta: { bytes: number; at: string };
+  };
+  forgedRow.__clippedMeta.bytes += 1;
+  forgedRow.output.text = compaction.canonicalToolResultClipPlaceholder(
+    forgedRow.name,
+    forgedRow.__clippedMeta.bytes,
+    forgedRow.callId,
+    forgedRow.__clippedMeta.at,
+  );
+  const forgedLengthRequest = modelRequest({ ...valid, result: forgedLength });
+  assert.throws(
+    () => provenance.recordModelRequestDispatchProvenance({
+      sessionId: valid.task.sessionId,
+      sourceUserSeq: valid.task.sourceUserSeq,
+      request: forgedLengthRequest as never,
+      hostProjection: promptCache.canonicalPromptCacheRequest(forgedLengthRequest as never),
+    }),
+    (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+      && error.code === 'logical_result_projection_mismatch',
+    'a self-consistent stub still fails when its claimed size differs from the lossless output row',
+  );
+
+  for (const eventMode of ['absent', 'wrong_count'] as const) {
+    const unowned = compactedProjectionFixture(`compaction event ${eventMode}`, eventMode);
+    const unownedRequest = modelRequest({ ...unowned, result: unowned.clipped });
+    assert.throws(
+      () => provenance.recordModelRequestDispatchProvenance({
+        sessionId: unowned.task.sessionId,
+        sourceUserSeq: unowned.task.sourceUserSeq,
+        request: unownedRequest as never,
+        hostProjection: promptCache.canonicalPromptCacheRequest(unownedRequest as never),
+      }),
+      (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+        && error.code === 'logical_result_projection_mismatch',
+      `${eventMode} condenser evidence must not authorize altered result bytes`,
+    );
+  }
 });
 
 test('observer identity maps exactly while host-only and cross-source calls remain distinct', () => {

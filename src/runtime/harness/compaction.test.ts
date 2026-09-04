@@ -135,6 +135,35 @@ test('clipOldToolResults — skips small outputs that wouldn\'t benefit', () => 
   assert.equal(clipped, 0, 'small outputs should be left alone');
 });
 
+test('clipOldToolResults — leaves structured projections exact for receipt verification', () => {
+  const structured = {
+    type: 'function_call_result',
+    callId: 'structured-old',
+    name: 'records.lookup',
+    status: 'completed',
+    output: {
+      type: 'text',
+      text: 'x'.repeat(1200),
+      structuredContent: { records: [{ id: 'row-1' }] },
+    },
+  } as unknown as AgentInputItem;
+  const recent = {
+    type: 'function_call_result',
+    callId: 'recent',
+    name: 'records.lookup',
+    status: 'completed',
+    output: { type: 'text', text: 'recent' },
+  } as unknown as AgentInputItem;
+
+  assert.equal(clipOldToolResults([structured, recent], 1), 0);
+  assert.equal((structured as unknown as Record<string, unknown>).__clipped, undefined);
+  assert.equal(
+    ((structured as unknown as { output: { text: string } }).output.text).length,
+    1200,
+    'Layer 1 cannot destroy structured fields it cannot reconstruct from the lossless text row',
+  );
+});
+
 test('clipOldToolResults — preserves callId pairing (no Codex 400 risk)', () => {
   const items: AgentInputItem[] = [];
   for (let i = 0; i < 6; i++) {
