@@ -208,10 +208,30 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
       if (FAILURE_FLAG_KEYS.has(key) && structuredTrue(child)) return `failure_${key}`;
       if (ERROR_FIELD_KEYS.has(key) && errorFieldIsFailure(child)) return `error_${key}`;
       if (STATUS_FIELD_KEYS.has(key)) {
-        // `status` on an identified returned entity is domain data (a failed
-        // job/order is still a successful read). Explicit HTTP/status-code
-        // fields remain transport evidence.
-        if (key === 'status' && businessEntity) continue;
+        // A status on an identified returned ENTITY is domain data: a failed
+        // job/order/task is still a successful READ of the response that
+        // reports it. That doctrine was only applied to the bare `status` key,
+        // so a per-row `status_code` stayed transport evidence and one bad row
+        // condemned the whole payload.
+        //
+        // Live 2026-09-04, the exact prospects/SEO shape: a DataForSEO request
+        // fanned out across geos returns
+        //   {status_code: 20000, tasks: [ {id:'a', status_code:20000, result:[...]},
+        //                                 {id:'b', status_code:20000, result:[...]},
+        //                                 {id:'c', status_code:40501, ...} ]}
+        // `tasks` is not a CONTRADICTION_RESULT_ARRAY_KEY, so the walker
+        // descends into each task; task c is identified (`id`) but its key is
+        // `status_code`, not `status`, so the skip never applied. Measured:
+        // success=false with recordCount=3 — three good geos discarded because
+        // a fourth errored. The same path condemned DataForSEO's NON-error
+        // in-progress codes (40602 "Task In Queue", 40603 "Task In Progress").
+        //
+        // The transport verdict belongs to the envelope, which carries no
+        // business identity, so a top-level `status_code: 40501`/`50000` still
+        // contradicts exactly as before — verified: dropping the 40_000-60_000
+        // band entirely would let real provider errors pass as success, because
+        // `status_message: "Invalid Field."` alone reads clean.
+        if (businessEntity) continue;
         if (statusCodeIsFailure(child)) return `failure_${key}`;
         if (typeof child === 'string' && FAILURE_STATUS_RE.test(child.trim())) return `failure_${key}`;
       }
