@@ -1242,6 +1242,51 @@ test('structured no-tool completion opt-in requires explicit empty tool authorit
   );
 });
 
+test('a typed blocked terminal remains blocked when the executor returned normally', async () => {
+  const sessionId = 'typed-blocked-terminal-through-bridge';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => ({
+      sessionId: opts.sessionId,
+      status: 'completed',
+      steps: 2,
+      lastTurn: 1,
+      lastDecision: {
+        summary: 'executor returned after a bounded host stop',
+        reply: 'I hit the same internal wall twice.',
+        done: true,
+        nextAction: 'completed',
+        reason: null,
+      },
+      publicPresentation: {
+        version: 1,
+        id: `turn:${opts.sourceUserSeq}:presentation`,
+        outcomeId: `turn:${opts.sourceUserSeq}`,
+        audience: 'user',
+        phase: 'final',
+        identity: {
+          sessionId: opts.sessionId,
+          turn: 1,
+          sourceUserSeq: opts.sourceUserSeq!,
+        },
+        status: 'blocked',
+        kind: 'blocked',
+        text: 'The host stopped after bounded recovery made no progress.',
+        resumable: false,
+      },
+    })) as never,
+  });
+
+  const response = await respondViaHarness('background', {
+    message: 'Run the exact workflow.',
+    sessionId,
+  });
+
+  assert.equal(response.stoppedReason, 'blocked');
+  assert.equal(response.text, 'The host stopped after bounded recovery made no progress.');
+});
+
 test('exact-source model directive binds a new attempt without a synthetic user event', async () => {
   const sessionId = 'exact-source-private-directive';
   createSession({ id: sessionId, kind: 'chat' });

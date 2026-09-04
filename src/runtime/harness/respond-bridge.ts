@@ -1777,8 +1777,41 @@ export async function respondViaHarness(
         ? 'failed'
         : 'completed';
 
-    const replyText = publicReplyText(result.publicPresentation?.text, '')
-      || publicReplyText(result.lastDecision?.reply, '');
+    // The loop status says whether the executor itself returned; the committed
+    // PresentationEvent says how the accepted user turn actually settled. A
+    // normal executor return can still carry a blocked/failed/needs-input
+    // terminal after the delivery reducer audits its evidence. Preserve that
+    // typed terminal across this compatibility bridge instead of re-deriving a
+    // green result from `status === "completed"` or from its prose. This is the
+    // same authority used by exact-terminal replay below.
+    if (result.publicPresentation) {
+      const presentation = result.publicPresentation;
+      if (
+        presentation.identity.sessionId !== sessionId
+        || presentation.identity.sourceUserSeq !== sourceUserEvent.seq
+      ) {
+        throw new Error('Harness returned a public terminal for a different accepted source.');
+      }
+      requestAttemptStatus = presentation.status === 'cancelled'
+        ? 'cancelled'
+        : presentation.status === 'done' || presentation.status === 'transferred'
+          ? 'completed'
+          : presentation.status === 'needs_input'
+            ? 'completed'
+            : 'failed';
+      return withRouteDiagnostics({
+        text: presentation.text,
+        sessionId,
+        stoppedReason: stoppedReasonForPresentation(presentation),
+        turnsUsed: result.lastTurn,
+        ...(presentation.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
+      }, routeForHarness(surface, request, opts.modelOverride));
+    }
+
+    // The authoritative public presentation returned above. From this point
+    // onward the result is necessarily presentation-less, so only the
+    // executor's retained decision may supply compatibility prose.
+    const replyText = publicReplyText(result.lastDecision?.reply, '');
 
     switch (result.status) {
       case 'held': {
@@ -2008,7 +2041,6 @@ export async function respondViaHarness(
       case 'blocked':
         return withRouteDiagnostics({
           text: result.error
-            || result.publicPresentation?.text
             || 'I could not admit this turn, so I stopped before using any tools.',
           sessionId,
           stoppedReason: 'blocked',
