@@ -97,6 +97,7 @@ import { validateHostLocalWorkspaceSourceBeforeDispatch } from '../runtime/harne
 import {
   classifyRuntimeToolEffect,
   unwrapRuntimeEffectiveToolIdentity,
+  type RuntimeToolEffect,
 } from '../runtime/harness/tool-effect.js';
 import {
   capabilityManifestDigest,
@@ -476,15 +477,6 @@ function clonePreparationValue<T>(value: T): T {
   return structuredClone(value);
 }
 
-function isHostReadOrCompute(toolName: string, args: unknown): boolean {
-  try {
-    const effect = classifyRuntimeToolEffect(toolName, args).effect;
-    return effect === 'read' || effect === 'compute';
-  } catch {
-    return false;
-  }
-}
-
 /** Only semantic plan disagreements are dispensable for a non-mutating host
  * call. A stored binding collision and an already-settled instance are
  * identity/once-ness facts, not proposal advice. */
@@ -676,6 +668,59 @@ export function graphlessForegroundReadAuthority(input: {
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** Resolve a work carrier to the one semantic call already sealed by the
+ * production host. Transport spellings are not effect authority: when the
+ * current opaque catalog attestation exactly matches the unwrapped logical
+ * contract, its immutable effect wins. Legacy/unattested callers retain the
+ * ordinary runtime classifier over the semantic call rather than the carrier.
+ */
+function resolvedHostWorkCallProjection(input: {
+  sessionId: string;
+  sourceUserSeq?: number;
+  logicalToolCallId?: string;
+  targetName: string;
+  targetArgs: unknown;
+}): {
+  toolName: string | null;
+  args: unknown;
+  effect: RuntimeToolEffect;
+} {
+  const effective = unwrapRuntimeEffectiveToolIdentity(input.targetName, input.targetArgs);
+  const classified = effective.toolName
+    ? classifyRuntimeToolEffect(effective.toolName, effective.args).effect
+    : 'unknown';
+  if (
+    !effective.toolName
+    || !Number.isSafeInteger(input.sourceUserSeq)
+    || (input.sourceUserSeq ?? 0) <= 0
+    || !input.logicalToolCallId
+  ) return { ...effective, effect: classified };
+
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq as number);
+  const contract = durableLogicalCallContract(
+    acceptedTaskId,
+    effective.toolName,
+    effective.args,
+  );
+  const attestation = currentHostCallAttestation();
+  const attested = Boolean(
+    contract
+    && attestation
+    && attestation.bindingKind === 'catalog_manifest'
+    && attestation.sessionId === input.sessionId
+    && attestation.sourceUserSeq === input.sourceUserSeq
+    && attestation.acceptedTaskId === acceptedTaskId
+    && attestation.logicalToolCallId === input.logicalToolCallId
+    && attestation.operationId.toLowerCase() === effective.toolName.toLowerCase()
+    && attestation.toolName === contract.toolName
+    && attestation.argumentDigest === contract.argumentDigest
+  );
+  return {
+    ...effective,
+    effect: attested ? attestation!.effect : classified,
+  };
 }
 
 function normalizedProposal(input: WorkCallInput['proposal']): ExpectedWorkProposalV1 | null {
@@ -1324,10 +1369,14 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         frame.refusalKind = 'work_authority_unavailable';
         return refuse(frame.refusalKind, 'accepted source or logical call identity is unavailable');
       }
-      const resolvedRuntimeEffect = classifyRuntimeToolEffect(
-        resolved.targetName,
-        resolved.targetArgs,
-      ).effect;
+      const effectiveTarget = resolvedHostWorkCallProjection({
+        sessionId: resolved.sessionId,
+        sourceUserSeq: resolved.sourceUserSeq,
+        logicalToolCallId: resolved.logicalToolCallId,
+        targetName: resolved.targetName,
+        targetArgs: resolved.targetArgs,
+      });
+      const resolvedRuntimeEffect = effectiveTarget.effect;
       // Fresh provider reads share work_call's carrier but do not need its
       // graph/once-ness contract. The exact resolved effect is known here,
       // after inner schema/account materialization and before any dispatch.
@@ -1402,10 +1451,6 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         graphlessForegroundRead
         && (resolvedRuntimeEffect === 'read' || resolvedRuntimeEffect === 'compute')
       ) {
-        const effectiveTarget = unwrapRuntimeEffectiveToolIdentity(
-          resolved.targetName,
-          resolved.targetArgs,
-        );
         if (!effectiveTarget.toolName) {
           frame.refusalKind = 'work_authority_unavailable';
           return refuse(frame.refusalKind, 'foreground read has no exact effective operation');
@@ -1444,10 +1489,6 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       const preAdmissionOperation = sourceContract?.operations.find((operation) => (
         operation.id === cardinalityBoundInput.requirement_id
       ));
-      const effectiveTarget = unwrapRuntimeEffectiveToolIdentity(
-        resolved.targetName,
-        resolved.targetArgs,
-      );
       let preparedAsyncRead: PreparedAsyncReadRefinementIntentV1 | null = null;
       if (
         sourceContract
@@ -1581,7 +1622,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         // operation. The exact accepted/logical substrate is re-proved first;
         // the inner dispatch still owns lease, capability, and provider gates.
         if (
-          isHostReadOrCompute(resolved.targetName, resolved.targetArgs)
+          (resolvedRuntimeEffect === 'read' || resolvedRuntimeEffect === 'compute')
           && isReadComputeSemanticRefusal(admission.kind, admission.reason)
         ) {
           const fallbackAuthority = unboundReadComputeAuthority({

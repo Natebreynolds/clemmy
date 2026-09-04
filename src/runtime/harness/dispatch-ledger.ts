@@ -22,6 +22,7 @@ import {
   acceptedTurnCallAuthorityFor,
   admitHostLogicalCallInTransaction,
   admitWorkflowLogicalCallInTransaction,
+  hostAttestedEffectForLogicalContract,
   poisonAcceptedTurnCallAuthorityInTransaction,
   workflowReadOnlyPhysicalClaimAttestationMatches,
   workflowV3AttestedEffectForLogicalContract,
@@ -86,6 +87,7 @@ import {
   type StagedPhysicalDispatchAuthorityState,
 } from './staged-transfer-authority.js';
 import { exactVerifiedMutationTargetAdmission } from './mutation-verification-proof.js';
+import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 export { derivePhysicalDispatchId } from './physical-crossing-identity.js';
 
 const WRITE_EFFECTS = new Set(['local_write', 'external_write', 'admin']);
@@ -701,7 +703,12 @@ export function admitLogicalCall(input: {
   const authority = expectedState.authority;
   const contract = durableLogicalCallContract(authority.acceptedTaskId, input.tool, input.args);
   const effect = contract
-    ? workflowV3AttestedEffectForLogicalContract({
+    ? hostAttestedEffectForLogicalContract({
+        acceptedTaskId: authority.acceptedTaskId,
+        logicalToolCallId: input.identity.logicalToolCallId,
+        toolName: contract.toolName,
+        argumentDigest: contract.argumentDigest,
+      }) ?? workflowV3AttestedEffectForLogicalContract({
         acceptedTaskId: authority.acceptedTaskId,
         toolName: contract.toolName,
         argumentDigest: contract.argumentDigest,
@@ -716,6 +723,45 @@ export function admitLogicalCall(input: {
   } catch (error) {
     return { status: 'storage_error', reason: boundedReason(error) };
   }
+}
+
+/**
+ * Recover the effect already sealed for this exact host-owned logical call.
+ *
+ * Provider-ready refinement changes argument representation, not capability
+ * identity or effect.  In particular, a resolved provider operation may use an
+ * opaque/lowercase transport spelling that the generic taxonomy deliberately
+ * classifies as `unknown`.  Once the production host has inserted its immutable
+ * capability binding, that exact binding is the stronger fact.  The checks
+ * below keep the authority narrow: another task, call, tool, root revision, or
+ * already-refined digest cannot lend its effect to this call.
+ */
+function exactDurableHostBoundEffectInTransaction(
+  db: ReturnType<typeof openEventLog>,
+  authority: CallAdmissionAuthority,
+  logicalToolCallId: string,
+  row: LogicalRow,
+): CallAdmissionEffect | undefined {
+  if (authority.authorityKind !== 'host_v1') return undefined;
+  const loaded = loadHostCallCapabilityBinding({
+    db,
+    sessionId: authority.identity.sessionId,
+    sourceUserSeq: authority.identity.sourceUserSeq,
+    logicalToolCallId,
+  });
+  if (loaded.status !== 'ok') return undefined;
+  const binding = loaded.binding;
+  if (
+    binding.acceptedTaskId !== authority.acceptedTaskId
+    || binding.acceptedTaskId !== row.accepted_task_id
+    || binding.toolName !== row.tool_name
+    || binding.logicalRawArgumentDigest !== row.raw_argument_digest
+    || (binding.boundEffectiveArgumentDigest ?? null) !== row.effective_argument_digest
+    || binding.effectiveArgumentDigest !== row.argument_digest
+    || binding.authorityDigest !== authority.authority.authorityDigest
+    || binding.authorityRevision !== authority.authority.revision
+  ) return undefined;
+  return binding.effect;
 }
 
 /**
@@ -742,7 +788,6 @@ export function refineLogicalCallContract(input: {
     input.tool,
     input.effectiveArgs,
   );
-  const effectiveEffect = classifyRuntimeToolEffect(input.tool, input.effectiveArgs).effect;
   const db = openEventLog();
   let mirror: EventRow | null = null;
   try {
@@ -772,6 +817,26 @@ export function refineLogicalCallContract(input: {
         logicalToolCallId,
       ) as LogicalRow | undefined;
       if (!row) return { status: 'missing', reason: 'logical call authority is missing' };
+      const effectiveEffect = hostAttestedEffectForLogicalContract({
+        acceptedTaskId: authority.acceptedTaskId,
+        logicalToolCallId,
+        toolName: effective.toolName,
+        argumentDigest: effective.argumentDigest,
+      }) ?? hostAttestedEffectForLogicalContract({
+        acceptedTaskId: authority.acceptedTaskId,
+        logicalToolCallId,
+        toolName: row.tool_name,
+        argumentDigest: row.argument_digest,
+      }) ?? workflowV3AttestedEffectForLogicalContract({
+        acceptedTaskId: authority.acceptedTaskId,
+        toolName: effective.toolName,
+        argumentDigest: effective.argumentDigest,
+      }) ?? exactDurableHostBoundEffectInTransaction(
+        db,
+        authority,
+        logicalToolCallId,
+        row,
+      ) ?? classifyRuntimeToolEffect(input.tool, input.effectiveArgs).effect;
       const open = ensureCallAdmissionOpenInTransaction(
         db,
         authority,
@@ -1168,7 +1233,16 @@ function beginPhysicalDispatchCore(
     && trustedAdmissionContract.argumentDigest === contract.argumentDigest
     ? trustedAdmissionCarrier.decision
     : null;
-  const admissionEffect = staged?.state.effect ?? trustedAdmissionDecision?.effect
+  const admissionEffect = staged?.state.effect
+    ?? (contract
+      ? hostAttestedEffectForLogicalContract({
+          acceptedTaskId: authority.acceptedTaskId,
+          logicalToolCallId: input.identity.logicalToolCallId,
+          toolName: contract.toolName,
+          argumentDigest: contract.argumentDigest,
+        })
+      : undefined)
+    ?? trustedAdmissionDecision?.effect
     ?? (contract
       ? workflowV3AttestedEffectForLogicalContract({
           acceptedTaskId: authority.acceptedTaskId,

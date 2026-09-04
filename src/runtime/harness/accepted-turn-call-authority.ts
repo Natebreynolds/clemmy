@@ -392,6 +392,28 @@ export function currentHostCallAttestation(): Readonly<HostCallAttestation> | un
   return hostCallAttestationStorage.getStore();
 }
 
+/** Narrow bridge for the shared logical/physical ledger's independent effect
+ * admission. A transport spelling can be conservatively `unknown` even after
+ * the production host has sealed one exact semantic catalog call (for example
+ * the same operation exposed by multiple current transports). Only the opaque
+ * attestation for this exact accepted task/tool/argument contract may supply
+ * the already-bound effect; model-authored carrier bytes cannot reach here. */
+export function hostAttestedEffectForLogicalContract(input: {
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  toolName: string;
+  argumentDigest: string;
+}): HostCallAttestation['effect'] | undefined {
+  const attested = hostCallAttestationStorage.getStore();
+  return attested
+    && attested.acceptedTaskId === input.acceptedTaskId
+    && attested.logicalToolCallId === input.logicalToolCallId
+    && attested.toolName === input.toolName
+    && attested.argumentDigest === input.argumentDigest
+    ? attested.effect
+    : undefined;
+}
+
 
 interface WorkflowReadOnlyCallAttestation {
   sessionId: string;

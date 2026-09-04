@@ -24,6 +24,8 @@ const turnOutcomes = await import('./turn-outcome.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const resolution = await import('./resolution-ledger.js');
 const approvals = await import('./approval-registry.js');
+const effects = await import('./tool-effect.js');
+const hostBindings = await import('./host-call-capability-binding.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -138,7 +140,7 @@ function withProductionHostAttestation<T>(
   tool: string,
   args: unknown,
   effect: authority.HostAdmissibleEffect,
-  work: () => T,
+  work: (attestation: authority.HostCallAttestation) => T,
 ): T {
   const loaded = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
   assert.equal(loaded.status, 'ok');
@@ -146,7 +148,7 @@ function withProductionHostAttestation<T>(
   const contract = contracts.durableLogicalCallContract(task.acceptedTaskId, tool, args);
   assert.ok(contract);
   const schemaFingerprint = digest(`schema:${tool}`);
-  return authority.withHostCallAttestation({
+  const attestationBase = {
     sessionId: task.sessionId,
     sourceUserSeq: task.sourceUserSeq,
     acceptedTaskId: task.acceptedTaskId,
@@ -164,7 +166,6 @@ function withProductionHostAttestation<T>(
     operationId: tool,
     manifestId: '',
     manifestDigest: '',
-    bindingDigest: digest(`binding:${tool}:${effect}`),
     engineVersion: loaded.authority.engineVersion,
     surfaceVersion: loaded.authority.surfaceVersion,
     authorityDigest: loaded.authority.authorityDigest,
@@ -172,7 +173,12 @@ function withProductionHostAttestation<T>(
     surfaceDigest: loaded.authority.surfaceDigest,
     catalogRevisionDigest: loaded.authority.catalogRevisionDigest!,
     bindingRevisionDigest: loaded.authority.bindingRevisionDigest!,
-  }, work);
+  } as const;
+  const attestation: authority.HostCallAttestation = {
+    ...attestationBase,
+    bindingDigest: hostBindings.hostCallAttestationBindingDigest(attestationBase),
+  };
+  return authority.withHostCallAttestation(attestation, () => work(attestation));
 }
 
 test('a corrupt persisted late approval cannot authorize a one-shot activation or body', () => {
@@ -532,6 +538,80 @@ test('production host owns an approval-ready local write through the shared call
     sourceUserSeq: task.sourceUserSeq,
     outcome: 'completed',
   }).status, 'closed');
+});
+
+test('resolved provider spelling cannot poison an exact no-op refinement of a durably bound read', () => {
+  const task = acceptedSource('Read one exact value through the resolved provider operation.');
+  assert.equal(armProductionHost(task).status, 'armed');
+  const logicalToolCallId = 'opaque-provider-read-refinement';
+  // This deliberately resembles the lowercase resolved carrier from live
+  // source 127466. It has no spelling/registry taxonomy of its own; the exact
+  // host capability binding is the effect authority.
+  const tool = `opaque_provider_values_lookup_${serial}`;
+  const rawArgs = '{"range":"Sheet1!V997","resource_id":"sheet-1"}';
+  const effectiveArgs = { resource_id: 'sheet-1', range: 'Sheet1!V997' };
+  assert.equal(effects.classifyRuntimeToolEffect(tool, effectiveArgs).effect, 'unknown');
+
+  const result = withProductionHostAttestation(
+    task,
+    logicalToolCallId,
+    tool,
+    rawArgs,
+    'read',
+    (attestation) => {
+      const admitted = dispatch.admitLogicalCall({
+        identity: { ...task, logicalToolCallId },
+        tool,
+        args: rawArgs,
+      });
+      assert.equal(admitted.status, 'inserted');
+      if (admitted.status !== 'inserted') throw new Error('fixture logical admission failed');
+      const bound = hostBindings.persistHostCallCapabilityBinding({
+        db: eventlog.openEventLog(),
+        attestation,
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        logicalToolCallId,
+        acceptedTaskId: task.acceptedTaskId,
+        toolName: admitted.identity.toolName,
+        argumentDigest: admitted.identity.argumentDigest,
+        effect: 'read',
+      });
+      assert.equal(bound.status, 'bound');
+      assert.deepEqual(eventlog.openEventLog().prepare(`
+        SELECT effect, attested_argument_digest, logical_raw_argument_digest,
+               bound_effective_argument_digest
+          FROM host_call_capability_bindings
+         WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+      `).get(task.sessionId, task.sourceUserSeq, logicalToolCallId), {
+        effect: 'read',
+        attested_argument_digest: admitted.identity.argumentDigest,
+        logical_raw_argument_digest: admitted.identity.argumentDigest,
+        bound_effective_argument_digest: null,
+      });
+      return dispatch.refineLogicalCallContract({
+        identity: { ...task, logicalToolCallId },
+        tool,
+        effectiveArgs,
+      });
+    },
+  );
+
+  assert.equal(result.status, 'replayed', 'canonical no-op reuses the sealed read effect');
+  assert.deepEqual(eventlog.openEventLog().prepare(`
+    SELECT state, argument_digest, raw_argument_digest, effective_argument_digest
+      FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, logicalToolCallId), {
+    state: 'open',
+    argument_digest: result.status === 'replayed' ? result.identity.argumentDigest : '',
+    raw_argument_digest: result.status === 'replayed' ? result.identity.rawArgumentDigest : '',
+    effective_argument_digest: null,
+  });
+  const root = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
+  assert.equal(root.status, 'ok');
+  if (root.status === 'ok') assert.equal(root.authority.state, 'open');
+  assert.equal(dispatch.physicalCrossingsFor(task.sessionId, task.sourceUserSeq).length, 0);
 });
 
 test('the canonical failed terminal poisons one host root, finishes its attempt, and clears only its marker', () => {
