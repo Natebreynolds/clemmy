@@ -2728,7 +2728,19 @@ export async function prepareDurableAcceptedTurnCompile(
         effectCeiling: primaryPlanningCatalog.effectCeiling,
       });
       if (!promoted) {
-        return { ok: false, reason: 'primary model proposal cites a capability that was not disclosed to this source' };
+        // Name the refs that actually failed. The host has computed exactly
+        // which cited refs fall outside the bounded set; dropping them left the
+        // model to guess which of N bindings was wrong, and a multi-leg plan
+        // (read + enrich + draft + write) gives it no way to tell.
+        const undisclosed = [...selectedPrimaryCapabilityRefs]
+          .filter((ref) => !boundedIds.has(ref))
+          .slice(0, 8)
+          .map((ref) => (typeof ref === 'string' ? ref.slice(0, 128) : String(ref)));
+        return {
+          ok: false,
+          reason: 'primary model proposal cites a capability that was not disclosed to this source'
+            + (undisclosed.length > 0 ? `: ${undisclosed.join(', ')}` : ''),
+        };
       }
       primaryPlanningCatalog.capabilities = promoted.capabilities.map((descriptor) => Object.freeze({ ...descriptor }));
       primaryPlanningCatalog.withheld = promoted.withheld;

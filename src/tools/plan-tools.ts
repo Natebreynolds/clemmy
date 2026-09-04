@@ -1127,6 +1127,33 @@ function verifierRepairInstruction(reason: string): string | null {
     + `plan_task again. The write cannot be admitted alone.`;
 }
 
+/**
+ * The undisclosed-ref repair. Admission names the exact refs that fell outside
+ * the bounded set (see admit-and-compile-accepted-source); this turns them into
+ * an instruction that matches `recoveryTool`.
+ *
+ * Before: this refusal fell through to the generic
+ * "correct the proposal using admissibleCapabilities" text while `recoveryTool`
+ * said `tool_search`. Those are two different actions, so the model was told to
+ * repair and to rediscover in the same breath — and a plan with four legs got
+ * no signal at all about WHICH leg was undisclosed. The refusal already carried
+ * that fact; it just never reached the model.
+ */
+function undisclosedRefRepairInstruction(
+  reason: string,
+  admissibleCount: number,
+): string | null {
+  if (!reason.includes('capability that was not disclosed')) return null;
+  const named = reason.split('to this source:')[1]?.trim();
+  const subject = named ? `The cited capabilityRef(s) ${named} were` : 'A cited capabilityRef was';
+  return `${subject} not disclosed to this source, so the plan cannot cite them. `
+    + (admissibleCount > 0
+      ? 'Either cite a capabilityRef from admissibleCapabilities that fills the same role, or run '
+        + 'tool_search once for that role and call plan_task with only the exact id it returns. '
+        + 'Every other binding in this plan was fine — keep them.'
+      : 'Run tool_search once for that role, then call plan_task with only the exact capabilityRef it returns.');
+}
+
 function verifierRecoveryTool(reason: string): 'plan_task' | 'tool_search' | null {
   if (!reason.startsWith('verification_successor_required:')) return null;
   return reason.includes(':ambiguous_compatible_verifier:') ? 'plan_task' : 'tool_search';
@@ -1493,6 +1520,7 @@ async function executePlanTask(
       : recoveryTool === 'stop_factual'
         ? 'State factually that the current policy does not admit the requested effect. Do not retry planning or discovery.'
         : (verifierRepairInstruction(planned.reason)
+          ?? undisclosedRefRepairInstruction(planned.reason, admissibleCapabilities.length)
           ?? (admissibleCapabilities.length > 0
             ? 'Correct the semantic proposal using only a capabilityRef from admissibleCapabilities with the matching effect, then call plan_task again. It may stand alone or be followed in the same frame by exactly one proposal-free dependency-root read/compute work_call.'
             : 'No citable capability is currently available. Use tool_search once for the missing role, then call plan_task with only the exact capabilityRef it returns.'))
