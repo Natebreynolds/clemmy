@@ -1201,8 +1201,36 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
         ? envelope.isError
         : undefined;
     const inspection = inspectProviderEnvelope(envelope);
+    // `status >= 400` is an HTTP rule, so it may only judge an HTTP status.
+    // Providers that publish their own numeric code in a status-shaped key
+    // (DataForSEO's `status_code: 20000` = OK) were read as HTTP and failed the
+    // comparison — and so did their ERROR codes (40501), so the heuristic gave
+    // this provider ZERO discrimination while destroying every success.
+    //
+    // Live 2026-09-04, both canary brains: three DataForSEO calls returned real
+    // records; the handle writer derived success=false here while the
+    // settlement independently classified the same bytes as a successful
+    // provider result. The disagreement threw
+    // "successful provider result did not produce redeemable result authority",
+    // rolled the transaction back, and the model was told the tool errored. The
+    // SEO leg never produced data, so the drafts were never written.
+    //
+    // Out-of-range codes are not evidence of success either — they are simply
+    // not an HTTP verdict, so they leave the decision to the signals that CAN
+    // speak: an explicit successful/success/ok key, the envelope inspection,
+    // and whether any records were projected. A code outside the HTTP range
+    // with no success key and NO records stays unsuccessful rather than being
+    // laundered into a pass.
+    const httpStatus = typeof status === 'number' && status >= 100 && status <= 599
+      ? status
+      : null;
+    const unexplainedNonHttpStatus = typeof status === 'number'
+      && httpStatus === null
+      && typeof successful !== 'boolean'
+      && (found?.records.length ?? 0) === 0;
     const errorish = inspection.verdict === 'contradicted'
-      || (typeof status === 'number' && status >= 400);
+      || (httpStatus !== null && httpStatus >= 400)
+      || unexplainedNonHttpStatus;
     const success = isError === true
       ? false
       : errorish
