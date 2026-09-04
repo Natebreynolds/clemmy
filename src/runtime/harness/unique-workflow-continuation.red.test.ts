@@ -136,7 +136,15 @@ test('NEGATIVE: unique-run is host-dispatched before the model loop', () => {
   const dispatchAt = src.indexOf('tryHostDispatchNamedWorkflow');
   const loopAt = src.indexOf('for (let stepIndex = currentHostStepIndex;');
   assert.ok(dispatchAt >= 0 && loopAt > dispatchAt, 'host dispatch must precede the model loop');
-  assert.match(src, /uniqueDispatch\.status === 'dispatched'/);
+  const owner = src.slice(dispatchAt, loopAt);
+  const completionGuard = owner.match(
+    /if \(([^)]*uniqueDispatch\.status[^)]*)\) \{\s*return await completedOutcome\(uniqueDispatch\.message\)/,
+  );
+  assert.equal(
+    completionGuard?.[1].trim(),
+    "uniqueDispatch.status === 'dispatched'",
+    'only a queued workflow run is complete; a blocked admission must continue to a real terminal',
+  );
 });
 
 test('NEGATIVE: a prepared unique-run cannot fall through a swallowed projection failure', () => {

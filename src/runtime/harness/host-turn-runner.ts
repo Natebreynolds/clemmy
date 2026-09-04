@@ -6167,7 +6167,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ...namedWorkflowDispatchInput,
         route: 'act',
       });
-      if (uniqueDispatch.status === 'dispatched' || uniqueDispatch.status === 'blocked') {
+      if (uniqueDispatch.status === 'dispatched') {
         return await completedOutcome(uniqueDispatch.message);
       }
     }
