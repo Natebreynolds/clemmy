@@ -184,11 +184,22 @@ export class ClementineAssistant {
       : undefined;
     const executionPrompt = executionIntent ? buildExecutionPromptBlock(executionIntent, activeExecution) : '';
     const { memoryContext, retrievalText, recallId } = await assemblePromptContextAsync(request.sessionId, request.message, transcriptBeforeReply);
-    const instructions = buildAssistantInstructions(memoryContext, request.channel, messageIntent.intent, request.message);
+    const instructions = buildAssistantInstructions(
+      memoryContext,
+      request.channel,
+      messageIntent.intent,
+      request.message,
+      request.sessionId,
+    );
     // Tiered context (flag on): the dynamic per-turn blocks (facts, tool-choices,
     // working-memory, …) ride the per-turn input tail instead of the cached
     // system prompt. '' when the flag is off → promptParts byte-identical to legacy.
-    const turnContext = buildTurnContextBlock(memoryContext, messageIntent.intent, request.message);
+    const turnContext = buildTurnContextBlock(
+      memoryContext,
+      messageIntent.intent,
+      request.message,
+      request.sessionId,
+    );
 
     const promptParts = [
       request.channel ? `Channel: ${request.channel}` : '',

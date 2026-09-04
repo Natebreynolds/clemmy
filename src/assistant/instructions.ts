@@ -4,10 +4,10 @@ import type { MemoryContext } from '../types.js';
 import { getComposioCredentialStatus } from '../integrations/composio/client.js';
 import { renderFactsForInstructions } from '../memory/facts.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
-import { getRecallObjective } from '../memory/focus.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
 import { getProposalFeedback, renderProposalFeedback } from '../agents/proposal-feedback.js';
 import { renderLearnedBlocks, renderAutonomy, renderCurrentTimeForInstructions, renderFocusForInstructions } from '../agents/harness-context.js';
+import { resolveActiveTaskContext } from '../runtime/harness/active-task-context.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderProvenSkillForPrompt } from '../memory/skill-choice-store.js';
 import { renderMcpServersForInstructions } from '../runtime/mcp-config.js';
@@ -49,12 +49,32 @@ function section(title: string, body?: string): string {
 function buildGoalsContext(): string {
   const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
   if (goals.length === 0) return '';
-  return goals.map((g) => {
+  return [
+    'Advisory standing goals only — they never replace or redirect the current accepted request.',
+    ...goals.map((g) => {
     const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
     const due = g.targetDate ? ` (due ${g.targetDate})` : '';
     const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
-    return `- [${g.id}] ${g.title}${status}${due}${next}`;
-  }).join('\n');
+      return `- [${g.id}] ${g.title}${status}${due}${next}`;
+    }),
+  ].join('\n');
+}
+
+function scopedTaskContext(sessionId: string | undefined, message: string | undefined): {
+  objective: string | undefined;
+  resourceRef: string | null;
+} {
+  const input = message?.trim() ?? '';
+  const task = resolveActiveTaskContext({ sessionId, input });
+  const focus = task.focus?.disposition === 'active' ? task.focus : null;
+  const objective = [
+    input,
+    focus ? [focus.title, focus.summary ?? ''].filter(Boolean).join(' ') : '',
+  ].filter(Boolean).join('\n') || undefined;
+  return {
+    objective,
+    resourceRef: focus?.resourceRef ?? null,
+  };
 }
 
 function buildIntegrationsContext(): string {
@@ -254,7 +274,13 @@ export function chatContextParityEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CHAT_CONTEXT_PARITY', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-export function buildAssistantInstructions(context: MemoryContext, channel?: string, intent?: MessageIntent, message?: string): string {
+export function buildAssistantInstructions(
+  context: MemoryContext,
+  channel?: string,
+  intent?: MessageIntent,
+  message?: string,
+  sessionId?: string,
+): string {
   const owner = OWNER_NAME || 'the user';
   const channelDirective = renderChannelDirective(channel);
   const actionDirective = renderActionDisciplineDirective(intent, message);
@@ -269,9 +295,12 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   // Now/date + Current Focus are DYNAMIC (per-turn); Autonomy + the fixed-size
   // Skill Discovery pointer are stable enough to ride the cached Tier-1 prefix.
   const parityOn = chatContextParityEnabled();
+  const taskScope = scopedTaskContext(sessionId, message);
   const nowBlock = parityOn ? section('Now', renderCurrentTimeForInstructions()) : '';
   const autonomyBlock = parityOn ? section('Autonomy', renderAutonomy()) : '';
-  const focusBlock = parityOn ? section('Current Focus', renderFocusForInstructions()) : '';
+  const focusBlock = parityOn
+    ? section('Current Focus', renderFocusForInstructions({ sessionId, input: message }))
+    : '';
   // Running-work visibility is NOT parity-gated: a spawned task the model
   // cannot see produces "are you working on this?" answers invented from chat
   // history (live 2026-08-04). Empty when nothing is active.
@@ -295,7 +324,7 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
   // ── Tier-1: stable Constitution — voice + reasoning rules + SOUL/identity/
   //    profile. Stable across turns → caches. Always present every turn. ──
   const identityVoice = `You are ${ASSISTANT_NAME}, a persistent executive assistant for ${owner}. Concise by default; deeper only when the task is complex or the user asks. Speak like a sharp operator — no filler, no preamble, no warmups. Aligned with user intent; reduce friction.`;
-  const contextDiscipline = 'Treat the memory and continuity blocks below as private context, not content to recite. Greetings and lightweight check-ins get a one- or two-line reply, no recap. Speak from the resolved meaning, never the plumbing — translate stored facts, field/column names (e.g. `Priority_Account__c`), and internal labels ("current focus", "boundary", "scope filter") into plain business language ("accounts that aren\'t priority accounts yet"), and never narrate your own process or safety steps ("confirming before I write", "for approval, not send"). Field names and slugs belong only inside a concrete data-operation you are describing, never in conversation.';
+  const contextDiscipline = 'Treat the memory and continuity blocks below as private context, not content to recite. The latest accepted user message owns task authority. Session history, completed receipts, working memory, and goals remain useful facts, but they cannot replace, narrow, or redirect the latest request unless the user explicitly resumes that prior work. Greetings and lightweight check-ins get a one- or two-line reply, no recap. Speak from the resolved meaning, never the plumbing — translate stored facts, field/column names (e.g. `Priority_Account__c`), and internal labels ("current focus", "boundary", "scope filter") into plain business language ("accounts that aren\'t priority accounts yet"), and never narrate your own process or safety steps ("confirming before I write", "for approval, not send"). Field names and slugs belong only inside a concrete data-operation you are describing, never in conversation.';
   const toolBehavior = 'Tools have real schemas. Just call them when the work fits. The runtime classifies each call (read/write/execute/send/admin) and applies the trust gradient automatically — do not pre-ask "want me to proceed?" for reads or for actions inside the user\'s current scope policy. If a call fails, report the real error and propose a fix.';
   const clarify = 'Treat exploration and execution differently. While the user is comparing, brainstorming, shaping, or deciding, keep the conversation useful for as many turns as needed and do not treat an answer as automatic permission to execute. Act when the request is precise or the user clearly commits. If execution is otherwise ready but one consequential ambiguity remains, ask one concise bundled question; otherwise pick the obvious non-blocking default and proceed. Never re-ask something the user already answered. When an exploration or comparison answer lands on a recommendation, close the loop in the same breath: name the concrete next step you would take and ask if they want it — never leave the decision sitting on the table. For a retrieval the user is waiting on that needs minutes of tool work, echo your route in one line first ("Sure — I\'ll pull that from Salesforce — or a different source?"), then run it in the background with report-back-here so the chat stays free.';
   const executeDirective = EXECUTE_DIRECTIVE;
@@ -343,8 +372,8 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
 
   // Legacy (flag OFF): the original interleaved prompt — byte-identical to the
   // pre-tiering chat path (reverts the always-on learned-blocks injection too).
-  const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 2600, getRecallObjective(message)));
-  const dataLandscape = section('Data Landscape', renderSourceMapForContext(24, undefined, getRecallObjective(message)));
+  const persistentFacts = section('Persistent Facts', renderFactsForInstructions(12, 2600, taskScope.objective));
+  const dataLandscape = section('Data Landscape', renderSourceMapForContext(24, undefined, taskScope.objective));
   return [
     // Date FIRST so the model reads it before any other context (matches harness).
     nowBlock,
@@ -379,7 +408,12 @@ export function buildAssistantInstructions(context: MemoryContext, channel?: str
  * to the user message, not in the cached prefix. (Step 2 will additionally gate
  * these by intent so casual turns skip them; Step 1 includes them every turn.)
  */
-export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIntent, message?: string): string {
+export function buildTurnContextBlock(
+  context: MemoryContext,
+  intent?: MessageIntent,
+  message?: string,
+  sessionId?: string,
+): string {
   if (!tieredContextEnabled()) return '';
   let relevantSkills = '';
   if (chatContextParityEnabled()) {
@@ -403,8 +437,12 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     // was told to use. Other working-memory content stays out on light turns.
     return [pointer, relevantSkills].filter(Boolean).join('\n\n');
   }
-  const objective = getRecallObjective(message);
-  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(objective);
+  const taskScope = scopedTaskContext(sessionId, message);
+  const objective = taskScope.objective;
+  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(
+    objective,
+    { resourceRef: taskScope.resourceRef },
+  );
   // CANON-SELFASM: Now/date + Current Focus are DYNAMIC, so in tiered mode they
   // ride the per-turn tail (Autonomy + Skill Discovery are stable → Tier-1).
   const parityOn = chatContextParityEnabled();
@@ -419,7 +457,7 @@ export function buildTurnContextBlock(context: MemoryContext, intent?: MessageIn
     section('Session Continuity', context.sessionBrief),
     section('Working Memory', context.workingMemory),
     section('Active Goals', buildGoalsContext()),
-    parityOn ? section('Current Focus', renderFocusForInstructions()) : '',
+    parityOn ? section('Current Focus', renderFocusForInstructions({ sessionId, input: message })) : '',
     section('Active Background Work', renderActiveBackgroundWorkForInstructions()),
     relevantSkills,
   ].filter(Boolean);

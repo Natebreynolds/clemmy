@@ -95,6 +95,31 @@ test('tiered ON: Constitution (voice+reasoning+SOUL) stays in instructions; dyna
   }
 });
 
+test('fresh current request preserves session memory as facts without granting it task authority', () => {
+  process.env.CLEMMY_TIERED_CONTEXT = 'on';
+  try {
+    const staleTaskContext: MemoryContext = {
+      ...ctx,
+      memory: 'Durable preference: use concise replies.',
+      sessionBrief: 'Tyler is waiting on the disabled salesforce-to-airtable-prospect-enrichment workflow.',
+      workingMemory: 'Resume Tyler and keep retrying the disabled workflow.',
+    } as MemoryContext;
+    const request = 'Start a brand-new prospect list from scratch; this is a different task.';
+    const instructions = buildAssistantInstructions(staleTaskContext, 'dashboard', 'action', request, 'fresh-session');
+    const tail = buildTurnContextBlock(staleTaskContext, 'action', request, 'fresh-session');
+    const assembled = `${instructions}\n\n${tail}`;
+
+    assert.match(assembled, /Durable preference: use concise replies/, 'long-term memory remains available as advisory context');
+    assert.match(assembled, /Tyler/, 'same-session history remains available');
+    assert.match(assembled, /salesforce-to-airtable-prospect-enrichment/, 'prior workflow results are not forgotten');
+    assert.match(tail, /## Session Continuity/);
+    assert.match(tail, /## Working Memory/);
+    assert.match(instructions, /latest accepted user message owns task authority/i);
+  } finally {
+    delete process.env.CLEMMY_TIERED_CONTEXT;
+  }
+});
+
 test('tiered prompt keeps skill discovery stable and injects only query-relevant summaries per turn', () => {
   installSkill('firm-document', 'Create polished Google Docs and Word document briefs for firms.');
   installSkill('calendar-operator', 'Schedule meetings and coordinate calendar availability.');
