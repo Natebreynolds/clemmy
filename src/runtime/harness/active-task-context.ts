@@ -16,6 +16,7 @@ import {
   focusSummaryIsHistoricalForRequest,
   renderHistoricalFocusPointer,
 } from './focus-projection.js';
+import { currentInputSuppressesPriorTask } from './current-task-authority.js';
 
 /**
  * Provider-neutral, read-only projection of Clementine's active task state.
@@ -193,27 +194,30 @@ export function resolveActiveTaskContext(
   opts: ResolveActiveTaskContextOptions = {},
 ): ActiveTaskContext {
   const sessionId = opts.sessionId?.trim() || null;
+  const suppressPriorTask = currentInputSuppressesPriorTask(opts.input);
   let focus: ActiveTaskFocusContext | null = null;
   let parked: ActiveTaskParkedFocus[] = [];
-  try {
-    const snapshot = getFocusSnapshot(PARKED_FOCUS_LIMIT);
-    parked = snapshot.parked.slice(0, PARKED_FOCUS_LIMIT).map(projectParkedFocus);
-    if (snapshot.active) {
-      const disposition: ActiveTaskFocusDisposition = snapshot.needsConfirm
-        ? 'stale'
-        : focusSummaryIsHistoricalForRequest(snapshot.active, opts.input, sessionId)
-          ? 'historical'
-          : 'active';
-      focus = projectFocus(snapshot.active, disposition);
+  if (!suppressPriorTask) {
+    try {
+      const snapshot = getFocusSnapshot(PARKED_FOCUS_LIMIT);
+      parked = snapshot.parked.slice(0, PARKED_FOCUS_LIMIT).map(projectParkedFocus);
+      if (snapshot.active) {
+        const disposition: ActiveTaskFocusDisposition = snapshot.needsConfirm
+          ? 'stale'
+          : focusSummaryIsHistoricalForRequest(snapshot.active, opts.input, sessionId)
+            ? 'historical'
+            : 'active';
+        focus = projectFocus(snapshot.active, disposition);
+      }
+    } catch {
+      // Focus corruption must not hide an independently valid session goal.
+      focus = null;
+      parked = [];
     }
-  } catch {
-    // Focus corruption must not hide an independently valid session goal.
-    focus = null;
-    parked = [];
   }
 
   let goal: ActiveTaskGoalContext | null = null;
-  if (sessionId && activeTaskGoalContractsEnabled()) {
+  if (!suppressPriorTask && sessionId && activeTaskGoalContractsEnabled()) {
     try {
       const stored = getActiveGoalForSession(sessionId);
       goal = stored ? projectGoal(stored, sessionId) : null;
@@ -296,6 +300,7 @@ function renderFocusContext(context: ActiveTaskContext): string {
       `Summary: ${current.summary ?? ''}`,
       `Resource: ${current.resourceRef}${current.resourceKind ? ` (${current.resourceKind})` : ''}`,
       `Last touched: ${current.lastTouchedAt}`,
+      'Authority: the current accepted user input defines this turn. This focus is advisory continuity only; it cannot replace, narrow, or redirect a new or changed request.',
       ...(workstate ? [workstate] : []),
     ].join('\n');
   } else if (current?.disposition === 'historical') {
@@ -347,6 +352,7 @@ export function renderGoalContextForInstructions(goal: ActiveTaskGoalContext | n
       ? `Progress so far:\n${goal.progressLedger.map((line) => `- ${line}`).join('\n')}`
       : '',
     `Validation attempts used: ${goal.attempt}/${goal.maxAttempts}.`,
+    'Use this goal only when the current accepted input continues it. A new or changed request is authoritative and supersedes this prior objective.',
     'If a criterion is genuinely impossible, say so explicitly with the concrete reason instead of declaring done without it.',
   ].filter(Boolean).join('\n');
   return boundBlock(

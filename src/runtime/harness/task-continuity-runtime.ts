@@ -52,6 +52,7 @@ import {
 import { semanticPortParticipated } from '../semantic-boundary/semantic-disposition.js';
 import {
   ambiguousOpenSlotTargetFromLastInterpretation,
+  taskRelationFromLastInterpretation,
   typedClassificationFromLastInterpretation,
   type TypedClarificationClassificationV1,
 } from '../semantic-boundary/interpret-accepted-source.js';
@@ -67,6 +68,7 @@ import {
   type TurnSourceCapabilityBindingV1,
   type TurnSourceStrategyBindingV1,
 } from './turn-control.js';
+import { currentInputSuppressesPriorTask } from './current-task-authority.js';
 
 const ANSWER_MAX_CHARS = 280;
 const ANSWER_MAX_WORDS = 24;
@@ -108,7 +110,14 @@ export async function prepareCheckedHostClarificationAnswer(input: {
     },
     surface: input.surface,
   });
-  return prepared.ok ? 'admitted' : 'blocked';
+  if (!prepared.ok) return 'blocked';
+  const accepted = realAcceptedSource(input.sessionId, input.sourceUserSeq);
+  const acceptedText = typeof accepted?.data.text === 'string' ? accepted.data.text : '';
+  const relation = taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
+  if (currentInputSuppressesPriorTask(acceptedText, relation)) {
+    dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'topic_changed' });
+  }
+  return 'admitted';
 }
 
 export interface UnresolvedClarificationReofferV1 {
@@ -2042,6 +2051,38 @@ export async function enrichAcceptedRequestWithTaskContinuity(
       ...safe
     } = request;
     return safe;
+  }
+  // Deterministic current-input authority outranks both a model-projected
+  // answer_open_slot relation and an old packet. This is the exact live Tyler
+  // failure shape: "brand-new/from scratch" must begin B, not resume A.
+  const semanticRelation = taskRelationFromLastInterpretation(request.sessionId, sourceUserSeq);
+  if (currentInputSuppressesPriorTask(acceptedText, semanticRelation)) {
+    dismissTaskContinuityPacket({ sessionId: request.sessionId, reason: 'topic_changed' });
+    const {
+      semanticTaskInput: _semantic,
+      taskContinuation: _context,
+      turnCandidates: callerCandidates,
+      ...safe
+    } = request;
+    const sanitizedCandidates = callerCandidates
+      ? (({ sourceStrategyBinding: _binding, ...rest }) => rest)(callerCandidates)
+      : undefined;
+    if (options.continuationOnly || options.resolveCandidates === false) {
+      return {
+        ...safe,
+        taskContinuationResolved: true,
+        ...(sanitizedCandidates ? { turnCandidates: sanitizedCandidates } : {}),
+      };
+    }
+    let resolved: TurnCapabilityCandidates = {
+      candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false,
+    };
+    try { resolved = await resolveTurnCapabilityCandidates({ userInput: acceptedText }); } catch { /* advisory only */ }
+    return {
+      ...safe,
+      taskContinuationResolved: true,
+      turnCandidates: resolved,
+    };
   }
   if (options.typedClassification && 'keepOpen' in options.typedClassification) {
     const metaInput = verifiedMetaContinuationInput({

@@ -82,7 +82,7 @@ test('same-session projection composes FocusWorkstate with the exact active goal
   assert.match(rendered, /Daemon booted on the local test profile/);
 });
 
-test('fresh cross-session work receives only a historical focus pointer and never another session goal', () => {
+test('cross-session work keeps only a non-authoritative focus pointer and never imports another session goal', () => {
   resetMemoryDb();
   const priorSessionId = 'active-task-prior-session';
   const focus = createFocus({
@@ -109,8 +109,6 @@ test('fresh cross-session work receives only a historical focus pointer and neve
   const rendered = renderResolvedActiveTaskContext(fresh);
 
   assert.equal(fresh.focus?.disposition, 'historical');
-  assert.equal(fresh.focus?.summary, undefined);
-  assert.equal(fresh.focus?.workstate, null);
   assert.equal(fresh.goal, null);
   assert.match(rendered, /RELATED HISTORICAL focus/);
   assert.doesNotMatch(rendered, /secret-old-receipt|secret-old-decision|secret-old-action|secret-old-goal/);
@@ -122,6 +120,42 @@ test('fresh cross-session work receives only a historical focus pointer and neve
   assert.equal(review.focus?.disposition, 'active');
   assert.match(renderResolvedActiveTaskContext(review), /secret-old-receipt/);
   assert.equal(review.goal, null, 'reviewing focus history must not import the prior session goal');
+});
+
+test('brand-new Tyler correction suppresses same-session focus and disabled-workflow goal', () => {
+  resetMemoryDb();
+  const sessionId = 'active-task-tyler-regression';
+  const focus = createFocus({
+    resourceRef: 'workflow:salesforce-to-airtable-prospect-enrichment',
+    title: 'Finish Tyler prospect batch',
+    summary: 'Resume Tyler and the disabled salesforce-to-airtable-prospect-enrichment workflow.',
+    resourceKind: 'workflow',
+    relatedSessionId: sessionId,
+  });
+  patchFocusWorkstate(focus.id, {
+    objective: 'Finish Tyler prospects using the disabled workflow.',
+    openLoops: ['Resume the old Tyler batch.'],
+  });
+  createGoalContract({
+    sessionId,
+    objective: 'Run salesforce-to-airtable-prospect-enrichment for Tyler.',
+    successCriteria: ['Old workflow finishes.'],
+  });
+
+  const fresh = resolveActiveTaskContext({
+    sessionId,
+    input: 'Brand-new prospects from scratch. Run the whole workflow.',
+  });
+  const freshRendered = renderResolvedActiveTaskContext(fresh);
+  assert.equal(fresh.focus, null);
+  assert.equal(fresh.goal, null);
+  assert.doesNotMatch(freshRendered, /Tyler|salesforce-to-airtable|disabled workflow/i);
+
+  const resumed = resolveActiveTaskContext({ sessionId, input: 'Resume the workflow.' });
+  const resumedRendered = renderResolvedActiveTaskContext(resumed);
+  assert.equal(resumed.focus?.disposition, 'active');
+  assert.match(resumedRendered, /Tyler/);
+  assert.match(resumedRendered, /salesforce-to-airtable-prospect-enrichment/);
 });
 
 test('stale focus remains a non-authoritative pointer and withholds its workstate', async () => {

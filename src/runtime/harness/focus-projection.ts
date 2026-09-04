@@ -1,11 +1,11 @@
 import type { FocusRow } from '../../memory/db.js';
+import {
+  currentInputExplicitlyResumesPriorTask,
+  currentInputSuppressesPriorTask,
+} from './current-task-authority.js';
 
 const HISTORICAL_REVIEW_RE =
   /\b(?:continue|pick\s+up|resume|reopen|review|inspect|recap|summari[sz]e|status|what\s+(?:happened|did)|where\s+(?:is|did)|show\s+me\s+(?:the\s+)?(?:status|progress|history))\b/i;
-const EXPLICIT_FRESH_RE =
-  /\b(?:fresh|new|again|rerun|re-run|run\s+again|perform|right\s+now)\b/i;
-const ACTION_RE =
-  /\b(?:add|build|create|delete|deploy|draft|edit|execute|generate|make|modify|post|publish|remove|run|schedule|send|set\s+up|update|upload|write)\b/i;
 
 /**
  * An active focus can point at work from another durable session. That pointer
@@ -19,10 +19,15 @@ export function focusSummaryIsHistoricalForRequest(
   sessionId?: string | null,
 ): boolean {
   const text = (input ?? '').trim();
-  if (!text || !sessionId || focus.related_session_id === sessionId) return false;
-  if (EXPLICIT_FRESH_RE.test(text)) return true;
+  if (currentInputSuppressesPriorTask(text)) return true;
+  if (!text || !sessionId) return false;
+  if (focus.related_session_id === sessionId) return false;
+  if (currentInputExplicitlyResumesPriorTask(text)) return false;
   if (HISTORICAL_REVIEW_RE.test(text)) return false;
-  return ACTION_RE.test(text);
+  // A process-global focus from another session is never the current task by
+  // default. Keep only its bounded historical pointer; explicit resume/review
+  // above is the one cross-session opt-in.
+  return true;
 }
 
 export function renderHistoricalFocusPointer(

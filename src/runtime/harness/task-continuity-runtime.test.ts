@@ -1337,6 +1337,36 @@ test('fresh-topic B dismisses A without inheriting semantic context or convergen
   assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), { status: 'none' });
 });
 
+test('brand-new/from-scratch input cannot be redirected by an admitted old open-slot answer', async () => {
+  const sessionId = 'continuity-tyler-disabled-workflow-regression';
+  const source = accepted(sessionId, 'Continue the pending Tyler prospects.');
+  commitClarification({
+    sessionId,
+    sourceSeq: source.seq,
+    question: 'Should I continue Tyler or use salesforce-to-airtable-prospect-enrichment?',
+    options: ['Continue Tyler', 'Use the workflow'],
+  });
+  const text = 'Brand-new prospects from scratch. Run the whole workflow.';
+  const answer = accepted(sessionId, text);
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+    sessionId,
+    sourceUserSeq: answer.seq,
+    message: text,
+  }, answer.seq, {
+    continuationOnly: true,
+    resolveCandidates: false,
+    // Reproduce the live semantic model's wrong relation. Deterministic
+    // current-input authority must still win over answer_open_slot.
+    typedClassification: { disposition: 'provided' },
+  });
+
+  assert.equal(enriched.message, text);
+  assert.equal(enriched.semanticTaskInput, undefined);
+  assert.equal(enriched.taskContinuation, undefined);
+  assert.equal(enriched.taskContinuationResolved, true);
+  assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), { status: 'none' });
+});
+
 test('send-consent controls cannot also consume a generic clarification packet', async () => {
   const sessionId = 'continuity-consent-isolation';
   const channelData = {

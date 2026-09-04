@@ -410,7 +410,7 @@ test('Current Focus applies one hard prompt budget to an oversized shared workst
   assert.doesNotMatch(rendered, /x{180}/, 'individual notebook lines are compact too');
 });
 
-test('a fresh cross-session action gets the focus pointer but not historical receipts', () => {
+test('a cross-session action retains only a bounded historical focus pointer, not old receipts', () => {
   resetMemoryDb();
   createFocus({
     resourceRef: 'https://docs.google.com/spreadsheets/d/sheet-focus-fixture/edit',
@@ -427,7 +427,6 @@ test('a fresh cross-session action gets the focus pointer but not historical rec
   });
   assert.match(fresh, /RELATED HISTORICAL focus/);
   assert.match(fresh, /sheet-focus-fixture/);
-  assert.match(fresh, /context only, never completion evidence/i);
   assert.doesNotMatch(fresh, /exec-old|old-write-123|old-read-456/);
 
   const review = renderHarnessMemoryContext({
@@ -443,6 +442,47 @@ test('a fresh cross-session action gets the focus pointer but not historical rec
     partition: 'volatile',
   });
   assert.match(sameSession, /old-write-123/);
+});
+
+test('a same-session pivot preserves settled receipts and checkpoint facts but revokes prior task authority', () => {
+  resetMemoryDb();
+  const session = createSession({ kind: 'chat', channel: 'test' });
+  createFocus({
+    resourceRef: 'workflow:old-prospect-flow',
+    title: 'Finish the old prospect run',
+    summary: 'Keep executing the old workflow.',
+    resourceKind: 'workflow',
+    relatedSessionId: session.id,
+  });
+  createGoalContract({
+    sessionId: session.id,
+    objective: 'Finish the old prospect run.',
+    successCriteria: ['Old run completes.'],
+  });
+  checkpointWorkingMemory(session.id, {
+    turn: 2,
+    toolCallsTotal: 3,
+    lastText: 'Previously found 12 valid accounts.',
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: { shapeKey: 'SETTLED_PRIOR_WRITE', targets: ['sheet:receipt-12'] },
+  });
+
+  const context = renderHarnessMemoryContext({
+    sessionId: session.id,
+    focusInput: 'Brand-new prospects from scratch. This is a different task.',
+    partition: 'all',
+  });
+
+  assert.match(context, /Previously found 12 valid accounts/);
+  assert.match(context, /SETTLED_PRIOR_WRITE/);
+  assert.match(context, /sheet:receipt-12/);
+  assert.match(context, /current accepted user input owns task authority/i);
+  assert.doesNotMatch(context, /## Current Focus|\[ACTIVE GOAL/);
 });
 
 test('partition: default ("all") is byte-identical to no partition (regression guard for the cache split)', (t) => {

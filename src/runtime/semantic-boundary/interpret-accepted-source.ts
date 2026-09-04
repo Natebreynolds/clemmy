@@ -1360,6 +1360,35 @@ export type TypedClarificationClassificationV1 =
       optionId?: string;
     };
 
+/** Admitted task relation for this exact accepted source. Consumers should
+ * prefer this checked relation over guessing continuation from wording. */
+export function taskRelationFromLastInterpretation(
+  sessionId: string,
+  sourceUserSeq: number,
+): import('../harness/current-task-authority.js').CurrentTaskSemanticRelation | undefined {
+  const persisted = readPersistedInterpretation(sessionId, sourceUserSeq);
+  if (
+    !persisted
+    || persisted.validationOutcome !== 'admitted'
+    || !persisted.raw
+    || typeof persisted.raw !== 'object'
+    || Array.isArray(persisted.raw)
+  ) return undefined;
+  const relation = (persisted.raw as Record<string, unknown>).relation;
+  switch (relation) {
+    case 'conversation':
+    case 'new_goal':
+    case 'continue_goal':
+    case 'answer_open_slot':
+    case 'amend_goal':
+    case 'abandon_goal':
+    case 'ambiguous':
+      return relation;
+    default:
+      return undefined;
+  }
+}
+
 /** Exact persisted relation identity for the one unresolved-slot reoffer
  * owner. A generic keepOpen projection also covers a legitimately new goal
  * with its own questions, so callers cloning the prior Q must require this

@@ -28,7 +28,7 @@
 import { loadMemoryContext } from '../memory/vault.js';
 import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
-import { getActiveObjective, getFocusSnapshot } from '../memory/focus.js';
+import { getFocusSnapshot } from '../memory/focus.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderRunStrategiesForContext } from '../memory/run-strategy-store.js';
@@ -48,7 +48,11 @@ import {
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
-import { renderActiveTaskContextForInstructions } from '../runtime/harness/active-task-context.js';
+import {
+  renderResolvedActiveTaskContext,
+  resolveActiveTaskContext,
+} from '../runtime/harness/active-task-context.js';
+import { classifyCurrentTaskInput } from '../runtime/harness/current-task-authority.js';
 
 // Legacy chat and journey callers still import the focus-only view from this
 // module. Keep that API while the harness itself consumes the richer shared
@@ -146,14 +150,15 @@ function clipContextLine(text: string): string {
 function renderActiveGoals(): string {
   const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
   if (goals.length === 0) return '';
-  return goals
-    .map((g) => {
+  return [
+    'Advisory standing goals only — they never replace or redirect the current accepted request.',
+    ...goals.map((g) => {
       const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
       const due = g.targetDate ? ` (due ${g.targetDate})` : '';
       const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
       return `- [${g.id}] ${g.title}${status}${due}${next}`;
-    })
-    .join('\n');
+    }),
+  ].join('\n');
 }
 
 /**
@@ -174,7 +179,10 @@ function renderActiveGoals(): string {
  * message+focus, harness uses the active focus). Returns the two SECTION strings
  * separately so each caller keeps its own block ordering. Best-effort.
  */
-export function renderLearnedBlocks(objective?: string): { recentlyLearned: string; toolChoices: string; establishedDestinations: string } {
+export function renderLearnedBlocks(
+  objective?: string,
+  focusScope?: { resourceRef?: string | null },
+): { recentlyLearned: string; toolChoices: string; establishedDestinations: string } {
   let recentlyLearned = '';
   try {
     // Keep only a compact recency bridge here. Durable detail already lives in
@@ -203,7 +211,12 @@ export function renderLearnedBlocks(objective?: string): { recentlyLearned: stri
   // of re-discovering / minting a new one / tripping the provenance gate.
   let establishedDestinations = '';
   try {
-    const focusRef = getFocusSnapshot().active?.resource_ref;
+    // User-turn callers pass an explicit scoped value (including null). The
+    // legacy no-options form retains the old global behavior for non-turn
+    // readers that have no session identity.
+    const focusRef = focusScope === undefined
+      ? getFocusSnapshot().active?.resource_ref
+      : focusScope.resourceRef ?? undefined;
     establishedDestinations = section('Established Deploy Targets', renderEstablishedDestinationsForContext(focusRef));
   } catch {
     establishedDestinations = '';
@@ -272,19 +285,35 @@ export function renderHarnessMemoryContext(opts?: {
     memContext = {};
   }
 
+  const partition = opts?.partition ?? 'all';
+  const acceptedInput = opts?.focusInput ?? opts?.query ?? '';
+  const inputDisposition = classifyCurrentTaskInput(acceptedInput);
+  const activeTaskContext = resolveActiveTaskContext({
+    sessionId: opts?.sessionId,
+    input: acceptedInput,
+  });
+  const scopedFocus = activeTaskContext.focus?.disposition === 'active'
+    ? activeTaskContext.focus
+    : null;
+  const focusObjective = scopedFocus
+    ? [scopedFocus.title, scopedFocus.summary ?? ''].filter(Boolean).join(' ').trim()
+    : '';
+  const requestObjective = [acceptedInput.trim(), focusObjective]
+    .filter(Boolean)
+    .join('\n') || undefined;
+
   let facts = '';
   // PHANTOM IMPRESSIONS killed (COMPOUNDING wave): Persistent Facts is a
   // STABLE-partition block; rendering it on a volatile-only pass recorded an
   // impression per fact per turn for text the model never received — the
   // measured live inflation behind the 1,735:1 impression:use ratio. Render
   // (and count) only when the partition actually delivers the block.
-  if ((opts?.partition ?? 'all') !== 'volatile') {
+  if (partition !== 'volatile') {
     try {
-      // Move 1 (scoped recall): scope injected facts to the active focus's
-      // objective so an off-topic fact can't leak into a focused session.
-      // getActiveObjective() returns undefined when there's no focus or the
-      // flag is off → identical to the global ranking (no regression).
-      facts = renderFactsForInstructions(10, 2600, getActiveObjective());
+      // The literal accepted request ranks first; only a focus proven current
+      // for this session may refine it. Process-global focus never scopes a
+      // different task branch.
+      facts = renderFactsForInstructions(10, 2600, requestObjective);
     } catch {
       facts = '';
     }
@@ -298,18 +327,18 @@ export function renderHarnessMemoryContext(opts?: {
   // 19-success sf-CLI memo above the recency fold of 358 memos — the model
   // went Composio-first against the owner's standing rule). The chat assembler
   // already blends message+focus; the two lanes now rank identically.
-  const learnedObjective = [
-    opts?.query?.trim() || opts?.focusInput?.trim() || '',
-    getActiveObjective() ?? '',
-  ].filter(Boolean).join('\n') || undefined;
-  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(learnedObjective);
+  const learnedObjective = requestObjective;
+  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(
+    learnedObjective,
+    { resourceRef: scopedFocus?.resourceRef ?? null },
+  );
   const rememberedToolChoices = opts?.includeRememberedToolChoices === false ? '' : toolChoices;
 
   // Source-map / landscape memory — a pointer-first index of WHERE the user's
   // data lives, scoped to the active objective. Off (flag) → ''.
   let dataLandscape = '';
   try {
-    dataLandscape = renderSourceMapForContext(24, undefined, getActiveObjective());
+    dataLandscape = renderSourceMapForContext(24, undefined, requestObjective);
   } catch {
     dataLandscape = '';
   }
@@ -321,11 +350,18 @@ export function renderHarnessMemoryContext(opts?: {
     profile = '';
   }
 
+  // A pivot revokes the prior task's control authority; it does not erase what
+  // happened in this conversation. Keep goals/held work visible as explicitly
+  // advisory history while the typed Active Task projection below decides what
+  // (if anything) may steer this turn.
   const goals = renderActiveGoals();
   const heldTasks = renderHeldTasks(opts?.sessionId);
   const nowLine = renderCurrentTimeForInstructions();
+  const sessionWorkingMemory = opts?.sessionId
+    ? loadWorkingMemoryForSession(opts.sessionId)
+    : undefined;
   const workingMemory = opts?.sessionId
-    ? loadWorkingMemoryForSession(opts.sessionId) ?? memContext.workingMemory
+    ? sessionWorkingMemory ?? (inputDisposition === 'resume' ? memContext.workingMemory : undefined)
     : memContext.workingMemory;
   let sessionActions = '';
   if (opts?.sessionId && opts.includeSessionActions !== false) {
@@ -336,7 +372,6 @@ export function renderHarnessMemoryContext(opts?: {
     }
   }
 
-  const partition = opts?.partition ?? 'all';
   let skillDiscovery = '';
   let relevantSkills = '';
   if (partition !== 'volatile') {
@@ -349,10 +384,7 @@ export function renderHarnessMemoryContext(opts?: {
   // Active task block — one typed projection composes Current Focus with this
   // session's exact active goal. It is rendered once per turn and remains in
   // the volatile partition for every provider lane.
-  const activeTask = renderActiveTaskContextForInstructions({
-    sessionId: opts?.sessionId,
-    input: opts?.focusInput ?? opts?.query,
-  });
+  const activeTask = renderResolvedActiveTaskContext(activeTaskContext);
 
   // Query-driven recall (parity with the main harness loop's buildTurnMemoryPrimer):
   // surface the consolidated facts MOST RELEVANT to the user's CURRENT message. A
@@ -427,7 +459,7 @@ export function renderHarnessMemoryContext(opts?: {
   }
   return [
     '# Persistent Context',
-    'This block is loaded fresh each turn from the user\'s vault and memory stores and carries across every Clementine channel. It blends explicit user memory, curated identity, derived observations, pointers, and current state; it is persistent context, not uniform ground truth. Honor explicit user-authored preferences and constraints, but use the displayed provenance and freshness of derived material, verify stale or conflicting claims against the live source, and never present an inference as a confirmed fact.',
+    'This block is loaded fresh each turn from the user\'s vault and memory stores and carries across every Clementine channel. It blends explicit user memory, curated identity, derived observations, pointers, and current state; it is persistent context, not uniform ground truth. The current accepted user input owns task authority. Session history, completed receipts, working memory, held work, and goals preserve facts but cannot replace, narrow, or redirect that input unless the user explicitly resumes them. Honor explicit user-authored preferences and constraints, but use the displayed provenance and freshness of derived material, verify stale or conflicting claims against the live source, and never present an inference as a confirmed fact.',
     '',
     ...blocks,
   ].join('\n\n');

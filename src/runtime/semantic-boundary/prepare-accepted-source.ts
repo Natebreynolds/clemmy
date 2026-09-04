@@ -5,6 +5,7 @@
 import type { TurnGraphIR } from '../graph/turn-graph-ir.js';
 import type { DurableSemanticSnapshotV1 } from './build-semantic-host-view.js';
 import type { OpenQuestionViewV1, ResumableGoalViewV1 } from './turn-semantic-proposal.js';
+import { currentInputSuppressesPriorTask } from '../harness/current-task-authority.js';
 
 export function snapshotFromAcceptedSource(input: {
   sessionId: string;
@@ -34,7 +35,10 @@ export function snapshotFromAcceptedSource(input: {
     predecessorRefs?: readonly string[];
   } | null;
 }): DurableSemanticSnapshotV1 {
-  const awaitInput = input.parentGraph?.nodes.find((node) => node.kind === 'await_input')?.awaitInput;
+  const suppressPriorTask = currentInputSuppressesPriorTask(input.acceptedText);
+  const awaitInput = suppressPriorTask
+    ? undefined
+    : input.parentGraph?.nodes.find((node) => node.kind === 'await_input')?.awaitInput;
   const resumableGoals: ResumableGoalViewV1[] = [];
   const openQuestions: OpenQuestionViewV1[] = [];
   if (awaitInput) {
@@ -58,7 +62,7 @@ export function snapshotFromAcceptedSource(input: {
       // it still cannot acquire any option id or option-specific meta action.
       allowFreeText: true,
     });
-  } else if (input.packet) {
+  } else if (!suppressPriorTask && input.packet) {
     const goalId = input.packet.goalId ?? `goal:${input.sessionId}:${input.packet.originatingSourceUserSeq}`;
     const revision = input.packet.revision ?? 0;
     resumableGoals.push({
