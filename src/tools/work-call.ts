@@ -166,7 +166,9 @@ export const WorkCallInputSchema = z.object({
   proposal: WorkProposalSchema.nullable().describe(
     'Complete provider-neutral work topology. Null when the host already froze the contract, and null after the first successful freeze. Required only when no contract exists yet.',
   ),
-  requirement_id: IdSchema.describe('Operation id in the frozen proposal discharged by this inner call.'),
+  requirement_id: IdSchema.describe(
+    'Binding selector: fresh write uses tool_search capabilityRef; frozen graph uses its open operation id; read/compute uses its requirement label.',
+  ),
   universe_item_id: MemberSchema.nullable().describe(
     'Exact accepted universe member for cardinality=each; otherwise use JSON null (not the string "null").',
   ),
@@ -183,7 +185,7 @@ export const WorkCallInputSchema = z.object({
     'ONE correction to a source-derived universe\'s memberIdPointer, allowed only after a seal refusal named the record\'s actual keys and only before any member is bound. The frozen proposal itself never changes.',
   ),
   source_call_ids: z.array(IdSchema).length(1).nullable().optional().describe(
-    'For a dependent read refinement or write, provide exactly one model-visible function call id naming the settled source result actually used. Use null only when the frozen requirement has no source dependency. This id nominates an existing projection receipt only; it grants no dispatch authority.',
+    'Content lineage: name one settled call only when args consume its result bytes; ordering/condition/decision reads use null. Evidence only, never authority.',
   ),
   source_record_ids: z.array(z.string().min(1).max(2_048)).min(1).max(64)
     .refine((values) => new Set(values).size === values.length, 'source record ids must be unique')

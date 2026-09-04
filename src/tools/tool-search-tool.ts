@@ -419,10 +419,39 @@ export type ToolSearchCandidateSourceKind =
 export function renderCarrierInvocationExample(
   carrier: string,
   invocation: { name: string; fixedArgs?: Record<string, unknown>; payloadField?: string },
-): { tool: string; args: { name: string; args_json: string } } {
+  capabilityRef?: string,
+): {
+  tool: string;
+  args: {
+    requirement_id?: string;
+    source_call_ids?: null;
+    source_record_ids?: null;
+    name: string;
+    args_json: string;
+  };
+} {
   const payloadField = invocation.payloadField ?? 'arguments';
   const inner = { ...(invocation.fixedArgs ?? {}), [payloadField]: { '<argument>': '<value>' } };
-  return { tool: carrier, args: { name: invocation.name, args_json: JSON.stringify(inner) } };
+  const base = { name: invocation.name, args_json: JSON.stringify(inner) };
+  // Direct tool-edge nomination is keyed by the opaque capability ref that
+  // tool_search just disclosed. Keeping that ref beside the literal carrier
+  // example prevents a second, contradictory grammar in
+  // which the model copies a semantic role label (for example
+  // "clause-8:write") into requirement_id and the host refuses the exact
+  // write before dispatch. A frozen graph still overrides this selector with
+  // its open operation id; the example grants no authority by itself.
+  if (carrier === 'work_call' && capabilityRef?.startsWith('cap:')) {
+    return {
+      tool: carrier,
+      args: {
+        requirement_id: capabilityRef,
+        source_call_ids: null,
+        source_record_ids: null,
+        ...base,
+      },
+    };
+  }
+  return { tool: carrier, args: base };
 }
 
 export interface ToolSearchBrokerCandidate {
@@ -706,7 +735,7 @@ export function toolSearchBrokerCoverage(
 
 function dispatchHint(carrier: ToolSearchDispatchCarrier): string {
   return carrier === 'work_call'
-    ? 'Invoke the selected result as the inner name/args_json of work_call. If the host already froze the contract, pass proposal:null. Otherwise the first work_call includes the complete provider-neutral semantic proposal and dispatches this first requirement in that same call; later calls use proposal:null.'
+    ? 'Invoke the selected result through work_call by copying its literal example. For one fresh standalone write, keep example.requirement_id equal to this result\'s exact capabilityRef — never replace it with role_key; the existing tool-edge allow/deny/ask path owns the decision. If a graph is already frozen, use its exact open operation id instead. Replace source_call_ids:null only when the write arguments consume or copy bytes from one settled model-visible result, using that exact function-call id; a prior read used only as a condition or decision is not content lineage and stays null.'
     : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.';
 }
 
@@ -1321,7 +1350,7 @@ export function registerToolSearchTool(
         if (exactCarrier) return dispatchHint(exactCarrier);
         if (opts.dispatchCarrierForName) {
           return 'Each result includes its required carrier. Invoke control/recovery results with call_tool(name, args_json); invoke business results as the inner name/args_json of work_call. Never send a business result through call_tool. '
-            + 'For a business result, args_json is ONE JSON string of {"tool_slug": "<the result name>", "arguments": {<the action arguments as an object>}} — copy the result\'s `example` and replace only the arguments; do not serialize the arguments object a second time.';
+            + 'For a business result, args_json is ONE JSON string of {"tool_slug": "<the result name>", "arguments": {<the action arguments as an object>}} — copy the result\'s `example` and replace only the action arguments; do not serialize the arguments object a second time. For one fresh standalone write, keep example.requirement_id equal to that result\'s exact capabilityRef, never role_key; the tool edge owns allow/deny/ask. If a graph is already frozen, use its exact open operation id instead.';
         }
         const fixedCarrier = opts.dispatchCarrier
           ?? (opts.dispatchViaCallTool ? 'call_tool' : null);
@@ -1380,6 +1409,10 @@ export function registerToolSearchTool(
                   ? r.carrier
                   : (opts.dispatchCarrierForName?.(r.name) ?? opts.dispatchCarrier ?? 'work_call'),
                 r.invocation,
+                planningRefs[r.name]
+                  && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
+                  ? planningRefs[r.name]
+                  : undefined,
               ) }
             : {}),
       });
