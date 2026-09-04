@@ -24,7 +24,7 @@
  */
 import { createHash } from 'node:crypto';
 import {
-  validateDocumentedComposioManifestOperationSemantics,
+  validatedDocumentedComposioDefinitionContracts,
 } from '../../integrations/composio/operation-semantics.js';
 import type {
   MutationVerificationContractV1,
@@ -450,20 +450,30 @@ export async function registerProofProvisionedCapabilities(identity: {
       const effect: BoundNodeCapability['effect'] = entry.effectClass === 'write' ? 'external_write' : 'read';
       const family = toolkitOf(slug);
       const write = effect === 'external_write';
+      // Whole-proof/JIT provisioning has no caller-selected definition row.
+      // Rebuild the complete adapter-authored contract from the same exact
+      // provider schemas rather than preserving semantics while silently
+      // dropping mutation or readback verification. Explicitly selected
+      // definitions remain authoritative, including an intentional absence.
+      const documentedContracts = !selectedSchema
+        ? validatedDocumentedComposioDefinitionContracts({
+            operationId: slug,
+            inputSchema: schema,
+            outputSchema,
+          })
+        : null;
+      // A documented declaration that no longer fits the exact live schemas
+      // is definition drift, not permission to mint a weaker callable.
+      if (documentedContracts && !documentedContracts.ok) continue;
       const operationSemantics = selectedSchema
         && Object.prototype.hasOwnProperty.call(selectedSchema, 'operationSemantics')
         ? selectedSchema.operationSemantics ?? null
-        : selectedSchema
-          ? null
-          : validateDocumentedComposioManifestOperationSemantics({
-              operationId: slug,
-              inputSchema: schema,
-            });
+        : documentedContracts?.operationSemantics ?? null;
       const atomicContentCommit = operationSemantics?.atomicInputContent;
       const verification: OperationVerificationContractV1 | null = selectedSchema
         && Object.prototype.hasOwnProperty.call(selectedSchema, 'verificationContract')
         ? selectedSchema.verificationContract ?? null
-        : null;
+        : documentedContracts?.verificationContract ?? null;
       const mutationVerification: MutationVerificationContractV1 | null = verification
         && 'mutation' in verification ? verification.mutation : null;
       const readbackVerification: ReadbackVerificationContractV1 | null = verification
