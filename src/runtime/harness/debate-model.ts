@@ -1019,6 +1019,39 @@ export function downshiftForBoundary(checker: ResolvedRoleModel): ResolvedRoleMo
   return { ...checker, modelId: fast };
 }
 
+/**
+ * Are the judge and the brain the SAME family?
+ *
+ * `provider` is a coarse TRANSPORT bucket — 'claude' | 'codex' | 'byo' — so two
+ * models from completely different vendors both answer 'byo'. Comparing that
+ * bucket declared a GLM 5.3 (z.ai) brain and a Kimi K3 (Moonshot) judge to be
+ * the same family: different companies, different training, different endpoints,
+ * graded as if the model were marking its own homework. A self-judge gets ONE
+ * hard bounce before going advisory (loop.ts), so the coarse compare quietly
+ * halved the judge's corrective budget.
+ *
+ * Worse, it made cross-family judging IMPOSSIBLE for a BYO-only user: with no
+ * Claude or Codex subscription every pairing is 'byo' vs 'byo', which is exactly
+ * the cheap-brain / expensive-judge setup this harness should support best.
+ *
+ * Two BYO models are the same family only when they run on the SAME backend, so
+ * compare the resolved baseURL. When either side cannot be resolved we return
+ * TRUE (same family) — the conservative direction, because self-judge grants
+ * FEWER hard bounces, never more.
+ */
+function sameJudgeFamily(checker: ResolvedRoleModel, brain: ResolvedRoleModel): boolean {
+  if (checker.provider !== brain.provider) return false;
+  if (checker.provider !== 'byo') return true;
+  const backendFor = (modelId: string): string => {
+    const resolved = resolveByoProviderForModel(modelId) ?? getByoBackendConfig();
+    return (resolved.baseURL || '').trim().toLowerCase();
+  };
+  const judgeBackend = backendFor(checker.modelId);
+  const brainBackend = backendFor(brain.modelId);
+  if (!judgeBackend || !brainBackend) return true;
+  return judgeBackend === brainBackend;
+}
+
 export function resolveBoundaryJudge(): BoundaryJudgeRouting {
   const brain = resolveRoleModel('brain');
   const brainFamily = brain.provider;
@@ -1036,7 +1069,7 @@ export function resolveBoundaryJudge(): BoundaryJudgeRouting {
       judgeFamily: checker.provider,
       brainFamily,
       transport: boundaryTransport(checker.provider),
-      selfJudge: checker.provider === brain.provider,
+      selfJudge: sameJudgeFamily(checker, brain),
     };
   }
   // Fail-open: no usable cross-family judge -> a concrete cheap model on the
