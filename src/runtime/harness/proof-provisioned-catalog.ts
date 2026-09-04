@@ -77,6 +77,13 @@ import {
 } from '../../integrations/composio/provider-definition-identity.js';
 import { requireAttestedTransport } from './implementation-artifacts/attested-transport.js';
 import { executeSealed, productionProviderCrossingAllowed } from './production-capability-adapters.js';
+import {
+  peekProductionCapabilityPort,
+  productionPortIdentityFromManifest,
+  registerProductionCapabilityPort,
+} from './production-capability-ports.js';
+import { composioPreparationForManifest } from './production-composio-preparation.js';
+import { loadShippedImplementations } from './shipped-implementation-identity.js';
 import { refreshTypedExecutionReadiness } from '../semantic-boundary/configure-typed-execution-runtime.js';
 import type { GraphNodeInvocationEnvelopeV1 } from './graph-node-envelope.js';
 import type { BoundNodeCapability } from './graph-node-capability.js';
@@ -725,6 +732,37 @@ export async function registerProofProvisionedCapabilities(identity: {
             identifier: slug,
           },
         };
+      }
+      // A newly observed definition can be published after daemon bootstrap,
+      // so it may not have participated in durable-port reconstruction. Bind
+      // its shipped invocation and adapter-owned preparation now. Existing
+      // exact ports are immutable and already carry the same stable hooks.
+      const portIdentity = productionPortIdentityFromManifest(manifest);
+      if (!peekProductionCapabilityPort(portIdentity)) {
+        const shipped = loadShippedImplementations();
+        const portRegistration = registerProductionCapabilityPort(portIdentity, {
+          ...composioPreparationForManifest(manifest),
+          invoke: shipped.invokeForSealedManifest(manifest),
+          ...(write ? { reconcile: shipped.reconcileForSealedManifest(manifest) } : {}),
+        });
+        const concurrentPort = peekProductionCapabilityPort(portIdentity);
+        if (
+          !portRegistration.ok
+          && (
+            !concurrentPort
+            || typeof concurrentPort.admitPreparation !== 'function'
+            || typeof concurrentPort.prepareInvocation !== 'function'
+            || typeof concurrentPort.invokeWithPreparation !== 'function'
+          )
+        ) {
+          return {
+            registered,
+            refusal: {
+              code: 'proof_manifest_install_refused',
+              identifier: slug,
+            },
+          };
+        }
       }
       const primaryRole = advisoryRoles[0]!;
       const validateForegroundPayload = createProofProviderForegroundPayloadValidator({

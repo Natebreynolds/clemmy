@@ -3574,6 +3574,37 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // definition at all.
       const shippedTransportPreparation = Boolean(manifest.externalDefinition)
         && typeof port.prepareInvocation !== 'function';
+      const portPreparationMembers = [
+        port.admitPreparation,
+        port.prepareInvocation,
+        port.invokeWithPreparation,
+      ];
+      const portPreparationMemberCount = portPreparationMembers.filter((member) => (
+        typeof member === 'function'
+      )).length;
+      if (
+        portPreparationMemberCount !== 0
+        && portPreparationMemberCount !== portPreparationMembers.length
+      ) return miss('production_port_preparation_contract_incomplete');
+      const portOwnsPreparation = portPreparationMemberCount === portPreparationMembers.length;
+      let preparedInvocationProof: unknown;
+      let preparedInvocationProofPresent = false;
+      const preparePortInvocation = async (): Promise<void> => {
+        if (!portOwnsPreparation) return;
+        port.admitPreparation!();
+        preparedInvocationProof = await port.prepareInvocation!();
+        preparedInvocationProofPresent = true;
+      };
+      const invokeDirectPort = async <T>(work: () => Promise<T>): Promise<T> => {
+        if (!portOwnsPreparation) return work();
+        if (!preparedInvocationProofPresent) {
+          throw new Error('production port invocation lacks its exact preparation proof');
+        }
+        const proof = preparedInvocationProof;
+        preparedInvocationProof = undefined;
+        preparedInvocationProofPresent = false;
+        return port.invokeWithPreparation!(proof, work);
+      };
       return {
         attestation,
         manifest,
@@ -3588,12 +3619,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? { validateBeforeConsent: validateForegroundPayload }
           : {}),
         ...(!preserveExternalCarrier
-          && (shippedTransportPreparation || catalogEntry.validateForegroundPayload)
+          && (portOwnsPreparation || shippedTransportPreparation || catalogEntry.validateForegroundPayload)
           ? {
               prepareBeforePhysical: async () => {
                 const validation = validateForegroundPayload();
                 if (validation) return validation;
-                if (shippedTransportPreparation) {
+                if (portOwnsPreparation) {
+                  await preparePortInvocation();
+                } else if (shippedTransportPreparation) {
                   await loadShippedImplementations().prepareComposioDispatch({
                     operationId: manifest.operationId,
                     accountId: manifest.accountId,
@@ -3617,7 +3650,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                 nestedCallAdmissions.delete(logicalToolCallId);
               }
             }
-          : async () => port.invoke({
+          : async () => invokeDirectPort(() => port.invoke({
               // A write the authored-consent evaluator granted carries the
               // host's call authority: the exact manifest bound above plus the
               // arguments this turn schema-validated. Reads and ungranted
@@ -3660,7 +3693,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                 manifest,
                 invoke: port.invoke,
               },
-            }),
+            })),
       };
     }
 

@@ -35,6 +35,7 @@ const eventlog = await import('./eventlog.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const provisioning = await import('./proof-provisioned-catalog.js');
 const production = await import('./production-capability-adapters.js');
+const ports = await import('./production-capability-ports.js');
 const manifests = await import('./capability-manifest.js');
 const manifestStores = await import('./capability-manifest-store.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
@@ -77,6 +78,7 @@ schemas._setToolSchemaLoaderForTests(async (identifier) => (
 ));
 
 after(() => {
+  ports.clearProductionCapabilityPorts();
   catalogs.installHostCapabilityCatalogFactory(null);
   manifestStores.installCapabilityManifestStore(null);
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -162,6 +164,34 @@ test('a read whose durable manifest predates the builder shape registers against
     accountIdentity: CONNECTION_ID,
   });
   assert.equal(resolved?.capabilityId, BASE_ID, 'the host\'s proven-live-read resolver binds it');
+});
+
+test('late proof provisioning publishes the complete production preparation contract', async () => {
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore([]));
+  ports.clearProductionCapabilityPorts();
+  assert.equal(
+    ports.listProductionCapabilityPorts().some(({ identity }) => identity.manifestId === BASE_ID),
+    false,
+    'the fixture must exercise late publication rather than bootstrap reconstruction',
+  );
+
+  const result = await provisioning.registerProofProvisionedCapabilities(
+    proofTurn('durable-identity-late-production-port'),
+    PROOF_OPTIONS,
+  );
+  assert.equal(result.refusal, undefined, JSON.stringify(result));
+  assert.ok(result.registered.includes(BASE_ID), JSON.stringify(result));
+
+  const manifest = manifestStores.peekCapabilityManifestStore()!.get(BASE_ID)!.manifest;
+  const port = ports.peekProductionCapabilityPort(
+    ports.productionPortIdentityFromManifest(manifest),
+  );
+  assert.ok(port, 'late proof publication installs the exact production port');
+  assert.equal(typeof port.admitPreparation, 'function');
+  assert.equal(typeof port.prepareInvocation, 'function');
+  assert.equal(typeof port.invokeWithPreparation, 'function');
 });
 
 test('a manifest the store refuses is a typed refusal, never an empty success', async () => {

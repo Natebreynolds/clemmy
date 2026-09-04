@@ -5604,20 +5604,46 @@ test('production host external reads require one exact frozen manifest/account/s
     registerCatalog?: boolean;
     registerPort: boolean;
     shouldExecute: boolean;
+    providerKind?: 'native_mcp' | 'composio';
+    withPreparation?: boolean;
   }) => {
     const fixture = acceptHostCanarySource(`production-external-${input.label}`);
-    const operationId = `market_${input.label}__lookup_attorneys`;
+    const providerKind = input.providerKind ?? 'native_mcp';
+    const operationId = providerKind === 'composio'
+      ? 'GOOGLESHEETS_VALUES_GET'
+      : `market_${input.label}__lookup_attorneys`;
     const manifest = capabilityManifests.attachSemanticContract({
       version: 1,
       manifestId: `cap:${input.label}:attorney-lookup`,
-      providerKind: 'native_mcp',
+      providerKind,
       operationId,
-      providerIdentity: `configured-market-directory:${input.label}`,
+      providerIdentity: providerKind === 'composio'
+        ? 'composio'
+        : `configured-market-directory:${input.label}`,
       providerVersion: '2026-08-22',
       operationVersion: '1',
       definitionFingerprint: 'a'.repeat(64),
+      ...(providerKind === 'composio'
+        ? {
+            externalDefinition: {
+              version: 1 as const,
+              providerInputSchemaDigest: 'c'.repeat(64),
+              providerOutputSchemaObserved: true,
+              providerOutputSchemaDigest: 'd'.repeat(64),
+              semanticName: operationId,
+              behaviorHints: {
+                readOnly: true,
+                destructive: false,
+                idempotent: true,
+                openWorld: false,
+              },
+            },
+          }
+        : {}),
       effect: 'read',
-      accountId: `account:${input.label}:primary`,
+      accountId: providerKind === 'composio'
+        ? 'ca_direct_composio_preparation'
+        : `account:${input.label}:primary`,
       idempotency: { required: false, policy: 'none' },
       reconciliation: { supported: false, policy: 'none' },
       outputContract: { kind: 'attorney_records' },
@@ -5659,6 +5685,9 @@ test('production host external reads require one exact frozen manifest/account/s
         account: input.accountMatches ? manifest.accountId : `account:${input.label}:foreign`,
         manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
         providerKind: manifest.providerKind,
+        ...(manifest.externalDefinition
+          ? { providerInputSchemaDigest: manifest.externalDefinition.providerInputSchemaDigest }
+          : {}),
         liveFingerprint: manifest.definitionFingerprint,
         manifest,
         invoke: portInvoke as never,
@@ -5666,10 +5695,39 @@ test('production host external reads require one exact frozen manifest/account/s
     }
     capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
     productionPorts.clearProductionCapabilityPorts();
+    const preparationOrder: string[] = [];
+    const preparationProofs = new WeakSet<object>();
     if (input.registerPort) {
       assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
         productionPorts.productionPortIdentityFromManifest(manifest),
-        { invoke: portInvoke as never },
+        {
+          ...(input.withPreparation
+            ? {
+                admitPreparation() {
+                  preparationOrder.push('admit');
+                },
+                async prepareInvocation() {
+                  preparationOrder.push('prepare');
+                  const proof = Object.freeze({});
+                  preparationProofs.add(proof);
+                  return proof;
+                },
+                async invokeWithPreparation(proof: unknown, work: () => Promise<unknown>) {
+                  preparationOrder.push('consume');
+                  assert.ok(
+                    proof && typeof proof === 'object' && preparationProofs.has(proof as object),
+                    'direct host dispatch consumes the exact one-shot preparation proof',
+                  );
+                  preparationProofs.delete(proof as object);
+                  return work();
+                },
+              }
+            : {}),
+          invoke: async (request: Parameters<typeof portInvoke>[0]) => {
+            preparationOrder.push('business');
+            return portInvoke(request);
+          },
+        } as never,
       ), { ok: true });
     }
     const carrier = brackets.wrapToolForHarness({
@@ -5715,6 +5773,13 @@ test('production host external reads require one exact frozen manifest/account/s
     }));
     assert.equal(outerBodies, 0);
     assert.equal(portBodies, input.shouldExecute ? 1 : 0);
+    if (input.withPreparation && input.shouldExecute) {
+      assert.deepEqual(
+        preparationOrder,
+        ['admit', 'prepare', 'consume', 'business'],
+        'direct host-owned Composio dispatch prepares exactly once before business',
+      );
+    }
     const db = eventlog.openEventLog();
     const logicalCount = (db.prepare(`
       SELECT COUNT(*) AS n FROM logical_tool_calls
@@ -5755,6 +5820,15 @@ test('production host external reads require one exact frozen manifest/account/s
       schemaMatches: true,
       registerPort: true,
       shouldExecute: true,
+    }));
+    await t.test('direct Composio call_tool prepares its exact port once', () => runVariant({
+      label: 'direct-composio-preparation',
+      accountMatches: true,
+      schemaMatches: true,
+      registerPort: true,
+      shouldExecute: true,
+      providerKind: 'composio',
+      withPreparation: true,
     }));
     await t.test('foreign account', () => runVariant({
       label: 'account',
