@@ -202,6 +202,11 @@ async function persistGraphWithUnsealedIntent(sessionId: string) {
       crashed += 1;
       throw new Error('fixture crash after immutable graph intent');
     },
+    // The live host now immediately adopts this exact intent and attempts the
+    // same durable recovery before another model step. Keep this fixture at
+    // the pre-seal checkpoint so the age-budget assertions below can advance
+    // its clock deliberately.
+    recoveryBindingSealFailure: () => 'fixture retained for recovery-budget testing',
   });
   try {
     await brackets.withHarnessRunContext({
@@ -318,6 +323,37 @@ test('a failing seal inside the budget stays held; past it the same failure is a
   planTools.installPlanTaskPreparationTestHooks(null);
 });
 
+test('a terminal source is retired from the pre-seal recovery queue', async () => {
+  const { session, source } = await persistGraphWithUnsealedIntent('plan-seal-terminal-retired');
+  // The fixture deliberately crashed before terminal preparation could build
+  // a typed projection. Insert the already-published terminal fact directly;
+  // this test owns queue selection, not terminal-publication validation.
+  eventlog.openEventLog().prepare(`
+    INSERT INTO events
+      (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+    VALUES (?, ?, ?, 'system', 'conversation_completed', NULL, ?, ?)
+  `).run(
+    'terminal:plan-seal-terminal-retired',
+    session.id,
+    source.turn,
+    JSON.stringify({
+      sourceUserSeq: source.seq,
+      reason: 'verification_required',
+      delivered: false,
+    }),
+    new Date().toISOString(),
+  );
+
+  assert.deepEqual(
+    planSettlement.pendingPlanTaskBindingSealRecoveryCandidates({ limit: 8 }),
+    [],
+    'a published terminal owns any later retry; the daemon must not re-seal its old source forever',
+  );
+  const swept = await planTools.recoverPendingPlanTaskBindingSealPreparations({ limit: 8 });
+  assert.equal(swept.scanned, 0, JSON.stringify(swept));
+  assert.equal(swept.held + swept.expired + swept.prepared + swept.replayed, 0);
+});
+
 test('a legacy owner with no exact intent is held, never expired, however old it is', async () => {
   const { session, source } = await persistGraphWithUnsealedIntent('plan-seal-budget-legacy');
   const db = eventlog.openEventLog();
@@ -354,7 +390,7 @@ test('a legacy owner with no exact intent is held, never expired, however old it
   planTools.installPlanTaskPreparationTestHooks(null);
 });
 
-test('the fresh-turn owner turns expired into a non-resumable factual terminal, and keeps held resumable', () => {
+test('the fresh-turn owner turns expired into a factual terminal and keeps an in-budget seal with host recovery', () => {
   const src = readFileSync(LOOP, 'utf8');
   const start = src.indexOf('recoverPlanTaskBindingSealPreparation({');
   const end = src.indexOf('recoverSettledPlanTaskActivation({', start);
@@ -370,6 +406,13 @@ test('the fresh-turn owner turns expired into a non-resumable factual terminal, 
   assert.match(expiredBranch, /Nothing was started/);
   assert.doesNotMatch(expiredBranch, /Please retry/, 'expired must not tell the user to retry the same source');
   const heldBranch = region.slice(heldAt);
-  assert.match(heldBranch, /Please retry/, 'inside the budget the honest answer is still retry');
+  assert.match(heldBranch, /status: 'held'/,
+    'inside the budget the immutable plan remains host-owned instead of becoming a public block');
+  assert.match(heldBranch, /wake: 'recovery'/);
+  assert.match(heldBranch, /reason: 'recovery_pending'/);
+  assert.match(heldBranch, /scheduleHostCheckpointRecovery/,
+    'the same accepted source receives a bounded background wake');
+  assert.doesNotMatch(heldBranch, /Please retry/,
+    'host preparation is no longer delegated back to the user');
   assert.doesNotMatch(heldBranch, /blockedResumable: false/);
 });

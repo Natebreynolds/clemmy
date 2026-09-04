@@ -370,6 +370,13 @@ function pendingPlanTaskBindingSealRecoveryCandidateRows(
           WHERE checkpoint.session_id = intent.session_id
             AND checkpoint.source_user_seq = intent.source_user_seq
        )
+         AND NOT EXISTS (
+           SELECT 1
+             FROM events terminal
+            WHERE terminal.session_id = intent.session_id
+              AND terminal.type = 'conversation_completed'
+              AND json_extract(terminal.data_json, '$.sourceUserSeq') = intent.source_user_seq
+         )
        ${afterWhere}
        ORDER BY intent.recorded_at ASC, intent.session_id ASC,
                 intent.source_user_seq ASC

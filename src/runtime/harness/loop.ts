@@ -5290,12 +5290,19 @@ async function runConversationWithinRuntimeConfig(
       };
     }
     if (recoveredPreparation.status === 'held') {
+      // The immutable plan/seal intent is already the continuation owner. A
+      // public blocked answer ("please retry") handed control back to the user
+      // and let the current provider loop repeat plan_task even though no new
+      // plan is legal. Keep the exact accepted source parked on the existing
+      // host-recovery wake; the daemon advances the same intent and the saved
+      // HostRecoveryState resumes its accepted provider frame.
+      scheduleHostCheckpointRecovery(options, sourceUserSeq);
       return {
         sessionId: options.sessionId,
-        status: 'blocked',
+        status: 'held',
         steps: 0,
         lastTurn: acceptedSource.turn,
-        error: 'I retained the accepted plan, but its host preparation is still pending. No requested action has started. Please retry.',
+        hold: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' },
       };
     }
     const recoveredPlan = await recoverSettledPlanTaskActivation({
