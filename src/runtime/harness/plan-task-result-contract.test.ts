@@ -177,11 +177,16 @@ test('recorded payloads that carried a capability list keep their recorded routi
     ...ASK_ONLY_MISSING_WRITE,
     admissibleCapabilities: [advertised],
   })), null);
-  // Neither is a recoveryTool the ask-only shape never emits.
-  assert.equal(parseExactPlanTaskRefusal(JSON.stringify({
+  // The producer DOES emit this pairing: when the cited write is blocked on a
+  // connected-account choice, no search can bind it, so the repair names the
+  // gathering-stage door and routes back to plan_task (plan-tools.ts, live
+  // 2026-09-03 run 28). It must be a member on the same 6-key set.
+  const accountBlocked = parseExactPlanTaskRefusal(JSON.stringify({
     ...ASK_ONLY_MISSING_WRITE,
     recoveryTool: 'plan_task',
-  })), null);
+  }));
+  assert.equal(accountBlocked?.recoveryTool, 'plan_task');
+  assert.equal(accountBlocked?.structural, true);
 });
 
 test('a keyed plan_invalid_input refusal parses as the structural plan_task member and projects a path-keyed stage', () => {

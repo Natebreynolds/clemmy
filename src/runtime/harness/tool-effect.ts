@@ -340,6 +340,44 @@ export function resolveProviderCarrierLocalReadControl(
 }
 
 /**
+ * Recover a HOST-ONLY control the model named inside a trusted LOCAL carrier
+ * (`call_tool` / `work_call`). Closed structural projection: the inner name
+ * must be an exact registry declaration whose entire execution is host-local
+ * (`runtimeEffect: 'host_only'`) and whose role is the control plane, so no
+ * provider, business, or external-effect name can ever enter here.
+ *
+ * Registry membership is NOT authority: callers must additionally prove the
+ * control is on THIS turn's configured surface before routing to it.
+ */
+export function resolveCarriedHostControl(
+  toolName: string,
+  rawArgs: unknown,
+): { toolName: string; args: Record<string, unknown> } | null {
+  if (
+    !isPlainOrClementineLocalTool(toolName, 'call_tool')
+    && !isPlainOrClementineLocalTool(toolName, 'work_call')
+  ) return null;
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, rawArgs);
+  if (
+    effective.composioCarrier === true
+    || !effective.toolName
+    || !effective.args
+    || typeof effective.args !== 'object'
+    || Array.isArray(effective.args)
+  ) return null;
+  const declaration = TOOL_REGISTRY.find((candidate) => candidate.name === effective.toolName);
+  if (
+    !declaration
+    || declaration.runtimeEffect !== 'host_only'
+    || declaration.actionTopologyRole !== 'control'
+  ) return null;
+  return {
+    toolName: declaration.name,
+    args: effective.args as Record<string, unknown>,
+  };
+}
+
+/**
  * Peel schema/discovery carriers using the full invocation payload. Callers
  * must run this before event previews are clipped: the returned identity is a
  * small durable fact, while `args` may be arbitrarily large and remains only

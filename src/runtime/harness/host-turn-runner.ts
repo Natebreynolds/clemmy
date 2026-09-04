@@ -185,6 +185,7 @@ import {
   classifyRuntimeToolEffect,
   isDelegationPrimitiveRuntimeCall,
   isUnscopedShellRuntimeCall,
+  resolveCarriedHostControl,
   resolveProviderCarrierLocalReadControl,
   runtimeToolAuthorityBinding,
   trustedRuntimeEffectCarrier,
@@ -637,17 +638,6 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
       `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
       'Call plan_task exactly once with the exact disclosed capabilities and correction named by the refusal.',
       'Do not rediscover, substitute capabilities, or call a provider or business tool.',
-    ].join(' ');
-  }
-  if (
-    consequence.stage === 'plan_incomplete:missing_write'
-    && consequence.recoveryToolNames.length === 1
-    && consequence.recoveryToolNames[0] === 'plan_task'
-  ) {
-    return [
-      'BOUNDED AUTO RECOVERY — the accepted plan is missing a write already present in the exact result.',
-      'Call plan_task exactly once with that matching disclosed write bound to the correct write topology operation.',
-      'Do not call tool_search, substitute an unrelated write, or claim that the user must continue this internal repair.',
     ].join(' ');
   }
   if (
@@ -3330,6 +3320,49 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         logicalToolCallId,
         runContextForCall,
         routedDetails,
+      );
+    }
+    // A CARRIED CONTROL IS THAT CONTROL — all the way to execution. The frame
+    // policy already classifies call_tool{plan_task} as the control it names
+    // and the host admits the frame; call_tool then refused it one layer down
+    // ("available, but not through this carrier"), and because that refusal
+    // settles as invalid_arguments the schema_invalid recovery narrowed the
+    // very next model surface to call_tool ALONE while telling the model not
+    // to call plan_task — a turn that cannot recover from a correct plan.
+    //
+    // Route it to the configured control object instead. `toolByName` is this
+    // turn's REAL surface (built from the agent's tools after tool policy and
+    // isEnabled), so a dormant or subtracted control is simply absent and keeps
+    // every authority check it has today; only host_only control-plane names
+    // are eligible, so nothing that can cross a provider boundary rides here.
+    const carriedHostControl = resolveCarriedHostControl(name, args);
+    const carriedHostControlTool = carriedHostControl
+      ? toolByName.get(carriedHostControl.toolName)
+      : undefined;
+    if (carriedHostControl && carriedHostControlTool) {
+      const routedArgumentsJson = materializedArgumentsJson(
+        carriedHostControlTool,
+        JSON.stringify(carriedHostControl.args),
+      );
+      const routedArgs = parsedArgs(routedArgumentsJson) ?? carriedHostControl.args;
+      return exactProductionHostCall(
+        carriedHostControl.toolName,
+        routedArgs,
+        routedArgumentsJson,
+        carriedHostControlTool,
+        logicalToolCallId,
+        runContextForCall,
+        {
+          ...(details && typeof details === 'object'
+            ? details as Record<string, unknown>
+            : {}),
+          toolCall: {
+            type: 'function_call' as const,
+            callId: logicalToolCallId,
+            name: carriedHostControl.toolName,
+            arguments: routedArgumentsJson,
+          },
+        },
       );
     }
     if (

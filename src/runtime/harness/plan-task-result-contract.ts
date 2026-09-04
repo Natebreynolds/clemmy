@@ -246,8 +246,8 @@ export function parseExactPlanTaskRefusal(value: unknown): ExactPlanTaskRefusal 
       exactPlanTaskResultKeys(payload, [
         'ok', 'code', 'detail', 'requestedEffectScope', 'repair', 'recoveryTool',
       ])
-      && payload.recoveryTool === 'tool_search'
-    ) return result(payload, 'settled_refusal', 'tool_search', true);
+      && (payload.recoveryTool === 'tool_search' || payload.recoveryTool === 'plan_task')
+    ) return result(payload, 'settled_refusal', payload.recoveryTool, true);
     // Durable payloads written while the refusal advertised a bounded write
     // list keep their recorded routing.
     if (
