@@ -376,6 +376,31 @@ Rules, standing:
 
 ## 8. Definition of done: the "better than both" test
 
+### 8.0 The owner's canonical ask (2026-09-04, his words, lightly compressed)
+
+> "I need to find 100 market-leader accounts — here's the criteria. I'm not sure if
+> you should search the web or look in Salesforce; figure that out. Compile them into
+> a sheet with comprehensive data on why each is a market leader and a target. Be
+> smart enough to work WITH me — ask questions along the way, within reason: 'here's
+> what I found, here's what we should do next.' I want to be able to trust you with a
+> task whenever needed."
+
+Every phase maps onto a beat of this ask. Use it as the shape of the P3 acceptance
+canary and every future demo:
+
+| Beat | Mechanism | Status |
+|---|---|---|
+| "web or Salesforce — figure it out" | source-strategy choice: ONE natural question when the source materially changes provenance/quality/cost; the confirmed choice persists across answer/restart/model switch | shipped in the v3.16 wave (see release notes: "Confirm the material choice, then preserve it") |
+| "100 accounts, here's the criteria" | count-only work grounds at the call — a count is a loop bound, not a census exam | landed `8a9703ef`+`73592a2f` (Patch C) |
+| gather → compile → sheet | read → local rehearsal → one granted push; ordinary reversible writes cross without approval cards | P3 (this weekend) |
+| "ask me along the way, within reason" | same-turn batched ask (question list, one pause, siblings keep running); ≤1 clarifying beat before autonomy | P4 (this weekend) |
+| "here's what I found, here's what we should do next" | mid-task check-in in Clem's own words, in thread (landed `a306221a`); next-edge always named on any stop | P2 acceptance + v3.17 item 2 (render it) |
+| "I can just trust you with a task" | completion graded on the effect ledger — "done" means the rows exist, never prose | P1 (this weekend) |
+
+The trust sentence at the end is the whole product. It is bought with P1 (never a
+false "done"), P2 (never a dead end), and P4 (asks that cost nothing) — not with any
+new feature.
+
 Unchanged from the research docs, now with the honest baseline attached. One
 provider-neutral scenario from a truly blank home, no seeded manifests, must show:
 
@@ -598,6 +623,152 @@ daemon to free a port.
 
 ---
 
+## 13. Competitive watch — live sweep 2026-09-04 (~16:30)
+
+Five research lenses, 178 live fetches, every claim CONFIRMED against a fetched page
+unless marked PLAUSIBLE. Raw findings with URLs: the reviewer session holds them; ask
+if a citation is needed. Headline: **all three references moved materially in the ~12
+days since our 08-22/23 baselines; nothing found reorders P0–P5; the moat holds but
+three tag claims need precision fixes before v3.16 ships.**
+
+### 13.1 Reference state (baselines are stale — new pins)
+
+- **DeepSeek Harness** → `dsh-v0.1.3-alpha.1` (published **today**, commit `d347e70`;
+  7 releases since our baseline, near-daily). NEW: same-turn ask
+  (`ctx.userQuestions.ask()` blocks inside the tool call; composer queues into the
+  running turn); session format v2 with **immutable adjacent-generation migrations**
+  (they converged on our migration rule) and a cross-process **session-file lease**;
+  formalized fail-closed pre-execute (deny-only guards, no argument rewriting,
+  **approval grants are one-shot only** — no standing grants); approval cards carry
+  typed permission categories; public reads are consent-free by policy. Workflow seam
+  **still foreground-only, no resume** — and they *reduced* its default exposure.
+  Experimental Agent Teams (event-sourced task DAG, CAS revisions, cold-resume
+  mailboxes) is their durability answer forming — task records, not external effects.
+  Their SAFETY.md now states sandboxing/approvals "do not guarantee isolation."
+- **Hermes** → `v0.21.0 "Pantheon"` (2026-08-31; ~500 merged PRs/week). NEW:
+  same-turn **batched** clarify (N questions, one pause); lean-tail compaction is
+  default **with a published recall eval harness**; cron got a **closed status set
+  separating computation from delivery** (`ok` may never mean "the user got it") plus
+  pre-dispatch validation that refuses to burn a run, and cron agents are now
+  **ever-learning** (persistent memory, continuity carry-forward, hash-skip unchanged
+  monitors); writes to its own instruction files now always require approval. Still
+  **zero** external-effect machinery: no receipts, no ledger, no per-write replay
+  protection; approvals remain command-pattern regex + an LLM that auto-APPROVES.
+- **bb** → head `1ab96a0` / desktop 0.41.0 (378 commits since baseline). Our three
+  load-bearing claims **verified at source level**: the ask holds the turn by
+  **withholding the JSON-RPC reply** to the in-flight call — a persisted
+  `pending_interaction` row, one active ask per thread, the answer returns **as that
+  call's own tool result**, zero extra model round trips, asks never expire and
+  survive daemon reconnects. Plan is an optional prompt literal; no compiler in front
+  of chat. NEW: **steer-on-Enter is the default** (user input CAS-injected into the
+  live turn); opt-in `automations` (cron/one-shot) and `workflows`
+  (**cached-call replay = restart-surviving runs**); marketplace, mobile app + push
+  on `interaction.pending`; Hermes/Grok/Cursor/opencode mountable inside bb. Still
+  zero external-effect settlement or business-write consent.
+- **Market**: Codex `rust-v0.153.x` — **async user questions** (model-side trained),
+  **Auto-review** (learned reviewer at the sandbox boundary, rationale attached,
+  deny returns *steering* not a stop, review history survives compaction/restart),
+  and **the planning tool is now disabled by default**. Claude Code — scheduled
+  routines, background workflows, **Remote Control** (attach/approve from phone,
+  the strongest approvals UX shipped). Google — Antigravity CLI: one harness, many
+  surfaces, permissions set once. Landscape: allow/deny/ask policy is now universal;
+  **Letta Code beat Claude Code on Terminal-Bench 2.0 on the same model via durable
+  memory** — the strongest external proof of our ever-learning axis.
+
+### 13.2 Moat verdict + three REQUIRED precision fixes to tag claims (text-only)
+
+The moat holds — no reference has an effect ledger, a per-external-write lease,
+never-blind retry, resolved live call authority, or ledger-graded completion. P1
+**extends** a lead no one is chasing. But three of our claims are now rebuttable as
+worded, and the tag must not ship them stale:
+
+1. Say "**one lease per external crossing**" — never bare "CAS/lease" (DeepSeek now
+   has a session-file lease; Hermes has trigger-layer CAS; bb has CAS lifecycle
+   tables — all guard records, none guard an external effect).
+2. Say "**their settlements aggregate model output; ours settle external effects**"
+   (DeepSeek v2 renders "durable settlements" of assistant streams — the word is no
+   longer ours alone).
+3. **Drop every "no reference has durable workflows" phrasing.** bb now has
+   restart-surviving workflow runs via cached-call replay (opt-in plugin). Correct
+   claim: "no reference has occurrence identity + checkpoints + an effect ledger
+   under its workflows; bb's replay caches agent results, not external crossings."
+
+Positioning gains, free to state honestly: DeepSeek grants approvals **once per ask**
+with no standing policy — our approve-once-then-governed-run is structurally better
+for unattended work; and their SAFETY.md disclaims enforcement while our enforcement
+layer is the verified §3 list (state it with the same honesty rule the notes already
+follow, §9.4 judge disclosure included).
+
+### 13.3 Phase validations + zero-risk design inputs (phases already executing — no scope change)
+
+- **P4 is now table stakes, validated by ALL of bb + Hermes + DeepSeek + Codex.**
+  Ship it exactly as scheduled. Design inputs from bb's verified mechanism: barrier =
+  withhold the reply on the in-flight call; the answer rides back as **that call's
+  own result**; one barrier per run-context; siblings keep running. Shape the payload
+  as a **question list** (batched; single question = degenerate case) so no v3.17
+  payload migration is needed.
+- **P5 is market-confirmed, not contrarian**: Codex disabled its planning tool by
+  default; bb keeps plan an optional literal; DeepSeek has no graph. Until P5 lands,
+  our plan-freeze exam is the outlier among all four.
+- **P2 validations + one test case**: Hermes — a stalled attempt must not burn retry
+  budget, and a **provider-proven** failure buys exactly one bounded retry through an
+  armed cooldown (their issue #100661; same shape as "shape rejections never end a
+  turn"). Codex charges all nested work to one root budget. bb ships failure-settling
+  with visible backoff — P2's acceptance already requires our typed stop payload to
+  reach the user-facing terminal **verbatim**; that is the market behavior.
+- **P3 design input**: category-labeled approval cards are table stakes (DeepSeek).
+  The same-step consent card should pass the reducer's **existing** typed fields
+  (effect, reversibility, account) through verbatim — pure pass-through, no new
+  mapping layer (defer any such layer to v3.17).
+- **P1 has no competitor equivalent.** Nearest cousin: Hermes cron's closed status
+  set ("never test `== ok` for the-user-got-their-result") — independent validation
+  of both P1 and our pre-dispatch-refusal-visibility priority.
+
+### 13.4 v3.17 backlog, ranked (forward-only; NONE of this is weekend scope)
+
+1. **Durable ask barrier** (persisted row, idempotent per-call id, re-attach on
+   restart) + optional deadline that degrades to recorded model judgment + a
+   deny-and-continue escalation policy for unattended runs. The composed property is
+   claimed by no one; bb holds two of the three pieces.
+2. **Desktop run-ledger/trajectory pane over the EXISTING journal.** Measured: the
+   desktop and console render **zero** of our effect vocabulary today (0 grep hits
+   for `external_write_succeeded` / `logical_call_settlements` /
+   `physical_dispatches` in apps/desktop + apps/console-web). Trajectory-grade
+   legibility is the market bar (DeepSeek renders live from its log; bb live-follows
+   by seq). Ours is a **rendering gap, not an engine gap** — desktop refinement only,
+   per the owner's surfaces rule: run ledger, live-follow via seq reads, background
+   inbox (running/blocked/needs-input/done + next edge), in-conversation schedules,
+   usage/step_efficiency stats.
+3. **Delivery-distinct terminal literals** for scheduled/workflow runs
+   (delivered-and-proven ≠ computed-but-undelivered ≠ refused-pre-dispatch).
+4. **Self-instruction-write consent class** in the ONE existing reducer (writes to
+   Clem's own memory/skills/workflow definitions = a named class; anti-prompt-
+   injection guarantee; Hermes shipped the equivalent). Touches the safety floor —
+   own red journey.
+5. **Occurrence continuity**: carry the previous occurrence's report into the next;
+   hash-skip unchanged monitor runs (Hermes cron parity on our ever-learning axis).
+6. **Compaction recall eval** over real sessions (Hermes ships one; we have none).
+7. **Auto-decision rationale in the transcript** + judge-gate denials return
+   steering, not a stop (Codex Auto-review parity; OPEN CLEM UP alignment).
+8. **Cross-surface benchmark**: remote approval reliably resumes the paused run;
+   run started on one surface fully inspectable/approvable from the others
+   (Claude Code Remote Control, Antigravity one-harness-many-surfaces).
+9. **Fork-from-checkpoint design pass** — the one Trajectory behavior with no engine
+   truth behind it here (interacts with CAS + never-blind retry; needs care).
+10. Re-propose-the-pending-call recovery UX (Gemini rewind); steer primitive
+    (user CAS-injection into the live turn, bb default); ACP interop watch;
+    read-result TTL cache for the curated-reads lane.
+
+### 13.5 Strategic read
+
+The market is converging on our consent shape while **conceding our two moats**:
+settled-external-effect truth and durable memory (Letta proved memory beats a
+first-party harness on its own model). The weekend phases attack exactly the right
+bar. The v3.17 kill-shot demo no reference can follow: **kill -9 mid-run → the
+occurrence resumes → the effect ledger is intact → zero duplicate external writes.**
+
+---
+
 ## 12. Reviewer log (append-only — executing agent: re-read at every phase boundary)
 
 The reviewer session watches every commit and canary outcome against this doc.
@@ -635,3 +806,27 @@ entries; the reviewer appends, you respond in commits and reports.
   DROPPED not committed; implementation artifacts re-emit
   (`--verify-current` must exit 0 — check the real exit code, never through a
   pipe); merge + v3.16.0 tag PREP (execution waits for owner approval).
+
+**2026-09-04 ~16:45 — TWO NEW SECTIONS, act as follows (no P0–P5 scope change):**
+
+- **§13 Competitive watch** added — a live 5-lens research sweep (178 fetches,
+  2026-09-04). Read §13.2 and §13.3 before writing the v3.16 tag notes and before
+  finishing P2/P3/P4. Binding items for THIS weekend, all text-or-shape only:
+  1. Apply the three claim-precision fixes in §13.2 to the tag notes and any
+     comparison prose ("one lease per EXTERNAL crossing"; "their settlements
+     aggregate model output, ours settle external effects"; never claim bb lacks
+     durable workflows — it has cached-replay restart, no effect ledger).
+  2. P4: payload is a QUESTION LIST (single question = degenerate case); barrier =
+     withheld reply on the in-flight call; the answer returns as that call's own
+     result; one barrier per run-context; siblings keep running.
+  3. P2: add/verify the two governor cases — a stalled attempt burns no retry
+     budget; a provider-proven failure buys exactly one bounded retry through an
+     armed cooldown. And the typed stop payload must reach the user-facing
+     terminal verbatim.
+  4. P3: the same-step consent card passes the reducer's EXISTING typed fields
+     (effect, reversibility, account) through verbatim — no new mapping layer.
+  Everything in §13.4 is v3.17 backlog: do NOT start any of it this weekend.
+- **§8.0 canonical ask** added — the owner's own scenario, phase-mapped. Shape the
+  P3 acceptance canary and the P1 before/after report against it where practical.
+- Reminder: commits 34d9dd63's live-wire verification (judge reaches the Claude
+  wire) still belongs in the P1 canary report, per the entry above.
