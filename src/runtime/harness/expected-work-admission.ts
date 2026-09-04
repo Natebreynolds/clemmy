@@ -21,6 +21,7 @@ import {
 import { compileAtomicInputContentContract } from './atomic-input-content-contract.js';
 import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
 import { classifyExternalWrite } from './confirm-first-gate.js';
+import { extractDuplicateIdentityKeys } from './grounding-gate.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import {
   canonicalExpectedWorkJson,
@@ -63,6 +64,7 @@ import {
 } from './result-handle.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 import {
+  catalogOperationIdentityKey,
   isPlainOrClementineLocalTool,
 } from './runtime-tool-identity.js';
 import {
@@ -705,26 +707,173 @@ function sourceWitness(
   const detected = detectMultiItemIntent(text);
   const exactMembers = detected.exactMembers ? [...detected.exactMembers].sort() : null;
   const proposedMembers = [...universe.members].sort();
-  if (
+  const exactAcceptedMembers = (
     !detected.isMultiItem
     || !exactMembers
     || detected.itemCount !== exactMembers.length
     || proposedMembers.length !== exactMembers.length
     || proposedMembers.some((member, index) => member !== exactMembers[index])
-  ) {
+  ) ? null : exactMembers;
+  if (exactAcceptedMembers) {
+    if (selectedIds.some((id) => !proposedMembers.includes(id))) {
+      return { ok: false, reason: 'selected members are outside the exact accepted-input universe' };
+    }
     return {
-      ok: false,
-      reason: 'accepted-input universe is not the exact host-extracted enumerated set; count-only or ambiguous input must use a later sealed source universe',
+      ok: true,
+      kind: 'accepted_user_input',
+      ref: row.id,
+      digest: expectedWorkDigest(canonicalExpectedWorkJson(exactAcceptedMembers)),
     };
   }
-  if (selectedIds.some((id) => !proposedMembers.includes(id))) {
-    return { ok: false, reason: 'selected members are outside the exact accepted-input universe' };
+
+  // A count-only request names the cardinality, not the eventual records. The
+  // immutable result handle that returned those records owns their lineage;
+  // accepted source prose does not need to enumerate them first. Require one
+  // exact returned record set rather than searching serialized bytes or
+  // accepting a subset/substring coincidence.
+  const memberDigest = expectedWorkDigest(canonicalExpectedWorkJson(proposedMembers));
+  const resultRows = db.prepare(`
+    SELECT s.logical_tool_call_id
+      FROM logical_call_settlements s
+      JOIN logical_tool_calls l
+        ON l.session_id = s.session_id
+       AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+     WHERE s.session_id = ? AND s.source_user_seq = ?
+       AND l.accepted_task_id = ?
+       AND s.outcome_kind = 'succeeded'
+       AND s.mutating = 0
+       AND s.result_handle_id IS NOT NULL
+     ORDER BY s.settled_at DESC, s.logical_tool_call_id
+  `).all(
+    contract.identity.sessionId,
+    contract.identity.sourceUserSeq,
+    contract.acceptedTaskId,
+  ) as Array<{ logical_tool_call_id: string }>;
+  for (const resultRow of resultRows) {
+    const redeemed = redeemSuccessfulSettlementResultForHost({
+      sessionId: contract.identity.sessionId,
+      sourceUserSeq: contract.identity.sourceUserSeq,
+      acceptedTaskId: contract.acceptedTaskId,
+      logicalToolCallId: resultRow.logical_tool_call_id,
+    });
+    if (redeemed.status !== 'ok') continue;
+    const records = recordsAtRecordPath(
+      redeemed.value.rawPayload,
+      redeemed.value.handle.recordPath,
+    );
+    if (!records) continue;
+    const coverage = proveFiniteReadResultCoverage({
+      proof: {
+        universeId: universe.id,
+        memberCount: proposedMembers.length,
+        argumentPointer: '',
+        memberIdPointer: null,
+        schemaDigest: expectedWorkDigest('settled-result-member-witness'),
+        memberDigest,
+      },
+      requestedMembers: proposedMembers,
+      rawResult: records,
+    });
+    if (coverage.status !== 'proved') continue;
+    if (selectedIds.some((id) => !proposedMembers.includes(id))) {
+      return { ok: false, reason: 'selected members are outside the settled result universe' };
+    }
+    return {
+      ok: true,
+      kind: 'complete_source_receipt',
+      ref: resultRow.logical_tool_call_id,
+      digest: memberDigest,
+    };
+  }
+  return {
+    ok: false,
+    reason: 'count-only accepted input has neither one exact settled result-member set nor a concrete call target',
+  };
+}
+
+const HOST_DERIVED_CALL_TARGET_SELECTOR: ExpectedWorkUniverseSelectorV1 = {
+  // The full normalized call is the immutable selection surface. Concrete
+  // recipient/record identity is extracted by the same provider-neutral
+  // target oracle used by duplicate-write protection.
+  argumentPointer: '',
+  memberIdPointer: null,
+};
+
+const SMALL_COUNT_WORDS = [
+  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
+  'eighteen', 'nineteen', 'twenty',
+] as const;
+
+function countOnlyAcceptedSourceMatches(text: string, count: number): boolean {
+  const intent = detectMultiItemIntent(text);
+  if (
+    intent.isMultiItem
+    && !Array.isArray(intent.exactMembers)
+    && intent.itemCount === count
+  ) return true;
+  const countWord = SMALL_COUNT_WORDS[count];
+  if (!countWord || Array.isArray(intent.exactMembers)) return false;
+  // The shared detector intentionally recognizes only numeric cardinality.
+  // This narrow supplement recognizes the same "count + plural target" shape
+  // when the user wrote a small number as a word (the live request says
+  // "five suitable prospects" and "five ... drafts").
+  return new RegExp(
+    `\\b${countWord}\\s+(?:[a-z][\\w'-]+\\s+){0,3}(?:people|men|women|children|[a-z][a-z'-]*s)\\b`,
+    'i',
+  ).test(text);
+}
+
+function callTargetWitness(input: {
+  db: Database.Database;
+  contract: AcceptedTaskWorkContractV1;
+  universe: ExpectedWorkUniverseV1;
+  logicalToolCallId: string;
+  universeItemId: string;
+  args: unknown;
+}): { ok: true; kind: string; ref: string; digest: string } | { ok: false; reason: string } {
+  const source = input.db.prepare(`
+    SELECT id, data_json FROM events
+     WHERE session_id = ? AND seq = ? AND type = 'user_input_received'
+  `).get(input.contract.identity.sessionId, input.contract.identity.sourceUserSeq) as {
+    id: string;
+    data_json: string;
+  } | undefined;
+  let sourceText = '';
+  try {
+    const parsed = source ? JSON.parse(source.data_json) as { text?: unknown } : null;
+    sourceText = typeof parsed?.text === 'string' ? parsed.text : '';
+  } catch {
+    return { ok: false, reason: 'count-only accepted source is unreadable' };
+  }
+  if (
+    !source
+    || input.universe.seal !== 'accepted_input'
+    || !countOnlyAcceptedSourceMatches(sourceText, input.universe.members.length)
+  ) {
+    return { ok: false, reason: 'call-target membership does not match one count-only accepted request' };
+  }
+  const targets = [...new Set(
+    extractDuplicateIdentityKeys(input.args)
+      .map((target) => target.normalize('NFKC').trim())
+      .filter(Boolean),
+  )].sort();
+  if (targets.length === 0 || targets.length > 2_048) {
+    return { ok: false, reason: 'the per-item write has no bounded concrete target identity' };
   }
   return {
     ok: true,
-    kind: 'accepted_user_input',
-    ref: row.id,
-    digest: expectedWorkDigest(canonicalExpectedWorkJson(exactMembers)),
+    // The binding row and logical-call argument digest retain this target
+    // receipt. The contract member is only a quota slot for count-only input.
+    kind: 'complete_source_receipt',
+    ref: input.logicalToolCallId,
+    digest: expectedWorkDigest(canonicalExpectedWorkJson({
+      acceptedSource: source.id,
+      count: input.universe.members.length,
+      member: input.universeItemId,
+      targets,
+    })),
   };
 }
 
@@ -1634,6 +1783,42 @@ function generatedArtifactContractForBinding(
   }
 }
 
+/**
+ * A host-resolved capability id is a durable definition identity, while a
+ * provider/model call names the operation on that definition. Requiring the
+ * caller to echo the host's `cap:resolved:...:definition:...` spelling makes
+ * transport syntax an admission gate. Recover only the standard resolved
+ * capability family here; arbitrary work ids remain exact-only.
+ */
+function frozenResolvedCapabilityOperationKey(requirementId: string): string | null {
+  const match = /^cap:resolved:([^:]+)(?::definition:[^:]+)?$/i.exec(requirementId.trim());
+  if (!match?.[1]) return null;
+  const key = catalogOperationIdentityKey(match[1]);
+  return key || null;
+}
+
+function invocationOperationForContract(input: {
+  contract: AcceptedTaskWorkContractV1;
+  requirementId: string;
+  tool: string;
+  args: unknown;
+}): ExpectedWorkOperationV1 | null {
+  const exact = input.contract.operations.find((entry) => entry.id === input.requirementId);
+  if (exact) return exact;
+
+  const requestedKey = catalogOperationIdentityKey(input.requirementId);
+  const effective = unwrapRuntimeEffectiveToolIdentity(input.tool, input.args);
+  const invokedKey = effective.toolName
+    ? catalogOperationIdentityKey(effective.toolName)
+    : '';
+  if (!requestedKey || requestedKey !== invokedKey) return null;
+
+  const candidates = input.contract.operations.filter((entry) => (
+    frozenResolvedCapabilityOperationKey(entry.id) === invokedKey
+  ));
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
 function priorRequirementAllowsAdmission(
   db: Database.Database,
   contract: AcceptedTaskWorkContractV1,
@@ -1653,8 +1838,9 @@ function priorRequirementAllowsAdmission(
   const rows = db.prepare(`
     SELECT b.tool_name, b.argument_digest, b.universe_item_id,
            b.logical_tool_call_id, l.state,
-           s.outcome_kind, s.recovery_action, s.retry_same_candidate,
-           s.eliminates_candidate, s.requires_reconciliation
+           s.execution_kind, s.outcome_kind, s.recovery_action, s.retry_same_candidate,
+           s.eliminates_candidate, s.requires_reconciliation,
+           s.physical_crossing_count
       FROM expected_work_call_bindings b
       JOIN logical_tool_calls l
         ON l.session_id = b.session_id
@@ -1678,11 +1864,13 @@ function priorRequirementAllowsAdmission(
     universe_item_id: string | null;
     logical_tool_call_id: string;
     state: string;
+    execution_kind: string | null;
     outcome_kind: string | null;
     recovery_action: string | null;
     retry_same_candidate: number | null;
     eliminates_candidate: number | null;
     requires_reconciliation: number | null;
+    physical_crossing_count: number | null;
   }>;
   const relevant = operation.cardinality.kind === 'each'
     ? rows.filter((row) => row.universe_item_id === universeItemId)
@@ -1708,8 +1896,19 @@ function priorRequirementAllowsAdmission(
       satisfiedByLogicalToolCallId: latestDischarged.logical_tool_call_id,
     };
   }
+  // A projector/policy refusal before provider entry is a host miss, not a
+  // business attempt and not discharge. Remove it from attempt accounting so
+  // the same frozen requirement can continue after metadata/identity repair.
+  // A mutation with any physical crossing remains governed by the ordinary
+  // one-crossing and reconciliation branches below.
+  const attempts = relevant.filter((row) => !(
+    row.outcome_kind === 'policy_denial'
+    && row.execution_kind === 'refused_pre_dispatch'
+    && row.physical_crossing_count === 0
+  ));
+  if (attempts.length === 0) return { ok: true };
   if (operation.effect === 'read' || operation.effect === 'compute') {
-    const exactRetained = [...relevant].reverse().find((row) => (
+    const exactRetained = [...attempts].reverse().find((row) => (
       (row.outcome_kind === 'succeeded' || row.outcome_kind === 'empty_result')
       && row.tool_name === currentTool
       && row.argument_digest === currentArgumentDigest
@@ -1728,7 +1927,7 @@ function priorRequirementAllowsAdmission(
     // A genuinely different clean query may therefore use the bounded
     // READ_EXPLORATION_CEILING below instead of dying after its first window.
   }
-  const settledAttempts = relevant.filter((row) => row.outcome_kind !== null);
+  const settledAttempts = attempts.filter((row) => row.outcome_kind !== null);
   if (settledAttempts.length >= 2) {
     // VALUE-AWARE READ EXPLORATION (live 2026-08-18, third specimen of the
     // class): "my search tool only allows one query per task pass" surfaced
@@ -1759,7 +1958,7 @@ function priorRequirementAllowsAdmission(
         : 'this requirement already used its one attempt and one repair; further calls cannot advance the plan. Use landed data or explain the precise blocker',
     };
   }
-  const latest = relevant.at(-1)!;
+  const latest = attempts.at(-1)!;
   if (latest.outcome_kind === 'succeeded' || latest.outcome_kind === 'empty_result') {
     if (operation.effect === 'read' || operation.effect === 'compute') {
       // One hollow success may take exactly one different-args repair. A
@@ -2402,7 +2601,12 @@ export function admitExpectedWorkInvocation(input: {
       return refusal(kind, reason);
     }
   };
-  const operation = contract.operations.find((entry) => entry.id === input.requirementId);
+  const operation = invocationOperationForContract({
+    contract,
+    requirementId: input.requirementId,
+    tool: input.tool,
+    args: input.args,
+  });
   if (!operation) return refusedWithPlan('work_requirement_unknown', `requirement ${input.requirementId} is not in the frozen proposal`);
   const runtimeProjection = runtimeExpectedWorkProjection(input.tool, input.args);
   if (!runtimeProjection.mayBindBusinessWork) {
@@ -2537,21 +2741,6 @@ export function admitExpectedWorkInvocation(input: {
         return refusedWithPlan('work_contract_conflict', 'logical call already owns a different work binding');
       }
 
-      // Accepted-input universes are authority at contract freeze, not when a
-      // later item happens to dispatch. Prove every one against the immutable
-      // accepted source now so a first unrelated call cannot freeze an omitted
-      // or substring-only member set.
-      for (const acceptedUniverse of contract.universes) {
-        if (acceptedUniverse.seal !== 'accepted_input') continue;
-        const witness = sourceWitness(
-          db,
-          contract,
-          acceptedUniverse,
-          acceptedUniverse.members,
-        );
-        if (!witness.ok) return refusedWithPlan('work_source_witness_missing', witness.reason);
-      }
-
       const prior = priorRequirementAllowsAdmission(
         db,
         contract,
@@ -2626,16 +2815,21 @@ export function admitExpectedWorkInvocation(input: {
         }
       } else {
         if (!universe) return refusedWithPlan('work_cardinality_mismatch', 'operation universe is missing');
-        if (!input.universeSelector) {
-          return refusedWithPlan('work_cardinality_mismatch', 'each/set cardinality requires an immutable argument selector');
-        }
         if (operation.cardinality.kind === 'each' && !input.universeItemId) {
           return refusedWithPlan('work_cardinality_mismatch', 'each cardinality requires universe_item_id');
         }
         if (operation.cardinality.kind === 'set' && input.universeItemId != null) {
           return refusedWithPlan('work_cardinality_mismatch', 'set cardinality binds the full set, not one item');
         }
-        const selected = selectedMemberIds(evidenceArgs, input.universeSelector, operation.cardinality.kind);
+        const hostMayBindPerItemTarget = operation.cardinality.kind === 'each'
+          && (operation.effect === 'external_write' || operation.effect === 'local_write')
+          && !input.universeSelector;
+        if (!input.universeSelector && !hostMayBindPerItemTarget) {
+          return refusedWithPlan('work_cardinality_mismatch', 'set/read cardinality requires an immutable argument selector');
+        }
+        const selected = input.universeSelector
+          ? selectedMemberIds(evidenceArgs, input.universeSelector, operation.cardinality.kind)
+          : { ok: true as const, ids: [input.universeItemId as string] };
         if (!selected.ok) return refusedWithPlan('work_cardinality_mismatch', selected.reason);
         // A pointer frozen before the read that proves it may be corrected
         // once, here, in the same call that binds the first member — so the
@@ -2695,12 +2889,26 @@ export function admitExpectedWorkInvocation(input: {
           inputSourceDigest = resolvedUniverse.seal.digest;
         } else {
           const witness = sourceWitness(db, contract, universe, selected.ids);
-          if (!witness.ok) return refusedWithPlan('work_source_witness_missing', witness.reason);
-          inputSourceKind = witness.kind;
-          inputSourceRef = witness.ref;
-          inputSourceDigest = witness.digest;
+          const grounded = witness.ok
+            ? witness
+            : hostMayBindPerItemTarget
+              ? callTargetWitness({
+                  db,
+                  contract,
+                  universe,
+                  logicalToolCallId: input.logicalToolCallId,
+                  universeItemId: input.universeItemId as string,
+                  args: evidenceArgs,
+                })
+              : witness;
+          if (!grounded.ok) return refusedWithPlan('work_source_witness_missing', grounded.reason);
+          inputSourceKind = grounded.kind;
+          inputSourceRef = grounded.ref;
+          inputSourceDigest = grounded.digest;
         }
-        selectorJson = canonicalExpectedWorkJson(input.universeSelector);
+        selectorJson = canonicalExpectedWorkJson(
+          input.universeSelector ?? HOST_DERIVED_CALL_TARGET_SELECTOR,
+        );
         memberDigest = expectedWorkDigest(canonicalExpectedWorkJson(selected.ids));
         memberCount = selected.ids.length;
       }
