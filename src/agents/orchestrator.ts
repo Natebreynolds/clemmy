@@ -3419,6 +3419,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // calls). Everywhere else keep call_tool even when the deferred set is
       // empty — it still carries the MCP-namespaced dispatch path and the
       // first-class-wrap fallback that avoids the not_reachable loop.
+      // Structural control names, computed here because `structuralTools` is
+      // built later and the dispatcher needs them now. Registry-derived and
+      // filtered to host-only controls below, so this can only ever admit a
+      // host-local control — never a business tool.
+      const structuralControlNames: readonly string[] = carrierWork && hostFreshPlanning
+        ? ['plan_task']
+        : [];
       const dispatcherOptions: BuildCallToolOptions = {
         reachableBuiltinNames: carrierWork ? workCallBuiltinNames : discoverableNames,
         // Emptying this wholesale removed the "first-class-wrap fallback"
@@ -3432,8 +3439,22 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // control that was deliberately subtracted stays excluded and keeps its
         // own authority checks. Business tools are untouched and still belong
         // to work_call.
+        // ...and STRUCTURAL controls must be in that set to survive the filter.
+        // 8a9badbb filtered `firstClassNames` alone, which is derived from the
+        // DISCOVERY surface (deriveOrchestratorDiscoveryNames -> lanes
+        // includes 'orchestrator'). plan_task declares `lanes: []` and is added
+        // straight into assembledTools as a structural tool, so it can never
+        // appear in that set and the filter was inert — verified live: Sonnet
+        // still hit "available, but not through this carrier" on cbbd573c,
+        // wrapped twice, and the frame-refusal ceiling ended the turn while the
+        // governor was still reporting retry_available.
+        //
+        // Union the structural names in before filtering. Still host-only
+        // controls only, still no provider name, and a business tool cannot
+        // reach it because structuralTools carries none.
         firstClassNames: carrierWork
-          ? new Set([...firstClassNames].filter((name) => isHostOnlyActionControl(name)))
+          ? new Set([...firstClassNames, ...structuralControlNames]
+              .filter((name) => isHostOnlyActionControl(name)))
           : firstClassNames,
         deniedNames: excludes,
         mcpToolScope,

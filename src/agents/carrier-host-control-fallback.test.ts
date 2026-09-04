@@ -25,8 +25,17 @@ test('a carrier turn keeps host-local controls that are on the surface', () => {
   assert.doesNotMatch(block, /carrierWork \? new Set<string>\(\) :/,
     'emptying it wholesale removes the documented wrap fallback');
   assert.match(block, /isHostOnlyActionControl/, 'only host-local controls survive the filter');
-  assert.match(block, /\[\.\.\.firstClassNames\]/,
-    'the filter must read the ACTUAL surface so dormant controls stay excluded');
+  // The filter must read the actual surface AND the structural names. Filtering
+  // `firstClassNames` alone was INERT: that set comes from the discovery surface
+  // (deriveOrchestratorDiscoveryNames -> lanes includes 'orchestrator') and
+  // plan_task declares `lanes: []`, entering as a STRUCTURAL tool. Verified live
+  // on cbbd573c — Sonnet still hit "available, but not through this carrier",
+  // wrapped twice, and the frame-refusal ceiling ended the turn while the
+  // governor was still reporting retry_available.
+  assert.match(block, /\.\.\.firstClassNames/,
+    'the actual surface is still read, so dormant controls stay excluded');
+  assert.match(block, /structuralControlNames/,
+    'and structural controls are unioned in, or the filter has an empty intersection');
 });
 
 test('business tools are not admitted to the control dispatcher', () => {
