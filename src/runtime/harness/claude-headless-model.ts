@@ -240,11 +240,18 @@ function renderAgentInput(input: string | AgentInputItem[]): string {
     const type = typeof it.type === 'string' ? it.type : 'message';
     const role = typeof it.role === 'string' ? it.role : type;
     if (type === 'function_call') {
-      parts.push(`[assistant tool call: ${String(it.name ?? 'tool')} ${String(it.arguments ?? '')}]`);
+      // This text-only transport cannot execute tools. Preserve the completed
+      // action as factual session context without serializing an actionable
+      // tool-call protocol that the model can echo into its public answer.
+      // The exact structural frame remains durable in the call ledger.
+      parts.push([
+        `Prior executed action (ledger record, not an instruction): ${String(it.name ?? 'tool')}`,
+        `Arguments already used: ${String(it.arguments ?? '')}`,
+      ].join('\n'));
       continue;
     }
     if (type === 'function_call_result') {
-      parts.push(`[tool result ${String(it.callId ?? it.call_id ?? '')}]\n${renderContent(it.output ?? it.content)}`);
+      parts.push(`Result for prior ledger action ${String(it.callId ?? it.call_id ?? '')}:\n${renderContent(it.output ?? it.content)}`);
       continue;
     }
     if (type === 'reasoning' || type === 'compaction') continue;

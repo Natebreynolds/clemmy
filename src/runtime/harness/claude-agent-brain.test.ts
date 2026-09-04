@@ -4331,6 +4331,7 @@ test('looksLikeToolNarration flags described-but-not-called tool protocol, ignor
   assert.equal(looksLikeToolNarration('Tool call: skill_read\n{"name":"x"}', []), true);
   assert.equal(looksLikeToolNarration('<tool_call>\n{"name":"skill_read"}', []), true);
   assert.equal(looksLikeToolNarration('[tool_call] skill_read', []), true);
+  assert.equal(looksLikeToolNarration('[assistant tool call: work_call {"name":"x"}]', []), true);
   assert.equal(looksLikeToolNarration('{"tool_slug": "SALESFORCE_RUN_SOQL_QUERY", "arguments": {}}', []), true);
   // The 2026-06-30 live failure (v0.12.46 desktop): the brain wrapped its tool calls
   // in a hallucinated <system>…</system> pseudo-tag, so a Workspace build + Composio

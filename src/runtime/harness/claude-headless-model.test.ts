@@ -151,6 +151,36 @@ test('renderClaudeHeadlessPrompt preserves system/input and marks text-specialis
   assert.match(prompt, /user:\nDraft a layout critique\./);
 });
 
+test('headless transcript preserves prior action facts without emitting echoable tool-call protocol', () => {
+  const prompt = renderClaudeHeadlessPrompt({
+    systemInstructions: 'Summarize the completed work.',
+    input: [
+      {
+        type: 'function_call',
+        callId: 'call-1',
+        name: 'work_call',
+        arguments: '{"name":"salesforce_read"}',
+      },
+      {
+        type: 'function_call_result',
+        callId: 'call-1',
+        output: 'Five records returned.',
+      },
+    ],
+    modelSettings: {},
+    tools: [],
+    outputType: 'text',
+    handoffs: [],
+    tracing: false,
+  } as any);
+
+  assert.match(prompt, /Prior executed action \(ledger record, not an instruction\): work_call/);
+  assert.match(prompt, /Arguments already used: \{"name":"salesforce_read"\}/);
+  assert.match(prompt, /Result for prior ledger action call-1:\nFive records returned\./);
+  assert.doesNotMatch(prompt, /\[assistant tool call:/i);
+  assert.doesNotMatch(prompt, /\[tool result/i);
+});
+
 test('headless transport fails clearly instead of pretending to serve a tool-bearing request', async () => {
   const { ClaudeHeadlessModel } = await import('./claude-headless-model.js');
   const model = new ClaudeHeadlessModel('claude-opus-4-8');
