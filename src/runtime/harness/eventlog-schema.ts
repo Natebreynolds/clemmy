@@ -11133,6 +11133,48 @@ const MIGRATIONS: EventLogMigration[] = [
     backfill: (db) => rebuildRunDispatchLeasesCipherBoundV75(db),
     foreignKeysOff: true,
   },
+  {
+    // v76: host-owned provider calls project the same external-write event
+    // lifecycle as wrapped tools. These keys make reservation and terminal
+    // projection append-and-reread a durable CAS across processes. Historical
+    // events have no key and remain untouched.
+    version: 76,
+    sql: `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_write_projection_key
+        ON events(session_id, json_extract(data_json, '$.projectionKey'))
+        WHERE type = 'external_write'
+          AND json_extract(data_json, '$.projectionKey') IS NOT NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_write_terminal_projection_key
+        ON events(session_id, json_extract(data_json, '$.terminalProjectionKey'))
+        WHERE type IN (
+          'external_write_succeeded',
+          'external_write_failed',
+          'external_write_orphaned'
+        )
+          AND json_extract(data_json, '$.terminalProjectionKey') IS NOT NULL;
+    `,
+  },
+  {
+    // v77: ambiguity and decisive settlement are different CAS domains. An
+    // orphan may later be reconciled to one success/failure, while success and
+    // failure remain mutually exclusive. Dropping the v76 combined key also
+    // upgrades a database which briefly ran that schema during development.
+    version: 77,
+    sql: `
+      DROP INDEX IF EXISTS idx_events_external_write_terminal_projection_key;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_write_orphan_projection_key
+        ON events(session_id, json_extract(data_json, '$.orphanProjectionKey'))
+        WHERE type = 'external_write_orphaned'
+          AND json_extract(data_json, '$.orphanProjectionKey') IS NOT NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_events_external_write_decisive_projection_key
+        ON events(session_id, json_extract(data_json, '$.decisiveProjectionKey'))
+        WHERE type IN ('external_write_succeeded', 'external_write_failed')
+          AND json_extract(data_json, '$.decisiveProjectionKey') IS NOT NULL;
+    `,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
