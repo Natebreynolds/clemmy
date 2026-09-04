@@ -112,6 +112,53 @@ test('a source-backed replacement still owes derivation and stale reconciliation
     && edge.fromObligation === 'source_completeness'));
 });
 
+test('expected work separates control ordering from content derivation', () => {
+  const controlOnly = {
+    version: 1,
+    operations: [
+      {
+        id: 'read',
+        effect: 'read',
+        coverage: 'resolved_operation',
+        dependsOn: [],
+        dataFrom: [],
+        cardinality: { kind: 'once' },
+      },
+      {
+        id: 'write',
+        effect: 'external_write',
+        dependsOn: ['read'],
+        dataFrom: [],
+        cardinality: { kind: 'once' },
+      },
+    ],
+    universes: [],
+  } as const;
+  assert.equal(
+    manifests.operationRequiresSourceDerivation(controlOnly.operations, 'write', true),
+    false,
+    'dependsOn alone is a control edge, even when a legacy fallback would be strict',
+  );
+  assert.equal(
+    manifests.expectedWorkDataLineageIncludes(controlOnly.operations, 'read', 'write'),
+    false,
+  );
+
+  const sourceBacked = controlOnly.operations.map((operation) => (
+    operation.id === 'write'
+      ? { ...operation, dataFrom: ['read'] as const }
+      : operation
+  ));
+  assert.equal(
+    manifests.operationRequiresSourceDerivation(sourceBacked, 'write', false),
+    true,
+  );
+  assert.equal(
+    manifests.expectedWorkDataLineageIncludes(sourceBacked, 'read', 'write'),
+    true,
+  );
+});
+
 test('only the current Sheet-from-JSON operation identity uses content commit instead of readback', () => {
   const atomic = compileFor('read the source and create one Sheet from those rows', [
     { operationId: 'read', resolvedTool: 'source_list_records' },

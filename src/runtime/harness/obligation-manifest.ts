@@ -44,7 +44,10 @@ import {
   type OperationEvidenceMode,
 } from '../graph/operation-evidence-contract.js';
 import { currentManifestOperationSemantics } from './current-manifest-operation-semantics.js';
-import { loadExpectedWorkContract } from './expected-work-contract.js';
+import {
+  loadExpectedWorkContract,
+  type ExpectedWorkOperationV1,
+} from './expected-work-contract.js';
 import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import {
   loadSealedNodeBinding,
@@ -155,6 +158,49 @@ function sha256(value: string): string {
 }
 
 /**
+ * Decide whether one operation's output is declared to contain current-source
+ * data. `dependsOn` is intentionally absent: it orders execution but does not
+ * say that dependency bytes are incorporated into the output.
+ *
+ * Missing legacy contracts keep the historical strict posture. A current
+ * contract is authoritative only for operation ids it actually contains.
+ */
+export function operationRequiresSourceDerivation(
+  operations: readonly ExpectedWorkOperationV1[] | null,
+  operationId: string,
+  legacyHasSourceRead: boolean,
+): boolean {
+  if (!operations) return legacyHasSourceRead;
+  const operation = operations.find((entry) => entry.id === operationId);
+  return operation ? operation.dataFrom.length > 0 : legacyHasSourceRead;
+}
+
+/** True only when `sourceOperationId` is in the target's transitive dataFrom
+ * lineage. A control-only dependsOn chain never qualifies. */
+export function expectedWorkDataLineageIncludes(
+  operations: readonly ExpectedWorkOperationV1[] | null,
+  sourceOperationId: string,
+  targetOperationId: string,
+): boolean {
+  if (!operations) return true;
+  const byId = new Map(operations.map((operation) => [operation.id, operation]));
+  const visited = new Set<string>();
+  const pending = [targetOperationId];
+  while (pending.length > 0) {
+    const operationId = pending.pop()!;
+    if (visited.has(operationId)) continue;
+    visited.add(operationId);
+    const operation = byId.get(operationId);
+    if (!operation) continue;
+    for (const dependencyId of operation.dataFrom) {
+      if (dependencyId === sourceOperationId) return true;
+      pending.push(dependencyId);
+    }
+  }
+  return false;
+}
+
+/**
  * The content address covers everything that changes what is owed: who accepted
  * the turn, which graph it refines, the manifest's own version and mode, its
  * readiness, and every resolved operation. Two manifests that differ in any of
@@ -207,7 +253,16 @@ export function compileObligationManifest(input: {
     errors.push(`frozen accepted-task resolution is ambiguous: ${frozen.reason}`);
   }
   const graphNodes = new Map(durableGraph.nodes.map((node) => [node.id, node]));
-  const hasSourceRead = ledgerFacts.some((operation) => refinedEffect(operation) === 'read');
+  // This remains the conservative fallback for legacy runs that predate an
+  // immutable expected-work contract.  A current contract carries the more
+  // precise distinction below: `dependsOn` is execution ordering, while
+  // `dataFrom` is content provenance.  Treating every earlier read as content
+  // provenance made a conditional "read cell; if empty, write this literal"
+  // owe a transform proof that cannot exist even after an exact write/readback.
+  const legacyHasSourceRead = ledgerFacts.some((operation) => refinedEffect(operation) === 'read');
+  const expectedOperations = expectedWork.status === 'ok'
+    ? expectedWork.contract.operations
+    : null;
   // The deterministic retrieve contract promised resolved-operation coverage:
   // one grounded retrieval, not an exhaustive set. Its read owes durable
   // observation, not source exhaustion — a proof many providers cannot even
@@ -288,6 +343,11 @@ export function compileObligationManifest(input: {
     const contentCommitMode = atomicInputContent
       ? 'documented_atomic_input' as const
       : undefined;
+    const hasSourceRead = operationRequiresSourceDerivation(
+      expectedOperations,
+      operation.operationId,
+      legacyHasSourceRead,
+    );
     const obligations = attachEvidenceObligations({
       effect: effectKind,
       reversibility: operation.reversibility,
@@ -328,25 +388,12 @@ export function compileObligationManifest(input: {
   // may not derive from a source whose collection is still incomplete.
   const edges: ObligationEdge[] = [];
   const readNodes = nodes.filter((node) => node.effectKind === 'read');
-  const expectedOperations = expectedWork.status === 'ok'
-    ? new Map(expectedWork.contract.operations.map((operation) => [operation.id, operation]))
-    : null;
   const isUpstreamRead = (sourceOperationId: string, writeOperationId: string): boolean => {
-    if (!expectedOperations) return true;
-    const visited = new Set<string>();
-    const pending = [writeOperationId];
-    while (pending.length > 0) {
-      const operationId = pending.pop()!;
-      if (visited.has(operationId)) continue;
-      visited.add(operationId);
-      const operation = expectedOperations.get(operationId);
-      if (!operation) continue;
-      for (const dependencyId of new Set([...operation.dependsOn, ...operation.dataFrom])) {
-        if (dependencyId === sourceOperationId) return true;
-        pending.push(dependencyId);
-      }
-    }
-    return false;
+    return expectedWorkDataLineageIncludes(
+      expectedOperations,
+      sourceOperationId,
+      writeOperationId,
+    );
   };
   for (const node of nodes) {
     const declared = new Set(node.obligations);
