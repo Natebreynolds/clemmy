@@ -185,7 +185,19 @@ const PlanOperationBindingSchema = z.object({
    * effect, dependency, coverage, and cardinality live only in topology. */
   role: PlanId,
   capabilityRef: PlanId,
-  evidence: z.array(PlanId).max(32),
+  /** Evidence KINDS this operation will produce — a CLOSED host vocabulary, not
+   * free description. The legal values are exactly: 'payload' (a read's bytes),
+   * 'tool_result', 'receipt' and 'readback' (an external write), and
+   * 'local_commit_receipt' (a local write). They are copied verbatim from the
+   * capability descriptor's evidenceKinds.
+   *
+   * The set was never disclosed anywhere, so a model with no prior turn to copy
+   * from could only guess — and every guess is prose, which fails the PlanId
+   * pattern. Live 2026-09-03/04: this was the single most repeated plan_task
+   * rejection of the day, including on a clean blank-state home. Naming the
+   * vocabulary here is disclosure, not a new constraint. */
+  evidence: z.array(PlanId).max(32)
+    .describe("Evidence kinds from the closed set: payload | tool_result | receipt | readback | local_commit_receipt. Copy from the capability's evidenceKinds; never prose."),
 }).strict();
 
 /** Compact model-authored delta. Accepted-source identity, relation, goal
@@ -229,7 +241,9 @@ export const FreshActionPlanDraftSchema = z.object({
   topology: ActionWorkTopologySchema,
   bindings: z.array(PlanOperationBindingSchema).min(1).max(32),
   deliverables: z.array(z.object({ id: PlanId, kind: PlanId }).strict()).max(32),
-  evidenceRequirements: z.array(PlanId).max(32),
+  /** Same closed vocabulary as a binding's `evidence` — see above. */
+  evidenceRequirements: z.array(PlanId).max(32)
+    .describe("Evidence kinds from the closed set: payload | tool_result | receipt | readback | local_commit_receipt. Never prose or human criteria."),
 }).strict().superRefine((draft, ctx) => {
   const bindingIds = draft.bindings.map((binding) => binding.operationId);
   if (new Set(bindingIds).size !== bindingIds.length) {
