@@ -11,8 +11,11 @@
  */
 import { ExternalWritePreDispatchError } from './external-write-admission.js';
 import { settleToolAttempt, type SettleToolAttemptInput } from './attempt-settlement.js';
-import { classifyRuntimeToolEffect } from './tool-effect.js';
-import { actionTopologyRoleForRuntimeCall } from './tool-effect.js';
+import {
+  actionTopologyRoleForRuntimeCall,
+  classifyRuntimeToolEffect,
+  unwrapRuntimeEffectiveToolIdentity,
+} from './tool-effect.js';
 
 export interface ResolvedCarrierTarget {
   sessionId: string;
@@ -38,16 +41,28 @@ export function settleResolvedCarrierRefusal(input: {
     || !resolved.logicalToolCallId
   ) return false;
 
-  const effect = classifyRuntimeToolEffect(resolved.targetName, resolved.targetArgs).effect;
+  // A carrier may have already refined the durable logical row to its exact
+  // semantic operation. Refusing/settling the transport spelling (for example
+  // `composio_execute_tool`) contradicts that row and poisons the accepted
+  // root. Project to the provider-neutral effective identity before writing
+  // any no-dispatch settlement; malformed carriers deliberately retain their
+  // raw identity and continue to fail closed.
+  const effective = unwrapRuntimeEffectiveToolIdentity(
+    resolved.targetName,
+    resolved.targetArgs,
+  );
+  const settledToolName = effective.toolName ?? resolved.targetName;
+  const settledArgs = effective.toolName ? effective.args : resolved.targetArgs;
+  const effect = classifyRuntimeToolEffect(settledToolName, settledArgs).effect;
   const refusedByThrow = input.refusal instanceof ExternalWritePreDispatchError;
   settleToolAttempt({
     sessionId: resolved.sessionId,
     sourceUserSeq: resolved.sourceUserSeq as number,
     turn: resolved.turn,
     lane: input.lane,
-    toolName: resolved.targetName,
+    toolName: settledToolName,
     callId: resolved.logicalToolCallId,
-    args: resolved.targetArgs,
+    args: settledArgs,
     mutating: effect === 'local_write' || effect === 'external_write' || effect === 'admin',
     // Match the rule the settling bracket uses for an ordinary call. The host
     // freezes mutating/businessCall before invoking, then ADOPTS the inner
@@ -57,7 +72,7 @@ export function settleResolvedCarrierRefusal(input: {
     // bracket outcome, so the bracket's discovery term is vacuously satisfied
     // and the role alone decides.
     businessCall: input.businessCall
-      ?? actionTopologyRoleForRuntimeCall(resolved.targetName, resolved.targetArgs) === 'business',
+      ?? actionTopologyRoleForRuntimeCall(settledToolName, settledArgs) === 'business',
     ...(refusedByThrow ? { thrown: input.refusal } : { result: input.refusal }),
     signals: {
       preDispatch: true,

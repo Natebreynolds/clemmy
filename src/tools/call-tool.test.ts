@@ -1965,6 +1965,76 @@ test('the same proof consumes identically on the Claude-lane surface shape (firs
   assert.match(JSON.stringify(resolved!.targetArgs), /OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW/);
 });
 
+test('a resolved carrier refusal settles the exact inner operation once with zero dispatch', async () => {
+  const previous = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = acceptedSourceForCallToolFixture(session.id);
+  const operationId = 'OUTLOOK_LIST_CALENDAR_CALENDAR_VIEW';
+  const operationArgs = { start_date_time: '2026-08-19T00:00:00Z' };
+  const restoreCatalog = installFixtureOperationContracts([
+    { operationId, effect: 'read' },
+  ]);
+  const { ExternalWritePreDispatchError } = await import('../runtime/harness/external-write-admission.js');
+  _setInnerDispatchToolsForTests(new Map([['composio_execute_tool', {
+    name: 'composio_execute_tool',
+    invoke: async () => {
+      throw new Error('the provider body must remain untouched');
+    },
+  }]]));
+  const wrapped = wrapToolForHarness(buildCallTool({
+    reachableBuiltinNames: new Set(['composio_execute_tool']),
+    aroundResolvedDispatch: async () => {
+      throw new ExternalWritePreDispatchError('fixture refusal before provider dispatch');
+    },
+  }) as never) as unknown as ToolLike;
+  const callId = 'resolved-carrier-refusal-inner-identity';
+
+  try {
+    const refusal = await withHarnessRunContext(
+      { sessionId: session.id, ...accepted, counter: new ToolCallsCounter(10) },
+      () => wrapped.invoke!(
+        { context: { sessionId: session.id } },
+        JSON.stringify({
+          name: 'composio_execute_tool',
+          args_json: JSON.stringify({
+            tool_slug: operationId,
+            arguments: JSON.stringify(operationArgs),
+          }),
+        }),
+        { toolCall: { callId } },
+      ) as Promise<unknown>,
+    );
+    assert.match(String(refusal), /fixture refusal before provider dispatch/);
+
+    const db = openEventLog();
+    assert.deepEqual(db.prepare(`
+      SELECT tool_name, state, outcome_kind
+        FROM logical_tool_calls
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(session.id, accepted.sourceUserSeq, callId), {
+      tool_name: operationId.toLowerCase(),
+      state: 'settled',
+      outcome_kind: 'policy_denial',
+    });
+    assert.deepEqual(db.prepare(`
+      SELECT execution_kind, outcome_kind, physical_crossing_count
+        FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+    `).get(session.id, accepted.sourceUserSeq, callId), {
+      execution_kind: 'refused_pre_dispatch',
+      outcome_kind: 'policy_denial',
+      physical_crossing_count: 0,
+    });
+  } finally {
+    restoreCatalog();
+    _setInnerDispatchToolsForTests(null);
+    if (previous === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = previous;
+  }
+});
+
 test('an exact bound source slug reaches the shared Composio carrier without generic capability proof', async () => {
   resetEventLog();
   const session = createSession({ kind: 'chat' });
