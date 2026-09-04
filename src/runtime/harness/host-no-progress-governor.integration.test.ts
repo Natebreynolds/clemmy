@@ -213,6 +213,45 @@ test('structural plan surfaces carry branch-specific one-call directives', () =>
   assert.match(plan, /Do not rediscover/);
 });
 
+test('provider-crossed invalid arguments expose one honest repair-or-alternative choice and remain bounded', () => {
+  const authority = { operation: [], account: [], target: [], evidence: [], effect: [] } as const;
+  const consequence = createNoProgressConsequence({
+    stage: 'execution:invalid_arguments',
+    recovery: 'repair_model',
+    effectState: 'known_terminal',
+    recoveryToolNames: ['work_call', 'tool_search'],
+  });
+  const initial = initializeNoProgressGovernor({
+    taskKey: 'provider-repair:directive-surface',
+    authority,
+  });
+  const first = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'provider_repair',
+    authority,
+    consequence,
+  });
+  assert.equal(first.action, 'continue');
+  assert.deepEqual(
+    recoverySurface(consequence, ['plan_task', 'tool_search', 'work_call', 'ask_user_question']),
+    ['tool_search', 'work_call'],
+    'the advertised recovery schemas are exactly the failed carrier plus one alternative search',
+  );
+  const directive = hostNoProgressRecoveryDirective(first.state);
+  assert.match(directive, /Choose exactly one next call/);
+  assert.match(directive, /call work_call once with corrected arguments/);
+  assert.match(directive, /OR call tool_search once for an alternative capability/);
+  assert.doesNotMatch(directive, /Do not repeat discovery/);
+
+  const repeated = observeNoProgress(first.state, {
+    taskKey: initial.taskKey,
+    attemptClass: 'provider_repair',
+    authority,
+    consequence,
+  });
+  assert.equal(repeated.action, 'terminalize', 'an unchanged provider rejection still cannot loop');
+});
+
 test('repeated discovery gets one control-only recovery and no third discovery crossing', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());

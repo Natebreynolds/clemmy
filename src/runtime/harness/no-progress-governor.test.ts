@@ -118,6 +118,51 @@ test('varying discovery, lookup, plan, and refusal classes cannot mint progress'
   assert.equal(lookup.action, 'terminalize');
 });
 
+test('provider repair is bounded, and alternative authority resets it without widening task work', () => {
+  const initial = initializeNoProgressGovernor({
+    taskKey: 'accepted:provider-invalid-arguments',
+    authority: EMPTY,
+  });
+  const consequence = createNoProgressConsequence({
+    stage: 'execution:invalid_arguments',
+    recovery: 'repair_model',
+    effectState: 'known_terminal',
+    recoveryToolNames: ['work_call', 'tool_search'],
+  });
+  const first = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'provider_repair',
+    authority: EMPTY,
+    consequence,
+  });
+  assert.equal(first.action, 'continue');
+  assert.equal(first.reason, 'retry_available');
+  assert.deepEqual(first.state.lastConsequence?.recoveryToolNames, ['tool_search', 'work_call']);
+
+  const repeated = observeNoProgress(first.state, {
+    taskKey: initial.taskKey,
+    attemptClass: 'provider_repair',
+    authority: EMPTY,
+    consequence,
+  });
+  assert.equal(repeated.action, 'terminalize', 'the same provider failure cannot loop');
+  assert.equal(repeated.blockedAttemptClass, 'provider_repair');
+  assert.equal(repeated.consequentialEffectState, 'known_terminal');
+
+  const discovered = observeNoProgress(first.state, {
+    taskKey: initial.taskKey,
+    attemptClass: 'authority_acquisition',
+    authority: snapshot({ operation: ['capability:alternative-read'] }),
+  });
+  assert.equal(discovered.action, 'continue');
+  assert.equal(discovered.reason, 'authority_progress');
+  assert.deepEqual(discovered.gained, ['operation']);
+  assert.equal(discovered.state.noProgressAttempts, 0);
+  assert.equal(discovered.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
+  assert.deepEqual(discovered.state.seenConsequenceKeys, []);
+  assert.equal(discovered.state.lastConsequence, null);
+});
+
 for (const kind of ['operation', 'account', 'target', 'evidence', 'effect'] as const) {
   test(`new exact ${kind} authority resets the retry budget`, () => {
     const initial = initializeNoProgressGovernor({

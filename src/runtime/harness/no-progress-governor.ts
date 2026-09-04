@@ -240,15 +240,19 @@ export type AuthorityProgressSnapshot = Readonly<
 >;
 
 /**
- * Only pre-effect attempts whose purpose is to find/admit missing work are
- * metered. Real task work is observed so its evidence can reset the budget,
- * but a long-running workflow is never stopped merely for having many steps.
+ * Only attempts that have not produced a consequential effect and now need
+ * bounded control/model recovery are metered. A provider repair may have
+ * crossed the transport boundary when the durable outcome proves pre-effect
+ * rejection. Real successful task work is observed so its evidence can reset
+ * the budget, but a long-running workflow is never stopped merely for having
+ * many steps.
  */
 export type NoProgressAttemptClass =
   | 'authority_acquisition'
   | 'dependency_lookup'
   | 'plan_admission'
   | 'zero_crossing_repair'
+  | 'provider_repair'
   | 'task_work'
   | 'terminal_projection';
 
@@ -379,6 +383,7 @@ const METERED_ATTEMPTS = new Set<NoProgressAttemptClass>([
   'dependency_lookup',
   'plan_admission',
   'zero_crossing_repair',
+  'provider_repair',
 ]);
 
 const ATTEMPT_CLASSES = new Set<NoProgressAttemptClass>([

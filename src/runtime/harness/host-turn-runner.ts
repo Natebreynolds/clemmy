@@ -654,6 +654,25 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
       'Do not call tool_search, plan_task, or another operation.',
     ].join(' ');
   }
+  if (
+    consequence.stage === 'execution:invalid_arguments'
+    && consequence.recoveryToolNames.length === 2
+    && consequence.recoveryToolNames.includes('tool_search')
+  ) {
+    const carrier = consequence.recoveryToolNames.find((name) => name !== 'tool_search');
+    if (carrier) {
+      // A provider-crossed invalid-argument result is different from a local
+      // schema refusal: the current carrier may still repair its arguments,
+      // while one bounded search may discover an alternative operation. The
+      // instruction must agree with the exact recovery surface or it creates
+      // a prose gate over an otherwise-admitted unlock.
+      return [
+        'BOUNDED AUTO RECOVERY — the last call reached its provider, which rejected the arguments before any consequential effect.',
+        `Choose exactly one next call: call ${carrier} once with corrected arguments for the same accepted requirement, OR call tool_search once for an alternative capability that can fulfill that same requirement.`,
+        'Do not call both, do not call planning, and do not ask the user to continue an internal repair.',
+      ].join(' ');
+    }
+  }
   return [
     `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
     'Use the exact result already present and make one corrective call from the restricted tool surface.',

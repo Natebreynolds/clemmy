@@ -841,6 +841,87 @@ test('projection storage failure is typed unavailable rather than silently empty
   incomplete.close();
 });
 
+test('one exact successful schema refresh unlocks work once instead of forcing a planning-only recovery', () => {
+  const identity = accepted('exact-schema-refresh-unlocks-work');
+  const baseline = projectHostNoProgressAuthority(identity);
+  assert.equal(baseline.status, 'ok');
+  if (baseline.status !== 'ok') return;
+  let state = initializeNoProgressGovernor({
+    taskKey: `${identity.sessionId}#${identity.sourceUserSeq}`,
+    authority: baseline.authority,
+  });
+
+  const appendExactRefresh = (callId: string) => {
+    appendEvent({
+      sessionId: identity.sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'discovery_governor_decision',
+      data: {
+        sourceUserSeq: identity.sourceUserSeq,
+        category: 'exact_schema_refresh',
+        callId,
+        subject: 'opaque_update',
+        decision: 'admitted',
+      },
+    });
+    appendEvent({
+      sessionId: identity.sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'capability_resolution',
+      data: {
+        sourceUserSeq: identity.sourceUserSeq,
+        authoritativeForTask: true,
+        entries: [{
+          identifier: 'OPAQUE_UPDATE',
+          accountIdentity: 'account-one',
+          effectClass: 'write',
+          status: 'proven',
+          connection: 'active',
+        }],
+      },
+    });
+    appendEvent({
+      sessionId: identity.sessionId,
+      turn: 1,
+      role: 'system',
+      type: 'discovery_governor_outcome',
+      data: {
+        sourceUserSeq: identity.sourceUserSeq,
+        category: 'exact_schema_refresh',
+        callId,
+        outcome: 'succeeded',
+      },
+    });
+  };
+
+  appendExactRefresh('exact-refresh-one');
+  const refreshed = projectHostNoProgressAuthority(identity);
+  assert.equal(refreshed.status, 'ok');
+  if (refreshed.status !== 'ok') return;
+  const first = observeNoProgress(state, {
+    taskKey: state.taskKey,
+    attemptClass: 'authority_acquisition',
+    authority: refreshed.authority,
+  });
+  assert.equal(first.reason, 'authority_progress');
+  assert.deepEqual(first.gained, ['operation']);
+  state = first.state;
+
+  appendExactRefresh('exact-refresh-repeat');
+  const repeated = projectHostNoProgressAuthority(identity);
+  assert.equal(repeated.status, 'ok');
+  if (repeated.status !== 'ok') return;
+  const second = observeNoProgress(state, {
+    taskKey: state.taskKey,
+    attemptClass: 'authority_acquisition',
+    authority: repeated.authority,
+  });
+  assert.equal(second.reason, 'retry_available');
+  assert.deepEqual(second.gained, []);
+});
+
 test('varied call ids and irrelevant capability refs cannot buy repeated retries', () => {
   const identity = accepted('varied-catalog-loop');
   const baseline = projectHostNoProgressAuthority(identity);
@@ -1290,7 +1371,7 @@ for (const [label, toolName] of [
   ['MCP', 'mcp__fixture__lookup'],
   ['external', 'composio__fixture__lookup'],
 ] as const) {
-  test(`${label} invalid arguments project the same bounded repair class`, () => {
+  test(`${label} zero-crossing invalid arguments project the same bounded schema repair`, () => {
     const identity = accepted(`cross-tool-${label}`);
     const db = settlementDb([{
       callId: 'invalid-call', outcomeKind: 'invalid_arguments', recoveryAction: 'repair_arguments',
@@ -1304,11 +1385,61 @@ for (const [label, toolName] of [
       assert.equal(projected.attemptClass, 'zero_crossing_repair');
       assert.equal(projected.consequence?.stage, 'schema_invalid');
       assert.equal(projected.consequence?.recovery, 'repair_model');
+      assert.equal(projected.consequence?.effectState, 'not_started');
       assert.deepEqual(projected.consequence?.recoveryToolNames, [toolName]);
     }
     db.close();
   });
 }
+
+test('provider-crossed invalid arguments expose bounded alternative authority, never schema repair', () => {
+  const identity = accepted('provider-crossed-invalid-arguments');
+  const db = settlementDb([
+    {
+      callId: 'provider-400',
+      executionKind: 'provider_execution',
+      outcomeKind: 'invalid_arguments',
+      recoveryAction: 'repair_arguments',
+      businessCall: 1,
+      physicalCrossingCount: 1,
+      outcomeDetail: 'http_400',
+    },
+    {
+      callId: 'provider-422',
+      executionKind: 'provider_execution',
+      outcomeKind: 'invalid_arguments',
+      recoveryAction: 'repair_arguments',
+      businessCall: 1,
+      physicalCrossingCount: 1,
+      outcomeDetail: 'http_422',
+    },
+  ], identity);
+  const project = (callId: string) => projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call(callId, 'work_call'), result(callId, 'work_call')],
+  }, db);
+  const http400 = project('provider-400');
+  const http422 = project('provider-422');
+  db.close();
+
+  for (const projected of [http400, http422]) {
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok') continue;
+    assert.equal(projected.attemptClass, 'provider_repair');
+    assert.equal(projected.consequence?.stage, 'execution:invalid_arguments');
+    assert.equal(projected.consequence?.recovery, 'repair_model');
+    assert.equal(projected.consequence?.effectState, 'known_terminal');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, ['tool_search', 'work_call']);
+    assert.equal(projected.consequence?.stage.startsWith('schema_invalid'), false);
+  }
+  if (http400.status === 'ok' && http422.status === 'ok') {
+    assert.equal(
+      http400.consequence?.key,
+      http422.consequence?.key,
+      'provider status/detail churn cannot mint another repair stage',
+    );
+  }
+});
 
 test('a retired capability gets one bounded current-source search, not a repeat carrier call', () => {
   const identity = accepted('retired-capability');
@@ -1357,6 +1488,76 @@ test('an ignored requirement repairs the same call instead of rediscovering its 
   db.close();
 });
 
+test('a zero-crossing policy refusal remains retryable on its refused carrier', () => {
+  const identity = accepted('zero-crossing-policy-refusal');
+  const db = settlementDb([{
+    callId: 'refused-call',
+    executionKind: 'refused_pre_dispatch',
+    outcomeKind: 'policy_denial',
+    recoveryAction: 'stop_and_explain',
+    businessCall: 1,
+    physicalCrossingCount: 0,
+    hostCrossingCount: 0,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      call('refused-call', 'opaque_refused_carrier'),
+      result('refused-call', 'opaque_refused_carrier'),
+    ],
+  }, db);
+  db.close();
+
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok') return;
+  assert.equal(projected.attemptClass, 'zero_crossing_repair');
+  assert.equal(projected.consequence?.stage, 'execution:policy_denial');
+  assert.equal(projected.consequence?.recovery, 'repair_model');
+  assert.equal(projected.consequence?.effectState, 'not_started');
+  assert.deepEqual(projected.consequence?.recoveryToolNames, ['opaque_refused_carrier']);
+});
+
+test('crossed and host-executed policy denials remain factual stops', () => {
+  const identity = accepted('genuine-policy-denials');
+  const db = settlementDb([
+    {
+      callId: 'provider-denial',
+      executionKind: 'provider_execution',
+      outcomeKind: 'policy_denial',
+      recoveryAction: 'stop_and_explain',
+      businessCall: 1,
+      physicalCrossingCount: 1,
+      hostCrossingCount: 0,
+    },
+    {
+      callId: 'host-policy-denial',
+      executionKind: 'local_execution',
+      outcomeKind: 'policy_denial',
+      recoveryAction: 'stop_and_explain',
+      businessCall: 1,
+      physicalCrossingCount: 0,
+      hostCrossingCount: 1,
+    },
+  ], identity);
+
+  for (const [callId, carrier] of [
+    ['provider-denial', 'opaque_provider_carrier'],
+    ['host-policy-denial', 'opaque_host_policy_carrier'],
+  ] as const) {
+    const projected = projectHostNoProgressAttempt({
+      ...identity,
+      historyDelta: [call(callId, carrier), result(callId, carrier)],
+    }, db);
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok') continue;
+    assert.equal(projected.consequence?.stage, 'execution:policy_denial');
+    assert.equal(projected.consequence?.recovery, 'stop_factual');
+    assert.equal(projected.consequence?.effectState, 'known_terminal');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, []);
+  }
+  db.close();
+});
+
 test('an unknown external crossing remains reconciliation-owned', () => {
   const identity = accepted('unknown-crossing');
   const db = settlementDb([{
@@ -1378,8 +1579,10 @@ test('an unknown external crossing remains reconciliation-owned', () => {
   }, db);
   assert.equal(projected.status, 'ok');
   if (projected.status === 'ok') {
+    assert.equal(projected.consequence?.stage, 'execution:effect_unknown');
     assert.equal(projected.consequence?.recovery, 'reconcile');
     assert.equal(projected.consequence?.effectState, 'unknown');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, []);
   }
   db.close();
 });

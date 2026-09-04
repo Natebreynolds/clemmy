@@ -150,10 +150,94 @@ const MAX_DISCLOSED_WRITE_REF_TOKENS = 8;
 /** Same bound, same reason, for reads. See the read-ref block below. */
 const MAX_DISCLOSED_READ_REF_TOKENS = 8;
 
+/**
+ * A successful exact-schema refresh is different from broad catalog walking:
+ * it re-proves the one operation/account the model is about to call. The live
+ * one-action lane used to throw that progress away because
+ * `capability_resolution` rows are (correctly) ignored when they are merely a
+ * bucket of alternatives. The no-progress reducer then replaced the business
+ * surface with planning-only tools immediately after the exact refresh that
+ * made the business call executable.
+ *
+ * Join three host-owned facts instead of trusting chronology or model text:
+ * an admitted exact_schema_refresh decision, its succeeded outcome, and one
+ * unambiguous proven resolution tuple whose identifier matches the decision
+ * subject. Repeating the same tuple is the same token, and the absolute cap
+ * keeps a model from manufacturing an unbounded walk through operation names.
+ */
+const MAX_EXACT_SCHEMA_REFRESH_TOKENS = 8;
+
+function exactSchemaRefreshAuthorityTokens(
+  events: readonly EventRow[],
+  tokens: Record<AuthorityProgressKind, Set<string>>,
+): void {
+  const succeededCallIds = new Set(events.flatMap((event) => (
+    event.type === 'discovery_governor_outcome'
+      && event.data.category === 'exact_schema_refresh'
+      && event.data.outcome === 'succeeded'
+      && nonEmptyString(event.data.callId)
+      ? [nonEmptyString(event.data.callId)!]
+      : []
+  )));
+  if (succeededCallIds.size === 0) return;
+
+  const resolutions = events.flatMap((event) => {
+    if (event.type !== 'capability_resolution' || event.data.authoritativeForTask !== true) return [];
+    const entries = Array.isArray(event.data.entries) ? event.data.entries : [];
+    return entries.flatMap((value) => {
+      const entry = record(value);
+      const identifier = nonEmptyString(entry?.identifier);
+      const account = nonEmptyString(entry?.accountIdentity);
+      const effect = nonEmptyString(entry?.effectClass);
+      return entry?.status === 'proven'
+        && entry?.connection !== 'missing'
+        && identifier
+        && account
+        && effect
+        ? [{ identifier, account, effect }]
+        : [];
+    });
+  });
+
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (seen.size >= MAX_EXACT_SCHEMA_REFRESH_TOKENS) break;
+    if (
+      event.type !== 'discovery_governor_decision'
+      || event.data.category !== 'exact_schema_refresh'
+      || event.data.decision !== 'admitted'
+    ) continue;
+    const callId = nonEmptyString(event.data.callId);
+    const subject = nonEmptyString(event.data.subject)?.toLowerCase();
+    if (!callId || !subject || !succeededCallIds.has(callId)) continue;
+    const matching = new Map<string, { identifier: string; account: string; effect: string }>();
+    for (const resolution of resolutions) {
+      if (resolution.identifier.toLowerCase() !== subject) continue;
+      const key = JSON.stringify([
+        resolution.identifier.toLowerCase(),
+        resolution.account,
+        resolution.effect,
+      ]);
+      matching.set(key, resolution);
+    }
+    if (matching.size !== 1) continue;
+    const exact = [...matching.values()][0]!;
+    const authority = token('operation', 'exact_schema_refresh', [
+      exact.identifier.toLowerCase(),
+      exact.account,
+      exact.effect,
+    ]);
+    if (seen.has(authority)) continue;
+    seen.add(authority);
+    tokens.operation.add(authority);
+  }
+}
+
 function eventCapabilityTokens(
   events: readonly EventRow[],
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
+  exactSchemaRefreshAuthorityTokens(events, tokens);
   const disclosedWriteRefs: string[] = [];
   const disclosedReadRefs: string[] = [];
   for (const event of events) {
@@ -870,6 +954,12 @@ function controlConsequence(input: {
   return null;
 }
 
+function isProviderCrossedInvalidArguments(settlement: NoProgressSettlementRow): boolean {
+  return settlement.outcome_kind === 'invalid_arguments'
+    && settlement.execution_kind === 'provider_execution'
+    && settlement.physical_crossing_count > 0;
+}
+
 function settlementConsequence(input: {
   call: HistoryCall;
   settlement: NoProgressSettlementRow;
@@ -897,6 +987,20 @@ function settlementConsequence(input: {
   const effectState = notStarted ? 'not_started' : 'known_terminal';
   switch (settlement.outcome_kind) {
     case 'invalid_arguments': {
+      // A provider-returned 400/422 is not a local schema refusal. The current
+      // carrier can still repair the request, but the crossed provider also
+      // proved this exact candidate/shape did not work. Expose one bounded
+      // alternative-authority search without interpreting provider names,
+      // response prose, or status text. The consequence key remains identical
+      // across 400/422 wording churn and therefore still stops a real loop.
+      if (isProviderCrossedInvalidArguments(settlement)) {
+        return createNoProgressConsequence({
+          stage: 'execution:invalid_arguments',
+          recovery: 'repair_model',
+          effectState: 'known_terminal',
+          recoveryToolNames: [call.name, 'tool_search'],
+        });
+      }
       // A host-authored repair key in the bounded outcome detail keys the
       // stage on the failing-path set; without one the stage is unchanged.
       const repairKey = /^validation:([a-f0-9]{16,64})$/.exec(settlement.outcome_detail ?? '')?.[1];
@@ -931,8 +1035,20 @@ function settlementConsequence(input: {
         effectState,
         recoveryToolNames: [call.name],
       });
-    case 'auth_failure':
     case 'policy_denial':
+      // A policy-shaped refusal with no provider or host crossing is the
+      // projector declining the prepared call, not a user/business terminal.
+      // Keep the frozen carrier available so repaired host metadata can retry
+      // it. Any crossed or host-executed denial remains a factual stop below;
+      // reconciliation has already taken precedence at the top of this
+      // reducer, so uncertain writes can never enter this retry lane.
+      return createNoProgressConsequence({
+        stage: `execution:${settlement.outcome_kind}`,
+        recovery: notStarted ? 'repair_model' : 'stop_factual',
+        effectState,
+        recoveryToolNames: notStarted ? [call.name] : [],
+      });
+    case 'auth_failure':
     case 'input_required':
     case 'unknown':
       return createNoProgressConsequence({
@@ -1023,11 +1139,13 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
 
     const failed = matchedSettlements.flatMap(({ call: matchedCall, settlement }) => {
       const consequence = settlementConsequence({ call: matchedCall, settlement });
-      return consequence ? [{ call: matchedCall, consequence }] : [];
+      return consequence ? [{ call: matchedCall, settlement, consequence }] : [];
     }).sort((left, right) => left.consequence.key.localeCompare(right.consequence.key))[0];
     if (failed) return {
       status: 'ok',
-      attemptClass: 'zero_crossing_repair',
+      attemptClass: isProviderCrossedInvalidArguments(failed.settlement)
+        ? 'provider_repair'
+        : 'zero_crossing_repair',
       consequence: failed.consequence,
     };
 
