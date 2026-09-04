@@ -2323,6 +2323,17 @@ test('classifyBackgroundTaskOutcome: exact-source in-progress is never reported 
   assert.match(outcome.reason ?? '', /exact accepted source|recovery/i);
 });
 
+test('classifyBackgroundTaskOutcome: typed blocked terminal is never reported done', () => {
+  const terminalText = 'The host ended this attempt at its typed terminal boundary.';
+  const outcome = classifyBackgroundTaskOutcome(
+    { runSessionId: 'sess-typed-blocked-terminal' },
+    terminalText,
+    'blocked',
+  );
+  assert.equal(outcome.outcome, 'blocked', 'typed terminal truth outranks neutral prose');
+  assert.equal(outcome.reason, terminalText);
+});
+
 test('classifyBackgroundTaskOutcome: the wall-clock error text alone (no stoppedReason) → blocked', () => {
   const outcome = classifyBackgroundTaskOutcome(
     { runSessionId: 'sess-p0c-text' },

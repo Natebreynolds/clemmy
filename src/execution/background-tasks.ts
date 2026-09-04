@@ -3420,6 +3420,14 @@ export function classifyBackgroundTaskOutcome(
       blockerType: 'unknown',
     };
   }
+  if (stoppedReason === 'blocked') {
+    const text = (finalText || '').trim();
+    return {
+      outcome: 'blocked',
+      reason: (text || 'The run ended with a typed blocked terminal.').slice(0, 400),
+      blockerType: classifyBlocker(text || 'typed blocked terminal'),
+    };
+  }
 
   // 3) Text heuristic: the agent's own final words say it's blocked.
   const text = (finalText || '').trim();

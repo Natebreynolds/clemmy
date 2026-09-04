@@ -89,3 +89,47 @@ test('Claude unverified terminal parks blocked without minting user-input or app
   assert.equal(run?.pendingApprovalId, undefined, 'no approval authority was minted from verification prose');
   assert.equal(run?.outputPreview, terminalText);
 });
+
+test('typed blocked terminal stays blocked through background settlement even with neutral prose', async () => {
+  const task = createBackgroundTask({
+    title: 'Inspect the current account state',
+    prompt: 'Inspect the current account state and report what you find.',
+    source: 'discord',
+    model: 'claude-sonnet-5',
+  });
+  const terminalText = 'The host ended this attempt at its typed terminal boundary.';
+
+  _setBackgroundResponseExecutorForTests(
+    async (_assistant, request: { sessionId: string }) => ({
+      text: terminalText,
+      sessionId: request.sessionId,
+      stoppedReason: 'blocked' as const,
+      raw: {
+        transport: 'claude_agent_sdk_brain',
+        model: 'claude-sonnet-5',
+      },
+    }),
+  );
+
+  const processed = await processBackgroundTasks({
+    getRuntime() { return {} as never; },
+    async respond(request: { sessionId: string }) {
+      return { text: 'unsafe legacy response', sessionId: request.sessionId };
+    },
+  } as never, 1);
+
+  assert.equal(processed, 1);
+  const blocked = getBackgroundTask(task.id);
+  assert.equal(blocked?.status, 'blocked', 'typed blocked work is never done or re-queued');
+  assert.equal(blocked?.error, terminalText);
+  assert.equal(blocked?.outcomeSnapshot?.blocker, terminalText);
+  assert.equal(blocked?.pendingQuestionId, undefined);
+  assert.equal(blocked?.pendingQuestion, undefined);
+  assert.equal(blocked?.pendingApprovalId, undefined);
+
+  const run = getRun(`run-${task.id}`);
+  assert.equal(run?.status, 'failed', 'the tracked run preserves the typed non-success');
+  assert.equal(run?.pendingInput, undefined);
+  assert.equal(run?.pendingApprovalId, undefined);
+  assert.equal(run?.outputPreview, terminalText);
+});
