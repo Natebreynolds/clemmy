@@ -685,9 +685,15 @@ function sourceWitness(
   contract: AcceptedTaskWorkContractV1,
   universe: ExpectedWorkUniverseV1,
   selectedIds: readonly string[],
-): { ok: true; kind: string; ref: string; digest: string } | { ok: false; reason: string } {
+):
+  | { ok: true; kind: string; ref: string; digest: string }
+  | { ok: false; reason: string; callTargetFallback: boolean } {
   if (universe.seal !== 'accepted_input') {
-    return { ok: false, reason: 'complete-source universes remain sealed until their host receipt is redeemable' };
+    return {
+      ok: false,
+      reason: 'complete-source universes remain sealed until their host receipt is redeemable',
+      callTargetFallback: false,
+    };
   }
   const row = db.prepare(`
     SELECT id, data_json FROM events
@@ -696,13 +702,15 @@ function sourceWitness(
     id: string;
     data_json: string;
   } | undefined;
-  if (!row) return { ok: false, reason: 'accepted user input witness is missing' };
+  if (!row) {
+    return { ok: false, reason: 'accepted user input witness is missing', callTargetFallback: false };
+  }
   let text = '';
   try {
     const parsed = JSON.parse(row.data_json) as { text?: unknown };
     text = typeof parsed.text === 'string' ? parsed.text : '';
   } catch {
-    return { ok: false, reason: 'accepted user input witness is unreadable' };
+    return { ok: false, reason: 'accepted user input witness is unreadable', callTargetFallback: false };
   }
   const detected = detectMultiItemIntent(text);
   const exactMembers = detected.exactMembers ? [...detected.exactMembers].sort() : null;
@@ -716,13 +724,25 @@ function sourceWitness(
   ) ? null : exactMembers;
   if (exactAcceptedMembers) {
     if (selectedIds.some((id) => !proposedMembers.includes(id))) {
-      return { ok: false, reason: 'selected members are outside the exact accepted-input universe' };
+      return {
+        ok: false,
+        reason: 'selected members are outside the exact accepted-input universe',
+        callTargetFallback: false,
+      };
     }
     return {
       ok: true,
       kind: 'accepted_user_input',
       ref: row.id,
       digest: expectedWorkDigest(canonicalExpectedWorkJson(exactAcceptedMembers)),
+    };
+  }
+
+  if (durableAcceptedLoopBound(contract) !== proposedMembers.length) {
+    return {
+      ok: false,
+      reason: 'the accepted count does not match this count-only work bound',
+      callTargetFallback: false,
     };
   }
 
@@ -777,7 +797,11 @@ function sourceWitness(
     });
     if (coverage.status !== 'proved') continue;
     if (selectedIds.some((id) => !proposedMembers.includes(id))) {
-      return { ok: false, reason: 'selected members are outside the settled result universe' };
+      return {
+        ok: false,
+        reason: 'selected members are outside the settled result universe',
+        callTargetFallback: false,
+      };
     }
     return {
       ok: true,
@@ -789,6 +813,7 @@ function sourceWitness(
   return {
     ok: false,
     reason: 'count-only accepted input has neither one exact settled result-member set nor a concrete call target',
+    callTargetFallback: true,
   };
 }
 
@@ -800,29 +825,19 @@ const HOST_DERIVED_CALL_TARGET_SELECTOR: ExpectedWorkUniverseSelectorV1 = {
   memberIdPointer: null,
 };
 
-const SMALL_COUNT_WORDS = [
-  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
-  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
-  'eighteen', 'nineteen', 'twenty',
-] as const;
-
-function countOnlyAcceptedSourceMatches(text: string, count: number): boolean {
-  const intent = detectMultiItemIntent(text);
-  if (
-    intent.isMultiItem
-    && !Array.isArray(intent.exactMembers)
-    && intent.itemCount === count
-  ) return true;
-  const countWord = SMALL_COUNT_WORDS[count];
-  if (!countWord || Array.isArray(intent.exactMembers)) return false;
-  // The shared detector intentionally recognizes only numeric cardinality.
-  // This narrow supplement recognizes the same "count + plural target" shape
-  // when the user wrote a small number as a word (the live request says
-  // "five suitable prospects" and "five ... drafts").
-  return new RegExp(
-    `\\b${countWord}\\s+(?:[a-z][\\w'-]+\\s+){0,3}(?:people|men|women|children|[a-z][a-z'-]*s)\\b`,
-    'i',
-  ).test(text);
+function durableAcceptedLoopBound(contract: AcceptedTaskWorkContractV1): number | null {
+  try {
+    const graph = turnGraphFromShadowEvent(getTurnGraphEventForSource(
+      contract.identity.sessionId,
+      contract.identity.sourceUserSeq,
+    ));
+    const count = graph?.classification.goalConstraints?.collection?.count;
+    return typeof count === 'number' && Number.isSafeInteger(count) && count > 0
+      ? count
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function callTargetWitness(input: {
@@ -840,17 +855,15 @@ function callTargetWitness(input: {
     id: string;
     data_json: string;
   } | undefined;
-  let sourceText = '';
   try {
-    const parsed = source ? JSON.parse(source.data_json) as { text?: unknown } : null;
-    sourceText = typeof parsed?.text === 'string' ? parsed.text : '';
+    if (source) JSON.parse(source.data_json);
   } catch {
     return { ok: false, reason: 'count-only accepted source is unreadable' };
   }
   if (
     !source
     || input.universe.seal !== 'accepted_input'
-    || !countOnlyAcceptedSourceMatches(sourceText, input.universe.members.length)
+    || durableAcceptedLoopBound(input.contract) !== input.universe.members.length
   ) {
     return { ok: false, reason: 'call-target membership does not match one count-only accepted request' };
   }
@@ -859,8 +872,8 @@ function callTargetWitness(input: {
       .map((target) => target.normalize('NFKC').trim())
       .filter(Boolean),
   )].sort();
-  if (targets.length === 0 || targets.length > 2_048) {
-    return { ok: false, reason: 'the per-item write has no bounded concrete target identity' };
+  if (targets.length !== 1) {
+    return { ok: false, reason: 'the per-item write must name exactly one concrete target identity' };
   }
   return {
     ok: true,
@@ -871,7 +884,6 @@ function callTargetWitness(input: {
     digest: expectedWorkDigest(canonicalExpectedWorkJson({
       acceptedSource: source.id,
       count: input.universe.members.length,
-      member: input.universeItemId,
       targets,
     })),
   };
@@ -1091,17 +1103,7 @@ function isCleanRedeemablePredecessorRead(
 }
 
 function goalDeclaresBoundedCollection(contract: AcceptedTaskWorkContractV1): boolean {
-  try {
-    const event = getTurnGraphEventForSource(
-      contract.identity.sessionId,
-      contract.identity.sourceUserSeq,
-    );
-    const count = turnGraphFromShadowEvent(event)
-      ?.classification.goalConstraints?.collection?.count;
-    return typeof count === 'number' && Number.isSafeInteger(count) && count > 0;
-  } catch {
-    return false;
-  }
+  return durableAcceptedLoopBound(contract) !== null;
 }
 
 function observedRequirementSettlements(
@@ -2891,7 +2893,7 @@ export function admitExpectedWorkInvocation(input: {
           const witness = sourceWitness(db, contract, universe, selected.ids);
           const grounded = witness.ok
             ? witness
-            : hostMayBindPerItemTarget
+            : hostMayBindPerItemTarget && witness.callTargetFallback
               ? callTargetWitness({
                   db,
                   contract,
@@ -2902,6 +2904,34 @@ export function admitExpectedWorkInvocation(input: {
                 })
               : witness;
           if (!grounded.ok) return refusedWithPlan('work_source_witness_missing', grounded.reason);
+          if (grounded.ref === input.logicalToolCallId) {
+            const duplicateTarget = db.prepare(`
+              SELECT universe_item_id
+                FROM expected_work_call_bindings
+               WHERE session_id = ? AND source_user_seq = ?
+                 AND contract_id = ? AND requirement_id = ?
+                 AND universe_id = ?
+                 AND input_source_kind = 'complete_source_receipt'
+                 AND input_source_ref = logical_tool_call_id
+                 AND input_source_digest = ?
+                 AND universe_item_id <> ?
+               LIMIT 1
+            `).get(
+              contract.identity.sessionId,
+              contract.identity.sourceUserSeq,
+              contract.contractId,
+              operation.id,
+              universe.id,
+              grounded.digest,
+              input.universeItemId as string,
+            ) as { universe_item_id: string } | undefined;
+            if (duplicateTarget) {
+              return refusedWithPlan(
+                'work_cardinality_mismatch',
+                `the concrete call target is already bound to count-only slot ${duplicateTarget.universe_item_id}`,
+              );
+            }
+          }
           inputSourceKind = grounded.kind;
           inputSourceRef = grounded.ref;
           inputSourceDigest = grounded.digest;

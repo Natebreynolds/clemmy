@@ -12,12 +12,14 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-work-denial-l
 
 const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
+const graphCompiler = await import('../graph/turn-graph-compiler.js');
 const identities = await import('./attempt-identity.js');
 const admission = await import('./expected-work-admission.js');
 const dispatch = await import('./dispatch-ledger.js');
 const outcomes = await import('./attempt-outcome.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const currentCapabilities = await import('./current-capability-manifest.fixture.js');
+const proactivity = await import('../../agents/proactivity-policy.js');
 
 const OPERATION = 'FIXTURE_UPDATE_RECORD';
 const READ_OPERATION = 'FIXTURE_LIST_RECORDS';
@@ -49,7 +51,7 @@ test.after(() => {
 
 let serial = 0;
 
-function acceptAction(label: string, text = ASK) {
+function acceptAction(label: string, text = ASK, acceptedLoopBound: number | null = null) {
   const id = ++serial;
   const session = eventlog.createSession({ id: `denial-latch-${label}-${id}`, kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -60,7 +62,25 @@ function acceptAction(label: string, text = ASK) {
     data: { text },
   });
   const task = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
-  assert.ok(shadow.recordTurnGraphShadow({ identity: task }), 'fixture graph persisted');
+  const graph = acceptedLoopBound === null
+    ? undefined
+    : graphCompiler.compileTurnGraph({
+        identity: task,
+        input: text,
+        sessionKind: 'chat',
+        surface: 'direct',
+        policy: graphCompiler.snapshotTurnGraphPolicy(proactivity.getProactivityPolicySnapshot()),
+        signals: {
+          multiItem: {
+            isMultiItem: true,
+            itemCount: acceptedLoopBound,
+            itemKind: 'prospects',
+            sameShapeWork: true,
+            explicitParallelRequest: false,
+          },
+        },
+      }).graph;
+  assert.ok(shadow.recordTurnGraphShadow({ identity: task, ...(graph ? { graph } : {}) }), 'fixture graph persisted');
   const activated = admission.activateActionExpectedWork(task);
   assert.ok(
     activated.status === 'activated' || activated.status === 'replayed',
@@ -87,7 +107,7 @@ function proposal() {
   };
 }
 
-function countOnlyProposal() {
+function countOnlyProposal(members: readonly string[] = COUNT_MEMBERS) {
   return {
     version: 1 as const,
     operations: [{
@@ -100,7 +120,7 @@ function countOnlyProposal() {
     universes: [{
       id: 'prospects',
       seal: 'accepted_input' as const,
-      members: COUNT_MEMBERS,
+      members: [...members],
     }],
   };
 }
@@ -125,7 +145,10 @@ function openCall(task: ReturnType<typeof acceptAction>, suffix: string): string
   return openExactCall(task, suffix, OPERATION, ARGS);
 }
 
-function settleSourceMembers(task: ReturnType<typeof acceptAction>): string {
+function settleSourceMembers(
+  task: ReturnType<typeof acceptAction>,
+  members: readonly string[] = COUNT_MEMBERS,
+): string {
   const args = { scope: 'prospects' };
   const logicalToolCallId = openExactCall(task, 'source-members', READ_OPERATION, args);
   const begun = dispatch.beginPhysicalDispatch({
@@ -153,7 +176,7 @@ function settleSourceMembers(task: ReturnType<typeof acceptAction>): string {
       payload: {
         successful: true,
         complete: true,
-        records: COUNT_MEMBERS.map((id) => ({ id, name: `Name ${id}` })),
+        records: members.map((id) => ({ id, name: `Name ${id}` })),
       },
     },
     outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
@@ -162,6 +185,17 @@ function settleSourceMembers(task: ReturnType<typeof acceptAction>): string {
   });
   assert.equal(settled.status, 'committed', JSON.stringify(settled));
   return logicalToolCallId;
+}
+
+function bindingCount(
+  task: ReturnType<typeof acceptAction>,
+  logicalToolCallId: string,
+): number {
+  return (eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS count
+      FROM expected_work_call_bindings
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(task.sessionId, task.sourceUserSeq, logicalToolCallId) as { count: number }).count;
 }
 
 function bind(input: {
@@ -238,7 +272,7 @@ test('zero-crossing pre-dispatch policy denial does not latch the requirement cl
 });
 
 test('count-only each write binds from a settled result handle without a model selector', () => {
-  const task = acceptAction('settled-members', COUNT_ASK);
+  const task = acceptAction('settled-members', COUNT_ASK, 5);
   const sourceCallId = settleSourceMembers(task);
   const args = { recipient_email: 'one@example.test', body: 'reversible draft' };
   const logicalToolCallId = openExactCall(task, 'draft-one', OPERATION, args);
@@ -247,7 +281,7 @@ test('count-only each write binds from a settled result handle without a model s
     sourceUserSeq: task.sourceUserSeq,
     logicalToolCallId,
     proposal: countOnlyProposal(),
-    requirementId: OPERATION,
+    requirementId: CAPABILITY_REQUIREMENT,
     universeItemId: COUNT_MEMBERS[0],
     universeSelector: null,
     tool: OPERATION,
@@ -269,7 +303,7 @@ test('count-only each write binds from a settled result handle without a model s
 });
 
 test('count-only each write can bind from its own concrete target without a result handle', () => {
-  const task = acceptAction('call-target', COUNT_ASK);
+  const task = acceptAction('call-target', COUNT_ASK, 5);
   const args = { recipient_email: 'one@example.test', body: 'reversible draft' };
   const logicalToolCallId = openExactCall(task, 'draft-one', OPERATION, args);
   const admitted = admission.admitExpectedWorkInvocation({
@@ -277,7 +311,7 @@ test('count-only each write can bind from its own concrete target without a resu
     sourceUserSeq: task.sourceUserSeq,
     logicalToolCallId,
     proposal: countOnlyProposal(),
-    requirementId: OPERATION,
+    requirementId: CAPABILITY_REQUIREMENT,
     universeItemId: COUNT_MEMBERS[0],
     universeSelector: null,
     tool: OPERATION,
@@ -296,4 +330,138 @@ test('count-only each write can bind from its own concrete target without a resu
     input_source_kind: 'complete_source_receipt',
     input_source_ref: logicalToolCallId,
   });
+});
+
+test('call-target fallback cannot change the accepted count', () => {
+  const task = acceptAction('count-mismatch', COUNT_ASK, 5);
+  const args = { recipient_email: 'one@example.test', body: 'reversible draft' };
+  const logicalToolCallId = openExactCall(task, 'draft-one', OPERATION, args);
+  const admitted = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId,
+    proposal: countOnlyProposal(COUNT_MEMBERS.slice(0, 4)),
+    requirementId: CAPABILITY_REQUIREMENT,
+    universeItemId: COUNT_MEMBERS[0],
+    universeSelector: null,
+    tool: OPERATION,
+    args,
+  });
+  assert.equal(admitted.status, 'refused', JSON.stringify(admitted));
+  if (admitted.status === 'refused') {
+    assert.equal(admitted.kind, 'work_source_witness_missing');
+    assert.match(admitted.reason, /accepted count does not match/i);
+  }
+  assert.equal(bindingCount(task, logicalToolCallId), 0);
+});
+
+test('settled result lineage cannot change the accepted count', () => {
+  const task = acceptAction('result-count-mismatch', COUNT_ASK, 5);
+  settleSourceMembers(task, COUNT_MEMBERS.slice(0, 4));
+  const args = { recipient_email: 'one@example.test', body: 'reversible draft' };
+  const logicalToolCallId = openExactCall(task, 'draft-one', OPERATION, args);
+  const admitted = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId,
+    proposal: countOnlyProposal(COUNT_MEMBERS.slice(0, 4)),
+    requirementId: CAPABILITY_REQUIREMENT,
+    universeItemId: COUNT_MEMBERS[0],
+    universeSelector: null,
+    tool: OPERATION,
+    args,
+  });
+  assert.equal(admitted.status, 'refused', JSON.stringify(admitted));
+  if (admitted.status === 'refused') {
+    assert.equal(admitted.kind, 'work_source_witness_missing');
+    assert.match(admitted.reason, /accepted count does not match/i);
+  }
+  assert.equal(bindingCount(task, logicalToolCallId), 0);
+});
+
+test('one concrete target cannot satisfy two count-only slots', () => {
+  const task = acceptAction('duplicate-target', COUNT_ASK, 5);
+  const args = { recipient_email: 'one@example.test', body: 'reversible draft' };
+  const firstCallId = openExactCall(task, 'draft-one', OPERATION, args);
+  const first = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: firstCallId,
+    proposal: countOnlyProposal(),
+    requirementId: CAPABILITY_REQUIREMENT,
+    universeItemId: COUNT_MEMBERS[0],
+    universeSelector: null,
+    tool: OPERATION,
+    args,
+  });
+  assert.equal(first.status, 'bound', JSON.stringify(first));
+
+  const secondCallId = openExactCall(task, 'draft-two', OPERATION, args);
+  const second = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId: secondCallId,
+    proposal: null,
+    requirementId: CAPABILITY_REQUIREMENT,
+    universeItemId: COUNT_MEMBERS[1],
+    universeSelector: null,
+    tool: OPERATION,
+    args,
+  });
+  assert.equal(second.status, 'refused', JSON.stringify(second));
+  if (second.status === 'refused') {
+    assert.equal(second.kind, 'work_cardinality_mismatch');
+    assert.match(second.reason, /already bound to count-only slot/i);
+  }
+  assert.equal(bindingCount(task, secondCallId), 0);
+});
+
+test('call-target fallback refuses a per-item write with no concrete target', () => {
+  const task = acceptAction('missing-target', COUNT_ASK, 5);
+  const args = { body: 'reversible draft' };
+  const logicalToolCallId = openExactCall(task, 'draft-one', OPERATION, args);
+  const admitted = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId,
+    proposal: countOnlyProposal(),
+    requirementId: CAPABILITY_REQUIREMENT,
+    universeItemId: COUNT_MEMBERS[0],
+    universeSelector: null,
+    tool: OPERATION,
+    args,
+  });
+  assert.equal(admitted.status, 'refused', JSON.stringify(admitted));
+  if (admitted.status === 'refused') {
+    assert.equal(admitted.kind, 'work_source_witness_missing');
+    assert.match(admitted.reason, /exactly one concrete target/i);
+  }
+  assert.equal(bindingCount(task, logicalToolCallId), 0);
+});
+
+test('call-target fallback refuses more than one concrete target', () => {
+  const task = acceptAction('multiple-targets', COUNT_ASK, 5);
+  const args = {
+    recipient_email: 'one@example.test',
+    record_id: 'record-one',
+    body: 'reversible draft',
+  };
+  const logicalToolCallId = openExactCall(task, 'draft-one', OPERATION, args);
+  const admitted = admission.admitExpectedWorkInvocation({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    logicalToolCallId,
+    proposal: countOnlyProposal(),
+    requirementId: CAPABILITY_REQUIREMENT,
+    universeItemId: COUNT_MEMBERS[0],
+    universeSelector: null,
+    tool: OPERATION,
+    args,
+  });
+  assert.equal(admitted.status, 'refused', JSON.stringify(admitted));
+  if (admitted.status === 'refused') {
+    assert.equal(admitted.kind, 'work_source_witness_missing');
+    assert.match(admitted.reason, /exactly one concrete target/i);
+  }
+  assert.equal(bindingCount(task, logicalToolCallId), 0);
 });
