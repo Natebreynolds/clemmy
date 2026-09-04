@@ -992,11 +992,31 @@ function validateProposedWork(
         const produced = predecessor.producedOutputKinds ?? [];
         const accepted = successor.acceptedInputKinds ?? [];
         if (!produced.some((kind) => accepted.includes(kind))) {
+          // Name BOTH sides. Both arrays are host-declared descriptor metadata
+          // sitting in scope here, and the old message ("predecessor produced
+          // kinds do not satisfy successor accepted kinds") disclosed neither —
+          // so the model had to guess which kinds exist on either end of an
+          // edge it cannot see. Live 2026-09-04 (Sonnet, blank state): this
+          // exact issue was returned three times in a row on
+          // op_dataforseo.dependsOn and op_draft_email.dependsOn, the model
+          // re-proposed an identical plan each time, and the turn ended with no
+          // business call. Naming the two lists is what makes the edge
+          // repairable — either cite a successor that accepts a produced kind,
+          // or drop a dependency the successor does not actually consume.
+          //
+          // Value-opaque: these are HOST-declared kinds from descriptors the
+          // host itself disclosed, never model text, so naming them grants no
+          // authority the source did not already have.
+          const nameKinds = (kinds: readonly string[]): string => (
+            kinds.length === 0
+              ? 'none'
+              : kinds.slice(0, 8).map((kind) => String(kind).slice(0, 64)).join('|')
+          );
           issue(
             issues,
             'dag_kind_mismatch',
             `work.operations.${operation.id}.dependsOn`,
-            'predecessor produced kinds do not satisfy successor accepted kinds',
+            `predecessor produces [${nameKinds(produced)}] but successor accepts [${nameKinds(accepted)}]`,
             { operationId: predecessorOp?.id ?? operation.id, capabilityRef: predecessorOp?.capabilityRef },
           );
         }

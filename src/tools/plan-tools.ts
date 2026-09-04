@@ -1154,6 +1154,38 @@ function undisclosedRefRepairInstruction(
       : 'Run tool_search once for that role, then call plan_task with only the exact capabilityRef it returns.');
 }
 
+/**
+ * The kind-flow repair. A dag_kind_mismatch is NOT a "pick a different
+ * capability with the matching effect" problem, which is what the generic
+ * instruction told the model — effect and kind are different axes, so that
+ * advice cannot close the gap. The edge is unsatisfiable because the
+ * predecessor's producedOutputKinds and the successor's acceptedInputKinds do
+ * not intersect, and there are exactly two ways out: change one endpoint, or
+ * drop the edge.
+ *
+ * Live 2026-09-04 (Sonnet, blank state): three consecutive identical
+ * dag_kind_mismatch refusals on op_dataforseo.dependsOn / op_draft_email
+ * .dependsOn, an identical re-proposal each time, and the turn ended with zero
+ * business calls. The refusal now names both kind lists (see
+ * turn-semantic-proposal), so this instruction can point at them.
+ */
+function dagKindMismatchRepairInstruction(reason: string): string | null {
+  if (!reason.includes('dag_kind_mismatch')) return null;
+  const edges = [...reason.matchAll(/dag_kind_mismatch:([^\s(]+)\s*\(([^)]*)\)/g)]
+    .slice(0, 4)
+    .map((match) => `${match[1]} — ${match[2]}`);
+  const named = edges.length > 0 ? ` Offending edge(s): ${edges.join('; ')}.` : '';
+  return 'A dependsOn edge cannot carry data: the predecessor\'s produced kinds and the '
+    + 'successor\'s accepted kinds do not overlap. This is a KIND problem, not an effect '
+    + 'problem, so substituting a capability with the same effect will not fix it.'
+    + named
+    + ' Do exactly one of: (a) cite a successor operation whose acceptedInputKinds include '
+    + 'one of the kinds the predecessor actually produces, (b) cite a different predecessor '
+    + 'that produces a kind the successor accepts, or (c) remove that dependsOn edge if the '
+    + 'successor does not really consume the predecessor\'s output — an operation with no '
+    + 'real data dependency should not declare one. Then call plan_task again.';
+}
+
 function verifierRecoveryTool(reason: string): 'plan_task' | 'tool_search' | null {
   if (!reason.startsWith('verification_successor_required:')) return null;
   return reason.includes(':ambiguous_compatible_verifier:') ? 'plan_task' : 'tool_search';
@@ -1521,6 +1553,7 @@ async function executePlanTask(
         ? 'State factually that the current policy does not admit the requested effect. Do not retry planning or discovery.'
         : (verifierRepairInstruction(planned.reason)
           ?? undisclosedRefRepairInstruction(planned.reason, admissibleCapabilities.length)
+          ?? dagKindMismatchRepairInstruction(planned.reason)
           ?? (admissibleCapabilities.length > 0
             ? 'Correct the semantic proposal using only a capabilityRef from admissibleCapabilities with the matching effect, then call plan_task again. It may stand alone or be followed in the same frame by exactly one proposal-free dependency-root read/compute work_call.'
             : 'No citable capability is currently available. Use tool_search once for the missing role, then call plan_task with only the exact capabilityRef it returns.'))
