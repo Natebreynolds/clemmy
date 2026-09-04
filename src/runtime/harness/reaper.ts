@@ -39,6 +39,7 @@ import { reapSettledAuthorityPayloads } from './dispatch-ledger.js';
 import { openEventLog } from './eventlog.js';
 import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
 import {
+  reconcileHostExternalWriteProjections,
   reconcileRevokedHostToolInvocations,
   type HostToolInvocationRecoverySweep,
 } from './host-tool-invocation.js';
@@ -370,6 +371,25 @@ export function stopApprovalReaper(): void {
 export function reapOnce(options: { nowMs?: number } = {}): approvalRegistry.PendingApprovalRow[] {
   const sweepNowMs = options.nowMs ?? Date.now();
   runBoundedRecoverySweep(sweepNowMs);
+  // Projection-only crash convergence for closed direct-host provider writes.
+  // This runs after revoked-call recovery so a reservation which crashed
+  // before physical admission can first acquire its truthful logical
+  // settlement. It never invokes a provider body and is idempotent by the
+  // reservation/terminal projection CAS.
+  try {
+    const projection = reconcileHostExternalWriteProjections({ limit: 100 });
+    if (projection.projected > 0) {
+      logger.info(
+        { projected: projection.projected, scanned: projection.scanned },
+        'host-owned external-write projections converged without redispatch',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err },
+      'host-owned external-write projection recovery failed',
+    );
+  }
   // B7a: accepted-input liveness. A session that accepted user input and never
   // started a turn (the sess-branch-1d43… silent no-reply) gets its durable
   // terminal here, surfaced as a notification — not just a ledger row.

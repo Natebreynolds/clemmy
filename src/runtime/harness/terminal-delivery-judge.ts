@@ -212,6 +212,8 @@ function auditFactsForPrompt(audit: AcceptedSourceSettlementAudit): string {
     successfulSdkAuthoringResults: facts.successfulSdkAuthoringResults,
     unrecoveredBusinessFailures: facts.unrecoveredBusinessFailures,
     confirmedWrites: facts.confirmedWrites,
+    requiredHostExternalWriteProjections: facts.requiredHostExternalWriteProjections,
+    missingHostExternalWriteProjections: facts.missingHostExternalWriteProjections,
     uncertainWrites: facts.uncertainWrites,
     blockingUncertainWrites: facts.blockingUncertainWrites,
   });

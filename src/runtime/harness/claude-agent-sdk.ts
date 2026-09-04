@@ -959,6 +959,8 @@ function appendSdkTopLevelToolEvent(
         effect: metadata.effect,
         ...(metadata.effectiveTool ? { effectiveTool: metadata.effectiveTool } : {}),
         ...(metadata.toolSlug ? { toolSlug: metadata.toolSlug } : {}),
+        ...(metadata.reversibility ? { reversibility: metadata.reversibility } : {}),
+        ...(metadata.recoverySemantics ? { recoverySemantics: metadata.recoverySemantics } : {}),
         ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
         ...(type === 'tool_returned' ? {
           ok: !result?.isError,

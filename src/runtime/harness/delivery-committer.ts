@@ -412,6 +412,7 @@ function deliveryMustHoldWhenJudgeUnavailable(audit: AcceptedSourceSettlementAud
   return deliveryMustHoldForHuman(audit)
     || audit.status === 'in_flight'
     || audit.status === 'storage_error'
+    || audit.status === 'write_projection_missing'
     // A source where NOTHING worked has no answer to qualify. Disclosure only
     // makes sense alongside real work: attaching a caveat to a reply whose every
     // business call failed would publish a bare claim with a footnote, which is

@@ -29,6 +29,9 @@ const settlements = await import('./logical-call-settlement-store.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const { recordSemanticParticipation } = await import('../semantic-boundary/semantic-disposition.js');
 const { resolveWriteEvidence } = await import('./work-report.js');
+const manifests = await import('./capability-manifest.js');
+const catalogs = await import('./host-capability-catalog-factory.js');
+const toolEffects = await import('./tool-effect.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -94,6 +97,359 @@ test('an exact later reconciliation clears the prior accepted source write reser
   );
   assert.equal(audit.facts.confirmedWrites, 1);
   assert.equal(audit.facts.uncertainWrites, 0);
+});
+
+test('a later source reusing an SDK call id cannot inject its orphan into an earlier confirmed source', () => {
+  const sessionId = 'workflow:cross-source-reused-call-id:update';
+  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const sourceA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the first record.' },
+  });
+  const sourceB = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update a second record.' },
+  });
+  const acceptedTaskA = `task:${sessionId}#${sourceA.seq}`;
+  const acceptedTaskB = `task:${sessionId}#${sourceB.seq}`;
+  // A's provider callback lands after B was already accepted. Exact source
+  // attribution, not chronological window, keeps it owned by A.
+  const reservationA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      acceptedTaskId: acceptedTaskA,
+      shapeKey: 'UPDATE_RECORD',
+      preDispatch: true,
+      canonicalCallId: 'sdk-reused-call-id',
+      targets: ['record:first'],
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: reservationA.id,
+    data: {
+      sourceUserSeq: sourceA.seq,
+      acceptedTaskId: acceptedTaskA,
+      shapeKey: 'UPDATE_RECORD',
+      canonicalCallId: 'sdk-reused-call-id',
+      targets: ['record:first'],
+    },
+  });
+  const reservationB = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceB.seq,
+      acceptedTaskId: acceptedTaskB,
+      shapeKey: 'UPDATE_RECORD',
+      preDispatch: true,
+      canonicalCallId: 'sdk-reused-call-id',
+      targets: ['record:second'],
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_orphaned',
+    parentEventId: reservationB.id,
+    data: {
+      sourceUserSeq: sourceB.seq,
+      acceptedTaskId: acceptedTaskB,
+      shapeKey: 'UPDATE_RECORD',
+      canonicalCallId: 'sdk-reused-call-id',
+      targets: ['record:second'],
+    },
+  });
+
+  const auditA = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: sourceA.seq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(auditA.status, 'clean', JSON.stringify(auditA));
+  assert.equal(auditA.facts.confirmedWrites, 1);
+  assert.equal(auditA.facts.uncertainWrites, 0);
+});
+
+test('a source-sequence-only shared-wrapper receipt remains owned by source A after source B arrives', () => {
+  const sessionId = 'workflow:cross-source-legacy-wrapper:update';
+  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const sourceA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the first record.' },
+  });
+  const sourceB = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'A newer request arrived while the first provider call ran.' },
+  });
+  // Compatibility with the first shared-wrapper projection release: it
+  // stamped the exact source sequence but not yet the canonical task id.
+  const reservationA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      shapeKey: 'UPDATE_RECORD',
+      preDispatch: true,
+      canonicalCallId: 'legacy-wrapper-call-id',
+      targets: ['record:first'],
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: reservationA.id,
+    data: {
+      sourceUserSeq: sourceA.seq,
+      shapeKey: 'UPDATE_RECORD',
+      canonicalCallId: 'legacy-wrapper-call-id',
+      targets: ['record:first'],
+    },
+  });
+  // Even with the same source sequence, a conflicting present task id is not
+  // compatible and cannot inject a terminal into A's write ledger.
+  const conflicting = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      acceptedTaskId: 'task:conflicting-owner#999',
+      shapeKey: 'UPDATE_RECORD',
+      preDispatch: true,
+      canonicalCallId: 'legacy-wrapper-call-id',
+      targets: ['record:other'],
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'system',
+    type: 'external_write_orphaned',
+    parentEventId: conflicting.id,
+    data: {
+      sourceUserSeq: sourceA.seq,
+      acceptedTaskId: 'task:conflicting-owner#999',
+      shapeKey: 'UPDATE_RECORD',
+      canonicalCallId: 'legacy-wrapper-call-id',
+      targets: ['record:other'],
+    },
+  });
+
+  const auditA = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: sourceA.seq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(auditA.status, 'clean', JSON.stringify(auditA));
+  assert.equal(auditA.facts.confirmedWrites, 1);
+  assert.equal(auditA.facts.uncertainWrites, 0);
+
+  const auditB = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: sourceB.seq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(auditB.status, 'no_business_evidence', JSON.stringify(auditB));
+  assert.equal(auditB.facts.confirmedWrites, 0, 'source B cannot borrow source A\'s late receipt');
+  assert.equal(auditB.facts.uncertainWrites, 0);
+});
+
+test('source B cannot borrow an unattributed late terminal whose parent reservation predates B', () => {
+  const sessionId = 'workflow:cross-source-parent-before-b:update';
+  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const sourceA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the first record.' },
+  });
+  const reservationA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      acceptedTaskId: `task:${sessionId}#${sourceA.seq}`,
+      shapeKey: 'UPDATE_RECORD',
+      preDispatch: true,
+      canonicalCallId: 'parent-before-b-call',
+      targets: ['record:first'],
+    },
+  });
+  const sourceB = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'A second request arrives.' },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: reservationA.id,
+    data: {
+      shapeKey: 'UPDATE_RECORD',
+      canonicalCallId: 'parent-before-b-call',
+      targets: ['record:first'],
+    },
+  });
+
+  const auditB = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: sourceB.seq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(auditB.status, 'no_business_evidence', JSON.stringify(auditB));
+  assert.equal(auditB.facts.confirmedWrites, 0);
+  assert.equal(auditB.facts.uncertainWrites, 0);
+});
+
+test('late source-A tool accounting cannot repair source B through a reused logical call id', () => {
+  const sessionId = 'workflow:cross-source-reused-accounting:update';
+  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const sourceA = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the first record.' },
+  });
+  const sourceB = eventlog.appendEvent({
+    sessionId,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the second record.' },
+  });
+  recordSemanticParticipation(sessionId, sourceB.seq, 'participated');
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId, turn: sourceB.turn, sourceUserSeq: sourceB.seq },
+  }));
+  const acceptedTaskA = identities.acceptedTaskIdFor(sessionId, sourceA.seq);
+  const acceptedTaskB = identities.acceptedTaskIdFor(sessionId, sourceB.seq);
+  const reusedCallId = 'logical:reused-across-sources';
+  const repairedCallId = 'logical:b-corrected-write';
+  const tool = 'mcp__fixture__update_record';
+  const failedArgs = { record_id: 'record-2', fields: { value: 'bad' } };
+  const repairedArgs = { record_id: 'record-2', fields: { value: 'good' } };
+
+  // A's late callback is chronologically inside B's window and reuses B's
+  // logical id. It must not supply B with reversible shape/target authority.
+  eventlog.appendEvent({
+    sessionId,
+    turn: sourceA.turn,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: sourceA.seq,
+      acceptedTaskId: acceptedTaskA,
+      tool,
+      callId: reusedCallId,
+      canonicalCallId: reusedCallId,
+      accounting: 'top_level',
+      effect: 'external_write',
+      reversibility: 'reversible',
+      arguments: JSON.stringify(failedArgs),
+    },
+  });
+  eventlog.appendEvent({
+    sessionId,
+    turn: sourceB.turn,
+    role: 'tool',
+    type: 'tool_called',
+    data: {
+      sourceUserSeq: sourceB.seq,
+      acceptedTaskId: acceptedTaskB,
+      tool,
+      callId: repairedCallId,
+      canonicalCallId: repairedCallId,
+      accounting: 'top_level',
+      effect: 'external_write',
+      reversibility: 'reversible',
+      arguments: JSON.stringify(repairedArgs),
+    },
+  });
+
+  const settleB = (callId: string, args: unknown, ok: boolean): void => {
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: {
+        sessionId,
+        sourceUserSeq: sourceB.seq,
+        turn: sourceB.turn,
+        acceptedTaskId: acceptedTaskB,
+        logicalToolCallId: callId,
+        physicalDispatchId: `dispatch:${callId}`,
+        ordinal: 0,
+      },
+      tool,
+      args,
+    });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    assert.equal(dispatch.settlePhysicalDispatch({
+      identity: begun.identity,
+      tool,
+      outcome: 'returned',
+    }).status, 'inserted');
+    assert.equal(settlements.commitLogicalCallSettlement({
+      identity: {
+        sessionId,
+        sourceUserSeq: sourceB.seq,
+        turn: sourceB.turn,
+        acceptedTaskId: acceptedTaskB,
+        logicalToolCallId: callId,
+      },
+      contract: { toolName: tool, args },
+      execution: { kind: 'provider_execution' },
+      ...(ok ? { result: { payload: { successful: true, data: { updated: true } } } } : {}),
+      outcome: ok
+        ? outcomes.classifyAttemptOutcome({ envelopeSuccessful: true })
+        : outcomes.classifyAttemptOutcome({ executionFailed: true }),
+      recovery: { businessCall: true, mutating: true },
+      observer: { lane: 'agents_runner', turn: sourceB.turn },
+    }).status, 'committed');
+  };
+  settleB(reusedCallId, failedArgs, false);
+  settleB(repairedCallId, repairedArgs, true);
+
+  const auditB = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: sourceB.seq,
+  });
+  assert.equal(auditB.status, 'unrecovered_failure', JSON.stringify(auditB));
+  assert.equal(auditB.facts.unrecoveredBusinessFailures, 1);
 });
 
 test('a later accepted source with no business evidence cannot erase an older ordinary failure', () => {
@@ -550,6 +906,206 @@ test('an EARLIER success does not recover a write rejected after it', () => {
     'unrecovered_failure',
     `chronology must never pass for recovery: ${JSON.stringify(audit)}`,
   );
+});
+
+test('host-v1 durable exact-artifact semantics let a corrected provider call recover without legacy write events', () => {
+  // Host-v1 dispatches providers directly; it does not traverse the legacy
+  // brackets.ts external_write reservation emitter. The live Platform 49 run
+  // therefore completed a corrected Sheets update but terminal publication
+  // could not prove that it repaired the provider-confirmed HTTP 400. The live
+  // manifest intentionally has no general reversibility declaration: its
+  // positive authority is exact-artifact reconciliation + required
+  // idempotency on one current, trusted Composio callable.
+  const sessionId = 'workflow:host-v1-repaired-write:main';
+  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  const source = eventlog.appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Update the tracker.' },
+  });
+  recordSemanticParticipation(sessionId, source.seq, 'participated');
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq },
+  }));
+  const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
+  const spreadsheetId = 'sheet-host-v1';
+
+  const manifest = manifests.attachSemanticContract({
+    version: 1,
+    manifestId: 'cap:live-shaped-batch-update',
+    providerKind: 'composio',
+    operationId: 'GOOGLESHEETS_BATCH_UPDATE',
+    providerIdentity: 'composio',
+    providerVersion: 'provider-live-shape-v1',
+    operationVersion: 'operation-live-shape-v1',
+    definitionFingerprint: '1'.repeat(64),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: '2'.repeat(64),
+      providerOutputSchemaObserved: true,
+      providerOutputSchemaDigest: '3'.repeat(64),
+      semanticName: 'GOOGLESHEETS_BATCH_UPDATE',
+      behaviorHints: {
+        readOnly: false,
+        destructive: null,
+        idempotent: null,
+        openWorld: null,
+      },
+    },
+    effect: 'external_write',
+    destination: { family: 'spreadsheet', posture: 'named_existing' },
+    accountId: 'account:composio:live-shaped',
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: true, policy: 'exact_artifact' },
+    outputContract: { kind: 'created_resource' },
+    purpose: 'persist_collection',
+    acceptedInputKinds: ['records'],
+    producedOutputKinds: ['created_resource'],
+    applicableDeliverableKinds: ['spreadsheet'],
+    evidenceContract: { kinds: ['receipt', 'readback'], readbackRequired: true },
+    provenance: {
+      issuer: 'host:resolution-proof',
+      issuedAt: '1970-01-01T00:00:00.000Z',
+      trusted: true,
+    },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['destination'],
+    argumentCompiler: { id: 'compile:proof-schema:v1', version: '1' },
+    invokePortId: 'port:live-shaped-batch-update',
+    reconcilePortId: 'reconcile:port:live-shaped-batch-update',
+  });
+  const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory([{
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    destination: manifest.destination,
+    account: manifest.accountId,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    providerInputSchemaDigest: manifest.externalDefinition?.providerInputSchemaDigest,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    reconcile: async () => ({ exists: true }),
+    invoke: async () => ({ successful: true }),
+  }]));
+
+  const settleHostUpdate = (input: {
+    callId: string;
+    firstCellLocation: string;
+    ok: boolean;
+  }) => {
+    const providerArgs = {
+      spreadsheet_id: spreadsheetId,
+      sheet_name: 'Daily Digest',
+      first_cell_location: input.firstCellLocation,
+      value_input_option: 'RAW',
+      values: [['23:59']],
+    };
+    const carrierArgs = {
+      tool_slug: 'GOOGLESHEETS_BATCH_UPDATE',
+      arguments: JSON.stringify(providerArgs),
+      connected_account_id: null,
+    };
+    const accounting = toolEffects.runtimeToolAccountingMetadata(
+      'composio_execute_tool',
+      carrierArgs,
+    );
+    assert.equal(accounting.reversibility, undefined);
+    assert.equal(
+      accounting.recoverySemantics?.basis,
+      'exact_artifact_reconciliation',
+      'fixture precondition: the live-shaped current manifest minted positive repair authority',
+    );
+    eventlog.appendEvent({
+      sessionId,
+      turn: source.turn,
+      role: 'Clem',
+      type: 'tool_called',
+      data: {
+        sourceUserSeq: source.seq,
+        tool: 'composio_execute_tool',
+        callId: input.callId,
+        canonicalCallId: input.callId,
+        accounting: 'top_level',
+        ...accounting,
+        arguments: JSON.stringify(carrierArgs),
+      },
+    });
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: {
+        sessionId,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        acceptedTaskId,
+        logicalToolCallId: input.callId,
+        physicalDispatchId: `dispatch:${input.callId}`,
+        ordinal: 0,
+      },
+      tool: 'googlesheets_batch_update',
+      args: providerArgs,
+    });
+    assert.equal(begun.status, 'inserted');
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    assert.equal(dispatch.settlePhysicalDispatch({
+      identity: begun.identity,
+      tool: 'googlesheets_batch_update',
+      outcome: 'returned',
+    }).status, 'inserted');
+    const committed = settlements.commitLogicalCallSettlement({
+      identity: {
+        sessionId,
+        sourceUserSeq: source.seq,
+        turn: source.turn,
+        acceptedTaskId,
+        logicalToolCallId: input.callId,
+      },
+      contract: { toolName: 'googlesheets_batch_update', args: providerArgs },
+      execution: { kind: 'provider_execution' },
+      ...(input.ok
+        ? { result: { payload: { successful: true, data: { updated: true } } } }
+        : {}),
+      outcome: input.ok
+        ? outcomes.classifyAttemptOutcome({ envelopeSuccessful: true })
+        : outcomes.classifyAttemptOutcome({ httpStatus: 400, mutating: true, acknowledged: false }),
+      recovery: { businessCall: true, mutating: true },
+      observer: { lane: 'composio', turn: source.turn },
+    });
+    assert.equal(committed.status, 'committed');
+  };
+
+  try {
+    settleHostUpdate({ callId: 'call-host-bad-range', firstCellLocation: 'NOT_A_CELL', ok: false });
+    settleHostUpdate({ callId: 'call-host-correct-range', firstCellLocation: 'H40', ok: true });
+  } finally {
+    // Terminal publication must consume only the durable event. The live
+    // process may no longer have the process-local capability catalog.
+    catalogs.installHostCapabilityCatalogFactory(priorCatalog);
+  }
+
+  assert.equal(
+    eventlog.listEvents(sessionId, { types: ['external_write'] }).length,
+    0,
+    'fixture precondition: this is the host-v1 lane, not the legacy reservation lane',
+  );
+  const called = eventlog.listEvents(sessionId, { types: ['tool_called'] });
+  assert.equal(called.length, 2);
+  assert.equal(called[0]?.data.reversibility, undefined);
+  assert.equal(
+    (called[0]?.data.recoverySemantics as { basis?: unknown } | undefined)?.basis,
+    'exact_artifact_reconciliation',
+  );
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId,
+    sourceUserSeq: source.seq,
+    requireEveryBusinessReadToSettle: true,
+  });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+  assert.equal(audit.facts.unrecoveredBusinessFailures, 0);
 });
 
 // ── A call that never crossed cannot hold a source open ────────────────────

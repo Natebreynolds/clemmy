@@ -28,6 +28,8 @@ const callAuthority = await import('./accepted-turn-call-authority.js');
 const logicalContracts = await import('./logical-call-contract.js');
 const hostBindings = await import('./host-call-capability-binding.js');
 const terminalDispatchOwners = await import('./terminal-physical-dispatch-owner.js');
+const workReport = await import('./work-report.js');
+const writeProjection = await import('./external-write-event-projection.js');
 const { removeV65StructuresFromHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
 const { tool: sdkTool } = await import('@openai/agents');
 const { z } = await import('zod');
@@ -1213,6 +1215,478 @@ test('host-owned external provenance is explicit and freezes a provider-site cro
   leases.revokeDispatchLease(task.parentLease);
 });
 
+test('host-owned external mutation projects one exact confirmed write and replay is event-idempotent', async () => {
+  const task = fixture('Update the current alpha record.');
+  let bodies = 0;
+  const execute = () => runCall(task, {
+    callId: 'model:projected-write-success',
+    toolName: 'space_publish',
+    args: { entry_id: 'alpha', fields: { state: 'ready' } },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => {
+      bodies += 1;
+      return { successful: true, data: { updated: true } };
+    },
+  });
+  const first = await execute();
+  assert.equal(first.settlement.outcome.kind, 'succeeded');
+  const lifecycle = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
+  });
+  assert.deepEqual(lifecycle.map((event) => event.type), [
+    'external_write',
+    'external_write_succeeded',
+  ]);
+  assert.equal(lifecycle[0]?.data.sourceUserSeq, task.sourceUserSeq);
+  assert.equal(lifecycle[0]?.data.physicalDispatchId, rows(task, 'model:projected-write-success')[0]?.physical_dispatch_id);
+  assert.equal(lifecycle[1]?.parentEventId, lifecycle[0]?.id);
+  assert.equal(workReport.resolveWriteEvidence(lifecycle).confirmed.length, 1);
+
+  const replay = await execute();
+  assert.equal(replay.settlement.duplicate, true);
+  assert.equal(bodies, 1);
+  assert.equal(eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
+  }).length, 2, 'settled replay does not duplicate reservation or terminal projection');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('daemon restart sweep repairs logical success committed before terminal projection without call replay', async () => {
+  const task = fixture('Update the current alpha record.');
+  let bodies = 0;
+  const execute = () => runCall(task, {
+    callId: 'model:projection-crash-window',
+    toolName: 'space_publish',
+    args: { entry_id: 'alpha', fields: { state: 'ready' } },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => {
+      bodies += 1;
+      return { successful: true, data: { updated: true } };
+    },
+  });
+  await execute();
+  const db = eventlog.openEventLog();
+  assert.equal(db.prepare(`
+    DELETE FROM events
+     WHERE session_id = ? AND type = 'external_write_succeeded'
+       AND json_extract(data_json, '$.canonicalCallId') = ?
+  `).run(task.sessionId, 'model:projection-crash-window').changes, 1);
+  const pending = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_succeeded'],
+  });
+  assert.equal(workReport.resolveWriteEvidence(pending).confirmed.length, 0);
+  assert.equal(workReport.resolveWriteEvidence(pending).uncertain.length, 1);
+  const missingAudit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(missingAudit.status, 'write_projection_missing', JSON.stringify(missingAudit));
+  assert.equal(missingAudit.facts.requiredHostExternalWriteProjections, 1);
+  assert.equal(missingAudit.facts.missingHostExternalWriteProjections, 1);
+
+  eventlog.closeEventLog();
+  reaper.reapOnce();
+  assert.equal(bodies, 1, 'recovery projects evidence from settlement; it never re-enters the body');
+  const repaired = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_succeeded'],
+  });
+  assert.equal(repaired.length, 2);
+  assert.equal(repaired[1]?.data.restartProjection, true);
+  assert.equal(workReport.resolveWriteEvidence(repaired).confirmed.length, 1);
+  const repairedAudit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(repairedAudit.status, 'clean', JSON.stringify(repairedAudit));
+  assert.equal(repairedAudit.facts.missingHostExternalWriteProjections, 0);
+  reaper.reapOnce();
+  assert.equal(eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_succeeded'],
+  }).length, 2, 'a second boot/reaper sweep is projection-idempotent');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('accepted-source audit requires exact projection per successful direct-host write', async () => {
+  const task = fixture('Update both current records.');
+  for (const entryId of ['alpha', 'beta']) {
+    await runCall(task, {
+      callId: `model:exact-audit-${entryId}`,
+      toolName: 'space_publish',
+      args: { entry_id: entryId, fields: { state: 'ready' } },
+      effect: 'external_write',
+      boundary: 'host_owned_external',
+      deadlineMs: 200,
+      invoke: async () => ({ successful: true, data: { updated: true } }),
+    });
+  }
+  const db = eventlog.openEventLog();
+  const alphaReservation = eventlog.listEvents(task.sessionId, { types: ['external_write'] })
+    .find((event) => event.data.canonicalCallId === 'model:exact-audit-alpha');
+  assert.ok(alphaReservation);
+  assert.equal(db.prepare(`
+    DELETE FROM events
+     WHERE session_id = ? AND type = 'external_write_succeeded'
+       AND parent_event_id = ?
+  `).run(task.sessionId, alphaReservation!.id).changes, 1);
+  const audit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'write_projection_missing', JSON.stringify(audit));
+  assert.equal(audit.facts.requiredHostExternalWriteProjections, 2);
+  assert.equal(audit.facts.missingHostExternalWriteProjections, 1,
+    'the unrelated beta confirmation cannot cover alpha');
+  assert.equal(audit.facts.confirmedWrites, 1);
+  invocation.reconcileHostExternalWriteProjections();
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('accepted-source audit requires projection for a successful direct-host mutation even when businessCall is false', async () => {
+  const task = fixture('Delete the obsolete current record.');
+  await runCall(task, {
+    callId: 'model:non-business-write-projection',
+    toolName: 'space_publish',
+    args: { entry_id: 'obsolete', operation: 'delete' },
+    effect: 'external_write',
+    businessCall: false,
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => ({ successful: true, data: { deleted: true } }),
+  });
+  const db = eventlog.openEventLog();
+  const reservation = eventlog.listEvents(task.sessionId, { types: ['external_write'] })[0];
+  assert.ok(reservation);
+  assert.equal(db.prepare(`
+    DELETE FROM events
+     WHERE session_id = ? AND type = 'external_write_succeeded'
+       AND parent_event_id = ?
+  `).run(task.sessionId, reservation!.id).changes, 1);
+
+  const audit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'write_projection_missing', JSON.stringify(audit));
+  assert.equal(audit.facts.requiredHostExternalWriteProjections, 1);
+  assert.equal(audit.facts.missingHostExternalWriteProjections, 1);
+  invocation.reconcileHostExternalWriteProjections();
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('accepted-source audit accepts one exact parented v76 success projection', async () => {
+  const task = fixture('Update the current alpha record.');
+  let bodies = 0;
+  const execute = () => runCall(task, {
+    callId: 'model:v76-write-projection-compatibility',
+    toolName: 'space_publish',
+    args: { entry_id: 'alpha', fields: { state: 'ready' } },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => {
+      bodies += 1;
+      return { successful: true, data: { updated: true } };
+    },
+  });
+  await execute();
+  const lifecycle = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_succeeded'],
+  });
+  const reservation = lifecycle.find((event) => event.type === 'external_write');
+  const currentSuccess = lifecycle.find((event) => event.type === 'external_write_succeeded');
+  assert.ok(reservation && currentSuccess);
+  const db = eventlog.openEventLog();
+  assert.equal(db.prepare('DELETE FROM events WHERE id = ?').run(currentSuccess!.id).changes, 1);
+  const {
+    decisiveProjectionKey: _removedDecisiveProjectionKey,
+    ...legacySuccessData
+  } = currentSuccess!.data;
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: currentSuccess!.turn,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: reservation!.id,
+    data: {
+      ...legacySuccessData,
+      terminalProjectionKey: `external-write-terminal:${reservation!.id}`,
+    },
+  });
+
+  const audit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+  assert.equal(audit.facts.requiredHostExternalWriteProjections, 1);
+  assert.equal(audit.facts.missingHostExternalWriteProjections, 0);
+  await execute();
+  assert.equal(bodies, 1, 'exact replay reuses the v76 decisive terminal without redispatch');
+  assert.equal(eventlog.listEvents(task.sessionId, {
+    types: ['external_write_succeeded'],
+  }).length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('host-owned external semantic outcomes project only proven no-effect failure; ambiguity stays orphaned', async () => {
+  const rejected = fixture('Update the current alpha record.');
+  const rejectedResult = await runCall(rejected, {
+    callId: 'model:projected-write-rejected',
+    toolName: 'space_publish',
+    args: { entry_id: 'alpha', fields: { state: 'ready' } },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => ({ successful: false, status: 400, error: { code: 'INVALID_INPUT' } }),
+  });
+  assert.equal(rejectedResult.settlement.outcome.kind, 'invalid_arguments');
+  const rejectedEvents = eventlog.listEvents(rejected.sessionId, {
+    types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+  });
+  assert.deepEqual(
+    rejectedEvents.map((event) => event.type),
+    ['external_write', 'external_write_failed'],
+    JSON.stringify(rejectedResult.settlement.outcome),
+  );
+  assert.equal(workReport.resolveWriteEvidence(rejectedEvents).failed.length, 1);
+  leases.revokeDispatchLease(rejected.parentLease);
+
+  const thrownRejected = fixture('Update the current alpha record.');
+  const structuredRejection = Object.assign(new Error('rejected'), { status: 422 });
+  await assert.rejects(
+    runCall(thrownRejected, {
+      callId: 'model:projected-write-thrown-rejected',
+      toolName: 'space_publish',
+      args: { entry_id: 'alpha', fields: { state: 'ready' } },
+      effect: 'external_write',
+      boundary: 'host_owned_external',
+      deadlineMs: 200,
+      invoke: async () => { throw structuredRejection; },
+    }),
+    (error: unknown) => error === structuredRejection,
+  );
+  const thrownRejectedEvents = eventlog.listEvents(thrownRejected.sessionId, {
+    types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+  });
+  assert.deepEqual(thrownRejectedEvents.map((event) => event.type), [
+    'external_write',
+    'external_write_failed',
+  ]);
+  leases.revokeDispatchLease(thrownRejected.parentLease);
+
+  const ambiguous = fixture('Update the current alpha record.');
+  const ambiguousResult = await runCall(ambiguous, {
+    callId: 'model:projected-write-ambiguous',
+    toolName: 'space_publish',
+    args: { entry_id: 'alpha', fields: { state: 'ready' } },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => ({ successful: false, error: { code: 'UNKNOWN' } }),
+  });
+  assert.equal(ambiguousResult.settlement.outcome.kind, 'uncertain_write');
+  const ambiguousEvents = eventlog.listEvents(ambiguous.sessionId, {
+    types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+  });
+  assert.deepEqual(ambiguousEvents.map((event) => event.type), ['external_write', 'external_write_orphaned']);
+  assert.equal(workReport.resolveWriteEvidence(ambiguousEvents).uncertain.length, 1);
+  leases.revokeDispatchLease(ambiguous.parentLease);
+});
+
+test('shared terminal CAS permits orphan-to-decisive reconciliation and rejects conflicting decisive truth', async () => {
+  const task = fixture('Update the current alpha record.');
+  await runCall(task, {
+    callId: 'model:orphan-then-decisive',
+    toolName: 'space_publish',
+    args: { entry_id: 'alpha', fields: { state: 'ready' } },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    deadlineMs: 200,
+    invoke: async () => ({ successful: false, error: { code: 'UNKNOWN_PROVIDER_OUTCOME' } }),
+  });
+  const initial = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_orphaned'],
+  });
+  assert.deepEqual(initial.map((event) => event.type), [
+    'external_write',
+    'external_write_orphaned',
+  ]);
+  const identity = writeProjection.externalWriteProjectionIdentityFromReservation(initial[0]!);
+  assert.ok(identity);
+  if (!identity) throw new Error('reservation identity missing');
+  const terminalInput = {
+    sessionId: task.sessionId,
+    turn: 1,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    physicalDispatchId: String(initial[0]!.data.physicalDispatchId),
+    ...identity,
+  };
+  assert.equal(writeProjection.projectExternalWriteTerminal({
+    ...terminalInput,
+    type: 'external_write_succeeded',
+    reason: 'reconciled_present',
+  }), 'external_write_succeeded');
+  assert.equal(writeProjection.projectExternalWriteTerminal({
+    ...terminalInput,
+    type: 'external_write_orphaned',
+    reason: 'late ambiguity observer',
+  }), 'external_write_succeeded', 'late orphan cannot downgrade decisive truth');
+  assert.throws(() => writeProjection.projectExternalWriteTerminal({
+    ...terminalInput,
+    type: 'external_write_failed',
+    reason: 'conflicting absent verdict',
+  }), writeProjection.ExternalWriteProjectionConflictError);
+  const lifecycle = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_orphaned', 'external_write_succeeded', 'external_write_failed'],
+  });
+  assert.deepEqual(lifecycle.map((event) => event.type), [
+    'external_write',
+    'external_write_orphaned',
+    'external_write_succeeded',
+  ]);
+  assert.equal(workReport.resolveWriteEvidence(lifecycle).confirmed.length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('host-owned external timeout and caller cancellation orphan their exact reservations', async () => {
+  for (const mode of ['timeout', 'caller'] as const) {
+    const task = fixture('Update the current alpha record.');
+    const controller = new AbortController();
+    if (mode === 'caller') setTimeout(() => controller.abort(new Error('stop')), 10);
+    await assert.rejects(
+      runCall(task, {
+        callId: `model:projected-write-${mode}`,
+        toolName: 'space_publish',
+        args: { entry_id: 'alpha', fields: { state: mode } },
+        effect: 'external_write',
+        boundary: 'host_owned_external',
+        deadlineMs: mode === 'timeout' ? 20 : 500,
+        ...(mode === 'caller' ? { callerSignal: controller.signal } : {}),
+        invoke: () => new Promise<never>(() => {}),
+      }),
+      (error: unknown) => error instanceof invocation.HostToolInvocationUncertainError,
+    );
+    const lifecycle = eventlog.listEvents(task.sessionId, {
+      types: ['external_write', 'external_write_orphaned'],
+    });
+    assert.deepEqual(lifecycle.map((event) => event.type), ['external_write', 'external_write_orphaned']);
+    assert.equal(lifecycle[1]?.parentEventId, lifecycle[0]?.id);
+    assert.equal(workReport.resolveWriteEvidence(lifecycle).uncertain.length, 1);
+    leases.revokeDispatchLease(task.parentLease);
+  }
+});
+
+test('host-owned external pre-dispatch refusal and read-only call emit no write lifecycle', async () => {
+  const refused = fixture('Update the current alpha record.');
+  const repair = new attemptSettlements.InvalidArgumentsPreDispatchResult('repair exact arguments');
+  const refusal = await runCall(refused, {
+    callId: 'model:projected-write-refused',
+    toolName: 'space_publish',
+    args: { wrong: true },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    beforePhysicalPreparation: async () => repair,
+    invoke: async () => ({ successful: true }),
+  });
+  assert.equal(refusal.settlement.outcome.kind, 'invalid_arguments');
+  assert.equal(eventlog.listEvents(refused.sessionId, {
+    types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
+  }).length, 0);
+  const refusalReplay = await runCall(refused, {
+    callId: 'model:projected-write-refused',
+    toolName: 'space_publish',
+    args: { wrong: true },
+    effect: 'external_write',
+    boundary: 'host_owned_external',
+    beforePhysicalPreparation: async () => {
+      throw new Error('settled replay must not re-enter preparation');
+    },
+    invoke: async () => {
+      throw new Error('settled replay must not enter the provider body');
+    },
+  });
+  assert.equal(refusalReplay.value, repair.output);
+  assert.equal(refusalReplay.settlement.duplicate, true);
+  assert.equal(eventlog.listEvents(refused.sessionId, {
+    types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
+  }).length, 0, 'intentional pre-reservation refusal replay invents no write lifecycle');
+  leases.revokeDispatchLease(refused.parentLease);
+
+  const read = fixture('Read the current alpha record.');
+  await runCall(read, {
+    callId: 'model:external-read-no-write-projection',
+    toolName: 'read_file',
+    args: { entry_id: 'alpha' },
+    effect: 'read',
+    boundary: 'host_owned_external',
+    invoke: async () => ({ successful: true, data: { id: 'alpha' } }),
+  });
+  assert.equal(eventlog.listEvents(read.sessionId, {
+    types: ['external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned'],
+  }).length, 0);
+  leases.revokeDispatchLease(read.parentLease);
+});
+
+test('a replayed started physical row after write reservation is orphaned, never mislabeled no-effect', async () => {
+  const task = fixture('Update the current alpha record.');
+  const callId = 'model:started-crossing-is-not-failed';
+  const args = { entry_id: 'alpha', state: 'ready' };
+  const physicalDispatchId = `dispatch:host:v1:${createHash('sha256').update(JSON.stringify({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    modelCallId: callId,
+  })).digest('hex')}`;
+  let bodies = 0;
+  await assert.rejects(
+    runCall(task, {
+      callId,
+      toolName: 'space_publish',
+      args,
+      effect: 'external_write',
+      boundary: 'host_owned_external',
+      deadlineMs: 200,
+      beforePhysicalPreparation: async (context) => {
+        const inserted = dispatch.beginPhysicalDispatch({
+          identity: {
+            sessionId: task.sessionId,
+            sourceUserSeq: task.sourceUserSeq,
+            acceptedTaskId: task.acceptedTaskId,
+            logicalToolCallId: callId,
+            physicalDispatchId,
+            ordinal: 1,
+          },
+          tool: 'space_publish',
+          args,
+          turn: 1,
+          relation: 'primary',
+          dispatchLease: context.lease,
+        });
+        assert.equal(inserted.status, 'inserted');
+      },
+      invoke: async () => {
+        bodies += 1;
+        return { successful: true };
+      },
+    }),
+    (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError,
+  );
+  assert.equal(bodies, 0);
+  const lifecycle = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_failed', 'external_write_orphaned'],
+  });
+  assert.deepEqual(lifecycle.map((event) => event.type), [
+    'external_write',
+    'external_write_orphaned',
+  ]);
+  assert.equal(rows(task, callId)[0]?.state, 'unknown');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('a settled success redeems its exact raw payload before another child lease, body, or crossing', async () => {
   const task = fixture();
   let bodies = 0;
@@ -1682,6 +2156,102 @@ test('nested wrappers settle once inside and the host adopts that exact durable 
   `).get(task.sessionId, task.sourceUserSeq, 'model:nested') as { n: number }).n, 1);
   assert.equal(rows(task, 'model:nested').length, 1);
   assert.equal(rows(task, 'model:nested')[0]?.execution_site, null);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('accepted-source audit does not relabel a nested provider write as a direct-host projection', async () => {
+  const task = fixture('Update the current alpha record.');
+  const callId = 'model:nested-projected-write';
+  const args = { entry_id: 'alpha', fields: { state: 'ready' } };
+  let bodies = 0;
+  const descriptor = writeProjection.describeExternalWriteEvent({
+    toolName: 'space_publish',
+    args,
+    forceMutating: true,
+  });
+  assert.ok(descriptor);
+  const reservation = writeProjection.projectExternalWriteReservation({
+    sessionId: task.sessionId,
+    turn: 1,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    callId,
+    descriptor: descriptor!,
+  });
+
+  const result = await runCall(task, {
+    callId,
+    toolName: 'space_publish',
+    args,
+    effect: 'external_write',
+    boundary: 'nested_owned',
+    deadlineMs: 200,
+    invoke: async () => identities.withLogicalToolCall({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      logicalToolCallId: callId,
+      tool: 'space_publish',
+      args,
+    }, async () => {
+      const value = await identities.withPhysicalDispatch({
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        turn: 1,
+        tool: 'space_publish',
+        args,
+      }, async () => {
+        bodies += 1;
+        return { successful: true, data: { updated: true } };
+      });
+      attemptSettlements.settleToolAttempt({
+        sessionId: task.sessionId,
+        sourceUserSeq: task.sourceUserSeq,
+        acceptedTaskId: task.acceptedTaskId,
+        callId,
+        turn: 1,
+        lane: 'composio',
+        toolName: 'space_publish',
+        args,
+        mutating: true,
+        businessCall: true,
+        result: value,
+      });
+      return value;
+    }),
+  });
+  writeProjection.projectExternalWriteTerminal({
+    sessionId: task.sessionId,
+    turn: 1,
+    sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId,
+    reservation,
+    descriptor: descriptor!,
+    type: 'external_write_succeeded',
+  });
+
+  assert.equal(result.settlement.outcome.kind, 'succeeded');
+  assert.equal(bodies, 1);
+  const [physical] = rows(task, callId);
+  assert.equal(physical?.state, 'returned');
+  assert.equal(physical?.execution_site, null);
+  assert.ok(
+    physical && !physical.physical_dispatch_id.startsWith('dispatch:host:v1:'),
+    'the nested provider owns a provider-side crossing, not the direct-host id',
+  );
+  assert.deepEqual(
+    eventlog.listEvents(task.sessionId, {
+      types: ['external_write', 'external_write_succeeded'],
+    }).map((event) => event.type),
+    ['external_write', 'external_write_succeeded'],
+  );
+  const audit = settlementAudit.auditAcceptedSourceSettlementTruth({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+  });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+  assert.equal(audit.facts.confirmedWrites, 1);
+  assert.equal(audit.facts.requiredHostExternalWriteProjections, 0);
+  assert.equal(audit.facts.missingHostExternalWriteProjections, 0);
   leases.revokeDispatchLease(task.parentLease);
 });
 
@@ -2281,6 +2851,67 @@ test('physical reservation storage error durably refuses the admitted call witho
   }));
   assert.equal(replayBodies, 0);
   assert.equal(invocation.reconcileRevokedHostToolInvocations().scanned, 0);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('restart sweep repairs a host write reservation committed before missing physical admission', async () => {
+  const task = fixture('Update the current alpha record.');
+  const db = eventlog.openEventLog();
+  db.exec(`
+    CREATE TRIGGER host_invocation_test_fail_external_physical_reservation
+    BEFORE INSERT ON physical_dispatches
+    BEGIN
+      SELECT RAISE(ABORT, 'forced external physical reservation storage error');
+    END
+  `);
+  let bodies = 0;
+  try {
+    await assert.rejects(
+      runCall(task, {
+        callId: 'model:restart-projection-before-physical',
+        toolName: 'space_publish',
+        args: { entry_id: 'alpha', state: 'ready' },
+        effect: 'external_write',
+        boundary: 'host_owned_external',
+        invoke: async () => { bodies += 1; return { successful: true }; },
+      }),
+      invocation.HostToolInvocationAuthorityError,
+    );
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS host_invocation_test_fail_external_physical_reservation');
+  }
+  assert.equal(bodies, 0);
+  assert.equal(rows(task, 'model:restart-projection-before-physical').length, 0);
+  const beforeCrash = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_failed'],
+  });
+  assert.deepEqual(beforeCrash.map((event) => event.type), [
+    'external_write',
+    'external_write_failed',
+  ]);
+  assert.equal(db.prepare(`
+    DELETE FROM events
+     WHERE session_id = ? AND type = 'external_write_failed'
+       AND parent_event_id = ?
+  `).run(task.sessionId, beforeCrash[0]!.id).changes, 1);
+
+  eventlog.closeEventLog();
+  const recovery = invocation.reconcileHostExternalWriteProjections();
+  assert.ok(recovery.records.some((record) => (
+    record.reservationEventId === beforeCrash[0]!.id
+    && record.status === 'projected'
+  )), JSON.stringify(recovery));
+  const afterRestart = eventlog.listEvents(task.sessionId, {
+    types: ['external_write', 'external_write_failed'],
+  });
+  assert.deepEqual(afterRestart.map((event) => event.type), [
+    'external_write',
+    'external_write_failed',
+  ]);
+  assert.equal(afterRestart[1]?.data.restartProjection, true);
+  assert.equal(afterRestart[1]?.data.physicalOutcome, 'not_started');
+  assert.equal(invocation.reconcileHostExternalWriteProjections().scanned, 0,
+    'terminal projection removes the reservation from the recovery scan');
   leases.revokeDispatchLease(task.parentLease);
 });
 

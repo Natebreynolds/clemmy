@@ -101,7 +101,8 @@ function sameWriteAttempt(
 export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWriteEvidence {
   const attempts: Array<{
     event: EventRow;
-    state: 'pending' | 'confirmed' | 'failed' | 'uncertain';
+    state: 'pending' | 'confirmed' | 'failed' | 'uncertain' | 'conflicted';
+    decisive: boolean;
   }> = [];
   const unmatchedOrphans: EventRow[] = [];
   for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
@@ -109,6 +110,10 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
       attempts.push({
         event,
         state: event.data.preDispatch === true ? 'pending' : 'confirmed',
+        // A legacy reservation without preDispatch historically carried
+        // provisional success meaning. A later explicit terminal may still
+        // correct it; only a terminal makes the state decisive.
+        decisive: false,
       });
       continue;
     }
@@ -126,7 +131,6 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
       : 0;
     let match = -1;
     for (let index = attempts.length - 1; index >= 0; index -= 1) {
-      if (attempts[index]?.state === 'failed') continue;
       if (sameWriteAttempt(attempts[index]!.event, event, {
         allowUnparentedPreDispatch: !event.parentEventId && matchingPreDispatchReservations === 1,
       })) {
@@ -135,11 +139,27 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
       }
     }
     if (match >= 0) {
-      attempts[match]!.state = event.type === 'external_write_succeeded'
-        ? 'confirmed'
-        : event.type === 'external_write_failed'
-          ? 'failed'
-          : 'uncertain';
+      const attempt = attempts[match]!;
+      if (event.type === 'external_write_orphaned') {
+        // Orphan records an ambiguity observation. Once the exact reservation
+        // has a decisive success/failure, an older or racing orphan can never
+        // downgrade that truth.
+        if (!attempt.decisive) {
+          attempt.state = 'uncertain';
+        }
+      } else if (event.type === 'external_write_succeeded') {
+        if ((attempt.state === 'failed' && attempt.decisive) || attempt.state === 'conflicted') {
+          attempt.state = 'conflicted';
+        } else {
+          attempt.state = 'confirmed';
+          attempt.decisive = true;
+        }
+      } else if ((attempt.state === 'confirmed' && attempt.decisive) || attempt.state === 'conflicted') {
+        attempt.state = 'conflicted';
+      } else {
+        attempt.state = 'failed';
+        attempt.decisive = true;
+      }
     } else if (event.type === 'external_write_orphaned') {
       // A few legacy transports emitted only the timeout row. Preserve that
       // uncertainty instead of dropping the only durable evidence.
@@ -151,7 +171,11 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
     failed: attempts.filter((attempt) => attempt.state === 'failed').map((attempt) => attempt.event),
     uncertain: [
       ...attempts
-        .filter((attempt) => attempt.state === 'pending' || attempt.state === 'uncertain')
+        .filter((attempt) => (
+          attempt.state === 'pending'
+          || attempt.state === 'uncertain'
+          || attempt.state === 'conflicted'
+        ))
         .map((attempt) => attempt.event),
       ...unmatchedOrphans,
     ],

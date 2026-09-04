@@ -43,6 +43,8 @@ function externalEffectManifest(input: {
   operationId: string;
   providerKind: ExternalProviderKind;
   effect: Extract<ManifestEffect, 'read' | 'external_write'>;
+  reversibility?: 'reversible' | 'irreversible';
+  exactArtifactRecovery?: boolean;
 }): CapabilityManifestV1 {
   const write = input.effect === 'external_write';
   const identity = `${input.providerKind}:${input.operationId}`;
@@ -68,6 +70,9 @@ function externalEffectManifest(input: {
       },
     },
     effect: input.effect,
+    ...(write && input.reversibility
+      ? { operationSemantics: { version: 1 as const, reversibility: input.reversibility } }
+      : {}),
     ...(write ? { destination: { family: 'fixture-provider', posture: 'create_new' } } : {}),
     accountId: `account:${input.providerKind}:fixture`,
     idempotency: write
@@ -91,7 +96,10 @@ function externalEffectManifest(input: {
   });
 }
 
-function registeredCapability(manifest: CapabilityManifestV1): RegisteredHostCapability {
+function registeredCapability(
+  manifest: CapabilityManifestV1,
+  exactArtifactRecovery = false,
+): RegisteredHostCapability {
   return {
     capabilityId: manifest.manifestId,
     toolName: manifest.operationId,
@@ -105,6 +113,9 @@ function registeredCapability(manifest: CapabilityManifestV1): RegisteredHostCap
     providerInputSchemaDigest: manifest.externalDefinition?.providerInputSchemaDigest,
     liveFingerprint: manifest.definitionFingerprint,
     manifest,
+    ...(exactArtifactRecovery
+      ? { reconcile: async () => ({ exists: true }) }
+      : {}),
     invoke: async () => ({ successful: true }),
   };
 }
@@ -114,12 +125,17 @@ function withCurrentExternalEffects<T>(
     operationId: string;
     providerKind: ExternalProviderKind;
     effect: Extract<ManifestEffect, 'read' | 'external_write'>;
+    reversibility?: 'reversible' | 'irreversible';
+    exactArtifactRecovery?: boolean;
   }>,
   run: () => T,
 ): T {
   const prior = peekHostCapabilityCatalogFactory();
   installHostCapabilityCatalogFactory(createHostCapabilityCatalogFactory(
-    effects.map((effect) => registeredCapability(externalEffectManifest(effect))),
+    effects.map((effect) => registeredCapability(
+      externalEffectManifest(effect),
+      effect.exactArtifactRecovery === true,
+    )),
   ));
   try {
     return run();
@@ -801,7 +817,12 @@ test('shell effects inspect only literal sh/bash/zsh command payloads', () => {
 
 test('accounting metadata decodes hook arguments and exposes the inner provider action', () => {
   withCurrentExternalEffects([
-    { operationId: 'HUBSPOT_FIND_OR_CREATE_CONTACT', providerKind: 'composio', effect: 'external_write' },
+    {
+      operationId: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+      providerKind: 'composio',
+      effect: 'external_write',
+      reversibility: 'reversible',
+    },
     { operationId: 'DATAFORSEO_CREATE_SERP_TASK_POST', providerKind: 'composio', effect: 'read' },
   ], () => {
     assert.deepEqual(runtimeToolAccountingMetadata(
@@ -811,6 +832,18 @@ test('accounting metadata decodes hook arguments and exposes the inner provider 
       effect: 'external_write',
       effectiveTool: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
       toolSlug: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+      reversibility: 'reversible',
+      recoverySemantics: {
+        version: 1,
+        operationId: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+        manifestDigest: capabilityManifestDigest(externalEffectManifest({
+          operationId: 'HUBSPOT_FIND_OR_CREATE_CONTACT',
+          providerKind: 'composio',
+          effect: 'external_write',
+          reversibility: 'reversible',
+        })),
+        basis: 'reversible_operation',
+      },
     });
     assert.deepEqual(runtimeToolAccountingMetadata(
       'mcp__clementine-local__composio_execute_tool',
@@ -819,6 +852,70 @@ test('accounting metadata decodes hook arguments and exposes the inner provider 
       effect: 'read',
       toolSlug: 'DATAFORSEO_CREATE_SERP_TASK_POST',
     }, 'a current manifest supplies effect, while missing inner arguments mint no execution identity');
+  });
+});
+
+test('accounting durably captures exact-artifact repair authority from the current manifest', () => {
+  withCurrentExternalEffects([{
+    operationId: 'GOOGLESHEETS_BATCH_UPDATE',
+    providerKind: 'composio',
+    effect: 'external_write',
+    // Matches the live proof-provisioned manifest: no general reversibility
+    // declaration, but current exact-artifact reconciliation + idempotency and
+    // an actual reconcile port are all present.
+    exactArtifactRecovery: true,
+  }], () => {
+    const metadata = runtimeToolAccountingMetadata('composio_execute_tool', {
+      tool_slug: 'GOOGLESHEETS_BATCH_UPDATE',
+      arguments: JSON.stringify({
+        spreadsheet_id: 'sheet-live-shape',
+        sheet_name: 'Daily Digest',
+        first_cell_location: 'H40',
+        value_input_option: 'RAW',
+        values: [['23:59']],
+      }),
+      connected_account_id: null,
+    });
+    assert.equal(metadata.reversibility, undefined, 'exact reconciliation is not mislabeled reversible');
+    assert.deepEqual(metadata.recoverySemantics, {
+      version: 1,
+      operationId: 'GOOGLESHEETS_BATCH_UPDATE',
+      manifestDigest: capabilityManifestDigest(
+        externalEffectManifest({
+          operationId: 'GOOGLESHEETS_BATCH_UPDATE',
+          providerKind: 'composio',
+          effect: 'external_write',
+          exactArtifactRecovery: true,
+        }),
+      ),
+      basis: 'exact_artifact_reconciliation',
+    });
+  });
+});
+
+test('accounting does not mint repair authority for irreversible or unreconciled mutations', () => {
+  withCurrentExternalEffects([
+    {
+      operationId: 'GMAIL_SEND_EMAIL',
+      providerKind: 'composio',
+      effect: 'external_write',
+      reversibility: 'irreversible',
+      exactArtifactRecovery: true,
+    },
+    {
+      operationId: 'CRM_MUTATE_UNKNOWN',
+      providerKind: 'composio',
+      effect: 'external_write',
+    },
+  ], () => {
+    assert.equal(runtimeToolAccountingMetadata('composio_execute_tool', {
+      tool_slug: 'GMAIL_SEND_EMAIL',
+      arguments: '{}',
+    }).recoverySemantics, undefined);
+    assert.equal(runtimeToolAccountingMetadata('composio_execute_tool', {
+      tool_slug: 'CRM_MUTATE_UNKNOWN',
+      arguments: '{}',
+    }).recoverySemantics, undefined);
   });
 });
 

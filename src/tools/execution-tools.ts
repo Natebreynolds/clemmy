@@ -19,6 +19,11 @@ import {
   externalWriteDuplicateIdentityKeys,
   withExternalWriteAdmissionLock,
 } from '../runtime/harness/external-write-admission.js';
+import {
+  ExternalWriteProjectionConflictError,
+  externalWriteProjectionIdentityFromReservation,
+  projectExternalWriteTerminal,
+} from '../runtime/harness/external-write-event-projection.js';
 
 /**
  * Pure focus-matcher: given a `query` (an execution id OR a
@@ -550,36 +555,42 @@ function reconcileExternalWriteUnlocked(input: {
   const actionKey = typeof attemptData.actionKey === 'string' && attemptData.actionKey.trim()
     ? attemptData.actionKey.trim()
     : `call:${input.callId}`;
-  appendEvent({
-    sessionId: input.execution.sessionId,
-    turn: 0,
-    role: 'system',
-    type: input.verdict === 'absent' ? 'external_write_failed' : 'external_write_succeeded',
-    parentEventId: attempt.id,
-    data: {
-      callId: input.callId,
-      canonicalCallId: input.callId,
-      sourceUserSeq: attemptData.sourceUserSeq,
-      actionKey,
-      ...(typeof attemptData.shapeKey === 'string' ? { shapeKey: attemptData.shapeKey } : {}),
-      ...(targets.length > 0 ? { targets } : {}),
-      ...(Array.isArray(attemptData.duplicateIdentityKeys)
-        ? { duplicateIdentityKeys: attemptData.duplicateIdentityKeys }
-        : {}),
-      ...(typeof attemptData.correlationFingerprint === 'string'
-        ? { correlationFingerprint: attemptData.correlationFingerprint }
-        : {}),
+  const projectionIdentity = externalWriteProjectionIdentityFromReservation(attempt);
+  if (!projectionIdentity || projectionIdentity.descriptor.actionKey !== actionKey) {
+    return `Reconciliation refused: ${input.callId} has no exact durable write-reservation identity.`;
+  }
+  try {
+    projectExternalWriteTerminal({
+      sessionId: input.execution.sessionId,
+      turn: 0,
+      sourceUserSeq: typeof attemptData.sourceUserSeq === 'number'
+        ? attemptData.sourceUserSeq
+        : undefined,
+      acceptedTaskId: typeof attempt.data.acceptedTaskId === 'string'
+        ? attempt.data.acceptedTaskId
+        : undefined,
+      physicalDispatchId: typeof attempt.data.physicalDispatchId === 'string'
+        ? attempt.data.physicalDispatchId
+        : undefined,
+      ...projectionIdentity,
+      type: input.verdict === 'absent'
+        ? 'external_write_failed'
+        : 'external_write_succeeded',
       reason: input.verdict === 'absent' ? 'reconciled_absent' : 'reconciled_present',
-      ...(input.verdict === 'present'
-        ? { settlementKey: `external-write:${attempt.id}` }
-        : {}),
-      evidenceCallId: input.evidenceCallId,
-      evidenceInvocationNonce,
-      evidenceSha256: createHash('sha256').update(evidence.output).digest('hex'),
-      evidenceToolName: evidenceCall.toolName,
-      reconciledBy: 'execution_reconcile_write',
-    },
-  });
+      data: {
+        evidenceCallId: input.evidenceCallId,
+        evidenceInvocationNonce,
+        evidenceSha256: createHash('sha256').update(evidence.output).digest('hex'),
+        evidenceToolName: evidenceCall.toolName,
+        reconciledBy: 'execution_reconcile_write',
+      },
+    });
+  } catch (error) {
+    if (error instanceof ExternalWriteProjectionConflictError) {
+      return `Reconciliation refused: ${input.callId} has conflicting durable write-settlement truth.`;
+    }
+    throw error;
+  }
   return { actionKey };
 }
 

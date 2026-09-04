@@ -10,14 +10,20 @@
  * result boundary and carries the host's successful-business verdict or the
  * registry-authorized successful-authoring verdict.
  */
+import { createHash } from 'node:crypto';
 import { classifyRuntimeToolEffect } from './tool-effect.js';
+import { classifyExternalWrite } from './confirm-first-gate.js';
+import { parseCurrentManifestRecoverySemantics } from './current-manifest-operation-semantics.js';
 import { listEvents, openEventLog, type EventRow } from './eventlog.js';
+import { extractExternalWriteIdentityKeys } from './grounding-gate.js';
+import { catalogOperationIdentitiesEqual } from './runtime-tool-identity.js';
 import { resolveWriteEvidence } from './work-report.js';
 
 export type AcceptedSourceSettlementAuditStatus =
   | 'clean'
   | 'in_flight'
   | 'uncertain_write'
+  | 'write_projection_missing'
   | 'unrecovered_failure'
   | 'no_business_evidence'
   | 'storage_error';
@@ -69,6 +75,12 @@ export interface AcceptedSourceSettlementAudit {
     attemptedMutations: number;
     unrecoveredBusinessFailures: number;
     confirmedWrites: number;
+    /** Successful direct host provider mutations which require one exact
+     * confirmed hostOwnedExternal reservation/terminal projection. */
+    requiredHostExternalWriteProjections: number;
+    /** Required direct-host successes without exactly one matching confirmed
+     * reservation. Any non-zero value is a terminal audit blocker. */
+    missingHostExternalWriteProjections: number;
     uncertainWrites: number;
     /** The subset of uncertain writes whose ambiguity is worth vetoing a turn
      * over: the host could not classify the effect as reversible. */
@@ -99,28 +111,112 @@ function writeCallId(event: EventRow): string {
   return typeof legacy === 'string' ? legacy.trim() : '';
 }
 
+function directHostPhysicalId(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+}): string {
+  const digest = createHash('sha256').update(JSON.stringify({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    modelCallId: input.logicalToolCallId,
+  })).digest('hex');
+  return `dispatch:host:v1:${digest}`;
+}
+
+function acceptedTaskAttributionIsCompatible(
+  event: EventRow,
+  acceptedTaskId: string,
+): boolean {
+  // Current producers stamp the canonical task id. The first shared-wrapper
+  // projection release stamped only the exact source sequence, so absence is
+  // a bounded compatibility case; a conflicting present task id is never
+  // allowed to cross a later user-input boundary.
+  return event.data.acceptedTaskId === undefined
+    || event.data.acceptedTaskId === acceptedTaskId;
+}
+
 function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number): EventRow[] {
   const events = listEvents(sessionId, { sinceSeq: sourceUserSeq - 1 });
   const source = events.find((event) => event.seq === sourceUserSeq && event.type === 'user_input_received');
   if (!source) throw new Error('accepted source event is missing');
   const nextSource = events.find((event) => event.seq > sourceUserSeq && event.type === 'user_input_received');
-  const sourceWindow = events.filter(
+  const acceptedTaskId = `task:${sessionId}#${sourceUserSeq}`;
+  const chronologicalSourceWindow = events.filter(
     (event) => event.seq >= sourceUserSeq && (!nextSource || event.seq < nextSource.seq),
   );
-
-  // A user-input boundary does not end the lifetime of a physical write. Crash
-  // recovery or an explicit reconciliation turn can settle the exact durable
-  // reservation later. Carry only resolutions whose canonical call id belongs
-  // to this source window; never borrow a sibling source's similarly-shaped
-  // write. Legacy reservations without an exact id remain window-scoped and
-  // fail closed because cross-source shape/target matching is not authority.
-  const sourceWriteCallIds = new Set(
-    sourceWindow
-      .filter((event) => event.type === 'external_write' && event.data.preDispatch === true)
-      .map(writeCallId)
-      .filter(Boolean),
+  const reservationById = new Map(events
+    .filter((event) => event.type === 'external_write')
+    .map((event) => [event.id, event]));
+  const belongsToAcceptedSource = (event: EventRow): boolean => (
+    event.data.sourceUserSeq === undefined
+    || (
+      event.data.sourceUserSeq === sourceUserSeq
+      && acceptedTaskAttributionIsCompatible(event, acceptedTaskId)
+    )
   );
-  if (!nextSource || sourceWriteCallIds.size === 0) return sourceWindow;
+  const sourceWindow = chronologicalSourceWindow.filter((event) => {
+    // Any current event which names an accepted source belongs only to that
+    // source. Chronology remains a compatibility fallback solely for legacy
+    // rows without source attribution; otherwise late A tool/accounting rows
+    // could be borrowed by newest source B when SDK call ids are reused.
+    if (!belongsToAcceptedSource(event)) return false;
+    if (event.type === 'external_write') return true;
+    if (
+      event.type !== 'external_write_succeeded'
+      && event.type !== 'external_write_failed'
+      && event.type !== 'external_write_orphaned'
+    ) return true;
+    if (!event.parentEventId) return true;
+    const parent = reservationById.get(event.parentEventId);
+    // A parented terminal can belong to this accepted source only through its
+    // exact reservation. A missing parent necessarily predates this source's
+    // sinceSeq window and must not be borrowed chronologically.
+    return parent !== undefined && belongsToAcceptedSource(parent);
+  });
+
+  // A user-input boundary does not end the lifetime of a physical write. A
+  // concurrent source can arrive before this source's host-owned reservation
+  // is appended, so reopen later reservations only from their exact accepted
+  // source/task attribution. Legacy unattributed reservations remain confined
+  // to the chronological source window.
+  if (!nextSource) return sourceWindow;
+  const windowReservations = sourceWindow
+    .filter((event) => event.type === 'external_write' && event.data.preDispatch === true);
+  const exactLaterReservations = events.filter((event) => (
+    event.seq >= nextSource.seq
+    && event.type === 'external_write'
+    && event.data.preDispatch === true
+    && event.data.sourceUserSeq === sourceUserSeq
+    && acceptedTaskAttributionIsCompatible(event, acceptedTaskId)
+  ));
+  const sourceReservations = [...windowReservations, ...exactLaterReservations];
+  const sourceReservationIds = new Set(sourceReservations.map((event) => event.id));
+  const legacyWindowWriteCallIds = new Set(windowReservations
+    .filter((event) => event.data.sourceUserSeq === undefined)
+    .map(writeCallId)
+    .filter(Boolean));
+  const callIds = [...legacyWindowWriteCallIds];
+  const ownerRows = callIds.length === 0
+    ? []
+    : openEventLog().prepare(`
+      SELECT COALESCE(
+               NULLIF(TRIM(json_extract(data_json, '$.canonicalCallId')), ''),
+               NULLIF(TRIM(json_extract(data_json, '$.callId')), '')
+             ) AS call_id,
+             COUNT(*) AS owner_count
+        FROM events
+       WHERE session_id = ? AND type = 'external_write'
+         AND json_extract(data_json, '$.preDispatch') = 1
+         AND COALESCE(
+               NULLIF(TRIM(json_extract(data_json, '$.canonicalCallId')), ''),
+               NULLIF(TRIM(json_extract(data_json, '$.callId')), '')
+             ) IN (${callIds.map(() => '?').join(', ')})
+       GROUP BY call_id
+    `).all(sessionId, ...callIds) as Array<{ call_id: string; owner_count: number }>;
+  const reservationOwnerCountByCallId = new Map(
+    ownerRows.map((row) => [row.call_id, row.owner_count]),
+  );
   const exactLaterResolutions = events.filter((event) =>
     event.seq >= nextSource.seq
     && (
@@ -128,9 +224,23 @@ function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number): 
       || event.type === 'external_write_failed'
       || event.type === 'external_write_orphaned'
     )
-    && sourceWriteCallIds.has(writeCallId(event)),
+    && (
+      // Current terminals name the exact reservation and repeat the accepted
+      // source attribution. A later source reusing the SDK call id therefore
+      // cannot inject its orphan/failure into this source's audit window.
+      (Boolean(event.parentEventId)
+        && sourceReservationIds.has(event.parentEventId ?? '')
+        && event.data.sourceUserSeq === sourceUserSeq
+        && acceptedTaskAttributionIsCompatible(event, acceptedTaskId))
+      // Historical unparented terminals have only a call id. Preserve that
+      // compatibility solely when one reservation in the entire observed
+      // history owns the id and that reservation belongs to this source.
+      || (!event.parentEventId
+        && legacyWindowWriteCallIds.has(writeCallId(event))
+        && reservationOwnerCountByCallId.get(writeCallId(event)) === 1)
+    ),
   );
-  return [...sourceWindow, ...exactLaterResolutions];
+  return [...sourceWindow, ...exactLaterReservations, ...exactLaterResolutions];
 }
 
 interface ReversibleWriteShape {
@@ -148,10 +258,31 @@ interface ReversibleWriteShape {
  * model says can enter this index, and an unclassified or irreversible write is
  * deliberately absent — those keep the strict exact-argument recovery rule.
  */
-function reversibleWriteShapeIndex(events: readonly EventRow[]): Map<string, ReversibleWriteShape> {
+function modelVisibleArguments(event: EventRow): unknown {
+  const raw = event.data.arguments;
+  if (typeof raw !== 'string') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function reversibleWriteShapeIndex(
+  events: readonly EventRow[],
+  settlements: readonly SettlementRow[],
+): Map<string, ReversibleWriteShape> {
   const index = new Map<string, ReversibleWriteShape>();
   for (const event of events) {
-    if (event.type !== 'external_write' || event.data.irreversible !== false) continue;
+    if (
+      event.type !== 'external_write'
+      || event.data.irreversible !== false
+      // A host-owned provider reservation may carry `false` only because an
+      // unknown operation had no positive irreversible classification. That
+      // is not proof of reversibility. These calls qualify solely through the
+      // exact tool_called + durable recoverySemantics authority below.
+      || event.data.hostOwnedExternal === true
+    ) continue;
     const callId = writeCallId(event);
     if (!callId) continue;
     const shape = event.data.shapeKey;
@@ -164,6 +295,62 @@ function reversibleWriteShapeIndex(events: readonly EventRow[]): Map<string, Rev
       : [];
     index.set(callId, {
       shapeTargetKey: JSON.stringify([shape.trim().toLowerCase(), targets]),
+      seq: event.seq,
+    });
+  }
+
+  // The host-v1 lane owns provider dispatch directly and therefore does not
+  // traverse brackets.ts's legacy `external_write` reservation emitter. Its
+  // exact `tool_called` event is nevertheless host-authored at the same
+  // accepted-source boundary and carries the effective operation, canonical
+  // call id, and model-visible arguments. Materialize the same reversible
+  // shape/target identity from that boundary so a corrected host call is not
+  // declared unrecovered merely because it used the newer execution lane.
+  //
+  // Fail closed: synthesize only for a settlement already classified as a
+  // mutation, only when the call event durably carries positive current-
+  // manifest repair authority, and only when an explicit resource target is
+  // extractable. Irreversible/unknown/ambient-destination writes retain exact
+  // call identity and can never be laundered by a later success.
+  const settlementByCallId = new Map(settlements.map((row) => [row.logical_tool_call_id, row]));
+  for (const event of events) {
+    if (event.type !== 'tool_called') continue;
+    const callId = writeCallId(event);
+    if (!callId || index.has(callId)) continue;
+    const row = settlementByCallId.get(callId);
+    if (!row || row.mutating !== 1) continue;
+    const args = modelVisibleArguments(event);
+    // Positive recovery semantics are captured durably while the exact
+    // selected capability manifest and reconcile port are current.
+    // Recomputing them here is unsound: terminal publication may run in a fresh
+    // process where the catalog singleton is absent. Legacy explicitly-
+    // reversible rows remain valid; a durable exact-artifact reconciliation
+    // contract is equally authoritative for a provider-rejected call. Neither
+    // an irreversible declaration nor a missing/malformed contract qualifies.
+    const recovery = parseCurrentManifestRecoverySemantics(event.data.recoverySemantics);
+    const eventOperation = typeof event.data.effectiveTool === 'string'
+      ? event.data.effectiveTool
+      : typeof event.data.toolSlug === 'string'
+        ? event.data.toolSlug
+        : '';
+    const hasDurableRepairAuthority = event.data.reversibility === 'reversible'
+      || Boolean(
+        event.data.reversibility !== 'irreversible'
+        && recovery
+        && eventOperation
+        && catalogOperationIdentitiesEqual(recovery.operationId, eventOperation),
+      );
+    if (!hasDurableRepairAuthority || event.data.effect !== 'external_write') continue;
+    const carrier = typeof event.data.tool === 'string' ? event.data.tool : row.tool_name;
+    const shape = classifyExternalWrite(carrier, args);
+    if (!shape.external || !shape.mutating || !shape.shapeKey) continue;
+    const targets = extractExternalWriteIdentityKeys(args)
+      .map((target) => target.trim().toLowerCase())
+      .filter(Boolean)
+      .sort();
+    if (targets.length === 0) continue;
+    index.set(callId, {
+      shapeTargetKey: JSON.stringify([shape.shapeKey.trim().toLowerCase(), targets]),
       seq: event.seq,
     });
   }
@@ -228,6 +415,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
     attemptedMutations: 0,
     unrecoveredBusinessFailures: 0,
     confirmedWrites: 0,
+    requiredHostExternalWriteProjections: 0,
+    missingHostExternalWriteProjections: 0,
     uncertainWrites: 0,
     blockingUncertainWrites: 0,
     successfulBusinessIdentities: [],
@@ -319,8 +508,89 @@ export function auditAcceptedSourceSettlementTruth(input: {
       && event.data.accounting === 'top_level'
       && event.data.sourceUserSeq === input.sourceUserSeq
       && event.data.successfulAuthoringResult === true).length;
-    const reversibleWrites = reversibleWriteShapeIndex(turnEvents);
+    const reversibleWrites = reversibleWriteShapeIndex(turnEvents, settlements);
     const writeEvidence = resolveWriteEvidence(turnEvents);
+    type RequiredHostExternalWriteProjection = {
+      logical_tool_call_id: string;
+      accepted_task_id: string;
+      physical_dispatch_id: string;
+    };
+    // A successful direct host provider mutation is not complete audit truth
+    // until the write ledger confirms that exact logical/physical crossing.
+    // Derive requirements from normalized immutable authority—not event
+    // presence—so an unrelated confirmed write cannot cover a missing one.
+    const requiredHostExternalWriteProjections = db.prepare(`
+      SELECT settlement.logical_tool_call_id,
+             binding.accepted_task_id,
+             physical.physical_dispatch_id
+        FROM logical_call_settlements settlement
+        JOIN host_call_capability_bindings binding
+          ON binding.session_id = settlement.session_id
+         AND binding.source_user_seq = settlement.source_user_seq
+         AND binding.logical_tool_call_id = settlement.logical_tool_call_id
+        JOIN physical_dispatches physical
+          ON physical.session_id = settlement.session_id
+         AND physical.source_user_seq = settlement.source_user_seq
+         AND physical.logical_tool_call_id = settlement.logical_tool_call_id
+       WHERE settlement.session_id = ? AND settlement.source_user_seq = ?
+         AND settlement.outcome_kind = 'succeeded'
+         AND settlement.execution_kind = 'provider_execution'
+         AND settlement.mutating = 1
+         AND settlement.physical_crossing_count = 1
+         AND settlement.result_handle_id IS NOT NULL
+         AND binding.root_authority_kind = 'host_v1'
+         AND binding.binding_kind = 'catalog_manifest'
+         AND binding.effect IN ('external_write', 'admin')
+         AND physical.ordinal = 1
+         AND physical.relation = 'primary'
+         AND physical.execution_site IS NULL
+         -- A null execution_site means provider-side, not direct-host.
+         -- Nested SDK/carrier owners also record provider rows with a null
+         -- execution site and already project their write lifecycle through
+         -- brackets.ts. Only the deterministic direct-host id belongs to the
+         -- additional hostOwnedExternal coverage invariant below.
+         AND physical.physical_dispatch_id LIKE 'dispatch:host:v1:%'
+         AND physical.state = 'returned'
+    `).all(
+      input.sessionId,
+      input.sourceUserSeq,
+    ) as RequiredHostExternalWriteProjection[];
+    const missingHostExternalWriteProjections = requiredHostExternalWriteProjections.filter((required) => {
+      const expectedPhysicalDispatchId = directHostPhysicalId({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        logicalToolCallId: required.logical_tool_call_id,
+      });
+      if (required.physical_dispatch_id !== expectedPhysicalDispatchId) return true;
+      const matches = writeEvidence.confirmed.filter((reservation) => (
+        reservation.data.preDispatch === true
+        && reservation.data.hostOwnedExternal === true
+        && reservation.data.sourceUserSeq === input.sourceUserSeq
+        && reservation.data.acceptedTaskId === required.accepted_task_id
+        && writeCallId(reservation) === required.logical_tool_call_id
+        && reservation.data.physicalDispatchId === required.physical_dispatch_id
+        && typeof reservation.data.projectionKey === 'string'
+        && reservation.data.projectionKey.startsWith('external-write-reservation:')
+      ));
+      if (matches.length !== 1) return true;
+      const reservation = matches[0]!;
+      const exactSuccesses = turnEvents.filter((terminal) => (
+        terminal.type === 'external_write_succeeded'
+        && terminal.parentEventId === reservation.id
+        && terminal.data.sourceUserSeq === input.sourceUserSeq
+        && terminal.data.acceptedTaskId === required.accepted_task_id
+        && writeCallId(terminal) === required.logical_tool_call_id
+        && terminal.data.physicalDispatchId === required.physical_dispatch_id
+        && (
+          terminal.data.decisiveProjectionKey === `external-write-decisive:${reservation.id}`
+          // Exact compatibility for the brief v76 combined terminal CAS. Its
+          // unique key made success/failure mutually exclusive; v77 split the
+          // orphan and decisive domains so read-back can resolve ambiguity.
+          || terminal.data.terminalProjectionKey === `external-write-terminal:${reservation.id}`
+        )
+      ));
+      return exactSuccesses.length !== 1;
+    });
     // `resolveWriteEvidence` accepts only a terminal for the exact reservation
     // call. A later similar write is not reconciliation: it may be a duplicate.
     // Both proved-present and proved-absent readback terminals remove the
@@ -421,6 +691,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
       attemptedMutations: [...settlements.filter((row) => row.mutating === 1), ...localMutations].length,
       unrecoveredBusinessFailures: unrecovered.length,
       confirmedWrites: writeEvidence.confirmed.length,
+      requiredHostExternalWriteProjections: requiredHostExternalWriteProjections.length,
+      missingHostExternalWriteProjections: missingHostExternalWriteProjections.length,
       uncertainWrites: writeEvidence.uncertain.length,
       blockingUncertainWrites: Math.max(
         writeEvidence.uncertain.length,
@@ -437,6 +709,13 @@ export function auditAcceptedSourceSettlementTruth(input: {
       return {
         status: 'in_flight',
         reason: `${facts.openLogicalCalls} logical call(s) and ${facts.startedDispatches} dispatch(es) remain open`,
+        facts,
+      };
+    }
+    if (facts.missingHostExternalWriteProjections > 0) {
+      return {
+        status: 'write_projection_missing',
+        reason: `${facts.missingHostExternalWriteProjections} successful direct-host external write(s) lack exact confirmed projection`,
         facts,
       };
     }

@@ -44,7 +44,7 @@ import {
   type HarnessRunContext,
 } from './brackets.js';
 import type { RuntimeToolEffect, TrustedRuntimeEffectCarrier } from './tool-effect.js';
-import { getToolOutput, openEventLog, writeToolOutput } from './eventlog.js';
+import { getToolOutput, listEvents, openEventLog, writeToolOutput } from './eventlog.js';
 import { openCanonicalArguments } from './authority-argument-seal.js';
 import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
 import {
@@ -56,6 +56,16 @@ import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { isHostDurableContinuationPendingError } from './host-durable-continuation.js';
 import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
+import {
+  describeExternalWriteEvent,
+  externalWriteTerminalForAttemptOutcome,
+  externalWriteProjectionIdentityFromReservation,
+  loadExternalWriteReservation,
+  projectExternalWriteReservation,
+  projectExternalWriteTerminal,
+  type ExternalWriteEventDescriptor,
+  type ExternalWriteReservationRef,
+} from './external-write-event-projection.js';
 
 export type HostToolInvocationStopReason = 'deadline' | 'caller' | 'kill';
 export type HostToolInvocationBoundary =
@@ -533,17 +543,326 @@ function exactModelCallId(value: string): string {
   return value;
 }
 
-function exactPhysicalId(input: InvokeHostToolCallInput<unknown>): string {
+function directHostPhysicalId(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  modelCallId: string;
+}): string {
   const digest = createHash('sha256').update(JSON.stringify({
-    sessionId: input.identity.sessionId,
-    sourceUserSeq: input.identity.sourceUserSeq,
-    modelCallId: input.identity.modelCallId,
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+    modelCallId: input.modelCallId,
   })).digest('hex');
   return `dispatch:host:v1:${digest}`;
 }
 
+function exactPhysicalId(input: InvokeHostToolCallInput<unknown>): string {
+  return directHostPhysicalId(input.identity);
+}
+
 function mutatingEffect(effect: RuntimeToolEffect): boolean {
   return effect === 'local_write' || effect === 'external_write' || effect === 'admin';
+}
+
+function projectsHostExternalWrite(input: InvokeHostToolCallInput<unknown>): boolean {
+  return input.boundary === 'host_owned_external'
+    && (input.effect === 'external_write' || input.effect === 'admin');
+}
+
+function hostExternalWriteDescriptor(
+  input: InvokeHostToolCallInput<unknown>,
+): ExternalWriteEventDescriptor | undefined {
+  if (!projectsHostExternalWrite(input)) return undefined;
+  const descriptor = describeExternalWriteEvent({
+    toolName: input.identity.toolName,
+    args: input.identity.args,
+    forceMutating: true,
+  });
+  if (!descriptor) {
+    throw new HostToolInvocationAuthorityError(
+      'host-owned external mutation lacks a projectable exact tool identity',
+    );
+  }
+  return descriptor;
+}
+
+type HostPhysicalState =
+  | 'missing'
+  | 'started'
+  | 'returned'
+  | 'threw'
+  | 'timed_out'
+  | 'cancelled'
+  | 'unknown';
+
+function exactHostPhysicalStateForIdentity(
+  identity: InvokeHostToolCallInput<unknown>['identity'],
+  expectedLease?: DispatchLeaseRef,
+): HostPhysicalState {
+  const rows = openEventLog().prepare(`
+    SELECT physical.state, physical.execution_site, physical.accepted_task_id,
+           physical.lease_scope_id, physical.lease_id,
+           lease.accepted_task_id AS lease_accepted_task_id,
+           lease.logical_tool_call_id AS lease_logical_tool_call_id
+      FROM physical_dispatches physical
+      LEFT JOIN run_dispatch_leases lease
+        ON lease.session_id = physical.session_id
+       AND lease.scope_id = physical.lease_scope_id
+       AND lease.lease_id = physical.lease_id
+     WHERE physical.session_id = ? AND physical.source_user_seq = ?
+       AND physical.logical_tool_call_id = ? AND physical.physical_dispatch_id = ?
+  `).all(
+    identity.sessionId,
+    identity.sourceUserSeq,
+    identity.modelCallId,
+    directHostPhysicalId(identity),
+  ) as Array<{
+    state: string;
+    execution_site: string | null;
+    accepted_task_id: string;
+    lease_scope_id: string | null;
+    lease_id: string | null;
+    lease_accepted_task_id: string | null;
+    lease_logical_tool_call_id: string | null;
+  }>;
+  if (rows.length > 1) {
+    throw new HostToolInvocationAuthorityError(
+      'multiple physical rows claim one exact host-owned provider crossing',
+    );
+  }
+  const row = rows[0];
+  if (!row) return 'missing';
+  if (row.execution_site !== null) {
+    throw new HostToolInvocationAuthorityError(
+      'host-owned external projection points at a local physical crossing',
+    );
+  }
+  const acceptedTaskId = acceptedTaskIdFor(
+    identity.sessionId,
+    identity.sourceUserSeq,
+  );
+  if (
+    row.accepted_task_id !== acceptedTaskId
+    || !row.lease_scope_id
+    || !row.lease_id
+    || row.lease_accepted_task_id !== acceptedTaskId
+    || row.lease_logical_tool_call_id !== identity.modelCallId
+    || (expectedLease !== undefined && (
+      expectedLease.sessionId !== identity.sessionId
+      || expectedLease.sourceUserSeq !== identity.sourceUserSeq
+      || expectedLease.acceptedTaskId !== acceptedTaskId
+      || expectedLease.logicalToolCallId !== identity.modelCallId
+      || row.lease_scope_id !== expectedLease.scopeId
+      || row.lease_id !== expectedLease.leaseId
+    ))
+  ) {
+    throw new HostToolInvocationAuthorityError(
+      'host-owned external physical crossing is not owned by its exact call lease',
+    );
+  }
+  if (
+    row.state === 'started'
+    || row.state === 'returned'
+    || row.state === 'threw'
+    || row.state === 'timed_out'
+    || row.state === 'cancelled'
+    || row.state === 'unknown'
+  ) return row.state;
+  throw new HostToolInvocationAuthorityError('host-owned external physical state is invalid');
+}
+
+function exactHostPhysicalState(
+  input: InvokeHostToolCallInput<unknown>,
+  expectedLease?: DispatchLeaseRef,
+): HostPhysicalState {
+  return exactHostPhysicalStateForIdentity(input.identity, expectedLease);
+}
+
+export interface HostExternalWriteProjectionRecoveryRecord {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+  reservationEventId: string;
+  status: 'projected' | 'held';
+  reason?: string;
+}
+
+export interface HostExternalWriteProjectionRecoverySweep {
+  scanned: number;
+  projected: number;
+  held: number;
+  records: HostExternalWriteProjectionRecoveryRecord[];
+}
+
+/**
+ * Bounded restart projection for the two durable crash windows around a direct
+ * host-owned provider mutation. It never enters a tool body and considers only
+ * reservations which lack any terminal event and already have one exact
+ * logical settlement. Open/in-flight calls remain untouched for their lease
+ * owner. The shared projector supplies the race-safe terminal CAS.
+ */
+export function reconcileHostExternalWriteProjections(
+  options: { limit?: number } = {},
+): HostExternalWriteProjectionRecoverySweep {
+  const limit = Math.max(1, Math.min(1_000, Math.trunc(options.limit ?? 100)));
+  let candidates: Array<{ session_id: string; event_id: string }>;
+  try {
+    candidates = openEventLog().prepare(`
+      SELECT reservation.session_id, reservation.id AS event_id
+        FROM events reservation
+       WHERE reservation.type = 'external_write'
+         AND json_extract(reservation.data_json, '$.hostOwnedExternal') = 1
+         AND NOT EXISTS (
+           SELECT 1 FROM events terminal
+            WHERE terminal.session_id = reservation.session_id
+              AND terminal.parent_event_id = reservation.id
+              AND terminal.type IN (
+                'external_write_succeeded',
+                'external_write_failed',
+                'external_write_orphaned'
+              )
+         )
+       ORDER BY reservation.seq
+       LIMIT ?
+    `).all(limit) as Array<{ session_id: string; event_id: string }>;
+  } catch (error) {
+    return {
+      scanned: 0,
+      projected: 0,
+      held: 1,
+      records: [{
+        sessionId: '',
+        sourceUserSeq: 0,
+        logicalToolCallId: '',
+        reservationEventId: '',
+        status: 'held',
+        reason: `projection recovery scan failed: ${String(error instanceof Error ? error.message : error).slice(0, 180)}`,
+      }],
+    };
+  }
+  const records: HostExternalWriteProjectionRecoveryRecord[] = [];
+  for (const candidate of candidates) {
+    let sourceUserSeq = 0;
+    let logicalToolCallId = '';
+    try {
+      const reservations = listEvents(candidate.session_id, { types: ['external_write'] })
+        .filter((event) => event.id === candidate.event_id);
+      if (reservations.length !== 1) {
+        throw new HostToolInvocationAuthorityError(
+          'projection recovery lacks one exact reservation event',
+        );
+      }
+      const reservationEvent = reservations[0]!;
+      const identity = externalWriteProjectionIdentityFromReservation(reservationEvent);
+      const acceptedTaskId = typeof reservationEvent.data.acceptedTaskId === 'string'
+        ? reservationEvent.data.acceptedTaskId.trim()
+        : '';
+      const physicalDispatchId = typeof reservationEvent.data.physicalDispatchId === 'string'
+        ? reservationEvent.data.physicalDispatchId.trim()
+        : '';
+      sourceUserSeq = typeof reservationEvent.data.sourceUserSeq === 'number'
+        && Number.isSafeInteger(reservationEvent.data.sourceUserSeq)
+        && reservationEvent.data.sourceUserSeq > 0
+        ? reservationEvent.data.sourceUserSeq
+        : 0;
+      logicalToolCallId = identity?.reservation.callId ?? '';
+      if (!identity || !sourceUserSeq || !acceptedTaskId || !physicalDispatchId) {
+        throw new HostToolInvocationAuthorityError(
+          'projection recovery reservation identity is incomplete',
+        );
+      }
+      if (
+        acceptedTaskIdFor(candidate.session_id, sourceUserSeq) !== acceptedTaskId
+        || directHostPhysicalId({
+          sessionId: candidate.session_id,
+          sourceUserSeq,
+          modelCallId: logicalToolCallId,
+        }) !== physicalDispatchId
+      ) {
+        throw new HostToolInvocationAuthorityError(
+          'projection recovery reservation conflicts with direct-host identity',
+        );
+      }
+      const prior = redeemDurableLogicalCallSettlementForHost({
+        sessionId: candidate.session_id,
+        sourceUserSeq,
+        acceptedTaskId,
+        logicalToolCallId,
+      });
+      if (prior.status !== 'ok') {
+        throw new HostToolInvocationAuthorityError(
+          `projection recovery logical settlement is ${prior.status}`,
+        );
+      }
+      const physicalState = exactHostPhysicalStateForIdentity({
+        sessionId: candidate.session_id,
+        sourceUserSeq,
+        modelCallId: logicalToolCallId,
+        toolName: identity.descriptor.toolName,
+        args: identity.descriptor.args,
+        turn: reservationEvent.turn,
+      });
+      const provenNoCrossing = physicalState === 'missing'
+        && prior.settlement.executionKind === 'refused_pre_dispatch'
+        && prior.settlement.physicalCrossingCount === 0;
+      if (physicalState === 'missing' && !provenNoCrossing) {
+        throw new HostToolInvocationAuthorityError(
+          'projection recovery cannot prove that a missing crossing never started',
+        );
+      }
+      const mapperPhysicalState = physicalState === 'started'
+        ? 'unknown' as const
+        : provenNoCrossing
+          ? 'not_started' as const
+          : physicalState === 'missing'
+            ? 'unknown' as const
+            : physicalState;
+      const terminalType = physicalState === 'started'
+        ? 'external_write_orphaned' as const
+        : externalWriteTerminalForAttemptOutcome(
+            prior.settlement.outcome,
+            mapperPhysicalState,
+            { hasDurableResultHandle: Boolean(prior.settlement.resultHandleId) },
+          );
+      projectExternalWriteTerminal({
+        sessionId: candidate.session_id,
+        turn: reservationEvent.turn,
+        sourceUserSeq,
+        acceptedTaskId,
+        physicalDispatchId,
+        ...identity,
+        type: terminalType,
+        reason: prior.settlement.outcome.detail
+          ?? `restart_projection_${prior.settlement.outcome.kind}`,
+        data: {
+          restartProjection: true,
+          physicalOutcome: mapperPhysicalState,
+        },
+      });
+      records.push({
+        sessionId: candidate.session_id,
+        sourceUserSeq,
+        logicalToolCallId,
+        reservationEventId: candidate.event_id,
+        status: 'projected',
+      });
+    } catch (error) {
+      records.push({
+        sessionId: candidate.session_id,
+        sourceUserSeq,
+        logicalToolCallId,
+        reservationEventId: candidate.event_id,
+        status: 'held',
+        reason: String(error instanceof Error ? error.message : error).slice(0, 180),
+      });
+    }
+  }
+  return {
+    scanned: candidates.length,
+    projected: records.filter((record) => record.status === 'projected').length,
+    held: records.filter((record) => record.status === 'held').length,
+    records,
+  };
 }
 
 function stopError(reason: HostToolInvocationStopReason, deadlineMs: number): Error {
@@ -807,6 +1126,10 @@ export async function invokeHostToolCall<T>(
     toolName: recoveryMaterial.toolName,
     argumentDigest: recoveryMaterial.argumentDigest,
   };
+  const externalWriteDescriptor = hostExternalWriteDescriptor(input);
+  const externalWritePhysicalDispatchId = externalWriteDescriptor
+    ? exactPhysicalId(input)
+    : undefined;
   const frozenBusinessCall = input.businessCall ?? true;
   const nestedReadOwner = input.nestedReadOwnerLogicalToolCallId?.trim();
   if (nestedReadOwner) {
@@ -895,7 +1218,98 @@ export async function invokeHostToolCall<T>(
         'settled logical call conflicts with the current invocation contract',
       );
     }
+    if (externalWriteDescriptor && externalWritePhysicalDispatchId) {
+      const physicalState = exactHostPhysicalState(input);
+      const provenNoCrossing = physicalState === 'missing'
+        && prior.settlement.executionKind === 'refused_pre_dispatch'
+        && prior.settlement.physicalCrossingCount === 0;
+      if (physicalState === 'missing' && !provenNoCrossing) {
+        throw new HostToolInvocationAuthorityError(
+          'settled host-owned external mutation lacks its exact terminal physical crossing',
+        );
+      }
+      const reservation = loadExternalWriteReservation({
+        sessionId: input.identity.sessionId,
+        sourceUserSeq: input.identity.sourceUserSeq,
+        acceptedTaskId,
+        callId: modelCallId,
+        descriptor: externalWriteDescriptor,
+        physicalDispatchId: externalWritePhysicalDispatchId,
+      });
+      if (!reservation && !provenNoCrossing) {
+        throw new HostToolInvocationAuthorityError(
+          'settled host-owned external mutation lacks its pre-dispatch write reservation',
+        );
+      }
+      // A typed preparation refusal intentionally happens before reservation.
+      // Its zero-crossing replay must not invent a write lifecycle. A
+      // reservation which exists before physical-admission failure, however,
+      // is durably projected as failed/no-effect.
+      if (reservation) {
+        const terminalType = physicalState === 'started'
+          ? 'external_write_orphaned' as const
+          : externalWriteTerminalForAttemptOutcome(
+              prior.settlement.outcome,
+              provenNoCrossing
+                ? 'not_started'
+                : physicalState === 'missing'
+                  ? 'unknown'
+                  : physicalState,
+              { hasDurableResultHandle: Boolean(prior.settlement.resultHandleId) },
+            );
+        projectExternalWriteTerminal({
+          sessionId: input.identity.sessionId,
+          turn: input.identity.turn,
+          sourceUserSeq: input.identity.sourceUserSeq,
+          acceptedTaskId,
+          physicalDispatchId: externalWritePhysicalDispatchId,
+          reservation,
+          descriptor: externalWriteDescriptor,
+          type: terminalType,
+          reason: prior.settlement.outcome.detail ?? `settled_${prior.settlement.outcome.kind}`,
+          data: {
+            replayProjection: true,
+            physicalOutcome: provenNoCrossing ? 'not_started' : physicalState,
+          },
+        });
+        if (physicalState === 'started') {
+          throw new HostToolInvocationAuthorityError(
+            'settled host-owned external mutation retains a started physical crossing',
+          );
+        }
+        if (
+          prior.settlement.outcome.kind === 'succeeded'
+          && terminalType !== 'external_write_succeeded'
+        ) {
+          throw new HostToolInvocationAuthorityError(
+            'settled host-owned external success lacks returned physical acknowledgement truth',
+          );
+        }
+      }
+    }
     if (!['succeeded', 'empty_result'].includes(prior.settlement.outcome.kind)) {
+      if (
+        prior.settlement.executionKind === 'refused_pre_dispatch'
+        && prior.settlement.physicalCrossingCount === 0
+      ) {
+        const retained = getToolOutput(input.identity.sessionId, modelCallId);
+        if (
+          retained
+          && !retained.truncatedAtWrite
+          && retained.tool === contract.toolName
+          && prior.settlement.outcome.kind === 'invalid_arguments'
+        ) {
+          return {
+            value: retained.output as T,
+            settlement: {
+              outcome: prior.settlement.outcome,
+              openedDiscoveryEpoch: prior.settlement.recovery.openedDiscoveryEpoch,
+              creditedProgress: prior.settlement.recovery.creditedProgress,
+              duplicate: true,
+            },
+          };
+        }
+      }
       if (contract.toolName === 'plan_task') {
         const retained = getToolOutput(input.identity.sessionId, modelCallId);
         if (
@@ -1091,6 +1505,26 @@ export async function invokeHostToolCall<T>(
       () => {
         let topCrossing: PhysicalCrossingIdentity | undefined;
         let topCrossingTool: string | undefined;
+        let externalWriteReservation: ExternalWriteReservationRef | undefined;
+        const projectExternalWrite = (
+          type: 'external_write_succeeded' | 'external_write_failed' | 'external_write_orphaned',
+          reason: string,
+          physicalOutcome: string,
+        ): void => {
+          if (!externalWriteDescriptor || !externalWriteReservation || !externalWritePhysicalDispatchId) return;
+          projectExternalWriteTerminal({
+            sessionId: input.identity.sessionId,
+            turn: input.identity.turn,
+            sourceUserSeq: input.identity.sourceUserSeq,
+            acceptedTaskId,
+            physicalDispatchId: externalWritePhysicalDispatchId,
+            reservation: externalWriteReservation,
+            descriptor: externalWriteDescriptor,
+            type,
+            reason,
+            data: { physicalOutcome },
+          });
+        };
         const rememberTopCrossing = (identity: PhysicalCrossingIdentity): void => {
           const stored = openEventLog().prepare(`
             SELECT tool_name FROM physical_dispatches
@@ -1172,6 +1606,14 @@ export async function invokeHostToolCall<T>(
             reason: string,
             cause?: unknown,
           ): Promise<never> => {
+            if (externalWriteReservation) {
+              const physicalState = exactHostPhysicalState(input, childLease);
+              projectExternalWrite(
+                physicalState === 'missing' ? 'external_write_failed' : 'external_write_orphaned',
+                reason,
+                physicalState === 'missing' ? 'not_started' : physicalState,
+              );
+            }
             await revokeDispatchLeaseBeforeRecovery(childLease);
             try {
               // This exact revoked generation is now the sole recovery owner.
@@ -1236,6 +1678,12 @@ export async function invokeHostToolCall<T>(
               });
               assertDispatchLeaseCurrent(childLease);
               if (preparation instanceof InvalidArgumentsPreDispatchResult) {
+                writeToolOutput({
+                  sessionId: input.identity.sessionId,
+                  callId: modelCallId,
+                  tool: contract.toolName,
+                  output: preparation.output,
+                });
                 const settlement = settleToolAttempt({
                   sessionId: input.identity.sessionId,
                   sourceUserSeq: input.identity.sourceUserSeq,
@@ -1267,6 +1715,26 @@ export async function invokeHostToolCall<T>(
                   : 'before-physical preparation refused',
                 error,
               );
+            }
+          }
+          if (externalWriteDescriptor && externalWritePhysicalDispatchId) {
+            try {
+              externalWriteReservation = projectExternalWriteReservation({
+                sessionId: input.identity.sessionId,
+                turn: input.identity.turn,
+                sourceUserSeq: input.identity.sourceUserSeq,
+                acceptedTaskId,
+                callId: modelCallId,
+                physicalDispatchId: externalWritePhysicalDispatchId,
+                descriptor: externalWriteDescriptor,
+                attribution: {
+                  ...(childContext.behaviorScopeId ? { runScopeId: childContext.behaviorScopeId } : {}),
+                  ...(childContext.executionId ? { executionId: childContext.executionId } : {}),
+                },
+                data: { hostOwnedExternal: true },
+              });
+            } catch (error) {
+              await refuseBeforePhysical('external-write reservation failed', error);
             }
           }
           const admitted = beginPhysicalDispatch({
@@ -1537,6 +2005,17 @@ export async function invokeHostToolCall<T>(
                         ...(isMutating ? { acknowledged: false } : {}),
                       },
                 });
+                if (externalWriteDescriptor) {
+                  projectExternalWrite(
+                    externalWriteTerminalForAttemptOutcome(
+                      settlement.outcome,
+                      'unknown',
+                      { hasDurableResultHandle: Boolean(settlement.resultHandleId) },
+                    ),
+                    settlement.outcome.detail ?? `stopped_${reason}`,
+                    'unknown',
+                  );
+                }
                 state = 'done';
                 reject(isMutating
                   ? new HostToolInvocationUncertainError(reason, settlement)
@@ -1587,7 +2066,7 @@ export async function invokeHostToolCall<T>(
                   'reason' in terminal ? terminal.reason : 'kill terminalization was not authoritative',
                 );
                 controller.abort(authorityError);
-                logicalSettlement({
+                const settlement = logicalSettlement({
                   thrown: authorityError,
                   thrownPresent: true,
                   signals: {
@@ -1596,6 +2075,17 @@ export async function invokeHostToolCall<T>(
                     ...(isMutating ? { acknowledged: false } : {}),
                   },
                 });
+                if (externalWriteDescriptor) {
+                  projectExternalWrite(
+                    externalWriteTerminalForAttemptOutcome(
+                      settlement.outcome,
+                      'unknown',
+                      { hasDurableResultHandle: Boolean(settlement.resultHandleId) },
+                    ),
+                    settlement.outcome.detail ?? 'kill_authority_unreadable',
+                    'unknown',
+                  );
+                }
                 state = 'done';
                 reject(authorityError);
               } catch (error) {
@@ -1653,6 +2143,18 @@ export async function invokeHostToolCall<T>(
                   const settlement = input.boundary === 'nested_owned'
                     ? adoptedNestedSettlement({ value })
                     : logicalSettlement({ result: value, resultPresent: true });
+                  if (externalWriteDescriptor) {
+                    const terminalType = externalWriteTerminalForAttemptOutcome(
+                      settlement.outcome,
+                      'returned',
+                      { hasDurableResultHandle: Boolean(settlement.resultHandleId) },
+                    );
+                    projectExternalWrite(
+                      terminalType,
+                      settlement.outcome.detail ?? `returned_${settlement.outcome.kind}`,
+                      'returned',
+                    );
+                  }
                   if (contract.toolName === 'plan_task') {
                     enforceSettledPlanTaskResult({
                       value,
@@ -1700,7 +2202,20 @@ export async function invokeHostToolCall<T>(
                   }
                   closeTop('threw');
                   if (input.boundary === 'nested_owned') adoptedNestedSettlement();
-                  else logicalSettlement({ thrown: error, thrownPresent: true });
+                  else {
+                    const settlement = logicalSettlement({ thrown: error, thrownPresent: true });
+                    if (externalWriteDescriptor) {
+                      projectExternalWrite(
+                        externalWriteTerminalForAttemptOutcome(
+                          settlement.outcome,
+                          'threw',
+                          { hasDurableResultHandle: Boolean(settlement.resultHandleId) },
+                        ),
+                        settlement.outcome.detail ?? 'provider_body_threw',
+                        'threw',
+                      );
+                    }
+                  }
                   await revokeDispatchLeaseBeforeRecovery(childLease);
                   state = 'done';
                   reject(error);

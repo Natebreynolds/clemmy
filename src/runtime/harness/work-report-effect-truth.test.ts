@@ -22,7 +22,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describeExternalWrite, synthesizeWorkReport } from './work-report.js';
+import { describeExternalWrite, resolveWriteEvidence, synthesizeWorkReport } from './work-report.js';
 import type { EventRow } from './eventlog.js';
 // The console mirror — pure TS, no DOM. Parity is pinned here because
 // console-web cannot import server modules.
@@ -128,6 +128,46 @@ test('CONNECTION pin: synthesizeWorkReport passes the recorded irreversible bit 
   assert.ok(report, 'expected a synthesized report');
   assert.doesNotMatch(report, /sent/i, `real callsite still says Sent: ${report}`);
   assert.match(report, /Updated a record/);
+});
+
+test('write resolution gives decisive truth precedence over orphan and fails closed on conflicting decisive terminals', () => {
+  const reservation = row({
+    seq: 20,
+    id: 'reservation-decisive-order',
+    data: {
+      preDispatch: true,
+      canonicalCallId: 'call-decisive-order',
+      shapeKey: 'UPDATE_RECORD',
+    },
+  });
+  const success = row({
+    seq: 21,
+    id: 'success-decisive-order',
+    type: 'external_write_succeeded' as EventRow['type'],
+    parentEventId: reservation.id,
+    data: { canonicalCallId: 'call-decisive-order', shapeKey: 'UPDATE_RECORD' },
+  });
+  const lateOrphan = row({
+    seq: 22,
+    id: 'orphan-after-decisive',
+    type: 'external_write_orphaned' as EventRow['type'],
+    parentEventId: reservation.id,
+    data: { canonicalCallId: 'call-decisive-order', shapeKey: 'UPDATE_RECORD' },
+  });
+  const decisive = resolveWriteEvidence([reservation, success, lateOrphan]);
+  assert.deepEqual(decisive.confirmed.map((event) => event.id), [reservation.id]);
+  assert.equal(decisive.uncertain.length, 0, 'orphan cannot downgrade decisive success');
+
+  const conflict = row({
+    seq: 23,
+    id: 'failed-conflict-after-success',
+    type: 'external_write_failed' as EventRow['type'],
+    parentEventId: reservation.id,
+    data: { canonicalCallId: 'call-decisive-order', shapeKey: 'UPDATE_RECORD' },
+  });
+  const conflicted = resolveWriteEvidence([reservation, success, lateOrphan, conflict]);
+  assert.equal(conflicted.confirmed.length, 0);
+  assert.deepEqual(conflicted.uncertain.map((event) => event.id), [reservation.id]);
 });
 
 test('PARITY pin: server and console-web copies phrase-match over the fixture table', () => {

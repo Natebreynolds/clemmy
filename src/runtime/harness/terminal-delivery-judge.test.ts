@@ -33,6 +33,8 @@ function audit(
       successfulSdkAuthoringResults: 0,
       unrecoveredBusinessFailures: status === 'unrecovered_failure' ? 1 : 0,
       confirmedWrites: 1,
+      requiredHostExternalWriteProjections: 0,
+      missingHostExternalWriteProjections: 0,
       uncertainWrites: status === 'uncertain_write' ? 1 : 0,
       blockingUncertainWrites: status === 'uncertain_write' ? 1 : 0,
       successfulBusinessIdentities: [],

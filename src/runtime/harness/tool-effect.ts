@@ -11,7 +11,11 @@ import {
   peekHostCapabilityCatalogFactory,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
-import { isMutatingExternalWrite } from './execution-gate.js';
+import { classifyCanonicalExternalEffect, isMutatingExternalWrite } from './execution-gate.js';
+import {
+  currentManifestRecoverySemantics,
+  type CurrentManifestRecoverySemanticsV1,
+} from './current-manifest-operation-semantics.js';
 import { resolveCallToolAlias } from '../../tools/call-tool-alias.js';
 import {
   catalogOperationIdentityKey,
@@ -864,12 +868,26 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
 export function runtimeToolAccountingMetadata(
   toolName: string,
   rawArgs: unknown,
-): { effect: RuntimeToolEffect; effectiveTool?: string; toolSlug?: string } {
+): {
+  effect: RuntimeToolEffect;
+  effectiveTool?: string;
+  toolSlug?: string;
+  /** Durable positive semantics captured while the exact capability manifest
+   * is current. Omitted for read-only, unknown, or unproven operations. */
+  reversibility?: 'reversible' | 'irreversible';
+  /** Exact current-manifest authority for same-shape/target repair. This is
+   * durable because terminal publication may run without the live catalog. */
+  recoverySemantics?: CurrentManifestRecoverySemanticsV1;
+} {
   const args = decodedToolArgs(rawArgs);
   const effect = classifyRuntimeToolEffect(toolName, args).effect;
+  const externalEffect = classifyCanonicalExternalEffect(toolName, args);
   const tail = localToolTail(toolName);
   const effectiveIdentity = unwrapRuntimeEffectiveToolIdentity(toolName, rawArgs);
   const effectiveTool = canonicalRuntimeEffectiveToolName(effectiveIdentity.toolName);
+  const recoverySemantics = effect === 'external_write'
+    ? currentManifestRecoverySemantics(effectiveTool)
+    : null;
   const slug = isTrustedComposioGateway(toolName)
     ? composioSlug(args)
     : isTrustedDynamicComposioTool(toolName)
@@ -879,5 +897,13 @@ export function runtimeToolAccountingMetadata(
     effect,
     ...(effectiveTool ? { effectiveTool } : {}),
     ...(slug ? { toolSlug: slug } : {}),
+    ...(externalEffect.external
+      && externalEffect.mutating
+      && externalEffect.reversibility === 'irreversible'
+      ? { reversibility: 'irreversible' as const }
+      : recoverySemantics?.basis === 'reversible_operation'
+        ? { reversibility: 'reversible' as const }
+        : {}),
+    ...(recoverySemantics ? { recoverySemantics } : {}),
   };
 }

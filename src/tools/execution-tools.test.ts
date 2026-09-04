@@ -888,13 +888,29 @@ test('execution_reconcile_write settles an ambiguous attempt from ANY read whose
   // The ambiguous attempt: dispatch started, outcome never settled (the live
   // 2026-07-30 rail — the model verified the draft absent and had NO verb to
   // record it, so the duplicate-safety hold wedged forever).
-  appendEvent({
+  const ambiguousReservation = appendEvent({
     sessionId, turn: 1, role: 'system', type: 'external_write',
     data: {
       sourceUserSeq: source.seq,
       callId: 'draft-ambiguous', canonicalCallId: 'draft-ambiguous',
       actionKey: 'email:draft', shapeKey: 'OUTLOOK_CREATE_DRAFT',
       targets: ['annie@example.com'], preDispatch: true,
+    },
+  });
+  appendEvent({
+    sessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_orphaned',
+    parentEventId: ambiguousReservation.id,
+    data: {
+      sourceUserSeq: source.seq,
+      callId: 'draft-ambiguous',
+      canonicalCallId: 'draft-ambiguous',
+      actionKey: 'email:draft',
+      shapeKey: 'OUTLOOK_CREATE_DRAFT',
+      targets: ['annie@example.com'],
+      reason: 'provider outcome unknown',
     },
   });
   const reconcile = registeredToolHandlers().get('execution_reconcile_write');

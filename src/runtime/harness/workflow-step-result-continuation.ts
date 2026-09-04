@@ -60,6 +60,7 @@ export function missingWorkflowStepResultContinuation(input: {
   if (
     audit.status === 'in_flight'
     || audit.status === 'uncertain_write'
+    || audit.status === 'write_projection_missing'
     || audit.status === 'storage_error'
   ) return null;
 

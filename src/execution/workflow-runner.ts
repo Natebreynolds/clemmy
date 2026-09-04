@@ -1427,7 +1427,8 @@ export function auditWorkflowRunSettlementTruth(runId: string): {
       // source-owned until their exact dispatch/write authority settles them.
       const hardBlocker = audit.status === 'storage_error'
         || audit.status === 'in_flight'
-        || audit.status === 'uncertain_write';
+        || audit.status === 'uncertain_write'
+        || audit.status === 'write_projection_missing';
       const laterSuccessKeys = new Set(
         audited
           .filter((candidate) =>

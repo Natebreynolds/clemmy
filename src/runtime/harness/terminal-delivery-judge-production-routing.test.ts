@@ -146,6 +146,8 @@ test('a Claude-self then Codex-independent chain executes only Codex once', asyn
         successfulSdkAuthoringResults: 0,
         unrecoveredBusinessFailures: 0,
         confirmedWrites: 0,
+        requiredHostExternalWriteProjections: 0,
+        missingHostExternalWriteProjections: 0,
         uncertainWrites: 0,
         blockingUncertainWrites: 0,
         successfulBusinessIdentities: [],
