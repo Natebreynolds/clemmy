@@ -6376,6 +6376,24 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               ...(attempt.consequence ? { consequence: attempt.consequence } : {}),
             });
             noProgressState = decision.state;
+            // GOVERNOR VISIBILITY. Every termination on 2026-09-03 was
+            // attributed by INFERENCE — the governor decided runs were over and
+            // wrote nothing about why. One such diagnosis cost ninety minutes
+            // and four wrong conclusions, and twice produced "fixes" for
+            // behaviour the code already had. The decision, the consequence key
+            // it turned on, and the two budgets are all in hand right here.
+            journalHostGuide('no_progress_decision', {
+              action: decision.action,
+              reason: decision.reason ?? null,
+              attemptClass: attempt.attemptClass,
+              consequenceKey: attempt.consequence?.key ?? null,
+              consequenceStage: attempt.consequence?.stage ?? null,
+              retriesRemaining: decision.state.retriesRemaining,
+              stageTransitionsRemaining: decision.state.stageTransitionsRemaining,
+              seenConsequenceKeys: decision.state.seenConsequenceKeys.slice(0, 8),
+              noProgressAttempts: decision.state.noProgressAttempts,
+              gained: (decision.gained ?? []).slice(0, 8),
+            });
             if (decision.action === 'terminalize') {
               // GUIDE, NOT GATE: the model gets one last-word turn with what
               // the governor observed before the harness ends the turn with
