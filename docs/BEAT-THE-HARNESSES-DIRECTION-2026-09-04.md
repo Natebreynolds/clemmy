@@ -582,3 +582,43 @@ daemon to free a port.
 7. **Line numbers in this document drift within hours** (host-turn-runner.ts grew
    9,012 → 9,088 during the audit itself). Re-grep for the named symbol; never edit
    at a remembered line number.
+
+---
+
+## 12. Reviewer log (append-only — executing agent: re-read at every phase boundary)
+
+The reviewer session watches every commit and canary outcome against this doc.
+Entries here are review feedback: act on them by committing a fix or by recording
+your disagreement (with evidence) in your phase report. Do not edit or delete
+entries; the reviewer appends, you respond in commits and reports.
+
+**2026-09-04 ~16:00 — P0 staging review, commits `b5aaaaf0` → `4d9036a9`:**
+
+- **All commits reviewed CLEAN.** Zero violations: no provider-named production
+  branches, no new flags/doors, coherent themed batches, tests travel with their
+  code. Provider names found only in test fixtures (allowed).
+- `e82c240a`: migrations **76+77 landed together** with their projection —
+  immutability rule honored. Consumers followed correctly in `911a6cf0`
+  (brackets) and `fb71c914` (execution-tools + ledger write-truth batch).
+- ⭐ **`34d9dd63` (honor explicit Claude routes in all-in) is on the §9 critical
+  path and NEEDS LIVE VERIFICATION.** It deletes the all_in early-return behind
+  §9.1 constraint 2. Before updating §9.1(2)/§9.4 row 3, the P1 canary report must
+  prove the pinned judge reaches the **Claude wire** (provider label at the
+  transport, not route metadata — the commit's own message records "route metadata
+  said Claude while GLM was billed" as the failure mode). Include this check next
+  to the §10.3 `claudeAvailable()` precondition.
+- `a80f515f` → `87534a3d`: benign local rewrite (branch unpushed).
+  **`src/runtime/harness/resolved-carrier-refusal.ts` was pulled back out of the
+  batch and is dirty again** — make sure it lands in a themed commit and is not
+  orphaned at P0 close.
+- `ae6d3523` touches `call-tool.ts` on the four-failed-fixes seam but only the
+  composio port-prep path, NOT the `:908` refusal branch — acceptable; the §11.1
+  instrument-before-edit rule still stands for that branch.
+- **Standing item for the owner:** the live daemon keeps auto-re-arming
+  `bg-graph-driver-tag-canary-20260904` (~90 s died→restart loop) on the unfrozen
+  tree — every run is non-evidentiary (§6) and spends real model quota. Consider
+  pausing the task until P0 closes and the tree is frozen.
+- **P0 remaining, being watched:** ~80 dirty entries; inert attempts must be
+  DROPPED not committed; implementation artifacts re-emit
+  (`--verify-current` must exit 0 — check the real exit code, never through a
+  pipe); merge + v3.16.0 tag PREP (execution waits for owner approval).
