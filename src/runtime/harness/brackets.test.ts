@@ -30,6 +30,7 @@ const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput,
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const capabilityManifests = await import('./capability-manifest.js');
+const { HostLocalExecutionFailureResult } = await import('./attempt-settlement.js');
 const { formatRecallableToolText } = await import('./tool-output-format.js');
 const { getToolOutputContext } = await import('./tool-output-context.js');
 const {
@@ -344,6 +345,33 @@ test('carrier-owned returned failures never settle as successful local work', as
       assert.equal(settled.data.physicalDispatchCount, 0, 'no provider crossing is invented');
     }
   }
+});
+
+test('nominal local MCP failure settles failed while preserving model-facing text', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const source = anchorAcceptedTask(session.id, 'Refresh the saved workspace now.');
+  const failureText = 'Refresh failed for "workspace-proof": source read was blocked.';
+  const wrapped = wrapToolForHarness({
+    name: 'space_refresh',
+    execute: async () => new HostLocalExecutionFailureResult(failureText),
+  });
+
+  const outward = await withHarnessRunContext({
+    sessionId: session.id,
+    sourceUserSeq: source.sourceUserSeq,
+    turn: source.turn,
+    behaviorScopeId: 'nominal-local-mcp-failure',
+    counter: new ToolCallsCounter(4),
+  }, () => wrapped.execute!({ slug: 'workspace-proof', source_id: null }, null));
+
+  assert.equal(outward, failureText, 'the nominal marker is consumed before model delivery');
+  const settled = listEvents(session.id, { types: ['tool_attempt_settled'] })
+    .find((event) => event.data.tool === 'space_refresh');
+  assert.ok(settled);
+  assert.notEqual(settled.data.kind, 'succeeded');
+  assert.equal(settled.data.detail, 'execution_failed');
+  assert.equal(settled.data.creditedProgress, false);
 });
 
 test('parallelPreWriteGatesEnabled: DEFAULT-ON with =off kill-switch', () => {
@@ -995,6 +1023,72 @@ test('wrapToolForHarness: invoke and execute expose the exact sourceUserSeq to t
   } finally {
     if (prev === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = prev;
+  }
+});
+
+test('shared write projector stamps the canonical accepted task when source A finishes after source B arrives', async () => {
+  const saved = {
+    HARNESS_TOOL_BRACKETS: process.env.HARNESS_TOOL_BRACKETS,
+    CLEMMY_EXECUTION_GATE: process.env.CLEMMY_EXECUTION_GATE,
+    CLEMMY_CONFIRM_FIRST: process.env.CLEMMY_CONFIRM_FIRST,
+    CLEMMY_GROUNDING_GATE: process.env.CLEMMY_GROUNDING_GATE,
+    CLEMMY_GOAL_FIDELITY_GATE: process.env.CLEMMY_GOAL_FIDELITY_GATE,
+    CLEMMY_OUTPUT_GROUNDING_GATE: process.env.CLEMMY_OUTPUT_GROUNDING_GATE,
+    CLEMMY_DESTINATION_GATE: process.env.CLEMMY_DESTINATION_GATE,
+  };
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_GOAL_FIDELITY_GATE = 'off';
+  process.env.CLEMMY_OUTPUT_GROUNDING_GATE = 'off';
+  process.env.CLEMMY_DESTINATION_GATE = 'off';
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const sourceA = appendEvent({
+    sessionId: session.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Create the alpha record.' },
+  });
+  anchorExistingSource(session.id, sourceA);
+  appendEvent({
+    sessionId: session.id,
+    turn: 2,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'A newer message arrived while source A was running.' },
+  });
+  try {
+    const wrapped = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: async () => ({ successful: true, data: { id: 'rec-alpha' } }),
+    });
+    await withHarnessRunContext({
+      sessionId: session.id,
+      sourceUserSeq: sourceA.seq,
+      behaviorScopeId: 'late-source-a-write',
+      counter: new ToolCallsCounter(10),
+    }, () => wrapped.execute!({
+      tool_slug: 'AIRTABLE_CREATE_RECORD',
+      arguments: { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Alpha' } },
+    }));
+
+    const [reservation] = listEvents(session.id, { types: ['external_write'] });
+    const [success] = listEvents(session.id, { types: ['external_write_succeeded'] });
+    const acceptedTaskId = `task:${session.id}#${sourceA.seq}`;
+    assert.ok(reservation && success);
+    assert.equal(reservation.data.sourceUserSeq, sourceA.seq);
+    assert.equal(reservation.data.acceptedTaskId, acceptedTaskId);
+    assert.equal(success.data.sourceUserSeq, sourceA.seq);
+    assert.equal(success.data.acceptedTaskId, acceptedTaskId);
+    assert.equal(success.parentEventId, reservation.id);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

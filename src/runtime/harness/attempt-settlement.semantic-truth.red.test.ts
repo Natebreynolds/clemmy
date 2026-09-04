@@ -240,6 +240,37 @@ test('an ordinary local string result still settles succeeded with host evidence
   assert.equal(settled.outcome.detail, 'host_execution');
 });
 
+test('a nominal host-local semantic failure cannot be upgraded to host-execution success', () => {
+  const task = accept('failed local aggregate');
+  const callId = 'logical:failed-local-aggregate';
+  const args = { slug: 'workspace-proof', source_id: null };
+  admitReturnedHostCrossing({
+    task,
+    logicalToolCallId: callId,
+    tool: 'space_refresh',
+    args,
+  });
+  const settled = settlement.settleToolAttempt({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    turn: task.turn,
+    lane: 'byo',
+    toolName: 'space_refresh',
+    callId,
+    args,
+    mutating: true,
+    businessCall: false,
+    result: new settlement.HostLocalExecutionFailureResult(
+      'Refresh failed for "workspace-proof": source failed before provider dispatch.',
+    ),
+  });
+
+  assert.notEqual(settled.outcome.kind, 'succeeded');
+  assert.equal(settled.outcome.detail, 'execution_failed');
+  assert.equal(settled.resultHandleId, undefined);
+  assert.equal(successHandleCount(task), 0);
+});
+
 test('the exact completed capability-adapter carrier settles its nested provider acknowledgement', () => {
   // Live Platform 49, 2026-08-31: both Slack and Sheets returned this exact
   // host-adapter shape with successful:true. Settlement sampled only the outer

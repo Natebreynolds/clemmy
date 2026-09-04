@@ -45,6 +45,12 @@ import {
   unwrapExternalWritePreDispatchResult,
   withExternalWriteAdmissionLock,
 } from './external-write-admission.js';
+import {
+  describeExternalWriteEvent,
+  projectExternalWriteReservation,
+  projectExternalWriteTerminal,
+  type ExternalWriteReservationRef,
+} from './external-write-event-projection.js';
 import { listPending as listPendingApprovals } from './approval-registry.js';
 import { evaluateToolCall, applyMode, noteGuardrailToolResult, noteGuardrailObservedCost } from './tool-guardrail.js';
 import {
@@ -183,12 +189,14 @@ import {
   attemptSignalsFromTypedResult,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
+  unwrapHostLocalExecutionFailureResult,
 } from './attempt-settlement.js';
 import {
   actionExpectedWorkRequired,
   currentExpectedWorkBinding,
 } from './expected-work-admission.js';
 import {
+  acceptedTaskIdFor,
   authorizeResolvedLogicalCallContract,
   currentLogicalCall,
   withLogicalToolCall,
@@ -1423,15 +1431,22 @@ export class ExternalWriteReservationError extends Error {
 
 function currentExternalWriteEventAttribution(invocationNonce?: string): {
   sourceUserSeq?: number;
+  acceptedTaskId?: string;
   runScopeId?: string;
   executionId?: string;
   invocationNonce?: string;
 } {
   const ctx = harnessRunContextStorage.getStore();
   const exactInvocationNonce = invocationNonce?.trim();
+  const exactSourceUserSeq = Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
+    ? ctx?.sourceUserSeq as number
+    : undefined;
   return {
-    ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
-      ? { sourceUserSeq: ctx?.sourceUserSeq as number }
+    ...(exactSourceUserSeq !== undefined
+      ? {
+          sourceUserSeq: exactSourceUserSeq,
+          acceptedTaskId: acceptedTaskIdFor(ctx!.sessionId, exactSourceUserSeq),
+        }
       : {}),
     ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
     ...(ctx?.executionId ? { executionId: ctx.executionId } : {}),
@@ -2077,13 +2092,6 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
  * ambiguous unless a local typed outcome proves dispatch=not_started AND
  * effect=none. A clean resolved result gets an exact-call success receipt.
  */
-interface ExternalWriteReservationRef {
-  eventId: string;
-  actionKey: string;
-  toolName: string;
-  callId: string;
-}
-
 function recordExternalWriteSettlement(
   sessionId: string | undefined,
   toolName: string,
@@ -2173,54 +2181,49 @@ function recordExternalWriteSettlement(
     && reservation.actionKey === actionKey
     ? reservation
     : undefined;
-  const correlationFingerprint = toolCallCorrelationFingerprint(toolName, parsedInput);
-  const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
-  appendEvent({
-    sessionId,
-    turn: 0,
-    role: 'system',
-    type,
-    ...(exactReservation?.eventId ? { parentEventId: exactReservation.eventId } : {}),
-    data: {
-      ...currentExternalWriteEventAttribution(settlementNonce),
-      shapeKey,
-      actionKey,
-      toolName,
-      callId,
-      canonicalCallId: callId,
-      ...(type === 'external_write_succeeded' && exactReservation?.eventId
-        ? { settlementKey: `external-write:${exactReservation.eventId}` }
-        : {}),
-      correlationFingerprint,
-      irreversible,
-      targets,
-      duplicateIdentityKeys: externalWriteDuplicateIdentityKeys(
-        toolName === 'run_shell_command'
-          ? extractDuplicateIdentityKeys(
-              typeof (parsedInput as { command?: unknown })?.command === 'string'
-                ? (parsedInput as { command: string }).command
-                : '',
-            )
-          : extractDuplicateIdentityKeys(parsedInput),
-        semanticFingerprint,
-      ),
-      ...(type !== 'external_write_succeeded'
-        ? {
-            reason: String(
-              result instanceof Error
-                ? result.message
-                : result instanceof ExternalWritePreDispatchResult
-                  ? result.output
-                : typeof settlementResult === 'string'
-                  ? settlementResult
-                  : 'provider result did not carry a trusted clean acknowledgement',
-            ).replace(/\s+/g, ' ').slice(0, 240),
-            ...(trustedNotStarted ? { dispatch: 'not_started', effect: 'none', preDispatch: true } : {}),
-          }
-        : {}),
-    },
+  if (!exactReservation) return undefined;
+  const descriptor = describeExternalWriteEvent({
+    toolName,
+    args: parsedInput,
+    forceMutating: true,
+    shapeKey,
+    irreversible,
+    targets,
+    duplicateIdentityKeys: toolName === 'run_shell_command'
+      ? extractDuplicateIdentityKeys(
+          typeof (parsedInput as { command?: unknown })?.command === 'string'
+            ? (parsedInput as { command: string }).command
+            : '',
+        )
+      : extractDuplicateIdentityKeys(parsedInput),
   });
-  return type;
+  if (!descriptor) return undefined;
+  const attribution = currentExternalWriteEventAttribution(settlementNonce);
+  return projectExternalWriteTerminal({
+    sessionId,
+    sourceUserSeq: attribution.sourceUserSeq,
+    acceptedTaskId: attribution.acceptedTaskId,
+    reservation: exactReservation,
+    descriptor,
+    type,
+    attribution,
+    ...(type !== 'external_write_succeeded'
+      ? {
+          reason: String(
+            result instanceof Error
+              ? result.message
+              : result instanceof ExternalWritePreDispatchResult
+                ? result.output
+              : typeof settlementResult === 'string'
+                ? settlementResult
+                : 'provider result did not carry a trusted clean acknowledgement',
+          ),
+          ...(trustedNotStarted
+            ? { data: { dispatch: 'not_started', effect: 'none', preDispatch: true } }
+            : {}),
+        }
+      : {}),
+  });
 }
 
 /**
@@ -3596,7 +3599,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
             // revoke while optional judges run before this callback; a stale
             // attempt must not consume consent, reserve, or invoke.
             assertDispatchLeaseCurrent(ctx.dispatchLease);
-            const correlationFingerprint = toolCallCorrelationFingerprint(tool.name, parsedInput);
             const duplicateTargets = extractDuplicateIdentityKeys(command);
             const ledgerTargets = Array.from(new Set([
               ...duplicateTargets,
@@ -3620,24 +3622,28 @@ export function wrapToolForHarness<T extends WrappableTool>(
               duplicateIdentityKeys,
             });
             try {
-              const event = appendEvent({
+              const descriptor = describeExternalWriteEvent({
+                toolName: tool.name,
+                args: parsedInput,
+                forceMutating: true,
+                shapeKey: mutation.shapeKey,
+                irreversible: true,
+                targets: ledgerTargets,
+                duplicateIdentityKeys,
+              });
+              if (!descriptor || !callId) {
+                throw new Error('shell external write lacks exact projection identity');
+              }
+              const attribution = currentExternalWriteEventAttribution(settlementNonce);
+              reservation = projectExternalWriteReservation({
                 sessionId: ctx.sessionId,
-                turn: 0,
-                role: 'system',
-                type: 'external_write',
+                sourceUserSeq: ctx.sourceUserSeq,
+                acceptedTaskId: attribution.acceptedTaskId,
+                callId,
+                descriptor,
+                attribution,
                 data: {
-                  ...currentExternalWriteEventAttribution(settlementNonce),
-                  shapeKey: mutation.shapeKey,
-                  actionKey,
-                  toolName: tool.name,
-                  callId,
-                  canonicalCallId: callId,
-                  correlationFingerprint,
-                  irreversible: true,
                   shell: true,
-                  preDispatch: true,
-                  targets: ledgerTargets,
-                  duplicateIdentityKeys,
                   ...(retry ? {
                     retryOfCallId: retry.retryOfCallId,
                     retryAuthorizationSeq: retry.authorizationSeq,
@@ -3645,12 +3651,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   } : {}),
                 },
               });
-              reservation = {
-                eventId: event.id,
-                actionKey,
-                toolName: tool.name,
-                callId: callId ?? '',
-              };
             } catch (cause) {
               throw new ExternalWriteReservationError(tool.name, cause);
             }
@@ -3673,7 +3673,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
             // reverse-order half of revoke-vs-reserve serialization.
             assertDispatchLeaseCurrent(ctx.dispatchLease);
             const actionKey = canonicalExternalWriteActionKey(tool.name, shape.shapeKey);
-            const correlationFingerprint = toolCallCorrelationFingerprint(tool.name, parsedInput);
             const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, parsedInput);
             const targets = extractExternalWriteIdentityKeys(parsedInput);
             const duplicateIdentityKeys = externalWriteDuplicateIdentityKeys(
@@ -3762,25 +3761,28 @@ export function wrapToolForHarness<T extends WrappableTool>(
               duplicateIdentityKeys,
             });
             try {
-              const event = appendEvent({
+              const descriptor = describeExternalWriteEvent({
+                toolName: tool.name,
+                args: parsedInput,
+                shapeKey: shape.shapeKey,
+                irreversible: shape.irreversible,
+                targets,
+                duplicateIdentityKeys,
+              });
+              if (!descriptor || !callId) {
+                throw new Error('generic external write lacks exact projection identity');
+              }
+              const attribution = currentExternalWriteEventAttribution(settlementNonce);
+              reservation = projectExternalWriteReservation({
                 sessionId: ctx.sessionId,
-                turn: 0,
-                role: 'system',
-                type: 'external_write',
+                sourceUserSeq: ctx.sourceUserSeq,
+                acceptedTaskId: attribution.acceptedTaskId,
+                callId,
+                descriptor,
+                attribution,
                 data: {
-                  ...currentExternalWriteEventAttribution(settlementNonce),
-                  shapeKey: shape.shapeKey,
-                  actionKey,
-                  toolName: tool.name,
-                  callId,
-                  canonicalCallId: callId,
-                  correlationFingerprint,
-                  irreversible: shape.irreversible,
-                  preDispatch: true,
                   count,
                   underScope,
-                  targets,
-                  duplicateIdentityKeys,
                   ...(retry ? {
                     retryOfCallId: retry.retryOfCallId,
                     retryAuthorizationSeq: retry.authorizationSeq,
@@ -3788,12 +3790,6 @@ export function wrapToolForHarness<T extends WrappableTool>(
                   } : {}),
                 },
               });
-              reservation = {
-                eventId: event.id,
-                actionKey,
-                toolName: tool.name,
-                callId: callId ?? '',
-              };
             } catch (cause) {
               throw new ExternalWriteReservationError(tool.name, cause);
             }
@@ -4530,7 +4526,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (ctx?.certifiedBatch && result instanceof ExternalWritePreDispatchResult) {
           throw new ExternalWritePreDispatchError(result.output);
         }
-        const outwardResult = unwrapExternalWritePreDispatchResult(result);
+        const outwardResult = unwrapHostLocalExecutionFailureResult(
+          unwrapExternalWritePreDispatchResult(result),
+        );
         recordPublishIfSucceeded(tool.name, parsedInput, outwardResult, shellOutcome);
         creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, outwardResult, shellOutcome);
         // Poll-vs-loop discrimination: record the result fingerprint so the
@@ -5048,7 +5046,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
       settlementNonce,
       bracketOutcome?.reservation,
     );
-    const outwardResult = unwrapExternalWritePreDispatchResult(result);
+    const outwardResult = unwrapHostLocalExecutionFailureResult(
+      unwrapExternalWritePreDispatchResult(result),
+    );
     recordPublishIfSucceeded(tool.name, input, outwardResult, shellOutcome);
     creditRecallFromToolResult(ctx?.sessionId, tool.name, input, outwardResult, shellOutcome);
     // MID-RUN STEERING + already-created advisory (mirror of the invoke path):

@@ -83,6 +83,32 @@ export class InvalidArgumentsPreDispatchResult extends ExternalWritePreDispatchR
   }
 }
 
+/**
+ * Nominal result for a local tool body that returned normally but reported a
+ * semantic failure through MCP's `isError:true` field. The local runtime
+ * adapter constructs this before flattening the MCP content to model-facing
+ * text, so settlement keeps the failure fact without interpreting prose.
+ */
+export class HostLocalExecutionFailureResult {
+  readonly failed = true as const;
+  readonly executionKind = 'local_execution' as const;
+  readonly outcomeKind = 'failed' as const;
+
+  constructor(readonly output: string) {}
+
+  toString(): string {
+    return this.output;
+  }
+
+  toJSON(): { ok: false; error: string } {
+    return { ok: false, error: this.output };
+  }
+}
+
+export function unwrapHostLocalExecutionFailureResult(value: unknown): unknown {
+  return value instanceof HostLocalExecutionFailureResult ? value.output : value;
+}
+
 /** Translate a nominal returned carrier into the shared settlement signals.
  * Provider/model prose can never satisfy this check. */
 export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
@@ -93,6 +119,9 @@ export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
       schemaAvailable: result.schemaAvailable,
       ...(result.repairKey ? { repairKey: result.repairKey } : {}),
     };
+  }
+  if (result instanceof HostLocalExecutionFailureResult) {
+    return { executionFailed: true };
   }
   // A locally constructed policy refusal may return corrective bytes to the
   // model/MCP client without throwing. The nominal base class prevents provider
@@ -219,7 +248,9 @@ export interface SettledToolAttempt {
 }
 
 /**
- * Close a logical call the host admitted but then refused before execution.
+ * Close a logical call the host admitted but held before execution. Policy,
+ * correctable arguments, and internal retry are distinct durable outcomes;
+ * only the first is a denial.
  *
  * This seam takes the exact durable logical id instead of consulting ambient
  * AsyncLocalStorage. That distinction matters for nested orchestrators: while a
@@ -229,7 +260,12 @@ export interface SettledToolAttempt {
  * child; the settlement store independently proves that row is exact, open, and
  * has zero physical crossings.
  */
-export function settleAdmittedLogicalCallPreDispatchRefusal(input: {
+export type AdmittedLogicalCallPreDispatchDisposition =
+  | 'policy_refusal'
+  | 'argument_repair'
+  | 'internal_retry';
+
+export function settleAdmittedLogicalCallPreDispatchDisposition(input: {
   sessionId: string;
   sourceUserSeq: number;
   logicalToolCallId: string;
@@ -239,11 +275,19 @@ export function settleAdmittedLogicalCallPreDispatchRefusal(input: {
   turn?: number;
   mutating?: boolean;
   reason: string;
+  disposition: AdmittedLogicalCallPreDispatchDisposition;
 }): SettledToolAttempt {
-  const classified = classifyAttemptOutcome({ preDispatch: true, policyRefused: true });
+  const classified = input.disposition === 'argument_repair'
+    ? classifyAttemptOutcome({ preDispatch: true, argumentValidationFailed: true, schemaAvailable: true })
+    : input.disposition === 'internal_retry'
+      ? classifyAttemptOutcome({ preDispatch: true, httpStatus: 503 })
+      : classifyAttemptOutcome({ preDispatch: true, policyRefused: true });
+  const boundedReason = input.reason.replace(/\s+/g, ' ').trim().slice(0, 120) || 'refused';
   const outcome: AttemptOutcome = {
     ...classified,
-    detail: `work_binding:${input.reason.replace(/\s+/g, ' ').trim().slice(0, 120) || 'refused'}`,
+    detail: input.disposition === 'policy_refusal'
+      ? `work_binding:${boundedReason}`
+      : `work_binding:${input.disposition}:${boundedReason}`,
   };
   const committed = commitLogicalCallSettlement({
     identity: {
@@ -279,6 +323,23 @@ export function settleAdmittedLogicalCallPreDispatchRefusal(input: {
       : {}),
     duplicate: committed.status === 'replayed',
   };
+}
+
+export function settleAdmittedLogicalCallPreDispatchRefusal(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallId: string;
+  toolName: string;
+  args?: unknown;
+  lane: SettleToolAttemptInput['lane'];
+  turn?: number;
+  mutating?: boolean;
+  reason: string;
+}): SettledToolAttempt {
+  return settleAdmittedLogicalCallPreDispatchDisposition({
+    ...input,
+    disposition: 'policy_refusal',
+  });
 }
 
 export type ToolAttemptSettlementAuthorityStatus = Exclude<

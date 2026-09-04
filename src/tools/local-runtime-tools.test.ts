@@ -20,6 +20,7 @@ const {
 } = await import('./local-runtime-tools.js');
 const { toolOutputContextFromSdk } = await import('../runtime/harness/tool-output-context.js');
 const {
+  HostLocalExecutionFailureResult,
   InvalidArgumentsPreDispatchResult,
   attemptSignalsFromTypedResult,
 } = await import('../runtime/harness/attempt-settlement.js');
@@ -112,6 +113,22 @@ test('local tool catalog is the exact loaded surface without schemas', () => {
     tools.map((entry) => entry.name),
   );
   assert.ok(catalog.every((entry) => typeof entry.description === 'string'));
+});
+
+test('local MCP isError survives text flattening as a nominal execution failure', async () => {
+  const getOpportunity = getLocalRuntimeTools()
+    .find((candidate) => (candidate as { name?: string }).name === 'automation_opportunity_get');
+  assert.ok(getOpportunity && getOpportunity.type === 'function');
+
+  const output = await getOpportunity.invoke(
+    new RunContext({ sessionId: 'local-semantic-failure' }),
+    JSON.stringify({ proposal_id: 'missing-opportunity' }),
+  );
+
+  assert.ok(output instanceof HostLocalExecutionFailureResult,
+    'the local adapter must retain MCP isError instead of returning success-shaped prose');
+  assert.deepEqual(attemptSignalsFromTypedResult(output), { executionFailed: true });
+  assert.match(String(output), /automation opportunity was not found/i);
 });
 
 test('local runtime preserves file_query argument refusal as a nominal invalid-arguments carrier', async () => {
@@ -341,6 +358,39 @@ test('ordinary planning prose cannot bypass scoped discovery', async () => {
 
   assert.equal(providerSearches, 1, 'non-control intent still reaches ordinary scoped discovery');
   assert.match(String(output), /SALESFORCE_QUERY_OPPORTUNITIES/);
+  assert.doesNotMatch(String(output), /host_structural_control_lookup_v1/);
+});
+
+test('a business discovery query that mentions work_call still reaches its provider', async () => {
+  let providerSearches = 0;
+  const search = buildScopedLocalToolSearch(
+    new Set<string>(),
+    'work_call',
+    undefined,
+    [{
+      kind: 'authorized_composio',
+      search: async () => {
+        providerSearches += 1;
+        return [{
+          name: 'GOOGLESHEETS_BATCH_GET',
+          summary: 'Read exact values from a Google Sheet.',
+          schema: { type: 'object', properties: { spreadsheet_id: { type: 'string' } }, required: ['spreadsheet_id'] },
+          carrier: 'work_call',
+        }];
+      },
+    }],
+  );
+  const output = await search.invoke(
+    new RunContext({ sessionId: 'business-query-mentions-work-call' }),
+    JSON.stringify({
+      query: '[role:clause-0:read] Google Sheets batch get values for one cell using work_call',
+      role_key: 'clause-0:read',
+      limit: 1,
+    }),
+  );
+
+  assert.equal(providerSearches, 1, 'a carrier name inside business intent is not a control-only lookup');
+  assert.match(String(output), /GOOGLESHEETS_BATCH_GET/);
   assert.doesNotMatch(String(output), /host_structural_control_lookup_v1/);
 });
 

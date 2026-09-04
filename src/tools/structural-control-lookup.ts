@@ -19,13 +19,31 @@ export interface HostStructuralPlanningControlLookupV1 {
 export function isHostStructuralPlanningControlLookup(query: string): boolean {
   const normalized = query.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
+  const withoutRolePrefix = normalized
+    .replace(/^\[role:[^\]]+\]\s*/i, '')
+    .trim();
   const explicitlyNamesControl = /(?:^|[^a-z0-9_])(?:plan_task|work_call)(?:[^a-z0-9_]|$)/i
-    .test(normalized);
+    .test(withoutRolePrefix);
+  const controlLookupWords = new Set([
+    'a', 'an', 'and', 'can', 'control', 'controls', 'describe', 'do', 'explain',
+    'find', 'for', 'get', 'help', 'host', 'how', 'i', 'list', 'local', 'lookup',
+    'me', 'model', 'of', 'or', 'orchestration', 'planning', 'schema', 'schemas',
+    'search', 'should', 'show', 'structural', 'the', 'tool', 'tools', 'usage',
+    'use', 'we',
+  ]);
+  const explicitControlOnlyLookup = explicitlyNamesControl
+    && withoutRolePrefix
+      .replace(/(?:^|[^a-z0-9_])(?:plan_task|work_call)(?=[^a-z0-9_]|$)/gi, ' ')
+      .replace(/[^a-z0-9]+/gi, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .every((word) => controlLookupWords.has(word.toLowerCase()));
   const semanticControlLookup = /\bplan\b/i.test(normalized)
     && /\b(?:multi[- ]?step|dependent|dependencies|operation\s+dag|work\s+topology)\b/i
       .test(normalized)
     && /\b(?:work\s+calls?|execute\s+work)\b/i.test(normalized);
-  return explicitlyNamesControl || semanticControlLookup;
+  return explicitControlOnlyLookup || semanticControlLookup;
 }
 
 export function hostStructuralPlanningControlLookup(
