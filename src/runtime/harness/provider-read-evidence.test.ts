@@ -2,10 +2,50 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  contradictionIsNestedStatusOnly,
   exactProviderDataEnvelopeAcknowledged,
   exactProviderDataPayload,
+  inspectProviderEnvelope,
   projectProviderResult,
 } from './provider-read-evidence.js';
+
+test('status contradictions retain root-versus-payload provenance', () => {
+  const root = inspectProviderEnvelope({ successful: true, status: 500 });
+  assert.deepEqual(root, {
+    verdict: 'contradicted',
+    reason: 'failure_status',
+    depth: 0,
+  });
+  assert.equal(contradictionIsNestedStatusOnly(root), false);
+
+  const nested = inspectProviderEnvelope({
+    data: { markdown: 'returned page', metadata: { statusCode: 404 } },
+  });
+  assert.deepEqual(nested, {
+    verdict: 'contradicted',
+    reason: 'failure_statuscode',
+    depth: 2,
+  });
+  assert.equal(contradictionIsNestedStatusOnly(nested), true);
+});
+
+test('raw MCP structuredContent uses the same nested-status authority boundary', () => {
+  const nestedStatusPayload = {
+    data: { markdown: 'returned page', metadata: { statusCode: 404 } },
+  };
+  assert.equal(inspectProviderEnvelope({
+    content: [{ type: 'text', text: JSON.stringify(nestedStatusPayload) }],
+    structuredContent: nestedStatusPayload,
+    isError: false,
+  }).verdict, 'clean');
+
+  const rootStatusPayload = { status: 500, message: 'provider unavailable' };
+  assert.equal(inspectProviderEnvelope({
+    content: [{ type: 'text', text: JSON.stringify(rootStatusPayload) }],
+    structuredContent: rootStatusPayload,
+    isError: false,
+  }).verdict, 'contradicted');
+});
 
 test('exact provider payload accepts only the closed successful SDK envelope, including durable JSON bytes', () => {
   const envelope = {
@@ -30,6 +70,30 @@ test('exact provider payload accepts only the closed successful SDK envelope, in
   const failed = { data: envelope.data, successful: false, error: 'denied' };
   assert.equal(exactProviderDataEnvelopeAcknowledged(failed), false);
   assert.equal(exactProviderDataPayload(failed), failed);
+});
+
+test('exact provider payload accepts the closed host adapter carrier around one successful SDK envelope', () => {
+  const provider = {
+    data: { range: 'Sheet1!V995', values: [] },
+    error: null,
+    successful: true,
+    logId: 'log-1',
+  };
+  const carrier = { result: provider, complete: true };
+  assert.equal(exactProviderDataEnvelopeAcknowledged(carrier), true);
+  assert.equal(exactProviderDataEnvelopeAcknowledged(JSON.stringify(carrier)), true);
+  assert.deepEqual(exactProviderDataPayload(carrier), provider.data);
+  assert.deepEqual(exactProviderDataPayload(JSON.stringify(carrier)), provider.data);
+
+  for (const rejected of [
+    { result: provider, complete: false },
+    { result: provider, complete: true, modelClaim: 'not host authority' },
+    { result: { ...provider, successful: false }, complete: true },
+    { result: { ...provider, error: 'denied' }, complete: true },
+  ]) {
+    assert.equal(exactProviderDataEnvelopeAcknowledged(rejected), false);
+    assert.deepEqual(exactProviderDataPayload(rejected), rejected);
+  }
 });
 
 test('auxiliary empty arrays never prove an empty provider result', () => {

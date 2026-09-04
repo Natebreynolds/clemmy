@@ -36,6 +36,11 @@ const EXACT_PROVIDER_DATA_ENVELOPE_KEYS = new Set([
   'sessionInfo',
 ]);
 
+const EXACT_COMPLETED_ADAPTER_ENVELOPE_KEYS = new Set([
+  'result',
+  'complete',
+]);
+
 function exactProviderDataEnvelope(value: unknown): Record<string, unknown> | null {
   let candidate = value;
   if (typeof value === 'string') {
@@ -52,6 +57,21 @@ function exactProviderDataEnvelope(value: unknown): Record<string, unknown> | nu
     }
   }
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  const carrier = candidate as Record<string, unknown>;
+  // Production capability adapters seal provider reads in exactly one
+  // host-owned completion carrier. `complete:true` proves coverage only; the
+  // nested provider envelope must still independently acknowledge success.
+  // Keep this closed to the adapter's two-key wire shape so arbitrary business
+  // payloads containing `result` cannot manufacture provider authority.
+  if (
+    carrier.complete === true
+    && Object.keys(carrier).length === EXACT_COMPLETED_ADAPTER_ENVELOPE_KEYS.size
+    && Object.keys(carrier).every((key) => EXACT_COMPLETED_ADAPTER_ENVELOPE_KEYS.has(key))
+    && carrier.result
+    && typeof carrier.result === 'object'
+    && !Array.isArray(carrier.result)
+    && inspectProviderEnvelope(carrier).verdict === 'clean'
+  ) candidate = carrier.result;
   const envelope = candidate as Record<string, unknown>;
   if (!Object.prototype.hasOwnProperty.call(envelope, 'data')) return null;
   if (Object.keys(envelope).some((key) => !EXACT_PROVIDER_DATA_ENVELOPE_KEYS.has(key))) return null;
@@ -148,15 +168,53 @@ const STATUS_FIELD_KEYS = new Set([
 const BUSINESS_IDENTITY_KEYS = new Set([
   'id', 'identifier', 'key', 'recordid', 'uid', 'uuid',
 ]);
+const EXACT_MCP_CALL_RESULT_KEYS = new Set([
+  'content', 'structuredContent', 'isError', '_meta',
+]);
 
 function normalizedEnvelopeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+function explicitMcpSuccessOwnsStructuredPayload(
+  record: Record<string, unknown>,
+): boolean {
+  return record.isError === false
+    && Array.isArray(record.content)
+    && Object.prototype.hasOwnProperty.call(record, 'structuredContent')
+    && Object.keys(record).every((key) => EXACT_MCP_CALL_RESULT_KEYS.has(key));
+}
+
 export type ProviderEnvelopeInspection =
   | { verdict: 'clean' }
-  | { verdict: 'contradicted'; reason: string }
+  | { verdict: 'contradicted'; reason: string; depth: number }
   | { verdict: 'uninspected'; reason: 'depth_limit' | 'node_limit' | 'entry_limit' };
+
+/**
+ * Is a contradiction's ONLY evidence a status-shaped key found somewhere in the
+ * payload?
+ *
+ * The carrier owns the verdict about the CALL: MCP states it as
+ * `CallToolResult.isError`, Composio as `successful`. The payload is domain data
+ * describing whatever the tool fetched. A `statusCode` nested under `metadata`
+ * is the status of a SCRAPED PAGE, not of the call that scraped it — live
+ * example, a Firecrawl scrape of a bot-blocked prospect site:
+ *   {success: true, data: {markdown: "...", metadata: {statusCode: 404}}}
+ * The scrape succeeded and returned content; only the fetched page 404'd.
+ *
+ * This predicate lets a caller that HAS an explicit carrier verdict discount
+ * that weakest signal while keeping every stronger one — `negative_*` (an
+ * explicit success flag set false), `error_*` (a populated error field), and the
+ * failure-flag keys. Those are the carrier speaking; a nested status is not.
+ */
+export function contradictionIsNestedStatusOnly(
+  inspection: ProviderEnvelopeInspection,
+): boolean {
+  if (inspection.verdict !== 'contradicted' || inspection.depth === 0) return false;
+  if (!inspection.reason.startsWith('failure_')) return false;
+  const key = inspection.reason.slice('failure_'.length);
+  return STATUS_FIELD_KEYS.has(key);
+}
 
 /**
  * Inspect transport/envelope structure without confusing a safety bound with
@@ -176,7 +234,17 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
     uninspectedReason ??= reason;
   };
 
-  const visit = (node: unknown, currentDepth: number, parentKey: string): string | null => {
+  type Contradiction = { reason: string; depth: number };
+  const contradict = (reason: string, currentDepth: number): Contradiction => ({
+    reason,
+    depth: Math.max(0, currentDepth - depth),
+  });
+
+  const visit = (
+    node: unknown,
+    currentDepth: number,
+    mcpPayloadRootDepth: number | null,
+  ): Contradiction | null => {
     if (!node || typeof node !== 'object') return null;
     visited += 1;
     if (currentDepth > CONTRADICTION_MAX_DEPTH) {
@@ -190,7 +258,7 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
     if (Array.isArray(node)) {
       if (node.length > CONTRADICTION_MAX_ENTRIES) markUninspected('entry_limit');
       for (const entry of node.slice(0, CONTRADICTION_MAX_ENTRIES)) {
-        const contradiction = visit(entry, currentDepth + 1, parentKey);
+        const contradiction = visit(entry, currentDepth + 1, mcpPayloadRootDepth);
         if (contradiction) return contradiction;
       }
       return null;
@@ -204,9 +272,15 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
     const businessEntity = normalizedKeys.some((key) => BUSINESS_IDENTITY_KEYS.has(key));
     for (const [rawKey, child] of inspectedEntries) {
       const key = normalizedEnvelopeKey(rawKey);
-      if (NEGATIVE_SUCCESS_KEYS.has(key) && structuredFalse(child)) return `negative_${key}`;
-      if (FAILURE_FLAG_KEYS.has(key) && structuredTrue(child)) return `failure_${key}`;
-      if (ERROR_FIELD_KEYS.has(key) && errorFieldIsFailure(child)) return `error_${key}`;
+      if (NEGATIVE_SUCCESS_KEYS.has(key) && structuredFalse(child)) {
+        return contradict(`negative_${key}`, currentDepth);
+      }
+      if (FAILURE_FLAG_KEYS.has(key) && structuredTrue(child)) {
+        return contradict(`failure_${key}`, currentDepth);
+      }
+      if (ERROR_FIELD_KEYS.has(key) && errorFieldIsFailure(child)) {
+        return contradict(`error_${key}`, currentDepth);
+      }
       if (STATUS_FIELD_KEYS.has(key)) {
         // A status on an identified returned ENTITY is domain data: a failed
         // job/order/task is still a successful READ of the response that
@@ -232,8 +306,16 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
         // band entirely would let real provider errors pass as success, because
         // `status_message: "Invalid Field."` alone reads clean.
         if (businessEntity) continue;
-        if (statusCodeIsFailure(child)) return `failure_${key}`;
-        if (typeof child === 'string' && FAILURE_STATUS_RE.test(child.trim())) return `failure_${key}`;
+        // An exact MCP carrier owns the call verdict outside structuredContent.
+        // Only status nested *inside* that selected payload yields to an
+        // explicit `isError:false`; a status at the payload root remains a
+        // transport contradiction. This keeps raw-settlement inspection aligned
+        // with result-fact derivation without weakening error/failure signals.
+        if (mcpPayloadRootDepth !== null && currentDepth > mcpPayloadRootDepth) continue;
+        if (statusCodeIsFailure(child)) return contradict(`failure_${key}`, currentDepth);
+        if (typeof child === 'string' && FAILURE_STATUS_RE.test(child.trim())) {
+          return contradict(`failure_${key}`, currentDepth);
+        }
       }
     }
 
@@ -244,14 +326,18 @@ export function inspectProviderEnvelope(value: unknown, depth = 0): ProviderEnve
       // that are unmistakably request/input echoes.
       if (providerRequestEchoKey(rawKey) && key !== 'payload') continue;
       if (Array.isArray(child) && CONTRADICTION_RESULT_ARRAY_KEYS.has(key)) continue;
-      const contradiction = visit(child, currentDepth + 1, key);
+      const nestedMcpPayloadRootDepth = key === 'structuredcontent'
+        && explicitMcpSuccessOwnsStructuredPayload(record)
+        ? currentDepth + 1
+        : mcpPayloadRootDepth;
+      const contradiction = visit(child, currentDepth + 1, nestedMcpPayloadRootDepth);
       if (contradiction) return contradiction;
     }
     return null;
   };
 
-  const contradiction = visit(value, depth, '');
-  if (contradiction) return { verdict: 'contradicted', reason: contradiction };
+  const contradiction = visit(value, depth, null);
+  if (contradiction) return { verdict: 'contradicted', ...contradiction };
   if (uninspectedReason) return { verdict: 'uninspected', reason: uninspectedReason };
   return { verdict: 'clean' };
 }

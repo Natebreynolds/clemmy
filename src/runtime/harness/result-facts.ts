@@ -10,6 +10,7 @@ import {
   inspectProviderEnvelope,
   providerRequestEchoKey,
   providerResultBookkeepingKey,
+  contradictionIsNestedStatusOnly,
 } from './provider-read-evidence.js';
 
 export type ResultCompleteness = 'complete' | 'partial' | 'unknown';
@@ -241,7 +242,8 @@ const MCP_TEXT_JSON_MAX_BYTES = 8_000_000;
 interface ExactMcpResultPayload {
   payload: unknown | null;
   pathPrefix: string | null;
-  isError: boolean;
+  /** `undefined` means the MCP carrier omitted its optional call verdict. */
+  isError: boolean | undefined;
   malformed: boolean;
 }
 
@@ -326,7 +328,7 @@ function exactDirectMcpResultPayload(value: unknown): ExactMcpResultPayload | nu
       pathPrefix: structuredIsValid && textPayloadsAgree && textAgrees
         ? 'structuredContent'
         : null,
-      isError: envelope.isError === true,
+      isError: typeof envelope.isError === 'boolean' ? envelope.isError : undefined,
       malformed: !contentIsValid || !isErrorIsValid
         || !structuredIsValid || !textPayloadsAgree || !textAgrees,
     };
@@ -336,7 +338,7 @@ function exactDirectMcpResultPayload(value: unknown): ExactMcpResultPayload | nu
   return {
     payload: fallback?.payload ?? null,
     pathPrefix: fallback ? `content.${fallback.index}.text` : null,
-    isError: envelope.isError === true,
+    isError: typeof envelope.isError === 'boolean' ? envelope.isError : undefined,
     malformed: !contentIsValid || !isErrorIsValid || !textPayloadsAgree,
   };
 }
@@ -379,7 +381,7 @@ function exactSealedInvokeResult(value: unknown): ExactSealedInvokeResult {
 function exactMcpResultPayload(value: unknown): ExactMcpResultPayload | null {
   const sealed = exactSealedInvokeResult(value);
   if (sealed.status === 'malformed') {
-    return { payload: null, pathPrefix: null, isError: false, malformed: true };
+    return { payload: null, pathPrefix: null, isError: undefined, malformed: true };
   }
   const candidate = sealed.status === 'valid' ? sealed.payload : value;
   const direct = exactDirectMcpResultPayload(candidate);
@@ -392,7 +394,7 @@ function exactMcpResultPayload(value: unknown): ExactMcpResultPayload | null {
     };
   }
   if (claimsMcpResultEnvelope(candidate)) {
-    return { payload: null, pathPrefix: null, isError: false, malformed: true };
+    return { payload: null, pathPrefix: null, isError: undefined, malformed: true };
   }
   return null;
 }
@@ -981,14 +983,20 @@ function envelopeMetadata(
   }
 }
 
-function statusOf(envelope: Record<string, unknown>): number | null {
+interface ProviderStatusObservation {
+  code: number;
+  /** Depth within the selected provider payload; zero is the carrier root. */
+  depth: number;
+}
+
+function statusOf(envelope: Record<string, unknown>): ProviderStatusObservation | null {
   const statusKeys = new Set([
     'httpcode', 'httpstatus', 'httpstatuscode', 'responsecode', 'status', 'statuscode',
   ]);
   const resultArrays = new Set(RECORD_CONTAINERS.map(normalizedStructuralKey));
   const identityKeys = new Set(['id', 'identifier', 'key', 'recordid', 'uid', 'uuid']);
   let nodes = 0;
-  const visit = (value: unknown, depth: number): number | null => {
+  const visit = (value: unknown, depth: number): ProviderStatusObservation | null => {
     if (!value || typeof value !== 'object') return null;
     nodes += 1;
     if (depth > PAGINATION_MAX_DEPTH || nodes > PAGINATION_MAX_NODES) return null;
@@ -997,13 +1005,15 @@ function statusOf(envelope: Record<string, unknown>): number | null {
     const businessEntity = entries.some(([key]) => identityKeys.has(normalizedStructuralKey(key)));
     for (const [rawKey, child] of entries.slice(0, PAGINATION_MAX_ENTRIES)) {
       const key = normalizedStructuralKey(rawKey);
-      if (!statusKeys.has(key) || (key === 'status' && businessEntity)) continue;
+      // Every status-shaped field on an identified returned entity is domain
+      // data. The carrier can successfully READ a failed job/order/task.
+      if (!statusKeys.has(key) || businessEntity) continue;
       const numeric = typeof child === 'number'
         ? child
         : typeof child === 'string' && /^\d{3,5}$/.test(child.trim())
           ? Number(child.trim())
           : Number.NaN;
-      if (Number.isFinite(numeric)) return numeric;
+      if (Number.isFinite(numeric)) return { code: numeric, depth };
     }
     for (const [rawKey, child] of entries.slice(0, PAGINATION_MAX_ENTRIES)) {
       if (!child || typeof child !== 'object') continue;
@@ -1193,12 +1203,26 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
       discovery.structuralCollectionPaths,
       discovery.structuralCollectionHasValues,
     );
-    const status = statusOf(envelope);
+    const statusObservation = statusOf(envelope);
+    const status = statusObservation?.code ?? null;
     const successful = envelope.successful ?? envelope.success ?? envelope.ok;
-    const isError = mcp?.isError === true
+    // MCP states the call's outcome in `CallToolResult.isError`. Only `true` was
+    // propagated here, so the protocol's explicit "this call did NOT fail" was
+    // thrown away and a status found in the payload decided by default —
+    // e.g. a Firecrawl scrape of a bot-blocked page,
+    // {content:[…], isError:false} carrying metadata.statusCode 404, derived
+    // success=false even though the scrape returned its markdown.
+    //
+    // Any explicit `true` still wins (the carrier or the payload reporting a
+    // real failure); only when nothing says true does an explicit `false` count
+    // as the carrier stating success.
+    const envelopeIsError = typeof envelope.isError === 'boolean'
+      ? envelope.isError
+      : undefined;
+    const isError = mcp?.isError === true || envelopeIsError === true
       ? true
-      : typeof envelope.isError === 'boolean'
-        ? envelope.isError
+      : mcp?.isError === false || envelopeIsError === false
+        ? false
         : undefined;
     const inspection = inspectProviderEnvelope(envelope);
     // `status >= 400` is an HTTP rule, so it may only judge an HTTP status.
@@ -1227,10 +1251,41 @@ export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandle
     const unexplainedNonHttpStatus = typeof status === 'number'
       && httpStatus === null
       && typeof successful !== 'boolean'
-      && (found?.records.length ?? 0) === 0;
-    const errorish = inspection.verdict === 'contradicted'
-      || (httpStatus !== null && httpStatus >= 400)
-      || unexplainedNonHttpStatus;
+      && (found?.records.length ?? 0) === 0
+      // A reviewed process observation already owns the execution verdict.
+      // Its JSON stdout may use status:0 as the provider's ordinary success
+      // code; an empty result must not reverse the enclosing exited/zero fact.
+      // Explicit errors, negative success flags and failing status codes still
+      // flow through `inspection` below and remain contradictions.
+      && cli?.success !== true;
+    // CARRIER FIRST. MCP states the call's outcome outside its selected business
+    // payload as `isError`. When that outer carrier has spoken explicitly, a
+    // nested status-shaped payload key must not overrule it — that value is
+    // describing what the tool fetched, not whether the call worked. Measured:
+    // {isError:false, data:{markdown:"...", metadata:{statusCode:404}}} derived
+    // success=false, so a successful scrape of a bot-blocked page was discarded.
+    // Every stronger contradiction still wins (negative_*, error_*, failure
+    // flags) — those are the carrier contradicting itself.
+    //
+    // A carrier success carrying nothing usable does not become a false
+    // `succeeded`: recordCount stays 0 and classifyAttemptOutcome reports
+    // `empty_result` — "the call worked and returned nothing", which consumers
+    // already treat as a non-failure.
+    // A payload's own `successful:true` (or root
+    // `isError:false`) can still contradict a root/nested transport status and
+    // therefore must not receive this precedence.
+    const mcpCarrierStatedSuccess = mcp?.isError === false;
+    const nestedMcpPayloadStatus = mcpCarrierStatedSuccess
+      && (statusObservation?.depth ?? 0) > 0;
+    const contradicted = inspection.verdict === 'contradicted'
+      && !(mcpCarrierStatedSuccess && contradictionIsNestedStatusOnly(inspection));
+    // The same nested value reaches this decision by TWO paths — the
+    // contradiction walker and `statusOf` — so both retain depth and apply the
+    // same boundary. Root status remains carrier evidence; only status inside
+    // the MCP-selected payload yields to the outer MCP call verdict.
+    const errorish = contradicted
+      || (!nestedMcpPayloadStatus && httpStatus !== null && httpStatus >= 400)
+      || (!nestedMcpPayloadStatus && unexplainedNonHttpStatus);
     const success = isError === true
       ? false
       : errorish

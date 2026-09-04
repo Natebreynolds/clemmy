@@ -858,15 +858,78 @@ test('raw fact derivation treats string and nested HTTP failure statuses as fail
   assert.equal(nestedStatus.statusCode, 503);
 });
 
-test('a returned business entity may truthfully have a failed domain status', () => {
-  const payload = {
-    successful: true,
-    data: { id: 'task-1', status: 'failed', name: 'Nightly import' },
+test('explicit MCP success owns nested status-shaped business payloads across carrier forms', () => {
+  const firecrawlPayload = {
+    data: {
+      markdown: 'The requested page returned useful content.',
+      metadata: { sourceURL: 'https://fixture.invalid', statusCode: 404 },
+    },
   };
-  assert.equal(providerEvidence.providerEnvelopeHasContradiction(payload), false);
-  const facts = results.deriveResultHandleFactsFromRaw(payload);
-  assert.equal(facts.success, true);
-  assert.equal(facts.statusCode, null);
+  const text = { type: 'text', text: JSON.stringify(firecrawlPayload) };
+  const directText = { content: [text], isError: false };
+  const directStructured = {
+    content: [text],
+    structuredContent: structuredClone(firecrawlPayload),
+    isError: false,
+  };
+  const fixtures = [
+    directText,
+    directStructured,
+    { result: directText, complete: true },
+    { result: directStructured, complete: true },
+  ];
+
+  for (const fixture of fixtures) {
+    const facts = results.deriveResultHandleFactsFromRaw(fixture);
+    assert.equal(facts.success, true, JSON.stringify(fixture));
+    assert.equal(facts.statusCode, 404, JSON.stringify(fixture));
+    assert.notEqual(
+      providerEvidence.inspectProviderEnvelope(fixture).verdict,
+      'contradicted',
+      `raw settlement inspection disagreed: ${JSON.stringify(fixture)}`,
+    );
+  }
+
+  const omittedVerdict = results.deriveResultHandleFactsFromRaw({ content: [text] });
+  assert.equal(
+    omittedVerdict.success,
+    false,
+    'omitting optional MCP isError is not an explicit carrier success',
+  );
+
+  const rootFailureText = {
+    type: 'text',
+    text: JSON.stringify({ status: 500, message: 'provider unavailable' }),
+  };
+  const rootFailure = results.deriveResultHandleFactsFromRaw({
+    content: [rootFailureText],
+    isError: false,
+  });
+  assert.equal(rootFailure.success, false, 'MCP success cannot mask a root payload status');
+  assert.equal(rootFailure.statusCode, 500);
+});
+
+test('identified business entities own every status spelling as domain data', () => {
+  for (const [statusKey, statusValue] of [
+    ['status', 'failed'],
+    ['status', 503],
+    ['statusCode', 404],
+    ['status_code', 40501],
+    ['httpStatus', 500],
+  ] as const) {
+    const payload = {
+      successful: true,
+      data: { id: 'task-1', [statusKey]: statusValue, name: 'Nightly import' },
+    };
+    assert.equal(
+      providerEvidence.providerEnvelopeHasContradiction(payload),
+      false,
+      statusKey,
+    );
+    const facts = results.deriveResultHandleFactsFromRaw(payload);
+    assert.equal(facts.success, true, statusKey);
+    assert.equal(facts.statusCode, null, statusKey);
+  }
 });
 
 // Provider SDK payloads carry undefined properties and non-plain-prototype
