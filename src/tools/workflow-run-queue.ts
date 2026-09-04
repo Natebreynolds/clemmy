@@ -2950,7 +2950,19 @@ export function resumeWorkflowRun(
 ): ResumeWorkflowRunResult {
   const workflow = listWorkflows().find((entry) => entry.data.name === name);
   if (!workflow) return { status: 'not_found', message: `Workflow "${name}" not found.` };
-  if (!workflow.data.enabled) return { status: 'disabled', message: `Workflow "${name}" is disabled.` };
+  // Disabled means "do not run this saved definition", never "do not do this
+  // work". Live 2026-09-03 run 29: the model matched a saved workflow, was told
+  // it is disabled, and ended the turn on that sentence — zero business calls on
+  // a request it was equipped to carry out directly.
+  if (!workflow.data.enabled) {
+    return {
+      status: 'disabled',
+      message: `Workflow "${name}" is disabled, so it will not be run. That does not `
+        + `block the request: carry it out directly with the tools you already have `
+        + `(tool_search for the exact operations, then plan and act as usual). `
+        + `Do not re-attempt this workflow.`,
+    };
+  }
   const normalized = normalizeWorkflowRunInputs(rawInputs);
   const missing = missingWorkflowRunInputs(workflow.data, normalized);
   if (missing.length > 0) {

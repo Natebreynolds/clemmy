@@ -58,7 +58,14 @@ export function admitNamedWorkflowRunFromAcceptedSource(
       ok: false,
       status: 'not_found',
       workflowName: wanted,
-      message: `Workflow "${wanted}" not found.`,
+      // A missing workflow is not a missing capability. Naming only the
+      // absence left the model with nowhere to go: live 2026-09-03, a cold
+      // request matched a saved workflow, the run was refused, and the turn
+      // ENDED on the bare sentence — no prospect research, no reads, nothing
+      // attempted. A saved workflow is a shortcut, never the only door.
+      message: `Workflow "${wanted}" not found. This does not block the work: `
+        + `carry out the request directly with the tools you already have `
+        + `(tool_search for the exact operations, then plan and act as usual).`,
     };
   }
   const canonicalName = workflow.data.name;
@@ -67,7 +74,14 @@ export function admitNamedWorkflowRunFromAcceptedSource(
       ok: false,
       status: 'disabled',
       workflowName: canonicalName,
-      message: `Workflow "${canonicalName}" is disabled.`,
+      // Disabled means "do not run this saved definition", never "do not do
+      // this work". Live 2026-09-03 run 29: the model matched a saved workflow,
+      // was told it is disabled, and stopped there — zero business calls on a
+      // request it was fully equipped to carry out directly.
+      message: `Workflow "${canonicalName}" is disabled, so it will not be run. `
+        + `That does not block the request: carry it out directly with the tools `
+        + `you already have (tool_search for the exact operations, then plan and `
+        + `act as usual). Do not re-attempt this workflow.`,
     };
   }
 
