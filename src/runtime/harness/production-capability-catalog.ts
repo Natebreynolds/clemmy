@@ -17,6 +17,7 @@ import {
   productionPortIdentityFromManifest,
   registerProductionCapabilityPort,
 } from './production-capability-ports.js';
+import { composioPreparationForManifest } from './production-composio-preparation.js';
 import {
   adoptObservedCapabilityIdentity,
   independentlyObserveCapability,
@@ -349,6 +350,7 @@ export function registerProductionCatalogPorts(): void {
     const shipped = loadShippedImplementations();
     const write = manifest.effect === 'external_write' || manifest.effect === 'local_write';
     registerProductionCapabilityPort(identity, {
+      ...composioPreparationForManifest(manifest),
       invoke: shipped.invokeForSealedManifest(manifest),
       ...(write ? { reconcile: shipped.reconcileForSealedManifest(manifest) } : {}),
     });
@@ -447,6 +449,7 @@ export function reconstructShippedPortsForDurableSuccessors(): void {
     if (peekProductionCapabilityPort(identity)) continue;
     const write = current.effect === 'external_write' || current.effect === 'local_write';
     registerProductionCapabilityPort(identity, {
+      ...composioPreparationForManifest(current),
       invoke: shipped.invokeForSealedManifest(current),
       ...(write ? { reconcile: shipped.reconcileForSealedManifest(current) } : {}),
     });

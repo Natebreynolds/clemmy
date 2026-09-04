@@ -125,6 +125,23 @@ test('a bare provider operation name in the carrier slot (GLM 5.3 cold-chat shap
   assert.equal(inner.tool_slug, 'GOOGLESHEETS_BATCH_GET');
   assert.deepEqual(JSON.parse(inner.arguments), { spreadsheet_id: '1abc', ranges: ['FL!A1:Z100'] });
 
+  const workCarrier = completeComposioCarrierArguments(JSON.stringify({
+    requirement_id: 'clause-8:read',
+    universe_item_id: null,
+    universe_selector: null,
+    seal_amendment: null,
+    source_call_ids: null,
+    source_record_ids: null,
+    name: 'GOOGLESHEETS_VALUES_GET',
+    args_json: JSON.stringify({ spreadsheet_id: 'sheet-1', range: 'Sheet1!V997' }),
+  }), [{ kind: 'composio', identifier: 'GOOGLESHEETS_VALUES_GET', effectClass: 'read' }]);
+  assert.ok(workCarrier);
+  const completedWorkCarrier = JSON.parse(workCarrier!.argumentsJson) as Record<string, unknown>;
+  assert.equal(completedWorkCarrier.name, 'composio_execute_tool');
+  assert.equal(completedWorkCarrier.requirement_id, 'clause-8:read');
+  assert.equal(completedWorkCarrier.universe_item_id, null);
+  assert.equal(completedWorkCarrier.source_call_ids, null);
+
   // A dotted name with a doubled toolkit stutter collapses too.
   const stutter = completeComposioCarrierArguments(JSON.stringify({ name: 'outlook.outlook_send_email', args_json: '{"to":"x"}' }), []);
   assert.equal(stutter!.toolSlug, 'OUTLOOK_SEND_EMAIL');

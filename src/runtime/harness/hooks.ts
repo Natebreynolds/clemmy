@@ -394,6 +394,8 @@ export function attachEventLogHooks(
           effect: accounting.effect,
           ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
           ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
+          ...(accounting.reversibility ? { reversibility: accounting.reversibility } : {}),
+          ...(accounting.recoverySemantics ? { recoverySemantics: accounting.recoverySemantics } : {}),
           arguments: clip(details?.toolCall?.arguments ?? null, maxResultChars),
         },
       });

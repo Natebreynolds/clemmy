@@ -121,7 +121,20 @@ export function completeComposioCarrierArguments(
     else if (asRecord(opArgs)) argumentsString = JSON.stringify(unwrapDoubledArgsEnvelope(asRecord(opArgs)!));
     else return null;
     const completedInner: Record<string, unknown> = { tool_slug: bareSlug, arguments: argumentsString };
-    const completedOuter: Record<string, unknown> = { name: GATEWAY_TAIL, args_json: JSON.stringify(completedInner) };
+    // Rewrite only the provider-routing fields. A carrier such as work_call
+    // owns additional host contract bytes (requirement/universe/lineage); if
+    // normalization drops them, the SDK sees a malformed outer call after the
+    // host has already admitted its semantic provider identity. The malformed
+    // wrapper then re-enters logical admission as `unknown` and poisons the
+    // accepted root before any business crossing. Preserving opaque siblings
+    // is provider-neutral: this adapter neither reads nor grants authority from
+    // them, and the outer tool's exact schema still validates every field.
+    const completedOuter: Record<string, unknown> = {
+      ...outer,
+      name: GATEWAY_TAIL,
+      args_json: JSON.stringify(completedInner),
+    };
+    if (!('args_json' in outer) && 'args' in outer) delete completedOuter.args;
     return {
       argumentsJson: JSON.stringify(completedOuter),
       toolSlug: bareSlug,

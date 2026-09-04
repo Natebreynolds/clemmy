@@ -70,8 +70,12 @@ import {
   capabilityManifestDigest,
   currentCapabilityManifest,
 } from '../runtime/harness/capability-manifest.js';
-import { resolveProductionPortsForManifest } from '../runtime/harness/production-capability-ports.js';
-import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
+import {
+  resolveProductionPortsForManifest,
+} from '../runtime/harness/production-capability-ports.js';
+import {
+  acceptedTaskIdFor,
+} from '../runtime/harness/attempt-identity.js';
 import { isIrreversibleSendSlug, classifyCanonicalExternalEffect } from '../runtime/harness/execution-gate.js';
 import { toolHasConsentPath } from './gated-mutating-tools.js';
 import {
@@ -103,6 +107,7 @@ import {
   validatedTurnSourceStrategyBinding,
   type TurnSourceStrategyBindingV1,
 } from '../runtime/harness/turn-control.js';
+import { currentHostCallAttestation } from '../runtime/harness/accepted-turn-call-authority.js';
 
 export { materializeStrictNullableFields } from '../runtime/schema-normalizer.js';
 
@@ -231,8 +236,30 @@ async function invokeCurrentCatalogProductionPort(input: {
       invoke: port.invoke,
     },
   });
+  const invokePreparedPort = async (): Promise<unknown> => {
+    const preparationMembers = [
+      port.admitPreparation,
+      port.prepareInvocation,
+      port.invokeWithPreparation,
+    ];
+    const preparationMemberCount = preparationMembers.filter((member) => (
+      typeof member === 'function'
+    )).length;
+    if (preparationMemberCount !== 0 && preparationMemberCount !== preparationMembers.length) {
+      throw new Error('catalog production port has an incomplete preparation contract');
+    }
+    if (preparationMemberCount === 0) return invokePort();
+
+    // This adapter-owned metadata crossing happens before `invokePort`, which
+    // is the only function below that may reserve/enter the business provider
+    // call. The opaque proof is consumed by the same exact port immediately;
+    // no model retry and no provider-specific shared-kernel branch is needed.
+    port.admitPreparation!();
+    const proof = await port.prepareInvocation!();
+    return port.invokeWithPreparation!(proof, invokePort);
+  };
   try {
-    const result = await invokePort();
+    const result = await invokePreparedPort();
     settleCurrentCatalogProductionAttempt({
       target: manifest.operationId,
       args: payload,
@@ -759,6 +786,10 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
 
       let target = requestedTarget;
       let resolvedArgs = args;
+      let remappedCatalogPreparation: {
+        manifest: NonNullable<ReturnType<typeof currentCapabilityManifest>>;
+        port: NonNullable<ReturnType<typeof resolveProductionPortsForManifest>>;
+      } | null = null;
       const alreadyReachable = reachableBuiltinNames.has(target) || firstClassNames.has(target);
       if (!alreadyReachable && !isMcpNamespacedTool(target)) {
         const alias = resolveCallToolAlias(target, args);
@@ -797,6 +828,19 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
                 requestedTarget: target,
               });
           if (proven) {
+            const exactEntry = uniqueCurrentCallableCatalogOperation(target);
+            const exactManifest = exactEntry
+              ? currentCapabilityManifest(exactEntry.manifest)
+              : null;
+            const exactPort = exactManifest
+              ? resolveProductionPortsForManifest(exactManifest)
+              : null;
+            if (exactEntry && exactManifest && exactPort) {
+              remappedCatalogPreparation = {
+                manifest: exactManifest,
+                port: exactPort,
+              };
+            }
             resolvedArgs = {
               tool_slug: proven.slug,
               arguments: JSON.stringify(resolvedArgs && typeof resolvedArgs === 'object' ? resolvedArgs : {}),
@@ -947,6 +991,48 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         });
       }
       resolvedArgs = carrierNormalization.args;
+      // The production host may canonicalize an exact catalog operation onto
+      // its trusted transport before this dispatcher runs. In that shape the
+      // requested target is already `composio_execute_tool`, so the exact-name
+      // remap above never gets a chance to retain the port that owns metadata
+      // preparation. Recover that port only from the current opaque host
+      // attestation plus the exact carried operation; model-authored carrier
+      // bytes alone never nominate a preparation crossing.
+      if (!remappedCatalogPreparation && target === 'composio_execute_tool') {
+        const canonical = normalizeComposioCarrierInput(resolvedArgs);
+        const attestation = currentHostCallAttestation();
+        // The attested capability id is the selector. A catalog may contain
+        // more than one current transport spelling for an operation; treating
+        // operation-name uniqueness as authority would discard the one exact
+        // manifest the host already sealed for this call.
+        const exactEntry = canonical.ok && attestation?.bindingKind === 'catalog_manifest'
+          ? peekHostCapabilityCatalogFactory()?.get(attestation.capabilityId) ?? null
+          : null;
+        const exactManifest = exactEntry
+          ? currentCapabilityManifest(exactEntry.manifest)
+          : null;
+        const exactPort = exactManifest
+          ? resolveProductionPortsForManifest(exactManifest)
+          : null;
+        if (
+          canonical.ok
+          && attestation?.bindingKind === 'catalog_manifest'
+          && exactEntry
+          && exactManifest
+          && exactPort
+          && attestation.operationId.toLowerCase() === canonical.canonical.toolSlug.toLowerCase()
+          && attestation.capabilityId === exactEntry.capabilityId
+          && attestation.manifestId === exactManifest.manifestId
+          && attestation.manifestDigest === capabilityManifestDigest(exactManifest)
+          && attestation.accountId === exactManifest.accountId
+          && attestation.invokePortId === exactManifest.invokePortId
+        ) {
+          remappedCatalogPreparation = {
+            manifest: exactManifest,
+            port: exactPort,
+          };
+        }
+      }
       const carrierValidationError = composioCarrierValidationError(target, resolvedArgs);
       if (carrierValidationError) {
         return refuse({
@@ -1128,6 +1214,33 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           // which, by construction, could never exist.
           Boolean(options.aroundResolvedDispatch && currentExpectedWorkBinding()),
         );
+      const dispatchWithCarrierPreparation = async (): Promise<unknown> => {
+        if (!remappedCatalogPreparation) return dispatch();
+        const { port } = remappedCatalogPreparation;
+        const preparationMembers = [
+          port.admitPreparation,
+          port.prepareInvocation,
+          port.invokeWithPreparation,
+        ];
+        const preparationMemberCount = preparationMembers.filter((member) => (
+          typeof member === 'function'
+        )).length;
+        if (preparationMemberCount === 0) return dispatch();
+        if (preparationMemberCount !== preparationMembers.length) {
+          throw new Error('remapped catalog production port has an incomplete preparation contract');
+        }
+
+        // The exact operation was intentionally normalized onto a trusted
+        // carrier, so that carrier (rather than port.invoke) owns the business
+        // physical row. Preparation is deliberately NOT recorded against the
+        // business logical call: any physical row freezes that call's contract,
+        // which would make the nested gateway reject before its one business
+        // crossing. The adapter returns a one-shot proof and its authoritative
+        // outcome still completes before the carrier can reserve business I/O.
+        port.admitPreparation!();
+        const proof = await port.prepareInvocation!();
+        return port.invokeWithPreparation!(proof, dispatch);
+      };
       let out: unknown;
       try {
         out = options.aroundResolvedDispatch
@@ -1141,8 +1254,8 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
               targetInputSchema: exactTargetInputSchema,
               ...(evidenceArgs !== dispatchArgs ? { evidenceArgs } : {}),
               ...(evidenceInputSchema ? { evidenceInputSchema } : {}),
-            }, dispatch)
-          : await dispatch();
+            }, dispatchWithCarrierPreparation)
+          : await dispatchWithCarrierPreparation();
       } catch (error) {
         if (resolvedRefusalTarget && error instanceof ExternalWritePreDispatchError) {
           settleResolvedCarrierRefusal({

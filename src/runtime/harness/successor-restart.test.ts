@@ -50,6 +50,11 @@ test('two-process provision then normal bootstrap reconstructs the shipped succe
     refreshTypedExecutionReadiness();
     const port = peekProductionCapabilityPort(productionPortIdentityFromManifest(provisioned.manifest));
     if (!port || !isShippedInvoke(port.invoke)) process.exit(4);
+    if (provisioned.manifest.providerKind === 'composio' && (
+      typeof port.admitPreparation !== 'function'
+      || typeof port.prepareInvocation !== 'function'
+      || typeof port.invokeWithPreparation !== 'function'
+    )) process.exit(5);
     process.stdout.write('reconstructed');
   `;
   const first = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
