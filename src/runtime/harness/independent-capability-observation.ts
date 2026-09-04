@@ -311,6 +311,13 @@ export function independentlyObserveCapability(
     // Re-observe from the live source. Reading the registration snapshot back
     // would make observation an echo of what was registered; the observer must
     // report what the capability says now, so drift and staleness are real.
+    // A restart-adopted observation has no synchronous re-observer. Once that
+    // frozen transport snapshot is stale, do not deposit it back into the
+    // transport before an async refresh: doing so can overwrite a newer remote
+    // observation with the exact stale belief we are trying to verify. The
+    // read-only call kernel may contact the attested transport once and then
+    // retry this synchronous last-edge observation.
+    if (!prior.observe && !observationIsFresh(prior.snapshot)) return null;
     const live = prior.observe ? prior.observe() : prior.snapshot;
     shipped.registerIsolatedObservation({
       operationId: live.operationId,

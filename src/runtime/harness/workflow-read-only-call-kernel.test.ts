@@ -20,6 +20,7 @@ const manifests = await import('./capability-manifest.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const observations = await import('./independent-capability-observation.js');
 const ports = await import('./production-capability-ports.js');
+const shipped = await import('./shipped-implementation-identity.js');
 const plans = await import('../../memory/workflow-node-invocation-plan.js');
 
 test.after(() => {
@@ -419,6 +420,84 @@ test('one real workflow activation owns one immutable-port read through both set
     assert.match(replay.resultHandleId, /^rh_/);
   }
   assert.equal(installed.portBodies(), 1, 'terminal replay cannot cross the immutable port again');
+});
+
+test('a stale restart-adopted read observation refreshes its exact provider identity before mint', async () => {
+  const installed = installCapability('read');
+  observations.clearIndependentCapabilityObservations();
+  assert.equal(observations.registerIndependentCapabilityObservation({
+    operationId: installed.exactManifest.operationId,
+    accountId: installed.exactManifest.accountId,
+    definitionFingerprint: installed.exactManifest.definitionFingerprint,
+    providerVersion: installed.exactManifest.providerVersion,
+    operationVersion: installed.exactManifest.operationVersion,
+    observedAt: Date.now() - observations.INDEPENDENT_OBSERVATION_FRESHNESS_MS - 1,
+    origin: 'independent',
+  }).ok, true);
+  shipped.loadShippedImplementations().registerIsolatedObservation({
+    operationId: installed.exactManifest.operationId,
+    accountId: installed.exactManifest.accountId,
+    definitionFingerprint: installed.exactManifest.definitionFingerprint,
+    providerVersion: installed.exactManifest.providerVersion,
+    operationVersion: installed.exactManifest.operationVersion,
+    observedAt: Date.now(),
+  });
+  const armed = arm(installed.plan, 'stale-restart-observation');
+  assert.equal(armed.status, 'armed');
+  if (armed.status !== 'armed') return;
+
+  const completed = await kernel.executeWorkflowReadOnlyCall({
+    activationId: armed.ref.activationId,
+    invocationPlan: installed.plan,
+    args: { scope: 'current' },
+  });
+
+  assert.equal(completed.status, 'completed', JSON.stringify(completed));
+  assert.equal(installed.portBodies(), 1);
+  const refreshed = observations.peekIndependentCapabilityObservation(
+    installed.exactManifest.operationId,
+    installed.exactManifest.accountId,
+  );
+  assert.ok(refreshed && observations.observationIsFresh(refreshed));
+});
+
+test('read observation self-heal refuses provider identity drift with zero business bodies', async () => {
+  const installed = installCapability('read');
+  observations.clearIndependentCapabilityObservations();
+  assert.equal(observations.registerIndependentCapabilityObservation({
+    operationId: installed.exactManifest.operationId,
+    accountId: installed.exactManifest.accountId,
+    definitionFingerprint: installed.exactManifest.definitionFingerprint,
+    providerVersion: installed.exactManifest.providerVersion,
+    operationVersion: installed.exactManifest.operationVersion,
+    observedAt: Date.now() - observations.INDEPENDENT_OBSERVATION_FRESHNESS_MS - 1,
+    origin: 'independent',
+  }).ok, true);
+  shipped.loadShippedImplementations().registerIsolatedObservation({
+    operationId: installed.exactManifest.operationId,
+    accountId: installed.exactManifest.accountId,
+    definitionFingerprint: digest('provider-definition-drift'),
+    providerVersion: installed.exactManifest.providerVersion,
+    operationVersion: installed.exactManifest.operationVersion,
+    observedAt: Date.now(),
+  });
+  const armed = arm(installed.plan, 'drifted-refresh-observation');
+  assert.equal(armed.status, 'armed');
+  if (armed.status !== 'armed') return;
+
+  const blocked = await kernel.executeWorkflowReadOnlyCall({
+    activationId: armed.ref.activationId,
+    invocationPlan: installed.plan,
+    args: { scope: 'current' },
+  });
+
+  assert.equal(blocked.status, 'blocked', JSON.stringify(blocked));
+  if (blocked.status === 'blocked') {
+    assert.equal(blocked.zeroBody, true);
+    assert.match(blocked.reason, /independent live observation differs/);
+  }
+  assert.equal(installed.portBodies(), 0);
+  assert.equal(kernelState(armed.ref).physical_n, 0);
 });
 
 test('an advisory learned pin stays inert until the ordinary workflow call kernel owns the exact read', async () => {

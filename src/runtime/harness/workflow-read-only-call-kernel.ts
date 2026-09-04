@@ -47,15 +47,26 @@ import {
   type CanonicalCatalogIdentityV1,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
-import { currentCapabilityManifest } from './capability-manifest.js';
+import {
+  capabilityManifestDigest,
+  currentCapabilityManifest,
+} from './capability-manifest.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
 import {
   createWorkflowNodeInvocationPlan,
   parseWorkflowNodeInvocationPlan,
   type WorkflowNodeArgumentBindingV1,
+  type WorkflowNodeCapabilityFingerprintV1,
   type WorkflowNodeInvocationEffectV1,
   type WorkflowNodeInvocationValueTypeV1,
 } from '../../memory/workflow-node-invocation-plan.js';
+import { workflowCapabilityDigest } from '../../execution/workflow-capability-digest.js';
+import {
+  independentlyObserveCapability,
+  observationIsFresh,
+  refreshIndependentCapabilityObservation,
+  type IndependentCapabilityObservation,
+} from './independent-capability-observation.js';
 import {
   activateDispatchLease,
   isDispatchLeaseCurrent,
@@ -526,6 +537,74 @@ function exactPortBinding(input: {
   };
 }
 
+function exactReadCatalogIdentity(
+  binding: WorkflowNodeCapabilityFingerprintV1,
+): CanonicalCatalogIdentityV1 | null {
+  const capability = peekHostCapabilityCatalogFactory()?.get(binding.capabilityId);
+  const identity = capability ? canonicalCatalogIdentityOf(capability) : null;
+  if (
+    !capability
+    || !identity
+    || !capability.manifest
+    || !currentCapabilityManifest(capability.manifest)
+    || capabilityManifestDigest(capability.manifest) !== binding.manifestDigest
+    || identity.capabilityId !== binding.capabilityId
+    || identity.manifestId !== binding.manifestId
+    || identity.manifestDigest !== binding.manifestDigest
+    || identity.operationId !== binding.operationId
+    || identity.schemaVersion !== binding.operationVersion
+    || workflowCapabilityDigest(identity.schemaDigest) !== binding.schemaDigest
+    || identity.providerVersion !== binding.providerVersion
+    || workflowCapabilityDigest(identity.liveFingerprint) !== binding.liveFingerprint
+    || identity.account !== binding.accountId
+    || identity.effect !== 'read'
+    || identity.invokePortId !== binding.invokePortId
+    || identity.argumentCompiler.id !== binding.argumentCompiler.id
+    || identity.argumentCompiler.version !== binding.argumentCompiler.version
+  ) return null;
+  return identity;
+}
+
+function observationMatchesReadBinding(
+  observation: IndependentCapabilityObservation | null,
+  binding: WorkflowNodeCapabilityFingerprintV1,
+): boolean {
+  return Boolean(
+    observation
+    && observation.origin === 'independent'
+    && observationIsFresh(observation)
+    && observation.operationId === binding.operationId
+    && observation.operationVersion === binding.operationVersion
+    && observation.providerVersion === binding.providerVersion
+    && workflowCapabilityDigest(observation.definitionFingerprint) === binding.liveFingerprint
+    && observation.accountId === binding.accountId,
+  );
+}
+
+/**
+ * Refresh only a frozen, exact read identity before the synchronous mint edge.
+ * A current re-observer usually repairs freshness without I/O. Restart-adopted
+ * observations have no such callback, so the attested transport gets one
+ * metadata refresh using the current catalog identity — never plan-authored
+ * provider bytes. Drift remains a normal fail-closed mint conflict.
+ */
+async function refreshExactReadObservationIfNeeded(
+  binding: WorkflowNodeCapabilityFingerprintV1,
+): Promise<void> {
+  if (binding.effect !== 'read') return;
+  const identity = exactReadCatalogIdentity(binding);
+  if (!identity) return;
+  const observed = independentlyObserveCapability(binding.operationId, binding.accountId);
+  if (observationMatchesReadBinding(observed, binding)) return;
+  await refreshIndependentCapabilityObservation({
+    operationId: identity.operationId,
+    accountId: identity.account,
+    definitionFingerprint: identity.liveFingerprint,
+    providerVersion: identity.providerVersion,
+    operationVersion: identity.schemaVersion,
+  });
+}
+
 /**
  * Execute the one exact call owned by a durable workflow-node activation.
  *
@@ -777,6 +856,16 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
       activationId: input.activationId,
     };
   }
+  if (input.signal?.aborted) {
+    port.close({ activationId: input.activationId, outcome: 'cancelled' });
+    return {
+      status: 'blocked',
+      reason: `${port.operationLabel} was cancelled before admission`,
+      zeroBody: true,
+      activationId: input.activationId,
+    };
+  }
+  await refreshExactReadObservationIfNeeded(parsed.plan.binding);
   if (input.signal?.aborted) {
     port.close({ activationId: input.activationId, outcome: 'cancelled' });
     return {
