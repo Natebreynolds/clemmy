@@ -1,7 +1,11 @@
 # Beating DeepSeek Harness and Hermes: the direction, backed by our own data
 
 Date: 2026-09-04
-Status: direction document. Owner approves any tag, push, or phase start.
+Status: direction document. The owner approved the P0 and P1 phase starts on
+2026-09-04. Before P2, P3, P4, or P5, report the preceding phase's measured
+evidence, name the exact next-phase scope and safety invariants, ask `Start Pn?`,
+and wait for the owner's answer. Every tag and push still requires its own explicit
+owner approval.
 Provenance: every number below was **measured this session** — a 49-agent adversarial
 audit (5.2M tokens, 1,886 tool calls) over the live daemon log, the event journal, the
 dirty working tree, and git. 30 candidate claims were generated; **17 were refuted on
@@ -19,6 +23,7 @@ canary recipe (§10), suite hygiene (§10), and the verified-trap register (§11
 included inline so you do not need any other session's memory. Execute the phases in
 §5 in order. Two hard rules override everything you may infer along the way:
 (1) the owner approves every `git push` and every tag — prepare both, then ask;
+P0 and P1 may start now, while P2–P5 use the phase-start ritual above;
 (2) do not diagnose by reading code — 17 of the 30 claims behind this doc's first
 draft died on measurement, and four prior fixes on one seam were written against
 code that was never even exercised. Run the real function on the real bytes, or
@@ -250,21 +255,29 @@ re-order; do not batch phases into one mega-change (no architecture churn).
 The release has been CI-blocked for 28 days, independent of any code quality question:
 `.github/workflows/release-desktop.yml:104-109` exits 1 unless `tag_sha ==
 origin/main`'s SHA, and origin/main sits at `18c5bcc7` = **v3.14.0 (2026-08-07)**.
-v3.15.0 was tagged locally and never pushed. HEAD is on no remote branch
-(~456–528 commits unpushed).
+v3.15.0 was tagged locally and never pushed. HEAD is on no remote branch. Re-measure
+the distance at closure with `git rev-list --count origin/main..HEAD` and
+`git rev-list --count main..HEAD`; do not carry a stale commit count into evidence.
 
-1. Commit the three **untracked production files** (661 lines, 11 tracked importers,
+1a. Commit this direction document and its two companion 2026-09-04 plan/audit
+    documents first, so the execution contract is durable before source cleanup.
+1b. Commit the three **untracked production files** (661 lines, 11 tracked importers,
    one `git clean` from deletion): `current-task-authority.ts`,
    `external-write-event-projection.ts`, `production-composio-preparation.ts`.
    Keep eventlog migrations 76+77 with their projection in ONE commit (77 exists
    solely to correct 76 — migrations are immutable).
-2. Stage the rest of the 163-file tree into reviewed commits; drop the attempts
-   documented as inert; re-emit implementation artifacts.
-3. Merge wave → main, push branch + tags.
+2. Re-measure the complete dirty tree with
+   `git status --porcelain=v1 --untracked-files=all`; stage it into reviewed commits,
+   drop the attempts documented as inert, and re-emit implementation artifacts once
+   after the source tree settles. Never reconcile against the obsolete 163-path census.
+3. Prepare the fast-forward wave → main integration. After separate owner approval,
+   push the intended branch/main ref and then the one intended v3.16 ref only. Never
+   use `git push --tags`: the unpublished stale v3.15 tag is not part of this release.
 4. Tag **v3.16.0** with the graph-driver subtraction *named as honestly deferred*
    (the tag procedure explicitly permits deferred capabilities). The end-to-end
    mutating canary becomes the **v3.17.0** gate, where it gates work actually in
-   scope. Demote the 13-row NEXT-TAG matrix to a north-star conformance roadmap:
+   scope. Demote the NEXT-TAG competitive-claim and provider-neutral matrices to a
+   north-star conformance roadmap:
    a gate defined as "the architecture is finished" cannot pass while the
    architecture is being rewritten — and its own matrix journey is green in 14 s
    while containing **zero occurrences of `external_write`**.

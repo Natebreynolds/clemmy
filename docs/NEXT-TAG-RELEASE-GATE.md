@@ -1,8 +1,13 @@
-# Clementine next-tag release gate
+# Clementine v3.16 safety gate and North-star conformance roadmap
 
 Target: release candidate by Monday, August 24, 2026. This is a quality gate,
 not a promise to publish on a date. A tag is created only when the candidate
 below is reproducible from one clean commit.
+
+Status: the Product claim through the provider-neutral matrix is a North-star
+conformance roadmap, not a v3.16 blocker. The upgrade gate and candidate/tag
+procedure remain binding v3.16 safety gates. The P1/P3 end-to-end mutating canary
+becomes a v3.17 gate; this demotion changes claims, never safety or CI coverage.
 
 ## Product claim
 
@@ -40,7 +45,7 @@ workflow resume, canonical entity truth, honest coverage, consent lineage, and
 upgrade safety. See `HERMES-HARNESS-RESEARCH-2026-08-22.md` and
 `DEEPSEEK-HARNESS-RESEARCH-2026-08-22.md`.
 
-### Executable competitive gate
+### Executable competitive conformance roadmap
 
 Architecture prose is not release evidence. Every row below is a required
 journey or generated cohort, and a component test may not substitute for it.
@@ -49,7 +54,7 @@ journey or generated cohort, and a component test may not substitute for it.
 |---|---|---|
 | Plain conversation and text-only creation are simpler than an agent harness | A generated cold-home cohort of greetings, conversation, explanations, arithmetic, writing, rewriting, brainstorming, and other answer-in-text requests through the ordinary foreground bridge | exactly one primary-model request; zero semantic/planner, catalog, discovery, memory-embedding, or tool calls; zero advertised tool-schema bytes; p95 host overhead no more than 50 ms above the recording model |
 | Model-visible context is reconstructable durable truth | A recording adapter snapshots every request, the process restarts, and an independent projector rebuilds the same accepted input, preamble, verified memory hints, disclosed capability refs, settled results, and tool schemas from durable rows | byte-identical normalized request digest at every model step; every injected block names durable provenance; no unlogged prompt mutation, hidden planner output, ambient memory, or provider result |
-| Cold unfamiliar work is one foreground reasoning loop | `src/journeys/restaurant-sheet-natural-request.integration.test.ts` using the exact Discord request, a blank capability memory, live connected definitions, and recording providers | zero hidden model calls; at most one bounded discovery call per unresolved role; one primary `plan_task`; zero user stops; exactly one aggregate read and one create-new Sheet effect; one terminal |
+| Cold unfamiliar work is one foreground reasoning loop | `src/journeys/restaurant-sheet-natural-request.integration.test.ts` using the exact Discord request, a blank capability memory, live connected definitions, and recording providers | zero hidden model calls; at most one bounded discovery call per unresolved role; no mandatory plan or DAG for bounded foreground work; zero user stops; exactly one aggregate read and one create-new Sheet effect; one terminal |
 | Verified memory buys efficiency but never authority | `src/journeys/harness-memory-efficiency.acceptance.test.ts`, followed by the same natural journey warm | warm discovery calls and routing bytes are strictly lower; no schema refresh when the live fingerprint matches; memory lookup/render changes zero authority or ledger rows; physical crossings remain identical |
 | Prompt caching reduces spend without freezing stale truth | A recording transport compares normalized request layers across cold/warm turns, policy revisions, memory changes, and catalog drift | identity/rubric prefix digest stays stable until its explicit revision changes; volatile memory/catalog/task blocks cannot invalidate the stable prefix or survive a live revision mismatch; cached and uncached usage are recorded; the verified warm natural journey uses at most 70% of the cold journey's uncached input tokens |
 | Multi-call work beats sequential-only loops without racing effects | `src/journeys/long-task-competitive-acceptance.red.test.ts` plus a timed generated cohort | four independent 100 ms reads finish within 180 ms p95 and reinsert in call order; declared dependency waves remain ordered; two same-resource 100 ms mutations have peak concurrency one and take at least 190 ms |
@@ -57,15 +62,15 @@ journey or generated cohort, and a component test may not substitute for it.
 | Complex fan-out spends tokens deliberately | A generated 100-item `run_worker` cohort with repeated shared context, distinct item facts, restart, partial failure, and budget exhaustion | each worker receives only the shared packet plus its item/dependencies; the parent sees bounded result envelopes rather than 100 raw transcripts; cached and uncached usage are accounted separately; aggregate uncached use never exceeds the durable run window; unstarted items are reported as not attempted, never silently dropped or claimed complete |
 | Restart never repeats settled work | `src/journeys/harness-restart-kernel-parity.red.test.ts` and real-process crash points before reservation, after claim, after return, and after settlement | returned reads and committed writes cross the provider once; claimed/unknown writes hold for reconciliation; settled results are adopted with zero new model, lease, body, physical row, or result handle |
 | Chat and workflows use one effect kernel | The parity journey plus every workflow execution adapter, including structured calls, pagination, and learned-memory hints | identical logical-call, call-lease, physical-claim, settlement, evidence-handle, and terminal vocabulary; memory performs zero provider I/O; no workflow-specific direct-dispatch lane |
-| Discovery remains bounded at provider scale | A generated permutation cohort with 10,000 live distractors and two relevant operations | initial planning surface at most 16 KiB; one search returns at most eight exact refs; correct refs selected for 100/100 order/name permutations; combined discovery/schema context at most 32 KiB; zero business I/O before plan admission |
+| Discovery remains bounded at provider scale | A generated permutation cohort with 10,000 live distractors and two relevant operations | initial planning surface at most 16 KiB; one search returns at most eight exact refs; correct refs selected for 100/100 order/name permutations; combined discovery/schema context at most 32 KiB; zero business I/O before exact call admission |
 | User stops correspond to real missing authority | A balanced generated corpus of conversation, reads, reversible creates, irreversible effects, missing credentials, and genuine choices | zero stops for conversation, admitted reads, and one exact reversible create; exactly one typed stop for a genuinely user-only choice, uncovered irreversible effect, or uncertain write; p95 questions per request at most one |
 
-The release is a no-go if a row is unimplemented, skipped, marked TODO, or
-green only because the fixture preselected a source, seeded historical
-authority, removed realistic provider arguments, injected a plan, or bypassed
-the ordinary channel/bridge/model/call path.
+The product may not claim North-star conformance for a row that is unimplemented,
+skipped, marked TODO, or green only because the fixture preselected a source,
+seeded historical authority, removed realistic provider arguments, injected a
+plan, or bypassed the ordinary channel/bridge/model/call path.
 
-## Release acceptance workload
+## North-star acceptance workload roadmap
 
 The representative workload is a large recurring entity dataset. A user can
 describe:
@@ -201,7 +206,7 @@ routing, authority, scheduling, deduplication, or completion logic.
 - Every surface projects the same typed `done`, `needs_input`, `blocked`,
   `held`, `cancelled`, `failed`, `uncertain`, and `transferred` truth.
 
-## Required provider-neutral test matrix
+## Required provider-neutral conformance matrix
 
 All framework fixtures use generated capability and field names. The same
 test is rerun with permuted names, catalog order, carrier kind, and memory
@@ -287,8 +292,9 @@ The tag is withheld unless every item is true:
 - fresh interactive chat selects the host-owned engine by default from the
   persisted accepted-turn boundary; `legacy_sdk` is rolling-upgrade resume
   compatibility only and cannot receive a new effect-capable turn;
-- live canaries progress in order: no-tool, bounded read, paginated read,
-  approval/resume write, then durable pilot;
+- v3.16 live canaries progress in order: no-tool, bounded read, then paginated
+  read. Approval/resume write, the durable pilot, and the P1/P3 end-to-end
+  mutation canary are explicitly deferred to the v3.17 release gate;
 - every canary has one accepted source, one owner, exact logical/physical
   settlements, one terminal, no legacy re-entry, and no open lease/attempt;
 - the packaged build fingerprint, `origin/main`, release commit, and tag SHA
