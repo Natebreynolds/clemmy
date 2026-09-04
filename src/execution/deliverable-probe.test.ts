@@ -40,6 +40,28 @@ test('extractDeliverables: pulls a created Google Sheet id from a composio resul
   assert.equal(dels[0].sourceUserSeq, 7);
 });
 
+test('extractDeliverables: ignores spreadsheet examples returned by tool discovery', () => {
+  const dels = extractDeliverables('s', {
+    listEventsFn: () => [{
+      sessionId: 's',
+      turn: 0,
+      role: 'tool',
+      type: 'tool_returned',
+      data: { sourceUserSeq: 7, tool: 'tool_search', ok: true, callId: 'c-search' },
+    }] as never,
+    getToolOutputFn: () => ({
+      output: JSON.stringify({
+        results: [{
+          name: 'GOOGLESHEETS_BATCH_GET',
+          example: { spreadsheetId: SHEET_ID },
+        }],
+      }),
+    }),
+  });
+
+  assert.deepEqual(dels, [], 'catalog metadata is not request-bound artifact evidence');
+});
+
 test('probe: a populated objective + a sheet with 0 data rows REFUSES completion with the specific gap', async () => {
   const deps: DeliverableProbeDeps = {
     ...sheetCreatedEvents(),
@@ -59,6 +81,110 @@ test('probe: a populated sheet (rows > 1) PASSES', async () => {
   const res = await probeSessionDeliverables('s', 'Create and populate the sheet with the data', deps);
   assert.equal(res.failures.length, 0);
   assert.match(res.evidenceText, /OK: sheet .* 42 rows/);
+});
+
+test('live-shaped existing-resource cell update accepts its exact frozen readback instead of treating one row as a blank new sheet', async () => {
+  const callIds = {
+    initial: 'toolu-initial-values-get',
+    update: 'toolu-update-values-batch',
+    final: 'toolu-final-values-get',
+  };
+  const marker = 'CLEM-PRETAG-BATCH-VERIFIER-V17-20260904-V996';
+  const outputByCall = new Map<string, string>([
+    [callIds.initial, JSON.stringify({
+      data: { display_url: `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`, range: 'Sheet1!V996', values: [] },
+      successful: true,
+    })],
+    [callIds.update, JSON.stringify({
+      data: { spreadsheetId: SHEET_ID, updatedRange: 'Sheet1!V996', updatedCells: 1 },
+      successful: true,
+    })],
+    [callIds.final, JSON.stringify({
+      data: { display_url: `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`, range: 'Sheet1!V996', values: [[marker]] },
+      successful: true,
+    })],
+  ]);
+  let rowCountReads = 0;
+  const deps: DeliverableProbeDeps = {
+    listEventsFn: () => [
+      { sessionId: 's', turn: 1, role: 'tool', type: 'tool_returned', data: {
+        sourceUserSeq: 127514, tool: 'work_call', effectiveTool: 'GOOGLESHEETS_VALUES_GET',
+        effect: 'read', ok: true, callId: callIds.initial,
+      } },
+      { sessionId: 's', turn: 1, role: 'tool', type: 'tool_returned', data: {
+        sourceUserSeq: 127514, tool: 'work_call', effectiveTool: 'GOOGLESHEETS_UPDATE_VALUES_BATCH',
+        effect: 'external_write', ok: true, callId: callIds.update,
+      } },
+      { sessionId: 's', turn: 1, role: 'tool', type: 'tool_returned', data: {
+        sourceUserSeq: 127514, tool: 'work_call', effectiveTool: 'GOOGLESHEETS_VALUES_GET',
+        effect: 'read', ok: true, callId: callIds.final,
+      } },
+    ] as never,
+    getToolOutputFn: (_sessionId, callId) => ({ output: outputByCall.get(callId) ?? '' }),
+    resourcePostureForCall: (_sessionId, sourceUserSeq, callId) => {
+      assert.equal(sourceUserSeq, 127514);
+      assert.equal(callId, callIds.update, 'read results never enter deliverable posture resolution');
+      return 'named_existing';
+    },
+    verifyNamedExistingMutation: async (deliverable) => {
+      assert.equal(deliverable.callId, callIds.update);
+      assert.equal(deliverable.ref, SHEET_ID);
+      return true;
+    },
+    readSheetRowCount: async () => {
+      rowCountReads += 1;
+      return 1;
+    },
+  };
+
+  const deliverables = extractDeliverables('s', deps);
+  assert.deepEqual(deliverables.map((deliverable) => ({
+    ref: deliverable.ref,
+    callId: deliverable.callId,
+    posture: deliverable.resourcePosture,
+  })), [{ ref: SHEET_ID, callId: callIds.update, posture: 'named_existing' }]);
+  const result = await probeDeliverables(
+    deliverables,
+    `Write the values ${marker} to the existing exact cell and read it back. Do not create a spreadsheet.`,
+    's',
+    deps,
+  );
+  assert.equal(result.failures.length, 0, result.summary);
+  assert.match(result.evidenceText, /exact committed mutation and authoritative readback verified/i);
+  assert.equal(rowCountReads, 0,
+    'a verified exact existing-target mutation is not judged by the new-sheet row-count heuristic');
+
+  const missingProof = await probeDeliverables(
+    deliverables,
+    'Write the values into the existing exact cell and verify them.',
+    's',
+    { ...deps, verifyNamedExistingMutation: async () => false },
+  );
+  assert.equal(missingProof.failures.length, 1,
+    'named-existing posture alone cannot manufacture completion without its exact proof');
+  assert.match(missingProof.evidenceText, /UNVERIFIED \(BLOCKING\)/);
+});
+
+test('a create/populate flow remains fail-closed even when an unrelated named-existing proof seam would pass', async () => {
+  let namedExistingProofs = 0;
+  const deps: DeliverableProbeDeps = {
+    ...sheetCreatedEvents(),
+    resourcePostureForCall: () => 'created',
+    verifyNamedExistingMutation: async () => {
+      namedExistingProofs += 1;
+      return true;
+    },
+    readSheetRowCount: async () => 1,
+  };
+  const result = await probeSessionDeliverables(
+    's',
+    'Create and populate the new Google Sheet with the data rows.',
+    deps,
+  );
+  assert.equal(result.failures.length, 1);
+  assert.match(result.summary, /title\/header row|0 data rows/);
+  assert.equal(namedExistingProofs, 0,
+    'new artifacts still require their own population readback');
 });
 
 test('probe: required population with an UNPROBEABLE sheet blocks truthful completion', async () => {

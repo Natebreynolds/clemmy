@@ -18,7 +18,12 @@
  * tests are deterministic with no fs/network dependence.
  */
 import { existsSync, statSync } from 'node:fs';
-import { listEvents, getToolOutput, type EventRow } from '../runtime/harness/eventlog.js';
+import {
+  listEvents,
+  getToolOutput,
+  openEventLog,
+  type EventRow,
+} from '../runtime/harness/eventlog.js';
 import { getRuntimeEnv } from '../config.js';
 
 export type DeliverableKind = 'google_sheet' | 'local_file' | 'space_view';
@@ -33,6 +38,12 @@ export interface Deliverable {
   /** The tool call that produced it (telemetry). */
   callId?: string;
   tool?: string;
+  /** Durable destination posture of the exact producing capability. Reads are
+   * never deliverables; a named-existing mutation is verified against its
+   * frozen mutation/readback proof instead of being treated as a newly-created
+   * blank artifact. Missing/legacy posture remains fail-closed through the
+   * historical population probe. */
+  resourcePosture?: 'created' | 'named_existing';
 }
 
 export interface DeliverableVerdict {
@@ -63,6 +74,19 @@ export interface DeliverableProbeDeps {
    *  error, bad slug, no connection). If population is required, this blocks done
    *  because creation evidence alone cannot prove populated contents. */
   readSheetRowCount?: (spreadsheetId: string, sessionId: string) => Promise<number>;
+  /** Test seam for the provider-neutral frozen mutation/readback proof. The
+   * production path reopens the exact owner write, verifier settlement/result,
+   * and issued readback receipt and performs no provider I/O. */
+  verifyNamedExistingMutation?: (
+    deliverable: Deliverable,
+    sessionId: string,
+  ) => Promise<boolean>;
+  /** Test seam for the durable destination posture of an accepted call. */
+  resourcePostureForCall?: (
+    sessionId: string,
+    sourceUserSeq: number,
+    callId: string,
+  ) => 'created' | 'named_existing' | 'unknown';
 }
 
 /** Kill-switch: CLEMMY_DELIVERABLE_PROBES=off restores pre-probe behavior. */
@@ -99,6 +123,102 @@ function resultTextFor(sessionId: string, ev: EventRow, deps: DeliverableProbeDe
   return typeof data.preview === 'string' ? data.preview : '';
 }
 
+function defaultResourcePostureForCall(
+  sessionId: string,
+  sourceUserSeq: number,
+  callId: string,
+): 'created' | 'named_existing' | 'unknown' {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT b.manifest_id, b.manifest_digest, m.digest, m.manifest_json
+        FROM host_call_capability_bindings b
+        JOIN capability_manifests m ON m.manifest_id = b.manifest_id
+       WHERE b.session_id = ? AND b.source_user_seq = ?
+         AND b.logical_tool_call_id = ? AND b.binding_kind = 'catalog_manifest'
+    `).get(sessionId, sourceUserSeq, callId) as {
+      manifest_id: string;
+      manifest_digest: string;
+      digest: string;
+      manifest_json: string;
+    } | undefined;
+    if (!row || row.manifest_digest !== row.digest) return 'unknown';
+    const manifest = JSON.parse(row.manifest_json) as {
+      manifestId?: unknown;
+      destination?: { posture?: unknown };
+    };
+    if (manifest.manifestId !== row.manifest_id) return 'unknown';
+    if (manifest.destination?.posture === 'create_new') return 'created';
+    if (manifest.destination?.posture === 'named_existing') return 'named_existing';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function populatedExactContent(content: unknown): boolean {
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return false;
+  const entries = (content as { entries?: unknown }).entries;
+  if (!Array.isArray(entries) || entries.length === 0) return false;
+  return entries.some((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const values = (entry as { values?: unknown }).values;
+    return Array.isArray(values) && values.some((row) =>
+      Array.isArray(row) && row.some((cell) =>
+        cell !== null && cell !== undefined && (typeof cell !== 'string' || cell.trim().length > 0)));
+  });
+}
+
+async function defaultVerifyNamedExistingMutation(
+  deliverable: Deliverable,
+  sessionId: string,
+): Promise<boolean> {
+  if (
+    !deliverable.callId
+    || !Number.isSafeInteger(deliverable.sourceUserSeq)
+    || (deliverable.sourceUserSeq ?? 0) <= 0
+  ) return false;
+  try {
+    const { proveFrozenMutationVerification } = await import(
+      '../runtime/harness/mutation-verification-proof.js'
+    );
+    const proof = proveFrozenMutationVerification({
+      sessionId,
+      sourceUserSeq: deliverable.sourceUserSeq!,
+      ownerLogicalToolCallId: deliverable.callId,
+    });
+    if (
+      proof.status !== 'verified'
+      || proof.resourceId !== deliverable.ref
+      || proof.recipe.proof !== 'exact_content_v1'
+      || proof.recipe.mutation.target.source !== 'provider_arguments'
+      || !populatedExactContent(proof.expectedContent)
+    ) return false;
+
+    const receipt = openEventLog().prepare(`
+      SELECT receipt_id
+        FROM host_write_receipts
+       WHERE session_id = ? AND source_user_seq = ?
+         AND logical_tool_call_id = ? AND kind = 'readback'
+         AND created_id = ?
+    `).get(
+      sessionId,
+      deliverable.sourceUserSeq,
+      deliverable.callId,
+      deliverable.ref,
+    ) as { receipt_id: string } | undefined;
+    if (!receipt) return false;
+    const { redeemEvidenceReceipt } = await import(
+      '../runtime/harness/evidence-receipts.js'
+    );
+    return redeemEvidenceReceipt(sessionId, receipt.receipt_id, {
+      expectKind: 'readback',
+      sourceUserSeq: deliverable.sourceUserSeq,
+    }).ok;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Extract the concrete deliverable references a session produced from its successful
  * tool_returned events. Deterministic + heuristic — only shapes we can probe.
@@ -126,25 +246,48 @@ export function extractDeliverables(sessionId: string, deps: DeliverableProbeDep
       callId?: string;
       sourceUserSeq?: number;
       accounting?: string;
+      effect?: string;
     };
     if (data.accounting === 'transport_mirror') continue;
     if (data.ok === false) continue; // a failed call produced no deliverable
     const tool = (data.tool ?? '').toString();
+    // Discovery returns schemas, examples, and documentation that can contain
+    // realistic spreadsheet ids/URLs. Those bytes are metadata, never evidence
+    // that this accepted request created or touched the referenced artifact.
+    if (tool.trim().toLowerCase() === 'tool_search') continue;
     const text = resultTextFor(sessionId, ev, deps);
     if (!text) continue;
 
-    // Google Sheet — a composio GOOGLESHEETS_* result carrying a spreadsheet id/URL.
+    // Google Sheet — a result carrying a spreadsheet id/URL. A read observed
+    // an already-existing resource; it did not produce a deliverable. For a
+    // mutation, the exact durable manifest destination decides whether this is
+    // a newly-created artifact or a named-existing target. This is deliberately
+    // capability/manifest-driven rather than an operation-name allowlist.
     if (/GOOGLESHEETS|google.?sheets|spreadsheet/i.test(tool + text)) {
       const id = SHEET_ID_RE.exec(text)?.[1] ?? SHEET_URL_RE.exec(text)?.[1];
-      if (id) add({
-        kind: 'google_sheet',
-        ref: id,
-        ...(Number.isSafeInteger(data.sourceUserSeq) && (data.sourceUserSeq ?? 0) > 0
-          ? { sourceUserSeq: data.sourceUserSeq }
-          : {}),
-        callId: data.callId,
-        tool,
-      });
+      if (id && data.effect !== 'read') {
+        const sourceUserSeq = Number.isSafeInteger(data.sourceUserSeq)
+          && (data.sourceUserSeq ?? 0) > 0
+          ? data.sourceUserSeq
+          : undefined;
+        const posture = sourceUserSeq !== undefined && data.callId
+          ? (deps.resourcePostureForCall ?? defaultResourcePostureForCall)(
+              sessionId,
+              sourceUserSeq,
+              data.callId,
+            )
+          : 'unknown';
+        add({
+          kind: 'google_sheet',
+          ref: id,
+          ...(sourceUserSeq !== undefined ? { sourceUserSeq } : {}),
+          callId: data.callId,
+          tool,
+          ...(posture === 'created' || posture === 'named_existing'
+            ? { resourcePosture: posture }
+            : {}),
+        });
+      }
     }
     // Local file — a write_file result names the absolute path it wrote.
     if (tool === 'write_file' || WROTE_FILE_RE.test(text)) {
@@ -249,6 +392,24 @@ async function probeOne(
   // google_sheet — only a POPULATION objective makes an empty sheet a failure.
   if (!objectiveImpliesPopulation(objective)) {
     return { deliverable: d, pass: true, method: 'skipped', detail: `sheet ${d.ref}: objective does not imply population — existence not readback-checked` };
+  }
+  if (d.resourcePosture === 'named_existing') {
+    const verified = deps.verifyNamedExistingMutation
+      ? await deps.verifyNamedExistingMutation(d, sessionId)
+      : await defaultVerifyNamedExistingMutation(d, sessionId);
+    return verified
+      ? {
+          deliverable: d,
+          pass: true,
+          method: 'probe',
+          detail: `sheet ${d.ref}: exact committed mutation and authoritative readback verified`,
+        }
+      : {
+          deliverable: d,
+          pass: false,
+          method: 'unverified',
+          detail: `sheet ${d.ref}: exact named-existing mutation readback could not be verified`,
+        };
   }
   let rows: number;
   try {
