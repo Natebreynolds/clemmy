@@ -171,6 +171,28 @@ export function getActiveObjective(): string | undefined {
 }
 
 /**
+ * Session-owned variant for execution/runtime decisions. The focus table has
+ * one process-global active row for UI continuity, but that row is not task
+ * authority for an unrelated session. Callers that have a session identity
+ * must use this function instead of the ambient global objective.
+ */
+export function getActiveObjectiveForSession(sessionId: string): string | undefined {
+  const enabled = (getRuntimeEnv('CLEMMY_SCOPED_RECALL', 'on') ?? 'on').toLowerCase() !== 'off';
+  const wanted = sessionId.trim();
+  if (!enabled || !wanted) return undefined;
+  try {
+    const focus = getActiveFocus();
+    if (!focus) return undefined;
+    const owned = focus.related_session_id === wanted
+      || focus.resource_ref === `session:${wanted}`;
+    if (!owned) return undefined;
+    return `${focus.title} ${focus.summary}`.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Recall objective for a single turn = the CURRENT MESSAGE blended with the
  * active focus. getActiveObjective() alone scopes recall to the focus, so a
  * one-off chat query ("pull MY priority-account accounts") with no matching

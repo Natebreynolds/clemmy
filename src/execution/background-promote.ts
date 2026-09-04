@@ -34,7 +34,7 @@ import {
   requestKill,
   type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
-import { getActiveObjective } from '../memory/focus.js';
+import { getActiveObjectiveForSession } from '../memory/focus.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
 import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
 import { checkpointCapsule, endHandoff, projectCapsuleFromDurableState, stepHandoff } from './continuation-capsule.js';
@@ -472,7 +472,7 @@ export function resolveBackgroundableObjective(
   } catch { /* the aligned turn objective remains authoritative */ }
   if (!objective) {
     try {
-      objective = getActiveObjective()?.trim() ?? '';
+      objective = getActiveObjectiveForSession(sessionId)?.trim() ?? '';
     } catch { /* focus store is optional context */ }
   }
   if (!objective) {

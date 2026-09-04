@@ -20,7 +20,7 @@
  *   - Skips error/approval/unavailable results.
  * Best-effort + silent: learning is additive and must never break a tool call.
  */
-import { getActiveObjective } from '../../memory/focus.js';
+import { getActiveObjective, getActiveObjectiveForSession } from '../../memory/focus.js';
 import { peekToolChoice, rememberToolChoice } from '../../memory/tool-choice-store.js';
 import { classifyToolError, detectStructuredToolFailure } from './tool-error-corrective.js';
 import { listEvents } from './eventlog.js';
@@ -255,10 +255,11 @@ export function detectRememberableSuccess(
  * retained as context.
  */
 function recallContextPhrase(opts?: { sessionId?: string; sourceUserSeq?: number }): string {
+  let sessionId = opts?.sessionId;
   try {
     const ambient = getToolOutputContext();
     const run = harnessRunContextStorage.getStore();
-    const sessionId = opts?.sessionId || ambient?.sessionId || run?.sessionId;
+    sessionId = sessionId || ambient?.sessionId || run?.sessionId;
     const sourceUserSeq = opts?.sourceUserSeq
       || ambient?.sourceUserSeq
       || run?.sourceUserSeq;
@@ -275,7 +276,11 @@ function recallContextPhrase(opts?: { sessionId?: string; sourceUserSeq?: number
       if (phrase) return phrase.slice(0, 240);
     }
   } catch { /* session recall is additive */ }
-  return (getActiveObjective() ?? '').trim();
+  return (
+    sessionId
+      ? getActiveObjectiveForSession(sessionId)
+      : getActiveObjective()
+  )?.trim() ?? '';
 }
 
 function rememberableIntent(success: RememberableSuccess): string {
