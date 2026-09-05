@@ -1359,6 +1359,57 @@ test('only the machine-typed terminal readback failure maps to unverified', asyn
   assert.equal(realBlock.stoppedReason, 'blocked');
 });
 
+test('a transferred terminal closes the public request successfully and replays the exact durable handoff', async () => {
+  const sessionId = 'typed-transferred-terminal-through-bridge';
+  const message = 'Continue the accepted work with its durable background owner.';
+  const text = 'The accepted task transferred to its durable background owner.';
+  let sourceUserSeq = 0;
+  let modelLoops = 0;
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+      modelLoops += 1;
+      const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === opts.sourceUserSeq)!;
+      sourceUserSeq = source.seq;
+      const identity = { sessionId: opts.sessionId, sourceUserSeq, turn: source.turn };
+      const committed = commitTurnOutcome({
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'transferred',
+        resumable: false,
+        presentation: { kind: 'transferred', text },
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'completed',
+        steps: 1,
+        lastTurn: source.turn,
+        publicPresentation: committed.presentation,
+      };
+    }) as never,
+  });
+  const response = await respondViaHarness('home', { sessionId, message });
+  assert.equal(response.stoppedReason, 'success');
+  assert.equal(response.sessionId, sessionId);
+  assert.equal(response.text, text);
+  _setBridgeImplsForTests({
+    configure: (async () => { throw new Error('durable handoff replay must not configure'); }) as never,
+  });
+  const replay = await respondPreferHarness('home', { sessionId, sourceUserSeq, message },
+    async () => { throw new Error('handoff replay must not use the legacy engine'); });
+  assert.equal(replay.stoppedReason, 'success');
+  assert.equal(replay.sessionId, sessionId);
+  assert.equal(replay.text, text);
+  assert.equal(modelLoops, 1);
+  const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1);
+  assert.equal((terminals[0].data.presentation as { status: string }).status, 'transferred',
+    'successful transport delivery never rewrites the task status to done');
+});
+
 test('an exact replay preserves the machine-typed readback-only terminal', async () => {
   const sessionId = 'typed-readback-only-terminal-replay';
   createSession({ id: sessionId, kind: 'chat' });

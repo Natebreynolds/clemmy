@@ -82,11 +82,21 @@ async function waitForMarker(
   return { marker, stdout, stderr, ...exit };
 }
 
-function crashAt(home: string, mode: 'start-after-read' | 'start-after-write') {
+function crashAt(
+  home: string,
+  mode: 'start-after-read' | 'start-after-write' | 'start-after-write-missing-input',
+) {
   return waitForMarker(childProcess(home, mode), 'READY', { killAfterMarker: true });
 }
 
-function runToCompletion(home: string, mode: 'resume-after-read' | 'resume-after-write') {
+function runToCompletion(
+  home: string,
+  mode:
+    | 'resume-after-read'
+    | 'resume-after-write'
+    | 'resume-after-write-no-dispatcher'
+    | 'resume-after-write-missing-input',
+) {
   return waitForMarker(childProcess(home, mode), 'DONE');
 }
 
@@ -279,6 +289,50 @@ test('SIGKILL after the Sheet-create checkpoint adopts its receipt with zero rep
     assert.equal(secondResume.marker.inserted, false);
     assert.deepEqual(auditLines(home), auditAtCrash);
     assertExactOnce(snapshot(home));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a ready write checkpoint is not promoted without a restart dispatcher', { timeout: 40_000 }, async () => {
+  const home = disposableHome('after-write-no-dispatcher');
+  try {
+    const crashed = await crashAt(home, 'start-after-write');
+    assert.equal(crashed.signal, 'SIGKILL');
+
+    const resumed = await runToCompletion(home, 'resume-after-write-no-dispatcher');
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.equal(resumed.marker.autoResumed, false);
+    assert.equal(resumed.marker.autoResumeSkipped, 'no_dispatcher');
+    assert.equal(
+      resumed.marker.recoveryStatePresent,
+      false,
+      'manual recovery must not leave an exact checkpoint owner with no dispatcher',
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a ready write checkpoint is not promoted without accepted input bytes', { timeout: 40_000 }, async () => {
+  const home = disposableHome('after-write-missing-input');
+  try {
+    const crashed = await crashAt(home, 'start-after-write-missing-input');
+    assert.equal(crashed.signal, 'SIGKILL');
+    const auditAtCrash = auditLines(home);
+
+    const resumed = await runToCompletion(home, 'resume-after-write-missing-input');
+    assert.equal(resumed.code, 0, resumed.stderr);
+    assert.equal(resumed.marker.batchOrdinal, 2, 'the settled write checkpoint is fully ready');
+    assert.equal(resumed.marker.autoResumed, false);
+    assert.equal(resumed.marker.autoResumeSkipped, 'identity_missing');
+    assert.equal(resumed.marker.dispatches, 0);
+    assert.equal(
+      resumed.marker.recoveryStatePresent,
+      false,
+      'missing accepted input cannot mint an exact continuation owner',
+    );
+    assert.deepEqual(auditLines(home), auditAtCrash, 'no model or provider body is re-entered');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

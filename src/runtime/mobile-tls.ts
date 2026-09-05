@@ -16,7 +16,7 @@
  */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
@@ -53,6 +53,14 @@ function generate(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const keyPath = path.join(dir, 'key.pem');
   const certPath = path.join(dir, 'cert.pem');
+  // Key material never needs group/world access. Create the key file 0600
+  // BEFORE openssl writes into it: openssl opens `-keyout` for write with
+  // truncation, so an existing file keeps its mode and the private key is
+  // never on disk at the umask default (LibreSSL on macOS writes a fresh key
+  // 0644). `writeFileSync(..., { mode })` only applies to a file it creates,
+  // which is why a post-hoc rewrite of the openssl output never tightened it.
+  writeFileSync(keyPath, '', { mode: 0o600 });
+  chmodSync(keyPath, 0o600);
   // P-256 to match the device-session curve; 10 years because expiry is not a
   // control here — the app pins the exact certificate, and rotation is a
   // deliberate re-pair, not a calendar event.
@@ -63,8 +71,9 @@ function generate(dir: string): void {
     '-subj', '/CN=Clementine Mobile',
     '-addext', 'subjectAltName=DNS:clementine.local',
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
-  // Key material never needs group/world access.
-  writeFileSync(keyPath, readFileSync(keyPath), { mode: 0o600 });
+  // Belt and braces: a platform that ignored the creation mode, or an openssl
+  // that replaced the file instead of truncating it, still ends at 0600.
+  chmodSync(keyPath, 0o600);
 }
 
 /**

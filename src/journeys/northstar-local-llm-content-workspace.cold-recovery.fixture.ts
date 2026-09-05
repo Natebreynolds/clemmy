@@ -27,7 +27,7 @@ type Input = {
   sessionId: string;
   sourceUserSeq: number;
   turn: number;
-  planningDigest: string;
+  authorityDigest: string;
 };
 
 function parseInput(): Input {
@@ -37,7 +37,7 @@ function parseInput(): Input {
   assert.equal(typeof value.sessionId, 'string');
   assert.ok(Number.isSafeInteger(value.sourceUserSeq) && Number(value.sourceUserSeq) > 0);
   assert.ok(Number.isSafeInteger(value.turn) && Number(value.turn) > 0);
-  assert.match(String(value.planningDigest), /^[a-f0-9]{64}$/);
+  assert.match(String(value.authorityDigest), /^[a-f0-9]{64}$/);
   return value as Input;
 }
 
@@ -114,8 +114,10 @@ const rePrimed = await primePrimaryModelPlanningCatalog({
   sourceUserSeq: input.sourceUserSeq,
 });
 if (!rePrimed.ok) throw new Error(rePrimed.reason);
-assert.equal(rePrimed.planning.digest, input.planningDigest,
-  'a cold module graph must rehydrate the exact immutable planning card');
+assert.equal(authority.authority.authorityDigest, input.authorityDigest,
+  'the cold process must retain the exact accepted call authority, not a stale discovery projection');
+assert.deepEqual(acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq), authority,
+  'refreshing the planning projection cannot change the accepted root');
 
 const terminal = deriveTerminalFromCheckpoint(input);
 const workspace = spaceStore.get(terminal.slug);

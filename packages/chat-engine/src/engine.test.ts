@@ -54,6 +54,25 @@ const ev = (seq: number, type: string, data: Record<string, unknown> = {}): Harn
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+test('approval consent facts survive both live delivery and transcript replay verbatim', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({ transport, api: {
+    send: async () => ({ sessionId: 'consent-card', accepted: true }),
+    loadSession: async () => ({ events: [], latestSeq: 0 }),
+  } });
+  const consentCall = { effect: 'external_write', accountId: 'account:exact-owner',
+    risk: { reversibility: 'irreversible', consequence: 'send', destructive: false } };
+  const approval = ev(2, 'approval_requested', { approvalId: 'apr-exact', subject: 'Send the exact message.', consentCall });
+  try {
+    await engine.send('Send the message');
+    await wait(10);
+    transport.live!.onEvent(approval);
+    assert.deepEqual(engine.snapshot().messages.find(message => message.approval)?.approval?.consentCall, consentCall);
+    assert.deepEqual(foldTranscript([approval])[0]?.approval?.consentCall, consentCall);
+    assert.equal(engine.snapshot().busy, false);
+  } finally { engine.dispose(); }
+});
+
 test('stream death recovers by poll first and delivers the missed terminal', async () => {
   const transport = new FakeTransport();
   const delivered: HarnessEvent[] = [];

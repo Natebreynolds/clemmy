@@ -32,7 +32,7 @@ const manifestStores = await import('../runtime/harness/capability-manifest-stor
 const expectedWork = await import('../runtime/harness/expected-work-contract.js');
 const planCoexistence = await import('../runtime/harness/host-planned-resolution-coexistence.js');
 const semantic = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
-const { hostRunRunner } = await import('../runtime/harness/host-turn-runner.js');
+const { hostRunRunner, hostNoProgressRecoveryDirective } = await import('../runtime/harness/host-turn-runner.js');
 const { discoveryGovernor } = await import('../runtime/harness/discovery-governor.js');
 const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
 const { buildPlanTaskTool } = await import('./plan-tools.js');
@@ -236,6 +236,28 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
   const missingLineageDraft = structuredClone(completeDraft);
   missingLineageDraft.topology.operations[1]!.dataFrom = [];
 
+  // One real body invocation, before the host/model journey: no shape failure
+  // may hide either independent static repair or reach compilation/persistence.
+  const shapeAndSemantic = JSON.parse(String(await brackets.withHarnessRunContext({
+    ...identity,
+    counter: new brackets.ToolCallsCounter(4),
+  }, () => (buildPlanTaskTool({ planning: primed.planning }) as unknown as {
+    invoke: (context: unknown, args: string) => Promise<unknown>;
+  }).invoke(null, JSON.stringify({
+    preamble: 'Should I create it?',
+    draft: { ...missingLineageDraft, version: 1 },
+  })))));
+  assert.equal(shapeAndSemantic.code, 'plan_invalid_input');
+  assert.match(shapeAndSemantic.detail, /preamble/);
+  assert.match(shapeAndSemantic.detail, /version/);
+  assert.match(shapeAndSemantic.detail, /dataFrom/);
+  assert.match(shapeAndSemantic.detail, /host has not attested/);
+  assert.match(shapeAndSemantic.repairKey, /^[a-f0-9]{32}$/);
+  assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
+  assert.equal(eventlog.listEvents(session.id, {
+    types: ['accepted_task_authority_armed', 'conversation_preamble'],
+  }).length, 0);
+
   let modelCalls = 0;
   let refusalObservedBeforeRetry = false;
   let lineageRepairObservedBeforeRetry = false;
@@ -248,12 +270,26 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
           responseId: 'plan-completeness-response-1',
           output: [toolCall('plan-read-only-subset', 'plan_task', {
             preamble: 'I’ll read the profile and create the workflow now.',
-            draft: completeDraft,
+            draft: missingLineageDraft,
           })],
         };
       }
       if (modelCalls === 2) {
         const requestText = JSON.stringify(request);
+        const projection = await import('../runtime/harness/host-no-progress-projection.js');
+        const projected = projection.projectHostNoProgressAttempt({
+          ...identity, historyDelta: (request as { input: unknown[] }).input.slice(1) as never,
+        });
+        assert.equal(projected.status, 'ok');
+        if (projected.status === 'ok') {
+          assert.match(projected.consequence?.stage ?? '', /^plan_incomplete:missing_write:[a-f0-9]{16}$/);
+          assert.deepEqual(projected.consequence?.recoveryToolNames, ['tool_search']);
+          for (const stage of [projected.consequence!.stage, 'plan_incomplete:missing_write']) {
+            assert.match(hostNoProgressRecoveryDirective({
+              lastConsequence: { ...projected.consequence, stage },
+            } as never), /Call tool_search exactly once/, 'keyed and historical stages retain their exact recovery');
+          }
+        }
         assert.match(
           requestText,
           /plan_incomplete_missing_write/,
@@ -264,8 +300,16 @@ test('mixed-source read-only plan refuses before persistence, then exact write r
         // offers exactly that search.
         assert.doesNotMatch(requestText, /admissibleCapabilities/);
         assert.match(requestText, /Use tool_search for the exact missing write capability/);
-        assert.match(requestText, /Call tool_search exactly once/);
-        assert.deepEqual(surfaceOf(request), ['tool_search']);
+        assert.match(requestText, /dataFrom/,
+          'the missing-write refusal also carries the independently known lineage issue on the first attempt');
+        // The first executed control now establishes its exact operation:
+        // real authority progress keeps ordinary tools available (P2), while
+        // the typed refusal still supplies the exact search repair above.
+        const decision = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+          .find((event) => event.data.kind === 'no_progress_decision');
+        assert.equal(decision?.data.reason, 'authority_progress');
+        assert.deepEqual(decision?.data.gained, ['operation']);
+        assert.ok(surfaceOf(request).includes('tool_search'));
         assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
         assert.equal(eventlog.listEvents(session.id, {
           types: ['accepted_task_authority_armed', 'conversation_preamble'],
@@ -550,6 +594,42 @@ function readOnlyFileDraftForContinuation(capabilityRef: string) {
     evidenceRequirements: ['tool_result', 'local_commit_receipt'],
   };
 }
+
+test('real semantic admission refusals carry stable full-issue repair keys without arming work', async () => {
+  eventlog.resetEventLog();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'plan-semantic-repair-key', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Read my current user profile and create a Profile Snapshot workflow from it.' },
+  });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true);
+  if (!primed.ok) return;
+  const writeRef = await discloseLocal(primed.planning, 'workflow_create');
+  const planTask = buildPlanTaskTool({ planning: primed.planning }) as unknown as {
+    invoke: (context: unknown, args: string) => Promise<unknown>;
+  };
+  const draft = readOnlyFileDraftForContinuation('cap:local:missing_one:read');
+  draft.bindings[1]!.capabilityRef = writeRef;
+  const invoke = async (preamble: string) => JSON.parse(String(await brackets.withHarnessRunContext({
+    ...identity, counter: new brackets.ToolCallsCounter(4),
+  }, () => planTask.invoke(null, JSON.stringify({ preamble, draft })))));
+  const first = await invoke('I will gather the profile and create the workflow.');
+  assert.equal(first.code, 'plan_not_admitted', JSON.stringify(first));
+  assert.match(first.repairKey, /^[a-f0-9]{32}$/);
+  assert.equal((await invoke('I will inspect the profile and create the workflow.')).repairKey, first.repairKey,
+    'unrelated valid prose cannot mint a new repair stage');
+  draft.bindings[0]!.capabilityRef = 'cap:local:missing_two:read';
+  assert.notEqual((await invoke('I will gather the profile and create the workflow.')).repairKey, first.repairKey,
+    'a different exact missing capability is reflected by the actual admission issue set');
+  assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
+  assert.equal(eventlog.listEvents(session.id, {
+    types: ['accepted_task_authority_armed', 'conversation_preamble'],
+  }).length, 0);
+});
 
 test('a selected same-source write omitted from a full eight-slot card reaches admission', async () => {
   eventlog.resetEventLog();

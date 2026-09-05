@@ -162,15 +162,25 @@ export function isSdkToolInputValidationError(error: unknown): error is SdkToolI
  * retry is a corrected retry, not a guess. Lives beside the nominal detector so
  * every surface renders the same repair text.
  */
-export function describeInvalidToolInput(error: unknown, toolName: string): string | null {
+export function describeInvalidToolInput(
+  error: unknown,
+  toolName: string,
+  /** How many violated paths to name (default 5). A packet-shaped tool whose
+   * every required field can be absent at once passes its full field count so
+   * one refusal names the whole repair instead of five fields per round. */
+  options?: { maxIssues?: number },
+): string | null {
   if (!error || typeof error !== 'object') return null;
   if ((error as { name?: unknown }).name !== 'InvalidToolInputError') return null;
   const original = (error as { originalError?: unknown }).originalError;
   const rawIssues = original && typeof original === 'object'
     ? (original as { issues?: unknown }).issues
     : undefined;
+  const maxIssues = Number.isSafeInteger(options?.maxIssues) && (options?.maxIssues ?? 0) > 0
+    ? options!.maxIssues as number
+    : 5;
   const issues = Array.isArray(rawIssues)
-    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, 5).map((issue) => {
+    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, maxIssues).map((issue) => {
         const path = Array.isArray(issue.path) && issue.path.length > 0 ? issue.path.join('.') : '(root)';
         return `${path}: ${String(issue.message ?? 'invalid')}`;
       })

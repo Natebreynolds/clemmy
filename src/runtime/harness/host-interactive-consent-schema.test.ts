@@ -111,3 +111,28 @@ test('evidence match is retained when a poisoned target pair cannot reproduce th
   ]);
   assert.equal(selected?.arguments, PROVIDER_ARGS);
 });
+
+test('exact selection refusal reports bounded value-free candidate mismatch categories', () => {
+  const seen: unknown[] = [];
+  const input = {
+    providerInputSchemaDigest: PROVIDER_DIGEST,
+    acceptedTaskId: ACCEPTED_TASK_ID,
+    effectiveArgumentDigest: PROVIDER_CONTRACT.argumentDigest,
+    effectiveToolName: PROVIDER_CONTRACT.toolName,
+    candidates: [
+      { inputSchema: null, arguments: {}, logicalToolName: 'GOOGLEDOCS_CREATE_DOCUMENT' },
+      { inputSchema: WRAPPER_SCHEMA, arguments: PROVIDER_ARGS, logicalToolName: 'GOOGLEDOCS_CREATE_DOCUMENT' },
+      { inputSchema: PROVIDER_SCHEMA, arguments: PROVIDER_ARGS, logicalToolName: 'OTHER_CREATE_DOCUMENT' },
+      { inputSchema: PROVIDER_SCHEMA, arguments: { title: 'PRIVATE-CHANGED-BODY' }, logicalToolName: 'GOOGLEDOCS_CREATE_DOCUMENT' },
+    ],
+    onMismatch: (diagnostic: unknown) => seen.push(diagnostic),
+  };
+  assert.equal(selectExactPreparedExternalCall(input), null);
+  assert.deepEqual(seen, [{ reason: 'no_matching_candidate', candidates: [
+    { index: 0, reason: 'schema_missing_or_invalid' },
+    { index: 1, reason: 'schema_digest_mismatch', schemaDigestMatches: false },
+    { index: 2, reason: 'tool_identity_mismatch', schemaDigestMatches: true, toolIdentityMatches: false },
+    { index: 3, reason: 'argument_digest_mismatch', schemaDigestMatches: true, toolIdentityMatches: true, argumentDigestMatches: false },
+  ] }]);
+  assert.doesNotMatch(JSON.stringify(seen), /PRIVATE|Quarterly|GOOGLEDOCS|OTHER|title|properties/);
+});

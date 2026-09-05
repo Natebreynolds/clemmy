@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { WORKSPACE_FIXTURE_AS_OF, workspaceFixtureDay } from './northstar-local-llm-content-workspace.clock.fixture.js';
 
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-async-pages-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -48,7 +49,7 @@ function completed(rows: ReturnType<typeof asyncCompletedPages>) {
 
 test('every PID verifies exactly the three recent articles from the shared pages', () => {
   const verified = verifyRecentArticleDateEvidence({
-    acceptedAt: '2026-08-31T12:00:00.000Z',
+    acceptedAt: WORKSPACE_FIXTURE_AS_OF,
     maxAgeDays: 30,
     minDistinctRecords: 3,
     candidates: CANDIDATES,
@@ -78,7 +79,7 @@ test('the drifted cold copy (time element outside <article>) is exactly the 2-of
     metadata: { sourceURL: ASYNC_SELECTED_URLS[2]!, statusCode: 200 },
   };
   const verified = verifyRecentArticleDateEvidence({
-    acceptedAt: '2026-08-31T12:00:00.000Z',
+    acceptedAt: WORKSPACE_FIXTURE_AS_OF,
     maxAgeDays: 30,
     minDistinctRecords: 3,
     candidates: CANDIDATES,
@@ -100,7 +101,8 @@ test('the shared pages are still inside the 30-day window as of today (the journ
     completedBatchResult: completed(asyncCompletedPages()),
   });
   assert.equal(verified.status, 'verified',
-    `the async journey pages carry absolute publication days (${Object.values(ASYNC_VERIFIED_PUBLICATION_DAYS).join(', ')}); `
-    + 'once they age past 30 days the in-process and cold journeys both fail with insufficient_evidence — '
-    + 'move the days forward in northstar-local-llm-content-workspace.async-pages.fixture.ts (one place).');
+    'the relative fixture publications must remain inside the unchanged real host recency window');
+  const today = new Date().toISOString().slice(0, 10);
+  for (const offset of [1, 3, 8, 10, 15]) assert.ok(workspaceFixtureDay(offset) > today,
+    'the authored campaign must not expire into the past while the host calendar contract stays unchanged');
 });

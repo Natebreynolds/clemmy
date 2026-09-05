@@ -61,6 +61,7 @@ import {
   type InteractiveConsentDecisionV1,
 } from './interactive-consent-policy.js';
 import { workflowCapabilityDigest } from '../../execution/workflow-capability-digest.js';
+import { buildHostConsentEvidence } from './host-consent-evidence.js';
 
 export const HOST_READ_ONLY_CALL_AUTHORITY_ENGINE_VERSION = 'host_v1_read_only' as const;
 export const HOST_READ_ONLY_EFFECT_CEILING = 'read_compute_host_only' as const;
@@ -2805,8 +2806,7 @@ export function evaluateWorkflowV3AutoConsent(input: {
 
   const source = workflowV3AutoSource(authority);
   const acceptedTaskId = workflowV3AutoAcceptedTaskId(authority);
-  const call: CapabilityRiskAttestationV1 = {
-    version: INTERACTIVE_CONSENT_POLICY_VERSION,
+  const { call, coverage } = buildHostConsentEvidence({ call: {
     source,
     acceptedTaskId,
     bindingDigest: workflowV3AutoBindingDigest({
@@ -2826,11 +2826,7 @@ export function evaluateWorkflowV3AutoConsent(input: {
     risk: loaded.attestation.projection.risk,
     semanticBasis: loaded.attestation.projection.semanticBasis,
     safety: loaded.attestation.projection.safety,
-  };
-  const coverage: ExactWorkCoverageV1 = {
-    version: INTERACTIVE_CONSENT_POLICY_VERSION,
-    source: { ...source },
-    acceptedTaskId,
+  }, coverage: (call) => ({
     contractId: `workspace-contract:${workflowV3AutoDigest('workspace-action-contract', {
       workflowId: authority.workflowId,
       workflowDigest: authority.workflowDigest,
@@ -2841,20 +2837,6 @@ export function evaluateWorkflowV3AutoConsent(input: {
       requirementId: authority.requirementId,
       call,
     }),
-    semanticScope: {
-      operationId: call.operationId,
-      schemaFingerprint: call.schemaFingerprint,
-      effect: call.effect,
-      accountId: call.accountId,
-      destination: { ...call.destination },
-      cardinality: { ...call.cardinality },
-      semanticBasis: { ...call.semanticBasis },
-    },
-    callBinding: {
-      logicalToolCallId: call.logicalToolCallId,
-      argumentDigest: call.argumentDigest,
-      bindingDigest: call.bindingDigest,
-    },
     reservationKey: `workspace-reservation:${workflowV3AutoDigest('workspace-action-reservation', {
       workflowId: authority.workflowId,
       runId: authority.runId,
@@ -2863,7 +2845,7 @@ export function evaluateWorkflowV3AutoConsent(input: {
       nodeAttempt: authority.nodeAttempt,
       authorityBindingDigest: authority.authorityBindingDigest,
     })}`,
-  };
+  }) });
   const decision = evaluateInteractiveConsentV1({
     call,
     coverage,

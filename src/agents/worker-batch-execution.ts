@@ -54,6 +54,10 @@ export class WorkerBatchGenerationCancelledError extends Error {
   constructor(
     message: string,
     readonly kind: 'deadline' | 'caller' | 'superseded',
+    /** How many item bodies had been admitted when the generation was cancelled;
+     * `null` when the throw site cannot know. Exactly 0 is the one case a caller
+     * may settle as a proven pre-dispatch refusal. */
+    readonly startedBodies: number | null = null,
   ) {
     super(message);
     this.name = 'WorkerBatchGenerationCancelledError';
@@ -487,6 +491,7 @@ export async function runResumableWorkerBatch<
       throw new WorkerBatchGenerationCancelledError(
         'worker batch body did not settle before the outer deadline; safe typed remainder withheld',
         'deadline',
+        states.filter((state) => state.state !== 'pending').length,
       );
     }
     // A cross-process successor may take only an explicitly revoked claim.

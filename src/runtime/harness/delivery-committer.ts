@@ -47,6 +47,7 @@ import { workEvidenceForAcceptedSource, type WorkEvidenceRef } from './work-mani
 import { constrainNeedsInputPresentationForRecovery } from './recovery-presentation-truth.js';
 import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-capability-learning.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
+import { pendingAcceptedLocalWork } from './local-work-completion.js';
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -258,6 +259,7 @@ function mergeDeliveryGaps(...values: Array<DeliveryGap | null | undefined>): De
 export interface AcceptedSourceDeliveryAssessment {
   settlementAudit: AcceptedSourceSettlementAudit;
   deliveryGap: DeliveryGap | null;
+  localWorkIncomplete: boolean;
 }
 
 /**
@@ -285,6 +287,8 @@ export function assessAcceptedSourceDelivery(input: {
       })
     : { status: 'needs_verification' as const, reason: settlementAudit.reason };
   let deliveryGap = mergeDeliveryGaps(input.deliveryConcern);
+  const localWork = pendingAcceptedLocalWork(input);
+  deliveryGap = mergeDeliveryGaps(deliveryGap, localWork);
   if (preparation.status !== 'ready' && preparation.status !== 'unstaged') {
     deliveryGap = mergeDeliveryGaps(deliveryGap, {
       ...('reason' in preparation && preparation.reason ? { reason: preparation.reason } : {}),
@@ -325,7 +329,7 @@ export function assessAcceptedSourceDelivery(input: {
       });
     }
   }
-  return { settlementAudit, deliveryGap };
+  return { settlementAudit, deliveryGap, localWorkIncomplete: localWork !== null };
 }
 
 function acceptedSourceHasBusinessEvidence(audit: AcceptedSourceSettlementAudit): boolean {
@@ -1006,7 +1010,7 @@ export function commitTurnOutcome(
         sessionId: requested.identity.sessionId,
         sourceUserSeq: requested.identity.sourceUserSeq,
       }) !== null;
-      const mustHold = acceptedReadPlanStillPending
+      const mustHold = assessment.localWorkIncomplete || acceptedReadPlanStillPending
         || (options.terminalJudgeDisposition === 'deliver'
           ? deliveryMustHoldForHuman(settlementAudit)
           : deliveryMustHoldWhenJudgeUnavailable(settlementAudit));

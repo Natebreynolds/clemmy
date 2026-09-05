@@ -72,6 +72,13 @@ export function boundedPlanTaskResultText(value: unknown, maxBytes = 8_192): val
     && !value.includes('\0');
 }
 
+function exactRepairKeyMember(payload: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  if (!('repairKey' in payload)) return exactPlanTaskResultKeys(payload, keys);
+  return typeof payload.repairKey === 'string'
+    && /^[a-f0-9]{16,64}$/.test(payload.repairKey)
+    && exactPlanTaskResultKeys(payload, [...keys, 'repairKey']);
+}
+
 export function exactPlanTaskResultId(value: unknown): value is string {
   return typeof value === 'string' && ID.test(value);
 }
@@ -243,7 +250,7 @@ export function parseExactPlanTaskRefusal(value: unknown): ExactPlanTaskRefusal 
     // capability list at all, by pin — offering card writes here is the
     // substitution incident.
     if (
-      exactPlanTaskResultKeys(payload, [
+      exactRepairKeyMember(payload, [
         'ok', 'code', 'detail', 'requestedEffectScope', 'repair', 'recoveryTool',
       ])
       && (payload.recoveryTool === 'tool_search' || payload.recoveryTool === 'plan_task')
@@ -282,7 +289,7 @@ export function parseExactPlanTaskRefusal(value: unknown): ExactPlanTaskRefusal 
       && boundedPlanTaskResultText(payload.repair);
     if (!common) return null;
     if (
-      exactPlanTaskResultKeys(payload, [
+      exactRepairKeyMember(payload, [
         'ok', 'code', 'detail', 'writeOperationIds', 'sourceOperationIds', 'repair', 'recoveryTool',
       ])
       && payload.recoveryTool === 'plan_task'
@@ -298,7 +305,7 @@ export function parseExactPlanTaskRefusal(value: unknown): ExactPlanTaskRefusal 
       && boundedPlanTaskResultText(payload.repair);
     if (!common) return null;
     if (
-      exactPlanTaskResultKeys(payload, [
+      exactRepairKeyMember(payload, [
         'ok', 'code', 'detail', 'reasonCode', 'admissibleCapabilities', 'ceiling',
         'withheld', 'repair', 'recoveryTool',
       ])

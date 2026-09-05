@@ -18,14 +18,17 @@ import type {
 import { NO_PROGRESS_RECOVERY_TOOL_NAME_CAP, createNoProgressConsequence } from './no-progress-governor.js';
 import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
+import { stableJsonDigest } from '../../shared/stable-json-digest.js';
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 
 /**
  * Exact, same-source projection for the pure no-progress reducer.
  *
  * Raw operation/account/target ids never leave this module: every token is a
  * domain-separated digest of a host-owned durable row. Model prose, query
- * text, physical call ids, provider names, and returned payload bytes are not
- * inputs and therefore cannot reset the governor.
+ * text, physical call ids, provider names, and returned payload bytes cannot
+ * reset authority progress. A typed schema refusal may use canonical attempted
+ * arguments only to discriminate its finite repair stages when no path key exists.
  */
 
 export type HostNoProgressProjection =
@@ -117,6 +120,7 @@ function exactSourceEvents(identity: HostNoProgressIdentity): EventRow[] {
       'discovery_governor_outcome',
       'planning_catalog_disclosed',
       'expected_work_progress',
+      'guardrail_tripped',
     ],
   }).filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
 }
@@ -166,6 +170,39 @@ const MAX_DISCLOSED_READ_REF_TOKENS = 8;
  * keeps a model from manufacturing an unbounded walk through operation names.
  */
 const MAX_EXACT_SCHEMA_REFRESH_TOKENS = 8;
+
+/** Host repairs are real progress, but repeating a repair for new physical
+ * calls is not. Record a bounded set of structural repair facts for this source
+ * without making argument values, call ids, or diagnostic prose identities. */
+const MAX_HOST_CARRIER_REPAIR_TOKENS = 8;
+const HOST_REPAIR_KIND = /^[a-z][a-z0-9_:-]{0,63}$/;
+
+function hostCarrierRepairTokens(
+  events: readonly EventRow[],
+  tokens: Record<AuthorityProgressKind, Set<string>>,
+): void {
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (seen.size >= MAX_HOST_CARRIER_REPAIR_TOKENS) break;
+    if (event.role !== 'system' || event.type !== 'guardrail_tripped' || event.data.kind !== 'carrier_repaired') continue;
+    const carrier = nonEmptyString(event.data.carrier);
+    const operation = nonEmptyString(event.data.operation);
+    const changes = event.data.changes;
+    if (
+      !carrier || carrier.length > 512
+      || !operation || operation.length > 512
+      || !Array.isArray(changes) || changes.length === 0 || changes.length > 8
+      || !changes.every((change) => typeof change === 'string' && HOST_REPAIR_KIND.test(change))
+    ) continue;
+    const repaired = token('evidence', 'host_carrier_repair', [
+      carrier,
+      operation,
+      [...new Set(changes)].sort(),
+    ]);
+    seen.add(repaired);
+    tokens.evidence.add(repaired);
+  }
+}
 
 function exactSchemaRefreshAuthorityTokens(
   events: readonly EventRow[],
@@ -238,6 +275,7 @@ function eventCapabilityTokens(
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
   exactSchemaRefreshAuthorityTokens(events, tokens);
+  hostCarrierRepairTokens(events, tokens);
   const disclosedWriteRefs: string[] = [];
   const disclosedReadRefs: string[] = [];
   for (const event of events) {
@@ -511,28 +549,23 @@ function durableAuthorityTokens(
   }
 
   for (const row of rows<{
-    capability_id: string;
     operation_id: string;
     schema_fingerprint: string;
     account_id: string;
   }>(db, `
-    SELECT host.capability_id, host.operation_id,
-           host.schema_fingerprint, host.account_id
-      FROM host_call_capability_bindings host
-      JOIN expected_work_call_bindings work
-        ON work.session_id = host.session_id
-       AND work.source_user_seq = host.source_user_seq
-       AND work.logical_tool_call_id = host.logical_tool_call_id
-     WHERE host.session_id = ? AND host.source_user_seq = ?
+    SELECT operation_id, schema_fingerprint, account_id
+      FROM host_call_capability_bindings
+     WHERE session_id = ? AND source_user_seq = ?
   `, params)) {
-    // Logical call id and argument digest are deliberately absent: retries or
-    // pagination over one selected accepted node remain one operation fact.
-    tokens.operation.add(token('operation', 'expected_work_capability_binding', [
-      row.capability_id,
+    // The call boundary has selected this operation/account/schema whether or
+    // not chat projected an expected-work graph. Logical call ids, arguments
+    // and refreshed catalog refs do not change that selected authority tuple.
+    tokens.operation.add(token('operation', 'host_call_capability_binding', [
       row.operation_id,
+      row.account_id,
       row.schema_fingerprint,
     ]));
-    if (row.account_id) tokens.account.add(token('account', 'expected_work_capability_binding', [
+    if (row.account_id) tokens.account.add(token('account', 'host_call_capability_binding', [
       row.account_id,
     ]));
   }
@@ -686,9 +719,30 @@ function schemaInvalidStage(repairKeys: readonly string[]): string {
   return `schema_invalid:${prefixes.join('.')}`;
 }
 
+/** A typed schema refusal without failing-path material still identifies the
+ * operation and exact attempted arguments. Reuse the ordinary carrier reader
+ * and canonical JSON digest so formatting/call-id churn cannot mint stages.
+ * This identifies only a bounded repair stage, never execution authority or a
+ * fresh retry budget; the governor's finite transition cap remains in force. */
+function fallbackSchemaInvalidStage(call: HistoryCall): string {
+  const effective = unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments);
+  let args = effective.toolName ? effective.args : call.arguments;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { /* unreadable bytes keep their exact refusal identity */ }
+  }
+  const digest = stableJsonDigest({
+    domain: 'schema-repair-call',
+    version: 1,
+    operation: effective.toolName ?? call.name,
+    arguments: args,
+  });
+  return `schema_invalid:call:${digest.slice(0, 16)}`;
+}
+
 interface HistoryCall {
   callId: string;
   name: string;
+  arguments: unknown;
 }
 
 function historyCalls(history: readonly unknown[]): HistoryCall[] {
@@ -697,7 +751,7 @@ function historyCalls(history: readonly unknown[]): HistoryCall[] {
     if (row?.type !== 'function_call') return [];
     const callId = nonEmptyString(row.callId);
     const name = nonEmptyString(row.name);
-    return callId && name ? [{ callId, name }] : [];
+    return callId && name ? [{ callId, name, arguments: row?.arguments }] : [];
   });
 }
 
@@ -847,12 +901,12 @@ function controlConsequence(input: {
     // Keyed on the host-authored digest of the violated paths when present:
     // a draft that repaired one complaint and met a different one is a new
     // stage (progress), an identical complaint is the same stage (the loop
-    // floor). Legacy payloads without a key keep the flat stage.
+    // floor). Older payloads fall back to the canonical attempted call.
     const planRepairKey = typeof payload.repairKey === 'string' && REPAIR_KEY_RE.test(payload.repairKey)
       ? payload.repairKey
       : null;
     return createNoProgressConsequence({
-      stage: planRepairKey ? schemaInvalidStage([planRepairKey]) : 'schema_invalid',
+      stage: planRepairKey ? schemaInvalidStage([planRepairKey]) : fallbackSchemaInvalidStage(input.call),
       recovery: 'repair_model',
       effectState: 'not_started',
       recoveryToolNames: [input.call.name],
@@ -869,9 +923,10 @@ function controlConsequence(input: {
       // Missing a write and missing its payload edge are distinct, finite plan
       // repairs. Keeping them distinct lets the model advance through both in
       // one turn without prose, arguments, or call ids minting new stages.
-      stage: payload.code === 'plan_incomplete_missing_write'
+      stage: (payload.code === 'plan_incomplete_missing_write'
         ? 'plan_incomplete:missing_write'
-        : 'plan_incomplete:data_lineage',
+        : 'plan_incomplete:data_lineage')
+        + (typeof payload.repairKey === 'string' ? `:${payload.repairKey.slice(0, 16)}` : ''),
       recovery: 'repair_model',
       effectState: 'not_started',
       // A current card write makes this a plan-only repair. When the exact
@@ -895,7 +950,8 @@ function controlConsequence(input: {
       : stablePlanDetailPrefix(payload.detail);
     const recoveryTool = planRefusal?.recoveryTool;
     return createNoProgressConsequence({
-      stage: `semantic_admission:${prefix}`,
+      stage: `semantic_admission:${prefix}`
+        + (typeof payload.repairKey === 'string' ? `:${payload.repairKey.slice(0, 16)}` : ''),
       recovery: recoveryTool === 'stop_factual'
         ? 'stop_factual'
         : recoveryTool === 'retry_host'
@@ -1002,10 +1058,10 @@ function settlementConsequence(input: {
         });
       }
       // A host-authored repair key in the bounded outcome detail keys the
-      // stage on the failing-path set; without one the stage is unchanged.
+      // stage on the failing-path set; otherwise identify the attempted call.
       const repairKey = /^validation:([a-f0-9]{16,64})$/.exec(settlement.outcome_detail ?? '')?.[1];
       return createNoProgressConsequence({
-        stage: repairKey ? schemaInvalidStage([repairKey]) : 'schema_invalid',
+        stage: repairKey ? schemaInvalidStage([repairKey]) : fallbackSchemaInvalidStage(call),
         recovery: 'repair_model',
         effectState,
         recoveryToolNames: [call.name],
@@ -1064,7 +1120,8 @@ function settlementConsequence(input: {
 
 /**
  * Classify one already-committed history delta by durable topology/effect
- * facts. Tool/provider vocabulary and argument text are deliberately ignored.
+ * facts. Canonical call arguments only distinguish a proven schema refusal's
+ * repair stage; they never classify effect, disposition or execution authority.
  */
 /** Readers of THIS turn's own parked tool output. Paging a result the turn
  *  already fetched is consuming evidence it paid for, not a fresh attempt at an

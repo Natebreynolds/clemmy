@@ -67,9 +67,22 @@ test('the cap is bounded and env-tunable, mirroring the background hard cap', ()
 test('continue-shaped completion reasons are recognized', () => {
   assert.equal(isContinueCompletionReason('awaiting_continue'), true);
   assert.equal(isContinueCompletionReason('limit_exceeded'), true);
+  assert.equal(isContinueCompletionReason('local_work_incomplete'), true);
   assert.equal(isContinueCompletionReason('budget_checkpoint_auto_resume'), false,
     'an auto checkpoint is not a human-continue prompt');
   assert.equal(isContinueCompletionReason('done'), false);
+});
+
+test('local continuation names only missing accepted items and keeps settled siblings retained', () => {
+  const text = buildContinueInput('Seven receipts are retained.', { auto: true, missing: ['nonce-batch/read_nonce/audit-8'] });
+  assert.match(text, /Remaining accepted local items: \["nonce-batch\/read_nonce\/audit-8"\]/);
+  assert.doesNotMatch(text, /audit-[1-7]/);
+  assert.doesNotMatch(text, /hit a step \/ time budget/);
+  assert.match(text, /do not rerun successful siblings or replay prior writes/);
+  assert.match(text, /this continuation grants no new permission/);
+  const longReply = 'Exact retained reply. '.repeat(30) + '\nFinal retained detail.';
+  assert.ok(buildContinueInput(longReply, { auto: true, missing: ['audit-8'] }).includes(JSON.stringify(longReply)),
+    'a same-turn continuation retains the full reply outside the canonical checkpoint chain');
 });
 
 test('a replayed auto-checkpoint terminal survives the legacy-winner adapter as blocked+resumable', async () => {

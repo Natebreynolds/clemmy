@@ -18,7 +18,7 @@
  *   (i)  gate the live-read path on decision.effect === 'read'
  *   (ii) require exactEntryMatches (byte-identical operationId) on the live
  *        proven read candidate
- *   (iii) require same-turn readDescent before resolveProvenLiveReadCatalogEntry
+ *   (iii) require same-turn readDescent before resolveProvenLiveCatalogEntry
  *         (live workflow:1788024507349 — worker proven=none)
  */
 import assert from 'node:assert/strict';
@@ -57,7 +57,7 @@ test('NEGATIVE: live-read dispatch does not require the name classifier to say r
     /decision\.effect === 'read'/,
     'a proven live read must not wait on the spelling classifier',
   );
-  assert.match(liveBlock, /resolveProvenLiveReadCatalogEntry/);
+  assert.match(liveBlock, /resolveProvenLiveCatalogEntry/);
   assert.match(src, /catalogOperationIdentitiesEqual/);
 });
 
@@ -110,13 +110,14 @@ test('re-break (ii): the read path carries no write-bar identity replay', () => 
   );
   const factory = readFileSync(FACTORY, 'utf8');
   const resolver = factory.slice(
-    factory.indexOf('export function resolveProvenLiveReadCatalogEntry'),
+    factory.indexOf('export function resolveProvenLiveCatalogEntry'),
     factory.indexOf('export function resolveRuntimeCapabilityCatalog'),
   );
   assert.doesNotMatch(resolver, /installed\.digest|\.digest !== entry\.manifestDigest/, 'durable-store digest identity (SLACK history, 09-01)');
   assert.doesNotMatch(resolver, /sameLineageFamily|:definition:/, 'lineage occupancy arithmetic (BATCH_GET, 08-29)');
   assert.match(resolver, /lifecycle\.state !== 'revoked'/, 'a disconnect still refuses');
-  assert.match(resolver, /entry\.manifest\.effect === 'read'/, 'the sealed manifest is the effect authority');
+  assert.match(resolver, /const effect = input\.effect \?\? 'read'/, 'the read call retains its read-only default');
+  assert.match(resolver, /entry\.manifest\.effect === effect/, 'the sealed manifest is the effect authority');
 });
 
 test('re-break: namespaced MCP consults the catalog before fail-closed write', () => {
@@ -157,6 +158,6 @@ test('re-break (iii): scheduling, admission and approval arming read the frame\'
   assert.match(admission, /currentFrameEffects\.get\(call\.callId\)/, 'admission reads the frame decision');
   const scheduling = src.slice(src.indexOf("if (!argumentsValue) return 'barrier';"), src.indexOf("executeCallAttempt,"));
   assert.match(scheduling, /currentFrameEffects\.get\(call\.callId\)/, 'scheduling reads the frame decision (a proven read is parallel)');
-  const arming = src.slice(src.indexOf('const runtimeEffect = '), src.indexOf('const quantifiedWorkerControl = Boolean('));
+  const arming = src.slice(src.indexOf('const runtimeEffect = '), src.indexOf('const workerControl = Boolean('));
   assert.match(arming, /currentFrameEffects\.get\(call\.callId\)/, 'approval arming reads the frame decision');
 });

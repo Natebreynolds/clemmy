@@ -1373,6 +1373,36 @@ test('recordRunAttemptUserInput upgrades its compatibility owner and preserves a
   );
 });
 
+test('same-source recovery transfers an interrupted physical marker to its active attempt without stale takeover', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat', channel: 'desktop' });
+  const crashed = beginRunAttempt(sess.id, { runId: 'recovery:crashed' });
+  const input = { turn: 1, role: 'user' as const, data: { text: 'Resume the exact accepted work.' } };
+  const source = recordRunAttemptUserInput(crashed, input, { armRunInFlight: true });
+  finishRunAttempt(crashed, 'interrupted');
+  const resumed = beginRunAttempt(sess.id, { runId: 'recovery:resumed' });
+  recordRunAttemptUserInput(resumed, input, { existingEventSeq: source.seq, armRunInFlight: true });
+  const resumedOwner = getSession(sess.id)?.metadata.__run_in_flight_owner as {
+    attemptId: string; sourceUserSeq: number; armedAt: string;
+  };
+  assert.equal(resumedOwner.attemptId, resumed.attemptId);
+  assert.equal(resumedOwner.sourceUserSeq, source.seq);
+  recordRunAttemptUserInput(crashed, input, { existingEventSeq: source.seq, armRunInFlight: true });
+  assert.deepEqual(getSession(sess.id)?.metadata.__run_in_flight_owner, resumedOwner,
+    'the late crashed attempt cannot steal the active same-source recovery owner');
+
+  finishRunAttempt(resumed, 'interrupted');
+  const successor = beginRunAttempt(sess.id, { runId: 'recovery:successor' });
+  recordRunAttemptUserInput(successor, input, { existingEventSeq: source.seq, armRunInFlight: true });
+  const successorOwner = getSession(sess.id)?.metadata.__run_in_flight_owner;
+  assert.equal((successorOwner as { attemptId: string }).attemptId, successor.attemptId);
+  finishRunAttempt(resumed, 'completed');
+  recordRunAttemptUserInput(resumed, input, { existingEventSeq: source.seq, armRunInFlight: true });
+  assert.deepEqual(getSession(sess.id)?.metadata.__run_in_flight_owner, successorOwner,
+    'completion of the previous same-source attempt cannot overwrite its successor');
+  assert.equal(listEvents(sess.id, { types: ['user_input_received'] }).length, 1);
+});
+
 test('recordRunAttemptUserInput gives only the newest accepted source fresh restart ownership', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat', channel: 'desktop' });

@@ -546,8 +546,17 @@ test('a chat session wearing forged workflow metadata gets no receipt and its lo
   ));
   assert.equal(uncovered.status, 'decided');
   if (uncovered.status === 'decided') {
-    assert.deepEqual(uncovered.decision, { kind: 'repair', reason: 'coverage_missing' });
+    assert.equal(uncovered.decision.kind, 'proceed');
+    assert.equal(uncovered.decision.kind === 'proceed' ? uncovered.decision.basis : null, 'settled_replay',
+      'the original call replays its now-durable refused_pre_dispatch result, not the tool body');
   }
+  const fresh = { ...attestation, logicalToolCallId: 'forged-hyg-fresh' };
+  const freshConsent = await callAuthority.withHostCallAttestation(fresh, () => (
+    hostConsent.evaluateUncoveredHostMutationConsent({ attestation: fresh, args: { apply: true } })
+  ));
+  assert.equal(freshConsent.status, 'decided');
+  assert.deepEqual(freshConsent.status === 'decided' ? freshConsent.decision : null,
+    { kind: 'repair', reason: 'coverage_missing' }, 'a new forged call still has no accepted workflow coverage');
 });
 
 test('a step AUTHORED requiresApproval keeps its gate: no receipt, local write refused before any body', async () => {

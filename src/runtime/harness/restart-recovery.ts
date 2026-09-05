@@ -52,6 +52,9 @@ import {
   exactCheckpointReentryExhausted,
   exactCheckpointReentryKey,
 } from './exact-checkpoint-reentry.js';
+import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
+import { prepareAcceptedModelBatchRestart } from './accepted-model-batch-checkpoint.js';
+import { HostRecoveryState } from './host-turn-runner.js';
 import { addNotification } from '../notifications.js';
 import {
   readActiveWorkflowOriginGroup,
@@ -143,6 +146,107 @@ function checkpointRecoverySourceUserSeq(
   sessionId: string,
 ): number | null {
   return checkpointRecoveryDescriptor(session, sessionId)?.sourceUserSeq ?? null;
+}
+
+/**
+ * A successful model/tool frame normally advances in memory, so it has no
+ * HostRecoveryState: that private owner is written only when the host returns
+ * a hold. A process can still die after the append-only batch checkpoint and
+ * before the next model step or public terminal. In that narrow window the
+ * checkpoint itself is enough to reconstruct the balanced conversation, but
+ * generic restart policy sees the settled external write and correctly refuses
+ * to replay the accepted prompt.
+ *
+ * Promote only a fully `ready` checkpoint into the existing `continue` owner.
+ * The exact run marker/attempt/source CAS prevents an old boot scan from
+ * attaching it to a newer turn. Reconciliation-required or incomplete batches
+ * remain subject to the ordinary no-double-act path; this never weakens the
+ * generic external-write skip.
+ */
+function promoteReadyAcceptedModelBatchCheckpoint(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  inFlightSince: string;
+  interruptedAttempt: RunAttemptRecord;
+}): CheckpointRecoveryDescriptor | null {
+  const prepared = prepareAcceptedModelBatchRestart({
+    sessionId: input.sessionId,
+    sourceUserSeq: input.sourceUserSeq,
+  });
+  if (prepared.status !== 'ready') return null;
+
+  const root = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
+  if (
+    root.status !== 'ok'
+    || (root.authority.authorityKind !== 'host_v1'
+      && root.authority.authorityKind !== 'host_v1_read_only')
+    || root.authority.identity.acceptedTaskId !== prepared.checkpoint.acceptedTaskId
+    || root.authority.authorityDigest !== prepared.checkpoint.authorityDigest
+  ) return null;
+
+  const serializedState = new HostRecoveryState(
+    input.sessionId,
+    input.sourceUserSeq,
+    'continue',
+    [...prepared.checkpoint.history],
+    [],
+    [],
+    prepared.checkpoint.lastResponseId,
+    undefined,
+    root.authority.authorityKind,
+    undefined,
+    prepared.checkpoint.batchOrdinal,
+    prepared.checkpoint,
+  ).toString();
+  const installedAt = new Date().toISOString();
+  const installed = openEventLog().prepare(`
+    UPDATE sessions
+       SET metadata_json = json_set(
+             metadata_json,
+             '$.__host_recovery_state',
+             ?
+           ),
+           updated_at = ?
+     WHERE id = ?
+       AND kind = 'chat'
+       AND json_valid(metadata_json)
+       AND json_extract(metadata_json, '$.__run_in_flight') = ?
+       AND json_type(metadata_json, '$.__host_recovery_state') IS NULL
+       AND json_extract(metadata_json, '$.__run_in_flight_owner.attemptId') = ?
+       AND json_extract(metadata_json, '$.__run_in_flight_owner.sourceUserSeq') = ?
+       AND ? = (
+         SELECT MAX(events.seq)
+           FROM events
+          WHERE events.session_id = sessions.id
+            AND events.type = 'user_input_received'
+       )
+       AND EXISTS (
+         SELECT 1
+           FROM run_attempts AS owner
+          WHERE owner.session_id = sessions.id
+            AND owner.attempt_id = ?
+            AND owner.source_user_seq = ?
+            AND owner.finished_at IS NULL
+       )
+  `).run(
+    serializedState,
+    installedAt,
+    input.sessionId,
+    input.inFlightSince,
+    input.interruptedAttempt.attemptId,
+    input.sourceUserSeq,
+    input.sourceUserSeq,
+    input.interruptedAttempt.attemptId,
+    input.sourceUserSeq,
+  );
+  return installed.changes === 1
+    ? {
+        serializedState,
+        sourceUserSeq: input.sourceUserSeq,
+        phase: 'continue',
+        frameCallIds: [],
+      }
+    : null;
 }
 
 /** Remove only the exact checkpoint blob already reconciled by this scan.
@@ -1171,7 +1275,29 @@ export function recoverInterruptedChatRuns(
     // recovery state is published or a manual terminal is committed.
     const ageMs = now() - Date.parse(since);
     const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
-    const checkpointRecovery = checkpointRecoveryDescriptor(sess, row.id);
+    let checkpointRecovery = checkpointRecoveryDescriptor(sess, row.id);
+    if (
+      !checkpointRecovery
+      && recoveryIdentity
+      && acceptedInput !== null
+      && interruptedAttempt
+      && dispatchResume
+      && !userStopped
+      && !pendingDispatchOwnership
+    ) {
+      try {
+        checkpointRecovery = promoteReadyAcceptedModelBatchCheckpoint({
+          sessionId: row.id,
+          sourceUserSeq: recoveryIdentity.sourceUserSeq,
+          inFlightSince: since,
+          interruptedAttempt,
+        });
+      } catch (err) {
+        // A failed promotion grants no recovery authority. The unchanged
+        // marker and generic external-write guard retain the safe owner.
+        record.errors.push(`checkpoint_promotion: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     const checkpointRecoverySource = checkpointRecovery?.sourceUserSeq ?? null;
     const exactCheckpointRecovery = Boolean(
       recoveryIdentity

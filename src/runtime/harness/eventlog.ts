@@ -374,6 +374,10 @@ export const EVENT_TYPES = [
   // role registry) — records the attempted intent, whether it matched, and the
   // resolved model/provider, so a trace can show "ran on Opus because 'design'".
   'worker_model_routed',
+  // The route a worker child ACTUALLY executed on, appended after its run (a
+  // rate-limit fallover can move it off the planned model); worker_result
+  // attributes from this, never from the plan (live 2026-09-05).
+  'worker_model_executed',
   // A fan-out worker COMPLETED — durable record of {item, ok, model, toolUses,
   // tokens} (Move 5). The honest N-of-M coverage map was in-memory only, so a
   // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker
@@ -4042,8 +4046,9 @@ export function recordRunAttemptUserInput(
       // replace an older valid owner, but only while it is still the newest
       // durable user input for this session. That max-source CAS lets an
       // overlapping turn take restart ownership without allowing a late stale
-      // continuation (or another physical attempt for the same source) to
-      // steal it back.
+      // continuation to steal it back. A boot-interrupted physical owner may
+      // also transfer to the active attempt for its SAME accepted source.
+      // Mere supersession is insufficient: that old process may still be live.
       db.prepare(
         `UPDATE sessions
             SET metadata_json = json_set(
@@ -4105,6 +4110,31 @@ export function recordRunAttemptUserInput(
                   SELECT 1
                     FROM json_each(metadata_json, '$.__run_in_flight_owner')
                    WHERE key NOT IN ('sourceUserSeq', 'armedAt')
+                )
+              )
+              OR (
+                json_type(metadata_json, '$.__run_in_flight_owner') = 'object'
+                AND json_extract(metadata_json, '$.__run_in_flight_owner.sourceUserSeq') = @sourceUserSeq
+                AND NOT EXISTS (
+                  SELECT 1
+                    FROM json_each(metadata_json, '$.__run_in_flight_owner')
+                   WHERE key NOT IN ('attemptId', 'sourceUserSeq', 'armedAt')
+                )
+                AND EXISTS (
+                  SELECT 1 FROM run_attempts AS previous
+                   WHERE previous.session_id = sessions.id
+                     AND previous.attempt_id = json_extract(metadata_json, '$.__run_in_flight_owner.attemptId')
+                     AND previous.source_user_seq = @sourceUserSeq
+                     AND previous.status = 'interrupted'
+                     AND previous.finished_at IS NOT NULL
+                )
+                AND EXISTS (
+                  SELECT 1 FROM run_attempts AS current
+                   WHERE current.session_id = sessions.id
+                     AND current.attempt_id = @attemptId
+                     AND current.source_user_seq = @sourceUserSeq
+                     AND current.status = 'active'
+                     AND current.finished_at IS NULL
                 )
               )
               OR (

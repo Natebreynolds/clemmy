@@ -1,4 +1,4 @@
-import { Agent, Runner, MaxTurnsExceededError } from '@openai/agents';
+import { Agent } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
 import { createHash } from 'node:crypto';
 import { MODELS, getRuntimeEnv } from '../config.js';
@@ -16,17 +16,14 @@ import type { RuntimeContextValue } from '../types.js';
 import type { DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
 import {
   wrapToolForHarness,
-  withHarnessRunContext,
-  ToolCallsCounter,
-  defaultToolCallsPerTurn,
   harnessRunContextStorage,
   workerThrashGuardEnabled,
   type WrappableTool,
 } from '../runtime/harness/brackets.js';
 import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
-import { buildWorkerJobPrompt, resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
-import { normalizeWorkerOutput } from './worker-output.js';
+import { resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
+import { runPacketWorkerWithHost } from '../runtime/harness/worker-host-runner.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import {
   externalMcpScopeFromExactToolNames,
@@ -379,35 +376,12 @@ export interface CrossProviderWorkerResult {
   toolUses: string[];
 }
 
-/** Per-worker loop-guard scope sequence — mirrors brackets.workerScopeIdFromDetails
- *  so parallel cross-provider workers each get their OWN loop-guard window
- *  instead of poisoning the one shared session tracker. */
-let crossWorkerScopeSeq = 0;
-
 /**
- * Run ONE parent-planned item on a NON-Claude worker model, using the SAME
- * `@openai/agents` Worker agent the orchestrator lane fans out — for the Claude
- * SDK brain lane, which has no `@openai/agents` run context of its own to invoke
- * `worker.asTool().invoke(runContext, …)` against. This is the cross-provider
- * parity path: it reuses `buildWorkerAgent` (harness-wrapped tools, goal-pin
- * inheritance) and runs it via a standalone `Runner` — the same primitive under
- * `asTool` — so the resolved model id routes through the global
- * RouterModelProvider to its real provider (Codex/GLM/BYO/…).
- *
- * Parity with the orchestrator's nested worker:
- *   - installs the parent `sessionId` via withHarnessRunContext so the
- *     harness-wrapped worker tools resolve the real session (kill/pause/plan-
- *     scope/recall/gates), not an empty one;
- *   - a UNIQUE guardrailScopeId so N parallel workers don't poison one loop-guard
- *     tracker (behind CLEMMY_WORKER_THRASH_GUARD, like the nested lane);
- *   - the intent-aware worker turn cap (resolveWorkerMaxTurns);
- *   - the cap → `ERROR:` envelope via normalizeWorkerOutput (identical to the
- *     nested lane's customOutputExtractor), so a capped worker is a FAILED item,
- *     never a hollow done, and hooks.ts fires worker_capped.
- *
- * Throws only on a genuine execution error (provider down, etc.) — a turn cap is
- * converted to the ERROR envelope and returned, never thrown, exactly like the
- * nested asTool path.
+ * Run one delegated item through the same host loop as the orchestrator lane.
+ * The coordinator gives it a packet-scoped session, current tool authority,
+ * inherited cancellation and the intent-aware cap. Provider selection remains
+ * RouterModelProvider's responsibility; child failures return item failures,
+ * never a conflict on the parent's accepted task.
  */
 export async function runCrossProviderWorker(
   input: WorkerToolInput,
@@ -424,13 +398,6 @@ export async function runCrossProviderWorker(
     resolvedTools: input.resolvedTools,
     externalMcpToolNames: input.externalMcpToolNames,
   });
-  const worker = await buildWorkerAgent({
-    model: modelId,
-    workerInput: input,
-    mcpToolScope: effectiveMcpToolScope,
-    sessionId,
-    ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
-  });
   const guard = workerThrashGuardEnabled();
   // Base per-item turn budget — mirrors the orchestrator nested lane
   // (CLEMMY_WORKER_MAX_TURNS default 8, intent-aware ceiling on top).
@@ -439,52 +406,16 @@ export async function runCrossProviderWorker(
     return Number.isFinite(n) && n >= 2 ? n : 8;
   })();
   const maxTurns = guard ? resolveWorkerMaxTurns(input.intent, base) : base;
-  // A generous tool-call ceiling so maxTurns + the identical-args loop-guard stay
-  // the real bounds (a multi-turn worker legitimately makes several calls); this
-  // counter only exists to satisfy the harness context + catch true runaways.
-  const counter = new ToolCallsCounter(Math.max(defaultToolCallsPerTurn(), maxTurns * 4));
-  const scopeId = `${sessionId}::sdkx:${Date.now()}-${(crossWorkerScopeSeq = (crossWorkerScopeSeq + 1) % 1_000_000)}`;
-  const runner = new Runner({ workflowName: 'clementine-sdk-brain-cross-worker', groupId: sessionId });
-  const parentHarnessContext = harnessRunContextStorage.getStore();
-  try {
-    const result = await withHarnessRunContext(
-      {
-        sessionId,
-        counter,
-        // Explicitly marks this standalone Runner as a compose-only worker.
-        // Do not infer worker authority from the optional thrash-guard id.
-        workerScope: true,
-        mcpToolScope: effectiveMcpToolScope,
-        ...(guard ? { guardrailScopeId: scopeId } : {}),
-        ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
-        ...(dispatchLease
-          ? { dispatchLease }
-          : parentHarnessContext?.sessionId === sessionId && parentHarnessContext.dispatchLease
-            ? { dispatchLease: parentHarnessContext.dispatchLease }
-          : {}),
-        ...(parentHarnessContext?.sessionId === sessionId && parentHarnessContext.runAttemptId
-          ? { runAttemptId: parentHarnessContext.runAttemptId }
-          : {}),
-      },
-      () =>
-        runner.run(worker, buildWorkerJobPrompt(input), {
-          context: { sessionId, turn: 0 },
-          maxTurns,
-          ...(abortSignal ? { signal: abortSignal } : {}),
-        }),
-    );
-    return { text: normalizeWorkerOutput(result), model: modelId, toolUses: [] };
-  } catch (err) {
-    // A turn cap on a standalone Runner.run THROWS (unlike asTool, which soft-
-    // converts). Mirror the nested lane: turn the cap into the same ERROR
-    // envelope (normalizeWorkerOutput('') → "hit its turn cap …") so the ledger
-    // marks the item failed and worker_capped fires. Real infra errors propagate
-    // to the run_worker handler's catch (which records + returns its ERROR text).
-    if (err instanceof MaxTurnsExceededError) {
-      return { text: normalizeWorkerOutput(''), model: modelId, toolUses: [] };
-    }
-    throw err;
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
+    return { text: 'ERROR: worker packet has no accepted parent source.', model: modelId, toolUses: [] };
   }
+  const text = await runPacketWorkerWithHost({
+    input, modelId, parentSessionId: sessionId, sourceUserSeq: sourceUserSeq!, maxTurns,
+    mcpToolScope: effectiveMcpToolScope ?? null, dispatchLease, signal: abortSignal,
+    buildAgent: (child) => buildWorkerAgent({ model: modelId, workerInput: input,
+      mcpToolScope: effectiveMcpToolScope, ...child }),
+  });
+  return { text, model: modelId, toolUses: [] };
 }
 
 /**

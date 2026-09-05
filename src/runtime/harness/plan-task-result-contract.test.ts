@@ -220,7 +220,40 @@ test('a keyed plan_invalid_input refusal parses as the structural plan_task memb
     assert.equal(first.consequence?.stage, `schema_invalid:${'a'.repeat(16)}`);
     assert.equal(second.consequence?.stage, `schema_invalid:${'b'.repeat(16)}`);
     assert.notEqual(first.consequence?.key, second.consequence?.key, 'a different violated-path set is a different stage');
-    assert.equal(legacy.consequence?.stage, 'schema_invalid');
+    assert.match(legacy.consequence?.stage ?? '', /^schema_invalid:call:[a-f0-9]{16}$/);
     assert.deepEqual(first.consequence?.recoveryToolNames, ['plan_task']);
+  }
+});
+
+test('semantic and completeness repair keys survive the exact union into real no-progress stages', () => {
+  const members = [
+    ASK_ONLY_MISSING_WRITE,
+    {
+      ok: false, code: 'plan_incomplete_data_lineage', detail: 'Missing dataFrom on write-one.',
+      writeOperationIds: ['write-one'], sourceOperationIds: ['read-one'],
+      repair: 'Name the source in dataFrom.', recoveryTool: 'plan_task',
+    },
+    {
+      ok: false, code: 'plan_not_admitted', detail: 'capability_not_disclosed: write-one; binding_mismatch: write-two',
+      reasonCode: 'capability_not_disclosed', admissibleCapabilities: [], ceiling: 'local_write',
+      withheld: [], repair: 'Disclose the exact write and correct its binding.', recoveryTool: 'tool_search',
+    },
+  ];
+  for (const [index, base] of members.entries()) {
+    const a = { ...base, repairKey: 'a'.repeat(32) };
+    const b = { ...base, repairKey: 'b'.repeat(32) };
+    assert.ok(parseExactPlanTaskRefusal(JSON.stringify(a)), base.code);
+    assert.ok(parseExactPlanTaskRefusal(JSON.stringify(base)), 'historical unkeyed member remains valid');
+    assert.equal(parseExactPlanTaskRefusal(JSON.stringify({ ...a, extra: true })), null);
+    assert.equal(parseExactPlanTaskRefusal(JSON.stringify({ ...a, repairKey: 'invalid' })), null);
+    const first = projectRefusal(`semantic-${index}-a`, a);
+    const second = projectRefusal(`semantic-${index}-b`, b);
+    assert.equal(first.status, 'ok', JSON.stringify(first));
+    assert.equal(second.status, 'ok', JSON.stringify(second));
+    if (first.status === 'ok' && second.status === 'ok') {
+      assert.notEqual(first.consequence?.key, second.consequence?.key,
+        'a changed full issue set is actual convergence at the existing governor boundary');
+      assert.deepEqual(first.consequence?.recoveryToolNames, [base.recoveryTool]);
+    }
   }
 });

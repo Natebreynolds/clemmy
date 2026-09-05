@@ -476,9 +476,10 @@ interface CompletionJudgeRun {
 
 /**
  * One HEDGED judge run — the shared engine for every completion-lane verdict
- * shape. The primary cross-family judge starts immediately; if it hasn't
- * answered by the hedge delay (or dies first), a cheap judge from the other
- * flagship family races it, and the first PARSED value wins (judge-family.ts).
+ * shape. The selected judge starts immediately. An unpinned selection may
+ * race a separately eligible independent family after the hedge delay (or an
+ * early failure); an explicit pin remains the only attempt. When a hedge is
+ * eligible, the first PARSED value wins (judge-family.ts).
  * Metrics record the winner's model/family, so a hedge win is visible in
  * telemetry. Parametrized on (instructions, prompt, parse, lane) so the
  * one-line DONE/INCOMPLETE judge, the per-criterion checklist judge, and the

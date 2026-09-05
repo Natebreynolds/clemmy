@@ -434,7 +434,10 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
                 },
                 {
                   id: WRITE_NODE, effect: 'external_write', coverage: null,
-                  dependsOn: [CREATE_NODE], dataFrom: [CREATE_NODE], cardinality: { kind: 'once' },
+                  // The created receipt supplies the destination, not the
+                  // literal header content already supplied by the user.
+                  // dependsOn retains exact verified-resource targeting.
+                  dependsOn: [CREATE_NODE], dataFrom: [], cardinality: { kind: 'once' },
                 },
               ],
               universes: [],
@@ -689,10 +692,21 @@ if (!PROCESS_RESTART_FIXTURE) test('a plan with no exact verifier is admitted an
     /verification_successor_required:no_compatible_verifier/,
     'G15 zero-candidate must carry the obligation, not refuse',
   );
+  // Since 5faf8eb7 the next-step reads "wrote and could not confirm — never
+  // claim done" and the admit output carries the obligation itself as
+  // unverifiedMutations. The contract is unchanged: a missing exact verifier is
+  // an OBLIGATION carried into the terminal — never a plan refusal, never a done
+  // claim.
   assert.match(
     text,
-    /could not verify/,
+    /could not (verify|confirm)/,
     'the admitted plan names the honest unverified-write report',
+  );
+  assert.match(text, /never claim done/, 'the admitted plan forbids a done claim on an unconfirmed write');
+  const admitted = JSON.parse(text) as { unverifiedMutations?: unknown };
+  assert.ok(
+    Array.isArray(admitted.unverifiedMutations) && admitted.unverifiedMutations.length > 0,
+    'the admitted plan carries the unverified-write obligation on every write requirement',
   );
 });
 

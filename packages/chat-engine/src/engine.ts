@@ -562,6 +562,7 @@ export class ChatEngine {
             subject: String(d.subject ?? d.tool ?? 'this action'),
             reason: typeof d.reason === 'string' ? d.reason : undefined,
             approvalId,
+            ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
           },
         }];
         this.busy = false;
@@ -927,6 +928,7 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
             subject: String(d.subject ?? d.tool ?? 'this action'),
             reason: typeof d.reason === 'string' ? d.reason : undefined,
             approvalId,
+            ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
           },
         });
         break;

@@ -55,6 +55,7 @@ import {
   type PreparedComposioOneShotDispatch,
 } from '../integrations/composio/client.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { planStagedFileUploads, StagedFileTransferPlanError } from '../integrations/composio/staged-file-transfer-plan.js';
 import {
   irreversibleSendRequiresExplicitTarget,
   validateIrreversibleSendPayload,
@@ -1266,6 +1267,9 @@ function currentDocumentedCreateProjection(input: {
   connectionId: string | undefined;
   providerSchemaLeaseFingerprint: string | undefined;
   providerInputSchemaDigest: string | undefined;
+  /** The dispatch ledger's own raw -> effective refinement of this logical
+   * call, when the trusted resolver performed one before this projection. */
+  refinedLogicalCall: { rawArgumentDigest: string; effectiveArgumentDigest: string } | null;
 }): RuntimeDocumentedCreateProjection {
   const attestation = currentHostCallAttestation();
   const work = currentExpectedWorkBinding();
@@ -1289,12 +1293,27 @@ function currentDocumentedCreateProjection(input: {
   if (attestation.bindingKind !== 'catalog_manifest') {
     return { status: 'refused', reason: 'documented create lacks catalog-manifest authority' };
   }
+  // The attestation was frozen at ADMISSION over the model's exact inner
+  // arguments; `input.args` are the provider-ready bytes the gateway resolved
+  // from them (host-only keys such as `artifact_key` or an inline
+  // `connected_account_id` deleted). The ledger records that as ONE raw ->
+  // effective refinement of the same logical call, and the physical crossing,
+  // the host capability binding and the settlement all speak the effective
+  // digest. Comparing the raw attestation against the effective contract
+  // refused the host's own planned create although nothing changed
+  // semantically. Accept the attestation on the raw side of the refined row
+  // — the same rule logical admission applies — and project the authority
+  // on the effective digest every later proof compares against.
+  const attestationCoversContract = attestation.argumentDigest === contract.argumentDigest
+    || (input.refinedLogicalCall !== null
+      && input.refinedLogicalCall.effectiveArgumentDigest === contract.argumentDigest
+      && input.refinedLogicalCall.rawArgumentDigest === attestation.argumentDigest);
   if (
     attestation.acceptedTaskId !== logical.acceptedTaskId
     || attestation.logicalToolCallId !== logical.logicalToolCallId
     || attestation.operationId !== input.toolSlug
     || attestation.toolName !== contract.toolName
-    || attestation.argumentDigest !== contract.argumentDigest
+    || !attestationCoversContract
     || attestation.effect !== 'external_write'
   ) return { status: 'refused', reason: 'host call attestation conflicts with the exact provider call' };
   if (
@@ -1344,7 +1363,7 @@ function currentDocumentedCreateProjection(input: {
       operationId: attestation.operationId,
       accountId: attestation.accountId,
       providerInputSchemaDigest: attestation.providerInputSchemaDigest,
-      argumentDigest: attestation.argumentDigest,
+      argumentDigest: contract.argumentDigest,
       submittedContentDigest: submitted.submittedContentDigest,
       resultIdentity: submitted.resultIdentity,
       effect: 'external_write',
@@ -2369,26 +2388,6 @@ function composioPlatformPlaneOperation(toolSlug: string): boolean {
   // MUTATION (deleting a connected account, rewriting a trigger) is not the
   // remedy for anything — cold, it refuses exactly like a business write.
   return classifyComposioSlugEffect(toolSlug) === 'read';
-}
-
-function schemaRequiresComposioFileUpload(schema: unknown): boolean {
-  const queue: unknown[] = [schema];
-  const seen = new Set<object>();
-  let visited = 0;
-  while (queue.length > 0 && visited < 4_000) {
-    const value = queue.shift();
-    if (!value || typeof value !== 'object' || seen.has(value as object)) continue;
-    seen.add(value as object);
-    visited += 1;
-    if (Array.isArray(value)) {
-      queue.push(...value);
-      continue;
-    }
-    const record = value as Record<string, unknown>;
-    if (record.file_uploadable === true) return true;
-    queue.push(...Object.values(record));
-  }
-  return false;
 }
 
 interface ClosedNoArgReadRepair {
@@ -3457,16 +3456,6 @@ export async function resolveComposioDispatch(
     });
     return { ok: false, reason: 'invalid-args', message, toolkit };
   }
-  if (opts.preparedExecution && !cliOnlyLane && schemaRequiresComposioFileUpload(dispatchSchema)) {
-    const message =
-      `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because this action requires a file upload, `
-      + 'and no separately admitted/staged upload plan is attached. Prepare the exact file transfer first, '
-      + 'then retry the business action. No provider dispatch was started.';
-    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
-      guard: 'prepared-file-upload-plan-required',
-    });
-    return { ok: false, reason: 'invalid-args', message, toolkit };
-  }
   const noArgReadRepair = repairClosedNoArgRead(toolSlug, args, dispatchSchema);
   if (noArgReadRepair) {
     args = noArgReadRepair.args;
@@ -3495,6 +3484,34 @@ export async function resolveComposioDispatch(
       message: `${message}${renderCallableContract(toolSlug, dispatchSchema)}`,
       toolkit,
     };
+  }
+
+  if (opts.preparedExecution && !cliOnlyLane && dispatchSchema) {
+    // The schema advertises possibilities; only values in this exact call
+    // require a transfer. Reuse the same bounded schema/argument projection
+    // as staged execution, after ordinary required-field/argument repair.
+    let hasUpload: boolean;
+    try {
+      hasUpload = planStagedFileUploads(dispatchSchema, args).length > 0;
+    } catch (error) {
+      if (!(error instanceof StagedFileTransferPlanError)) throw error;
+      const message = `⚠️ ${toolSlug} arguments could not be prepared (${error.code}): ${error.message}. `
+        + `Repair this call against the exact schema and retry. No provider dispatch was started.${renderCallableContract(toolSlug, dispatchSchema)}`;
+      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+        guard: 'prepared-file-upload-arguments-invalid', field: error.pointer, validationReason: error.code,
+      });
+      return { ok: false, reason: 'invalid-args', message, toolkit };
+    }
+    if (hasUpload) {
+      const message =
+        `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because this call supplies a file upload, `
+        + 'and no separately admitted/staged upload plan is attached. Prepare the exact file transfer first, '
+        + 'then retry the business action. No provider dispatch was started.';
+      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+        guard: 'prepared-file-upload-plan-required',
+      });
+      return { ok: false, reason: 'invalid-args', message, toolkit };
+    }
   }
 
   let accountIdentityProof: ComposioGatewayResolved['accountIdentityProof'];
@@ -3962,13 +3979,17 @@ async function runComposioExecuteInner(
   }
   args = resolved.args;
   const resolvedRun = harnessRunContextStorage.getStore();
+  // The ledger's verdict on the gateway's raw -> provider-ready rewrite. Every
+  // later identity compare on this call (projection, crossing, settlement)
+  // must read the same refined row rather than re-digesting raw bytes.
+  let refinedLogicalCall: { rawArgumentDigest: string; effectiveArgumentDigest: string } | null = null;
   if (
     currentLogicalCall()
     && resolvedRun?.sessionId
     && Number.isSafeInteger(resolvedRun.sourceUserSeq)
     && (resolvedRun.sourceUserSeq ?? 0) > 0
   ) {
-    authorizeResolvedLogicalCallContract({
+    refinedLogicalCall = authorizeResolvedLogicalCallContract({
       sessionId: resolvedRun.sessionId,
       sourceUserSeq: resolvedRun.sourceUserSeq as number,
       turn: resolvedRun.turn,
@@ -3985,6 +4006,7 @@ async function runComposioExecuteInner(
     connectionId: effectiveConnectionId,
     providerSchemaLeaseFingerprint: resolved.schemaFingerprint,
     providerInputSchemaDigest: resolved.providerInputSchemaDigest,
+    refinedLogicalCall,
   });
   if (documentedCreateProjection.status === 'refused') {
     settleComposioPreDispatchRefusal(toolSlug, 'constraint', args);

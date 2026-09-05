@@ -754,6 +754,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'approval_requested': {
       const action = pendingActionProjection(data.pendingAction);
       const actionId = pendingActionId(data);
+      const consentCall = data.consentCall && typeof data.consentCall === 'object'
+        && !Array.isArray(data.consentCall) ? data.consentCall as Record<string, unknown> : null;
+      const risk = consentCall?.risk && typeof consentCall.risk === 'object'
+        && !Array.isArray(consentCall.risk) ? consentCall.risk as Record<string, unknown> : null;
       return {
         ...selected(data, [
           'approvalId', 'subject', 'tool', 'destructive', 'expiresAt', 'sourceId',
@@ -761,6 +765,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ]),
         ...(actionId ? { pendingActionId: actionId } : {}),
         ...(action ? { pendingAction: action } : {}),
+        ...(consentCall && risk ? { consentCall: {
+          ...selected(consentCall, ['effect', 'accountId']),
+          risk: selected(risk, ['reversibility', 'consequence', 'destructive']),
+        } } : {}),
       };
     }
     case 'approval_resolved':

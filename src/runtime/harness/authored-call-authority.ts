@@ -1,29 +1,20 @@
 /**
- * Call authority for a write the host granted on an AUTHORED workflow step.
- *
- * Owner rule (2026-07-24, reaffirmed 2026-09-01): saving and enabling a
- * workflow is the consent for its authored write/send steps; the only human
- * gate inside a saved workflow is a step authored `requiresApproval`. The
- * host evaluates that consent per call (authored-workflow-write-authority.ts)
- * and, once it decides `proceed`, the shipped invoke adapter still needs a
- * call authority to forward a generic external write. Until 2026-09-01 the
- * only minter was the admitted-construct lane (plan_task → work_call), so a
- * consented authored write reached the adapter with no authority and died
- * inside it ("generic external write requires current call authority") —
- * settled as an uncertain mutation for a call that never left the process.
+ * Existing adapter authority for a write granted by the host consent reducer.
+ * Authored workflows and exact accepted chat calls share this one shape; a
+ * chat write does not need a compiled plan to carry the reducer's decision.
  *
  * This authority carries exactly what the adapter verifies — the current
  * manifest's identity, versions, fingerprint, compiler and port — plus the
  * canonical arguments the host already schema-validated, and the grant that
- * produced it. It is minted only from a decided authored consent and never
+ * produced it. It is minted only from decided host consent and never
  * persists as ledger authority; the dispatch ledger keeps its own rows.
  */
 import { capabilityManifestDigest, type CapabilityManifestV1 } from './capability-manifest.js';
 
-export const AUTHORED_CALL_AUTHORITY_VERSION = 1 as const;
+export const HOST_CONSENT_CALL_AUTHORITY_VERSION = 1 as const;
 
-export interface AuthoredCallGrantV1 {
-  /** `authored-workflow:<receipt authority digest>` from the consent coverage. */
+export interface HostConsentCallGrantV1 {
+  /** The existing reducer's authored-workflow or exact accepted-call coverage. */
   coverageContractId: string;
   sessionId: string;
   sourceUserSeq: number;
@@ -31,9 +22,9 @@ export interface AuthoredCallGrantV1 {
   logicalCallId: string;
 }
 
-export interface AuthoredCallAuthorityV1 {
-  version: typeof AUTHORED_CALL_AUTHORITY_VERSION;
-  kind: 'authored_workflow_step';
+export interface HostConsentCallAuthorityV1 {
+  version: typeof HOST_CONSENT_CALL_AUTHORITY_VERSION;
+  kind: 'host_consent_call';
   operationId: string;
   capabilityRef: string;
   manifestId: string;
@@ -48,7 +39,7 @@ export interface AuthoredCallAuthorityV1 {
   invokePortId: string;
   accountId: string;
   canonicalArgs: Record<string, unknown>;
-  grant: AuthoredCallGrantV1;
+  grant: HostConsentCallGrantV1;
 }
 
 /**
@@ -57,21 +48,21 @@ export interface AuthoredCallAuthorityV1 {
  * the adapter's byte-for-byte comparison against its current sealed manifest
  * is the proof that this authority names the same capability.
  */
-export function mintAuthoredCallAuthority(input: {
+export function mintHostConsentCallAuthority(input: {
   manifest: CapabilityManifestV1;
   canonicalArgs: Record<string, unknown>;
-  grant: AuthoredCallGrantV1;
-}): AuthoredCallAuthorityV1 {
+  grant: HostConsentCallGrantV1;
+}): HostConsentCallAuthorityV1 {
   const { manifest } = input;
   if (!input.canonicalArgs || typeof input.canonicalArgs !== 'object' || Array.isArray(input.canonicalArgs)) {
-    throw new Error('authored call authority requires canonical object arguments');
+    throw new Error('host consent call authority requires canonical object arguments');
   }
-  if (!input.grant.coverageContractId.startsWith('authored-workflow:')) {
-    throw new Error('authored call authority requires an authored-workflow coverage contract');
+  if (!/^(?:authored-workflow|accepted-call):[a-f0-9]{64}$/.test(input.grant.coverageContractId)) {
+    throw new Error('host consent call authority requires exact reducer coverage');
   }
   return Object.freeze({
-    version: AUTHORED_CALL_AUTHORITY_VERSION,
-    kind: 'authored_workflow_step',
+    version: HOST_CONSENT_CALL_AUTHORITY_VERSION,
+    kind: 'host_consent_call',
     operationId: manifest.operationId,
     capabilityRef: manifest.manifestId,
     manifestId: manifest.manifestId,

@@ -43,6 +43,8 @@ const {
   HostInterruptState,
   HostRecoveryState,
   hostNoProgressRecoveryDirective,
+  hostNoProgressRecoveryToolNames,
+  hostNoProgressBlockedText,
   hostRunRunner,
 } = await import('./host-turn-runner.js');
 const {
@@ -52,6 +54,7 @@ const {
   NO_PROGRESS_RETRY_BUDGET,
 } = await import('./no-progress-governor.js');
 const { projectHostNoProgressAuthority } = await import('./host-no-progress-projection.js');
+const { ModelStreamStalledError } = await import('./model-stall-policy.js');
 
 const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
 
@@ -182,7 +185,7 @@ test('approval-resume state preserves a spent no-progress retry and exact histor
   );
 });
 
-test('structural plan surfaces carry branch-specific one-call directives', () => {
+test('structural repair directives retain their next call without forbidding the proven read surface', () => {
   const authority = { operation: [], account: [], target: [], evidence: [], effect: [] } as const;
   const directive = (stage: string, tool: string) => {
     const initial = initializeNoProgressGovernor({ taskKey: `directive:${stage}`, authority });
@@ -201,16 +204,16 @@ test('structural plan surfaces carry branch-specific one-call directives', () =>
   };
   const graphNeutral = directive('plan_not_required:graph_neutral', 'call_tool');
   assert.match(graphNeutral, /Call call_tool exactly once/);
-  assert.match(graphNeutral, /Do not call plan_task, tool_search/);
+  assert.match(graphNeutral, /Available discovery and read controls/);
   const workflow = directive('plan_not_required:unique_workflow', 'workflow_run');
   assert.match(workflow, /Call workflow_run exactly once/);
-  assert.match(workflow, /Do not call plan_task, workflow_get, tool_search/);
+  assert.match(workflow, /Available discovery and read controls/);
   const search = directive('semantic_admission:capability_not_disclosed', 'tool_search');
   assert.match(search, /Call tool_search exactly once/);
-  assert.match(search, /Do not call plan_task until that search returns/);
+  assert.match(search, /Available discovery and read controls/);
   const plan = directive('semantic_admission:write_not_aligned', 'plan_task');
   assert.match(plan, /Call plan_task exactly once/);
-  assert.match(plan, /Do not rediscover/);
+  assert.match(plan, /Available discovery and read controls/);
 });
 
 test('provider-crossed invalid arguments expose one honest repair-or-alternative choice and remain bounded', () => {
@@ -233,7 +236,7 @@ test('provider-crossed invalid arguments expose one honest repair-or-alternative
   });
   assert.equal(first.action, 'continue');
   assert.deepEqual(
-    recoverySurface(consequence, ['plan_task', 'tool_search', 'work_call', 'ask_user_question']),
+    [...hostNoProgressRecoveryToolNames(consequence, ['plan_task', 'tool_search', 'work_call', 'ask_user_question'])],
     ['tool_search', 'work_call'],
     'the advertised recovery schemas are exactly the failed carrier plus one alternative search',
   );
@@ -252,7 +255,7 @@ test('provider-crossed invalid arguments expose one honest repair-or-alternative
   assert.equal(repeated.action, 'terminalize', 'an unchanged provider rejection still cannot loop');
 });
 
-test('repeated discovery gets one control-only recovery and no third discovery crossing', async () => {
+for (const stalled of [false, true]) test(`discovery recovery keeps the proven surface and stops resumably without a last-word call (stall=${stalled})`, async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
 
@@ -280,9 +283,22 @@ test('repeated discovery gets one control-only recovery and no third discovery c
   assert.deepEqual(primed.planning.capabilities, []);
 
   let modelCalls = 0;
+  let providerAttempts = 0;
+  let stallInjected = false;
+  let budgetAtStall: unknown;
   const surfaces: string[][] = [];
   const model = {
     async getResponse(request: { tools?: Array<{ name?: string }> }) {
+      providerAttempts += 1;
+      const lastBudget = () => eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+        .filter((event) => event.data.kind === 'no_progress_decision').at(-1)?.data.retriesRemaining;
+      if (stalled && modelCalls === 2 && !stallInjected) {
+        stallInjected = true;
+        budgetAtStall = lastBudget();
+        throw new ModelStreamStalledError(600, true, false);
+      }
+      if (stallInjected && modelCalls === 2) assert.equal(lastBudget(), budgetAtStall,
+        'a stalled provider attempt has no tool result and consumes no governor retry');
       modelCalls += 1;
       const surface = (request.tools ?? [])
         .map((entry) => entry.name ?? '')
@@ -294,18 +310,14 @@ test('repeated discovery gets one control-only recovery and no third discovery c
         assert.ok(surface.includes('tool_search'));
         assert.ok(surface.includes('plan_task'), 'the citable path enables exact plan admission');
       } else {
-        assert.equal(surface.includes('tool_search'), false,
-          'the clean recovery cannot cross another discovery dependency');
-        assert.ok(surface.every((name) => (
-          name === 'plan_task' || name.split('__').at(-1) === 'ask_user_question'
-        )), JSON.stringify(surface));
+        assert.ok(surface.includes('tool_search'),
+          'a no-gain lookup cannot hide discovery needed to pivot to another requirement');
       }
       return {
         responseId: `host-no-progress-response-${modelCalls}`,
         usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        // The third response deliberately hallucinates the now-hidden search.
-        // The host must refuse it before the tool body even though the full
-        // configured agent still owns a real tool_search implementation.
+        // Repeated no-gain discovery must stop at the bounded governor; the
+        // recovery model must still have executable schemas until that stop.
         output: [functionCall(`discover-${modelCalls}`, 'tool_search', {
           query: modelCalls === 1 ? 'write_file' : `write_file alternate ${modelCalls}`,
           role_key: null,
@@ -336,7 +348,7 @@ test('repeated discovery gets one control-only recovery and no third discovery c
     sessionId: session.id,
     sourceUserSeq: source.seq,
     turn: 1,
-    counter: new brackets.ToolCallsCounter(6),
+    counter: new brackets.ToolCallsCounter(20),
     behaviorScopeId: `${session.id}::turn:1`,
   };
 
@@ -345,32 +357,27 @@ test('repeated discovery gets one control-only recovery and no third discovery c
     agent as never,
     [{ role: 'user', content: prompt }] as never,
     {
-      maxTurns: 5,
+      maxTurns: 10,
       hostTurnEngine: 'host_v1',
       context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
     } as never,
   ));
 
-  assert.equal(modelCalls, 3);
+  assert.ok(modelCalls <= NO_PROGRESS_RETRY_BUDGET + 2, `model calls: ${modelCalls}`);
+  assert.equal(providerAttempts, modelCalls + (stalled ? 1 : 0));
   assert.deepEqual(outcome.terminal, {
     status: 'blocked',
     reason: 'control_no_progress_exhausted',
-    resumable: false,
   });
-  assert.equal(outcome.finalOutput, HOST_NO_PROGRESS_BLOCKED_TEXT);
-  assert.equal(surfaces[2]?.includes('tool_search'), false);
+  assert.match(String(outcome.finalOutput), /Next: .*resume/i);
+  assert.equal(surfaces[2]?.includes('tool_search'), true);
+  assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'last_word_turn').length, 0);
   const called = eventlog.listEvents(session.id, { types: ['discovery_governor_decision'] })
     .map((event) => event.data.callId)
     .filter((callId) => typeof callId === 'string');
-  assert.deepEqual(called.filter((callId) => String(callId).startsWith('discover-')), [
-    'discover-1',
-    'discover-2',
-  ], 'the hallucinated third discovery never enters the tool body');
-  assert.equal((eventlog.openEventLog().prepare(`
-    SELECT COUNT(*) AS n FROM physical_dispatches
-     WHERE session_id = ? AND source_user_seq = ?
-       AND logical_tool_call_id = 'discover-3'
-  `).get(session.id, source.seq) as { n: number }).n, 0);
+  assert.ok(called.includes('discover-3'), 'the recovery lookup reaches its own discovery governor');
+  assert.equal(eventlog.listEvents(session.id, { types: ['external_write'] }).length, 0);
 });
 
 // A write already on the card is NOT a repair for a draft missing ITS write:
@@ -425,14 +432,11 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
         };
       }
       const requestText = JSON.stringify(request);
-      assert.match(requestText, /plan_incomplete_missing_write/);
-      assert.doesNotMatch(requestText, /admissibleCapabilities/,
+      assert.ok(requestText.includes('plan_incomplete_missing_write'));
+      assert.ok(!requestText.includes('admissibleCapabilities'),
         'the refusal must not advertise card writes as substitutes');
-      assert.match(requestText, /Use tool_search for the exact missing write capability/);
-      assert.match(requestText, /Call tool_search exactly once/);
-      assert.doesNotMatch(requestText, /Do not call tool_search/);
-      assert.deepEqual(surface, ['tool_search'],
-        'the recovery surface offers exactly the search the repair names');
+      assert.ok(requestText.includes('Use tool_search for the exact missing write capability'));
+      assert.ok(surface.includes('tool_search'), 'the repair keeps its discovery control');
       throw expectedStop;
     },
     getStreamedResponse: modelStream,
@@ -473,7 +477,7 @@ test('a current-card write still gets the ask-only missing-write recovery (one t
   }
   assert.equal(thrown, expectedStop);
   assert.equal(modelCalls, 3);
-  assert.deepEqual(surfaces[2], ['tool_search']);
+  assert.ok(surfaces[2]?.includes('tool_search'));
   assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
 });
 
@@ -525,12 +529,11 @@ test('an empty-card missing-write recovery exposes one search, then newly disclo
       }
       if (modelCalls === 3) {
         const requestText = JSON.stringify(request);
-        assert.match(requestText, /plan_incomplete_missing_write/);
-        assert.doesNotMatch(requestText, /admissibleCapabilities/,
+        assert.ok(requestText.includes('plan_incomplete_missing_write'));
+        assert.ok(!requestText.includes('admissibleCapabilities'),
           'the ask-only refusal carries no capability list to pick from');
-        assert.match(requestText, /Call tool_search exactly once/);
-        assert.doesNotMatch(requestText, /Do not repeat discovery/);
-        assert.deepEqual(surface, ['tool_search']);
+        assert.ok(requestText.includes('Use tool_search for the exact missing write capability'));
+        assert.ok(surface.includes('tool_search'));
         return {
           responseId: 'search-repair-write-search',
           output: [functionCall('search-repair-write-search', 'tool_search', {
@@ -582,7 +585,7 @@ test('an empty-card missing-write recovery exposes one search, then newly disclo
   }
   assert.equal(thrown, expectedStop);
   assert.equal(modelCalls, 4);
-  assert.deepEqual(surfaces[2], ['tool_search']);
+  assert.ok(surfaces[2]?.includes('tool_search'));
   assert.ok(surfaces[3]?.includes('plan_task'));
   assert.equal(eventlog.getTurnGraphEventForSource(session.id, source.seq), null);
 });
@@ -794,9 +797,23 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
       })],
       exact: true,
     },
+    {
+      // The governor has no choices and the tool declares `options` as a
+      // required strict-nullable field. A brain that omits it emits the bytes
+      // the host will materialize to options: null — the canonical ask — so
+      // the authority compare must read the materialized call, not raw bytes.
+      label: 'omitted-nullable-options',
+      choices: [] as readonly string[],
+      output: [functionCall('omitted-options-ask', 'ask_user_question', {
+        question,
+        purpose: 'clarification',
+      })],
+      exact: true,
+    },
   ] as const;
 
   for (const fixtureCase of cases) {
+    const caseChoices = 'choices' in fixtureCase ? fixtureCase.choices : choices;
     eventlog.resetEventLog();
     catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
     const session = eventlog.createSession({
@@ -822,7 +839,7 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
         stage: 'input_required:account_selection',
         recovery: 'ask_user',
         effectState: 'not_started',
-        userInput: { question, choices, purpose: 'clarification' },
+        userInput: { question, choices: caseChoices, purpose: 'clarification' },
       }),
     });
     assert.equal(asked.action, 'continue');
@@ -885,13 +902,7 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
         context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
       } as never,
     ));
-    // A malformed ask CALL is refused on the spot — one model step, unchanged.
-    // A completed PROSE answer is different: it cannot carry the question,
-    // options and purpose, so instead of answering for the model with harness
-    // copy the host names the exact call this state requires and gives it one
-    // last-word turn (2026-09-03). That turn is a real model step, so this one
-    // case makes 2. Every invariant below is unchanged.
-    assert.equal(modelCalls, fixtureCase.label === 'completed-prose' ? 2 : 1);
+    assert.equal(modelCalls, 1, 'an invalid ask never buys a last-word model call');
     const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
     if (fixtureCase.exact) {
       assert.equal(outcome.terminal, undefined, JSON.stringify({
@@ -901,11 +912,12 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
       }));
       assert.equal(asks.length, 1);
       assert.equal(asks[0]?.data.question, question);
-      assert.deepEqual(asks[0]?.data.options, choices);
+      assert.deepEqual(asks[0]?.data.options ?? null, caseChoices.length > 0 ? caseChoices : null);
       assert.equal(asks[0]?.data.purpose, 'clarification');
     } else {
       assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
-      assert.equal(outcome.terminal?.resumable, false);
+      assert.notEqual(outcome.terminal?.resumable, false);
+      assert.match(String(outcome.finalOutput), /Next: Answer:/);
       assert.equal(asks.length, 0);
       assert.notEqual(outcome.finalOutput,
         'Tell me whatever account details you have and ask me to continue.');
@@ -913,7 +925,7 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
   }
 });
 
-test('stop-factual recovery cannot manufacture an ask or resumable terminal', async () => {
+test('a known result stops from retained state without a model call or invented approval', async () => {
   for (const [label, text] of [
     ['ask-marker', 'ASK: Please reconnect the account and tell me to continue.'],
     ['approval-envelope', JSON.stringify({
@@ -1011,12 +1023,10 @@ test('stop-factual recovery cannot manufacture an ask or resumable terminal', as
         context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
       } as never,
     ));
-    // One guiding last-word turn before the harness answers (2026-09-03); the
-    // model repeats the same ask-shaped reply, so the typed terminal stands.
-    assert.equal(modelCalls, 2);
+    assert.equal(modelCalls, 0);
     assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
-    assert.equal(outcome.terminal?.resumable, false);
-    assert.equal(outcome.finalOutput, HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT);
+    assert.notEqual(outcome.terminal?.resumable, false);
+    assert.equal(outcome.finalOutput, hostNoProgressBlockedText(recovery.state));
     assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
     assert.notEqual(outcome.finalOutput, text);
   }
@@ -1118,12 +1128,7 @@ function projectSchemaRefusal(input: {
 
 /** The runner's recovery-surface rule for a consequence with recovery tool
  * names: the model sees exactly those tool names and nothing else. */
-function recoverySurface(consequence: { recoveryToolNames: readonly string[] }, toolNames: readonly string[]) {
-  const exact = new Set(consequence.recoveryToolNames);
-  return toolNames.filter((name) => exact.has(name));
-}
-
-test('a schema refusal recovers on exactly the refused carrier with a no-discovery directive', () => {
+test('a schema refusal preserves its carrier and the turn\'s available discovery/read controls', () => {
   eventlog.resetEventLog();
   const validator = schemaRefusalValidator();
   const camelArgs = {
@@ -1149,10 +1154,13 @@ test('a schema refusal recovers on exactly the refused carrier with a no-discove
   assert.equal(consequence.effectState, 'not_started');
   assert.deepEqual(consequence.recoveryToolNames, [SCHEMA_REPAIR_CARRIER]);
   assert.deepEqual(
-    recoverySurface(consequence, ['tool_search', 'plan_task', 'ask_user_question', 'call_tool', SCHEMA_REPAIR_CARRIER, 'workflow_run']),
-    [SCHEMA_REPAIR_CARRIER],
-    'the recovery surface is exactly the refused carrier',
+    [...hostNoProgressRecoveryToolNames(consequence, ['tool_search', 'read_file', 'plan_task', 'call_tool', SCHEMA_REPAIR_CARRIER, 'write_file', 'unknown_mutation'])],
+    ['tool_search', 'read_file', SCHEMA_REPAIR_CARRIER],
+    'reads/discovery stay available; unrelated writes and unproven carriers do not',
   );
+  assert.deepEqual([...hostNoProgressRecoveryToolNames(consequence,
+    ['call_tool', 'work_call', 'proven_read', 'unknown_mutation'], ['proven_read'])],
+  ['call_tool', 'work_call', 'proven_read'], 'proven reads retain their existing carrier');
 
   const initial = initializeNoProgressGovernor({
     taskKey: attemptIdentity.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),
@@ -1168,8 +1176,7 @@ test('a schema refusal recovers on exactly the refused carrier with a no-discove
   const directive = hostNoProgressRecoveryDirective(decision.state);
   assert.match(directive, /^BOUNDED AUTO RECOVERY — the last call was refused before dispatch because its arguments did not match the exact schema/);
   assert.match(directive, new RegExp(`Call ${SCHEMA_REPAIR_CARRIER} exactly once with one corrected JSON object for the same operation`));
-  assert.match(directive, /Do not call tool_search, plan_task, or another operation\./);
-  assert.doesNotMatch(directive, /Call tool_search/);
+  assert.match(directive, /available discovery and read controls/);
 
   // The keyed marker is an exact host projection: the receipt lane accepts it.
   assert.equal(hostResults.describeCanonicalHostModelResult(marker)?.disposition, 'refused_pre_dispatch');

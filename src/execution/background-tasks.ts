@@ -6075,6 +6075,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      const resume = task.inputResolution;
 	      const continuation = task.continueResolution;
 	      const acceptedContractVersion = task.contractVersion ?? 1;
+	      const acceptedUserMessage = resume ? `${task.prompt}\n\n${resume.answer}` : task.prompt;
 	      let workerMessage = resume
 	        ? buildWorkerInputResumePrompt(task, resume.answer)
 	        : continuation
@@ -6133,10 +6134,10 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          message: workerMessage,
 	          // `message` is a private host directive that contains orchestration
 	          // and reporting instructions. Keep the accepted user authority on
-	          // the literal task request so catalog/account parsing, memory, and
-	          // replay cannot mistake phrases such as "from the user" in our own
-	          // wrapper for a connected-account nomination.
-	          displayMessage: task.prompt,
+	          // the literal task request plus any accepted answer so catalog/account
+	          // parsing, memory, and replay cannot mistake phrases such as "from the
+	          // user" in our own wrapper for a connected-account nomination.
+	          displayMessage: acceptedUserMessage,
 	          runId: run.id,
 	          shouldCancel: () => {
 	            if (Date.now() > wallClockDeadlineMs) {

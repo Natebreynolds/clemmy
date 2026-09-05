@@ -280,7 +280,7 @@ final class PinnedWebNavigationPolicyTests: XCTestCase {
         XCTAssertEqual(disposition("https://192.168.1.11:43117/m/../admin"), .cancel)
         XCTAssertEqual(disposition("https://192.168.1.11:43117/m/%2e%2e/admin"), .cancel)
         XCTAssertEqual(disposition("https://192.168.1.11:43117/m/%2Fadmin"), .cancel)
-        XCTAssertEqual(disposition("https://user:secret@192.168.1.11:43117/m/"), .cancel)
+        XCTAssertEqual(disposition("https://user:PLACEHOLDER@192.168.1.11:43117/m/"), .cancel)
         XCTAssertEqual(disposition("http://192.168.1.11:43117/m/"), .cancel)
         XCTAssertEqual(disposition("javascript:alert(1)", userInitiated: true), .cancel)
     }

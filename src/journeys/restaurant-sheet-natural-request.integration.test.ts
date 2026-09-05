@@ -656,7 +656,10 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery before planning');
         assert.equal(tools.includes('work_call'), false,
           'the proposal-free carrier stays hidden until exact disclosure can also expose plan_task');
-        assert.equal(tools.includes('run_worker'), false, 'worker dispatch is hidden before plan activation');
+        assert.ok(tools.includes('run_worker'), 'scoped delegation is plan-optional on the first primary surface');
+        assert.equal(providerCalls.length, 0, 'advertising a worker grants no provider crossing');
+        assert.equal(eventlog.listEvents(session.id, { types: ['worker_started', 'worker_result'] }).length, 0,
+          'fresh discovery has not dispatched any worker');
         output = [functionCall('discover-capabilities', 'tool_search', {
           query: 'search for restaurants by location and create a new Google Sheet from the results',
           role_key: 'clause-0:read',
@@ -834,6 +837,8 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   assert.ok(builtSurfaces.some((surface) => surface.includes('work_call')));
 
   const events = eventlog.listEvents(session.id);
+  assert.equal(events.filter((event) => event.type === 'worker_started' || event.type === 'worker_result').length, 0,
+    'this direct two-operation task performs no worker I/O despite plan-optional visibility');
   const preambles = events.filter((event) =>
     event.type === 'conversation_preamble' && event.data.sourceUserSeq === sourceUserSeq);
   assert.equal(preambles.length, 1);

@@ -11,6 +11,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-dispatch-lease-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -20,6 +21,9 @@ const {
   createSession,
   finishRunAttempt,
   listEvents,
+  appendEvent,
+  openEventLog,
+  recordRunAttemptUserInput,
 } = await import('./eventlog.js');
 const {
   activateDispatchLease,
@@ -32,8 +36,69 @@ const {
   revokeDispatchLeaseBeforeRecovery,
   StaleDispatchLeaseError,
 } = await import('./dispatch-lease.js');
+const contracts = await import('./logical-call-contract.js');
+const callAuthority = await import('./accepted-turn-call-authority.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
+
+function delegatedWorkerLeaseFixture(marker = true) {
+  const parent = createSession({ kind: 'chat' });
+  const parentAttempt = beginRunAttempt(parent.id);
+  const source = recordRunAttemptUserInput(parentAttempt, { turn: 1, role: 'user', data: { text: 'Read each local item in parallel.' } });
+  const root = callAuthority.armHostCallAuthority({ sessionId: parent.id, sourceUserSeq: source.seq,
+    catalogRevisionDigest: 'a'.repeat(64), bindingRevisionDigest: 'b'.repeat(64), maxLogicalCalls: 10, maxParallelCalls: 2 });
+  assert.equal(root.status, 'armed');
+  const packet = { item: 'one', objective: 'Read this local item.' };
+  const lineage = { parentSessionId: parent.id, parentSourceUserSeq: source.seq,
+    parentAcceptedTaskId: `task:${parent.id}#${source.seq}`, parentLogicalCallId: 'worker-call',
+    packetKey: 'packet-one', packetDigest: createHash('sha256').update(JSON.stringify(packet)).digest('hex'), item: packet.item };
+  const parentArgs = { item: 'one' };
+  const material = contracts.durableLogicalCallRecoveryMaterial(lineage.parentAcceptedTaskId, 'run_worker', parentArgs)!;
+  openEventLog().prepare(`INSERT INTO logical_tool_calls
+    (session_id, source_user_seq, accepted_task_id, logical_tool_call_id, tool_name, argument_digest, raw_argument_digest, state, opened_at)
+    VALUES (?, ?, ?, ?, 'run_worker', ?, ?, 'open', ?)`)
+    .run(parent.id, source.seq, lineage.parentAcceptedTaskId, lineage.parentLogicalCallId, material.argumentDigest, material.argumentDigest, new Date().toISOString());
+  const parentLease = activateDispatchLease({ sessionId: parent.id, scopeId: `${parent.id}::call`, runAttemptId: parentAttempt.attemptId,
+    sourceUserSeq: source.seq, acceptedTaskId: lineage.parentAcceptedTaskId, logicalToolCallId: lineage.parentLogicalCallId,
+    recovery: { material, effect: 'local_write', businessCall: false } });
+  const child = createSession({ kind: 'agent', metadata: { source: 'delegated_worker', workerScope: true, ...lineage } });
+  const attempt = beginRunAttempt(child.id);
+  const childSource = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', parentEventId: source.id,
+    data: { text: JSON.stringify(packet), delegatedWorker: { ...lineage, composeOnly: true, packet } } });
+  if (marker) appendEvent({ sessionId: parent.id, turn: 0, role: 'system', type: 'worker_started',
+    data: { ...lineage, childSessionId: child.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
+  const activate = (lease = parentLease) => activateDispatchLease({ sessionId: child.id,
+    scopeId: `${child.id}::host`, runAttemptId: attempt.attemptId, parentLease: lease });
+  return { parent, child, childSource, attempt, parentLease, activate };
+}
+
+test('delegated worker leases use durable lineage and parent cancellation without owning the parent', () => {
+  const fixture = delegatedWorkerLeaseFixture();
+  const child = fixture.activate();
+  assert.equal(isDispatchLeaseCurrent(child), true);
+  revokeDispatchLease(child);
+  assert.equal(isDispatchLeaseCurrent(fixture.parentLease), true);
+  const next = fixture.activate();
+  revokeDispatchLease(fixture.parentLease);
+  assert.equal(isDispatchLeaseCurrent(next), false);
+  assert.throws(() => assertDispatchLeaseCurrent(next), StaleDispatchLeaseError);
+});
+
+for (const change of ['foreign-parent', 'wrong-call-lease', 'forged-metadata', 'changed-packet', 'missing-marker'] as const) {
+  test(`delegated worker lease refuses ${change} before any child dispatch`, () => {
+    const fixture = delegatedWorkerLeaseFixture(change !== 'missing-marker');
+    if (change === 'foreign-parent' || change === 'wrong-call-lease') {
+      const foreign = change === 'foreign-parent' ? createSession({ kind: 'chat' }) : fixture.parent;
+      const lease = activateDispatchLease({ sessionId: foreign.id, scopeId: `${foreign.id}::parent` });
+      assert.throws(() => fixture.activate(lease), /parent must belong/);
+    } else {
+      if (change === 'forged-metadata') openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(metadata_json, '$.parentLogicalCallId', 'another-call') WHERE id = ?`).run(fixture.child.id);
+      if (change === 'changed-packet') openEventLog().prepare(`UPDATE events SET data_json = json_set(data_json, '$.delegatedWorker.packet.objective', 'Changed scope') WHERE seq = ?`).run(fixture.childSource.seq);
+      assert.throws(() => fixture.activate(), /parent must belong/);
+    }
+    assert.equal(isDispatchLeaseCurrent(fixture.parentLease), true);
+  });
+}
 
 async function waitForFile(file: string, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

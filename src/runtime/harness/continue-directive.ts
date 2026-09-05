@@ -27,7 +27,8 @@ export function isContinueCompletionReason(reason: unknown): boolean {
   return reason === 'awaiting_continue'
     || reason === 'limit_exceeded'
     || reason === 'step_budget_parked'
-    || reason === 'sdk_step_budget_parked';
+    || reason === 'sdk_step_budget_parked'
+    || reason === 'local_work_incomplete';
 }
 
 /**
@@ -37,17 +38,24 @@ export function isContinueCompletionReason(reason: unknown): boolean {
  */
 export function buildContinueInput(
   lastSummary: string | undefined,
-  opts: { auto?: boolean } = {},
+  opts: { auto?: boolean; missing?: readonly string[] } = {},
 ): string {
   return [
-    opts.auto
+    opts.missing?.length
+      ? 'The accepted local work is not complete. Continue the remaining items in this same turn using the retained results.'
+      : opts.auto
       ? 'You hit a step / time budget on the previous turn and the harness is continuing automatically under your budget preset.'
       : 'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
     'Pick up where you left off; do not restart the workflow from scratch.',
     lastSummary
-      ? `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
+      ? opts.missing?.length
+        ? `Your previous reply in this turn was: ${JSON.stringify(lastSummary)}.`
+        : `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
       : 'Use the conversation history above to figure out where you were.',
-    'Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.',
+    ...(opts.missing?.length ? [
+      `Remaining accepted local items: ${JSON.stringify(opts.missing)}.`,
+      'Dispatch only these missing items, keeping their existing packet/manifest identity. Reuse successful item receipts; do not rerun successful siblings or replay prior writes. Obey the accepted retry and tool limits; this continuation grants no new permission. If a tool fails, use the retained error to repair the missing item. Do not claim completion until every required result exists.',
+    ] : ['Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.']),
   ].join('\n\n');
 }
 

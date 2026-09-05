@@ -28,6 +28,8 @@
  * (default 12 tool calls between checks).
  */
 import { getRuntimeEnv } from '../../config.js';
+import { actionBus } from '../action-bus.js';
+import { listEvents, type EventRow } from './eventlog.js';
 
 export function watcherJudgeEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WATCHER_JUDGE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -103,6 +105,83 @@ export function shouldStartWatcherCheck(input: WatcherGateInput): boolean {
   );
 }
 
+/**
+ * RE-ARMED cadence for a worker fan-out. A run_worker batch is ONE parent
+ * tool call that can hold the loop for minutes, so the tool-call interval
+ * never elapses while the children run: live 2026-09-04 (frozen 1931743f,
+ * 8 workers) the only check completed BEFORE worker_started and no judge saw
+ * the fan-out. When the parent learns a batch started, the interval condition
+ * is treated as already elapsed so a check is due NOW — every other cap
+ * (enabled, in-flight, injections, checks) is the same gate, unchanged. A
+ * check started this way spends the ordinary check budget; it is not an
+ * extra lane, so a run with no fan-out never sees it.
+ */
+export function rearmedWatcherCadence(input: WatcherGateInput): WatcherGateInput {
+  return { ...input, lastCheckedAtToolCalls: input.totalToolCalls - input.checkIntervalTools };
+}
+
+/**
+ * The parent learns a fan-out started from the event it already owns: every
+ * worker lane appends `worker_started` to the PARENT session's eventlog
+ * (worker-host-runner.ts, orchestrator.ts), and the eventlog publishes each
+ * persisted row on the action bus. Fires `onStart` once per observed batch
+ * (a batchKey when the lane fenced one, else the parent logical call, else the
+ * first worker) for the session. Returns the unsubscribe; callers scope it to
+ * the tool invocation so nothing outlives the parent call.
+ */
+export function observeWorkerFanoutStart(sessionId: string, onStart: (event: EventRow) => void): () => void {
+  const seen = new Set<string>();
+  return actionBus.subscribe((bus) => {
+    if (bus.kind !== 'harness.event') return;
+    const event = bus.event as EventRow;
+    if (event.sessionId !== sessionId || event.type !== 'worker_started') return;
+    const data = (event.data ?? {}) as Record<string, unknown>;
+    const batch = String(data.batchKey ?? data.parentLogicalCallId ?? '') || `event:${event.seq}`;
+    if (seen.has(batch)) return;
+    seen.add(batch);
+    onStart(event);
+  });
+}
+
+/**
+ * Children's progress as the parent's eventlog records it — the watcher reads
+ * the trajectory the fan-out is producing, not only the parent's own calls.
+ * '' when the session has no worker events (a run without a fan-out sends the
+ * judge exactly the prompt it always did).
+ */
+export function summarizeWorkerProgressForWatcher(sessionId: string): string {
+  try {
+    const events = listEvents(sessionId, { types: ['worker_started', 'worker_result', 'work_item_checkpoint'] });
+    if (events.length === 0) return '';
+    const started: string[] = [];
+    let ok = 0;
+    let failed = 0;
+    const checkpoints = new Map<string, number>();
+    for (const event of events) {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      if (event.type === 'worker_started') {
+        started.push(String(data.item ?? '').slice(0, 80));
+      } else if (event.type === 'worker_result') {
+        if (data.ok === true) ok += 1; else failed += 1;
+      } else {
+        const status = String(data.status ?? 'unknown');
+        checkpoints.set(status, (checkpoints.get(status) ?? 0) + 1);
+      }
+    }
+    const parts = [
+      `${started.length} started${started.length ? ` (${started.filter(Boolean).slice(0, 12).join(', ')}${started.length > 12 ? ', …' : ''})` : ''}`,
+      `${ok + failed} returned (${ok} ok, ${failed} failed)`,
+      `${Math.max(0, started.length - ok - failed)} still running`,
+    ];
+    if (checkpoints.size > 0) {
+      parts.push(`checkpoints: ${[...checkpoints.entries()].map(([status, n]) => `${status}×${n}`).join(', ')}`);
+    }
+    return `parallel workers: ${parts.join('; ')}`;
+  } catch {
+    return '';
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Verdict contract — one plain-text line, parsed deterministically
 // (the same no-schema-to-flake treatment as every other boundary judge)
@@ -175,6 +254,18 @@ export function buildWatcherPrompt(input: WatcherJudgeInput): string {
 }
 
 export type WatcherJudgeFn = (input: WatcherJudgeInput) => Promise<WatcherVerdict | null>;
+
+let watcherJudgeForTests: WatcherJudgeFn | null = null;
+
+/** Test seam (isolated homes only): stub the one judge call the host mount
+ *  makes, the way loop.ts takes `options.watcherJudge`. */
+export function _setWatcherJudgeForTests(fn: WatcherJudgeFn | null): void {
+  watcherJudgeForTests = process.env.CLEMMY_TEST_ISOLATED_HOME === '1' ? fn : null;
+}
+
+export function currentWatcherJudge(): WatcherJudgeFn {
+  return watcherJudgeForTests ?? runWatcherJudge;
+}
 
 /**
  * One trajectory check: a single hedged cross-family judge call on the shared

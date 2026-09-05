@@ -17,7 +17,7 @@ const {
   freezeCatalogSnapshotForSource,
   installHostCapabilityCatalogFactory,
   isCurrentCallableCatalogEntry,
-  resolveProvenLiveReadCatalogEntry,
+  resolveProvenLiveCatalogEntry,
 } = await import('./host-capability-catalog-factory.js');
 const { attachSemanticContract, capabilityManifestDigest } = await import('./capability-manifest.js');
 const {
@@ -79,6 +79,59 @@ function asRegistered(
     invoke: async () => ({}),
   };
 }
+
+test('P3: proven live mutation resolves its attested operation, effect and selected account', () => {
+  const manifest = attachSemanticContract({
+    ...sheetManifest(), manifestId: 'cap:resolved:fixture_create_draft:current',
+    operationId: 'fixture__create_draft', accountId: 'acct-selected',
+  });
+  const entry = asRegistered(manifest);
+  installHostCapabilityCatalogFactory(createHostCapabilityCatalogFactory([entry]));
+  try {
+    const request = {
+      capabilityId: 'cap:resolved:fixture_create_draft',
+      effectiveName: 'FIXTURE_CREATE_DRAFT', accountIdentity: 'acct-selected',
+      effect: 'external_write' as const,
+    };
+    const resolved = resolveProvenLiveCatalogEntry(request);
+    assert.equal(resolved?.capabilityId, entry.capabilityId);
+    assert.equal(resolved?.effect, 'external_write');
+    assert.equal(resolved?.manifestDigest, capabilityManifestDigest(manifest));
+    assert.equal(resolved?.account, 'acct-selected');
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, accountIdentity: 'acct-other' }), null);
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, effect: 'read' }), null);
+  } finally { installHostCapabilityCatalogFactory(null); }
+});
+
+test('P3: a live mutation cannot borrow another effect, account, altered manifest or revoked capability', () => {
+  const manifest = attachSemanticContract({
+    ...sheetManifest(), manifestId: 'cap:fixture:write-boundary',
+    operationId: 'FIXTURE_CREATE_DRAFT', accountId: 'acct-selected',
+  });
+  const entry = asRegistered(manifest);
+  const otherAccount = asRegistered(attachSemanticContract({
+    ...manifest, manifestId: 'cap:fixture:other-account', accountId: 'acct-other',
+  }));
+  const factory = createHostCapabilityCatalogFactory([entry, otherAccount]);
+  const store = createCapabilityManifestStore([manifest, otherAccount.manifest!]);
+  installHostCapabilityCatalogFactory(factory);
+  installCapabilityManifestStore(store);
+  try {
+    const request = { capabilityId: entry.capabilityId, effectiveName: manifest.operationId, effect: 'external_write' as const };
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, accountIdentity: 'acct-other' })?.capabilityId, otherAccount.capabilityId);
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, capabilityId: 'cap:unknown' }), null, 'two unselected accounts require an input choice');
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, effect: 'admin' }), null);
+    const originalDigest = entry.manifestDigest;
+    entry.manifestDigest = 'a'.repeat(64);
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, accountIdentity: 'acct-selected' }), null, 'tampered attestation cannot resolve');
+    entry.manifestDigest = originalDigest;
+    assert.equal(store.revoke(entry.capabilityId), true);
+    assert.equal(resolveProvenLiveCatalogEntry({ ...request, accountIdentity: 'acct-selected' }), null, 'disconnect remains authoritative');
+  } finally {
+    installHostCapabilityCatalogFactory(null);
+    installCapabilityManifestStore(null);
+  }
+});
 
 test('a mixed-generation proof compiler entry without a foreground validator remains callable', async () => {
   const manifest = attachSemanticContract({
@@ -347,7 +400,7 @@ test('NEGATIVE: a proven Sheets read still resolves when two current spellings s
   factory.register(successor);
   factory.register(native);
   installHostCapabilityCatalogFactory(factory);
-  const resolved = resolveProvenLiveReadCatalogEntry({
+  const resolved = resolveProvenLiveCatalogEntry({
     capabilityId: 'cap:resolved:googlesheets_batch_get',
     effectiveName: 'GOOGLESHEETS_BATCH_GET',
     accountIdentity: 'acct-google-1',
@@ -368,7 +421,7 @@ test('account-bound direct read resolution never transplants a legacy base from 
   const b = batchGetRead(`${baseId}:definition:account-b`, operationId, 'acct-b');
   const factory = createHostCapabilityCatalogFactory([a, b]);
   installHostCapabilityCatalogFactory(factory);
-  const resolved = resolveProvenLiveReadCatalogEntry({
+  const resolved = resolveProvenLiveCatalogEntry({
     capabilityId: baseId,
     effectiveName: operationId,
     accountIdentity: 'acct-b',
@@ -387,17 +440,17 @@ test('two current rows of one read in one account are one operation: the proven 
   const duplicate = batchGetRead(`${baseId}:definition:duplicate`, operationId, 'acct-one');
   const factory = createHostCapabilityCatalogFactory([first, duplicate]);
   installHostCapabilityCatalogFactory(factory);
-  assert.equal(resolveProvenLiveReadCatalogEntry({
+  assert.equal(resolveProvenLiveCatalogEntry({
     capabilityId: baseId,
     effectiveName: operationId,
     accountIdentity: 'acct-one',
   })?.capabilityId, baseId);
-  assert.equal(resolveProvenLiveReadCatalogEntry({
+  assert.equal(resolveProvenLiveCatalogEntry({
     capabilityId: duplicate.capabilityId,
     effectiveName: operationId,
     accountIdentity: 'acct-one',
   })?.capabilityId, duplicate.capabilityId);
-  assert.equal(resolveProvenLiveReadCatalogEntry({
+  assert.equal(resolveProvenLiveCatalogEntry({
     capabilityId: 'cap:resolved:something_else',
     effectiveName: operationId,
     accountIdentity: 'acct-one',
@@ -418,7 +471,7 @@ test('superseded is not revoked: a callable current row still serves a read; a r
   const factory = createHostCapabilityCatalogFactory([base]);
   installCapabilityManifestStore(store);
   installHostCapabilityCatalogFactory(factory);
-  assert.equal(resolveProvenLiveReadCatalogEntry({
+  assert.equal(resolveProvenLiveCatalogEntry({
     capabilityId: baseId,
     effectiveName: operationId,
     accountIdentity: 'acct-stale',
@@ -435,7 +488,7 @@ test('superseded is not revoked: a callable current row still serves a read; a r
     acceptedText: 'read the fixture',
   }), null, 'graph binding keeps its exact-identity bar');
   assert.equal(store.revoke(baseId), true);
-  assert.equal(resolveProvenLiveReadCatalogEntry({
+  assert.equal(resolveProvenLiveCatalogEntry({
     capabilityId: baseId,
     effectiveName: operationId,
     accountIdentity: 'acct-stale',

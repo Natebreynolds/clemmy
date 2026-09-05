@@ -45,7 +45,6 @@ import {
   evaluateInteractiveConsentV1,
   type CapabilityRiskAttestationV1,
   type ExactUserGrantV1,
-  type ExactWorkCoverageV1,
   type InteractiveConsentCrossing,
   type InteractiveConsentDestination,
 } from './interactive-consent-policy.js';
@@ -55,6 +54,7 @@ import {
 } from './accepted-model-batch-checkpoint.js';
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import type { HostInteractiveConsentResult } from './host-interactive-consent.js';
+import { buildHostConsentEvidence, type HostConsentCoverageScope } from './host-consent-evidence.js';
 
 const VERSION = 1 as const;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -697,32 +697,13 @@ function occurrenceReservationKey(input: {
 function coverageFor(input: {
   receipt: AuthoredWorkflowWriteReceiptV1;
   attestation: HostCallAttestation;
-  call: CapabilityRiskAttestationV1;
   acceptedBatch: AcceptedModelBatchRef;
   callIndex: number;
-}): ExactWorkCoverageV1 {
-  const { call } = input;
+}): HostConsentCoverageScope {
   return {
-    version: 1,
-    source: call.source,
-    acceptedTaskId: call.acceptedTaskId,
     contractId: `authored-workflow:${input.receipt.authorityDigest}`,
     requirementId: input.attestation.operationId,
     requirementDigest: input.receipt.authorityDigest,
-    semanticScope: {
-      operationId: call.operationId,
-      schemaFingerprint: call.schemaFingerprint,
-      effect: call.effect,
-      accountId: call.accountId,
-      destination: call.destination,
-      cardinality: call.cardinality,
-      semanticBasis: call.semanticBasis,
-    },
-    callBinding: {
-      logicalToolCallId: call.logicalToolCallId,
-      argumentDigest: call.argumentDigest,
-      bindingDigest: call.bindingDigest,
-    },
     reservationKey: occurrenceReservationKey(input),
   };
 }
@@ -965,8 +946,7 @@ async function evaluateAuthoredCatalogWrite(input: {
   const cardinality = gate === 'send'
     ? { kind: 'once' as const }
     : occurrenceCardinality({ receipt, acceptedBatch: input.acceptedBatch });
-  const call: CapabilityRiskAttestationV1 = {
-    version: 1,
+  const { call, coverage } = buildHostConsentEvidence({ call: {
     source: {
       kind: 'accepted_turn',
       id: receipt.sourceEventId,
@@ -985,10 +965,9 @@ async function evaluateAuthoredCatalogWrite(input: {
     risk: projection.risk,
     semanticBasis: projection.semanticBasis,
     safety: projection.safety,
-  };
-  const coverage: ExactWorkCoverageV1 = gate === 'send'
+  }, coverage: () => gate === 'send'
     ? {
-        ...coverageFor({ ...input, receipt, call }),
+        ...coverageFor({ ...input, receipt }),
         // One authored send per step attempt: the reservation is the receipt
         // itself, not the admitted occurrence.
         reservationKey: digest({
@@ -997,7 +976,7 @@ async function evaluateAuthoredCatalogWrite(input: {
           cardinality: 'once',
         }),
       }
-    : coverageFor({ ...input, receipt, call });
+    : coverageFor({ ...input, receipt }) });
   const grantScope: ExactUserGrantV1['scope'] = {
     source: call.source,
     acceptedTaskId: call.acceptedTaskId,
@@ -1187,8 +1166,7 @@ async function evaluateAuthoredLocalWrite(input: {
   });
   if (!crossing) return null;
   const argumentDigest = digest(input.args);
-  const call: CapabilityRiskAttestationV1 = {
-    version: 1,
+  const { call, coverage } = buildHostConsentEvidence({ call: {
     source: {
       kind: 'accepted_turn',
       id: receipt.sourceEventId,
@@ -1207,8 +1185,7 @@ async function evaluateAuthoredLocalWrite(input: {
     risk: projected.risk,
     semanticBasis: projected.semanticBasis,
     safety: 'admissible',
-  };
-  const coverage = coverageFor({ ...input, receipt, call });
+  }, coverage: () => coverageFor({ ...input, receipt }) });
   const decision = evaluateInteractiveConsentV1({
     call,
     coverage,

@@ -58,6 +58,7 @@ const { HarnessSession } = await import('../runtime/harness/session.js');
 const { boundAgentMcpToolScope } = await import('../runtime/mcp-tool-authority.js');
 const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
+const { RouterModelProvider } = await import('../runtime/harness/router-model.js');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
 const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
@@ -798,7 +799,7 @@ test('chat run_worker intent routing kill-switch keeps legacy role-wide worker',
   }
 });
 
-test('run_worker invokes the nested Worker on the routed intent model (offline SDK path)', async () => {
+test('run_worker invokes the host Worker on the routed intent model (offline provider)', async (t) => {
   resetEventLog();
   const session = createSession({ kind: 'chat', title: 'run_worker intent route' });
   const prev: Record<string, string | undefined> = {
@@ -838,8 +839,10 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
           responseId: 'resp_worker_done',
         } as unknown as import('@openai/agents').ModelResponse;
       },
-      async *getStreamedResponse() {
-        throw new Error('not used in this test');
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
       },
     };
     const stubProvider: import('@openai/agents').ModelProvider = {
@@ -854,6 +857,7 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
     assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
 
     const packet = {
       objective: 'Generate one design variation for the parent batch.',
@@ -1007,7 +1011,7 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
   }
 });
 
-test('run_worker route and result telemetry use the effective post-repair BYO model', async () => {
+test('run_worker route and result telemetry use the effective post-repair BYO model', async (t) => {
   resetEventLog();
   clearByoNotServedForTest();
   const session = createSession({ kind: 'chat', title: 'run_worker repaired route truth' });
@@ -1049,8 +1053,10 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
           responseId: 'resp_worker_repaired',
         } as unknown as import('@openai/agents').ModelResponse;
       },
-      async *getStreamedResponse() {
-        throw new Error('not used in this test');
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
       },
     };
     const stubProvider: import('@openai/agents').ModelProvider = {
@@ -1084,6 +1090,7 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
       },
     };
     const input = JSON.stringify(packet);
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
     const anchor = anchorAcceptedTask(session.id, 'Produce one fictional SEO note.');
     const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
@@ -1120,7 +1127,7 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
   }
 });
 
-test('a Claude brain executes a durable Codex worker binding on the host worker lane', async () => {
+test('a Claude brain executes a durable Codex worker binding on the host worker lane', async (t) => {
   resetEventLog();
   const session = createSession({ kind: 'chat', title: 'claude brain codex worker route' });
   const authFile = path.join(TMP_HOME, 'state', 'auth.json');
@@ -1175,8 +1182,10 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
           responseId: 'resp_codex_worker_done',
         } as unknown as import('@openai/agents').ModelResponse;
       },
-      async *getStreamedResponse() {
-        throw new Error('not used in this test');
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
       },
     };
     const stubProvider: import('@openai/agents').ModelProvider = {
@@ -1191,6 +1200,7 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
     assert.ok(runWorker, 'expected run_worker on the Claude-brain orchestrator surface');
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
 
     const packet = {
       objective: 'Research one fictional account.',
@@ -1246,7 +1256,7 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
   }
 });
 
-test('run_worker routes Claude workers through the Claude Agent SDK worker path', async () => {
+test('fresh-host run_worker is enabled and invokes a worker before any plan is compiled', async () => {
   resetEventLog();
   const session = createSession({ kind: 'chat', title: 'claude sdk worker route' });
   const prev: Record<string, string | undefined> = {
@@ -1269,11 +1279,36 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       };
     });
 
-    const agent = await buildOrchestratorAgent();
-    const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
+    const acceptedText = 'Design one report section using the taste skill.';
+    const anchor = anchorAcceptedTask(session.id, acceptedText);
+    const { actionExpectedWorkRequired } = await import('../runtime/harness/expected-work-admission.js');
+    assert.equal(actionExpectedWorkRequired({
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+    }), false, 'fresh accepted input has no compiled expected-work contract');
+    const agent = await buildOrchestratorAgent({
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+      userInput: acceptedText,
+      acceptedRoute: 'act',
+      hostFreshPlanning: freshPlanningFixture(session.id, anchor.sourceUserSeq),
+      allowedToolNames: ['run_worker', 'skill_read'],
+      mcpToolScope: {
+        authority: 'none',
+        reason: 'local worker preparation needs no external capabilities',
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      },
+    });
+    // Use the SDK's filtered surface: agent.tools alone includes tools hidden
+    // by isEnabled, which is why the original route-only test missed this wall.
+    const runContext = new RunContext({ sessionId: session.id });
+    const enabledTools = await agent.getAllTools(runContext);
+    const runWorker = enabledTools.find((t) => t.name === 'run_worker') as {
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
-    assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+    assert.ok(runWorker, 'local delegation must be enabled before plan_task');
 
     const packet = {
       objective: 'Design one report section using the taste skill.',
@@ -1286,9 +1321,8 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       intent: 'design',
     };
     const input = JSON.stringify(packet);
-    const anchor = anchorAcceptedTask(session.id, 'Design one report section using the taste skill.');
     const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
-      new RunContext({ sessionId: session.id }),
+      runContext,
       input,
       { toolCall: { name: 'run_worker', callId: 'call_worker_claude_design', arguments: input } },
     ));
@@ -1297,6 +1331,11 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
     assert.equal(captured.modelId.startsWith('claude-'), true);
     assert.match(captured.prompt, /WORKER JOB PACKET/);
     assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
+    assert.equal(captured.sessionId, session.id);
+    assert.equal(captured.sourceUserSeq, anchor.sourceUserSeq);
+    assert.equal(captured.workerScope, true, 'delegation retains worker effect restrictions');
+    assert.ok(captured.maxTurns > 0 && Number.isFinite(captured.maxTurns));
+    assert.equal(captured.nativeMcpToolScope, null, 'enabling delegation retains the denied external scope');
     const routed = listEvents(session.id, { types: ['worker_model_routed'] });
     const sdkEvent = routed.find((event) => (event.data as { transport?: string }).transport === 'claude_agent_sdk_worker');
     assert.ok(sdkEvent, 'expected SDK worker telemetry event');
@@ -1307,6 +1346,10 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
     assert.equal((results[0].data as { ok?: boolean }).ok, true);
     assert.equal((results[0].data as { model?: string }).model, 'claude-sonnet-4-6');
     assert.deepEqual((results[0].data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
+    assert.equal(actionExpectedWorkRequired({
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+    }), false, 'delegation must not manufacture a planning contract');
   } finally {
     setClaudeAgentSdkWorkerRunForTest(null);
     for (const [key, value] of Object.entries(prev)) {

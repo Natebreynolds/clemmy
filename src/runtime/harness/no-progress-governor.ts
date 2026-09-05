@@ -261,7 +261,7 @@ export interface NoProgressGovernorState {
   /** Opaque accepted-task identity, normally a canonical digest. */
   readonly taskKey: string;
   readonly authority: AuthorityProgressSnapshot;
-  /** Consecutive metered attempts since the last exact authority gain. */
+  /** Consecutive metered attempts with neither authority gain nor a new typed repair. */
   readonly noProgressAttempts: number;
   /** Clean model-led recoveries left after the last genuine gain; integer in [0, NO_PROGRESS_RETRY_BUDGET]. */
   readonly retriesRemaining: number;
@@ -346,7 +346,7 @@ export interface NoProgressTerminalDecision {
    * another discovery/planning turn after this decision. */
   readonly owner: 'host_terminal_reducer';
   readonly requiredProjection: 'factual_internal_failure';
-  readonly publicResumable: false;
+  readonly publicResumable: true;
   readonly blockedAttemptClass: Exclude<
     NoProgressAttemptClass,
     'task_work' | 'terminal_projection'
@@ -481,15 +481,17 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
   const noProgressAttempts = Number(candidate.noProgressAttempts);
   const observations = Number(candidate.observations);
   if (observations < noProgressAttempts) return null;
-  // A fresh sequence (no metered miss yet) always holds the full budget — a
-  // checkpoint written under an older, smaller budget restores as fresh. Once
-  // a miss is recorded the budget is strictly below full; arbitrary JSON
-  // cannot turn a spent retry back into a clean one.
-  if (noProgressAttempts === 0 && Number(candidate.retriesRemaining) === 0) return null;
-  const retriesRemaining = noProgressAttempts === 0
+  // A new typed repair resets the consecutive no-progress counter, but spends
+  // a retry. Only a sequence with neither misses nor typed repairs is fresh;
+  // restoring a converging checkpoint must not refill its budget.
+  const hasTypedRepairs = Array.isArray(candidate.seenConsequenceKeys)
+    && candidate.seenConsequenceKeys.length > 0;
+  const fresh = noProgressAttempts === 0 && !hasTypedRepairs;
+  if (fresh && Number(candidate.retriesRemaining) === 0) return null;
+  const retriesRemaining = fresh
     ? NO_PROGRESS_RETRY_BUDGET
     : Number(candidate.retriesRemaining);
-  if (noProgressAttempts !== 0 && retriesRemaining >= NO_PROGRESS_RETRY_BUDGET) return null;
+  if (!fresh && retriesRemaining >= NO_PROGRESS_RETRY_BUDGET) return null;
   try {
     if (candidate.version === 1) {
       // V1 knew only the single retry bit. Preserve that spent budget without
@@ -511,7 +513,9 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
     }
     if (
       !Array.isArray(candidate.seenConsequenceKeys)
-      || candidate.seenConsequenceKeys.length > NO_PROGRESS_STAGE_TRANSITION_BUDGET + 1
+      // One first consequence + bounded transitions + the current terminal
+      // consequence, which must remain visible even when it has no retry.
+      || candidate.seenConsequenceKeys.length > NO_PROGRESS_STAGE_TRANSITION_BUDGET + 2
       || !Number.isSafeInteger(candidate.stageTransitionsRemaining)
       || Number(candidate.stageTransitionsRemaining) < 0
       || Number(candidate.stageTransitionsRemaining) > NO_PROGRESS_STAGE_TRANSITION_BUDGET
@@ -531,6 +535,8 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
     if (
       (lastConsequence === null && seenConsequenceKeys.length !== 0)
       || (lastConsequence !== null && !seenConsequenceKeys.includes(lastConsequence.key))
+      || (seenConsequenceKeys.length > NO_PROGRESS_STAGE_TRANSITION_BUDGET + 1
+        && (retriesRemaining !== 0 || Number(candidate.stageTransitionsRemaining) !== 0))
       || (retriesRemaining === NO_PROGRESS_RETRY_BUDGET
         && (seenConsequenceKeys.length !== 0
           || Number(candidate.stageTransitionsRemaining) !== NO_PROGRESS_STAGE_TRANSITION_BUDGET))
@@ -558,9 +564,10 @@ export function parseNoProgressGovernorState(value: unknown): NoProgressGovernor
  * Reduce one fully paired host frame.
  *
  * A new exact token in any authority dimension resets the retry budget.
- * A metered frame with no new token spends one retry. The frame after the
- * budget is spent terminalizes without another model call. Unmetered task work never spends
- * the budget, though evidence/effect tokens it earns still reset it.
+ * A metered frame with no new token spends one retry. A new host-typed repair
+ * resets the consecutive-miss counter and may spend its finite stage allowance
+ * after the retry budget runs out. Repeating a repair is a cycle. Unmetered
+ * task work never spends the budget, though its evidence/effects still reset it.
  */
 export function observeNoProgress(
   state: NoProgressGovernorState,
@@ -601,20 +608,31 @@ export function observeNoProgress(
     });
   }
 
-  if (gained.length > 0) {
+  // Acquiring the exact operation/account/schema cannot answer a missing
+  // user-owned value. Preserve that ask's canonical surface even when this
+  // same frame also establishes new authority.
+  if (gained.length > 0 && consequence?.recovery !== 'ask_user') {
+    // The provider may reject the very call that established this binding.
+    // Keep that failure as the first attempt of the new authority sequence,
+    // otherwise its next identical failure incorrectly earns a second retry.
+    const providerRejection = input.attemptClass === 'provider_repair'
+      && consequence?.recovery === 'repair_model'
+      && consequence.effectState === 'known_terminal'
+      ? consequence
+      : null;
     const next = Object.freeze({
       ...state,
       authority,
       noProgressAttempts: 0,
-      retriesRemaining: NO_PROGRESS_RETRY_BUDGET,
-      seenConsequenceKeys: Object.freeze([]),
-      lastConsequence: null,
+      retriesRemaining: NO_PROGRESS_RETRY_BUDGET - (providerRejection ? 1 : 0),
+      seenConsequenceKeys: Object.freeze(providerRejection ? [providerRejection.key] : []),
+      lastConsequence: providerRejection,
       stageTransitionsRemaining: NO_PROGRESS_STAGE_TRANSITION_BUDGET,
       observations,
     }) satisfies NoProgressGovernorState;
     return Object.freeze({
       action: 'continue',
-      reason: 'authority_progress',
+      reason: providerRejection ? 'retry_available' : 'authority_progress',
       gained: Object.freeze(gained),
       state: next,
     });
@@ -644,7 +662,7 @@ export function observeNoProgress(
     gained: Object.freeze([]) as readonly [],
     owner: 'host_terminal_reducer',
     requiredProjection: 'factual_internal_failure',
-    publicResumable: false,
+    publicResumable: true,
     blockedAttemptClass: input.attemptClass as NoProgressTerminalDecision['blockedAttemptClass'],
     consequentialEffectState: effectState,
     resumeOn: Object.freeze(['authority_progress', 'user_input']) as readonly [
@@ -661,6 +679,7 @@ export function observeNoProgress(
         authority,
         noProgressAttempts,
         retriesRemaining: 0 as const,
+        lastConsequence: consequence,
         observations,
       }) satisfies NoProgressGovernorState, consequence.effectState);
     }
@@ -680,6 +699,9 @@ export function observeNoProgress(
         authority,
         noProgressAttempts,
         retriesRemaining: 0 as const,
+        seenConsequenceKeys: Object.freeze([...state.seenConsequenceKeys, consequence.key]
+          .slice(-(NO_PROGRESS_STAGE_TRANSITION_BUDGET + 2))),
+        lastConsequence: consequence,
         observations,
       }) satisfies NoProgressGovernorState, consequence.effectState);
     }
@@ -696,8 +718,8 @@ export function observeNoProgress(
     const next = Object.freeze({
       ...state,
       authority,
-      noProgressAttempts,
-      retriesRemaining: 0 as const,
+      noProgressAttempts: 0,
+      retriesRemaining: Math.max(0, state.retriesRemaining - 1),
       seenConsequenceKeys,
       lastConsequence: consequence,
       stageTransitionsRemaining,
