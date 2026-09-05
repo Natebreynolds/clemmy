@@ -830,3 +830,51 @@ entries; the reviewer appends, you respond in commits and reports.
   P3 acceptance canary and the P1 before/after report against it where practical.
 - Reminder: commits 34d9dd63's live-wire verification (judge reaches the Claude
   wire) still belongs in the P1 canary report, per the entry above.
+
+**2026-09-04 ~17:15 — P0 CLOSE-OUT + P1 TRANSITION STEERING (tree reached 0 dirty
+at `6caa463e`; all ~30 staging commits reviewed clean; artifact verify EXIT=0
+reproduced by the reviewer):**
+
+P0 report checklist — the report is not complete without all five:
+1. **Full isolated suite on the exact HEAD, real exit code.** Nobody has run the
+   suite on the staged tree; 30 clean-looking commits are not a green suite. Hygiene
+   per §10.2: stop the daemon first, `pkill -9 -f cutover-hold-entry`, never pipe
+   the runner through `head`/`tail`. Report pass/fail counts and the HEAD SHA.
+2. Re-measured distances: `git rev-list --count origin/main..HEAD` and
+   `main..HEAD` (never a stale number).
+3. Artifact verify EXIT=0 (already true at `6caa463e` — re-run if HEAD moved).
+4. **Stash inventory, explicit:** `stash@{0}` ("WIP verified-mutation vertical…",
+   journey 0/5, executor unbuilt) is intentionally parked — **do NOT pop it during
+   P1 or P2**; it is P3-adjacent and re-enters only under the P3 phase start.
+   `stash@{1}` (on `aa08f966`, "no branch") predates this effort — leave it
+   untouched and note it exists.
+5. Merge plan: **fast-forward is verified clean** — `18c5bcc7` (origin/main) IS an
+   ancestor of HEAD, local main likewise. No merge-strategy decision is needed;
+   prepare a fast-forward only. Push plan remains: branch, then main, then the ONE
+   `v3.16.0` ref. Never `--tags` (stale local v3.15.0 must not publish).
+
+P1 execution order (approved to start after the P0 report is posted):
+1. **Stop the auto-re-arming canary task first** (`bg-graph-driver-tag-canary-
+   20260904` has been cycling died→restart ~every 90 s all afternoon). Mixed-code
+   evidence: the live daemon booted from a dirty tree hours ago, so its in-memory
+   code is NOT current HEAD. After the P1 commit, **restart the daemon** — the tree
+   is clean now, so a fresh boot runs exactly HEAD — and stamp
+   `git rev-parse HEAD` in the run per §6.
+2. P1 scope fence: ledger completion authority (D1) + the §6 instrument work +
+   the §12 governor/consent design inputs already listed. Nothing from `stash@{0}`,
+   nothing from §13.4.
+3. The canary re-run follows §10.3 byte-identical rules + the 34d9dd63 judge-wire
+   check. Expected flip, stated in advance: the tag canary reports **blocked**
+   (honest) instead of completed; any sheet-write-class run with real crossings
+   reports **done**. Report BOTH directions — the false-RED half (5/7 real writes
+   reported as failures) is the bigger number.
+
+Tag-time traps (for the moment the owner gives the tag go — record now, act then):
+- Both `package.json` files already read `3.16.0` and MATCH (root + apps/desktop,
+  verified 17:15). At tag time verify they still match the tag name — the v3.5.0
+  incident was one bumped without the other.
+- A red **"Test"** check on a pushed tag is a KNOWN BENIGN CI glob issue (recorded
+  in the release history) — judge the release by the release-desktop workflow's own
+  result, and do not chase the Test glob red.
+- The release workflow preflight requires `tag_sha == origin/main` — push main
+  BEFORE pushing the tag.
