@@ -189,6 +189,64 @@ export function workerCallItems(call: Pick<WorkerToolCall, 'item' | 'items'>): s
 }
 
 /**
+ * Why `workerCallItems` found no work, in the terms the model must repair:
+ * every entry it dropped, grouped by the shape that disqualified it, and
+ * which of `item` / `items` was absent altogether. The packet may have PASSED
+ * its schema (`items: []`, `items: ["null"]`, `items: ["   "]` are all valid
+ * `string[]`), so a schema digest cannot name this — only the body can, and
+ * a refusal that does not say which entries were dropped and why leaves the
+ * model to guess (live: the same empty batch re-sent as 'succeeded'). Pure.
+ */
+export function describeMissingWorkerItems(call: Pick<WorkerToolCall, 'item' | 'items'>): {
+  reason: string;
+  /** Value-free shape tags of what went wrong, for a stable repair key. */
+  shapes: string[];
+} {
+  const blank: string[] = [];
+  const absentLiterals: string[] = [];
+  const placeholders: string[] = [];
+  const classify = (raw: string): void => {
+    const trimmed = raw.trim();
+    if (!trimmed) blank.push(raw);
+    else if (JUNK_ITEM_RE.test(trimmed)) absentLiterals.push(trimmed);
+    else if (TEMPLATE_PLACEHOLDER_RE.test(trimmed)) placeholders.push(trimmed);
+  };
+  for (const entry of call.items ?? []) classify(entry);
+  const hasItemsField = Array.isArray(call.items);
+  const hasItemField = typeof call.item === 'string';
+  if (hasItemField) classify(call.item as string);
+  const quote = (values: string[]): string => values.slice(0, 5).map((value) => JSON.stringify(value)).join(', ');
+  const dropped = [
+    absentLiterals.length ? `${absentLiterals.length} absent-value literal${absentLiterals.length === 1 ? '' : 's'} (${quote(absentLiterals)})` : '',
+    placeholders.length ? `${placeholders.length} unresolved template placeholder${placeholders.length === 1 ? '' : 's'} (${quote(placeholders)})` : '',
+    blank.length ? `${blank.length} blank entr${blank.length === 1 ? 'y' : 'ies'}` : '',
+  ].filter(Boolean);
+  const shapes = [
+    ...(hasItemField ? [] : ['item:absent']),
+    ...(hasItemsField ? (call.items!.length === 0 ? ['items:empty'] : []) : ['items:absent']),
+    ...(absentLiterals.length ? ['items:absent_value_literal'] : []),
+    ...(placeholders.length ? ['items:template_placeholder'] : []),
+    ...(blank.length ? ['items:blank'] : []),
+  ];
+  const itemsPart = hasItemsField
+    ? call.items!.length === 0
+      ? '`items` was an empty list'
+      : `every one of the ${call.items!.length} \`items\` entr${call.items!.length === 1 ? 'y' : 'ies'} was dropped`
+    : '`items` was absent';
+  // Only reached when `item` named no work either: absent, blank, or junk.
+  const itemPart = !hasItemField
+    ? '`item` was absent'
+    : (call.item as string).trim()
+      ? '`item` was dropped'
+      : '`item` was blank';
+  const reason = `run_worker named no dispatchable work: ${itemsPart} and ${itemPart}`
+    + (dropped.length ? ` — ${dropped.join('; ')}` : '')
+    + '. Retry once with `item` (one concrete identifier) or `items` (the full list of concrete identifiers: ids, names, domains, rows, records or URLs). '
+    + 'Placeholders, absent-value words and blanks are never work.';
+  return { reason, shapes };
+}
+
+/**
  * Normalized failure signature for uniform-failure detection: strip ids,
  * numbers, and item names so "worker for X failed: 400 Unknown Model" and
  * "worker for Y failed: 400 Unknown Model" collapse to one signature. Pure.

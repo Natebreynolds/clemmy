@@ -4214,6 +4214,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
       let bracketOutcome: BracketOutcome | undefined;
       let deferredDiscoveryAdmissionError: unknown;
       let hostPhysicalReserved = false;
+      // Set when the body returned a typed pre-dispatch carrier; the outward
+      // value is flattened to its `.output` bytes below, so a later branch
+      // cannot tell the refusal from ordinary text by inspecting the value.
+      let returnedPreDispatchCarrier = false;
       try {
         bracketOutcome = await runBrackets(
           ctx?.sessionId ?? '',
@@ -4525,6 +4529,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         if (ctx?.certifiedBatch && result instanceof ExternalWritePreDispatchResult) {
           throw new ExternalWritePreDispatchError(result.output);
         }
+        returnedPreDispatchCarrier = result instanceof ExternalWritePreDispatchResult;
         const outwardResult = unwrapHostLocalExecutionFailureResult(
           unwrapExternalWritePreDispatchResult(result),
         );
@@ -4663,6 +4668,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
           // SDK's generic "An error occurred…" string (the soft-converted
           // MaxTurnsExceeded / internal-error path the customOutputExtractor
           // never sees, because a throw skips it). Behind the flag.
+          //
+          // A typed pre-dispatch refusal is NOT a worker output: the packet
+          // never passed its schema, so no item ran, capped or errored. Its
+          // text carries the SDK's generic prefix (the laundered-failure
+          // marker settlement keys on), which the normalizer would collapse
+          // into the generic "did not complete this item" line — erasing the
+          // named schema issues and telling the model to retry an item that
+          // was never dispatched. The settlement above already flattened the
+          // carrier to its exact repair bytes; return them untouched.
+          if (returnedPreDispatchCarrier) return result;
           return workerThrashGuardEnabled() ? normalizeWorkerOutput(result) : result;
         } catch (err) {
           if (err instanceof ToolTimeout) {

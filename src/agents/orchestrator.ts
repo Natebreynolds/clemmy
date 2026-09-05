@@ -118,7 +118,7 @@ import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
+import { describeMissingWorkerItems, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
 import { acquireWorkerSlot, workerBatchPoolWidth } from './worker-concurrency.js';
 import {
@@ -161,6 +161,9 @@ import {
 } from '../runtime/harness/guardrails.js';
 import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
+import { CancelledPreDispatchResult, HostLocalExecutionFailureResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
+import { WorkerBatchGenerationCancelledError } from './worker-batch-execution.js';
+import { describeInvalidToolInput, isSdkToolInputValidationError } from '../tools/shared.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
@@ -2297,16 +2300,92 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'COMPOSE → SINGLE COMMIT for external mutations: workers may execute reads and reason, but the Composio gateway mechanically refuses worker writes/sends. Require each worker to return one exact {id, composioSlug, args, account_alias?} payload. Validate and aggregate every returned payload, then call run_batch action="propose" ONCE; its immutable pending batch is the one payload the user approves and the parent executes. Never approve a summary before the workers materialize the final payloads, and never ask workers to call run_batch or pending_action tools.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
     ].join(' ');
+  /**
+   * THE one door for a run_worker refusal that starts no child.
+   *
+   * A packet can pass its schema and still name no dispatchable work
+   * (`items: []`, `["null", "<site>"]`, `["  "]`, neither field), or fail a
+   * body-level manifest / lease / batch-identity gate. Every such refusal used
+   * to return a plain "ERROR: …" string, which this lane's settlement can only
+   * read as a returned local result: it minted a host crossing, a durable
+   * result handle and outcome_kind='succeeded' over ZERO item receipts and
+   * zero children (verifier, 2026-09-05: five shapes through the real host_v1
+   * door). The truth is the same one the schema rejection carries — nothing
+   * was dispatched, the arguments are what must change — so it rides the same
+   * nominal carrier: refused_pre_dispatch / invalid_arguments, recovery
+   * repair_arguments, zero crossing, no handle, no credited progress. The
+   * `ERROR: workers were NOT started` prefix stays: it is the vocabulary the
+   * parent prompt already teaches, and the bracket wrapper flattens the carrier
+   * to exactly these bytes for the model.
+   *
+   * A PARTIAL fan-out (some children started) never comes through here — its
+   * item receipts settle it — and neither does a durable-completion reuse,
+   * which legitimately returns without starting a worker.
+   */
+  const refuseWorkerPacketBeforeDispatch = (
+    reason: string,
+    /** Value-free tags of the violated paths / gate, so the no-progress
+     * projection can tell a new repair attempt from a byte-identical repeat. */
+    repairShapes: readonly string[],
+  ): InvalidArgumentsPreDispatchResult => new InvalidArgumentsPreDispatchResult(
+    `ERROR: workers were NOT started — ${reason.replace(/^ERROR:\s*/i, '').replace(/^workers were NOT started\s*[—-]\s*/i, '')}`,
+    true,
+    createHash('sha256').update(JSON.stringify(['run_worker', ...new Set(repairShapes)].sort())).digest('hex').slice(0, 32),
+  );
   const runWorkerTool = tool({
     name: 'run_worker',
     description: runWorkerToolDescription,
     parameters: WorkerToolCallSchema,
     strict: true,
+    // A packet the SDK schema rejects never reaches execute, so no child,
+    // worker_started, worker_result or provider request exists for it. The
+    // SDK's default errorFunction launders that rejection into a bare
+    // "Invalid JSON input for tool" string, which this lane's settlement can
+    // only read as a returned local result: it minted a host crossing, a
+    // durable result handle and outcome_kind='succeeded' over ZERO item
+    // receipts, and the model learned nothing it could repair. Return the
+    // nominal pre-dispatch carrier (local-runtime-tools precedent) naming
+    // every violated path, so the parent settles refused_pre_dispatch /
+    // invalid_arguments and the same turn can retype the packet.
+    errorFunction: (_context, error) => {
+      if (isSdkToolInputValidationError(error)) {
+        const guidance = describeInvalidToolInput(error, 'run_worker', {
+          maxIssues: Object.keys(WorkerToolCallSchema.shape).length,
+        });
+        return new InvalidArgumentsPreDispatchResult(
+          `An error occurred while running the tool. Please try again. Error: ${error.toString()}`
+          + (guidance ? `\n${guidance}` : ''),
+        ) as unknown as string;
+      }
+      // A body THROW (a cancellation, a spent outer deadline at batch entry, a
+      // batch-generation error) is not a returned worker result. Laundering it
+      // into the SDK's plain error string let settlement read it as a successful
+      // host execution — 'succeeded', a durable result handle, zero children —
+      // and the model was told to retry an item that never dispatched. Hand
+      // settlement the local-failure carrier it already reads (local-runtime
+      // precedent): failed local execution, no handle, no credited progress.
+      const details = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      if (error instanceof WorkerBatchGenerationCancelledError && error.startedBodies === 0) {
+        // Proven: the generation was cancelled (spent outer deadline, caller
+        // abort, supersession) before any item body was admitted. A pre-dispatch
+        // refusal — no handle, no progress — that the model can simply reissue.
+        return new CancelledPreDispatchResult(
+          `ERROR: workers were NOT started — the batch was cancelled before any item was admitted (${details}). `
+          + 'Nothing was dispatched and nothing was retained; reissue this same run_worker call when the step has budget.',
+          error.name, error.kind,
+        ) as unknown as string;
+      }
+      return new HostLocalExecutionFailureResult(
+        `ERROR: workers were NOT started — the batch body failed before settling (${details}). `
+        + 'No item was dispatched by this call and no result was retained; check worker receipts for any item that already ran, then reissue only what is missing.',
+      ) as unknown as string;
+    },
     execute: async (callParams, runContext, details) => {
       const call = callParams as WorkerToolCall;
       const callItems = workerCallItems(call);
       if (!callItems || callItems.length === 0) {
-        return 'ERROR: run_worker needs `item` (one identifier) or `items` (the full list for a parallel batch).';
+        const missing = describeMissingWorkerItems(call);
+        return refuseWorkerPacketBeforeDispatch(missing.reason, missing.shapes);
       }
       // Advisory-only cost note for browser-per-item fan-outs (live 2026-07-23).
       const heavyAdvisory = maybeHeavyPerItemToolAdvisory(
@@ -2316,7 +2395,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       );
       const knownDeadSig = fanoutUniformFailure(extractSessionId(runContext) ?? '');
       if (knownDeadSig) {
-        return `ERROR: workers were NOT started — parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`;
+        return refuseWorkerPacketBeforeDispatch(
+          `parallel fan-out already failed uniformly this run (${knownDeadSig}). Process the remaining items inline; workers stay refused until the underlying failure changes.`,
+          ['fanout:uniform_failure'],
+        );
       }
       const manifestSessionId = extractSessionId(runContext) ?? '';
       const manifestSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq
@@ -2327,7 +2409,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         items: callItems,
         workManifest: call.workManifest as WorkerManifestDescriptor | null | undefined,
       });
-      if (!quantifiedManifestGate.ok) return `ERROR: ${quantifiedManifestGate.error}`;
+      if (!quantifiedManifestGate.ok) {
+        return refuseWorkerPacketBeforeDispatch(
+          quantifiedManifestGate.error ?? 'the quantified work contract for this request refused the batch; declare the full canonical universe in one workManifest-bearing call.',
+          ['workManifest:quantified_contract'],
+        );
+      }
       let manifestBinding: PreparedWorkerManifest | undefined;
       if (call.workManifest && manifestSessionId) {
         const prepared = prepareWorkerManifest({
@@ -2337,7 +2424,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           descriptor: call.workManifest as WorkerManifestDescriptor,
           objective: call.objective,
         });
-        if (!prepared.ok) return `ERROR: workers were NOT started — ${prepared.error}`;
+        if (!prepared.ok) {
+          return refuseWorkerPacketBeforeDispatch(
+            `${prepared.error} Retry once with the workManifest corrected (id, contractVersion, phase, phases, aliases, mode).`,
+            ['workManifest:binding', prepared.error],
+          );
+        }
         manifestBinding = prepared.binding;
       }
       // A durable completion is materially different from a fresh worker run.
@@ -2377,7 +2469,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const outputContext = getToolOutputContext();
         const batchHarnessContext = harnessRunContextStorage.getStore();
         if (!manifestBinding && (!manifestSessionId || !batchHarnessContext?.dispatchLease)) {
-          return 'ERROR: workers were NOT started — an ordinary batch needs an exact accepted-source dispatch lease so concurrent/restart execution can be fenced durably.';
+          return refuseWorkerPacketBeforeDispatch(
+            'an ordinary batch needs an exact accepted-source dispatch lease so concurrent/restart execution can be fenced durably. Supply a workManifest (id, contractVersion, phase) so the batch can be fenced by its manifest instead.',
+            ['dispatch_lease:absent'],
+          );
         }
         let exactBatchKey: string;
         try {
@@ -2393,7 +2488,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
         } catch (error) {
           if (error instanceof WorkerBatchIdentityError) {
-            return `ERROR: workers were NOT started — ${error.message}.`;
+            return refuseWorkerPacketBeforeDispatch(`${error.message}.`, ['batch_identity', error.message]);
           }
           throw error;
         }
@@ -2451,7 +2546,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           });
         } catch (error) {
           if (error instanceof WorkerBatchOwnershipConflictError) {
-            return 'ERROR: workers were NOT started — this exact batch already has a live durable owner. Wait for that generation to settle; do not start overlapping work.';
+            return refuseWorkerPacketBeforeDispatch(
+              'this exact batch already has a live durable owner. Wait for that generation to settle; do not start overlapping work.',
+              ['batch_owner:conflict'],
+            );
           }
           throw error;
         }

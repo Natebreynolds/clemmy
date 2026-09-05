@@ -84,6 +84,23 @@ export class InvalidArgumentsPreDispatchResult extends ExternalWritePreDispatchR
 }
 
 /**
+ * Nominal result for a host-local coordinator (run_worker) whose generation was
+ * cancelled — outer deadline already spent, caller abort, supersession — before
+ * ANY item body was admitted. Proven no-dispatch (the batch runner counted zero
+ * started bodies), so it settles refused_pre_dispatch / cancelled with no result
+ * handle and no credited progress, and pairs back to the model like every other
+ * pre-dispatch refusal instead of laundering into a successful host execution.
+ */
+export class CancelledPreDispatchResult extends ExternalWritePreDispatchResult {
+  readonly executionKind = 'refused_pre_dispatch' as const;
+  readonly outcomeKind = 'unknown' as const;
+
+  constructor(output: string, readonly errorName: string, readonly cancellation: 'deadline' | 'caller' | 'superseded') {
+    super(output, 'local_pre_dispatch_cancelled');
+  }
+}
+
+/**
  * Nominal result for a local tool body that returned normally but reported a
  * semantic failure through MCP's `isError:true` field. The local runtime
  * adapter constructs this before flattening the MCP content to model-facing
@@ -119,6 +136,9 @@ export function attemptSignalsFromTypedResult(result: unknown): AttemptSignals {
       schemaAvailable: result.schemaAvailable,
       ...(result.repairKey ? { repairKey: result.repairKey } : {}),
     };
+  }
+  if (result instanceof CancelledPreDispatchResult) {
+    return { preDispatch: true, cancelled: true, errorName: result.errorName };
   }
   if (result instanceof HostLocalExecutionFailureResult) {
     return { executionFailed: true };
