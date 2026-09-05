@@ -23,6 +23,8 @@ import {
   type InteractiveConsentReversibility,
 } from './interactive-consent-policy.js';
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
+import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
+import { buildHostConsentEvidence } from './host-consent-evidence.js';
 import { openEventLog } from './eventlog.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
@@ -54,7 +56,10 @@ import {
   currentCapabilityManifest,
 } from './capability-manifest.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
-import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
+import {
+  loadHostCallCapabilityBinding,
+  hostCallCapabilityBindingMatchesAttestation,
+} from './host-call-capability-binding.js';
 
 export interface HostInteractiveConsentSubjectV1 {
   version: 1;
@@ -123,6 +128,13 @@ export type HostInteractiveConsentResult =
   | { status: 'repair'; reason: string; retryable: true }
   | { status: 'hold'; reason: string; retryable: true }
   | { status: 'conflict'; reason: string };
+
+interface DurableHostConsentApproval {
+  approvalId: string;
+  persistedSubject: HostInteractiveConsentSubjectV1;
+  outerToolName: string;
+  outerRawArguments: string;
+}
 
 /**
  * Process-local proof that one exact durable approval was re-evaluated against
@@ -210,7 +222,7 @@ export function consumeHostConsentGrantAdmission(input: {
 }
 
 function exactConsentSubject(input: {
-  prepared: PreparedHostWorkCallV1;
+  prepared: Pick<PreparedHostWorkCallV1, 'sessionId' | 'sourceUserSeq' | 'acceptedTaskId' | 'logicalToolCallId'>;
   call: CapabilityRiskAttestationV1;
   coverage: ExactWorkCoverageV1;
   decisionSubjectDigest: string;
@@ -926,15 +938,42 @@ async function semanticBasisForExactCall(input: {
   } };
 }
 
+/** Pause and resume reduce the same exact evidence and durable approval. */
+function reduceHostConsentEvidence(input: {
+  identity: Parameters<typeof exactConsentSubject>[0]['prepared'];
+  call: CapabilityRiskAttestationV1;
+  coverage: ExactWorkCoverageV1;
+  crossing: InteractiveConsentCrossing;
+  reservationAlreadyClaimed: boolean;
+  durableApproval?: DurableHostConsentApproval;
+}) {
+  const { call, coverage, crossing, reservationAlreadyClaimed } = input;
+  const ungrantedDecision = evaluateInteractiveConsentV1({
+    call, coverage, userGrant: null, readiness: { kind: 'ready' },
+    crossing, reservationAlreadyClaimed,
+  });
+  const consentSubject = exactConsentSubject({
+    prepared: input.identity, call, coverage,
+    decisionSubjectDigest: ungrantedDecision.kind === 'needs_user'
+      && ungrantedDecision.need === 'approval'
+      ? ungrantedDecision.subjectDigest : call.bindingDigest,
+  });
+  const userGrant = input.durableApproval ? durableApprovalGrant({
+    ...input.durableApproval, currentSubject: consentSubject, call,
+  }) : null;
+  const decision: InteractiveConsentDecisionV1 = input.durableApproval && !userGrant
+    ? { kind: 'repair', reason: 'scope_mismatch' }
+    : userGrant ? evaluateInteractiveConsentV1({
+        call, coverage, userGrant, readiness: { kind: 'ready' },
+        crossing, reservationAlreadyClaimed,
+      }) : ungrantedDecision;
+  return { decision, consentSubject, userGrant };
+}
+
 /** Evaluate a fully materialized plan-bound work_call. */
 export async function evaluatePreparedHostWorkCallConsent(input: {
   preparation: object;
-  durableApproval?: {
-    approvalId: string;
-    persistedSubject: HostInteractiveConsentSubjectV1;
-    outerToolName: string;
-    outerRawArguments: string;
-  };
+  durableApproval?: DurableHostConsentApproval;
 }): Promise<HostInteractiveConsentResult> {
   const prepared = inspectPreparedHostWorkCall(input.preparation);
   if (!prepared) return { status: 'conflict', reason: 'work_call preparation is not host-issued' };
@@ -1005,8 +1044,7 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     capabilityIdentity: semantic.requirementCapabilityIdentity,
     semanticBasis: semantic.semanticBasis,
   });
-  const call: CapabilityRiskAttestationV1 = {
-    version: INTERACTIVE_CONSENT_POLICY_VERSION,
+  const { call, coverage } = buildHostConsentEvidence({ call: {
     source,
     acceptedTaskId: prepared.acceptedTaskId,
     bindingDigest,
@@ -1021,89 +1059,25 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     risk: semantic.risk,
     semanticBasis: semantic.semanticBasis,
     safety: semantic.safety,
-  };
-  const requirementDigest = digest({
-    version: 1,
-    contractId: prepared.contract.contractId,
-    graphHash: prepared.contract.graphHash,
-    operation,
-    capabilityIdentity: semantic.requirementCapabilityIdentity,
-    destination,
-    semanticBasis: call.semanticBasis,
-  });
-  const coverage: ExactWorkCoverageV1 = {
-    version: INTERACTIVE_CONSENT_POLICY_VERSION,
-    source,
-    acceptedTaskId: prepared.acceptedTaskId,
+  }, coverage: (call) => ({
     contractId: prepared.contract.contractId,
     requirementId: prepared.binding.requirementId,
-    requirementDigest,
-    semanticScope: {
-      operationId: call.operationId,
-      schemaFingerprint: call.schemaFingerprint,
-      effect: call.effect,
-      accountId: call.accountId,
-      destination: call.destination,
-      cardinality: call.cardinality,
+    requirementDigest: digest({
+      version: 1,
+      contractId: prepared.contract.contractId,
+      graphHash: prepared.contract.graphHash,
+      operation,
+      capabilityIdentity: semantic.requirementCapabilityIdentity,
+      destination,
       semanticBasis: call.semanticBasis,
-    },
-    callBinding: {
-      logicalToolCallId: call.logicalToolCallId,
-      argumentDigest: call.argumentDigest,
-      bindingDigest: call.bindingDigest,
-    },
+    }),
     reservationKey: reservationKey({ prepared, cardinality }),
-  };
+  }) });
   const reservationAlreadyClaimed = priorReservationExists(prepared);
-  // The durable subject is derived from the same pure reducer result on both
-  // pause and resume. Do not seed it from a caller-selected approximation:
-  // explicit checkpoints may use a subject distinct from the call binding.
-  const ungrantedDecision = evaluateInteractiveConsentV1({
-    call,
-    coverage,
-    userGrant: null,
-    readiness: { kind: 'ready' },
-    crossing,
-    reservationAlreadyClaimed,
+  const { decision, consentSubject, userGrant } = reduceHostConsentEvidence({
+    identity: prepared, call, coverage, crossing, reservationAlreadyClaimed,
+    durableApproval: input.durableApproval,
   });
-  const decisionSubjectDigest = ungrantedDecision.kind === 'needs_user'
-    && ungrantedDecision.need === 'approval'
-    ? ungrantedDecision.subjectDigest
-    : call.bindingDigest;
-  const consentSubject = exactConsentSubject({
-    prepared,
-    call,
-    coverage,
-    decisionSubjectDigest,
-  });
-  const userGrant = input.durableApproval
-    ? durableApprovalGrant({
-        approvalId: input.durableApproval.approvalId,
-        persistedSubject: input.durableApproval.persistedSubject,
-        currentSubject: consentSubject,
-        outerToolName: input.durableApproval.outerToolName,
-        outerRawArguments: input.durableApproval.outerRawArguments,
-        call,
-      })
-    : null;
-  if (input.durableApproval && !userGrant) {
-    return {
-      status: 'decided',
-      decision: { kind: 'repair', reason: 'scope_mismatch' },
-      call,
-      coverage,
-    };
-  }
-  const decision = userGrant
-    ? evaluateInteractiveConsentV1({
-        call,
-        coverage,
-        userGrant,
-        readiness: { kind: 'ready' },
-        crossing,
-        reservationAlreadyClaimed,
-      })
-    : ungrantedDecision;
   if (decision.kind !== 'proceed') {
     return {
       status: 'decided',
@@ -1156,15 +1130,74 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
 }
 
 /**
- * Evaluate a graph-neutral mutation. Current local semantics may attest risk,
- * but no accepted-work coverage is manufactured; the reducer therefore emits
- * repair rather than a user approval request.
+ * Evaluate a graph-neutral mutation. An exact catalog call reopens its already
+ * admitted source/call binding as coverage; the graph is not an entrance. The
+ * legacy uncovered local projection remains non-authorizing.
  */
 export async function evaluateUncoveredHostMutationConsent(input: {
   attestation: HostCallAttestation;
   args: unknown;
+  inputSchema?: unknown;
+  durableApproval?: DurableHostConsentApproval;
 }): Promise<HostInteractiveConsentResult> {
   const attestation = input.attestation;
+  if (attestation.bindingKind === 'catalog_manifest') {
+    const loaded = loadHostCallCapabilityBinding({ db: openEventLog(), ...attestation });
+    if (loaded.status !== 'ok' || !hostCallCapabilityBindingMatchesAttestation(loaded.binding, attestation)) {
+      return { status: 'hold', reason: 'exact_host_call_durable_authority_reopen_mismatch', retryable: true };
+    }
+    const binding = loaded.binding;
+    const logical = durableLogicalCallContract(attestation.acceptedTaskId, binding.toolName, input.args);
+    if (!logical || logical.argumentDigest !== binding.effectiveArgumentDigest) {
+      return { status: 'repair', reason: 'exact_host_call_arguments_do_not_match_binding', retryable: true };
+    }
+    const target: PreparedConsentTarget = {
+      ...attestation,
+      targetName: binding.toolName,
+      targetArgs: input.args,
+      targetInputSchema: input.inputSchema ?? getCachedToolSchema(binding.operationId),
+      hostCapabilityBinding: binding,
+    };
+    const semanticResolution = await semanticBasisForExactCall({
+      prepared: target, requirementId: binding.logicalToolCallId, effect: binding.effect,
+    });
+    if (semanticResolution.status !== 'ready') {
+      return { ...semanticResolution, retryable: true };
+    }
+    const semantic = semanticResolution.semantic;
+    const source = sourceFromHostBinding(binding);
+    const { call, coverage } = buildHostConsentEvidence({ call: {
+      source,
+      acceptedTaskId: binding.acceptedTaskId,
+      bindingDigest: digest({ version: 1, hostCapabilityBinding: binding.durableBindingDigest,
+        logicalToolCallId: binding.logicalToolCallId, argumentDigest: binding.effectiveArgumentDigest,
+        semanticBasis: semantic.semanticBasis }),
+      logicalToolCallId: binding.logicalToolCallId,
+      operationId: semantic.operationId,
+      argumentDigest: binding.effectiveArgumentDigest,
+      schemaFingerprint: semantic.schemaFingerprint,
+      effect: semantic.effect,
+      accountId: semantic.accountId,
+      destination: semantic.destination,
+      cardinality: { kind: 'once' },
+      risk: semantic.risk,
+      semanticBasis: semantic.semanticBasis,
+      safety: semantic.safety,
+    }, coverage: () => ({
+      contractId: `accepted-call:${digest({ source, acceptedTaskId: binding.acceptedTaskId })}`,
+      requirementId: binding.logicalToolCallId,
+      requirementDigest: binding.durableBindingDigest,
+      reservationKey: digest({ version: 1, hostCapabilityBinding: binding.durableBindingDigest,
+        logicalToolCallId: binding.logicalToolCallId, argumentDigest: binding.effectiveArgumentDigest }),
+    }) });
+    const crossing = crossingFor(binding) ?? 'possibly_started';
+    const { decision, consentSubject } = reduceHostConsentEvidence({
+      identity: binding, call, coverage, crossing, reservationAlreadyClaimed: false,
+      durableApproval: input.durableApproval,
+    });
+    return { status: 'decided', decision, call, coverage,
+      ...(decision.kind === 'needs_user' && decision.need === 'approval' ? { consentSubject } : {}) };
+  }
   const source = {
     kind: 'accepted_turn' as const,
     id: attestation.sourceEventId,
@@ -1192,8 +1225,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
         }),
       }
     : { posture: 'not_applicable', digest: digest({ version: 1, source, unknown: true }) };
-  const call: CapabilityRiskAttestationV1 = {
-    version: INTERACTIVE_CONSENT_POLICY_VERSION,
+  const { call, coverage } = buildHostConsentEvidence({ call: {
     source,
     acceptedTaskId: attestation.acceptedTaskId,
     bindingDigest: digest({
@@ -1218,7 +1250,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       digest: definition?.envelopeFingerprint ?? attestation.bindingDigest,
     },
     safety: 'admissible',
-  };
+  }, coverage: null });
   const crossing = crossingFor({
     sessionId: attestation.sessionId,
     sourceUserSeq: attestation.sourceUserSeq,
@@ -1226,11 +1258,11 @@ export async function evaluateUncoveredHostMutationConsent(input: {
   }) ?? 'possibly_started';
   const decision = evaluateInteractiveConsentV1({
     call,
-    coverage: null,
+    coverage,
     userGrant: null,
     readiness: { kind: 'ready' },
     crossing,
     reservationAlreadyClaimed: false,
   });
-  return { status: 'decided', decision, call, coverage: null };
+  return { status: 'decided', decision, call, coverage };
 }
