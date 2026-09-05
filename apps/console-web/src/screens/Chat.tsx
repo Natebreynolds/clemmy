@@ -1,11 +1,12 @@
 import { useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { ArrowRight, Sparkles, X } from 'lucide-react';
+import { ArrowRight, X } from 'lucide-react';
 import { apiGet } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
 import { getContext } from '@/lib/memory';
 import { greetingName, timeGreeting } from '@/lib/greeting';
+import { DEFAULT_HOME_PREFERENCES, useHomePreferences } from '@/lib/home-prefs';
 import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
@@ -16,13 +17,8 @@ import { ChatBubble } from '@/components/chat/ChatBubble';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
+import { QuickActions } from '@/components/home/QuickActions';
 import { cn } from '@/lib/cn';
-
-const SUGGESTIONS = [
-  "What's on my plate today?",
-  'Recap what got done yesterday',
-  'Draft a follow-up email',
-];
 
 /** Where a "Needs you" card should land. Both approval- and needs-attention-
  *  notification-backed cards live on the Inbox "Needs you" tab now — deep-link
@@ -84,6 +80,10 @@ export function Chat() {
   // The profile changes rarely; a slow poll keeps the greeting personal
   // without adding chatter to the fast command-center loop.
   const userContext = usePoll(['user-context'], getContext, 300000);
+  // Quick actions are the user's own (HomePreferences) — the same chips the
+  // Home screen renders, never a hardcoded list.
+  const homePrefs = useHomePreferences();
+  const quickActions = (homePrefs.data ?? DEFAULT_HOME_PREFERENCES).quickActions;
   const dismissCard = async (item: CommandCenterItem) => {
     if (!item.dismissKind || !item.dismissId) return;
     try { await dismissInboxItem(item.dismissKind, item.dismissId); } finally {
@@ -205,19 +205,12 @@ export function Chat() {
         <RunningTasksDrawer className="mb-2" composerRef={composerRef} />
         <Composer inputRef={composerRef} busy={chat.busy} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
 
-        <div className="mt-4 flex flex-wrap justify-center gap-2">
-          {SUGGESTIONS.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => chat.send({ text: s })}
-              className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-3.5 py-1.5 text-small text-muted transition-colors hover:border-border-strong hover:text-fg cursor-pointer"
-            >
-              <Sparkles className="h-3.5 w-3.5 text-primary" aria-hidden />
-              {s}
-            </button>
-          ))}
-        </div>
+        <QuickActions
+          className="mt-4 items-center [&>div]:justify-center"
+          actions={quickActions}
+          disabled={chat.busy}
+          onPrompt={(text) => { void chat.send({ text }); }}
+        />
       </div>
     );
   }

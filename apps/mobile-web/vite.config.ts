@@ -7,6 +7,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Served by the Clementine daemon at /m/ — see src/channels/mobile-routes.ts.
 // All assets resolve relative to that mount.
+// Dev proxy target: the daemon's port (CLEM_DEV_DAEMON_PORT, same knob as console-web).
+const devDaemon = `http://127.0.0.1:${process.env.CLEM_DEV_DAEMON_PORT ?? '8420'}`;
+
 export default defineConfig({
   base: '/m/',
   plugins: [preact()],
@@ -43,9 +46,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/m/auth': 'http://127.0.0.1:8420',
-      '/m/api': 'http://127.0.0.1:8420',
-      '/api/console': 'http://127.0.0.1:8420',
+      '/m/auth': devDaemon,
+      '/m/api': devDaemon,
+      '/api/console': devDaemon,
     },
   },
 });

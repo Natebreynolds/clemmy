@@ -21,7 +21,7 @@ import {
   type WorkflowCapabilityInboxGate,
 } from '../lib/api';
 import { Decisions, relativeTime } from '../components/Approvals';
-import { ScreenNotice } from '../components/ScreenNotice';
+import { ScreenNotice, type ScreenNote } from '../components/ScreenNotice';
 import { haptic, reportNativeNotificationHandled } from '../lib/native-bridge';
 import {
   collapseAttentionNotifications,
@@ -65,6 +65,14 @@ interface AnswerReceipt {
   id: string;
   title: string;
   text: string;
+}
+
+/** A decision made on this phone in this session — the "Decided earlier
+ * today" list is built from these exact receipts, never inferred. */
+interface DecidedEntry {
+  id: string;
+  text: string;
+  at: number;
 }
 
 interface Props {
@@ -153,7 +161,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const [tab, setTab] = useState<InboxTab>('needs');
   const [notice, setNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
   const [reading, setReading] = useState<string | null>(null);
-  const [receipts, setReceipts] = useState<AnswerReceipt[]>([]);
+  const [decided, setDecided] = useState<DecidedEntry[]>([]);
   const handledDeepLink = useRef<string | null>(null);
   const readingLock = useRef(false);
 
@@ -263,23 +271,41 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
     });
   }, [approvalIds, data, initialNotificationId, notificationNeeds, notifications, planIds, questionIds, trustIds, updates]);
 
+  const recordDecision = (id: string, text: string) => {
+    setDecided((current) => [
+      { id, text, at: Date.now() },
+      ...current.filter((row) => row.id !== id),
+    ].slice(0, 12));
+  };
+
   const resolved = (text: string, tone: 'success' | 'error' = 'success') => {
     setNotice({ tone, text });
+    if (tone === 'success') recordDecision(`decision-${Date.now().toString(36)}`, text);
     void refresh();
     window.requestAnimationFrame(() => document.getElementById('inbox-action-receipt')?.focus());
   };
 
   const answered = (question: InboxQuestion, receipt: Omit<AnswerReceipt, 'id'>) => {
-    setReceipts((current) => [
-      { id: question.id, ...receipt },
-      ...current.filter((row) => row.id !== question.id),
-    ].slice(0, 3));
+    recordDecision(question.id, receipt.text ? `${receipt.title} · ${receipt.text}` : receipt.title);
     setNotice(null);
     void refresh();
     window.requestAnimationFrame(() => {
       document.getElementById(`inbox-receipt-${question.id}`)?.focus();
     });
   };
+
+  // ONE line for the screen's own state. The transport truth (offline, a
+  // failed load) outranks it inside ScreenNotice; among the rest, what the
+  // user just did outranks what the app could not refresh.
+  const note: ScreenNote | null = notice
+    ? { tone: notice.tone, text: notice.text, id: notice.tone === 'success' ? 'inbox-action-receipt' : undefined }
+    : data?.requestedNotificationMissing
+      ? { tone: 'info', text: 'That update is no longer available. Your current Inbox is shown instead.', id: 'inbox-missing-notification' }
+      : data?.unavailable.length
+        ? { tone: 'error', text: `Some items could not refresh: ${data.unavailable.join(', ')}. Everything else is still available.` }
+        : null;
+  const startOfToday = new Date().setHours(0, 0, 0, 0);
+  const decidedToday = decided.filter((entry) => entry.at >= startOfToday);
 
   const selectTab = (next: InboxTab) => {
     setTab(next);
@@ -309,20 +335,6 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
 
   return (
     <div class="inbox-screen" aria-busy={refreshing}>
-      <header class="inbox-intro">
-        <img src="/m/clemmy.png" width="44" height="44" alt="" />
-        <div>
-          <h2>{needsCount > 0
-            ? 'Clem needs you'
-            : data?.needsCountKnown ? 'You’re all caught up' : 'Checking your Inbox'}</h2>
-          <p>{needsCount > 0
-            ? 'Questions and decisions I need before I can keep going.'
-            : data?.needsCountKnown
-              ? 'I’ll bring questions and finished work back here.'
-              : 'Some sources have not returned yet; your last known badge is unchanged.'}</p>
-        </div>
-      </header>
-
       <div class="inbox-tabs" role="tablist" aria-label="Inbox views">
         <button
           id="inbox-tab-needs"
@@ -362,55 +374,21 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
         </button>
       </div>
 
-      {notice ? (
-        <div
-          id={notice.tone === 'success' ? 'inbox-action-receipt' : undefined}
-          class={`inbox-notice inbox-notice-${notice.tone}`}
-          role={notice.tone === 'error' ? 'alert' : 'status'}
-          tabIndex={notice.tone === 'success' ? -1 : undefined}
-        >
-          {notice.text}
-        </div>
-      ) : null}
-
-      {data?.unavailable.length ? (
-        <div class="inbox-notice inbox-notice-error" role="status">
-          Some items could not refresh: {data.unavailable.join(', ')}. Everything else is still available.
-        </div>
-      ) : null}
-
-      {data?.requestedNotificationMissing ? (
-        <div id="inbox-missing-notification" class="inbox-notice" role="status" tabIndex={-1}>
-          That update is no longer available. Your current Inbox is shown instead.
-        </div>
-      ) : null}
-
       <ScreenNotice
         error={error}
         offline={offline}
         onRetry={() => void refresh()}
         hasData={Boolean(data)}
+        note={note}
       />
 
       {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
 
       {!loading && tab === 'needs' ? (
         <div id="inbox-panel-needs" class="inbox-stack" role="tabpanel" aria-labelledby="inbox-tab-needs">
-          {receipts.map((receipt) => (
-            <article
-              key={receipt.id}
-              id={`inbox-receipt-${receipt.id}`}
-              class="inbox-receipt"
-              role="status"
-              tabIndex={-1}
-            >
-              <span aria-hidden="true">✓</span>
-              <div><strong>{receipt.title}</strong><p>{receipt.text}</p></div>
-            </article>
-          ))}
           {data?.needsCountKnown && needsCount === 0 ? (
             <div class="inbox-clear">
-              <span aria-hidden="true">✓</span>
+              <span aria-hidden="true"><CheckGlyph /></span>
               <h2>Nothing is waiting on you</h2>
               <p>New questions will stay here until you answer them.</p>
             </div>
@@ -454,7 +432,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 class="inbox-card inbox-attention-card"
                 tabIndex={-1}
               >
-                <CardMeta label="Clem needs you" at={row.createdAt} urgent />
+                <CardMeta label="Update · needs you" at={row.createdAt} urgent />
                 <h2>{row.title || 'I need your attention'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
                 {earlier > 0 ? <p class="inbox-card-fine">+{earlier} earlier update{earlier === 1 ? '' : 's'} like this</p> : null}
@@ -476,6 +454,23 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
               </article>
             )
           ))}
+
+          {decidedToday.length > 0 ? (
+            <section class="inbox-decided" aria-labelledby="inbox-decided-head">
+              <h3 id="inbox-decided-head" class="pane-head">Decided earlier today</h3>
+              <div class="inbox-decided-list" role="list">
+                {decidedToday.map((entry) => (
+                  <div key={entry.id} id={`inbox-receipt-${entry.id}`} class="inbox-decided-row" role="listitem" tabIndex={-1}>
+                    <CheckGlyph />
+                    <span class="inbox-decided-text">{entry.text}</span>
+                    <time class="inbox-decided-time" dateTime={new Date(entry.at).toISOString()}>
+                      {new Date(entry.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                    </time>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
         </div>
       ) : null}
 
@@ -483,7 +478,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
         <div id="inbox-panel-updates" class="inbox-stack" role="tabpanel" aria-labelledby="inbox-tab-updates">
           {data?.updatesKnown && updates.length === 0 ? (
             <div class="inbox-clear">
-              <span aria-hidden="true">✓</span>
+              <span aria-hidden="true"><CheckGlyph /></span>
               <h2>No updates yet</h2>
               <p>Finished work and proactive messages will stay here.</p>
             </div>
@@ -559,7 +554,7 @@ function WorkflowCapabilityCard({ row, gate, onResolved, onOpenSettings, onOpenW
   const resolution = gate.resolution;
   return (
     <article id={`inbox-notification:${row.id}`} class="inbox-card inbox-attention-card" tabIndex={-1} aria-busy={busy}>
-      <CardMeta label="Workflow needs you" at={row.createdAt} urgent />
+      <CardMeta label={`Workflow · ${gateNeedLabel(gate)}`} at={row.createdAt} urgent />
       <h2>{row.title || `${gate.workflow} needs you`}</h2>
       {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
       <p class="inbox-card-fine">No {gate.tool} dispatch occurred. Completed work is preserved.</p>
@@ -640,7 +635,7 @@ function TrustProposalCard({ proposal, onResolved }: {
   const scope = trustScopeSummary(proposal);
   return (
     <article id={`inbox-trust:${proposal.id}`} class="inbox-card inbox-trust-card" tabIndex={-1} aria-busy={Boolean(busy)}>
-      <CardMeta label="Standing permission" at={proposal.createdAt} />
+      <CardMeta label="Permission · standing" at={proposal.createdAt} />
       <h2>Should I stop asking before future sends to this exact scope?</h2>
       <p class="inbox-card-body">{proposal.rationale}</p>
       <dl class="trust-scope">
@@ -743,7 +738,7 @@ function QuestionCard({ question, onAnswered, onReply }: {
   return (
     <article id={`inbox-${question.id}`} class="inbox-card inbox-question-card" tabIndex={-1} aria-busy={busy}>
       <CardMeta
-        label={question.agentLabel && question.agentLabel !== 'Clem' ? `${question.agentLabel} asked` : 'Clem needs you'}
+        label={`Question · ${questionSourceLabel(question)}`}
         at={question.askedAt}
         urgent={question.urgency === 'high'}
       />
@@ -806,6 +801,35 @@ function QuestionCard({ question, onAnswered, onReply }: {
       )}
       {error ? <p id={errorId} class="inbox-inline-error" role="alert">{error}</p> : null}
     </article>
+  );
+}
+
+/** The kind label's second half: what this gate is waiting on, from the
+ * typed resolution — never from the notification prose. */
+function gateNeedLabel(gate: WorkflowCapabilityInboxGate): string {
+  switch (gate.resolution.kind) {
+    case 'choose_account': return 'needs one input';
+    case 'connect_and_retry': return 'needs a connection';
+    case 'retry_exact_metadata': return 'needs a retry';
+    default: return 'needs review';
+  }
+}
+
+/** Who or what is asking, from typed fields: the workflow's name, a named
+ * agent, or the source kind. */
+function questionSourceLabel(question: InboxQuestion): string {
+  if (question.workflowName) return question.workflowName;
+  if (question.agentLabel && question.agentLabel !== 'Clem') return question.agentLabel;
+  if (question.source === 'workflow') return 'workflow';
+  if (question.source === 'background_task') return 'task';
+  return 'check-in';
+}
+
+function CheckGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
   );
 }
 

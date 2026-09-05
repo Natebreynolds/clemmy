@@ -16,6 +16,7 @@ import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { useScreenData } from '../lib/use-screen-data';
 import { buildWorkflowRunDetail } from '../lib/workflow-run-detail';
+import { whenLabel } from '../lib/schedule-label';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -65,7 +66,7 @@ export function Workflows() {
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
           <div class="workflow-row-meta">
             <span>{wf.stepCount} steps</span>
-            {wf.schedule ? <span>cron: {wf.schedule}</span> : null}
+            {wf.schedule ? <span>{whenLabel(wf.schedule)}</span> : null}
             {wf.requiresInput ? <span class="workflow-row-tag">needs input</span> : null}
             {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-tag">needs binding</span> : null}
             {wf.lastRunAt ? <span>last: {relativeTime(wf.lastRunAt)}</span> : null}
@@ -374,30 +375,6 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
       </div>
     </div>
   );
-}
-
-/** When it runs, in words. A cron string is not an answer to "when". */
-function whenLabel(schedule: string | null): string {
-  if (!schedule) return 'When asked';
-  const parts = schedule.trim().split(/\s+/);
-  if (parts.length < 5) return schedule;
-  const [minute, hour, dom, , dow] = parts;
-  const at = (): string => {
-    const h = Number(hour);
-    const m = Number(minute);
-    if (!Number.isFinite(h) || !Number.isFinite(m)) return schedule;
-    const suffix = h < 12 ? 'am' : 'pm';
-    const hour12 = h % 12 === 0 ? 12 : h % 12;
-    return m === 0 ? `${hour12}${suffix}` : `${hour12}:${String(m).padStart(2, '0')}${suffix}`;
-  };
-  if (hour.includes('*')) return 'Hourly';
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  if (dow !== '*' && !dow.includes('*')) {
-    const day = days[Number(dow)] ?? dow;
-    return `${day} ${at()}`;
-  }
-  if (dom !== '*' && !dom.includes('*')) return `Monthly ${at()}`;
-  return `Daily ${at()}`;
 }
 
 /** What it touches, as consequence rather than counts. */

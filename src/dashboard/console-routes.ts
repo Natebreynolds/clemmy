@@ -204,6 +204,7 @@ import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { classifyTool } from '../agents/tool-taxonomy.js';
 import { loadPlugins, PLUGINS_DIR } from '../plugins/loader.js';
 import { loadUserProfile, saveUserProfile } from '../runtime/user-profile.js';
+import { loadHomePreferences, saveHomePreferences } from '../runtime/home-preferences.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { getOrRefreshScan, probe, readCachedScan } from '../runtime/cli-discovery.js';
 import { getSavedClis, addSavedCli, removeSavedCli } from '../runtime/saved-clis.js';
@@ -8425,6 +8426,24 @@ export function registerConsoleRoutes(
       const updated = saveUserProfile(req.body ?? {});
       bumpStableContextGeneration();
       res.json({ profile: updated });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Home preferences: the one per-user record that shapes the main window on
+  // desktop and phone (panes, nav, landing, quick actions). No execution
+  // authority lives here — a quick action is a prompt/workflow the user taps.
+  app.get('/api/console/settings/home', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ home: loadHomePreferences() });
+  });
+
+  app.patch('/api/console/settings/home', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      res.json({ home: saveHomePreferences(body) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

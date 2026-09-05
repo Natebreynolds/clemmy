@@ -56,9 +56,11 @@ test('navigation is a left drawer — the bottom dock is gone from code and styl
 
 test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the current screen', () => {
   const app = read('../app.tsx');
-  // Hamburger opens it from the header's left edge with a real touch target.
-  assert.match(app, /class="menu-btn"[\s\S]*?aria-label=\{decisions > 0/);
-  assert.match(app, /aria-expanded=\{drawerOpen\}/);
+  // The title is the navigator (owner design 2026-09-04): it opens the
+  // switcher sheet with a real touch target; "More" there opens the drawer.
+  assert.match(app, /class="title-switch"[\s\S]*?aria-haspopup="dialog"/);
+  assert.match(app, /aria-expanded=\{switcherOpen\}/);
+  assert.match(app, /onMore=\{\(\) => \{[\s\S]*?openDrawer\(\);/);
   // Dialog semantics + Escape + scrim close.
   assert.match(app, /class=\{`drawer-layer\$\{drawerClosing \? ' closing' : ''\}`\}[\s\S]*?role=\{drawerClosing \? undefined : 'dialog'\}/);
   assert.match(app, /aria-hidden=\{drawerClosing \? true : undefined\}/);
@@ -69,12 +71,12 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   const closeStart = app.indexOf('const closeDrawer =');
   const closeEnd = app.indexOf('\n  };', closeStart);
   const closeSource = app.slice(closeStart, closeEnd);
-  assert.ok(closeSource.indexOf('menuBtnRef.current?.focus()') < closeSource.indexOf('window.setTimeout'),
+  assert.ok(closeSource.indexOf('titleBtnRef.current?.focus()') < closeSource.indexOf('window.setTimeout'),
     'focus returns before the exit animation rather than staying inside aria-hidden content');
   // The active section carries the page marker, accent-highlighted in CSS.
   assert.match(app, /aria-current=\{tab === t\.id \? 'page' : undefined\}/);
   const css = read('../styles.css');
-  assert.match(css, /\.menu-btn \{[\s\S]*?width: 44px;[\s\S]*?height: 44px/);
+  assert.match(css, /\.title-switch \{[\s\S]*?min-height: 44px/);
   assert.match(css, /\.drawer \{[\s\S]*?width: min\(82vw, 320px\)/);
   assert.match(css, /\.drawer \{[\s\S]*?env\(safe-area-inset-left\)/);
   assert.match(css, /\.drawer-item \{[\s\S]*?min-height: 48px/);
@@ -163,4 +165,37 @@ test('the keyboard stays in daylight: color-scheme meta + shell trait override',
   assert.match(indexHtml, /<meta name="color-scheme" content="light" \/>/);
   const shell = readFileSync(new URL('../../../ios/Clem/PinnedWebView.swift', import.meta.url), 'utf8');
   assert.match(shell, /overrideUserInterfaceStyle = \.light/);
+});
+
+/**
+ * Owner design 2026-09-04: the title is the navigator and the floating ask
+ * capsule is the app's ONE persistent control. Navigation lives in a
+ * bottom sheet fed by HomePreferences.phoneSwitcher; the inline ask box on
+ * Home is gone; the capsule floats above the safe area with 44px targets.
+ */
+test('the title switcher and the ask capsule replace the hamburger and the inline ask box', () => {
+  const app = read('../app.tsx');
+  assert.match(app, /<TitleSwitcher/);
+  assert.match(app, /phoneSwitcherIds\(prefs, TABS\.map/,
+    'the switcher lists the user\'s chosen destinations from the ONE preferences record');
+  assert.match(app, /<AskCapsule onAsk=\{\(draft\) => goToChat\(\{ draft, autoSend: true \}\)\}/,
+    'the capsule sends through the same path Home\'s ask box used');
+  assert.doesNotMatch(app, /class="menu-btn"/);
+  const home = read('../screens/Home.tsx');
+  assert.doesNotMatch(home, /class="ask rise"|class="ask-input"/, 'the inline ask box is gone from Home');
+  assert.doesNotMatch(home, /listRecentRuns|listChatSessions/, 'no dead run fetch, no duplicate working-now poll');
+  assert.match(home, /useWorkingNow\(\)/, 'Running renders from the ONE shared snapshot');
+  const css = read('../styles.css');
+  assert.match(css, /\.ask-capsule \{[\s\S]*?position: fixed;[\s\S]*?env\(safe-area-inset-bottom\)/);
+  assert.match(css, /\.ask-capsule-send \{[\s\S]*?width: 44px;[\s\S]*?height: 44px/);
+  assert.match(css, /\.ask-capsule-mic \{[\s\S]*?width: 44px;[\s\S]*?height: 44px/);
+  assert.doesNotMatch(css, /\.menu-btn \{|\.inbox-intro \{/, 'dead chrome styles are deleted, not hidden');
+});
+
+test('one working-now poll feeds the header chip and Home', () => {
+  const sheet = read('../components/RunningTasksSheet.tsx');
+  assert.match(sheet, /useWorkingNow\(\)/);
+  assert.doesNotMatch(sheet, /useScreenData\(listWorkingNow/);
+  const app = read('../app.tsx');
+  assert.match(app, /useWorkingNow\(authenticated\)/, 'the shell keeps the poll alive while signed in');
 });

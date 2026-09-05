@@ -33,6 +33,8 @@ import {
   workspaceFromSearch,
   workspaceNavigationIntent,
 } from './lib/workspace-route';
+import { SWITCHER_MORE, phoneSwitcherIds, useHomePreferences } from './lib/home-prefs';
+import { useWorkingNow } from './lib/working-now';
 import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
@@ -45,6 +47,9 @@ import { Settings } from './screens/Settings';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
+import { TitleSwitcher, type SwitcherEntry } from './components/TitleSwitcher';
+import { AskCapsule } from './components/AskCapsule';
+import { CustomizeSheet } from './components/CustomizeSheet';
 
 type Tab = 'home' | 'inbox' | 'chats' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
 
@@ -59,6 +64,13 @@ function inboxNotificationFromSearch(search: string): string | null {
   return new URLSearchParams(search).get('notification');
 }
 
+/** An explicit destination (a push, a handoff, a pairing) outranks the
+ * "open on launch" preference; only a bare cold launch honors it. */
+function searchHasDestination(search: string): boolean {
+  const params = new URLSearchParams(search);
+  return ['tab', 'notification', 'workspace', 'pair', 'adopt'].some((key) => params.has(key));
+}
+
 export function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -71,6 +83,10 @@ export function App() {
   const [workspaceId, setWorkspaceId] = useState<string | null>(
     () => workspaceFromSearch(window.location.search),
   );
+  // The title is the navigator: tapping it opens the switcher sheet. The
+  // full section menu (the left drawer) stays behind "More".
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [customizeOpen, setCustomizeOpen] = useState(false);
   // Left drawer (owner directive 2026-08-25): sections live in a slide-in
   // menu, never a bottom dock — content gets the full height.
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -79,7 +95,7 @@ export function App() {
   const [drawerClosing, setDrawerClosing] = useState(false);
   const drawerClosingRef = useRef(false);
   const drawerCloseTimer = useRef<number | null>(null);
-  const menuBtnRef = useRef<HTMLButtonElement | null>(null);
+  const titleBtnRef = useRef<HTMLButtonElement | null>(null);
   const routeTitleRef = useRef<HTMLHeadingElement | null>(null);
   const routeTitleMounted = useRef(false);
   const drawerRef = useRef<HTMLElement | null>(null);
@@ -91,7 +107,18 @@ export function App() {
   const [decisionsKnown, setDecisionsKnown] = useState(false);
   /** Set when Home hands a question to Chats — consumed once on arrival. */
   const [handoff, setHandoff] = useState<ChatHandoff | null>(null);
+  /** The Chats LIST is a capsule surface; an open thread has its own composer. */
+  const [chatsListVisible, setChatsListVisible] = useState(false);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
+  const authenticated = Boolean(authStatus?.authenticated);
+
+  // ONE record shapes the window (panes, switcher, landing, quick actions),
+  // and ONE working-now poll feeds Home, the header chip, and the sheet.
+  const { prefs, loaded: prefsLoaded } = useHomePreferences({ enabled: authenticated });
+  useWorkingNow(authenticated);
+  const bootHadDestination = useRef(searchHasDestination(window.location.search));
+  const userNavigated = useRef(false);
+  const landingApplied = useRef(false);
 
   useEffect(() => {
     const onDoor = (event: Event) => setDoor((event as CustomEvent<ConnectionDoor>).detail);
@@ -197,10 +224,11 @@ export function App() {
     return () => window.removeEventListener('popstate', syncLocation);
   }, []);
 
-  // Needs-you is shell state, not Home state. Polling here keeps the hamburger
-  // and drawer truthful while the user is in Chat, Memory, or a deep detail.
+  // Needs-you is shell state, not Home state. Polling here keeps the header
+  // pill and the switcher truthful while the user is in Chat, Memory, or a
+  // deep detail — ONE count from ONE source for every surface.
   useEffect(() => {
-    if (!authStatus?.authenticated) {
+    if (!authenticated) {
       setDecisions(0);
       setDecisionsKnown(false);
       return;
@@ -226,7 +254,7 @@ export function App() {
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('online', onWake);
     };
-  }, [authStatus?.authenticated]);
+  }, [authenticated]);
 
   const setAuthoritativeDecisionCount = useCallback((count: number) => {
     setDecisions(count);
@@ -236,11 +264,11 @@ export function App() {
   // The greeting name, resolved at runtime from the profile — never hardcoded,
   // and a miss simply means an unnamed greeting.
   useEffect(() => {
-    if (!authStatus?.authenticated) return;
+    if (!authenticated) return;
     void api<{ name?: string }>('/m/api/whoami')
       .then((who) => setName(who.name ?? ''))
       .catch(() => setName(''));
-  }, [authStatus?.authenticated]);
+  }, [authenticated]);
 
   // ORIGIN ADOPTION — the credential handoff that makes off-LAN access work.
   //
@@ -316,7 +344,7 @@ export function App() {
   // While authenticated on the LAN, keep a fresh handoff parked with the
   // shell, so leaving the house never finds an expired one.
   useEffect(() => {
-    if (!authStatus?.authenticated) return;
+    if (!authenticated) return;
     if (door === 'relay') return; // already remote — this origin can't mint
     if (!inNativeShell()) return; // browsers do not need a cross-origin shell credential
     let cancelled = false;
@@ -343,7 +371,7 @@ export function App() {
       clearInterval(timer);
       document.removeEventListener('visibilitychange', parkOnHide);
     };
-  }, [authStatus?.authenticated, door]);
+  }, [authenticated, door]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -385,6 +413,34 @@ export function App() {
     return () => { cancelled = true; };
   }, [refreshAuth]);
 
+  const navigateTo = useCallback((next: Tab, notificationId?: string | null) => {
+    userNavigated.current = true;
+    setTab(next);
+    setWorkspaceId(null);
+    const selectedNotification = next === 'inbox' ? notificationId ?? null : null;
+    setInboxNotification(selectedNotification);
+    const params = new URLSearchParams();
+    if (next !== 'home') params.set('tab', next);
+    if (next === 'inbox' && selectedNotification) params.set('notification', selectedNotification);
+    const query = params.toString();
+    window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+  }, []);
+
+  // "Open on launch" — honored once, on a bare cold launch, after the record
+  // has actually been read. A push, a pairing, or a tap the user already made
+  // outranks it; a record that never loads falls back to Home.
+  useEffect(() => {
+    if (!authenticated || !prefsLoaded || landingApplied.current) return;
+    landingApplied.current = true;
+    if (bootHadDestination.current || userNavigated.current) return;
+    if (prefs.landing === 'last_conversation') {
+      setHandoff({ openLatest: true });
+      navigateTo('chats');
+    } else if (prefs.landing === 'current_project') {
+      navigateTo('spaces');
+    }
+  }, [authenticated, prefsLoaded, prefs.landing, navigateTo]);
+
   if (bootError && !authStatus) {
     return (
       <div class="login-shell">
@@ -411,18 +467,6 @@ export function App() {
     return <Login pairError={pairError} />;
   }
 
-  const navigateTo = (next: Tab, notificationId?: string | null) => {
-    setTab(next);
-    setWorkspaceId(null);
-    const selectedNotification = next === 'inbox' ? notificationId ?? null : null;
-    setInboxNotification(selectedNotification);
-    const params = new URLSearchParams();
-    if (next !== 'home') params.set('tab', next);
-    if (next === 'inbox' && selectedNotification) params.set('notification', selectedNotification);
-    const query = params.toString();
-    window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
-  };
-
   const selectWorkspace = (slug: string | null) => {
     const intent = workspaceNavigationIntent({
       search: window.location.search,
@@ -446,6 +490,11 @@ export function App() {
     navigateTo('chats');
   };
 
+  const openWorkspace = (slug: string) => {
+    navigateTo('spaces');
+    selectWorkspace(slug);
+  };
+
   const openDrawer = () => {
     if (drawerCloseTimer.current !== null) {
       window.clearTimeout(drawerCloseTimer.current);
@@ -461,7 +510,7 @@ export function App() {
     drawerClosingRef.current = true;
     // End the modal contract immediately. The exiting pixels stay mounted,
     // but are hidden from assistive tech and cannot keep focus trapped.
-    if (restoreOpener) menuBtnRef.current?.focus();
+    if (restoreOpener) titleBtnRef.current?.focus();
     setDrawerOpen(false);
     setDrawerClosing(true);
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -472,42 +521,101 @@ export function App() {
     }, reduceMotion ? 0 : 250);
   };
 
+  const switcherEntries: SwitcherEntry[] = phoneSwitcherIds(prefs, TABS.map((t) => t.id))
+    .filter((id) => id !== SWITCHER_MORE)
+    .flatMap((id) => {
+      const entry = TABS.find((t) => t.id === id);
+      return entry ? [{ id, label: entry.label, icon: entry.icon, badge: id === 'inbox' ? decisions : undefined }] : [];
+    });
+
+  // The capsule is the one persistent control — on Home, Needs you, and the
+  // Chats list. An open thread has its own composer; other screens have
+  // their own primary action.
+  const capsuleShown = tab === 'home' || tab === 'inbox' || (tab === 'chats' && chatsListVisible);
+  const decisionsLabel = decisions > 99 ? '99+' : String(decisions);
+
   return (
     <>
       <header class="app-header">
-        <button
-          ref={menuBtnRef}
-          class="menu-btn"
-          aria-label={decisions > 0 ? `Open menu, ${decisions} ${decisions === 1 ? 'item needs' : 'items need'} you` : 'Open menu'}
-          aria-haspopup="dialog"
-          aria-expanded={drawerOpen}
-          onClick={() => { haptic('light'); openDrawer(); }}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <line x1="4" y1="7" x2="20" y2="7" /><line x1="4" y1="12" x2="20" y2="12" /><line x1="4" y1="17" x2="20" y2="17" />
-          </svg>
-          {/* The Home decisions count rode the dock icon; with the dock gone
-              the hamburger carries it so the signal survives a closed menu. */}
-          {decisions > 0 ? <span class="menu-badge">{decisions > 9 ? '9+' : decisions}</span> : null}
-        </button>
-        <h1 ref={routeTitleRef} class="brand-name app-title" tabIndex={-1}>{TAB_TITLES[tab]}</h1>
+        <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
+        <h1 ref={routeTitleRef} class="app-title" tabIndex={-1}>
+          <button
+            ref={titleBtnRef}
+            type="button"
+            class="title-switch"
+            aria-haspopup="dialog"
+            aria-expanded={switcherOpen}
+            aria-label={`${TAB_TITLES[tab]}. Go to another section`}
+            onClick={() => { haptic('light'); setSwitcherOpen(true); }}
+          >
+            <span class="title-switch-text">{TAB_TITLES[tab]}</span>
+            {tab === 'inbox' && decisions > 0 ? <span class="title-badge" aria-hidden="true">{decisionsLabel}</span> : null}
+            <svg class="title-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+        </h1>
         <div class="meta">
           {/* Compact running-work chip — the sheet's trigger, which must not
               float at the bottom now that the dock is gone. Absent at zero
               (presenter contract: the pill disappears when total is 0). */}
           <RunningTasksSheet />
-          <span
-            class={`conn-pill conn-${door}`}
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            aria-label={`${DOOR_COPY[door].label}. ${DOOR_COPY[door].hint}`}
-            title={DOOR_COPY[door].hint}
-          >
-            <span class="conn-dot" aria-hidden="true" />{DOOR_COPY[door].label}
-          </span>
+          {tab === 'home' && decisions > 0 ? (
+            <button
+              type="button"
+              class="needs-pill"
+              aria-label={`${decisions} ${decisions === 1 ? 'item needs' : 'items need'} you. Open Needs you`}
+              onClick={() => { haptic('light'); navigateTo('inbox'); }}
+            >
+              <span class="needs-pill-face" aria-hidden="true">Needs you · {decisionsLabel}</span>
+            </button>
+          ) : null}
+          {door === 'direct' ? (
+            // Direct is the quiet default: one green dot. Remote and offline
+            // keep their words because they change what the user can expect.
+            <span
+              class="conn-dot-only"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              aria-label={`${DOOR_COPY.direct.label}. ${DOOR_COPY.direct.hint}`}
+              title={DOOR_COPY.direct.hint}
+            />
+          ) : (
+            <span
+              class={`conn-pill conn-${door}`}
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              aria-label={`${DOOR_COPY[door].label}. ${DOOR_COPY[door].hint}`}
+              title={DOOR_COPY[door].hint}
+            >
+              <span class="conn-dot" aria-hidden="true" />{DOOR_COPY[door].label}
+            </span>
+          )}
         </div>
       </header>
+
+      <TitleSwitcher
+        open={switcherOpen}
+        onClose={() => setSwitcherOpen(false)}
+        current={tab}
+        entries={switcherEntries}
+        onSelect={(id) => {
+          setSwitcherOpen(false);
+          if (TAB_IDS.has(id as Tab)) navigateTo(id as Tab);
+        }}
+        onMore={() => {
+          setSwitcherOpen(false);
+          openDrawer();
+        }}
+      />
+
+      <CustomizeSheet
+        open={customizeOpen}
+        onClose={() => setCustomizeOpen(false)}
+        sections={TABS.map((t) => ({ id: t.id, label: t.label }))}
+      />
 
       {drawerOpen || drawerClosing ? (
         <div
@@ -597,14 +705,15 @@ export function App() {
         </div>
       ) : null}
 
-      <main class="app-main" key={tab}>
+      <main class={`app-main${capsuleShown ? ' app-main-capsule' : ''}`} key={tab}>
         <ScreenBoundary tab={tab}>
           {tab === 'home' ? (
             <Home
               name={name}
               onAsk={(draft) => goToChat({ draft, autoSend: true })}
-              onOpenChat={(session) => goToChat({ session })}
               onOpenInbox={() => navigateTo('inbox')}
+              onOpenWorkspace={openWorkspace}
+              onCustomize={() => setCustomizeOpen(true)}
               needsYouCount={decisions}
               needsYouCountKnown={decisionsKnown}
             />
@@ -617,7 +726,11 @@ export function App() {
               onOpenWorkflows={() => navigateTo('workflows')}
             />
           ) : tab === 'chats' ? (
-            <Chats handoff={handoff} onHandoffConsumed={() => setHandoff(null)} />
+            <Chats
+              handoff={handoff}
+              onHandoffConsumed={() => setHandoff(null)}
+              onListVisibleChange={setChatsListVisible}
+            />
           ) : tab === 'agents' ? (
             <Agents
               onMessage={(agent) => {
@@ -637,12 +750,14 @@ export function App() {
                 door={door}
                 doorCopy={DOOR_COPY[door]}
                 onSignOut={async () => { await logout(); await refreshAuth(); }}
+                onCustomize={() => setCustomizeOpen(true)}
               />
             )
             : <Activity />}
         </ScreenBoundary>
       </main>
 
+      {capsuleShown ? <AskCapsule onAsk={(draft) => goToChat({ draft, autoSend: true })} /> : null}
     </>
   );
 }
@@ -688,8 +803,8 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 };
 
 const TAB_TITLES: Record<Tab, string> = {
-  home: 'Clementine',
-  inbox: 'Inbox',
+  home: 'Home',
+  inbox: 'Needs you',
   chats: 'Chats',
   agents: 'Agents',
   spaces: 'Workspaces',

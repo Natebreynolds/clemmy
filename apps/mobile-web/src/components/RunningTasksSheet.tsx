@@ -1,9 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import {
-  listWorkingNow,
-  type ActivityEntry,
-} from '../lib/api';
-import { useScreenData } from '../lib/use-screen-data';
+import type { ActivityEntry } from '../lib/api';
+import { useWorkingNow } from '../lib/working-now';
 import { haptic } from '../lib/native-bridge';
 import {
   hasExpandableTaskFacts,
@@ -15,7 +12,6 @@ import {
 import { presentWorkingNow } from '@clem/chat-engine';
 import { RunControl } from './RunControl';
 
-const POLL_MS = 4_000;
 const MAX_VISIBLE_TASKS = 12;
 
 /** Compact foreground affordance backed only by the daemon's shared
@@ -30,7 +26,9 @@ export function RunningTasksSheet({
    *  tab, and on non-chat tabs focus falls back to the document body. */
   composerRef?: { current: HTMLTextAreaElement | null };
 }) {
-  const { data, refresh } = useScreenData(listWorkingNow, { intervalMs: POLL_MS });
+  // ONE snapshot for the whole app: the shell keeps the poll alive and Home
+  // renders from this same store, so the chip and the page cannot disagree.
+  const { data, refresh } = useWorkingNow();
   // ONE presenter for counts, label, pulse, and elapsed — the same function
   // the desktop badge and drawer render from, so the phone and the desktop
   // can never disagree about how much is running.

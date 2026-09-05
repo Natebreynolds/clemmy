@@ -1,8 +1,9 @@
-import { Sun, Moon, Monitor, ChevronRight } from 'lucide-react';
+import { Sun, Moon, Monitor, ChevronRight, Sliders } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
+import { openCustomizeHome } from '@/components/home/CustomizePanel';
 import { useTheme, type ThemeChoice } from '@/lib/theme';
 import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
@@ -35,10 +36,28 @@ function LinkRow({ title, desc, to }: { title: string; desc: string; to: string 
   );
 }
 
+// Home layout lives in the Customize sheet (one record, applies on the phone
+// too); this card is the Settings door into it.
+function HomeLayoutCard() {
+  return (
+    <Card className="flex items-center gap-3 p-5">
+      <Sliders className="h-5 w-5 shrink-0 text-muted" aria-hidden />
+      <div className="flex-1">
+        <h3 className="text-h3 text-fg">Home layout</h3>
+        <p className="text-small text-muted">
+          Which panes show, what the sidebar pins, what opens on launch, and your quick actions. Applies on your phone too.
+        </p>
+      </div>
+      <Button variant="secondary" size="sm" onClick={openCustomizeHome}>Customize</Button>
+    </Card>
+  );
+}
+
 // Anchor jump-nav for the long single-page scroll — no router change, each
 // section keeps its component; the ids live on lightweight wrapper divs.
 const SECTIONS: { id: string; label: string }[] = [
   { id: 'appearance', label: 'Appearance' },
+  { id: 'home', label: 'Home' },
   { id: 'notch', label: 'Notch' },
   { id: 'profile', label: 'Profile' },
   { id: 'notifications', label: 'Notifications' },
@@ -82,6 +101,8 @@ export function Settings() {
           </div>
         </Card>
         </div>
+
+        <div id="home" className="scroll-mt-16"><HomeLayoutCard /></div>
 
         <div id="notch" className="scroll-mt-16"><NotchSettingsCard /></div>
 

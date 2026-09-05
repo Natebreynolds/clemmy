@@ -1,8 +1,13 @@
-import { Component, lazy, Suspense, type ComponentType, type ReactNode } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { Component, lazy, Suspense, useEffect, useState, type ComponentType, type ReactNode } from 'react';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AppShell } from './components/AppShell';
 import { Chat } from './screens/Chat';
+import { Home } from './screens/Home';
+import { useHomePreferences } from './lib/home-prefs';
+import { lastChatSession } from './lib/last-session';
+import { listSpaces } from './lib/spaces';
+import { currentProject } from './components/home/home-model';
 import { ChatScreen } from './features/conversations/ChatScreen';
 import { ConversationThread } from './features/conversations/chat/ConversationThread';
 import { NotchSurface } from './features/notch/NotchSurface';
@@ -98,6 +103,51 @@ function DeferredScreen({ children }: { children: ReactNode }) {
 
 const deferred = (screen: ReactNode) => <DeferredScreen>{screen}</DeferredScreen>;
 
+/** If the preferences never arrive (daemon restarting, slow disk), land on
+ *  Home rather than a blank window. */
+const LANDING_WAIT_MS = 4_000;
+
+/**
+ * The index route reads the user's chosen landing from HomePreferences:
+ * 'home' → /home; 'last_conversation' → the active conversation the chat
+ * surfaces remembered (Home when there is none); 'current_project' → the
+ * workspace the user is in the middle of (Home when there is none).
+ */
+function LandingRedirect() {
+  const prefs = useHomePreferences();
+  const [waitedOut, setWaitedOut] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setWaitedOut(true), LANDING_WAIT_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
+  // useHomePreferences serves the defaults as placeholder data while the real
+  // record loads; a redirect on the placeholder would ignore the user's choice.
+  const settled = !prefs.isPlaceholderData || prefs.isError || waitedOut;
+  const landing = settled && !prefs.isError ? (prefs.data?.landing ?? 'home') : 'home';
+  const spaces = useQuery({
+    queryKey: ['spaces'],
+    queryFn: listSpaces,
+    enabled: landing === 'current_project',
+    staleTime: 30_000,
+  });
+
+  if (!settled) return <LandingFallback />;
+  if (landing === 'last_conversation') {
+    const last = lastChatSession();
+    return <Navigate to={last ? `/chat/${encodeURIComponent(last)}` : '/home'} replace />;
+  }
+  if (landing === 'current_project') {
+    if (spaces.isPending && !waitedOut) return <LandingFallback />;
+    const current = currentProject(spaces.data ?? []);
+    return <Navigate to={current ? `/workspaces/${encodeURIComponent(current.id)}` : '/home'} replace />;
+  }
+  return <Navigate to="/home" replace />;
+}
+
+function LandingFallback() {
+  return <div className="flex min-h-48 items-center justify-center text-body text-muted" aria-busy="true" />;
+}
+
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
@@ -112,7 +162,8 @@ export function App() {
           <Route path="/notch" element={<NotchSurface />} />
 
           <Route element={<AppShell />}>
-            <Route index element={<Navigate to="/chat" replace />} />
+            <Route index element={<LandingRedirect />} />
+            <Route path="/home" element={<Home />} />
 
             <Route path="/chat" element={<ChatScreen />}>
               <Route index element={<Chat />} />
@@ -143,7 +194,7 @@ export function App() {
             <Route path="/settings" element={deferred(<Settings />)} />
             <Route path="/help" element={deferred(<Help />)} />
 
-            <Route path="*" element={<Navigate to="/chat" replace />} />
+            <Route path="*" element={<Navigate to="/home" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>

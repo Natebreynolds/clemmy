@@ -153,7 +153,7 @@ function WorkspaceChooserCard({ chooser, index, acting, disabled, onChoose }: {
   return (
     <article class="card card-approval rise" style={{ '--i': index }}>
       <header class="card-head">
-        <span class="chip chip-plan">Workspace</span>
+        <span class="chip chip-kind">Workspace · needs a choice</span>
         <span class="card-when">{relativeTime(chooser.createdAt)}</span>
       </header>
       <h2 class="card-title">I need your help choosing where these records should live.</h2>
@@ -195,7 +195,7 @@ function PlanCard({ row, index, acting, disabled, onAct, onReply }: {
   return (
     <article id={`inbox-plan:${row.id}`} class="card card-plan rise" style={{ '--i': index }} tabIndex={-1}>
       <header class="card-head">
-        <span class="chip chip-plan">Plan ready</span>
+        <span class="chip chip-kind">Plan · ready to start</span>
         <span class="card-when">{relativeTime(row.proposedAt)}</span>
       </header>
       <h2 class="card-title">I made a plan for “{row.objective}.”</h2>
@@ -263,7 +263,7 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
   return (
     <article id={`inbox-approval:${row.approvalId}`} class="card card-approval rise" style={{ '--i': index }} tabIndex={-1}>
       <header class="card-head">
-        <span class="chip chip-tool">{approvalKindLabel(row.tool)}</span>
+        <span class="chip chip-kind">Approval · {approvalKindLabel(row.tool)}</span>
         <span class="card-when">
           {relativeTime(row.requestedAt)} ·{' '}
           <time class="card-expiry" dateTime={row.expiresAt} title={new Date(row.expiresAt).toLocaleString()}>

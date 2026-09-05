@@ -4458,6 +4458,28 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // same workspace, and the UI says so rather than pretending to be the
   // desktop.
 
+  // Home preferences — the same per-user record the desktop console edits
+  // (panes, nav, landing, quick actions, phone switcher). Read/write only;
+  // no execution authority lives here.
+  router.get('/api/settings/home', requireMobileSession, async (_req, res) => {
+    try {
+      const { loadHomePreferences } = await import('../runtime/home-preferences.js');
+      res.json({ home: loadHomePreferences() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch('/api/settings/home', requireMobileSession, async (req, res) => {
+    try {
+      const { saveHomePreferences } = await import('../runtime/home-preferences.js');
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      res.json({ home: saveHomePreferences(body) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.get('/api/workspaces', requireMobileSession, async (_req, res) => {
     try {
       const { spaceStore } = await import('../spaces/store.js');

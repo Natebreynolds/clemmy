@@ -1,23 +1,70 @@
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { ChevronRight } from 'lucide-react';
-import { PRIMARY_NAV, ADVANCED_NAV, DEVELOPER_NAV, FOOTER_NAV, type NavDest } from '@/lib/nav';
-import { apiGet } from '@/lib/api';
+import { ChevronRight, Ellipsis } from 'lucide-react';
+import { resolveSidebarNav, type NavDest } from '@/lib/nav';
+import { DEFAULT_HOME_PREFERENCES, useHomePreferences } from '@/lib/home-prefs';
 import { usePoll } from '@/lib/poll';
 import { getSettings } from '@/lib/settings';
 import { DogMark } from './DogMark';
 import { cn } from '@/lib/cn';
 
-function NavRow({ dest, collapsed, badge }: { dest: NavDest; collapsed: boolean; badge?: number }) {
+/**
+ * The sidebar the user shapes: pinned, then shown, then a "More" fold —
+ * all from HomePreferences.nav (persisted server-side, so the phone agrees).
+ * Two per-window conveniences live in localStorage: whether the rail is
+ * collapsed and whether More is open. Both are best-effort (private window,
+ * cleared site data) and the sidebar renders correctly without them.
+ */
+const COLLAPSED_PREF_KEY = 'clem.sidebar.collapsed';
+const MORE_PREF_KEY = 'clem.sidebar.more';
+
+export function readSidebarCollapsed(): boolean {
+  try { return localStorage.getItem(COLLAPSED_PREF_KEY) === 'collapsed'; } catch { return false; }
+}
+
+export function writeSidebarCollapsed(collapsed: boolean): void {
+  try { localStorage.setItem(COLLAPSED_PREF_KEY, collapsed ? 'collapsed' : 'open'); } catch { /* preference only */ }
+}
+
+function readMoreOpen(): boolean {
+  try { return localStorage.getItem(MORE_PREF_KEY) === 'open'; } catch { return false; }
+}
+
+function writeMoreOpen(open: boolean): void {
+  try { localStorage.setItem(MORE_PREF_KEY, open ? 'open' : 'closed'); } catch { /* preference only */ }
+}
+
+function formatBadge(n: number): string {
+  return n > 99 ? '99+' : String(n);
+}
+
+function NavRow({
+  dest,
+  collapsed,
+  badge,
+  badgeTone = 'primary',
+  badgeLabel,
+}: {
+  dest: NavDest;
+  collapsed: boolean;
+  badge?: number;
+  /** Primary = someone is waiting on you; muted = purely informational. */
+  badgeTone?: 'primary' | 'muted';
+  /** Screen-reader phrasing for the count, e.g. "2 waiting on you". */
+  badgeLabel?: string;
+}) {
   const Icon = dest.icon;
+  const showBadge = typeof badge === 'number' && badge > 0;
+  const badgeClass = badgeTone === 'primary' ? 'bg-primary text-primary-fg' : 'bg-subtle text-muted';
   return (
     <NavLink
       to={dest.path}
       title={collapsed ? `${dest.label} — ${dest.hint}` : dest.hint}
+      aria-label={showBadge && badgeLabel ? `${dest.label}, ${badgeLabel}` : undefined}
       className={({ isActive }) =>
         cn(
-          'group relative flex items-center gap-3 rounded-md px-3 py-2.5 text-body font-medium transition-colors duration-fast cursor-pointer',
-          collapsed && 'justify-center px-0',
+          'group relative flex h-10 items-center gap-3 rounded-sm px-3 text-body font-medium transition-colors duration-fast cursor-pointer',
+          collapsed && 'w-11 justify-center px-0',
           isActive
             ? 'bg-primary-tint text-primary'
             : 'text-muted hover:bg-hover hover:text-fg',
@@ -31,37 +78,72 @@ function NavRow({ dest, collapsed, badge }: { dest: NavDest; collapsed: boolean;
           )}
           <Icon className="h-5 w-5 shrink-0" aria-hidden />
           {!collapsed && <span className="truncate">{dest.label}</span>}
-          {!collapsed && badge ? (
-            <span className="ml-auto inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
-              {badge > 99 ? '99+' : badge}
+          {showBadge && !collapsed && (
+            <span
+              className={cn('ml-auto inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-caption font-bold', badgeClass)}
+              aria-hidden
+            >
+              {formatBadge(badge)}
             </span>
-          ) : null}
+          )}
+          {showBadge && collapsed && (
+            <span
+              className={cn(
+                'absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold leading-none',
+                badgeClass,
+              )}
+              aria-hidden
+            >
+              {formatBadge(badge)}
+            </span>
+          )}
         </>
       )}
     </NavLink>
   );
 }
 
-export function Sidebar({ collapsed }: { collapsed: boolean }) {
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+export function Sidebar({
+  collapsed,
+  needsYouCount,
+  runningCount = 0,
+}: {
+  collapsed: boolean;
+  /** The ONE needs-you count, from AppShell's presentWorkingNow view. The
+   *  sidebar renders it verbatim and never derives its own. */
+  needsYouCount: number;
+  /** Same source; shown muted on Running as a plain count, not a summons. */
+  runningCount?: number;
+}) {
+  const [moreOpen, setMoreOpen] = useState<boolean>(readMoreOpen);
+  const toggleMore = () => {
+    setMoreOpen((v) => {
+      writeMoreOpen(!v);
+      return !v;
+    });
+  };
 
-  // Live Inbox badge: pending approvals (best-effort).
-  const approvals = usePoll(
-    ['approvals-count'],
-    () => apiGet<{ count?: number; urgentCount?: number; approvals?: unknown[] }>('/api/console/approvals/list'),
-    8000,
-  );
-  // Aged-out approvals (48h+ unanswered, nothing parked on them) stay
-  // approvable in the Inbox but stop inflating the badge.
-  const pending = approvals.data?.urgentCount
-    ?? approvals.data?.count
-    ?? approvals.data?.approvals?.length
-    ?? 0;
-
-  // Developer panel is opt-in (Settings → Developer mode); only then does the
-  // "Developer" item appear under Advanced.
+  const prefs = useHomePreferences();
+  // Developer mode only widens what a preference path may resolve to; it
+  // never adds a group of its own (power tools live behind Settings).
   const settings = usePoll(['settings'], getSettings, 0);
-  const advancedNav = settings.data?.developerMode ? [...ADVANCED_NAV, DEVELOPER_NAV] : ADVANCED_NAV;
+  const nav = resolveSidebarNav(prefs.data ?? DEFAULT_HOME_PREFERENCES, {
+    developerMode: settings.data?.developerMode === true,
+  });
+
+  const badgeFor = (dest: NavDest) => {
+    if (dest.path === '/inbox') {
+      return { badge: needsYouCount, badgeTone: 'primary' as const, badgeLabel: `${needsYouCount} waiting on you` };
+    }
+    if (dest.path === '/tasks') {
+      return { badge: runningCount, badgeTone: 'muted' as const, badgeLabel: `${runningCount} running` };
+    }
+    return {};
+  };
+
+  const renderRows = (dests: NavDest[]) => dests.map((d) => (
+    <NavRow key={d.path} dest={d} collapsed={collapsed} {...badgeFor(d)} />
+  ));
 
   return (
     <nav
@@ -76,39 +158,46 @@ export function Sidebar({ collapsed }: { collapsed: boolean }) {
         {!collapsed && <span className="text-h3 font-bold text-fg">Clementine</span>}
       </div>
 
-      <div className="flex-1 space-y-1 overflow-y-auto px-3 py-2">
-        {PRIMARY_NAV.map((d) => (
-          <NavRow key={d.path} dest={d} collapsed={collapsed} badge={d.path === '/inbox' ? pending : undefined} />
-        ))}
+      <div className={cn('flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-2', collapsed && 'items-center px-0')}>
+        {renderRows(nav.pinned)}
+        {renderRows(nav.shown)}
 
-        <div className="pt-3">
-          <button
-            type="button"
-            onClick={() => setAdvancedOpen((v) => !v)}
-            className={cn(
-              'flex w-full items-center gap-3 rounded-md px-3 py-2 text-small font-semibold text-faint transition-colors hover:bg-hover hover:text-muted cursor-pointer',
-              collapsed && 'justify-center px-0',
-            )}
-            aria-expanded={advancedOpen}
-            title="Advanced"
-          >
-            <ChevronRight className={cn('h-4 w-4 transition-transform duration-fast', advancedOpen && 'rotate-90')} aria-hidden />
-            {!collapsed && <span>Advanced</span>}
-          </button>
-          {advancedOpen && !collapsed && (
-            <div className="mt-1 space-y-1">
-              {advancedNav.map((d) => (
-                <NavRow key={d.path} dest={d} collapsed={false} />
-              ))}
+        {nav.more.length > 0 && (
+          <div className={cn('flex flex-col gap-1 pt-2', collapsed && 'items-center')}>
+            <button
+              type="button"
+              onClick={toggleMore}
+              className={cn(
+                'flex h-10 items-center gap-3 rounded-sm px-3 text-body font-medium text-faint transition-colors duration-fast hover:bg-hover hover:text-muted cursor-pointer',
+                collapsed ? 'w-11 justify-center px-0' : 'w-full',
+                moreOpen && 'text-muted',
+              )}
+              aria-expanded={moreOpen}
+              aria-controls="sidebar-more"
+              aria-label={collapsed ? (moreOpen ? 'Hide more destinations' : 'Show more destinations') : undefined}
+              title={collapsed ? 'More' : undefined}
+            >
+              {collapsed ? (
+                <Ellipsis className="h-5 w-5" aria-hidden />
+              ) : (
+                <>
+                  <ChevronRight className={cn('h-5 w-5 transition-transform duration-fast', moreOpen && 'rotate-90')} aria-hidden />
+                  <span>More</span>
+                </>
+              )}
+            </button>
+            <div
+              id="sidebar-more"
+              className={cn(moreOpen ? 'flex' : 'hidden', 'flex-col gap-1', collapsed && 'items-center')}
+            >
+              {renderRows(nav.more)}
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
-      <div className="space-y-1 border-t border-border px-3 py-3">
-        {FOOTER_NAV.map((d) => (
-          <NavRow key={d.path} dest={d} collapsed={collapsed} />
-        ))}
+      <div className={cn('flex flex-col gap-1 border-t border-border px-3 py-3', collapsed && 'items-center px-0')}>
+        {renderRows(nav.footer)}
       </div>
     </nav>
   );

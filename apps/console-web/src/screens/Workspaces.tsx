@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Plus, Clock, Database, Zap, History, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
@@ -107,6 +107,16 @@ export function Workspaces() {
   const navigate = useNavigate();
   const spaces = usePoll(['spaces'], listSpaces, 8000);
   const [modalOpen, setModalOpen] = useState(false);
+  // Home's 'New project' lands here with ?new=1: open the create dialog once,
+  // then drop the flag so a refresh does not reopen it.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.get('new') !== '1') return;
+    setModalOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete('new');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   // On create, carry the build request to the view as route state so the dock
   // seeds Clem with it immediately (no cold context-switch to chat).

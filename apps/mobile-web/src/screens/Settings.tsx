@@ -33,10 +33,12 @@ import { ScreenNotice } from '../components/ScreenNotice';
  * reaches me" notification preferences, quiet hours, approval posture, the
  * cost section, schedule pause.
  */
-export function Settings({ door, doorCopy, onSignOut }: {
+export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
   door: ConnectionDoor;
   doorCopy: { label: string; hint: string };
   onSignOut: () => Promise<void> | void;
+  /** Opens the shell's customize-home sheet (ONE sheet, shared with Home). */
+  onCustomize: () => void;
 }) {
   const devices = useScreenData(listDevices);
   const daemon = useScreenData(getDaemonStatus);
@@ -69,6 +71,17 @@ export function Settings({ door, doorCopy, onSignOut }: {
         onRetry={() => void retryAll()}
         hasData={Boolean(devices.data || daemon.data || models.data || connections.data)}
       />
+
+      <section class="card settings-card" aria-label="Home">
+        <h2 class="settings-card-title">Home</h2>
+        <button type="button" class="settings-row" onClick={() => { haptic('light'); onCustomize(); }}>
+          <span class="settings-row-main">
+            <span class="settings-row-label">Customize your home</span>
+            <span class="settings-row-note">Panes, the title switcher, what opens on launch, quick actions. Same as your desktop.</span>
+          </span>
+          <span class="settings-row-action">Open</span>
+        </button>
+      </section>
 
       <NotificationsCard />
 

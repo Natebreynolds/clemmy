@@ -1,30 +1,45 @@
 import { useEffect, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
-import { Sidebar } from './Sidebar';
+import { Sidebar, readSidebarCollapsed, writeSidebarCollapsed } from './Sidebar';
 import { TopBar } from './TopBar';
 import { CommandPalette } from './CommandPalette';
+import { CustomizePanel } from './home/CustomizePanel';
 import { VoiceOverlay } from './VoiceOverlay';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
-import { ALL_NAV } from '@/lib/nav';
+import { ALL_NAV, DEVELOPER_NAV } from '@/lib/nav';
 import { usePoll } from '@/lib/poll';
+import { apiGet } from '@/lib/api';
+import type { CommandCenter } from '@/lib/types';
 import { listWorkingNowSnapshot } from '@/lib/activity';
 import { presentWorkingNow } from '@/lib/activity-presentation';
 
+const NARROW_QUERY = '(max-width: 720px)';
+
 function titleForPath(pathname: string): string {
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
-  const match = [...ALL_NAV]
+  const match = [...ALL_NAV, DEVELOPER_NAV]
     .sort((a, b) => b.path.length - a.path.length)
     .find((d) => pathname === d.path || pathname.startsWith(d.path + '/'));
   return match?.label ?? 'Clementine';
 }
 
 export function AppShell() {
+  // A narrow window always starts collapsed; otherwise the user's last
+  // choice (localStorage, best-effort) wins.
   const [collapsed, setCollapsed] = useState(() => (
-    typeof window !== 'undefined' ? window.matchMedia('(max-width: 720px)').matches : false
+    typeof window !== 'undefined' && window.matchMedia(NARROW_QUERY).matches
+      ? true
+      : readSidebarCollapsed()
   ));
+  const toggleSidebar = () => {
+    setCollapsed((v) => {
+      writeSidebarCollapsed(!v);
+      return !v;
+    });
+  };
   const location = useLocation();
   const title = titleForPath(location.pathname);
 
@@ -35,6 +50,11 @@ export function AppShell() {
   // entries. The conversation the user is currently watching is omitted in
   // the presenter call: its bubble already narrates itself.
   const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, 12_000);
+  // ONE needs-you number for every badge: the command center's decision-shaped
+  // list (the same query Home and Chat render), never the presenter's broader
+  // 'needs attention' bucket — two denominators on one screen was the clutter.
+  const commandCenter = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
+  const needsYouCount = commandCenter.data?.needsYou?.length ?? 0;
   const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
   const currentChatSession = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
   const workingView = presentWorkingNow(
@@ -49,7 +69,8 @@ export function AppShell() {
   const [needsLogin, setNeedsLogin] = useState(false);
 
   useEffect(() => {
-    const media = window.matchMedia('(max-width: 720px)');
+    const media = window.matchMedia(NARROW_QUERY);
+    // Forced by the viewport, not chosen — so it is not persisted.
     const sync = () => { if (media.matches) setCollapsed(true); };
     sync();
     media.addEventListener('change', sync);
@@ -71,15 +92,19 @@ export function AppShell() {
         Skip to content
       </a>
 
-      <Sidebar collapsed={collapsed} />
+      <Sidebar
+        collapsed={collapsed}
+        needsYouCount={needsYouCount}
+        runningCount={workingView.running}
+      />
 
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar
           title={title}
           sidebarCollapsed={collapsed}
-          onToggleSidebar={() => setCollapsed((v) => !v)}
+          onToggleSidebar={toggleSidebar}
           runningCount={workingView.running}
-          needsYouCount={workingView.needsYou}
+          needsYouCount={needsYouCount}
           onOpenTasks={() => navigate('/tasks')}
         />
         <LocalRecordingBanner />
@@ -107,8 +132,8 @@ export function AppShell() {
         </main>
       </div>
 
-
       <CommandPalette />
+      <CustomizePanel />
       <VoiceOverlay />
       <UpdaterBanner />
     </div>

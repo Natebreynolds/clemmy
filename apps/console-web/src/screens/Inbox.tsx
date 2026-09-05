@@ -152,7 +152,7 @@ export function Inbox() {
       setDecisionStates((prev) => ({ ...prev, [id]: { busy: false, notice } }));
       setDecisionNotice(notice);
     } finally {
-      invalidate('approvals', 'approvals-count', 'command-center');
+      invalidate('approvals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
   const toggleChecked = (id: string) => setChecked((prev) => {
@@ -212,7 +212,7 @@ export function Inbox() {
         }),
       });
       setBulkBusy(false);
-      invalidate('approvals', 'approvals-count', 'command-center');
+      invalidate('approvals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
   const onCancelStale = async () => {
@@ -223,7 +223,7 @@ export function Inbox() {
     } catch (error) {
       setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not clear stale approvals.') });
     } finally {
-      invalidate('approvals', 'approvals-count');
+      invalidate('approvals', 'approvals-count', 'working-now-badge', 'command-center');
     }
   };
   const onChooseWorkspace = async (chooser: WorkspaceDestinationChooser, choiceId: string) => {
@@ -243,7 +243,7 @@ export function Inbox() {
       });
     } finally {
       setChooserBusy(null);
-      invalidate('workspace-choosers', 'approvals', 'approvals-count', 'command-center');
+      invalidate('workspace-choosers', 'approvals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
   const onDecideTrust = async (row: TrustProposalRow, decision: 'approve' | 'decline') => {
@@ -276,7 +276,7 @@ export function Inbox() {
     } finally {
       trustLockRef.current = null;
       setTrustBusy(null);
-      invalidate('trust-proposals', 'approvals-count', 'command-center');
+      invalidate('trust-proposals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
   const onDecidePlan = async (id: string, decision: 'approve' | 'reject') => {
@@ -295,7 +295,7 @@ export function Inbox() {
       setDecisionNotice({ tone: 'error', text: actionError(error, `Could not ${decision} that plan.`) });
     } finally {
       setPlanBusy(null);
-      invalidate('plan-proposals', 'approvals-count', 'command-center');
+      invalidate('plan-proposals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
   const onAnswerQuestion = async (row: InboxQuestionRow, option?: string) => {

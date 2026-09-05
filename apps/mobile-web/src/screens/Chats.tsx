@@ -13,15 +13,21 @@ export interface ChatHandoff {
   session?: ChatSession;
   sessionId?: string;
   title?: string;
+  /** Open the most recent conversation once the list has loaded (the
+   *  "last conversation" launch preference). */
+  openLatest?: boolean;
 }
 
 interface Props {
   /** Home hands over a question to ask, or a thread to open. Consumed once. */
   handoff?: ChatHandoff | null;
   onHandoffConsumed?: () => void;
+  /** The shell shows the floating ask capsule only over the LIST — an open
+   *  thread has its own composer. */
+  onListVisibleChange?: (visible: boolean) => void;
 }
 
-export function Chats({ handoff, onHandoffConsumed }: Props) {
+export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
   const [selectedTitle, setSelectedTitle] = useState<string | undefined>();
@@ -32,6 +38,7 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
   };
   useBackGesture(selectedId !== null, closeSelected);
   const [composing, setComposing] = useState<{ draft?: string; autoSend?: boolean } | null>(null);
+  const [pendingLatest, setPendingLatest] = useState(false);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.
   const listVisible = !composing && !selectedId;
@@ -40,6 +47,22 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
     { intervalMs: 8000, disabled: !listVisible },
   );
   const sessions = data?.sessions ?? [];
+
+  useEffect(() => {
+    onListVisibleChange?.(listVisible);
+    return () => onListVisibleChange?.(false);
+  }, [listVisible, onListVisibleChange]);
+
+  // "Open on launch: last conversation" — resolved from the same list the
+  // screen renders, once it has actually loaded. An empty list stays a list.
+  useEffect(() => {
+    if (!pendingLatest || !data) return;
+    setPendingLatest(false);
+    const latest = data.sessions[0];
+    if (!latest) return;
+    setSelectedId(latest.id);
+    setSelectedTitle(latest.title);
+  }, [pendingLatest, data]);
 
   // An ask typed on Home opens straight into a new chat with the text
   // already in the composer; a tapped thread opens that thread.
@@ -54,6 +77,7 @@ export function Chats({ handoff, onHandoffConsumed }: Props) {
       setSelectedTitle(handoff.title);
       setSelectedDraft(handoff.draft);
     }
+    else if (handoff.openLatest) setPendingLatest(true);
     else setComposing({ draft: handoff.draft, autoSend: handoff.autoSend });
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
