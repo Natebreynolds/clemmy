@@ -31,7 +31,13 @@ writeFileSync(fakeSf, [
   'process.stdout.write("sf mock\\n");',
 ].join('\n'), 'utf8');
 chmodSync(fakeSf, 0o700);
-process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ''}`;
+const spawnEnv = await import('../runtime/spawn-env.js');
+// Daemon-side resolution walks augmentPath(PATH), which PREPENDS the well-known
+// tool dirs (/usr/local/bin, /opt/homebrew/bin, ...) ahead of anything not
+// already on PATH. On a host whose shell PATH lacks one of those dirs, a real
+// `sf` installed there outranks this fixture and the reviewed read hashes the
+// real binary. Augment first (idempotent), then put the fixture in front.
+process.env.PATH = `${binDir}${path.delimiter}${spawnEnv.augmentPath(process.env.PATH)}`;
 
 const catalog = await import('../integrations/cli-catalog/catalog.js');
 const reconcile = await import('../runtime/harness/catalog-reviewed-cli-reconcile.js');
