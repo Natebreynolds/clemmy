@@ -11,6 +11,7 @@
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { workspaceFixtureDay } from './northstar-local-llm-content-workspace.clock.fixture.js';
 
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
 import { closeEventLog, listEvents, openEventLog } from '../runtime/harness/eventlog.js';
@@ -48,7 +49,7 @@ const SKILL_RULE_MARKER = 'SOURCE-DATED-CALENDAR-ONE-IDEA-PER-POST';
 type Input = {
   sessionId: string;
   sourceUserSeq: number;
-  planningDigest: string;
+  authorityDigest: string;
 };
 
 type ResearchRow = {
@@ -65,7 +66,7 @@ function parseInput(): Input {
   const value = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Partial<Input>;
   assert.equal(typeof value.sessionId, 'string');
   assert.ok(Number.isSafeInteger(value.sourceUserSeq) && Number(value.sourceUserSeq) > 0);
-  assert.match(String(value.planningDigest), /^[a-f0-9]{64}$/);
+  assert.match(String(value.authorityDigest), /^[a-f0-9]{64}$/);
   return value as Input;
 }
 
@@ -170,7 +171,7 @@ function nestedNews(value: unknown, depth = 0): Array<Record<string, unknown>> |
 }
 
 function selectedResearch(result: string): ResearchRow[] {
-  const retrieval = Date.parse('2026-08-31T00:00:00.000Z');
+  const retrieval = Date.parse(`${workspaceFixtureDay(0)}T00:00:00.000Z`);
   const seen = new Set<string>();
   const selected: ResearchRow[] = [];
   for (const row of nestedNews(result) ?? []) {
@@ -202,11 +203,11 @@ function selectedResearch(result: string): ResearchRow[] {
 }
 
 const POSTS = [
-  { id: 'post-1', date: '2026-09-01', channel: 'LinkedIn', theme: 'Why local now', body: 'Local LLM processing is becoming a product decision, not a novelty demo. Start with the moments that benefit from private context, responsive interaction, or resilience through weak connectivity, then benchmark those moments on the devices people actually use.' },
-  { id: 'post-2', date: '2026-09-03', channel: 'X', theme: 'Hybrid architecture', body: 'A practical local-LLM architecture is rarely all-local or all-cloud. Keep the fast, sensitive, repeatable loop near the user and escalate only when additional reasoning clearly earns the network trip and remains visibly recoverable.' },
-  { id: 'post-3', date: '2026-09-08', channel: 'LinkedIn', theme: 'Prototype with evidence', body: 'Prototype one narrow local-model workflow with a measurable before-and-after. Track latency, quality, battery cost, memory pressure, and fallback behavior before turning an impressive demo into a durable product promise.' },
-  { id: 'post-4', date: '2026-09-10', channel: 'X', theme: 'Choose for the device', body: 'Small models make device constraints first-class design inputs. Context window, memory footprint, evaluation set, device class, and recovery path belong in one decision record that teams can test and revisit.' },
-  { id: 'post-5', date: '2026-09-15', channel: 'LinkedIn', theme: 'Trust through boundaries', body: 'Local inference can reduce unnecessary data movement, but deployment location alone does not create trust. Define allowed actions, visible decisions, disclosed fallback, and correction paths before making privacy claims.' },
+  { id: 'post-1', date: workspaceFixtureDay(1), channel: 'LinkedIn', theme: 'Why local now', body: 'Local LLM processing is becoming a product decision, not a novelty demo. Start with the moments that benefit from private context, responsive interaction, or resilience through weak connectivity, then benchmark those moments on the devices people actually use.' },
+  { id: 'post-2', date: workspaceFixtureDay(3), channel: 'X', theme: 'Hybrid architecture', body: 'A practical local-LLM architecture is rarely all-local or all-cloud. Keep the fast, sensitive, repeatable loop near the user and escalate only when additional reasoning clearly earns the network trip and remains visibly recoverable.' },
+  { id: 'post-3', date: workspaceFixtureDay(8), channel: 'LinkedIn', theme: 'Prototype with evidence', body: 'Prototype one narrow local-model workflow with a measurable before-and-after. Track latency, quality, battery cost, memory pressure, and fallback behavior before turning an impressive demo into a durable product promise.' },
+  { id: 'post-4', date: workspaceFixtureDay(10), channel: 'X', theme: 'Choose for the device', body: 'Small models make device constraints first-class design inputs. Context window, memory footprint, evaluation set, device class, and recovery path belong in one decision record that teams can test and revisit.' },
+  { id: 'post-5', date: workspaceFixtureDay(15), channel: 'LinkedIn', theme: 'Trust through boundaries', body: 'Local inference can reduce unnecessary data movement, but deployment location alone does not create trust. Define allowed actions, visible decisions, disclosed fallback, and correction paths before making privacy claims.' },
 ] as const;
 
 function evidenceTheme(finding: string): string {
@@ -242,7 +243,7 @@ function campaignDataset(articles: readonly ResearchRow[]) {
     synthesis: {
       appliedSkill: 'technical-content-marketing', appliedRuleMarker: SKILL_RULE_MARKER,
     },
-    research: { retrievedAt: '2026-08-31', windowDays: 30, articles },
+    research: { retrievedAt: workspaceFixtureDay(0), windowDays: 30, articles },
     calendar: POSTS.map(({ id, date, channel, theme }) => ({ id, date, channel, theme })),
     posts,
     _mobile: {
@@ -404,7 +405,11 @@ const rePrimed = await primePrimaryModelPlanningCatalog({
   sourceUserSeq: input.sourceUserSeq,
 });
 if (!rePrimed.ok) throw new Error(rePrimed.reason);
-assert.equal(rePrimed.planning.digest, input.planningDigest);
+assert.equal(phaseARecovery.acceptedModelBatchRef?.authorityDigest, input.authorityDigest);
+const reopenedRoot = openEventLog().prepare('SELECT authority_digest FROM accepted_turn_call_authorities WHERE session_id = ? AND source_user_seq = ?')
+  .get(input.sessionId, input.sourceUserSeq) as { authority_digest: string };
+assert.equal(reopenedRoot.authority_digest, input.authorityDigest,
+  'refreshing the discovery projection must preserve the exact durable call authority');
 
 let modelCalls = 0;
 let selected: ResearchRow[] = [];
@@ -582,7 +587,7 @@ assert.equal(listEvents(input.sessionId, { types: ['conversation_completed'] })
 
 const result = {
   pid: process.pid,
-  planningDigest: rePrimed.planning.digest,
+  authorityDigest: reopenedRoot.authority_digest,
   modelCalls,
   workspaceVersion: workspace.version,
   postCount: data.posts?.length ?? 0,

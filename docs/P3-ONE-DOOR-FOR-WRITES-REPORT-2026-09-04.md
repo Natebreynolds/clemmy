@@ -126,6 +126,45 @@ do not satisfy this list.
 
 ## Release status
 
+### Reviewer §12 23:06 — current-byte verification and correction
+
+The owner prioritized this family before live replay. Measured on `5b8dd86a`
+plus the explicitly uncommitted worker fixes (no live daemon):
+
+- The exact Search → verified Batch → Workspace journey failed, exit 1,
+  `/private/tmp/p3-workspace-head-reviewer-recheck.log`. Its actual diagnostic was
+  `work_source_selection_invalid`, not external-write attestation/consent.
+- A temporary diagnostic, removed before commit, measured accepted
+  `asOf=2026-09-05T06:11:07.300Z`, first post dates September 1 and 3, and a valid
+  desktop view. The existing calendar contract rejects past publication dates;
+  that validator is byte-identical in candidate `64c3bfa5`. This is stale fixture
+  content, not evidence that P3 mistyped a local create as external. The reviewer
+  independently corrected the regression attribution in §12 23:15.
+- Fixture content now uses one reference day inherited by cold-process fixtures:
+  recent publications stay recent, stale negatives stay stale, and campaign dates
+  retain the original 1/3/8/10/15-day offsets. Runtime clocks, leases, consent and
+  payload validation are unchanged. Exact Search → Batch → create is GREEN 1/1,
+  real exit 0, `/private/tmp/p3-workspace-relative-dates-first.log`.
+- Full family then measured 12/15, exit 1. Two remaining assertions incorrectly
+  froze the initial empty planning-card projection. They now assert the immutable
+  accepted call-authority digest/root, retain all exact writes/receipts/zero-replay
+  checks, and pass both real-process recoveries: 2/2, exit 0,
+  `/private/tmp/p3-workspace-recovery-authority-green.log`.
+- One real cleanup issue remains assigned: completed async cold recovery leaves
+  `runInFlightSince()` non-null although its private recovery state is gone and
+  its Workspace committed exactly once. No full-family green claim yet.
+- The cited new unit failure already passes on current bytes: all five tests in
+  `plan-tools-completeness.red.test.ts`, exit 0,
+  `/private/tmp/p3-plan-head-reviewer-recheck.log`. `cf50388e` changed that producer
+  and fixture after the review's tested `72565801`; no second speculative fix.
+
+The four new journey failures are reproduced separately, real exit 1
+(`/private/tmp/p3-four-journeys-current.log`). Two still require the removed
+hidden-until-plan worker surface; one maps Home `transferred` to error; one calls
+created-resource target lineage `dataFrom` despite literal, user-supplied content.
+They remain assigned; neither the stale-unit attribution nor the Workspace
+correction waives those failures.
+
 Reviewer heavy-gate measurements on `64c3bfa5` are baseline evidence, not results
 on final P3 bytes. Preserve their exact counts and exits in direction §12. Re-emit
 implementation artifacts once the implementation settles and run verification

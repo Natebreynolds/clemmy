@@ -1812,3 +1812,89 @@ assert the refusal receipt, not the tool's absence). If it was not deliberate, i
 a regression. Early-vs-late P2 split (`4ed325eb`) follows. Ignore "GATE scheduling
 latency … p95" in this run: it failed under three concurrent test runs on one
 machine (CPU contention), not on the candidate's full run.
+
+**2026-09-04 23:06 — FULL RELEASE-GATE TALLY on candidate `64c3bfa5` (detached checkout, isolated
+homes, real exit codes) + what HEAD changed since.** Light gates 4/4 ✅ ·
+proof:selftest 239/239 ✅ · test:measurement 97/97 ✅ · bench:gates ✅ · eval:memory ✅ ·
+eval:passk strict 100% ✅ · eval:jobs ✅ · **npm test 14,418 pass / 3 fail ❌** ·
+**journeys 143/159 ❌**. The three unit failures: "daemon rehash reprovisions the
+reviewed read when executable bytes drift" (`catalog-reviewed-cli-reconcile`:
+`skipped:[salesforce]` where a reprovision was expected — machine-state-sensitive,
+classification vs baseline running), "private key is written 0600" (`mobile-tls`:
+mode 0644 !== 0600 — same), "mixed-source read-only plan refuses before persistence,
+then exact write retry admits" (`plan-tools-completeness.red`: nested
+"Call tool_search exactly once" mismatch; this file was later changed by
+`cf50388e`, so re-check on HEAD). **Attribution finished:** all 4 new journey
+failures are already present at the P2-frozen SHA `4ed325eb` → the two P2 ones were
+introduced EARLY in P2 (between `2bd49667` 21:05 and `4ed325eb` 21:42), i.e. by the
+free-the-turn commits that advertise `run_worker` in the primary loop.
+**HEAD (`72565801`) is WORSE on the same 9 files: 22 failing names vs 15 on the
+candidate.** New on HEAD — the whole `northstar-local-llm-content-workspace`
+family (6 tests) now fails with `host_tool_disposition_v1 disposition:
+refused_pre_dispatch, effect: none` where `/Created workspace/` was expected, plus
+one uncaught AssertionError in "a settled Firecrawl result survives a true cold
+process" (turn ended `error` with retained handles). A LOCAL Workspace create is
+being refused at the pre-dispatch door on HEAD — most likely the same-step consent
+path (`f616da92`) or the shared consent evidence (`ddccda93`/`8cb61013`) treating a
+local mutation as an unattested external write. This is a forward-only regression
+on the owner's canonical local flow (Search → Batch → Workspace) — fix before
+anything else in P3; the journeys are the pin. Ignore "GATE scheduling latency p95"
+on HEAD — contention artifact (three concurrent test runs). `304af7c7` (judge
+continuation budget carried in HostInterruptState/HostRecoveryState, bounds-checked
+on parse, pinned [1,1,2,2] across serialized recovery, reset only for a fresh
+source) — ACCEPTED; §16 fix #4 done.
+
+**2026-09-04 23:06 — the 3 npm-test failures CLASSIFIED (same 3 files at pre-today `38fa83ad`
+vs HEAD `72565801`):** "daemon rehash reprovisions the reviewed read…" and "private
+key is written 0600" fail on the pre-today baseline too → NOT today's; stable-red on
+this machine (CLI/PATH state and file-mode on this volume) — check them on the CI
+runner before deciding whether they are environment-only or real. "mixed-source
+read-only plan refuses before persistence, then exact write retry admits" PASSES on
+the baseline and fails on the candidate AND on HEAD → introduced today (P1/P2) and
+not repaired by `cf50388e`; it is a real gate failure for the tag. Net tag picture
+on the candidate: everything green except journeys (4 new + 11 old) and this one
+unit test (+2 machine-suspect); on HEAD add the Workspace-journey refusals.
+
+**2026-09-04 23:12 — `5b8dd86a` (continue incomplete local items in the existing loop) —
+ACCEPTED; closes the finding on `b699ad38`.** `local_work_incomplete` is now a
+continue reason; the continuation input names ONLY the missing accepted items and
+forbids re-running settled siblings or replaying writes; the host re-enters in the
+same loop (event `guardrail_tripped kind:local_work_continuation`, attempt-counted,
+never when the model asked for input/approval), and an unchanged missing set cannot
+spin (pinned: 7/8 → one same-loop repair → `done`; one accepted source owns the
+whole repair; calls=2). One note, not a finding: the re-entry is gated on the budget
+preset's `autoContinueOnLimit` like ceiling parks — for a bounded, local, read-only
+item repair (one attempt) the `standard` preset arguably should continue too; the
+owner's call. **Disk cleanup done by the reviewer (owner-authorized):** root volume
+327 MB → **67 GB free**. Removed: a cold session's 28 GB of `harness.db` copies, the
+npm cache (16 GB → 113 MB), 16 clean git worktrees older than two weeks (12 GB;
+branches untouched; the two dirty ones and the three recent ones kept), stale test
+homes. Untouched: the live home, all `/private/tmp/clem-*` and `clementine-p1-*`
+evidence homes (~7 GB — executing agent: prune the ones whose evidence is already
+retained in the P2/P3 reports when convenient).
+
+**2026-09-04 23:15 — CORRECTION to the 23:06 entry: the Workspace-family refusals are
+PRE-EXISTING, not a HEAD regression. Executing agent: do NOT treat them as a P3
+regression.** Evidence: running `northstar-local-llm-content-workspace.host-e2e`
+ALONE at the pre-today SHA `38fa83ad` → test 2 ("the exact prompt executes Search →
+verified Batch refinement → one visible Workspace") already fails with
+`refused_pre_dispatch` / `work_source_selection_invalid` ("structured Workspace
+create does not satisfy its frozen desktop, calendar, posts, and phone contract"),
+after which the node test runner aborts the whole file with "Unable to deserialize
+cloned data" — the same file-level crash seen in the full runs at the baseline AND
+the candidate. HEAD merely stopped crashing the runner, so the remaining Workspace
+tests became VISIBLE (8 red). So: (1) the 08-31 "156/171" number never counted these
+— real wave debt is larger than recorded; (2) the fix is the same in either case and
+belongs to the wave-debt decision, not to P3's ordering: either the frozen typed
+evidence contract for structured Workspace creates is right and the fixture's
+nomination must be brought up to it, or the contract over-refuses a legitimate
+one-result nomination (the refusal text asks for `source_call_ids` naming exactly
+one result present in accepted history + `source_record_ids` copied from
+`canonicalRecordIds`) — decide from the owner's canonical local flow, not from the
+fixture; (3) the "Unable to deserialize cloned data" runner crash is itself a defect
+worth one fix (a test reports a non-cloneable error object) because it hides
+results. Also on HEAD `5b8dd86a`: "mixed-source read-only plan refuses before
+persistence…" now PASSES (it was red on `64c3bfa5`/`72565801`), so the only
+today-introduced unit failure is resolved; the two machine-stable-red unit tests
+remain for the CI runner to classify. The 4 new journeys attributed to P1 / early
+P2 stand — they were measured on files that ran to completion.

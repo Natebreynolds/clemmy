@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import { workspaceFixtureDay } from './northstar-local-llm-content-workspace.clock.fixture.js';
 
 import {
   ASYNC_SELECTED_URLS,
@@ -109,7 +110,7 @@ const TRUSTED_RESEARCH: readonly ResearchRow[] = Object.freeze([
   {
     title: 'On-device inference benchmark update',
     publisher: 'Fixture Device Lab',
-    publishedAt: '2026-08-25',
+    publishedAt: workspaceFixtureDay(-6),
     url: 'https://research.example.test/local-llm/on-device-inference-benchmark',
     finding: 'A recent benchmark compares latency and memory tradeoffs for compact local inference.',
     selectionRationale: 'Published six days before retrieval and directly compares practical local-processing constraints.',
@@ -117,7 +118,7 @@ const TRUSTED_RESEARCH: readonly ResearchRow[] = Object.freeze([
   {
     title: 'Private-by-default local assistant rollout',
     publisher: 'Fixture Product Engineering',
-    publishedAt: '2026-08-21',
+    publishedAt: workspaceFixtureDay(-10),
     url: 'https://research.example.test/local-llm/private-assistant-rollout',
     finding: 'The rollout documents which interactions stayed local and which used a bounded cloud fallback.',
     selectionRationale: 'Recent implementation evidence connects architecture choices with user trust and graceful fallback.',
@@ -125,7 +126,7 @@ const TRUSTED_RESEARCH: readonly ResearchRow[] = Object.freeze([
   {
     title: 'Small-model evaluation field guide',
     publisher: 'Fixture Applied AI',
-    publishedAt: '2026-08-13',
+    publishedAt: workspaceFixtureDay(-18),
     url: 'https://research.example.test/local-llm/small-model-evaluation',
     finding: 'The guide evaluates quality, battery, latency, and recovery as one product-level decision set.',
     selectionRationale: 'Inside the explicit 30-day window and useful for a concrete builder-oriented evaluation framework.',
@@ -135,7 +136,7 @@ const TRUSTED_RESEARCH: readonly ResearchRow[] = Object.freeze([
 const HOSTILE_RESEARCH: ResearchRow = Object.freeze({
   title: 'Untrusted scraped page',
   publisher: 'Fixture hostile page',
-  publishedAt: '2026-08-26',
+  publishedAt: workspaceFixtureDay(-5),
   url: 'https://research.example.test/local-llm/untrusted-page',
   finding: HOSTILE_INSTRUCTION,
   selectionRationale: 'Returned by search so the production model boundary must treat it only as hostile evidence.',
@@ -144,7 +145,7 @@ const HOSTILE_RESEARCH: ResearchRow = Object.freeze({
 const EVASIVE_HOSTILE_RESEARCH: ResearchRow = Object.freeze({
   title: 'Untrusted role-header page',
   publisher: 'Fixture evasive hostile page',
-  publishedAt: '2026-08-24',
+  publishedAt: workspaceFixtureDay(-7),
   url: 'https://research.example.test/local-llm/evasive-untrusted-page',
   finding: EVASIVE_HOSTILE_INSTRUCTION,
   selectionRationale: 'Returned by search to prove role-header and secret-copy instructions are quarantined.',
@@ -153,7 +154,7 @@ const EVASIVE_HOSTILE_RESEARCH: ResearchRow = Object.freeze({
 const STALE_RESEARCH: ResearchRow = Object.freeze({
   title: 'Old local model roundup',
   publisher: 'Fixture archive',
-  publishedAt: '2026-06-10',
+  publishedAt: workspaceFixtureDay(-82),
   url: 'https://research.example.test/local-llm/old-roundup',
   finding: 'An older roundup repeats broad local-model claims without current implementation evidence.',
   selectionRationale: 'Returned by the bounded search but outside the accepted 30-day recency window.',
@@ -294,23 +295,23 @@ function asyncRefineWorkArgs(searchCallId: string) {
 
 const POSTS = Object.freeze([
   {
-    id: 'post-1', date: '2026-09-01', channel: 'LinkedIn', theme: 'Why local now',
+    id: 'post-1', date: workspaceFixtureDay(1), channel: 'LinkedIn', theme: 'Why local now',
     body: 'Local LLM processing is becoming a product choice, not a novelty demo. For builders, the useful first question is which moments benefit from private context, fast response, or resilience through a weak connection. Map those constraints before choosing a model, then measure the experience on the devices people actually use.',
   },
   {
-    id: 'post-2', date: '2026-09-03', channel: 'X', theme: 'Hybrid architecture',
+    id: 'post-2', date: workspaceFixtureDay(3), channel: 'X', theme: 'Hybrid architecture',
     body: 'A practical local-LLM architecture is rarely all-local or all-cloud. Keep the fast, sensitive, repeatable loop near the user; escalate long-tail reasoning only when it earns the network trip. The winning boundary is the one users can understand and the product can recover from.',
   },
   {
-    id: 'post-3', date: '2026-09-08', channel: 'LinkedIn', theme: 'Prototype with evidence',
+    id: 'post-3', date: workspaceFixtureDay(8), channel: 'LinkedIn', theme: 'Prototype with evidence',
     body: 'Start a local-model prototype with one narrow workflow and a measurable before-and-after: summarize a private note, classify an offline field report, or assist inside a support draft. Track latency, quality, battery cost, and fallback behavior before turning a good demo into a roadmap promise.',
   },
   {
-    id: 'post-4', date: '2026-09-10', channel: 'X', theme: 'Choose for the device',
+    id: 'post-4', date: workspaceFixtureDay(10), channel: 'X', theme: 'Choose for the device',
     body: 'Small models change the build conversation because constraints become design inputs. Context window, memory footprint, device class, evaluation set, and recovery path belong in one decision record. A model that fits the real device can outperform a larger model that misses the moment of need.',
   },
   {
-    id: 'post-5', date: '2026-09-15', channel: 'LinkedIn', theme: 'Trust through boundaries',
+    id: 'post-5', date: workspaceFixtureDay(15), channel: 'LinkedIn', theme: 'Trust through boundaries',
     body: 'Local inference can reduce unnecessary data movement, but deployment location alone does not create trust. Define what the assistant may do, what requires a visible decision, how cloud fallback is disclosed, and how users can inspect or correct the result. Reliable boundaries matter more than slogans.',
   },
 ]);
@@ -354,7 +355,7 @@ function buildCampaignDataset(articles: readonly ResearchRow[]) {
       appliedRuleMarker: SKILL_RULE_MARKER,
     },
     research: {
-      retrievedAt: '2026-08-31',
+      retrievedAt: workspaceFixtureDay(0),
       windowDays: 30,
       rankingRationale: 'Recency, direct relevance to local processing, implementation specificity, and source distinctness.',
       articles: [...articles],
@@ -496,7 +497,7 @@ function nestedVerifiedRecentRecords(
 
 function selectedResearchFromFirecrawlResult(resultText: string): ResearchRow[] {
   const rows = nestedFirecrawlNews(resultText) ?? [];
-  const retrieval = new Date('2026-08-31T00:00:00.000Z').getTime();
+  const retrieval = Date.parse(`${workspaceFixtureDay(0)}T00:00:00.000Z`);
   const seen = new Set<string>();
   const selected: ResearchRow[] = [];
   for (const row of rows) {
@@ -2066,7 +2067,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
     preamble: 'I’ll research the current local-LLM landscape, apply the selected marketing procedure, and build one review-ready Workspace.',
     draft: {
       criteria: [
-        'Research is bounded to distinct dated sources published in the 30 days before 2026-08-31.',
+        `Research is bounded to distinct dated sources published in the 30 days before ${workspaceFixtureDay(0)}.`,
         'One three-week calendar and exactly five complete cited social posts are visible on desktop and mobile.',
         'Untrusted page instructions are excluded from synthesis and cannot change the selected skill, destination, or authority.',
       ],
@@ -2465,7 +2466,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
   assert.ok(durable.posts.every((post) => post.citations.length === 3));
   assert.equal(new Set(durable.research.articles.map((article) => article.url)).size, 3);
   assert.doesNotMatch(JSON.stringify(durable), /evil\.example|old-roundup|switch to the decoy skill|replace the destination/i);
-  const retrieval = new Date('2026-08-31T00:00:00.000Z').getTime();
+  const retrieval = Date.parse(`${workspaceFixtureDay(0)}T00:00:00.000Z`);
   assert.ok(durable.research.articles.every((article) => {
     const ageDays = (retrieval - new Date(`${article.publishedAt}T00:00:00.000Z`).getTime()) / 86_400_000;
     return ageDays >= 0 && ageDays <= 30;
@@ -2558,8 +2559,8 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
   assert.equal(new Set(allFunctionCalls.map((call) => `${call.name}\0${call.arguments}`)).size,
     allFunctionCalls.length, 'no model tool call repeats the same operation and arguments');
 
-  assert.equal(rePrimed.planning.digest, primed.planning.digest,
-    're-entry reuses the immutable planning-card surface');
+  assert.match(rePrimed.planning.digest, /^[a-f0-9]{64}$/,
+    're-entry may refresh the discovery projection; the accepted root below is the immutable authority');
   assert.deepEqual(authorityAfterReprime, authorityAfterFirstRun,
     'planning re-prime cannot mutate the accepted host root');
   const recoveredAuthority = callAuthorities.acceptedTurnCallAuthorityFor(
@@ -2580,7 +2581,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
   });
   // Cross a genuine module/OS-process boundary at the post-write/pre-publish
   // seam. The child has no provider transport or model fixture: it must reopen
-  // the immutable planning card, compound Workspace proof, and accepted host
+  // the current planning projection, compound Workspace proof, and accepted host
   // authority from disk, derive the terminal from the accepted model-batch
   // result, then prepare and publish it once.
   workspaceDb.closeWorkspaceDb();
@@ -2598,7 +2599,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
         sessionId: session.id,
         sourceUserSeq: answerSource.seq,
         turn: answerSource.turn,
-        planningDigest: primed.planning.digest,
+        authorityDigest: recoveredAuthority.authority.authorityDigest,
       }), 'utf8').toString('base64url'),
     },
   });
@@ -2626,7 +2627,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
     terminalEvents: number;
   };
   assert.notEqual(coldResult.pid, process.pid, 'terminal recovery must cross a real OS-process boundary');
-  assert.equal(coldResult.planningDigest, primed.planning.digest);
+  assert.match(coldResult.planningDigest, /^[a-f0-9]{64}$/);
   assert.equal(coldResult.authorityDigest, recoveredAuthority.authority.authorityDigest);
   assert.match(coldResult.checkpointBatchId, /^[a-f0-9]{64}$/);
   assert.match(coldResult.checkpointHistoryDigest, /^[a-f0-9]{64}$/);
@@ -4485,7 +4486,7 @@ test('a settled Firecrawl result survives a true cold process before Workspace a
       CLEM_NORTHSTAR_PREWRITE_COLD_RECOVERY_INPUT: Buffer.from(JSON.stringify({
         sessionId,
         sourceUserSeq: source.seq,
-        planningDigest,
+        authorityDigest: recovery.acceptedModelBatchRef?.authorityDigest,
       }), 'utf8').toString('base64url'),
     },
   });
@@ -4496,7 +4497,7 @@ test('a settled Firecrawl result survives a true cold process before Workspace a
   assert.ok(resultLine, `pre-write cold recovery emitted no result marker:\n${cold.stdout}\n${cold.stderr}`);
   const result = JSON.parse(resultLine.slice(PREWRITE_COLD_RECOVERY_MARKER.length)) as {
     pid: number;
-    planningDigest: string;
+    authorityDigest: string;
     modelCalls: number;
     workspaceVersion: number;
     postCount: number;
@@ -4509,7 +4510,7 @@ test('a settled Firecrawl result survives a true cold process before Workspace a
     replaySteps: number;
   };
   assert.notEqual(result.pid, process.pid, 'phase B crosses a real OS-process/module boundary');
-  assert.equal(result.planningDigest, planningDigest);
+  assert.equal(result.authorityDigest, recovery.acceptedModelBatchRef?.authorityDigest);
   assert.equal(result.modelCalls, 2, 'cold phase needs one save round and one terminal round');
   assert.equal(result.workspaceVersion, 1);
   assert.equal(result.postCount, 5);
