@@ -1356,4 +1356,28 @@ wire. The gap is subagents + selfJudge carry + one audit door; the contract and 
 order are in §15.4 and are **v3.17, after P3**. Do not start it this weekend; do not
 add a second loop; a judge never gains write/approval authority.
 
+**2026-09-04 ~23:20 — TAG BLOCKERS FOUND BY THE REVIEWER'S RELEASE-GATE DRY RUN
+(detached checkout of `2cc40895`, real exit codes; these are gates the release
+workflow runs on a tag push):** typecheck ✅ · test:public-hygiene ✅ ·
+**check:public-hygiene ❌ · test:release-assets ❌**. Three concrete fixes, none of
+them harness work — fold them into P3 or a `chore(release)` commit before the tag:
+1. `docs/P2-FREE-THE-TURN-REPORT-2026-09-04.md` contains a personal home path
+   (`/Users/<user>/…`, one occurrence) → replace with `~/…` or `<repo>/…`.
+2. `apps/ios/ClemTests/PendingPushNavigationTests.swift:283` — the fixture
+   `https://user:secret@192.168.1.11:43117/m/` trips `credential-bearing-url`. It is
+   an intentional negative test (asserts `.cancel`), but the checker cannot know
+   that. Use the checker's placeholder form if it has one, else an obviously fake
+   value (e.g. `https://user:PLACEHOLDER@example.invalid/m/`). NOTE: this line is on
+   `origin/main` since `d315e50d` (2026-08-30) — the hygiene gate has been red on
+   main since then, independent of today's work.
+3. `scripts/release-workflow.test.mjs:266-273` asserts
+   `HARNESS_SCHEMA_VERSION = 74` — a stale pinned fixture; the tree is at 77 (v76/77
+   landed today; it was already stale at v75). Make the test read the real constant
+   (or update the pin to 77 alongside the migration rule that keeps it equal).
+Heavy gates the workflow also runs (journeys, proof:selftest, test:measurement,
+bench:gates, eval:memory/passk/jobs) still need a daemon-DOWN window for the
+isolation sentinel; the reviewer will run them in the next window the executing
+agent is not using. Until all gates are green on the release bytes, the tag is a
+no-go by the procedure's own rule ("packed-candidate green on those bytes").
+
 **2026-09-04 — EXECUTING AGENT P2 REPORT:** [P2 report](./P2-FREE-THE-TURN-REPORT-2026-09-04.md) records green local runs (252/252, 414/414, 96/96, reviewer follow-up 91/91; overlapping counts, real exit 0), typecheck/artifact verify exit 0, and the cooldown test receipt (`p2-floor-final.log`, test 50; model-transport cooldown is distinct from tool `provider_repair`). Same fixed canary on clean `4ed325eb` reached `input_required:account_selection`/`needs_input`, resumable true with retained results, zero writes and zero bare-schema/last-word events; global ≤1 wasted-step metric not claimed. Eight-worker acceptance FAILED: an advertised call was refused before dispatch, zero workers despite terminal `done`. Five genuine Claude watchers overlapped Codex brain calls. Separate final-source direct-auditor test on clean `5b8c3267` PASSED all three exact reads/results plus real Claude/Codex overlap, exit 0. Main DEV rebooted clean `c2623d01`, PID 51650/8520, requested pairing and both watchers on. No P2 push or tag; P3 has not started. `Start P3?` is the next owner decision, with mixed live results preserved rather than waived.
