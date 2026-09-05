@@ -2044,3 +2044,46 @@ the attempted amendment was refused `fresh_plan_already_activated`. Reproduce th
 FIRST failure from retained model/call bytes before deciding the P3 correction;
 do not silently expand into P5 or treat the final governor stop as the root cause.
 Worker precondition stays live-green; P3 write acceptance remains RED.
+
+**2026-09-04 23:53 — REVIEWER on the draft-canary RED (frozen `1931743f`, zero drafts) and
+gates resumed.** Agreed with the executing agent's order: reproduce the FIRST
+refusal from retained bytes before choosing the P3 correction. Three direction-level
+readings to carry into that reproduction, none of them a new door:
+(1) **The live win inside the loss is real and measured:** two searches vs eleven,
+the answered mailbox resolved on the first search, no repeated account question —
+§16 fix #1 is live-proven; the P2 turn-burn class is closed.
+(2) **A dead-end pair, by construction:** the carrier refusal
+`effective_inner_name_missing` told the model to amend its plan, and the amendment
+was refused `fresh_plan_already_activated`. The harness instructed an action it
+then refused — the exact NO DEAD ENDS violation (typed stop + next edge that is
+actually open). Whatever the first-failure reproduction shows, a refusal's
+`repair` text must name an edge the SAME turn can take; if the plan is sealed, the
+edge is "re-issue the call with the corrected inner name under the existing plan",
+never "amend the plan".
+(3) **Over-planning + a typed-universe mismatch:** `plan_task` accepted 25 planned
+instances (five draft operations × five company names) for a five-draft objective,
+and the first frame failed `work_cardinality_mismatch` because it selected
+`/to_recipients/0` (an email) against a universe of company names. The objective
+needs five calls, each needing a recipient the universe does not contain — that is a
+missing READ (find the contact for the company), which the harness should route to
+(a typed "needs evidence: recipient for <company>" next edge → one bounded read),
+not a cardinality refusal. This is P5 plan-optional and the D5 read→write lineage
+seen from the write side; keep it OUT of P3's fix unless the reproduction proves
+the exact-schema comparison (`bound_catalog_call_does_not_match_exact_schema_and_
+arguments` on a correctly shaped singleton with a durable matching binding) is the
+first failure — that one IS P3's, and looks like the write bar comparing against
+a different serialization of the same exact call.
+Gates: resumed on `1931743f` in the detached checkout — worker pins + the three
+updated journeys first, then the light gates, full journeys and npm test; results
+land here with exit codes.
+
+**2026-09-04 23:54 — FROZEN `1931743f`, isolated checkout: worker-door pins **123/123 ✅**
+(the 23:35 "3 !== 2" was a version artifact — withdrawn stands); the three updated
+journey files **16/17** — the ONLY red is "a plan with no exact verifier is admitted
+and carries the obligation", which is on the pre-existing (08-31) list. So all FOUR
+journeys that were new today are closed on these bytes: two-operation request
+(`done`), cold Discord restaurant loop, fresh-discovery gate surface, and Home
+parity (verified at `18ac00d4`). Light gates + full journeys + npm test on the same
+bytes are running; the tag picture after that is: the 11 older journeys decision,
+the 2 machine-stable-red unit tests on the CI runner, and the P3 write acceptance
+(draft canary red).
