@@ -1142,3 +1142,18 @@ warning (§12 09-04 audit), not a blocker. Push/fast-forward ask still owed.
 artifact verify exited 0, branch + `main` fast-forwarded to `fee50292`, tag withheld;
 the exact P1 canary honestly blocked before any Outlook write, while ledger tests
 prove settled-write completion and ambiguous-write veto. `Start P2?` remains pending.
+
+**2026-09-04 ~21:05 — REVIEWER: P1 ACCEPTED.** Verified independently: origin/main =
+origin/wave = local main = HEAD = `2bd49667` (the 28-day CI preflight block is
+lifted; no tag pushed — `v3.15.0`/`v3.16.0` absent on origin, correct). The canary's
+terminal on the new build is **`blocked`** (`gitSha a58c34c0` stamped in the payload —
+the §6 instrument works), not the false `completed` it reported all day: the
+verdict flip landed in the direction stated in advance. The false-RED half is pinned
+by test (ambiguous readback cannot poison an exact settlement). Its death reason is
+`control_no_progress_exhausted`, `resumable:false`, `host-turn-runner.ts:6935` — the
+D2 class exactly, i.e. P2's target; the same run should flip to a resumable typed
+stop with a next edge once P2 lands. **Owner decisions now: confirm the push was
+intended (if it was not, nothing is published; a tag is still withheld) and answer
+`Start P2?`.** P2 design inputs are already in §12/§13.3: decrement-don't-zero,
+key discriminator, recovery-surface union, last-word deletion, the two Hermes-derived
+governor test cases, and typed-stop-payload-reaches-the-user verbatim.
