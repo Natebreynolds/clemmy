@@ -908,7 +908,9 @@ function stoppedReasonForPresentation(
   presentation: PresentationEvent,
   blockedReason?: unknown,
 ): NonNullable<AssistantResponse['stoppedReason']> {
-  if (presentation.status === 'done') return 'success';
+  // A durable handoff successfully closes this synchronous request without
+  // changing the accepted task's canonical `transferred` status to `done`.
+  if (presentation.status === 'done' || presentation.status === 'transferred') return 'success';
   if (presentation.status === 'cancelled') return 'cancelled';
   if (presentation.status === 'blocked') {
     return blockedReason === 'authoritative_terminal_verification_incomplete'
