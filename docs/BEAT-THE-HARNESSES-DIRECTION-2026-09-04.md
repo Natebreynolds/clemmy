@@ -1437,3 +1437,11 @@ receipts, `physical_crossing_count 0 / host_crossing_count 1`, 2 model calls, no
 `check:public-hygiene` passes on the working tree. Also: `eval:passk` (strict) on
 `64c3bfa5` = **100% ≥ 85% ✅** (deterministic, offline) — added to the heavy-gate
 tally. Remaining P2 finding: #2 (local-task completion still prose-graded).
+
+**2026-09-04 22:55 — `79686a6b` (extraction survives an unavailable judge pin) —
+ACCEPTED; closes the minor finding on `27787ce5`.** `callExtractor` keeps the fast
+lane when `resolveBoundaryJudge()` throws; pinned by a test that mocks the pin
+outage and asserts the extraction still validates on `MODELS.fast` in one call.
+Nothing else in the commit. Reviewer's open queue on P3: nothing owed to the
+executing agent right now — proceed; heavy-gate results (journeys / npm test /
+bench / evals) land here as they finish.
