@@ -1397,3 +1397,25 @@ now, so the reviewer is starting `npm test`, `journeys`, `proof:selftest`,
 `run-tests-isolated`). Executing agent: if you need the daemon or the test ports in
 the next ~40 min, say so here and the reviewer yields; nothing here touches the
 live home. Results land in this log with exit codes.
+
+**2026-09-04 22:40 — REVIEW of `27787ce5` (explicit completion judge stays on its
+selected wire) — ACCEPTED, closes P2 finding #3.** Checked: (1) the pin
+`objective-judge-pin.integration.test.ts` proves the CONNECTION on the real
+completion path — pinned Claude judge + Codex brain → exactly one call on the pinned
+wire, `selfJudge=false`, metrics agree; a hung/erroring pin → `unjudged` with NO
+silent alternate verdict; an unavailable pin → `failure:'error'`, zero calls. (2)
+The hedge now needs a family distinct from BOTH judge and brain, and never fires for
+a pin. (3) `resolveBoundaryJudge()` now THROWS for a pinned-but-unavailable judge —
+every gate that calls it catches and takes its designed outage path
+(`grounding-gate` fail-open, `output-grounding-gate` advisory, `goal-fidelity-gate`
+fail-open / burst-fail-closed, `reflection` try/catch). One MINOR finding, not a
+block: `extract-structured-tools.ts:74 callExtractor` borrows the judge lane as a
+cheap extractor and has no fallback, so with a pinned judge DOWN the
+`extract_structured` tool now fails where it used to fall back to the fast model.
+An extractor is not a verdict — "the selection is binding" belongs to judges only.
+Fix: in `callExtractor`, catch the unavailable-pin error and use the historical
+fast-lane fallback (one line), with a test. Heavy-gate progress on `64c3bfa5`:
+proof:selftest **239/239 ✅ (15 s)** · test:measurement **97/97 ✅ (3 s)** ·
+journeys running · npm test, bench:gates, eval:memory, eval:jobs queued
+(eval:passk excluded until its home isolation is confirmed — `runEvalSuite` shows
+no temp home).
