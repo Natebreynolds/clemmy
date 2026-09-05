@@ -1110,6 +1110,36 @@ test('rate-limit memo: a 429-marked brain is skipped on the NEXT call (no retry 
   }
 });
 
+test('a provider-proven failure arms cooldown before exactly one bounded rescue attempt', async () => {
+  const { isBrainRateLimited } = await import('./fallback-model.js');
+  const attempts: string[] = [];
+  const providerFailure = new BoundaryError({
+    kind: 'model.rate_limited', retryable: true, userMessage: '', operatorMessage: 'provider rejected request',
+  });
+  const rescueFailure = new BoundaryError({
+    kind: 'model.http_5xx', retryable: true, userMessage: '', operatorMessage: 'rescue provider unavailable',
+  });
+  const primary = model({ getResponse: async () => {
+    attempts.push('primary');
+    throw providerFailure;
+  } });
+  const rescue = model({ getResponse: async () => {
+    attempts.push('rescue');
+    assert.equal(isBrainRateLimited('bounded-primary'), true,
+      'the provider rejection is recorded before admitting the rescue');
+    throw rescueFailure;
+  } });
+  const chain = withModelFallback([
+    target('bounded-primary', primary), target('bounded-rescue', rescue),
+  ], { falloverOn429: true });
+
+  await assert.rejects(chain.getResponse(req()), (error) => error === rescueFailure);
+  assert.deepEqual(attempts, ['primary', 'rescue'], 'a failed rescue cannot start a retry ladder');
+  attempts.length = 0;
+  await assert.rejects(chain.getResponse(req()), (error) => error === rescueFailure);
+  assert.deepEqual(attempts, ['rescue'], 'the armed cooldown suppresses the known-failed primary');
+});
+
 test('L2 (v2.3.0): an OVERLOADED brain joins the cooldown memo — the 529-storm class', async () => {
   const { markBrainRateLimited, isBrainRateLimited } = await import('./fallback-model.js');
   const { BoundaryError } = await import('../boundary-error.js');

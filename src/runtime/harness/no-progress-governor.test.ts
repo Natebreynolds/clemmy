@@ -68,6 +68,63 @@ test('one grounded lookup with an exact action path receives one clean recovery'
   assert.equal(decision.state.noProgressAttempts, 1);
 });
 
+test('a new typed repair spends one retry and preserves the remaining discovery budget', () => {
+  const initial = initializeNoProgressGovernor({ taskKey: 'accepted:repair-then-lookup', authority: EMPTY });
+  const consequence = createNoProgressConsequence({
+    stage: 'schema_invalid:0123456789abcdef',
+    recovery: 'repair_model',
+    effectState: 'not_started',
+    recoveryToolNames: ['work_call'],
+  });
+  const repaired = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'zero_crossing_repair',
+    authority: EMPTY,
+    consequence,
+  });
+  assert.equal(repaired.action, 'continue');
+  assert.equal(repaired.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 1);
+  assert.equal(repaired.state.noProgressAttempts, 0, 'a newly identified repair is structural progress');
+  assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(repaired.state))), repaired.state);
+  assert.equal(parseNoProgressGovernorState({
+    ...repaired.state, retriesRemaining: NO_PROGRESS_RETRY_BUDGET,
+  }), null, 'zero consecutive misses cannot refill a typed repair checkpoint');
+
+  const lookup = observe(repaired.state, 'authority_acquisition');
+  assert.equal(lookup.action, 'continue', 'the turn can discover what the typed repair requires');
+  assert.equal(lookup.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 2);
+  assert.equal(lookup.state.noProgressAttempts, 1);
+});
+
+test('distinct host schema repair keys are stages, but an unchanged repair is still a bounded cycle', () => {
+  const initial = initializeNoProgressGovernor({ taskKey: 'accepted:distinct-schema-repairs', authority: EMPTY });
+  const a = createNoProgressConsequence({
+    stage: 'schema_invalid:0123456789abcdef', recovery: 'repair_model', effectState: 'not_started',
+  });
+  const b = createNoProgressConsequence({
+    stage: 'schema_invalid:fedcba9876543210', recovery: 'repair_model', effectState: 'not_started',
+  });
+  const first = observeNoProgress(initial, {
+    taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence: a,
+  });
+  const second = observeNoProgress(first.state, {
+    taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence: b,
+  });
+  assert.equal(second.action, 'continue');
+  assert.equal(second.state.noProgressAttempts, 0);
+  assert.equal(second.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 2);
+  assert.equal(second.state.stageTransitionsRemaining, NO_PROGRESS_STAGE_TRANSITION_BUDGET - 1);
+  assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(second.state))), second.state);
+
+  const repeated = observeNoProgress(second.state, {
+    taskKey: initial.taskKey, attemptClass: 'zero_crossing_repair', authority: EMPTY, consequence: a,
+  });
+  assert.equal(repeated.action, 'terminalize');
+  assert.equal(repeated.state.lastConsequence?.key, a.key, 'the stop names this failure, not the previous row');
+  assert.equal(repeated.state.noProgressAttempts, 1);
+  assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(repeated.state))), repeated.state);
+});
+
 test('the lookup after the retry budget is spent terminalizes before another model call', () => {
   const initial = initializeNoProgressGovernor({
     taskKey: 'accepted:lookup-loop',
@@ -82,7 +139,7 @@ test('the lookup after the retry budget is spent terminalizes before another mod
     gained: [],
     owner: 'host_terminal_reducer',
     requiredProjection: 'factual_internal_failure',
-    publicResumable: false,
+    publicResumable: true,
     blockedAttemptClass: 'authority_acquisition',
     consequentialEffectState: 'not_started',
     resumeOn: ['authority_progress', 'user_input'],
@@ -137,6 +194,7 @@ test('provider repair is bounded, and alternative authority resets it without wi
   });
   assert.equal(first.action, 'continue');
   assert.equal(first.reason, 'retry_available');
+  assert.equal(first.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 1);
   assert.deepEqual(first.state.lastConsequence?.recoveryToolNames, ['tool_search', 'work_call']);
 
   const repeated = observeNoProgress(first.state, {
@@ -148,6 +206,7 @@ test('provider repair is bounded, and alternative authority resets it without wi
   assert.equal(repeated.action, 'terminalize', 'the same provider failure cannot loop');
   assert.equal(repeated.blockedAttemptClass, 'provider_repair');
   assert.equal(repeated.consequentialEffectState, 'known_terminal');
+  assert.equal(repeated.state.retriesRemaining, 0, 'a failed provider repair cannot blindly replay again');
 
   const discovered = observeNoProgress(first.state, {
     taskKey: initial.taskKey,
@@ -161,6 +220,39 @@ test('provider repair is bounded, and alternative authority resets it without wi
   assert.equal(discovered.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET);
   assert.deepEqual(discovered.state.seenConsequenceKeys, []);
   assert.equal(discovered.state.lastConsequence, null);
+});
+
+test('a first provider rejection retains its one retry when that call also acquires authority', () => {
+  const initial = initializeNoProgressGovernor({ taskKey: 'accepted:provider-bound-on-failure', authority: EMPTY });
+  const consequence = createNoProgressConsequence({
+    stage: 'execution:invalid_arguments', recovery: 'repair_model', effectState: 'known_terminal',
+    recoveryToolNames: ['work_call', 'tool_search'],
+  });
+  const authority = snapshot({ operation: ['bound:operation-a'] });
+  const first = observeNoProgress(initial, {
+    taskKey: initial.taskKey, attemptClass: 'provider_repair', authority, consequence,
+  });
+  assert.equal(first.action, 'continue');
+  assert.equal(first.state.lastConsequence?.key, consequence.key,
+    'the first rejected provider result must not disappear behind its new binding');
+  assert.equal(first.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - 1);
+  assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(first.state))), first.state);
+
+  const repeated = observeNoProgress(first.state, {
+    taskKey: initial.taskKey, attemptClass: 'provider_repair', authority, consequence,
+  });
+  assert.equal(repeated.action, 'terminalize', 'the one retry failed; no second retry is minted');
+
+  const alternative = observeNoProgress(first.state, {
+    taskKey: initial.taskKey, attemptClass: 'provider_repair',
+    authority: snapshot({ operation: ['bound:operation-a', 'bound:operation-b'] }), consequence,
+  });
+  assert.equal(alternative.action, 'continue', 'a different proven operation receives its own bounded repair');
+  const alternativeRepeated = observeNoProgress(alternative.state, {
+    taskKey: initial.taskKey, attemptClass: 'provider_repair',
+    authority: alternative.state.authority, consequence,
+  });
+  assert.equal(alternativeRepeated.action, 'terminalize');
 });
 
 for (const kind of ['operation', 'account', 'target', 'evidence', 'effect'] as const) {
@@ -428,6 +520,8 @@ test('host-validated schema to semantic admission is bounded acyclic progress', 
     consequence: beyondBudget,
   });
   assert.equal(stopped.action, 'terminalize');
+  assert.equal(stopped.state.lastConsequence?.key, beyondBudget.key,
+    'the terminal retains the current stage even when no transition remains');
   assert.deepEqual(
     parseNoProgressGovernorState(JSON.parse(JSON.stringify(stopped.state))),
     stopped.state,
@@ -493,7 +587,7 @@ test('the same host consequence repeats once then stops without user-owned proje
   });
   assert.equal(second.action, 'terminalize');
   assert.equal(second.reason, 'control_no_progress_exhausted');
-  assert.equal(second.publicResumable, false);
+  assert.equal(second.publicResumable, true);
   assert.equal(second.requiredProjection, 'factual_internal_failure');
 });
 
@@ -557,7 +651,7 @@ test('a known terminal result gets one factual response step but cannot repeat',
     consequence: factual,
   });
   assert.equal(repeated.action, 'terminalize');
-  assert.equal(repeated.publicResumable, false);
+  assert.equal(repeated.publicResumable, true);
 });
 
 test('only a typed exact user question selects the ask-user recovery lane', () => {
@@ -613,4 +707,25 @@ test('ask-user call authority fixes question, option order, purpose, and key set
   assert.equal(isCanonicalNoProgressAskArguments({
     ...canonical, extra: true,
   }, userInput), false);
+});
+
+test('an exact user question takes precedence over newly acquired operation authority', () => {
+  const initial = initializeNoProgressGovernor({ taskKey: 'accepted:new-binding-needs-account', authority: EMPTY });
+  const consequence = createNoProgressConsequence({
+    stage: 'input_required:account_selection',
+    recovery: 'ask_user',
+    effectState: 'not_started',
+    userInput: { question: 'Which account should I use?', choices: ['Work', 'Personal'], purpose: 'clarification' },
+  });
+  const decision = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'plan_admission',
+    authority: snapshot({ operation: ['host-bound:plan_task'] }),
+    consequence,
+  });
+  assert.equal(decision.action, 'continue');
+  assert.equal(decision.reason, 'user_input_required');
+  assert.equal(decision.state.lastConsequence?.key, consequence.key);
+  assert.deepEqual(decision.state.authority.operation, ['host-bound:plan_task']);
+  assert.deepEqual(parseNoProgressGovernorState(JSON.parse(JSON.stringify(decision.state))), decision.state);
 });
