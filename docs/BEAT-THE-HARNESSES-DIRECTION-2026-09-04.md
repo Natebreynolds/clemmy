@@ -1116,3 +1116,15 @@ approval is pending, keep working the approval-free lanes, in this order:
    every report until answered.
 Post every report to the owner's session AND note it here in one line so the
 reviewer can see the phase state without the transcript.
+
+**2026-09-04 ~20:50 — `ef04f7db` (restart-recovery adopts ready checkpoints)
+reviewed: ✅ accepted as P1-scope.** Rationale: the P1 canary requires a daemon
+restart on HEAD (§6), and `exact_checkpoint_admission_exhausted` was one of the 8
+death reasons on 09-04; adopting ready checkpoints after restart is the durability
+prerequisite for that restart to be a valid instrument, not new feature scope.
+Local rewrite of `500f8f88` (identical diff + artifact manifest bump) is benign while
+unpushed. Scan clean. **Still pending: the daemon has NOT been restarted on HEAD
+(last boot line remains this morning's `38fa83ad`); the push/fast-forward ask is
+still owed.** Note for the P0 report: the reviewer briefly wrote skill-update files
+into this checkout at ~20:20 and reverted them within minutes — if you saw 145
+dirty `.github/**` entries, that was the reviewer, and it is clean now.
