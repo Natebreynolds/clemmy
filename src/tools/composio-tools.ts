@@ -55,6 +55,7 @@ import {
   type PreparedComposioOneShotDispatch,
 } from '../integrations/composio/client.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
+import { planStagedFileUploads, StagedFileTransferPlanError } from '../integrations/composio/staged-file-transfer-plan.js';
 import {
   irreversibleSendRequiresExplicitTarget,
   validateIrreversibleSendPayload,
@@ -2371,26 +2372,6 @@ function composioPlatformPlaneOperation(toolSlug: string): boolean {
   return classifyComposioSlugEffect(toolSlug) === 'read';
 }
 
-function schemaRequiresComposioFileUpload(schema: unknown): boolean {
-  const queue: unknown[] = [schema];
-  const seen = new Set<object>();
-  let visited = 0;
-  while (queue.length > 0 && visited < 4_000) {
-    const value = queue.shift();
-    if (!value || typeof value !== 'object' || seen.has(value as object)) continue;
-    seen.add(value as object);
-    visited += 1;
-    if (Array.isArray(value)) {
-      queue.push(...value);
-      continue;
-    }
-    const record = value as Record<string, unknown>;
-    if (record.file_uploadable === true) return true;
-    queue.push(...Object.values(record));
-  }
-  return false;
-}
-
 interface ClosedNoArgReadRepair {
   args: Record<string, unknown>;
   note: string;
@@ -3457,16 +3438,6 @@ export async function resolveComposioDispatch(
     });
     return { ok: false, reason: 'invalid-args', message, toolkit };
   }
-  if (opts.preparedExecution && !cliOnlyLane && schemaRequiresComposioFileUpload(dispatchSchema)) {
-    const message =
-      `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because this action requires a file upload, `
-      + 'and no separately admitted/staged upload plan is attached. Prepare the exact file transfer first, '
-      + 'then retry the business action. No provider dispatch was started.';
-    emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
-      guard: 'prepared-file-upload-plan-required',
-    });
-    return { ok: false, reason: 'invalid-args', message, toolkit };
-  }
   const noArgReadRepair = repairClosedNoArgRead(toolSlug, args, dispatchSchema);
   if (noArgReadRepair) {
     args = noArgReadRepair.args;
@@ -3495,6 +3466,34 @@ export async function resolveComposioDispatch(
       message: `${message}${renderCallableContract(toolSlug, dispatchSchema)}`,
       toolkit,
     };
+  }
+
+  if (opts.preparedExecution && !cliOnlyLane && dispatchSchema) {
+    // The schema advertises possibilities; only values in this exact call
+    // require a transfer. Reuse the same bounded schema/argument projection
+    // as staged execution, after ordinary required-field/argument repair.
+    let hasUpload: boolean;
+    try {
+      hasUpload = planStagedFileUploads(dispatchSchema, args).length > 0;
+    } catch (error) {
+      if (!(error instanceof StagedFileTransferPlanError)) throw error;
+      const message = `⚠️ ${toolSlug} arguments could not be prepared (${error.code}): ${error.message}. `
+        + `Repair this call against the exact schema and retry. No provider dispatch was started.${renderCallableContract(toolSlug, dispatchSchema)}`;
+      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+        guard: 'prepared-file-upload-arguments-invalid', field: error.pointer, validationReason: error.code,
+      });
+      return { ok: false, reason: 'invalid-args', message, toolkit };
+    }
+    if (hasUpload) {
+      const message =
+        `⚠️ PREPARATION-REQUIRED: ${toolSlug} was not started because this call supplies a file upload, `
+        + 'and no separately admitted/staged upload plan is attached. Prepare the exact file transfer first, '
+        + 'then retry the business action. No provider dispatch was started.';
+      emitComposioGatewayBlock(sid, toolSlug, 'invalid-args', {
+        guard: 'prepared-file-upload-plan-required',
+      });
+      return { ok: false, reason: 'invalid-args', message, toolkit };
+    }
   }
 
   let accountIdentityProof: ComposioGatewayResolved['accountIdentityProof'];

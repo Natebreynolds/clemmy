@@ -4022,7 +4022,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             ...(currentAcceptedSourceCatalogManifestScope()?.operationIds ?? []),
           ].filter((operationId) => operationId && operationId !== name.toUpperCase()))];
       const repair = boundOperations.length > 0
-        ? ` This turn bound: ${boundOperations.join(', ')}. Use one of those exactly, or call plan_task again to amend the plan before retrying.`
+        ? ` This turn bound: ${boundOperations.join(', ')}. Use available discovery or read tools if needed, then reissue the call under the existing plan with its exact requirement_id and corrected inner name and arguments.`
         : provenOperations.length > 0
           ? ` The operations proven for this step are: ${provenOperations.join(', ')}. Use one of those exactly, with tool_slug spelled exactly as listed.`
           : ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that is the door for a write no plan has bound. If it only reads: call tool_search and retry with the exact operation name it returns.';

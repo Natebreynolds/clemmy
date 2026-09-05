@@ -187,6 +187,23 @@ test('an exact graph-neutral reversible draft reaches the existing reducer witho
   assert.equal(result.consentSubject, undefined);
 });
 
+test('the real consent refusal journals value-free exact-pair evidence without changing its decision', async () => {
+  const { request } = await exactCall('draft');
+  const refused = await consent.evaluateUncoveredHostMutationConsent({
+    ...request, inputSchema: { type: 'object', properties: { private_schema_key: { type: 'string' } } },
+  });
+  assert.equal(refused.status, 'repair');
+  assert.equal(refused.status === 'repair' ? refused.reason : null, 'bound_catalog_call_does_not_match_exact_schema_and_arguments');
+  const events = eventlog.listEvents(request.attestation.sessionId, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'prepared_external_call_mismatch');
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.data.logicalToolCallId, request.attestation.logicalToolCallId);
+  assert.deepEqual(events[0]!.data.diagnostic, { reason: 'no_matching_candidate', candidates: [
+    { index: 0, reason: 'schema_digest_mismatch', schemaDigestMatches: false },
+  ] });
+  assert.doesNotMatch(JSON.stringify(events[0]!.data), /private_schema_key|Exact requested content|account:direct:owner/);
+});
+
 for (const kind of ['send', 'delete', 'admin'] as const) {
   test(`an exact graph-neutral ${kind} retains the reducer's genuine approval subject`, async () => {
     const { result } = await exactCall(kind);

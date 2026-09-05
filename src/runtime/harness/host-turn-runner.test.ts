@@ -820,6 +820,104 @@ test('host stepping: N host steps = N getResponse; tools run on host; hooks stil
   assert.ok(resultItem, 'the tool result rejoined the projection for the next step');
 });
 
+test('activated-plan carrier refusal names existing-call repair instead of an unavailable amendment', async () => {
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorFetch = globalThis.fetch;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  const client = await import('../../integrations/composio/client.js');
+  const adapters = await import('./production-capability-adapters.js');
+  const connected = await import('./connected-goal-catalog.js');
+  const inputSchema = { type: 'object', properties: { subject: { type: 'string' }, body: { type: 'string' } },
+    required: ['subject', 'body'] };
+  const operationId = 'OUTLOOK_CREATE_DRAFT';
+  const accountId = 'account-sealed-plan-fixture';
+  let providerCalls = 0;
+  const provider = async () => { providerCalls += 1; throw new Error('malformed call must never dispatch'); };
+  adapters.installProductionTransport(provider);
+  client.__test__.setComposioApiKeyOverride('fixture-key');
+  client.__test__.setConnectedAccountsLoader(async () => [{ id: accountId, status: 'ACTIVE', user_id: 'fixture-user',
+    toolkit: { slug: 'outlook' }, email: 'fixture@example.test' }]);
+  client.__test__.setComposioClient({ client: { baseURL: 'https://backend.composio.dev' },
+    tools: { getRawComposioTools: async () => [{ slug: operationId, name: 'Create an Outlook draft',
+      description: 'Create a standalone draft without sending it.', toolkit: { slug: 'outlook' },
+      inputParameters: inputSchema, outputParameters: { type: 'object' }, version: '1' }], execute: provider },
+  });
+  globalThis.fetch = async () => new Response(JSON.stringify({ items: [] }),
+    { status: 200, headers: { 'content-type': 'application/json' } });
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  connected.installConnectedRegistryPort(() => ({ connectedToolkits: ['outlook'], tools: [{ slug: operationId, schema: inputSchema }] }));
+  try {
+    const fixture = acceptHostCanarySource('create-external-draft');
+    Object.assign(fixture.context, { turn: 1 });
+    Object.assign(fixture.parent, { turn: 1 });
+    const primed = await semanticCompile.primePrimaryModelPlanningCatalog({ ...fixture.context, turn: 1 });
+    assert.equal(primed.ok, true, JSON.stringify(primed));
+    if (!primed.ok) return;
+    const plan = {
+      preamble: 'I will create the requested draft without sending it.',
+      draft: {
+        criteria: ['Create one draft.'], cardinality: null,
+        destination: { posture: 'create_new', family: 'external_resource', handleRequired: true },
+        topology: { version: 1, operations: [{ id: 'create_draft', effect: 'external_write', coverage: null,
+          dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } }], universes: [] },
+        bindings: [{ operationId: 'create_draft', role: 'destination', capabilityRef: 'cap:resolved:outlook_create_draft', evidence: ['result'] }],
+        deliverables: [{ id: 'draft', kind: 'result' }], evidenceRequirements: ['result'],
+      },
+    };
+    let calls = 0;
+    let contractBefore: unknown;
+    const model = {
+      async getResponse(request: unknown) {
+        calls += 1;
+        if (calls === 3) {
+          contractBefore = expectedWorkContracts.loadExpectedWorkContract(fixture.session.id, fixture.source.seq);
+          assert.equal((contractBefore as { status: string }).status, 'ok', JSON.stringify(request));
+          assert.equal(expectedWorkAdmission.actionExpectedWorkRequired(fixture.context), true);
+        }
+        if (calls === 4) {
+          const input = (request as { input: Array<{ type?: string; callId?: string; output?: { text?: string } }> }).input;
+          const refusal = input.find((item) => item.type === 'function_call_result' && item.callId === 'repair-inner-name');
+          const text = refusal?.output?.text ?? '';
+          assert.match(text, /effective_inner_name_missing/);
+          assert.match(text, /This turn bound: OUTLOOK_CREATE_DRAFT/);
+          assert.doesNotMatch(text, /call plan_task again|amend the plan/);
+          assert.match(text, /existing plan.*exact requirement_id/);
+          assert.match(text, /corrected inner name and arguments/);
+        }
+        return { responseId: `sealed-plan-repair-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          output: calls === 1 ? [toolCall('discover-draft', 'tool_search', { query: `${operationId} account ${accountId}`, role_key: null, limit: 8 })]
+            : calls === 2 ? [toolCall('admit-external-plan', 'plan_task', plan)]
+            : calls === 3 ? [toolCall('repair-inner-name', 'work_call', {
+              ...fusedWorkArgs('composio_execute_tool'), requirement_id: 'create_draft',
+              source_call_ids: null, source_record_ids: null, args_json: JSON.stringify({ arguments: {} }),
+            })] : [textMsg('The exact call can be repaired under the existing plan.')],
+        };
+      }, getStreamedResponse: testModelStream,
+    };
+    const agent = await buildOrchestratorAgent({ userInput: String(fixture.source.data.text), ...fixture.context,
+      hostFreshPlanning: primed.planning, allowToolJit: true, model: model as never });
+    await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
+    assert.equal(calls, 4);
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(expectedWorkContracts.loadExpectedWorkContract(fixture.session.id, fixture.source.seq), contractBefore);
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['approval_requested', 'external_write_succeeded'] }).length, 0);
+  } finally {
+    globalThis.fetch = priorFetch;
+    adapters.installProductionTransport(null);
+    client.__test__.setComposioApiKeyOverride(null);
+    client.__test__.setComposioClient(null);
+    client.__test__.setConnectedAccountsLoader(null);
+    connected.installConnectedRegistryPort(null);
+    capabilityManifestStores.installCapabilityManifestStore(priorStore);
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  }
+});
+
 test('production host pairs a no-effect refusal when its durable ALS owner is absent', async () => {
   let bodies = 0;
   const model = stubModel([

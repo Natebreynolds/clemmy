@@ -8,7 +8,7 @@
  * names never enter the reducer as policy branches.
  */
 import { createHash } from 'node:crypto';
-import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { closedCanonicalJson, ClosedCanonicalJsonError } from '../../shared/closed-canonical-json.js';
 import {
   evaluateInteractiveConsentV1,
   INTERACTIVE_CONSENT_POLICY_VERSION,
@@ -25,7 +25,7 @@ import {
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { buildHostConsentEvidence } from './host-consent-evidence.js';
-import { openEventLog } from './eventlog.js';
+import { appendEvent, getEvent, openEventLog } from './eventlog.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
   localPlanningArgumentsMatch,
@@ -733,6 +733,24 @@ export interface ExactPreparedExternalCallV1 {
   logicalToolName: string;
 }
 
+interface ExactPreparedCandidateMismatch {
+  index: number;
+  reason: 'schema_missing_or_invalid' | 'arguments_missing_or_invalid' | 'schema_digest_mismatch'
+    | 'logical_contract_unreadable' | 'tool_identity_mismatch' | 'argument_digest_mismatch'
+    | 'canonicalization_rejected' | 'matched';
+  schemaDigestMatches?: boolean;
+  toolIdentityMatches?: boolean;
+  argumentDigestMatches?: boolean;
+  canonicalizationCode?: ClosedCanonicalJsonError['code'] | 'unknown';
+}
+
+interface ExactPreparedSelectionMismatch {
+  reason: 'expected_schema_digest_missing_or_invalid' | 'no_matching_candidate'
+    | 'ambiguous_matching_candidates' | 'canonicalization_rejected';
+  candidates: ExactPreparedCandidateMismatch[];
+  omittedCandidates?: number;
+}
+
 export function selectExactPreparedExternalCall(input: {
   providerInputSchemaDigest?: string;
   acceptedTaskId: string;
@@ -743,27 +761,58 @@ export function selectExactPreparedExternalCall(input: {
     arguments: unknown;
     logicalToolName: string;
   }[];
+  /** Observability only: never changes selection or grants call authority. */
+  onMismatch?: (diagnostic: ExactPreparedSelectionMismatch) => void;
 }): ExactPreparedExternalCallV1 | null {
+  const candidateDiagnostics: ExactPreparedCandidateMismatch[] = [];
+  const refused = (reason: ExactPreparedSelectionMismatch['reason']): null => {
+    try {
+      input.onMismatch?.({ reason, candidates: candidateDiagnostics.slice(0, 8),
+        ...(candidateDiagnostics.length > 8 ? { omittedCandidates: candidateDiagnostics.length - 8 } : {}) });
+    } catch { /* a diagnostic sink must not become a tool gate */ }
+    return null;
+  };
   const expected = input.providerInputSchemaDigest?.trim().toLowerCase();
-  if (!expected || !/^[a-f0-9]{64}$/.test(expected)) return null;
+  if (!expected || !/^[a-f0-9]{64}$/.test(expected)) return refused('expected_schema_digest_missing_or_invalid');
   const matches = new Map<string, ExactPreparedExternalCallV1>();
-  for (const candidate of input.candidates) {
+  for (const [index, candidate] of input.candidates.entries()) {
+    const diagnostic: ExactPreparedCandidateMismatch = { index, reason: 'matched' };
+    candidateDiagnostics.push(diagnostic);
     const schema = candidate.inputSchema;
     const args = candidate.arguments;
-    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) continue;
-    if (!args || typeof args !== 'object' || Array.isArray(args)) continue;
+    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+      diagnostic.reason = 'schema_missing_or_invalid';
+      continue;
+    }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      diagnostic.reason = 'arguments_missing_or_invalid';
+      continue;
+    }
     const schemaDigest = canonicalExternalInputSchemaDigestV1(schema);
-    if (schemaDigest !== expected) continue;
+    diagnostic.schemaDigestMatches = schemaDigest === expected;
+    if (schemaDigest !== expected) {
+      diagnostic.reason = 'schema_digest_mismatch';
+      continue;
+    }
     const contract = durableLogicalCallContract(
       input.acceptedTaskId,
       candidate.logicalToolName,
       args,
     );
-    if (
-      !contract
-      || contract.toolName !== input.effectiveToolName
-      || contract.argumentDigest !== input.effectiveArgumentDigest
-    ) continue;
+    if (!contract) {
+      diagnostic.reason = 'logical_contract_unreadable';
+      continue;
+    }
+    diagnostic.toolIdentityMatches = contract.toolName === input.effectiveToolName;
+    if (!diagnostic.toolIdentityMatches) {
+      diagnostic.reason = 'tool_identity_mismatch';
+      continue;
+    }
+    diagnostic.argumentDigestMatches = contract.argumentDigest === input.effectiveArgumentDigest;
+    if (!diagnostic.argumentDigestMatches) {
+      diagnostic.reason = 'argument_digest_mismatch';
+      continue;
+    }
     try {
       const schemaBytes = closedCanonicalJson(schema, EXTERNAL_SCHEMA_CANONICAL_LIMITS);
       const argumentBytes = closedCanonicalJson(args, EXTERNAL_SCHEMA_CANONICAL_LIMITS);
@@ -776,11 +825,14 @@ export function selectExactPreparedExternalCall(input: {
         `${contract.toolName}\0${schemaDigest}\0${schemaBytes}\0${argumentBytes}`,
         selected,
       );
-    } catch {
-      return null;
+    } catch (error) {
+      diagnostic.reason = 'canonicalization_rejected';
+      diagnostic.canonicalizationCode = error instanceof ClosedCanonicalJsonError ? error.code : 'unknown';
+      return refused('canonicalization_rejected');
     }
   }
-  return matches.size === 1 ? matches.values().next().value ?? null : null;
+  return matches.size === 1 ? matches.values().next().value ?? null
+    : refused(matches.size === 0 ? 'no_matching_candidate' : 'ambiguous_matching_candidates');
 }
 
 function exactPreparedExternalCall(
@@ -808,6 +860,17 @@ function exactPreparedExternalCall(
     effectiveArgumentDigest: prepared.hostCapabilityBinding.effectiveArgumentDigest,
     effectiveToolName: prepared.hostCapabilityBinding.toolName,
     candidates,
+    onMismatch: (diagnostic) => {
+      // This edge previously erased which schema/argument pair disagreed with
+      // the exact durable call. Keep only bounded comparison facts, never
+      // schemas, argument values, recipient/account data or canonical paths.
+      const source = getEvent(prepared.hostCapabilityBinding.sourceEventId);
+      if (!source) return;
+      appendEvent({ sessionId: prepared.sessionId, turn: source.turn, role: 'system', type: 'guardrail_tripped', data: {
+        kind: 'prepared_external_call_mismatch', sourceUserSeq: prepared.sourceUserSeq,
+        logicalToolCallId: prepared.logicalToolCallId, diagnostic,
+      } });
+    },
   });
 }
 

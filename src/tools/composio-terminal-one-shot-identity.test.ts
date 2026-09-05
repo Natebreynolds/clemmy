@@ -638,3 +638,54 @@ test('invoke-port drift between the host attestation and registered manifest is 
   assert.deepEqual(fixture.noRetryOptions, []);
   assert.equal(fixture.accountLoads(), 1);
 });
+
+for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missing_required', 'missing_required_file'] as const) {
+  test(`prepared call stages only a runtime-present upload (${variant})`, async () => {
+    // Same optional scalar/array annotation shape retained from the P3 draft
+    // canary. This is provider-neutral preparation, not a draft-name bypass.
+    const inputSchema = {
+      type: 'object', additionalProperties: false,
+      required: variant === 'missing_required_file' ? ['subject', 'body', 'attachment'] : ['subject', 'body'],
+      properties: {
+        subject: { type: 'string' }, body: { type: 'string' },
+        attachment: { anyOf: [
+          { type: 'string', file_uploadable: true },
+          { type: 'array', items: { type: 'string', file_uploadable: true } },
+          { type: 'null' },
+        ] },
+      },
+    };
+    const fixture = await prepareFixture({ slug: 'ACME_CREATE_DOCUMENT', effect: 'external_write', inputSchema });
+    const args = {
+      subject: 'Prepared document',
+      ...(variant === 'missing_required' ? {} : { body: 'Exact local text.' }),
+      ...(variant === 'null' ? { attachment: null }
+        : variant === 'empty_array' ? { attachment: [] }
+        : variant === 'file' ? { attachment: '/allowed/report.pdf' }
+        : variant === 'files' ? { attachment: ['/allowed/report.pdf'] } : {}),
+    };
+    const result = await authority.withHostCallAttestation(hostAttestation(fixture.manifest), () => tools.resolveComposioDispatch(
+      fixture.manifest.operationId, args, fixture.manifest.accountId, { preparedExecution: true },
+    ));
+    if (variant === 'file' || variant === 'files') {
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.message, /separately admitted\/staged upload plan/);
+    } else if (variant === 'missing_required' || variant === 'missing_required_file') {
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.reason, 'invalid-args');
+      assert.match(result.message, variant === 'missing_required' ? /body/ : /attachment/);
+      assert.doesNotMatch(result.message, /file upload|staged upload plan/,
+        'invalid required shape is ordinary schema repair, not an invented upload');
+    } else {
+      assert.equal(result.ok, true, result.ok ? '' : result.message);
+      if (!result.ok) return;
+      assert.deepEqual(result.args, args);
+      assert.ok(result.preparedDispatch, 'the exact normal one-shot is prepared');
+      await tools.executePreparedComposioGatewayTool(result.preparedDispatch!);
+    }
+    assert.equal(fixture.rawBodies(), ['absent', 'null', 'empty_array'].includes(variant) ? 1 : 0);
+    assert.equal(fixture.legacyBodies(), 0);
+  });
+}
