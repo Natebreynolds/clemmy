@@ -26,6 +26,7 @@
  *  - PROMOTION: a reached tool is recorded to the session hot-set, so it becomes
  *    first-class next turn (stops paying the catalog/dispatch indirection).
  */
+import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -409,6 +410,29 @@ export function isResolvedDispatchPreparedWithoutExecution(
   return Boolean(value && typeof value === 'object' && resolvedDispatchPreparations.has(value));
 }
 
+/**
+ * Value-free digest of the exact failing argument paths behind a pre-dispatch
+ * refusal, so the no-progress governor can tell a real repair attempt from a
+ * byte-identical repeat without reading prose.
+ *
+ * Live 2026-09-05, from the owner's phone: "find and add <person> to that"
+ * refused three carrier attempts as schema-invalid, none carried repair
+ * material, so every attempt keyed a fresh stage on a digest of its own
+ * arguments and the turn died at the governor's transition cap — the reply the
+ * user read was `schema_invalid:call:fbbf339c…`. Nine sites mint an
+ * invalid-arguments refusal and exactly one (plan_task) fed this channel.
+ * Deriving the key here covers every refusal this dispatcher raises.
+ */
+function carrierRepairKeyFor(payload: Record<string, unknown>): string | undefined {
+  const violations = payload.violations;
+  if (!Array.isArray(violations)) return undefined;
+  const paths = [...new Set(violations
+    .map((violation) => (typeof violation === 'string' ? violation.trim() : ''))
+    .filter((violation) => violation.length > 0))].sort();
+  if (paths.length === 0) return undefined;
+  return createHash('sha256').update(JSON.stringify(paths)).digest('hex').slice(0, 32);
+}
+
 interface CarrierValidationError {
   detail: string;
   reason?: 'arguments_missing' | 'target_missing';
@@ -734,10 +758,15 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         // Preserve the exact JSON corrective for the model while retaining a
         // nominal, local-only proof for the surrounding effect ledger. A
         // provider-returned object or marker can never manufacture this class.
-        const refusal = new ExternalWritePreDispatchResult(
-          JSON.stringify(payload),
-          typeof payload.error === 'string' ? payload.error : 'call_tool_refused',
-        );
+        const repairKey = classification === 'invalid_arguments'
+          ? carrierRepairKeyFor(payload)
+          : undefined;
+        const refusal = repairKey
+          ? new InvalidArgumentsPreDispatchResult(JSON.stringify(payload), true, repairKey)
+          : new ExternalWritePreDispatchResult(
+            JSON.stringify(payload),
+            typeof payload.error === 'string' ? payload.error : 'call_tool_refused',
+          );
         // EVERY pre-dispatch refusal settles its logical call, not just the
         // ones late enough to have resolved a target.
         //
@@ -1062,6 +1091,12 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
             detail: parsed.error.issues
               .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
               .join('; '),
+            // The failing PATHS on their own (no values, no prose): the model
+            // reads `detail`, and the host keys its repair stage on these, so
+            // fixing one field and breaking another counts as progress while
+            // resending the same wrong field is the loop floor.
+            violations: [...new Set(parsed.error.issues
+              .map((i) => i.path.join('.') || '(root)'))],
           });
         }
         dispatchArgs = parsed.data;

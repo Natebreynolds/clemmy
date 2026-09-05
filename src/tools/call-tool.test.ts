@@ -356,6 +356,40 @@ test('bad args return the schema with error=arg_validation and NO dispatch', asy
   assert.ok(!getHotSet('sess-argval').includes(target!), 'a validation miss must not dispatch');
 });
 
+test('a schema refusal carries repair material keyed on the failing paths', async () => {
+  // Live 2026-09-05, from the owner's phone: "find and add <person> to that"
+  // refused three carrier attempts as schema-invalid. None carried repair
+  // material, so each attempt keyed a fresh stage on a digest of its own
+  // arguments, the governor's transition budget ran out, and the reply the
+  // user read was "Stopped at: schema_invalid:call:fbbf339c5926d378".
+  _resetHotSetForTest();
+  _resetCallToolSchemaCacheForTest();
+  const schemas = getLocalToolSchemas();
+  const allowed = deriveOrchestratorDiscoveryNames();
+  const target = [...allowed].find((n) => {
+    const s = schemas.get(n);
+    return s ? !s.safeParse({}).success : false;
+  });
+  assert.ok(target, 'expected an orchestrator tool with a required arg');
+
+  const first = await invokeCallTool('sess-repairkey-a', target!, '{}');
+  const parsed = JSON.parse(String(first));
+  assert.equal(parsed.error, 'arg_validation');
+  assert.ok(Array.isArray(parsed.violations) && parsed.violations.length > 0,
+    'the refusal names the failing paths, not only a prose detail');
+  const firstKey = (first as unknown as { repairKey?: string }).repairKey;
+  assert.match(String(firstKey), /^[a-f0-9]{32}$/,
+    'an invalid-arguments refusal carries a value-free repair key');
+
+  // Same failing paths, different offered values: the repair stage must NOT move.
+  const second = await invokeCallTool('sess-repairkey-b', target!, JSON.stringify({ __never: 'a' }));
+  const third = await invokeCallTool('sess-repairkey-c', target!, JSON.stringify({ __never: 'b' }));
+  const secondKey = (second as unknown as { repairKey?: string }).repairKey;
+  const thirdKey = (third as unknown as { repairKey?: string }).repairKey;
+  assert.equal(secondKey, thirdKey,
+    'two attempts failing the same paths are the same repair stage, whatever values they carried');
+});
+
 test('unknown deferred arguments are rejected instead of silently stripped before dispatch', async () => {
   _resetHotSetForTest();
   _resetCallToolSchemaCacheForTest();
