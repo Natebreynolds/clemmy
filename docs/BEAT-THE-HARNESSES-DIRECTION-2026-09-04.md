@@ -2728,3 +2728,20 @@ toolkit the request names.
 
 Evidence for all three runs (event trails, refusal texts, task records, snapshots):
 `scratchpad/takeover/live/cold-draft-{1,2,3}`.
+
+
+**2026-09-05 10:05 — GATES on the wave tip `d26a2fcd` (final bytes of this takeover):**
+`npm test` 14,554 tests, **14,553 pass, 0 fail**, 1 skipped · journeys **171/172** (the
+only red is the competitive byte ledger at 21,660 B against its 16 KiB ceiling, the owner
+decision named above) · typecheck ✅ · check:public-hygiene ✅ · test:public-hygiene ✅ ·
+test:release-assets ✅ · proof:selftest ✅ · test:measurement 97/97 ✅ ·
+**test:release-closure 42/42 ✅** (it was red on stale schema pins — two places named
+harness schema 74 by literal while the candidate ships 77, with every amendment foreign
+key and both immutability triggers exactly as expected; fixed at `d26a2fcd` to track the
+shipped constant) · prepack ✅ · **test:packed-candidate ✅** (clemmy@3.16.0, 1,166 files)
+· **test:packaged-upgrade 21/21 ✅** (the packed candidate migrates and recovers an exact
+v3.14 home across two daemon processes). Not run: bench:gates and the eval:* lanes, which
+spend live model calls.
+
+So the release machinery is green on these bytes; what is NOT met is the owner's other
+condition — running an ordinary task end to end — and that is where the open lane sits.
