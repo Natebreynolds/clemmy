@@ -2626,3 +2626,60 @@ record says `committedExternalActions=2` while the ledger has 0
 `external_write_succeeded` — a task-record truth defect to reconcile separately.
 The owner's conditions for the tag are NOT met until this canary produces its
 drafts.
+
+
+**2026-09-05 08:16 — REVIEWER TAKEOVER, seven commits, and the canary re-run. What landed
+(each pinned, each red-without-the-fix):** `c40fa871` a task record commits only
+ledger-succeeded external writes (the live `committedExternalActions=2` against zero
+`external_write_succeeded`); `cb753931` the flaky revalidation rebind — two cache layers,
+one reset: the durable contract store survived `resetToolSchemaCache()`, an equal-millisecond
+observation of the same slug under a different label hit the store's authority-conflict rule,
+and the exact refresh settled unavailable (9 of 20 runs; 30/30 and 6/6 green after, no sleeps,
+no relaxed assertion, no production change); `045b486c` a read the host itself nominated
+cannot stop at prose (the `plan_not_required` -> `call_tool` nomination had no continuation
+sibling, so a prose reply published a dead-end turn); `8e79559f` a planning card citing this
+source's own replayed rows is not drift (legacy input-digest staged identity after restart);
+`53c3fe66` the compact advertised-schema projection (cold step-1 tools 19,616 -> 12,579 B,
+initial surface 28,843 -> 21,623 B, semantics over four steps -17%); `57829004` the
+provenance fix below; `6dae0e10` a refused frame now journals whether its carrier was even
+advertised this turn.
+
+**The provenance root cause was NOT what the last entry predicted, and the correction matters.**
+Reversing the stub "from the receipt" is impossible: the receipt row seals bytes and a digest,
+never the envelope text, and the envelope carries a host-authored `message` plus a `diagnostic`
+that no row stores. The reversal instead has a second, stronger owner — the accepted-model-batch
+checkpoint and admission history, the host's own record of the exact frame it sent, written
+before the model ever replied and unreachable by it. Finding this receipt's item there,
+byte-identical to the receipt and the same character count the stub reports, proves the stub
+presents that settlement and nothing else. Proven on the canary's OWN database: both live stubs
+refuse on the previous bytes and are accepted on these; pinned in the production persistence
+shape (parked message 352 chars, sealed envelope 758), red without the fix.
+
+**CANARY RE-RUN (frozen `57829004`, brain/judge/worker pinned claude-sonnet-5, the SAME parked
+home the last run died in). Three resumes, and the instrument earned its keep:**
+(1) The provenance wall is GONE — the turn ran, discovered capabilities, repaired a carrier and
+reached the provider. It then died on `attested transport could not resolve the packaged
+provider client`: the attested transport requires `dist/integrations/composio/client.js`, which
+a source checkout does not have until it is built. Worth knowing for any dev-source daemon.
+(2) After building the frozen source, the next resume refused its own work_call with
+`host_planned_work_call_requires_plan_sibling` on a PROVEN READ — the refusal text names
+`OUTLOOK_GET_DRAFTS_MAIL_FOLDER` as unprovable while listing it among the ten proven reads two
+lines above. The single model step after that refusal was terminated as
+`recovery_surface_mismatch`. That is a dead end in the exact shape the directives forbid: the
+host refused what it had already proven and then closed the only door it had named.
+(3) The third resume produced a complete, correct draft body for a real prospect, hit the same
+dispatch wall, said so honestly — and the task was recorded `done` with zero drafts, zero
+`external_write_succeeded` and no result body. A task that accomplished nothing must not settle
+as done.
+
+**TAG VERDICT: the owner's conditions are NOT met, so nothing is pushed and nothing is tagged.**
+Two of the three journeys are green; the third (competitive byte ledger) is at 21,623 B against
+its 16 KiB ceiling and the remaining 5,239 B is an owner decision, not a trim — the surface is
+9 strict-mode tool contracts (12,579 B) plus the action rubric (8,218 B as sent) plus 582 B of
+input; the only levers left are gating the two call-id-only readers off a cold surface (-2,635 B,
+but it churns the tools block mid-session and the monotonic floor exists BECAUSE that churn
+measured a cache-hit drop to 0.74), trimming the rubric's binding blocks, or shrinking the
+advertised packet contract. The end-to-end condition ("confident I can run Clem end to end on
+any task") is not met either: the canary still cannot create its five drafts. The next lane is
+the carrier/plan-authority class on continuation turns, with the new `frame_refused` fields to
+name the cause on the first run instead of the fourth.
