@@ -2341,3 +2341,19 @@ digest site and make each one go through `materializedArgumentsJson`.
 The FIX-NOW group of the old journeys is closed; remaining from the nine: the two
 deferred ones (written reasons owed in `docs/releases/v3.16.0.md`) and the byte
 ceiling (deliberately red).
+
+**2026-09-05 01:10 — §15 WATCHER RE-ARM ON FAN-OUT LANDED: `a32317cf`.** The judge coverage gap
+from the live replay is closed at the code level: the first `worker_started` of a
+batch re-arms the same watcher gate (only the call interval waived; in-flight,
+check/injection caps and kill-switch unchanged) and runs the same check body in
+the parent's context with the workers' progress in its summary; the verdict rides
+the existing steer-note channel to the parent's next model request only.
+Verifier probes: a hostile steer note during the batch reached no child, no
+consent, no dispatch; a no-fan-out run's event dump is byte-identical to
+unpatched; zero listener leak. Pins 255/255 (timing pin stable ×3); typecheck ✅.
+The LIVE proof of `auditorOverlapsWorker:true` belongs to the next cold worker
+replay on the final bytes. Reviewer's remaining-work list: malformed
+`run_worker` packet part 2 (in flight) · materialization-split sweep (in flight) ·
+owner's "defer" on the three skips · full gates on final bytes · cold worker
+replay + draft canary on the final frozen SHA · packaged rehearsal · push/tag on
+the owner's words.
