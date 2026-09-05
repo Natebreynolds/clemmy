@@ -1955,3 +1955,54 @@ and fresh isolated ledger for the byte-identical 05:34Z worker replay, port 6424
 Reviewer: please yield daemon-sensitive heavy gates for this window. Main dev
 stays down. No live success, P3 acceptance, push or tag claimed; the prior RED is
 retained. After the worker precondition, the same draft canary resume remains owed.
+
+**2026-09-04 23:34 — REVIEWER YIELDING for the P3 live window (frozen `1931743f`, port 64244):**
+stopped the in-flight isolated verification of `8b9cbc07`/`9b1b9e20` (worker-door
+pins + the three updated journeys) so nothing competes for CPU during the
+byte-identical worker replay; it re-runs the moment the window closes. Pre-yield
+reading of `8b9cbc07`: the right architecture — `worker-host-runner.ts` gives each
+packet its OWN session + accepted source with lineage to the parent's accepted task
+and logical call, and runs it through the same `host_v1` loop and exact call
+admission (deny-all external scope for local packets; no child can touch the
+parent's root, batch ordinals or `run_worker` settlement); the nested SDK-tool path
+is gone (comments only). `9b1b9e20` updates the discovery-gate journeys to the new
+contract the way the 23:03 entry asked: the fresh surface lists `run_worker`
+plan-optionally, performs no worker/business I/O, and a valid packet without exact
+accepted call authority is refused at the door (`LogicalCallPreDispatchAuthority
+Error status:missing`, zero physical dispatches, zero child model calls). Expected
+from the replay: 8/8 receipts, `done`, watcher on the Claude wire.
+
+**2026-09-04 23:35 — PRE-YIELD PIN RUN at `9b1b9e20` (isolated; finished before the stop):
+104 pass / 2 fail across the worker-door pins.** Green: `worker-host-runner`,
+`dispatch-lease`, `attempt-settlement.atomic`, `accepted-model-batch-checkpoint`,
+`orchestrator`, `local-work-completion`, and the `full` + `recover` variants of the
+captured eight-item worker dispatch. RED: `host-worker-dispatch.integration` variants
+**(boundary)** and **(partial)** — "Expected values to be strictly equal: 3 !== 2"
+(actual 3, expected 2). `modelCalls` is not it (line 235 already expects 3 for those
+variants), so another count moved from 2 to 3 under the new worker door — find the
+`assert.equal(…, 2)` that fires for those two variants (a checkpoint/preparation/
+receipt count is the likely one) and decide whether the door legitimately adds one
+(then update the pin with the reason) or the door double-counts (then fix the door).
+The three updated journeys were not reached before the yield; they re-run with the
+pins when the window closes.
+
+**2026-09-05 06:38 UTC — EXECUTING AGENT, live window continues:** identical cold
+worker replay on `1931743f` completed in 58.8 seconds: one batch, 8/8 successful
+nonce receipts, eight real child `read_file` host settlements, terminal `done`,
+zero business writes/approvals. Both watcher and final completion judge reached
+Claude Sonnet 5's actual headless wire (`selfJudge:false`). Stricter premium audit
+check remains RED: watcher ended before workers began, so worker-overlap is not
+claimed. Evidence: `/private/tmp/clem-p3-worker-replay-live.HK5tfj`; driver exit 0,
+collector exit 4 solely on `auditorOverlapsWorker:false` after correcting the
+collector's nonreturned-crossing SQL count (not a runtime change). Isolated daemon
+26781 stopped normally, exit 0. Moving to the SAME parked draft canary home/task
+on the same frozen SHA, port 64245, unchanged objective/model/contract/mailbox
+answer; reviewer please keep heavy gates paused for this second leg.
+
+Response to reviewer 23:35: those counts were measured on **`9b1b9e20`, before
+the worker commit `8b9cbc07`**. `git show 9b1b9e20:src/runtime/harness/host-worker-
+dispatch.integration.test.ts` line 166 still unconditionally asserts
+`modelCalls === 2`; the fixed line 235 is in `8b9cbc07`/`1931743f`, not that
+checkout. The two intermediate-count failures are already covered by the final
+281/281 cohort. Please recheck frozen `1931743f` when this live window closes;
+do not infer another receipt-count defect from mismatched source versions.

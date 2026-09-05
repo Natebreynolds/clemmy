@@ -137,6 +137,48 @@ read-only package/nonce paths. Setup copies the original nonce expectations into
 the new collector home without changing the original files. Record prompt and
 packet hashes plus byte-equality checks; no revised task or stronger prompt.
 
+## Identical cold worker replay — dispatch GREEN; premium overlap not proven
+
+- Frozen SHA `1931743f2fdf8e9f542a0a096110af078114098a`, clean source
+  `/private/tmp/clem-p3-worker-replay-source.S51n5j`, fingerprint
+  `c110b3a465963f51e154c2dce20b33782583194419e8616d8c0eb906c1d7def2`.
+- Evidence `/private/tmp/clem-p3-worker-replay-live.HK5tfj/evidence`;
+  session `sess-desktop-a6a8d5e987b032a07d8c65ef`.
+- Exact original prompt/packet byte equality both true; prompt hash
+  `118fbc087c24ff362e93a54ed301bc87e10c9044b4410b5db6c1007b0dba7023`, packet hash
+  `e93ad673509adc166814a505c631d4c20caa34127757f3b8cd8c00839537b382`.
+- 06:34:29.364 → 06:35:28.160 UTC, **58.8 seconds**. One worker batch, 8 starts,
+  8 successful exact nonce receipts, eight distinct child host sessions with real
+  successful `read_file` settlements, all eight exact lines in the user result,
+  terminal `done`. Workers genuinely overlapped; all eight effective routes Codex
+  Terra. Zero business mutations, external-write events or approval rows across
+  parent AND children; one nonbusiness local coordinator bookkeeping settlement.
+- Actual watcher wire: Claude Sonnet 5, `claude_code_headless`, provider session
+  `100b6000-834c-461f-9b91-7c072a3af122`, 06:34:59.852–06:35:04.321 UTC,
+  4.469 seconds, healthy cross-family metrics (`selfJudge:false`).
+- **Final completion judge also reached Claude's wire**, provider session
+  `e35d5209-e2a6-422e-9bbb-9222d68d124e`, 06:35:25.315–06:35:28.105 UTC,
+  2.790 seconds, actual model Sonnet 5, verdict done, `selfJudge:false`.
+- Driver exit 0. Stronger collector remains **exit 4 solely because the watcher
+  did not overlap workers**: it finished before first worker at 06:35:07.455.
+  This proves reviewer §12 23:40's expected 8/8 + done + Claude wire, NOT the
+  premium claim that a judge audited the children while they worked. §15 broader
+  subagent auditing remains separate scope, not silently shipped or waived.
+- Collector correction is explicit: `nonreturned_crossing_count` is a derived
+  count over physical dispatches, not a settlement-table column. The first
+  instrument therefore wrongly counted the coordinator's local bookkeeping as a
+  business mutation. Corrected SQL preserves the zero-unknown/nonreturned check;
+  initial and corrected collector logs remain retained. No runtime was changed.
+- Daemon PID 26781/64244 stopped normally, actual exit 0, before SQLite collection.
+  Both subscription families were available; isolated Claude access expired at
+  07:11:59 UTC, after this run. Main dev stayed down.
+
+Reviewer 23:35's two intermediate count failures were on `9b1b9e20` (before
+worker commit `8b9cbc07`); that old fixture line 166 asserts two model calls
+unconditionally. The fixed line 235 belongs to the newer worker fixture. Final
+local 281/281 evidence and this live replay use the newer bytes, not that
+intermediate checkout. Final release gates are still owed on final bytes.
+
 ## Same canary — invocation contract
 
 Resume `bg-graph-driver-tag-canary-20260904`, never recreate it. Original prompt:
