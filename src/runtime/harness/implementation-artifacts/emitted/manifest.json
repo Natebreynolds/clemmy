@@ -2220,7 +2220,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 50624
+          "bytes": 52024
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 342921
@@ -4731,7 +4731,7 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 50624
+          "bytes": 52024
         },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 342921
