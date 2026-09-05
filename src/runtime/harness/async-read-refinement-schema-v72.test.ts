@@ -12,6 +12,7 @@ process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const schema = await import('./eventlog-schema.js');
 const asyncSchema = await import('./async-read-refinement-schema.js');
+const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 
 function version(db: Database.Database): number {
   return (db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as {
@@ -113,7 +114,7 @@ test('v71 to v72 adds the historical terminal owner and v73 normalizes Stop auth
       .includes('cancellation_run_attempt_id'));
 
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 75);
+    assert.equal(version(db), HARNESS_SCHEMA_VERSION);
     assert.ok(columnNames(db, asyncSchema.ASYNC_READ_REFINEMENT_TERMINAL_RECEIPTS_TABLE)
       .includes('cancellation_run_attempt_id'));
     exerciseTerminalOutcomeAuthority(db, 'plain');
@@ -172,7 +173,7 @@ test('v73 upgrades the earlier v71 terminal-table candidate without assuming a c
       )
     `);
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 75);
+    assert.equal(version(db), HARNESS_SCHEMA_VERSION);
     assert.ok(object(db, asyncSchema.ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE));
     assert.ok(object(db, 'trg_async_read_refinement_completion_excludes_terminal'));
     assert.ok(object(db, 'trg_async_read_refinement_terminal_excludes_completion'));
@@ -202,7 +203,7 @@ test('v73 restores recovery structures missing from an already-stamped v72 home'
     assert.equal(object(db, 'plan_task_binding_seal_recovery_cursor'), undefined);
 
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 75);
+    assert.equal(version(db), HARNESS_SCHEMA_VERSION);
     assert.ok(object(db, 'plan_task_binding_seal_recovery_cursor'));
     assert.ok(object(db, asyncSchema.ASYNC_READ_REFINEMENT_RECOVERY_CURSOR_TABLE));
     assert.ok(object(db, 'idx_sessions_chat_run_in_flight_updated'));

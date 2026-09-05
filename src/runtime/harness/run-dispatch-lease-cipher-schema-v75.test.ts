@@ -11,6 +11,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const schema = await import('./eventlog-schema.js');
+const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 
 test.after(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
@@ -47,7 +48,7 @@ test('v75 rebuilds run_dispatch_leases with the sealed-call cipher bound and kee
     db.pragma('foreign_keys = ON');
 
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 75);
+    assert.equal(version(db), HARNESS_SCHEMA_VERSION);
     const after = db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'run_dispatch_leases'`).get() as { sql: string };
     assert.match(after.sql, /length\(recovery_argument_cipher\) BETWEEN 1 AND 16777216/);
     assert.ok(!/BETWEEN 1 AND 48000/.test(after.sql));
@@ -84,15 +85,15 @@ test('v75 rebuilds run_dispatch_leases with the sealed-call cipher bound and kee
   }
 });
 
-test('a fresh database lands on v75 with the rebuilt bound', () => {
+test('a fresh current schema includes the v75 rebuilt bound', () => {
   const db = new Database(path.join(TEST_HOME, 'fresh.db'));
   try {
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 75);
+    assert.equal(version(db), HARNESS_SCHEMA_VERSION);
     const table = db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'run_dispatch_leases'`).get() as { sql: string };
     assert.match(table.sql, /BETWEEN 1 AND 16777216/);
     schema.applyHarnessMigrations(db);
-    assert.equal(version(db), 75);
+    assert.equal(version(db), HARNESS_SCHEMA_VERSION);
   } finally {
     db.close();
   }

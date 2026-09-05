@@ -15,6 +15,7 @@ const schema = await import('./eventlog-schema.js');
 const coexistence = await import('./host-planned-resolution-coexistence.js');
 const settlement = await import('./plan-task-post-settlement.js');
 const eventlog = await import('./eventlog.js');
+const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 
 const NOW = '2026-08-30T12:00:00.000Z';
 const digest = (character: string): string => character.repeat(64);
@@ -279,7 +280,7 @@ test('v70 through current backfills exact v71 receipts, retains legacy ambiguity
     schema.applyHarnessMigrations(db);
     assert.equal((db.prepare(`SELECT MAX(version) AS version FROM schema_version`).get() as {
       version: number;
-    }).version, 75);
+    }).version, HARNESS_SCHEMA_VERSION);
     assert.deepEqual(db.prepare(`
       SELECT logical_tool_call_id, delivery_owner
         FROM ${coexistence.PLAN_TASK_PREPARATION_CHECKPOINTS_TABLE}
