@@ -449,7 +449,7 @@ committed. The supported build/settings/active-work APIs returned exit 0 and:
 - Source fingerprint
   `f54fc9788e4885c915c5e8a522718d34479bb20df92719e37a0aeed2961fa451`,
   version `3.16.0`, schema `77/77`, entry
-  `/Users/nathan.reynolds/clementine-next/src/index.ts`.
+  `<repo>/src/index.ts`.
 - Brain/default worker Codex Terra; judge Claude Sonnet 5; both providers ready.
 - Both watcher flags on, chat interval 4 and workflow interval 2; routing off.
 - Zero active sessions, background tasks, or pending approvals at verification.
