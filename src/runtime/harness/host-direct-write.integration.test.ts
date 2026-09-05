@@ -225,6 +225,91 @@ for (const kind of ['send', 'delete', 'admin'] as const) test(`exact ${kind} pau
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 1);
 });
 
+// The fourth reducer decision. allow/ask/deny above all carry exact accepted
+// coverage; a graph-neutral direct local mutation has none, so the reducer
+// answers `repair` (coverage_missing) and the same-step door must release the
+// admitted logical call into the zero-I/O repair pairing. The strict schema
+// has a nullable field the model omits, so the raw model bytes and the
+// materialized bytes the loop admitted digest DIFFERENTLY: settlement must
+// present the admitted bytes or the release fails and the turn is refused.
+test('an uncovered direct local write with an omitted strict-nullable field repairs before I/O', async () => {
+  const { acceptedTaskIdFor } = await import('./attempt-identity.js');
+  const { durableLogicalCallContract } = await import('./logical-call-contract.js');
+  const { materializeStrictNullableFields } = await import('../schema-normalizer.js');
+  const taxonomy = await import('../../agents/tool-taxonomy.js');
+  const RAW_ARGS = { path: '/fixture/draft.txt', content: 'draft', mode: 'create', append: null };
+  const schema = {
+    type: 'object',
+    properties: {
+      path: { type: 'string' },
+      content: { type: 'string' },
+      mode: { anyOf: [{ type: 'string', enum: ['create', 'append', 'overwrite'] }, { type: 'null' }] },
+      append: { anyOf: [{ type: 'boolean' }, { type: 'null' }] },
+      optional_context: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    },
+    required: ['path', 'content', 'mode', 'append', 'optional_context'],
+    additionalProperties: false,
+  };
+  let bodies = 0;
+  const tool = brackets.wrapToolForHarness({
+    type: 'function', name: 'write_file', description: 'Recording-only local write fixture.', strict: true, parameters: schema,
+    needsApproval: taxonomy.needsApprovalFromTaxonomy('write_file', { computeInsideWorkspace: () => true }),
+    invoke: async () => { bodies += 1; return JSON.stringify({ ok: true }); },
+  } as never);
+  const prompt = 'Create a small draft file in the selected workspace.';
+  const callId = 'uncovered-local-write';
+  const session = eventlog.createSession({ id: 'p3-direct-write-local-uncovered-repair', kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: prompt } });
+  let modelCalls = 0;
+  const model = {
+    async getResponse() {
+      modelCalls += 1;
+      return { responseId: `uncovered-local-write-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: modelCalls === 1
+          ? [{ type: 'function_call', callId, name: 'write_file', arguments: JSON.stringify(RAW_ARGS) }]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The write was repaired without I/O.' }] }],
+      };
+    }, getStreamedResponse: modelStream,
+  };
+  const agent = { model, tools: [tool] };
+  const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [tool], activeToolNames: ['write_file'],
+    policyHash: 'p3-direct-write-local', budget: { maxUncachedTokens: 10_000, maxModelCalls: 3, maxToolCalls: 3, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok);
+  if (!sealed.ok) return;
+  envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const runner = new EventEmitter();
+  Object.assign(runner, { run() { throw new Error('legacy Runner must remain unreachable'); } });
+  const outcome = await brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
+    counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${session.id}::turn:1` },
+  () => hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: prompt }],
+    { maxTurns: 3, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq } } as never));
+
+  // This pin only proves something if admission and raw bytes truly diverge.
+  const acceptedTaskId = acceptedTaskIdFor(session.id, source.seq);
+  const admitted = materializeStrictNullableFields(RAW_ARGS, schema);
+  assert.deepEqual(admitted, { ...RAW_ARGS, optional_context: null });
+  const rawDigest = durableLogicalCallContract(acceptedTaskId, 'write_file', RAW_ARGS)!.argumentDigest;
+  const admittedDigest = durableLogicalCallContract(acceptedTaskId, 'write_file', admitted)!.argumentDigest;
+  assert.notEqual(rawDigest, admittedDigest, 'raw and materialized bytes must digest differently for this pin to bite');
+
+  assert.equal(bodies, 0, 'an uncovered mutation must never reach its body');
+  assert.equal(Boolean(outcome.hasInterruptions), false, 'coverage_missing is a repair, not an approval question');
+  assert.equal((outcome as { terminal?: unknown }).terminal, undefined, 'a repair is paired to the model, never a public terminal');
+  assert.equal(modelCalls, 2, 'the paired repair must reach the next model step');
+  assert.ok(outcome.history.some((item) => (item as any).type === 'function_call_result' && (item as any).callId === callId),
+    `the refused call stays paired in model history: ${JSON.stringify(outcome.history)}`);
+  const db = eventlog.openEventLog();
+  const rows = db.prepare('SELECT tool_name, argument_digest, state FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?')
+    .all(session.id, source.seq) as Array<{ tool_name: string; argument_digest: string; state: string }>;
+  assert.equal(rows.length, 1, JSON.stringify(rows));
+  assert.equal(rows[0]!.tool_name, 'write_file');
+  assert.equal(rows[0]!.argument_digest, admittedDigest, 'the reducer admitted the materialized contract');
+  assert.equal(rows[0]!.state, 'settled', 'the refused call is settled under the bytes that admitted it, never left open');
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?').get(session.id, source.seq) as { n: number }).n, 0);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?').get(session.id) as { n: number }).n, 0);
+});
+
 test('the real host approval reaches the public event with reducer effect, account and reversibility', async () => {
   const fixture = await directWriteFixture('call_tool', 'send', 'public-card');
   assert.ok(fixture);

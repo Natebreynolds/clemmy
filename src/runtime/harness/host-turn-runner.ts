@@ -7516,11 +7516,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const countingCallIds = refusalProgress.hasTypedRefusal
         ? new Set(refusalProgress.countingCallIds)
         : undefined;
+      // A frame identity is settled with the bytes that admitted it. The
+      // pre-approval loop admitted each logical call (and minted its durable
+      // argument digest) from the strict-nullable materialized arguments, so
+      // settlement must present those same bytes; the raw model bytes digest
+      // differently whenever the model omitted a nullable field.
       const released = preparedInBatch.every((candidate) => (
         releasePreparedHostWorkCallForRepair(candidate, 'sibling_frame_replanned_before_dispatch')
       )) && canonicalCalls.every((call) => settlePendingCallBeforeDispatch({
         callId: call.callId, name: call.name,
-        rawItem: { name: call.name, callId: call.callId, arguments: call.argumentsJson },
+        rawItem: {
+          name: call.name, callId: call.callId,
+          arguments: materializedArgumentsJson(toolByName.get(call.name), call.argumentsJson),
+        },
       }, 'sibling_frame_replanned_before_dispatch'));
       for (const call of canonicalCalls) nestedCallAdmissions.delete(call.callId);
       if (!released) {
