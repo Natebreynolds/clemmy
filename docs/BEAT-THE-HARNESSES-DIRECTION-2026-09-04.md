@@ -2482,3 +2482,53 @@ every confirmed site, and a real key-permission fix. LIVE PROOFS start now on th
 exact bytes: the cold 8-worker replay (must show `auditorOverlapsWorker:true` this
 time) and then the parked draft canary (five reversible drafts, zero cards, zero
 sends).
+
+**2026-09-05 03:34 — LIVE PROOFS on `b69046aa` (frozen source, fresh isolated homes, live home
+never opened, daemons stopped and verified; evidence under the reviewer scratchpad
+`takeover/live/`; every number re-derived by a read-only verifier from the stopped
+snapshot DBs):**
+**(1) Cold 8-worker replay — 12/12 collector assertions GREEN, 47.3 s wall, terminal
+`done`, 8/8 nonce receipts through real child host `read_file` settlements, one
+batch, parallel, zero writes/approvals, and `auditorOverlapsWorker: TRUE` — two
+watcher checks on the real Claude wire, the second overlapping six of the eight
+workers (the `a32317cf` re-arm demonstrated live; the 1931743f run had one check
+and no overlap).** BUT it is not a substantive reproduction of the Codex-worker /
+Claude-judge contract: the owner's **Codex weekly quota crossed 100%** between the
+two runs (`state/model-rate-limits.json`: usedPercent 100, resets
+2026-09-11T05:29Z; 96% at the 06:35Z run), the first brain call rate-limited, the
+fallover routed brain, all 16 worker turns AND the judges onto claude-sonnet-5
+(0 Codex tokens; ~220k Sonnet input tokens billed to the owner's Claude plan). **A
+REAL DEFECT this exposed — planned-vs-executed attribution:** `worker_model_routed`
+/ `worker_started` / `worker_result` and the runs ledger stamp the PLANNED packet
+model (`worker-tools.ts:666/682`, `orchestrator.ts:462 source:'packet'`); the
+fallover (`fallback-model.ts:830 preselected-rate-limited`) never corrects them;
+`debate-model.ts:1058` derives `brainFamily`/`selfJudge` from the CONFIGURED brain
+(`judge-family.ts:332` aggregates it) — so the judge lane reported `brainFamily
+codex / selfJudge false` while Claude Sonnet 5 judged Claude Sonnet 5: a
+self-judge presented as cross-family, violating "judge a different family" with no
+signal. The collector's `codexWorkerRoutes` / `watcherHealthy` passed on labels;
+only `model_route_decisions/outcomes` and per-session `turn_model_routed` tell the
+truth. Fix: attribute EXECUTED routes on every worker/judge label, derive
+`selfJudge` from the executed brain family, and make in-repo pins assert on route
+rows. Not re-run on purpose: a retry cannot reach Codex before 09-11 and only
+bills Claude again.
+**(2) Parked draft canary — RED in 1.4 s with ZERO tool calls and ZERO model
+calls (nothing billed), a NEW deterministic dead end:** the first brain request of
+the resumed turn is refused pre-dispatch by
+`model-request-provenance.ts:871` — `host_result_projection_mismatch`. Mechanism,
+reproduced offline byte-for-byte: layer-1 compaction (`compaction.ts:362
+clipOldToolResults`) clipped the two refused `work_call` frames from the 1931743f
+leg into "[clipped …]" stubs — clip-eligible only because each refused frame was
+persisted TWICE (a host-disposition receipt AND a plain-text `tool_outputs` row from
+the `host-turn-runner.ts:4136` refusal path) — and the HOST-RECEIPT branch of
+provenance has no Layer-1 stub allowance (the logical-settlement branch does,
+:933/:1349). Every resume of `bg-graph-driver-tag-canary-20260904` now dies
+identically; the task record says `resumable:true`, the turn says `resumable:false`,
+and the user sees "Something went wrong on that turn." The previous leg got 5 tool
+calls and 5 minutes; this state is worse and durable. Fix (general): the
+host-receipt branch accepts a Layer-1 clip stub exactly as the logical branch does,
+AND a refused frame is persisted once (no `tool_outputs` row for a frame settled by
+host receipt, or host-disposition results exempt from clipping); typed stop must
+not contradict itself. Both fixes launched (isolated worktrees, pins, adversarial
+verification). Canary re-run after the fix needs the owner's word: with Codex at
+100% it would execute on Claude fallover (contract change + Claude billing).
