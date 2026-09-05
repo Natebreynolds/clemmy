@@ -152,7 +152,6 @@ import { evaluateQuantifiedWorkManifestGate } from '../runtime/harness/quantifie
 import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import type { DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
 import {
-  actionExpectedWorkRequired,
   bindWorkerPacketExpectedWork,
 } from '../runtime/harness/expected-work-admission.js';
 import {
@@ -2308,8 +2307,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     description: runWorkerToolDescription,
     parameters: WorkerToolCallSchema,
     strict: true,
-    isEnabled: async () => !hostFreshPlanning
-      || actionExpectedWorkRequired(hostFreshPlanning.identity),
     execute: async (callParams, runContext, details) => {
       const call = callParams as WorkerToolCall;
       const callItems = workerCallItems(call);

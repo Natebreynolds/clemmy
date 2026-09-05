@@ -1246,7 +1246,7 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
   }
 });
 
-test('run_worker routes Claude workers through the Claude Agent SDK worker path', async () => {
+test('fresh-host run_worker is enabled and invokes a worker before any plan is compiled', async () => {
   resetEventLog();
   const session = createSession({ kind: 'chat', title: 'claude sdk worker route' });
   const prev: Record<string, string | undefined> = {
@@ -1269,11 +1269,36 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       };
     });
 
-    const agent = await buildOrchestratorAgent();
-    const runWorker = (agent.tools ?? []).find((t) => (t as { name?: string }).name === 'run_worker') as {
+    const acceptedText = 'Design one report section using the taste skill.';
+    const anchor = anchorAcceptedTask(session.id, acceptedText);
+    const { actionExpectedWorkRequired } = await import('../runtime/harness/expected-work-admission.js');
+    assert.equal(actionExpectedWorkRequired({
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+    }), false, 'fresh accepted input has no compiled expected-work contract');
+    const agent = await buildOrchestratorAgent({
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+      userInput: acceptedText,
+      acceptedRoute: 'act',
+      hostFreshPlanning: freshPlanningFixture(session.id, anchor.sourceUserSeq),
+      allowedToolNames: ['run_worker', 'skill_read'],
+      mcpToolScope: {
+        authority: 'none',
+        reason: 'local worker preparation needs no external capabilities',
+        allowedServerSlugs: [],
+        toolPatterns: [],
+        maxTools: 0,
+      },
+    });
+    // Use the SDK's filtered surface: agent.tools alone includes tools hidden
+    // by isEnabled, which is why the original route-only test missed this wall.
+    const runContext = new RunContext({ sessionId: session.id });
+    const enabledTools = await agent.getAllTools(runContext);
+    const runWorker = enabledTools.find((t) => t.name === 'run_worker') as {
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
-    assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+    assert.ok(runWorker, 'local delegation must be enabled before plan_task');
 
     const packet = {
       objective: 'Design one report section using the taste skill.',
@@ -1286,9 +1311,8 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
       intent: 'design',
     };
     const input = JSON.stringify(packet);
-    const anchor = anchorAcceptedTask(session.id, 'Design one report section using the taste skill.');
     const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
-      new RunContext({ sessionId: session.id }),
+      runContext,
       input,
       { toolCall: { name: 'run_worker', callId: 'call_worker_claude_design', arguments: input } },
     ));
@@ -1297,6 +1321,11 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
     assert.equal(captured.modelId.startsWith('claude-'), true);
     assert.match(captured.prompt, /WORKER JOB PACKET/);
     assert.ok(captured.allowedLocalMcpTools.includes('skill_read'));
+    assert.equal(captured.sessionId, session.id);
+    assert.equal(captured.sourceUserSeq, anchor.sourceUserSeq);
+    assert.equal(captured.workerScope, true, 'delegation retains worker effect restrictions');
+    assert.ok(captured.maxTurns > 0 && Number.isFinite(captured.maxTurns));
+    assert.equal(captured.nativeMcpToolScope, null, 'enabling delegation retains the denied external scope');
     const routed = listEvents(session.id, { types: ['worker_model_routed'] });
     const sdkEvent = routed.find((event) => (event.data as { transport?: string }).transport === 'claude_agent_sdk_worker');
     assert.ok(sdkEvent, 'expected SDK worker telemetry event');
@@ -1307,6 +1336,10 @@ test('run_worker routes Claude workers through the Claude Agent SDK worker path'
     assert.equal((results[0].data as { ok?: boolean }).ok, true);
     assert.equal((results[0].data as { model?: string }).model, 'claude-sonnet-4-6');
     assert.deepEqual((results[0].data as { toolUses?: string[] }).toolUses, ['mcp__clementine-local__skill_read']);
+    assert.equal(actionExpectedWorkRequired({
+      sessionId: session.id,
+      sourceUserSeq: anchor.sourceUserSeq,
+    }), false, 'delegation must not manufacture a planning contract');
   } finally {
     setClaudeAgentSdkWorkerRunForTest(null);
     for (const [key, value] of Object.entries(prev)) {
