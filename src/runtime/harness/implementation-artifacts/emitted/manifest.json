@@ -1509,7 +1509,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 200416
+          "bytes": 200275
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -2211,7 +2211,7 @@
           "bytes": 62848
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 28413
+          "bytes": 29959
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -2220,10 +2220,10 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 49423
+          "bytes": 50624
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 348643
+          "bytes": 342921
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4020,7 +4020,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 200416
+          "bytes": 200275
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -4722,7 +4722,7 @@
           "bytes": 62848
         },
         "src/runtime/harness/no-progress-governor.ts": {
-          "bytes": 28413
+          "bytes": 29959
         },
         "src/runtime/harness/scrub-internal-narration.ts": {
           "bytes": 4170
@@ -4731,10 +4731,10 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 49423
+          "bytes": 50624
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 348643
+          "bytes": 342921
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
