@@ -2295,3 +2295,49 @@ drives an uncovered write with an omitted nullable field through the real door
 this checkout: pins 252/252 ✅ · `provider-neutral-no-random-gate` **52/56** (the
 six repair subtests + parent green; the four left are the bisected 08-31
 approved-outbound group) · typecheck ✅.
+
+**2026-09-05 00:48 — malformed `run_worker` packet: part 1 built and REFUTED as incomplete;
+part 2 in flight (not committed until the class is closed).** Mechanism (fixer, then
+independently confirmed by its verifier through the real host_v1 door): `run_worker`
+on the orchestrator lane was built with `tool({strict:true, execute})` and no
+`errorFunction`, so an SDK zod failure came back as a bare "An error occurred…"
+string; settlement reads only `worker_result` receipts for run_worker, so zero
+receipts + a plain string fell through to `hostExecuted` → **`succeeded`, a host
+crossing and a durable result handle for a call that dispatched nothing**; and
+`brackets.ts` then rewrote the string into the generic "worker did not complete this
+item" envelope, hiding the repair. Part 1 (errorFunction → typed
+`InvalidArgumentsPreDispatchResult`; brackets returns the exact repair bytes;
+`describeInvalidToolInput(maxIssues)` so a many-violation packet repairs in one
+round; pin with three shapes: 3/3, neighbors green) is correct for the SDK-invalid
+class — but the adversarial verifier found five schema-VALID no-child shapes that
+still settle `succeeded` (empty `items` with a manifest; all-junk items;
+whitespace items; neither `item` nor `items`; a manifest `phase` not in `phases`)
+because the tool BODY returns plain "ERROR: …" strings for its own pre-dispatch
+refusals. Part 2 routes every no-child refusal in the body through the same typed
+carrier (no blanket "zero receipts ⇒ failed" rule — the atomic pin's unrelated-call
+variant and durable-completion reuse legitimately settle without new receipts) and
+extends the pin with all five shapes plus a partial-fan-out control. The verifier's
+method — same real door, ledger rows read back — is the standard for this class.
+
+**2026-09-05 01:00 — APPROVED-OUTBOUND-ON-RESUME FIXED: `0c63a90b`. `provider-neutral-no-random-
+gate.acceptance` is 56/56 — the whole file green for the first time since the
+v3.16.0 cut.** Mechanism (two investigators, four adversarial verifiers, all
+reproduced): the resumed-frame "approval edit" compare (`host-turn-runner.ts`
+~5783) checked persisted MATERIALIZED pending bytes against RAW checkpoint bytes;
+`d3a35922` (08-31) added `source_call_ids`/`source_record_ids` as nullable fields
+on `work_call`, so every unchanged approval materialized differently, was treated
+as a user edit, and was refused `approval_scope_changed_before_dispatch` — the send
+never crossed. The `git bisect` pointing at `36c5b311` was an artifact of the six
+08-31 commits landing as one internally inconsistent batch. Fix: compare both
+sides under the same materialization (raw fallback); a genuine edit still differs
+and is still refused (the four negative cases stay green). Pin: the direct-write
+fixture carrier now has a required nullable field the model omits, so every
+resume case exercises the split. Verified here: pins 287/287 ✅ · journey 56/56 ✅
+· typecheck ✅. Three of today's harness bugs were the SAME class — a strict-nullable
+materialization split between the bytes that admit a call and the bytes that
+settle/compare it (`39d00400`, this, and f616da92's own pin schema hiding it) —
+worth one sweep: grep every `rawItem.arguments` / `argumentsJson` compare and
+digest site and make each one go through `materializedArgumentsJson`.
+The FIX-NOW group of the old journeys is closed; remaining from the nine: the two
+deferred ones (written reasons owed in `docs/releases/v3.16.0.md`) and the byte
+ceiling (deliberately red).
