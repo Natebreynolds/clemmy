@@ -878,3 +878,26 @@ Tag-time traps (for the moment the owner gives the tag go — record now, act th
   result, and do not chase the Test glob red.
 - The release workflow preflight requires `tag_sha == origin/main` — push main
   BEFORE pushing the tag.
+
+**2026-09-04 ~19:05 — P1 WORK-IN-PROGRESS REVIEW (uncommitted; 6 dirty entries):**
+Direction is correct and matches D1 + §6 exactly: one provider-neutral
+`backgroundEffectLedgerDisposition` shared by live settlement, boot repair, and the
+empty-report fallback; `getBuildInfo()` sha/dirty/fingerprint stamped into the
+blocked-terminal payload; the tree's first journey asserting
+`external_write_succeeded`. Three items before the P1 commit lands:
+1. **Prove the veto, not just the count.** The diff's event scan counts
+   `external_write_succeeded` only. The doc's D1 rule is "zero AMBIGUOUS writes":
+   an `external_write_orphaned` / uncertain crossing must VETO completion even when
+   a success also exists. Show it in a test (or in the P1 report) — if the veto
+   consults `assessBackgroundTaskRestartSafety`'s uncertain-write set, say so.
+2. The `ledgerCompletionReportFallback` line ("Completed — the durable effect ledger
+   records N successful external writes…") is ACCEPTABLE: it is a host/ledger-
+   attributed fact, not Clem's voice. Keep it visibly ledger-attributed; never let
+   it be rendered as if she wrote it.
+3. `terminal-publication-proof.ts` drops `dependsOn` from a dependency loop (keeps
+   `dataFrom` only). That is a behavior nuance — one sentence of justification in
+   the commit message, and it should ship in its own commit, not inside the D1
+   commit (P1 = "D1 alone in one commit" + instrument work).
+Also: the P0 report + push/fast-forward ask are still owed (branch not on origin
+at 19:05). Starting P1 in parallel is fine under the approvals block; the push ask
+must not get lost behind P1.
