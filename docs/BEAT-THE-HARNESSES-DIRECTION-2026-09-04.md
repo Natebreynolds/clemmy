@@ -1172,3 +1172,41 @@ terminal verbatim, `resumable:true` with a named next edge. Then the SAME canary
 expected flip from `control_no_progress_exhausted / resumable:false` to a resumable
 typed stop, ≤1 wasted model step per failing run. One fix per commit, red journey
 first where possible. `Start P3?` follows the P2 report.
+
+**2026-09-04 ~22:05 — REVIEWER: P2 batch `ce05be82`·`7bd17d6f`·`b8f334e9`·`658b12c2`
+(+ manifest `4ed325eb`) reviewed. Scans clean. Against the six checks:**
+- ✅ (1) `no-progress-governor.ts`: a NEW typed consequence now decrements
+  (`Math.max(0, retriesRemaining - 1)`) and counts as bounded structural progress;
+  zeroing remains only for a repeated key and an exhausted transition budget. The
+  dead 3-retry budget is alive.
+- ✅ (4) The tool-free "last word" round trip is gone (`tryLastWordTurn` /
+  `modelStepSchemas = []` no longer exist; −336 lines); the typed stop is published
+  with retained results, resumability and a next edge.
+- ✅ (3) Directive + surface: the refused carrier stays available alongside proven
+  read/discovery controls for host-side refusals ("without changing dispatch
+  authority" — correct: wider recovery, same authority).
+- ✅ `b8f334e9`: settled host capability bindings are counted directly by
+  operation/account/schema and a bounded structural carrier repair is progress —
+  the graph-neutral lane is no longer invisible to the governor (§2's back-end
+  seam, at the governor).
+- ⚠️ (2) PARTIAL: the bare `'schema_invalid'` stage fallback still exists
+  (`host-no-progress-projection.ts` ~885 and ~1038) when no repairKey is derivable.
+  Two different shape errors with no key still collide into the same-key terminal.
+  Should-fix before P3: key the bare case on operation id + argument digest, and
+  report how many bare `schema_invalid` stages the P2 canary still produced.
+- ⚠️ (5) PARTIAL: "a stalled attempt burns no budget" is covered by the integration
+  fixtures; the "provider-proven failure buys exactly one bounded retry through an
+  armed cooldown" case is not evidenced — state in the P2 report whether it maps
+  onto `retry_host`/`provider_repair` and pin it, or record why it does not apply.
+- ➕ `658b12c2` (run_worker no longer hidden behind an expected-work contract on
+  fresh turns; −3 lines, tested) is D5/P5 scope, not P2 — accepted as a benign,
+  tested subtraction that serves NO DEAD ENDS; note the scope creep and stop there.
+**P2 acceptance run still owed:** daemon restart on HEAD (`4ed325eb`), the SAME
+canary, expected flip `control_no_progress_exhausted / resumable:false` → a
+resumable typed stop with a named next edge, ≤1 wasted model step; include the
+task-level terminal line (the P1 run had none in the log) and the sha stamp.
+- ✅ 22:20 partial (2) CLOSED by `82e067f1`: no bare `'schema_invalid'` stage remains;
+  a typed schema refusal without a repairKey is keyed
+  `schema_invalid:call:<digest16>` over the effective operation + canonical argument
+  digest (stable JSON, so formatting/call-id churn cannot mint stages); 96 test
+  lines. Remaining before P3: partial (5) evidence + the acceptance run.
