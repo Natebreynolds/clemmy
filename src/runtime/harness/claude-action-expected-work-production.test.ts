@@ -357,7 +357,7 @@ test('exact Claude act surface exposes work_call as its sole generic business ca
     brokerCoverage: string;
   };
   assert.equal(searchBody.results[0]?.carrier, 'work_call');
-  assert.match(searchBody.hint, /inner name\/args_json of work_call/);
+  assert.match(searchBody.hint, /through work_call by copying its literal example/);
   assert.equal(searchBody.brokerCoverage, 'builtins_only',
     'an explicitly denied external scope cannot arm provider-backed role discovery');
 
