@@ -1797,7 +1797,7 @@ function verifyHostSealedWriteReceipt(input: {
       return { ok: false, status: 'conflict', reason: 'write lineage contains an invalid ancestor reference' };
     }
     ancestors.add(nodeId);
-    for (const dependencyId of new Set([...operation.dependsOn, ...operation.dataFrom])) {
+    for (const dependencyId of operation.dataFrom) {
       if (!operations.has(dependencyId)) {
         return { ok: false, status: 'conflict', reason: 'write lineage ancestor is missing' };
       }

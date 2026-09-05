@@ -57,6 +57,8 @@ const { issueCollectionReceipt } = await import('../harness/evidence-receipts.js
 const { setAdmittedGraphRunFault } = await import('../harness/admitted-construct-run.js');
 const { freezeActionExpectedWorkContract } = await import('../harness/expected-work-contract.js');
 const { readCanonicalGraphNodeLease } = await import('../harness/canonical-graph-node-lease.js');
+const { loadManifestState } = await import('../harness/obligation-store.js');
+const { verifyAcceptedTaskTerminalProofInTransaction } = await import('../harness/terminal-publication-proof.js');
 import type { RegisteredHostCapability } from '../harness/host-capability-catalog-factory.js';
 import type { ManifestEffect } from '../harness/capability-manifest.js';
 
@@ -1032,6 +1034,55 @@ test('collect → analyze → construct → readback finishes typed done with on
   if (dispatched.kind !== 'typed') return;
   assert.equal(dispatched.result.status, 'success', dispatched.result.error);
   assert.equal(creates.count, 1, 'exactly-once create');
+  const manifestState = loadManifestState(identity.sessionId, identity.sourceUserSeq);
+  assert.equal(manifestState.status, 'ok');
+  if (manifestState.status !== 'ok') return;
+  const sourceNode = manifestState.manifest.nodes.find((node) => node.operationId === 'op-source');
+  const collectionNode = manifestState.manifest.nodes.find((node) => node.operationId === 'op-collect');
+  const writeNode = manifestState.manifest.nodes.find((node) => node.operationId === 'op-write');
+  assert.ok(sourceNode && collectionNode && writeNode);
+  const isDerivationEdge = (edge: typeof manifestState.manifest.edges[number]) => (
+    edge.toNodeId === writeNode.nodeId
+    && edge.toObligation === 'derivation_from_current_source'
+  );
+  assert.equal(
+    manifestState.manifest.edges.some((edge) => edge.fromNodeId === sourceNode.nodeId && isDerivationEdge(edge)),
+    false,
+    'control-only dependsOn is not content lineage',
+  );
+  const dataLineageEdge = manifestState.manifest.edges.find((edge) => (
+    edge.fromNodeId === collectionNode.nodeId && isDerivationEdge(edge)
+  ));
+  assert.ok(dataLineageEdge, 'the declared dataFrom source owns the write derivation edge');
+  const proofInput = {
+    db: openEventLog(),
+    sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq,
+    acceptedTaskId: `task:${identity.sessionId}#${identity.sourceUserSeq}`,
+  };
+  assert.deepEqual(
+    verifyAcceptedTaskTerminalProofInTransaction({
+      ...proofInput,
+      manifest: manifestState.manifest,
+    }),
+    { ok: true },
+    'terminal proof ignores control ordering when checking content lineage',
+  );
+  assert.deepEqual(
+    verifyAcceptedTaskTerminalProofInTransaction({
+      ...proofInput,
+      manifest: {
+        ...manifestState.manifest,
+        edges: manifestState.manifest.edges.filter((edge) => edge !== dataLineageEdge),
+      },
+    }),
+    {
+      ok: false,
+      status: 'conflict',
+      reason: 'manifest omits an upstream source-to-derivation edge',
+    },
+    'terminal proof still requires the real dataFrom lineage edge',
+  );
   const crossings = physicalCrossingsFor(identity.sessionId, identity.sourceUserSeq);
   assert.ok(crossings.length > 0, 'construct must pay a physical crossing');
   assert.ok(crossings.every((crossing) => crossing.settled), JSON.stringify(crossings));
