@@ -920,6 +920,102 @@ speech must originate in a session so it is model-authored, never a template.
 
 ---
 
+## 15. Concurrent judges: what exists, what the market does, and the contract (2026-09-04 ~23:00)
+
+Owner's premise: "most assistant harnesses now run parallel judge agents that work
+concurrently with the working agent and its subagents, injecting logic into them."
+Two verified lenses (in-tree read + live market fetch, 104 tool uses):
+
+### 15.1 Market verdict — not supported as stated; Clem is ahead
+
+- What ships is a **synchronous boundary reviewer** that returns allow/deny at an
+  action or approval: Codex Guardian/Auto-review (rationale + a fixed
+  anti-circumvention instruction on deny), Claude Code's auto-mode classifier
+  (allow/block, subagents checked at three points), Hermes "smart approval"
+  (APPROVE/DENY/ESCALATE), bb (a pass-through to Codex). DeepSeek Harness and
+  opencode have **no LLM judge at all**.
+- The only genuinely **concurrent** component anywhere is Codex Guardian v2's async
+  per-call risk scorer — non-blocking, emits a low/high score and user warnings,
+  **injects nothing** into the working agent.
+- Mid-run steering channels exist (Hermes `delegate_task steer`, DeepSeek team
+  "Steer" delivery) but they are **parent- or human-driven**, not judge-driven.
+  Claude Workflows verify only after workers finish ("no mid-run user input").
+
+### 15.2 What Clem already has (verified file:line)
+
+- **A concurrent, steering trajectory judge**: `src/runtime/harness/watcher-judge.ts`
+  (since `690c14de`, 07-30). Non-blocking (fired `void async`, never awaited), judges
+  the trajectory against the GOAL with the shared cross-family hedged engine
+  (`runHedgedJudge`, lane `watcher`), and on drift injects one sentence into the
+  parent brain's next continuation. Mounted on all three lanes: loop.ts
+  (`CONTINUATION_INPUT` + steer, :9067-9124), host_v1 (`pendingHostModelDirective`,
+  host-turn-runner.ts:6274-6343, mounted `e505332c` 09-02), workflow lane
+  (`applyWatcherSteerToPrompt`, workflow-runner.ts:2255-2270 — **default OFF**,
+  `CLEMMY_WORKFLOW_WATCHER_JUDGE`). Budgets: `MAX_WATCHER_CHECKS=4`,
+  `MAX_WATCHER_INJECTIONS=2`, 25 s timeout; advisory text only — it cannot block,
+  approve, or touch an effect gate ("guardrails inform, not override").
+  **P2 proved it on the wire**: 5 real Claude Sonnet 5 watcher calls overlapping live
+  Codex brain calls, `selfJudge:false` (P2 report §7).
+- The rest of the judge family, each with its authority: completion judge
+  (end-of-turn, ≤2 continuations, self-judge = ONE bounce then advisory — the
+  "unapproved sends" scar, loop.ts:8054-8076); terminal-delivery judge (**mandates a
+  different family**, resume|ask|deliver); per-write grounding/goal-fidelity gates
+  (soft-block + reroute; judge outage mints an approval card via
+  `mintJudgeFailApproval`, brackets.ts:1649-1725); output-grounding gate (runs
+  concurrently with the completion judge); workflow advisory judges (detection
+  only); fusion "verify" checker (default off). The consent reducer
+  (`interactive-consent-policy.ts:279`) is pure — **no judge branch exists in
+  consent, execution-gate, or confirm-first**, by design.
+
+### 15.3 What is missing (the real gap)
+
+1. **The watcher never reaches subagents.** Every injection channel is the parent
+   brain's input. `run_worker` workers run in an SDK subprocess under the parent
+   session (claude-agent-worker.ts:112-114); the only in-flight channel into a
+   worker is the steer-note block at the brackets tool-result boundary
+   (brackets.ts:4568, 5055), which today carries **user** notes only
+   (`user_steer_note`; steer-notes.ts:35-37 also excludes `workflow:` sessions).
+2. **Subagent trajectory is only partly visible**: native external MCP calls inside
+   the SDK never reach brackets/eventlog as `tool_called` (claude-agent-sdk.ts:439-440).
+3. **The watcher drops `selfJudge`** (watcher-judge.ts:188-197), so unlike the
+   completion judge it has no same-family demotion — a same-family watcher can steer
+   with full force. (P2 also found the final completion verdict was self-family
+   despite the Claude pin — §12 finding 3.)
+4. Three audit vocabularies for one fact (`heartbeat watcher_steer`,
+   `goal_alignment_judged kind:watcher`, `step_advisory watcher_steer`).
+5. Subagent OUTPUT validation is post-hoc only (fanout-item-verify at reduce time;
+   schema-validated reduce tier) — correct, but the owner's ask is in-flight.
+
+### 15.4 The contract — extend, never add a loop (v3.17, after P3)
+
+- **Channel:** a second, judge-authored steer-note kind (`judge_steer_note`)
+  delivered through the SAME brackets tool-result boundary — it already reaches
+  every wrapped tool on every lane, SDK workers included. Widen
+  `sessionSupportsSteering` to `workflow:` sessions. Keep the existing frame:
+  a steer note is **context, not authority**.
+- **Engine:** `watcher-judge.ts` + `runHedgedJudge`, cross-family by default; carry
+  `selfJudge` into the verdict so the loop demotes same-family steers exactly as it
+  does for the completion judge. Budgets stay explicit (checks, injections, timeout)
+  and per run/turn; a subagent gets its own bounded budget, not the parent's.
+- **Audit:** one `watcher` `VerdictDoor` in `src/execution/verdict.ts`
+  (`recordVerdictEvent`) so the three vocabularies collapse to one ledgered row
+  **with the rationale** (this is also §13.4 item 7, Codex-parity).
+- **Authority:** a judge may steer or hold, never approve, never mint an action, never
+  write to the resolution/dispatch ledgers (those are expected-vs-observed authority
+  and must not carry opinion). Any BLOCKING outcome is projected as a **structural
+  fact** into `evaluateInteractiveConsentV1` (`needs_user` / `repair`) or through the
+  existing `mintJudgeFailApproval` — never a text-level block.
+- **Visibility first:** before steering subagents, make their trajectory observable
+  (SDK-native MCP calls → `tool_called`), or the judge steers blind.
+- **Owner floor unchanged:** cross-family or demoted; the irreversible-send ask can
+  never be satisfied by a judge; two hard bounces never push a worker past a
+  consent boundary (the recorded regression).
+
+Order inside v3.17: visibility (15.3-2) → audit door (15.3-4) → selfJudge carry
+(15.3-3) → judge steer notes to workers (15.3-1). None of it is weekend scope.
+
+---
+
 ## 12. Reviewer log (append-only — executing agent: re-read at every phase boundary)
 
 The reviewer session watches every commit and canary outcome against this doc.
@@ -1210,5 +1306,54 @@ task-level terminal line (the P1 run had none in the log) and the sha stamp.
   `schema_invalid:call:<digest16>` over the effective operation + canonical argument
   digest (stable JSON, so formatting/call-id churn cannot mint stages); 96 test
   lines. Remaining before P3: partial (5) evidence + the acceptance run.
+
+**2026-09-04 ~22:45 — REVIEWER: P2 ACCEPTED** on `docs/P2-FREE-THE-TURN-REPORT-2026-09-04.md`
+(the most disciplined phase report of the day: frozen SHA + fingerprint + isolated
+home, real exit codes, evidence dirs, and explicit refusals to overclaim).
+- ✅ The flip landed: the SAME canary went from `control_no_progress_exhausted /
+  resumable:false` to `needs_input` · `input_required:account_selection` ·
+  `resumable:true` with the exact next edge ("Which connected account should I
+  use?"), 26 tool calls, 21 settled dispatches, 5 retained result handles, 0 bare
+  `schema_invalid`, 0 last-word turns, 0 writes. A mailbox question on a blank
+  state is the CORRECT stop (§8.0 beat 4). Production diff net −73 lines (−48
+  through the follow-up). §3 files untouched.
+- ✅ Partial (5) resolved by clarification: the "cooldown" is a model-transport
+  property (`withModelFallback`: provider-proven failure arms cooldown before one
+  bounded rescue — tested); tool rejections are governed by `provider_repair`. No
+  timed business-tool cooldown exists or is required. Accepted.
+- Honest caveat kept: "≤1 wasted model step" was NOT independently classified
+  (the collector's `modelSteps:0` is unusable) — carry it into P3's acceptance.
+**The parallel audit answers the owner's question:** Clem already HAS the
+concurrent judge — the trajectory watcher (chat interval 4 tool calls, workflow
+interval 2 steps), advisory, cross-family — and it is now **proven on the wire**:
+5 real Claude Sonnet 5 watcher calls overlapping live Codex Terra brain calls
+(2.4–2.9 s each, `selfJudge:false`); the direct-auditor run on the final build
+PASSED. What failed was fan-out, not the auditor.
+**THREE NEW FINDINGS (P3 preconditions — log them as the first P3 red journeys):**
+1. `run_worker` was advertised in the request schema, the model emitted a correct
+   8-item call, and the host **refused it pre-dispatch** (`refused_pre_dispatch`,
+   recovery `replan`) with only a generic diagnostic — the narrower reason was NOT
+   retained in receipts/logs. That is the 09-03 "pre-dispatch refusals record
+   nothing" class AND the brief's "advertised schema must be dispatchable" rule.
+   Red journey from the captured call bytes; fix must name the reason and dispatch.
+2. **Local-task completion is still prose-graded**: the unmet 8-worker task ended
+   `done / success` while its own text said it could not complete. D1 fixed
+   EXTERNAL-effect tasks; a local-only task needs its own ledger-shaped authority
+   (deliverable/result-handle evidence, or the worker receipts it was asked for).
+   This is D1's class, incomplete — P3 scope, before any write work.
+3. The **final objective-completion judge was self-family** (`selfJudge:true`,
+   Codex hedge) even with `claude-sonnet-5` pinned as judge — the watcher path
+   honors the pin, the completion-verdict path does not. §9.4 row 3 stays RED
+   until the completion judge is provably cross-family on the wire.
+Owner decision now: `Start P3?` (same-step consent+dispatch for the nominated
+write, write-bar extension, ONE attestation builder, single-pass plan validation)
+with findings 1–3 as its first red journeys.
+
+**2026-09-04 ~23:05 — §15 ADDED (concurrent judges).** Verified: the market does not
+run parallel steering judges (only Codex has a concurrent component, a non-injecting
+risk scorer); Clem already has one — the trajectory watcher — and P2 proved it on the
+wire. The gap is subagents + selfJudge carry + one audit door; the contract and its
+order are in §15.4 and are **v3.17, after P3**. Do not start it this weekend; do not
+add a second loop; a judge never gains write/approval authority.
 
 **2026-09-04 — EXECUTING AGENT P2 REPORT:** [P2 report](./P2-FREE-THE-TURN-REPORT-2026-09-04.md) records green local runs (252/252, 414/414, 96/96, reviewer follow-up 91/91; overlapping counts, real exit 0), typecheck/artifact verify exit 0, and the cooldown test receipt (`p2-floor-final.log`, test 50; model-transport cooldown is distinct from tool `provider_repair`). Same fixed canary on clean `4ed325eb` reached `input_required:account_selection`/`needs_input`, resumable true with retained results, zero writes and zero bare-schema/last-word events; global ≤1 wasted-step metric not claimed. Eight-worker acceptance FAILED: an advertised call was refused before dispatch, zero workers despite terminal `done`. Five genuine Claude watchers overlapped Codex brain calls. Separate final-source direct-auditor test on clean `5b8c3267` PASSED all three exact reads/results plus real Claude/Codex overlap, exit 0. Main DEV rebooted clean `c2623d01`, PID 51650/8520, requested pairing and both watchers on. No P2 push or tag; P3 has not started. `Start P3?` is the next owner decision, with mixed live results preserved rather than waived.
