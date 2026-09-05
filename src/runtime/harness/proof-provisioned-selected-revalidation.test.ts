@@ -20,7 +20,7 @@ const production = await import('./production-capability-adapters.js');
 const typedRuntime = await import('../semantic-boundary/configure-typed-execution-runtime.js');
 const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
-const { digestSchema } = await import('../../tools/tool-contract-store.js');
+const { digestSchema, _clearToolContractsForTests } = await import('../../tools/tool-contract-store.js');
 const composio = await import('../../integrations/composio/client.js');
 const providerIdentity = await import('../../integrations/composio/provider-definition-identity.js');
 const selectedDefinitions = await import('../../integrations/composio/selected-definition-revalidation.js');
@@ -53,6 +53,29 @@ const OUTPUT_B = {
   type: 'object',
   properties: { records: { type: 'array' } },
 };
+
+/**
+ * Start a test from NO prior provider observation of any slug.
+ *
+ * The schema cache has two halves: the process map, and the durable contract
+ * store on disk behind it — and `rememberToolSchema` writes every provider
+ * observation through both. `resetToolSchemaCache()` clears only the map, so
+ * the durable half carried one test's observation into the next. The store
+ * orders observations per identifier by millisecond and treats an EQUAL-time
+ * observation of the same schema under a different operation-version label
+ * (or output schema) as an authority conflict: it revokes the lease until a
+ * strictly later observation arrives. Consecutive tests here relabel
+ * MEGA_SELECTED_SOURCE (20260824_01 → 20260824_02 → 20260901_03) while the
+ * whole file runs in a few milliseconds, so the label-only rebind test's
+ * single exact refresh landed in the same millisecond as the previous test's
+ * deposit, lost its lease, and refused `selected_definition_exact_refresh_unavailable`
+ * in 9 of 20 identical runs. Every reset now clears both halves, so no test
+ * inherits another's observation and the boundary is order- and clock-free.
+ */
+function resetSchemaCaches(): void {
+  schemas.resetToolSchemaCache();
+  _clearToolContractsForTests();
+}
 
 /**
  * Local copies of the retired Sheets declarations. They describe the raw
@@ -164,7 +187,7 @@ test('retired adapter contracts cannot publish a mutation or host-derived verifi
     businessCalls += 1;
     return {};
   });
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   schemas._setToolSchemaLoaderForTests(async (identifier) => {
     if (identifier === create) {
       return {
@@ -234,7 +257,7 @@ test('a fully bound opaque operation preserves generic reversible semantics acro
     user_id: 'selected-user',
     toolkit: { slug: 'mega' },
   }]);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   schemas._setToolSchemaLoaderForTests(async (operationId) => operationId === identifier
     ? {
         inputParameters: SCHEMA_B,
@@ -314,7 +337,7 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
     businessCalls += 1;
     return {};
   });
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   schemas._setToolSchemaLoaderForTests(async (identifier) => {
     if (identifier === create) {
       return {
@@ -484,7 +507,7 @@ test('historical disclosure cannot inject retired mutation or verifier semantics
 
 after(() => {
   schemas._setToolSchemaLoaderForTests(null);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   composio.__test__.setConnectedAccountsLoader(null);
   composio.__test__.setComposioApiKeyOverride(null);
   catalogs.installHostCapabilityCatalogFactory(null);
@@ -589,7 +612,7 @@ test('the full 8/9/32-operation plan set revalidates with bounded concurrency', 
         businessCalls += 1;
         return {};
       });
-      schemas.resetToolSchemaCache();
+      resetSchemaCaches();
       let exactReads = 0;
       let activeReads = 0;
       let maxActiveReads = 0;
@@ -649,7 +672,7 @@ test('a second-batch definition failure publishes none of a nine-operation plan'
     businessCalls += 1;
     return {};
   });
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   const exactReads: string[] = [];
   schemas._setToolSchemaLoaderForTests(async (identifier) => {
     exactReads.push(identifier);
@@ -696,7 +719,7 @@ test('a later selected schema drift refuses before any selected capability is pu
   }]);
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   const exactReads: string[] = [];
   schemas._setToolSchemaLoaderForTests(async (identifier) => {
     exactReads.push(identifier);
@@ -792,7 +815,7 @@ test('selected provider output, version, full fingerprint, and invoke port drift
       }]);
       const factory = catalogs.createHostCapabilityCatalogFactory();
       catalogs.installHostCapabilityCatalogFactory(factory);
-      schemas.resetToolSchemaCache();
+      resetSchemaCaches();
       let exactReads = 0;
       schemas._setToolSchemaLoaderForTests(async () => {
         exactReads += 1;
@@ -858,7 +881,7 @@ test('a label-only operation-version move rebinds to the live definition instead
     user_id: 'selected-user',
     toolkit: { slug: 'mega' },
   }]);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   schemas._setToolSchemaLoaderForTests(async () => ({
     inputParameters: SCHEMA_A,
     outputParameters: OUTPUT_A,
@@ -919,7 +942,7 @@ test('legacy disclosure from account A cannot replay against a current account B
   }]);
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   schemas._setToolSchemaLoaderForTests(async () => ({
     inputParameters: SCHEMA_A,
     outputParameters: null,
@@ -1008,7 +1031,7 @@ test('invalid disclosure digests and removed exact slugs refuse before publicati
   }]);
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   let exactReads = 0;
   schemas._setToolSchemaLoaderForTests(async () => {
     exactReads += 1;
@@ -1064,7 +1087,7 @@ test('a stale pre-existing global catalog entry cannot bypass selected revalidat
   }]);
   const factory = catalogs.createHostCapabilityCatalogFactory();
   catalogs.installHostCapabilityCatalogFactory(factory);
-  schemas.resetToolSchemaCache();
+  resetSchemaCaches();
   let currentSchema = SCHEMA_A;
   let exactReads = 0;
   schemas._setToolSchemaLoaderForTests(async () => {
