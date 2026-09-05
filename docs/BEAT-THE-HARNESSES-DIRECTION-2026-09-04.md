@@ -2608,3 +2608,21 @@ timing race, present since `b6fbaf9f` (09-02), not today's work. A flake in a
 release gate is a defect: root-cause + fix lane launched (no retries, no relaxed
 assertion; production fix or injected-clock determinism). Journeys 169/172 (the
 three under repair), everything else ✅.
+
+**2026-09-05 07:23 — CLAUDE-PINNED CANARY (frozen `5620f314`, brain pinned claude-sonnet-5,
+judge REPORTED selfJudge:true as it now must): RED again at the same check — 2.8 s,
+zero tool calls, zero drafts, `host_result_projection_mismatch`.** The driver found
+precisely why `686de7ed` did not reach it: the PREVIOUS leg persisted the two
+clipped stubs in the conversation snapshot (the compaction exemption only prevents
+NEW clips), and the allowance cannot reverse them because for a pre-dispatch
+refusal production writes the 352-char plain refusal MESSAGE to `tool_outputs` (the
+recall target), not the 758-char disposition JSON the receipt covers — my pin had
+written the JSON there, a shape production never produces (green pin, red live: the
+reviewer's own "pins prove connection" miss). Fix in flight: reverse the stub from
+the RECEIPT (`resultItemFromHostModelResultReceipt`), pin with the exact production
+persistence shape, offline-replay the real persisted snapshot, then re-run the
+canary on the patched frozen source — all in one lane. Also surfaced: the task
+record says `committedExternalActions=2` while the ledger has 0
+`external_write_succeeded` — a task-record truth defect to reconcile separately.
+The owner's conditions for the tag are NOT met until this canary produces its
+drafts.
