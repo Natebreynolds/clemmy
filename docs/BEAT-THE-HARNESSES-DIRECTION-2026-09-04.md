@@ -1664,3 +1664,18 @@ dispatch agent takes that fix after the same-step write batch; local continuatio
 is assigned after the plan-validation batch. §16 is retained as measured guidance,
 not an unbounded P3 scope expansion. Current report and live receipts are in
 `docs/P3-ONE-DOOR-FOR-WRITES-REPORT-2026-09-04.md`. P3 remains in progress.
+
+**2026-09-04 23:50 — `ddccda93` (share exact consent evidence across call paths) —
+ACCEPTED; this is the P3 "ONE attestation builder" item.** `buildHostConsentEvidence`
+is now the single projection behind all six consent call sites
+(accepted-turn-call-authority, authored-workflow-write-authority ×2,
+host-interactive-consent ×3; the two `coverage: (call) => …` closures are inputs to
+it, not bypasses), and `reduceHostConsentEvidence` folds the three decision
+reductions into one. Pure refactor by diff (no allow|deny|ask outcome changed) with
+a direct-consent integration pin: unknown mutation semantics → `repair`, never an
+invented approval; the exact approved direct call reuses the risk subject and
+rejects changed scope; no physical dispatch without consent. Reviewer's P3 checklist
+now: ✅ one attestation builder · ✅ three P2-derived findings addressed in code ·
+⏳ same-step consent+dispatch (not yet seen) · ⏳ write-bar CONNECTION at the runner
+(owed, 23:00 entry) · ⏳ single-pass plan validation (not yet seen) · ❗ worker-child
+call authority (23:40 entry) — the live replay is red until that lands.
