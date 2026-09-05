@@ -2572,3 +2572,15 @@ bundles the live daemon serves at `/` and `/m`) · mobile-web unit tests 95/95 �
 hygiene ✅. The phone finish review on a real device is still owed — that is the
 live test itself. Next: journey fixes land → final gates on the merged bytes →
 owner starts the daemon on the live home and mints the QR.
+
+**2026-09-05 06:59 — VERIFIER GAPS IN THE TWO HAND-MADE FIXES CLOSED: `ae8ee14d`.** The
+adversarial pass (capacity returned at 05:00) refuted both as incomplete and
+supplied patches: the host clip allowance lacked the receipt-before-clip
+chronology leg (a backdated stub was accepted); `executedBrainFamily` scanned the
+whole session (an earlier turn's fallover mislabeled later normal turns — the
+inverse defect after 09-11's quota reset), the judge chain's last-resort lane
+disagreed with the primary, and the worker executed-route lookup matched by item
+across the session (a later pre-run refusal inherited an old model). All four
+fixed and pinned (two attack-test files, RED without the hunks); 452/452 across
+13 suites; typecheck ✅. Lesson recorded: a hand-made fix ships only with its
+adversarial pass, even when it costs an hour.
