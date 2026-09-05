@@ -1419,3 +1419,21 @@ proof:selftest **239/239 ✅ (15 s)** · test:measurement **97/97 ✅ (3 s)** ·
 journeys running · npm test, bench:gates, eval:memory, eval:jobs queued
 (eval:passk excluded until its home isolation is confirmed — `runEvalSuite` shows
 no temp home).
+
+**2026-09-04 22:50 — REVIEW of `752603bf` (scoped worker calls dispatch without a
+plan census) — ACCEPTED, closes P2 finding #1.** Checked: (1) host admission of
+`run_worker` now needs only the exact approved production call
+(`approvalExactProduction`) + the local tool identity — the quantified-work manifest
+proof is no longer a pre-dispatch hoop; (2) the manifest gate is NOT lost: the worker
+BODY still runs `evaluateQuantifiedWorkManifestGate` (`worker-tools.ts:195`) and the
+pin asserts children stay compose-only with deny-all external scope; (3) the
+refusal-visibility bug that made the 4ed325eb refusal reasonless is fixed at the
+source — `calls` now filters `function_call` history entries and reads
+`argumentsJson ?? arguments`, and the pin asserts the `coverage_missing` detail AND
+the offending call ride the refusal event; (4) the pin replays the frozen-P2 captured
+call against a real model request that advertises `run_worker`: 8 children, 8 ok
+receipts, `physical_crossing_count 0 / host_crossing_count 1`, 2 model calls, no
+`awaiting_user_input`; (5) the new fixture carries no home paths / secrets and
+`check:public-hygiene` passes on the working tree. Also: `eval:passk` (strict) on
+`64c3bfa5` = **100% ≥ 85% ✅** (deterministic, offline) — added to the heavy-gate
+tally. Remaining P2 finding: #2 (local-task completion still prose-graded).
