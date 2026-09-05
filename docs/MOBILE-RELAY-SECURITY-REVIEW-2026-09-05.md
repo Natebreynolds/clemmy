@@ -127,3 +127,85 @@ chmod'd after (`42b09dd3`, verified under umask 022/000/077).
    chat / customize; then leave the LAN (cellular) and repeat through the relay.
 5. Revoke the device from the console; confirm the phone is back at "scan the QR".
    Re-pair; confirm the device keeps its identity (one row, not a stranger).
+
+
+---
+
+## Addendum — 2026-09-05 10:54 PDT: six-dimension audit with adversarial verification
+
+Twenty-four agents audited the phone door across pairing, PIN and rate limiting,
+ingress and transport, session binding, blast radius and the unauthenticated
+surface; every high or medium finding was then handed to a verifier told to
+refute it. Fourteen survived. One verify lane died on a provider error, so the
+two blast-radius items below were re-checked by hand against the source before
+they were reported to the owner.
+
+### Fixed today
+
+**HIGH — the relay's LAN-only ceremony block was bypassable by path spelling.**
+`src/runtime/mobile-ingress.ts` matched a literal Set against the raw pathname,
+and Express neither decodes it, collapses repeated separators, nor drops a
+trailing slash. Reproduced against this repo's own Express: relay POST to
+`/m/auth/login` returns 404 while `/m/auth/login/` and `//m/auth/login` reach the
+handler; likewise `/m/auth/pair`. So the PIN box and the pairing-token consumer,
+the two ceremonies deliberately deleted from the internet, were reachable through
+the relay. The default-deny realm gate did not catch it either: it drops empty
+segments before matching, so both spellings still resolve to the anonymous mobile
+realm. The relay is on by default and its origin ships in the same QR as the
+pairing token, so that Set was the whole defence. Fixed at `2ade543f` by
+canonicalizing the path (percent-decode, collapse separators, drop trailing
+slashes, lowercase) before the compare, pinned on ten spellings plus the two
+neighbours that must keep working.
+
+### Open — the test-user answer
+
+**HIGH — a paired device has owner parity.** `requireMobileSession`
+(src/channels/mobile-routes.ts:1484) is the only authorization model, and its one
+narrowing is a legacy-weak-PIN sandbox. Every QR- or PIN-created session is scope
+`full`, and full means all ~90 routes; only `/auth/rotate` and `/auth/sessions`
+require the desktop admin credential. Verified by hand: `/api/approvals` (:2635)
+lists every pending approval on the machine with no session, device or channel
+filter, so a phone can approve the irreversible action its own chat just caused
+and approvals raised by the owner's desktop and scheduled workflows;
+`/api/devices/revoke-all` (:5458) signs out every device the owner has;
+`/api/auth/codex-device/begin` (:2555) runs the OAuth device flow and writes the
+resulting tokens into the owner's vault; `/api/settings/models/brain` (:5215)
+rewrites the daemon's `.env` model keys. A phone chat is handed straight to the
+same agent loop as the desktop (:3751).
+
+**There is no guest or read-only mode to hand anyone.** Containing a test user
+today means a separate machine with its own `CLEMENTINE_HOME` and its own
+throwaway connected accounts.
+
+### Open — worth fixing before a tester, in this order
+
+1. **PIN gate is check-then-act** (mobile-routes.ts:1752 → :1762): the counter is
+   read, ~50 ms of scrypt runs, and the failure is recorded afterwards, so a
+   concurrent burst is evaluated together. 200 simultaneous attempts all ran in
+   the verifier's reproduction. Reserve the slot before hashing.
+2. **Unauthenticated 32 MiB scrypt with no concurrency cap** (mobile-pin.ts:104)
+   stalls the shared thread pool, so the LAN PIN door is a denial-of-service on
+   the whole daemon, not just the phone surface.
+3. **Revocation does not close what is already open**: an attached chat stream
+   (mobile-routes.ts:3321) keeps delivering after Revoke, and push subscriptions
+   survive every revoke path, so a revoked phone keeps receiving notification
+   content. Rotating the PIN plus a daemon restart is today's only certain cut.
+4. **Device binding is client-elective** (mobile-routes.ts:1469-1472): a redeemer
+   that omits `devicePublicKeyJwk` gets a plain 14-day bearer cookie, which is
+   exactly what the binding was built to prevent.
+5. **PIN policy is length-only** (mobile-pin.ts:81-96): `12345678` passes.
+6. **Relay is on by default with no opt-in** (mobile-relay.ts:154-158), dials out
+   at boot with zero paired phones, and its hostname is derivable from the
+   certificate fingerprint the Mac broadcasts over mDNS on every network it
+   joins. `CLEMENTINE_MOBILE_RELAY=off` is the documented kill switch.
+7. **A successful pair raises no alert**, and a displayed QR cannot be cancelled
+   early; it simply expires after ten minutes.
+
+### Not exposed
+
+No unauthenticated route reads messages, memory or workflows: every data route
+requires a paired session. Session tokens are stored only as hashes, the device
+proof pins ES256 before touching the key, tokens rotate on a 12-hour cadence with
+a 90-day ceiling, and replaying a retired token kills the device chain and
+notifies the owner. The pairing token itself is 256-bit, hashed at rest, compared
+in constant time, single-use under a file lock, and dead after ten minutes.
