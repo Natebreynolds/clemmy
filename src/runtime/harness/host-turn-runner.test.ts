@@ -8441,6 +8441,106 @@ test('the completion judge is bounded: after MAX continuations the reply stands;
 });
 
 
+test('the completion judge budget survives serialized checkpoint recovery and resets only for a fresh source', async (t) => {
+  const { _setHostObjectiveJudgeForTests, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } = await import('./host-turn-runner.js');
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: false, reason: 'the requested post still has no evidence' };
+  });
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  const fixture = acceptJudgedSource('judge-reentry-budget', 'Post the summary to the channel');
+  const model = scriptedRecordingModel([
+    [textMsg('I will post the summary.')],
+    [toolCall('judge-checkpoint-1', 'tool_search', { query: 'first lookup' })],
+    [textMsg('I will post the summary.')],
+    [toolCall('judge-checkpoint-2', 'tool_search', { query: 'second lookup' })],
+    [textMsg('I will post the summary.')],
+  ]);
+  const search = {
+    type: 'function', name: 'tool_search', description: 'local lookup fixture',
+    parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false },
+    needsApproval: async () => false, invoke: async () => 'No operation found.',
+  };
+  const agent = { model, tools: [search] };
+  bindHostCanarySurface(fixture, agent, [search]);
+  const run = (state: unknown) => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never, state as never,
+    { maxTurns: 8, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
+  ));
+  const db = eventlog.openEventLog();
+  const trigger = `reject_judge_checkpoint_${acceptedSerial}`;
+  const sessionId = fixture.session.id.replaceAll("'", "''");
+  const captured: string[] = [];
+  let state: unknown = [{ type: 'message', role: 'user', content: fixture.source.data.text }];
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    db.exec(`CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON accepted_model_batch_checkpoints
+      WHEN NEW.session_id = '${sessionId}' BEGIN SELECT RAISE(ABORT, 'judge checkpoint fixture'); END`);
+    let held: Awaited<ReturnType<typeof run>>;
+    try { held = await run(state); } finally { db.exec(`DROP TRIGGER IF EXISTS ${trigger}`); }
+    assert.ok(held.serializedRecoveryState, 'a real checkpoint failure must transfer exact recovery ownership');
+    captured.push(held.serializedRecoveryState);
+    const recovered = await run(HostRecoveryState.fromString(held.serializedRecoveryState));
+    assert.ok(recovered.serializedRecoveryState);
+    captured.push(recovered.serializedRecoveryState);
+    state = HostRecoveryState.fromString(recovered.serializedRecoveryState);
+  }
+  const final = await run(state);
+  assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS,
+    'two continuations cover the whole accepted source, not each admit/finalize/continue re-entry');
+  assert.equal(model.calls(), 5, 'an exhausted judge budget does not start another model cycle');
+  assert.equal(final.finalOutput, 'I will post the summary.');
+  assert.deepEqual(captured.map((blob) => JSON.parse(blob).objectiveJudgeContinuations), [1, 1, 2, 2]);
+  for (const blob of captured) {
+    const parsed = JSON.parse(blob);
+    delete parsed.objectiveJudgeContinuations;
+    assert.equal(HostRecoveryState.fromString(JSON.stringify(parsed)).objectiveJudgeContinuations, 0,
+      'pre-counter checkpoints remain readable');
+    for (const invalid of [-1, 0.5, 3, '1', null]) {
+      assert.throws(() => HostRecoveryState.fromString(JSON.stringify({ ...parsed, objectiveJudgeContinuations: invalid })),
+        /invalid objective-judge continuation count/);
+    }
+  }
+  assert.deepEqual(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .map((event) => event.data.continuationsUsed), [0, 1]);
+
+  const fresh = acceptJudgedSource('judge-fresh-budget', 'Post the summary to the channel');
+  const freshAgent = { model: stubModel([[textMsg('I will post the summary.')]]), tools: [] };
+  bindHostCanarySurface(fresh, freshAgent, []);
+  await runJudgedHost(fresh, freshAgent, true);
+  assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS * 2, 'a genuinely new source gets its own budget');
+});
+
+test('an interruption checkpoint restores the exhausted completion judge budget without changing approval authority', async (t) => {
+  const { _setHostObjectiveJudgeForTests, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } = await import('./host-turn-runner.js');
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => { judgeCalls += 1; return { done: false, reason: 'still incomplete' }; });
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  const fixture = acceptJudgedSource('judge-interrupt-budget', 'Post the summary to the channel');
+  const history = [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never;
+  const state = new HostInterruptState(history, [], undefined, 'host_v1', undefined, undefined, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
+  const restored = HostInterruptState.fromString(state.toString());
+  assert.equal(restored.objectiveJudgeContinuations, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
+  assert.deepEqual(restored.getInterruptions(), [], 'the budget metadata cannot mint a card or approval');
+  const model = stubModel([[textMsg('I will post the summary.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const outcome = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never, restored as never,
+    { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
+  ));
+  assert.equal(outcome.finalOutput, 'I will post the summary.');
+  assert.equal(judgeCalls, 0);
+  assert.equal(model.calls(), 1);
+  const parsed = JSON.parse(state.toString());
+  delete parsed.objectiveJudgeContinuations;
+  assert.equal(HostInterruptState.fromString(JSON.stringify(parsed)).objectiveJudgeContinuations, 0);
+  for (const invalid of [-1, 0.5, 3, '1', null]) {
+    assert.throws(() => HostInterruptState.fromString(JSON.stringify({ ...parsed, objectiveJudgeContinuations: invalid })),
+      /invalid objective-judge continuation count/);
+  }
+});
+
 test('a refused call frame tells the model the real defect and the exact repair shape, keeping the stage token the governor keys on', async () => {
   const { hostFrameRefusalDirective } = await import('./host-turn-runner.js');
   const malformed = hostFrameRefusalDirective('host_work_call_inner_operation_unidentified');

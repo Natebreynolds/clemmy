@@ -959,6 +959,15 @@ function parseAcceptedModelBatchRef(value: unknown): AcceptedModelBatchRef | und
 
 type HostRecoveryPhase = 'admit' | 'finalize' | 'continue';
 
+function parseHostObjectiveJudgeContinuations(value: unknown): number {
+  if (value === undefined) return 0;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)
+    || value < 0 || value > MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS) {
+    throw new Error('paused host state has an invalid objective-judge continuation count');
+  }
+  return value;
+}
+
 /**
  * Private host-owned recovery state.  It is deliberately a different wire
  * type from HostInterruptState: no approval card, user decision, or
@@ -981,6 +990,7 @@ export class HostRecoveryState {
     public readonly noProgressCheckpoint: HostNoProgressCheckpoint | undefined,
     public readonly stepIndex: number,
     public readonly acceptedModelBatchRef?: AcceptedModelBatchRef,
+    public readonly objectiveJudgeContinuations: number = 0,
   ) {}
 
   static isHostState(blob: string): boolean {
@@ -1085,6 +1095,7 @@ export class HostRecoveryState {
       parseHostNoProgressCheckpoint(parsed.noProgressCheckpoint, history.length),
       stepIndex,
       ref,
+      parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
     );
   }
 
@@ -1104,6 +1115,7 @@ export class HostRecoveryState {
         ? { noProgressCheckpoint: this.noProgressCheckpoint }
         : {}),
       stepIndex: this.stepIndex,
+      objectiveJudgeContinuations: this.objectiveJudgeContinuations,
       ...(this.acceptedModelBatchRef
         ? { acceptedModelBatchRef: this.acceptedModelBatchRef }
         : {}),
@@ -1136,6 +1148,8 @@ export class HostInterruptState {
     public readonly noProgressCheckpoint?: HostNoProgressCheckpoint,
     /** V5: the exact still-open model batch that owns a paused approval. */
     public readonly acceptedModelBatchRef?: AcceptedModelBatchRef,
+    /** The completion-judge budget belongs to the accepted source, not a re-entry. */
+    public readonly objectiveJudgeContinuations: number = 0,
   ) {}
 
   static isHostState(blob: string): boolean {
@@ -1151,6 +1165,7 @@ export class HostInterruptState {
       turnEngine?: unknown;
       noProgressCheckpoint?: unknown;
       acceptedModelBatchRef?: unknown;
+      objectiveJudgeContinuations?: unknown;
     };
     const version = parsed[HOST_STATE_KEY];
     if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== HOST_STATE_VERSION) {
@@ -1198,6 +1213,7 @@ export class HostInterruptState {
       version === HOST_STATE_VERSION
         ? parseAcceptedModelBatchRef(parsed.acceptedModelBatchRef)
         : undefined,
+      parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
     );
   }
 
@@ -1207,6 +1223,7 @@ export class HostInterruptState {
       history: this.history,
       pending: this.pending,
       turnEngine: this.turnEngine,
+      objectiveJudgeContinuations: this.objectiveJudgeContinuations,
       ...(this.lastResponseId !== undefined ? { lastResponseId: this.lastResponseId } : {}),
       ...(this.noProgressCheckpoint
         ? { noProgressCheckpoint: this.noProgressCheckpoint }
@@ -2367,7 +2384,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let hostWatcherLastCheckedAt = 0;
   let hostWatcherCheckInFlight = false;
   let lastContinueMarkerNote: string | undefined;
-  let objectiveJudgeContinuations = 0;
+  let objectiveJudgeContinuations = itemsOrState instanceof HostInterruptState
+    || itemsOrState instanceof HostRecoveryState
+    ? itemsOrState.objectiveJudgeContinuations
+    : 0;
   const resumedNoProgressCheckpoint = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
     ? itemsOrState.noProgressCheckpoint
@@ -2694,6 +2714,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       input.stepIndexOverride
         ?? (input.phase === 'finalize' ? currentHostStepIndex + 1 : currentHostStepIndex),
       input.acceptedModelBatchRef,
+      objectiveJudgeContinuations,
     );
     hostTurnLogger.error({
       reason: input.reason,
@@ -2732,6 +2753,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       currentNoProgressCheckpoint(),
       currentHostStepIndex + 1,
       ref,
+      objectiveJudgeContinuations,
     );
     hostTurnLogger.info({
       reason,
@@ -2787,6 +2809,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         hostTurnEngine ?? 'host_v1_read_only',
         currentNoProgressCheckpoint(),
         ref,
+        objectiveJudgeContinuations,
       ).toString(),
     } satisfies RunOutcome;
   };
@@ -5887,6 +5910,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         hostTurnEngine ?? 'host_v1_read_only',
         currentNoProgressCheckpoint(),
         resumedAcceptedFrame.ref,
+        objectiveJudgeContinuations,
       ).toString(),
     } satisfies RunOutcome;
   }
@@ -7494,6 +7518,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         hostTurnEngine ?? 'host_v1_read_only',
         currentNoProgressCheckpoint(),
         acceptedFrame.ref,
+        objectiveJudgeContinuations,
       );
       return {
         history,
