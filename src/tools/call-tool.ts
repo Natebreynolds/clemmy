@@ -279,18 +279,15 @@ async function invokeCurrentCatalogProductionPort(input: {
 }
 
 const DESCRIPTION = [
-  'Invoke a built-in tool that is in the catalog but not currently one of your first-class tools. Pass the exact tool `name` (from the catalog / tool_search) and `args_json` — a JSON object string of that tool\'s arguments (use "{}" for none).',
-  'Use this to reach a catalog-only tool without a round-trip: e.g. call_tool("workflow_schedule", "{\\"workflow_id\\":\\"...\\"}").',
-  'APPROVAL: call_tool never prompts on its own — the target tool\'s own classification decides. A read runs immediately; a write/send/irreversible target gates for approval exactly as if you had called it directly.',
-  'RESILIENT HTTP GET: common guessed names http_fetch, web_fetch, web_fetch_simple, and fetch_url are bounded read-only aliases for the real run_shell_command curl path when that tool is allowed on the active turn.',
-  'If the arguments do not match the tool\'s schema, call_tool returns the schema and an error and makes NO change — fix the args and call again without broad discovery. If the capability is unresolved, call tool_search once for that requirement; if its exact name/schema is already present, invoke it directly.',
+  'Invoke a catalog built-in that is not one of your first-class tools: exact `name` (from the catalog / tool_search) plus `args_json`, a JSON object string of its arguments ("{}" for none).',
+  'call_tool never prompts on its own — the target\'s own classification decides: a read runs immediately; a write/send/irreversible target gates exactly as if called directly. http_fetch, web_fetch, web_fetch_simple and fetch_url are bounded read-only aliases of the curl path when run_shell_command is allowed.',
+  'Arguments that miss the schema make NO change and return the schema — fix and retry without broad discovery; call tool_search once only for an unresolved capability.',
 ].join(' ');
 
 const CONTROL_ONLY_DESCRIPTION = [
-  'Invoke one deferred built-in control, recovery, or READ tool returned by tool_search. Pass its exact `name` and `args_json` JSON object string.',
-  'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are always direct here — no proposal needed.',
-  'The selected control keeps its own schema, approval classification, capability admission, and settlement behavior exactly as if it were first-class.',
-  'If arguments fail validation, no inner dispatch occurs; use the exact schema returned by tool_search and retry once.',
+  'Invoke one deferred built-in control, recovery, or READ tool returned by tool_search: exact `name` plus `args_json` (a JSON object string).',
+  'Business/provider WRITES and external MCP tools belong inside `work_call`; local reads are direct here. The target keeps its own schema, approval class, admission, and settlement.',
+  'Invalid arguments dispatch nothing — retry once with the exact schema from tool_search.',
 ].join(' ');
 
 /** Lazily-built, memoized name → Zod schema map for local runtime tools. Dynamic
@@ -648,9 +645,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
     parameters: z.object({
       name: z.string().min(1).describe(options.controlOnlyBuiltins
-        ? 'Exact registry-declared control/recovery tool name returned by tool_search.'
-        : 'Exact tool name to invoke: a built-in from the catalog, OR a connected external MCP tool as <server>__<tool> (e.g. dataforseo__serp_organic_live_advanced).'),
-      args_json: z.string().describe('JSON object string of the target tool\'s arguments. Use "{}" for no args.'),
+        ? 'Exact control/recovery tool name returned by tool_search.'
+        : 'Exact built-in name from the catalog, or a connected external MCP tool as <server>__<tool>.'),
+      args_json: z.string().describe('JSON object string of the target\'s arguments ("{}" for none).'),
     }),
     isEnabled: async () => options.modelVisibility
       ? Boolean(await options.modelVisibility())

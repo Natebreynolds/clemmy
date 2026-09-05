@@ -943,7 +943,7 @@ export function registerMemoryTools(server: McpServer): void {
 
   server.tool(
     'memory_recall_all',
-    'Recall EVERYTHING relevant to an objective in one call — durable facts, vault notes, known people/things (entities), where data lives (resources), and proven tools (tool-recall) — ranked together across all memory stores. Use this as the FIRST lookup for "what do I already know / have / use for X?" instead of firing memory_search, memory_search_facts, etc. separately. Returns a single ranked list tagged by kind (FACT/NOTE/WHO·WHAT/WHERE/HOW).',
+    'Recall everything relevant to an objective in one ranked call — facts, vault notes, entities, resources and proven tools — tagged by kind (FACT/NOTE/WHO·WHAT/WHERE/HOW). Use it FIRST for "what do I already know / have / use for X?" instead of separate memory searches.',
     {
       objective: z.string().min(1),
       limit: z.number().int().min(1).max(50).optional(),

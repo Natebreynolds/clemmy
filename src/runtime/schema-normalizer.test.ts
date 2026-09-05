@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import {
+  compactAdvertisedJsonSchema,
   materializeStrictNullableFields,
   normalizeZodForCodexStrict,
   normalizeZodForDeferredJson,
@@ -13,6 +14,53 @@ function containsKey(value: unknown, key: string): boolean {
   if (Array.isArray(value)) return value.some((item) => containsKey(item, key));
   return Object.values(value).some((item) => containsKey(item, key));
 }
+
+// The advertised schema is the projection every model step carries for every
+// tool; the pin measures the exact converter artifacts on real zod output so
+// the byte cut cannot silently regress (2026-09-05: a cold 9-tool surface
+// spent 459 B on `$schema` alone and 30 B per bare `.int()`).
+test('compactAdvertisedJsonSchema drops converter artifacts without changing what the schema accepts', () => {
+  const advertised = z.toJSONSchema(z.object({
+    role_key: z.string().min(1).max(128).nullable().optional().describe('admission key'),
+    offset: z.number().int().min(0).optional(),
+    fields: z.union([z.array(z.string()), z.string()]).optional(),
+    mode: z.enum(['declare', 'reconcile']).nullable(),
+    // A property literally named "anyOf" is data inside `properties`, never a keyword.
+    anyOf: z.string(),
+  })) as Record<string, unknown>;
+  assert.equal(typeof advertised.$schema, 'string', 'zod emits the draft URI the projection must drop');
+  const properties = advertised.properties as Record<string, { anyOf?: unknown[]; maximum?: unknown }>;
+  assert.equal(properties.role_key!.anyOf!.length, 2, 'zod nests nullable+optional as anyOf[anyOf[T,null],null]');
+  assert.ok(containsKey(properties.role_key, 'anyOf'));
+
+  const compact = compactAdvertisedJsonSchema(advertised) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(compact, '$schema'), false, 'no draft URI on the advertised surface');
+  const compactProperties = compact.properties as Record<string, Record<string, unknown>>;
+  assert.deepEqual(compactProperties.role_key, {
+    anyOf: [{ type: 'string', minLength: 1, maxLength: 128 }, { type: 'null' }],
+    description: 'admission key',
+  }, 'the nested nullable wrapper flattens to one anyOf with a single null branch');
+  assert.equal(properties.offset!.maximum, Number.MAX_SAFE_INTEGER, 'zod spells a bare .int() as the safe-integer range');
+  assert.deepEqual(compactProperties.offset, { type: 'integer', minimum: 0 },
+    'the safe-integer sentinel maximum is gone; the real minimum stays');
+  assert.deepEqual(compactProperties.fields!.anyOf, [
+    { type: 'array', items: { type: 'string' } },
+    { type: 'string' },
+  ], 'a real union is left exactly as written');
+  assert.deepEqual(compactProperties.mode!.anyOf, [
+    { type: 'string', enum: ['declare', 'reconcile'] },
+    { type: 'null' },
+  ], 'enum instance values are kept verbatim');
+  assert.deepEqual(compactProperties.anyOf, { type: 'string' }, 'a property named anyOf is untouched data');
+  assert.deepEqual(compact.required, advertised.required, 'required is contract, not an artifact');
+  assert.equal(compact.additionalProperties, advertised.additionalProperties);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(compact)) < Buffer.byteLength(JSON.stringify(advertised)) - 60,
+    'the projection is measurably smaller than the raw converter output',
+  );
+  // Idempotent: projecting an already-compact schema changes nothing.
+  assert.deepEqual(compactAdvertisedJsonSchema(compact), compact);
+});
 
 test('normalizeZodForCodexStrict rewrites records without JSON Schema propertyNames', () => {
   const schema = normalizeZodForCodexStrict(z.record(z.string(), z.string()));

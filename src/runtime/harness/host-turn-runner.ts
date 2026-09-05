@@ -36,7 +36,7 @@ import {
 } from '@openai/agents';
 import { toSmartString } from '@openai/agents-core/utils';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
-import { materializeStrictNullableFields } from '../schema-normalizer.js';
+import { compactAdvertisedJsonSchema, materializeStrictNullableFields } from '../schema-normalizer.js';
 import { getBuildInfo } from '../build-info.js';
 import type { Agent, AgentInputItem, ModelRequest } from '@openai/agents';
 import {
@@ -1524,7 +1524,9 @@ function serializedTools(tools: FunctionToolLike[]): unknown[] {
     type: 'function',
     name: tool.name,
     description: tool.description ?? '',
-    parameters: tool.parameters ?? { type: 'object', properties: {} },
+    // The model sees the compact projection; the tool's own zod schema still
+    // parses every call, so nothing accepted or refused changes.
+    parameters: compactAdvertisedJsonSchema(tool.parameters ?? { type: 'object', properties: {} }),
     strict: tool.strict === true,
     ...(tool.deferLoading === true ? { deferLoading: true } : {}),
     ...(tool.providerData ? { providerData: tool.providerData } : {}),

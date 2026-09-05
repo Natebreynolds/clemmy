@@ -476,7 +476,7 @@ export function renderSkillsIndex(): string {
  * descriptions, counts, or paths: changing the skill library must not bust the
  * cacheable system prefix, and a large library must not tax every turn. */
 export function renderSkillDiscoveryPrompt(): string {
-  return 'Specialized skills are available on demand. When the request names a skill or needs a specialized procedure, style, audit, document, sheet, slide, PDF, or site workflow, use `skill_list()` to search installed names/descriptions, then `skill_read("<name>")` for the best match before creating the deliverable. If no match fits, continue normally.';
+  return 'Specialized skills are available on demand. When the request names a skill or needs a specialized procedure, style, audit, document, sheet, slide, PDF, or site workflow, `skill_list()` searches installed names/descriptions and `skill_read("<name>")` loads the best match before you create the deliverable; if none fits, continue normally.';
 }
 
 export interface RelevantSkillMatch {

@@ -1164,7 +1164,7 @@ export function renderCapabilityCandidateCard(resolved: TurnCapabilityCandidates
         ]
       : [
           '## Discovery roles for this request',
-          'For broad `tool_search`, copy one unresolved `role_key` exactly; synonymous queries/providers for that key share its slot. Claude native ToolSearch uses a `[role:<role_key>]` query prefix. Exact selected-tool schema repair is separate.',
+          'For broad `tool_search`, copy one unresolved `role_key` exactly (synonymous queries/providers share its slot); Claude native ToolSearch uses a `[role:<role_key>]` query prefix. Exact selected-tool schema repair is separate.',
           ...unresolved.map((requirement) => {
             const text = requirement.text.replace(/\s+/g, ' ').trim();
             return `- role_key \`${requirement.roleKey}\`: ${text.slice(0, 180)}${text.length > 180 ? '…' : ''}`;

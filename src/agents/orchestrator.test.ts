@@ -23,6 +23,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
+import { compactAdvertisedJsonSchema } from '../runtime/schema-normalizer.js';
 
 const {
   resetEventLog,
@@ -669,6 +670,17 @@ test('run_worker requires a structured parent-planned job packet', async () => {
   assert.equal(aliasItems?.additionalProperties, false);
   assert.deepEqual(aliasItems?.required, ['alias', 'itemId']);
   assert.equal(Object.hasOwn(runWorker.parameters?.properties ?? {}, 'input'), false);
+  // Byte budget for the advertised definition (name + description + the
+  // compact projected schema the host loop sends). run_worker rides every
+  // model step of every fan-out-capable turn; at 8,836 B (2026-09-05) its
+  // description was prompt prose masquerading as schema and it alone was
+  // 31% of the cold step-1 surface. The packet contract above is unchanged.
+  const advertisedBytes = Buffer.byteLength(JSON.stringify({
+    name: 'run_worker',
+    description: runWorker.description ?? '',
+    parameters: compactAdvertisedJsonSchema(runWorker.parameters),
+  }), 'utf8');
+  assert.ok(advertisedBytes <= 4_600, `run_worker advertised definition must stay compact: ${advertisedBytes} B`);
 });
 
 test('orchestrator run_worker refuses a quantified successful subset before dispatch', async () => {

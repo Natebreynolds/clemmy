@@ -71,24 +71,24 @@ export const RECALL_TOOL_RESULT_SHAPE = {
   call_id: z
     .string()
     .min(1)
-    .describe('The call_id from the [clipped: ...] stub. Looks like "call_abc123".'),
+    .describe('The call_id from the [clipped: ...] stub, e.g. "call_abc123".'),
   offset: z
     .number()
     .int()
     .min(0)
     .optional()
-    .describe('Start character (default 0); use the "offset: N" hint from a prior call to page.'),
+    .describe('Start character (default 0); page with the "offset: N" hint from a prior slice.'),
   max_chars: z
     .number()
     .int()
     .min(100)
     .max(RECALL_MAX_CHARS_CEILING)
     .optional()
-    .describe('Optional cap on the returned slice. Defaults to the largest slice this brain\'s context window allows.'),
+    .describe('Optional cap on the returned slice (default: the largest this context window allows).'),
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
-  call_id: z.string().min(1).describe('The call_id from the digest/clip footer, e.g. "call_abc123".'),
+  call_id: z.string().min(1).describe('The call_id from the digest/clip footer.'),
   // Accepts BOTH an array and a comma-separated string. The array is the
   // documented form; the string form is deliberate boundary tolerance — a
   // near-miss models actually produce (`"fields": "subject,start"`), and a
@@ -98,15 +98,15 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
   fields: z
     .union([
       z.array(z.string()),
-      z.string().describe('Comma-separated field names — equivalent to the array form.'),
+      z.string(),
     ])
     .optional()
-    .describe('Keys to keep from each record, e.g. ["subject","start"]; omit for all.'),
-  filter_field: z.string().optional().describe('Keep only records where this field matches filter_contains/filter_equals.'),
-  filter_contains: z.string().optional().describe('Substring match (case-insensitive) for filter_field.'),
+    .describe('Keys to keep per record, e.g. ["subject","start"] or "subject,start"; omit for all.'),
+  filter_field: z.string().optional().describe('Field to match with filter_contains/filter_equals.'),
+  filter_contains: z.string().optional().describe('Case-insensitive substring for filter_field.'),
   filter_equals: z.string().optional().describe('Exact match for filter_field.'),
-  offset: z.number().int().min(0).optional().describe('Skip this many matching records (default 0).'),
-  limit: z.number().int().min(1).max(200).optional().describe('Return at most this many records (default 50).'),
+  offset: z.number().int().min(0).optional().describe('Matching records to skip (default 0).'),
+  limit: z.number().int().min(1).max(200).optional().describe('Max records to return (default 50).'),
 };
 
 /** Normalize the widened `fields` input to a clean array (or undefined). One
@@ -177,10 +177,9 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
     [
-      'Read the full verbatim output of a prior tool call by its call_id — whenever a `[clipped: …]` stub or `[digest: …]` footer names a call_id and you need a detail the shortened view dropped.',
-      'Always available inside a turn; the payload is stored losslessly, so never say the data is unavailable — call this.',
-      'Returns one slice per call from `offset` (default 0), sized to this brain\'s context window; the header names the next offset when more remains and the exact call to continue.',
-      `Input is ONE JSON object, e.g. ${toolCallHint('recall_tool_result', { call_id: 'call_abc123' })}.`,
+      'Read the full verbatim output of a prior tool call by the call_id a `[clipped: …]` stub or `[digest: …]` footer names, when you need a detail the shortened view dropped.',
+      'The payload is stored losslessly — never say the data is unavailable. Returns one slice from `offset`; the header names the next offset when more remains.',
+      `E.g. ${toolCallHint('recall_tool_result', { call_id: 'call_abc123' })}.`,
     ].join(' '),
     RECALL_TOOL_RESULT_SHAPE,
     async (input: Record<string, unknown>) => {
@@ -264,10 +263,9 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'tool_output_query',
     [
-      'Query a slice of a large prior tool output by its call_id without loading it all — after a `[digest: …]` footer or `[clipped: …]` stub names a call_id and you need specific records.',
-      'Always available inside a turn; the result is parked losslessly, so never say the data is unavailable — call this.',
-      'JSON array: filter rows, project fields, paginate. JSON object: project top-level keys. Returns compact JSON plus a "showing X of N" header.',
-      `Input is ONE JSON object, e.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
+      'Query a slice of a large prior tool output by the call_id a `[digest: …]` footer or `[clipped: …]` stub names, without loading it all: filter rows, project fields and paginate a JSON array, or project the top-level keys of an object.',
+      'The result is parked losslessly — never say the data is unavailable.',
+      `E.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
     ].join(' '),
     TOOL_OUTPUT_QUERY_SHAPE,
     async (input: Record<string, unknown>) => {

@@ -212,12 +212,9 @@ export function registerAutonomyActionTools(server: McpServer): void {
   server.tool(
     'check_in',
     [
-      'Tell the user what you have found or what you are doing, mid-task, WITHOUT stopping.',
-      'It lands in the conversation, so they can walk away and read it whenever they come back.',
-      'Use it when the picture changes — a first finding, a surprise, a stretch of slow work,',
-      'or a judgement call you made. One or two sentences, in your own words.',
-      'This is not a question (use ask_user_question) and not an alert (use notify_user);',
-      'nothing is interrupted and nothing waits on it.',
+      'Tell the user what you found or are doing, mid-task, WITHOUT stopping — it lands in the conversation for whenever they come back.',
+      'Use it when the picture changes (a first finding, a surprise, slow work, a judgement call); one or two sentences in your own words.',
+      'Not a question (ask_user_question) and not an alert (notify_user); nothing waits on it.',
     ].join(' '),
     { note: z.string().min(1).max(600) },
     async ({ note }) => {

@@ -393,6 +393,107 @@ export function materializeStrictNullableFields(value: unknown, schemaValue: unk
   return out;
 }
 
+// Values of these keywords are maps keyed by user-authored property/schema
+// names; a property literally named "anyOf" is data, not a keyword.
+const ADVERTISED_SCHEMA_NAMED_MAP_KEYS = new Set([
+  '$defs',
+  'definitions',
+  'dependentSchemas',
+  'patternProperties',
+  'properties',
+]);
+
+// These keywords carry instance JSON, never nested schema nodes.
+const ADVERTISED_SCHEMA_INSTANCE_VALUE_KEYS = new Set(['const', 'enum', 'default', 'examples']);
+
+function isBareNullSchema(value: unknown): boolean {
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && Object.keys(value as object).length === 1
+    && (value as { type?: unknown }).type === 'null';
+}
+
+/** `anyOf[anyOf[T,null],null]` (zod's `.nullable().optional()`) says exactly
+ * what `anyOf[T,null]` says. A wrapper whose ONLY keyword is `anyOf` carries
+ * no type, description or constraint of its own, so its alternatives are
+ * lifted into the parent list and a duplicated bare null branch is dropped. */
+function flattenAnyOfAlternatives(alternatives: readonly unknown[]): unknown[] {
+  const flat: unknown[] = [];
+  for (const alternative of alternatives) {
+    const wrapper = alternative && typeof alternative === 'object' && !Array.isArray(alternative)
+      ? alternative as Record<string, unknown>
+      : null;
+    if (wrapper && Object.keys(wrapper).length === 1 && Array.isArray(wrapper.anyOf)) {
+      flat.push(...(wrapper.anyOf as unknown[]));
+    } else {
+      flat.push(alternative);
+    }
+  }
+  let sawNull = false;
+  return flat.filter((alternative) => {
+    if (!isBareNullSchema(alternative)) return true;
+    if (sawNull) return false;
+    sawNull = true;
+    return true;
+  });
+}
+
+function compactAdvertisedSchemaNode(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(compactAdvertisedSchemaNode);
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (ADVERTISED_SCHEMA_INSTANCE_VALUE_KEYS.has(key)) {
+      out[key] = nested;
+      continue;
+    }
+    // zod spells a bare `.int()` as the full safe-integer range; "any integer"
+    // is already what `type: integer` says.
+    if (
+      (key === 'maximum' && nested === Number.MAX_SAFE_INTEGER)
+      || (key === 'minimum' && nested === Number.MIN_SAFE_INTEGER)
+    ) continue;
+    if (
+      ADVERTISED_SCHEMA_NAMED_MAP_KEYS.has(key)
+      && nested
+      && typeof nested === 'object'
+      && !Array.isArray(nested)
+    ) {
+      out[key] = Object.fromEntries(
+        Object.entries(nested as Record<string, unknown>)
+          .map(([name, schema]) => [name, compactAdvertisedSchemaNode(schema)]),
+      );
+      continue;
+    }
+    if (key === 'anyOf' && Array.isArray(nested)) {
+      out[key] = flattenAnyOfAlternatives(nested.map(compactAdvertisedSchemaNode));
+      continue;
+    }
+    out[key] = compactAdvertisedSchemaNode(nested);
+  }
+  return out;
+}
+
+/**
+ * The ADVERTISED form of a tool's JSON schema — the bytes every model step
+ * carries for every tool on the surface — is a projection of the parser, not
+ * the parser itself: the registered zod schema still validates every call.
+ * Two converter artifacts ride along without telling the model anything and
+ * are removed here, once, for every surface:
+ *   - the root `$schema` draft URI (meaningless inside a tool definition);
+ *   - `anyOf[anyOf[T,null],null]`, zod's spelling of `.nullable().optional()`,
+ *     which is exactly `anyOf[T,null]`;
+ *   - the safe-integer `minimum`/`maximum` sentinels zod adds to a bare `.int()`.
+ * Nothing the schema accepts or rejects changes; only its byte count does.
+ */
+export function compactAdvertisedJsonSchema(schemaValue: unknown): unknown {
+  const compacted = compactAdvertisedSchemaNode(schemaValue);
+  if (!compacted || typeof compacted !== 'object' || Array.isArray(compacted)) return compacted;
+  const { $schema: _draft, ...rest } = compacted as Record<string, unknown>;
+  return rest;
+}
+
 /**
  * Present a truthful, compact schema on the deferred args_json transport.
  * Codex-strict JSON Schema marks optional fields as required+nullable; through

@@ -33,15 +33,14 @@ export function registerFileQueryTools(server: McpServer): void {
   server.tool(
     'file_query',
     [
-      'Ask a question against a BIG document or a prior tool result and get back only the most relevant passages — instead of reading a byte-clipped preview. Deterministic retrieval (no model call): heading-aware chunks ranked by term relevance.',
-      'Sources (pass exactly one): `file` — a local path; PDFs/DOCX/PPTX/etc are converted to text automatically; or `call_id` — a prior tool call whose lossless parked output is searched even though your model-visible copy was clipped. A legacy-truncated or corrupt/missing chunked result fails closed; page/re-read it or stage the full result as a file.',
-      'Use for: "what does the 200-page agreement say about termination", "find the rows mentioning refunds in that big export", "which section covers X".',
+      'Get only the most relevant passages of a BIG document or prior tool result instead of a byte-clipped preview (deterministic heading-aware retrieval, no model call).',
+      'Pass exactly one source: `file` (a local path; PDF/DOCX/PPTX are converted automatically) or `call_id` (the lossless parked output of a prior call). A truncated or corrupt stored result fails closed.',
     ].join(' '),
     {
-      query: z.string().min(2).describe('What to find — a question or key phrase.'),
+      query: z.string().min(2).describe('A question or key phrase.'),
       file: z.string().optional(),
       call_id: z.string().optional(),
-      top_k: z.number().int().min(1).max(20).optional().describe('How many passages (default 5).'),
+      top_k: z.number().int().min(1).max(20).optional().describe('Passages to return (default 5).'),
     },
     async ({ query, file, call_id, top_k }) => {
       try {

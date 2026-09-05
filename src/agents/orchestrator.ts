@@ -27,7 +27,6 @@ import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { enabledExternalServerNames } from '../runtime/mcp-servers.js';
 import { batchShapeDirective } from '../tools/batch-shape-directive.js';
-import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
 import { resolveMcpToolScope, resolveMcpToolScopeWithRecall, type McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { renderCapabilityCandidateCard, type TurnCapabilityCandidates } from '../runtime/read-path/capability-candidates.js';
@@ -1578,32 +1577,29 @@ export function buildRequestApprovalTool() {
 }
 
 const askUserQuestionParams = z.object({
-  question: z.string().min(4).describe('A single concise question for the user.'),
+  question: z.string().min(4).describe('One concise question.'),
   options: z
     .array(z.string())
     .max(5)
     .nullable()
-    .describe('Pre-canned answers; pass null if none.'),
+    .describe('Pre-canned answers; null if none.'),
   purpose: z
     .enum(['clarification', 'approval'])
     .nullable()
-    .describe('"clarification" (pause for a fact only the user has) or "approval" (sign-off for requested work; auto-proceeds in autonomous mode). Pass null if neither fits.'),
+    .describe('"clarification" (pause for a fact only the user has) or "approval" (sign-off; auto-proceeds in autonomous mode); null if neither.'),
 });
 
 export function buildAskUserQuestionTool() {
   return tool({
     name: 'ask_user_question',
     description:
-      'Ask the user one question and (normally) pause for the reply — the one source of their intent. A normal step, '
-      + 'not a last resort. ASK when the ambiguity changes the outcome (which account/base/records, time window, '
-      + 'destination, format), BEFORE committing to a direction; or when a boundary needs their decision (the tool '
-      + 'cannot do exactly what they asked, or a step needs their account/permission) — name the gap and the closest '
-      + 'thing you CAN do. DO NOT ask what you can find out yourself, what would not change the outcome, or what this '
-      + 'session already settled. Do the unblocked part first, then ask ONE targeted question; give 2-5 concrete '
-      + 'options with your recommendation first; never add an "other" option; batch independent questions. '
-      + '`purpose`: "clarification" when you cannot proceed without a fact only they have; "approval" when seeking '
-      + 'sign-off for work already requested — in autonomous mode an approval does not pause, it proceeds with your '
-      + 'best default. Safety and irreversible actions are gated elsewhere, never here.',
+      'Ask the user one question and (normally) pause for the reply — a normal step, not a last resort. Ask BEFORE '
+      + 'committing when an ambiguity changes the outcome (account/records, time window, destination, format) or a '
+      + 'boundary needs their decision — name the gap and the closest thing you CAN do. Never ask what you can find '
+      + 'out yourself, what would not change the outcome, or what this session already settled. Do the unblocked part '
+      + 'first; ask ONE targeted question with 2-5 concrete options, recommendation first, no "other" option; batch '
+      + 'independent questions. `purpose`: "clarification" = a fact only they have; "approval" = sign-off for '
+      + 'requested work (autonomous mode proceeds with your best default). Safety gates live elsewhere.',
     parameters: askUserQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);
@@ -2316,17 +2312,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const n = Number.parseInt(getRuntimeEnv('CLEMMY_WORKER_MAX_TURNS', '8') ?? '8', 10);
     return Number.isFinite(n) && n >= 2 ? n : 8;
   })();
+  // The advertised description rides every model step of every turn, so it
+  // carries only what the model must know AT THE CALL: the packet contract,
+  // the lease rule, compose-only mutations and the ERROR: failure envelope.
+  // Everything else it used to narrate is enforced or surfaced by the harness
+  // at the moment it matters — the compose-only refusal (WORKER_COMPOSE_ONLY),
+  // the per-item batch ledger and "FAILED items" header, the manifest gates,
+  // and the digest footer that names tool_output_query for parked shards.
   const runWorkerToolDescription = [
-      'Spawn stateless Workers over 1..N items using a structured parent-planned job packet. For 2+ independent same-shape items, pass them ALL in `items` in ONE call — the harness runs them as a concurrency-bounded pool with an honest per-item ledger (scrape, classify, summarize, fetch, transform, create N records, send N messages with different bodies).',
-      'Each worker gets its own isolated context — use this to keep your own context from ballooning over hundreds of items, and to run the work concurrently instead of sequentially.',
-      'Input: one packet (objective, resolvedTools, externalMcpToolNames, context, instructions, expectedOutput) that applies to every item, plus `items` (the full list) or `item` (a single identifier). Put every external MCP capability in the typed exact `externalMcpToolNames` array (`server__tool`); resolvedTools carries schemas/commands/instructions but does not widen that lease. Workers are isolated and cannot see your prior tool outputs unless you paste the needed details into the packet. Include intent when the items should use a user-configured worker category such as design, writing, research, code, or analysis.',
-      'When to use: 3+ independent items of the same kind. The Worker returns a tight result you aggregate. TRIP-WIRE: if you catch yourself about to call the same research/enrichment/read/write tool a 3rd time for a DIFFERENT item in one turn, STOP and fan the REMAINING items out with run_worker instead of looping serially (serial piles every item\'s payload into your context and is exactly what tripped the loop guard and got the last batch cancelled).',
-      `On LARGE fan-outs, results MAY return as compact digests with the full output parked and shard summaries attached — when they do, synthesize from those and drill into a specific item with ${toolCallHint('tool_output_query', { call_id: '<call id>' })} only where an exact figure is needed.`,
-      'For durable multi-wave or multi-phase work, include workManifest. Its phases are per-item worker stages; exclude parent-only ranking, merge, final synthesis, and reporting. Declare the canonical item universe and graph on the first wave; reconcile later labels (for example sheet rows) back to those ids with aliases. The harness checkpoints logical progress and refuses accidental scope inflation before spawning workers.',
-      'CRITICAL: a worker result beginning with "ERROR:" means that item FAILED — it was NOT done. Never summarize a batch as complete if any worker returned ERROR. Report exactly which items succeeded and which failed, including the worker reason, and treat the run as needs-attention rather than success.',
-      'COMPOSE → SINGLE COMMIT for external mutations: workers may execute reads and reason, but the Composio gateway mechanically refuses worker writes/sends. Require each worker to return one exact {id, composioSlug, args, account_alias?} payload. Validate and aggregate every returned payload, then call run_batch action="propose" ONCE; its immutable pending batch is the one payload the user approves and the parent executes. Never approve a summary before the workers materialize the final payloads, and never ask workers to call run_batch or pending_action tools.',
-      'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
-    ].join(' ');
+    'Fan stateless Workers out over independent same-shape items with a structured parent-planned job packet: 2+ items go ALL in `items` in ONE call (a concurrency-bounded pool with a per-item ledger); `item` for one.',
+    'Workers see only the packet, never your context or prior outputs. Name every external MCP capability in the typed exact `externalMcpToolNames` array (`server__tool`); resolvedTools carries schemas/commands/instructions but does not widen that lease.',
+    'Workers only COMPOSE external mutations (one exact payload each; the parent proposes ONE batch). A result beginning "ERROR:" means that item FAILED — name it; never report the batch complete.',
+  ].join(' ');
   /**
    * THE one door for a run_worker refusal that starts no child.
    *
@@ -3724,7 +3721,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
           ].filter(Boolean).join('\n')
         : hostFreshPlanning
-          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search`; search is metadata/schema discovery only and returns exact citable capabilityRef values. Run safe reads progressively while reasoning. Emit one identified proposal-free `work_call` directly for a sole action; its existing tool-edge allow/deny/ask decision owns consent and dispatch, and chat does not compile a hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Keep ownership of broader topology: use explicit `plan_task` for multiple actions, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work. Direct conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) do not need plan_task.'
+          ? '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. Emit one identified proposal-free `work_call` directly for a sole action; its tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use explicit `plan_task` for multiple actions, each/set work, unresolved dependencies, ambiguity, admin, destructive, or unknown-effect work; conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) need none.'
           : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
       : null,
     catalogBlock,

@@ -388,9 +388,9 @@ class ToolSearchContinuationStore {
 }
 
 const DESCRIPTION = [
-  'Search the full built-in tool catalog by intent and get the tools that match — names + one-line summaries for the top results, plus the complete JSON input schema for the closest few so you can call them right the first time.',
-  'Use this when the tool you need is not already on your surface: describe what you want to do (e.g. "schedule a recurring workflow", "read a clipped tool result", "spawn workers for N items") and follow the returned invocation hint.',
-  'Read-only — searching never changes anything.',
+  'Search the built-in tool catalog by intent: names + one-line summaries for the top matches, plus the complete JSON input schema for the closest few.',
+  'Use it when the tool you need is not on your surface — say what you want to do (e.g. "schedule a recurring workflow", "spawn workers for N items") and follow the returned invocation hint.',
+  'Read-only.',
 ].join(' ');
 
 interface ToolSearchMetadata {
@@ -862,14 +862,14 @@ export function registerToolSearchTool(
         .string()
         .min(1)
         .max(400)
-        .describe('What you want to do, in plain language. Ranked against every built-in tool.'),
+        .describe('What you want to do, in plain language.'),
       role_key: z
         .string()
         .min(1)
         .max(128)
         .nullable()
         .optional()
-        .describe('Required on the wire. For broad discovery: one exact unresolved role_key from the current capability card; if no unresolved role is listed, pass null. For an exact tool-name schema refresh, pass null. Keys admission only, never ranking or authority.'),
+        .describe('Required on the wire. For broad discovery: one exact unresolved role_key from the current capability card; if no unresolved role is listed, pass null. For an exact tool-name schema refresh, pass null.'),
       limit: z
         .number()
         .int()
@@ -877,7 +877,7 @@ export function registerToolSearchTool(
         .max(20)
         .nullable()
         .optional()
-        .describe(`How many ranked results to return (default ${TOP_RESULTS}).`),
+        .describe(`Ranked results to return (default ${TOP_RESULTS}).`),
       cursor: z
         .string()
         .max(160)
@@ -887,7 +887,7 @@ export function registerToolSearchTool(
         // Empty string is omitted — models emit "" for "no continuation"
         // (live 2026-08-29 GLM/Grok: min(1) 400'd the first discovery call).
         .default(null)
-        .describe('Opaque next_cursor or schema_handles[*].cursor from a prior result in this session; empty or null means the first page. Cursor reads never re-run discovery or mint authority.'),
+        .describe('next_cursor or schema_handles[*].cursor from a prior result in this session; null means the first page.'),
     },
     async ({ query, role_key, limit, cursor }: {
       query: string;

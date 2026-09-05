@@ -9,24 +9,26 @@ const ExternalMcpToolNamesSchema = z
   ))
   .max(32);
 
+// Field descriptions are advertised on every model step of every turn that
+// can fan out; they name the contract of each field and nothing more. The
+// zod constraints (not the prose) are what admit or refuse a packet.
 export const WorkerManifestDescriptorSchema = z.object({
   id: z
     .string()
     .min(1)
-    .describe('Stable id for this logical work set across waves, retries, phases, and background continuations.'),
+    .describe('Stable id of this logical work set across waves.'),
   contractVersion: z
     .string()
-    .min(1)
-    .describe('Version of the user-approved work contract. Change it only through an explicit contract revision.'),
+    .min(1),
   phase: z
     .string()
     .min(1)
-    .describe('Current phase id, such as research, validate, merge, publish, or readback.'),
+    .describe('Current phase id.'),
   mode: z
     .enum(['declare', 'reconcile', 'extend'])
     .nullable()
     .optional()
-    .describe('First wave declares; later waves reconcile. Use extend only when the logical scope genuinely grows.'),
+    .describe('declare on the first wave; reconcile later; extend only when scope grows.'),
   phases: z
     .array(z.object({
       id: z.string().min(1),
@@ -36,32 +38,27 @@ export const WorkerManifestDescriptorSchema = z.object({
     .max(32)
     .nullable()
     .optional()
-    .describe(
-      'Ordered per-item graph: every phase must run for every canonical item through run_worker. '
-      + 'Exclude parent-only ranking, merge, final synthesis, and reporting. Supply on the declaration wave; later waves can omit it.',
-    ),
+    .describe('Ordered per-item phase graph (no parent-only merge/synthesis); declaration wave only.'),
   aliases: z
     .array(z.object({
       alias: z
         .string()
-        .min(1)
-        .describe('Current worker item label, such as a spreadsheet row or renamed record.'),
+        .min(1),
       itemId: z
         .string()
-        .min(1)
-        .describe('Canonical manifest item id that this label resolves to.'),
+        .min(1),
     }))
     .max(256)
     .nullable()
     .optional()
-    .describe('Alias-to-canonical-id pairs for changed labels (for example spreadsheet row -> CRM account id). Use null when labels already match canonical ids.'),
+    .describe('Changed label -> canonical item id; null when labels match.'),
 });
 
 export const WorkerToolInputSchema = z.object({
   objective: z
     .string()
     .min(8)
-    .describe('The parent-planned objective for this fan-out batch, scoped to the one item this worker handles.'),
+    .describe('Objective for this fan-out, scoped to one item.'),
   item: z
     .string()
     .min(1)
@@ -69,61 +66,53 @@ export const WorkerToolInputSchema = z.object({
   resolvedTools: z
     .string()
     .min(1)
-    .describe('Exact tool slugs, CLI commands, schemas, or "none needed". The parent must resolve shared tools before fan-out.'),
+    .describe('Exact tool slugs/CLI commands/schemas the worker uses, or "none needed".'),
   externalMcpToolNames: ExternalMcpToolNamesSchema
     .nullable()
     .optional()
-    .describe('Typed exact external MCP capability lease (`server__tool`). Populate for every external MCP tool the worker may call; use null when none are needed. Prose in resolvedTools never widens this list.'),
+    .describe('Typed exact external MCP lease (`server__tool`); null when none. Prose in resolvedTools never widens it.'),
   context: z
     .string()
     .min(1)
-    .describe('All source facts this isolated worker needs: URLs, rows, memory facts, skill excerpts, prior outputs, and constraints.'),
+    .describe('Every source fact the isolated worker needs.'),
   instructions: z
     .string()
     .min(1)
-    .describe('Rules to follow, approval scope, safety boundaries, style rules, and what not to do.'),
+    .describe('Rules, approval scope, safety boundaries, style.'),
   expectedOutput: z
     .string()
     .min(1)
-    .describe('The compact output shape the parent will aggregate. Include required fields and failure format.'),
+    .describe('Compact output shape to aggregate, incl. failure format.'),
   intent: z
     .string()
     .min(1)
     .nullable()
-    .describe('Model-routing intent/category for this item, using the user\'s own word such as "design", "writing", or "research". Pass null for ordinary workers.'),
+    .describe('Worker category in the user\'s word ("design", "research"); null for ordinary workers.'),
   model: z
     .string()
     .min(1)
     .nullable()
     .optional()
-    .describe('Exact model id this worker should run on (for example a codex or grok id) — spread a fleet across models per item. Null/omitted uses intent/role routing. An unroutable id falls back to routing; it never refuses the dispatch.'),
+    .describe('Exact model id; null uses routing (an unroutable id falls back, never refuses).'),
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()
-    .describe(
-      'Bind durable work to canonical items and per-item worker phases; exclude parent-only synthesis. '
-      + 'This prevents retries or changed labels from inflating progress.',
-    ),
+    .describe('Durable multi-wave binding of canonical items to per-item phases; null otherwise.'),
   expectedWork: z
     .object({
       requirementId: z
         .string()
         .min(1)
-        .describe('The frozen-contract requirement each worker item discharges — copy it from your work_call plan.'),
+        .describe('Requirement id from your work_call plan.'),
       universeId: z
         .string()
         .min(1)
         .nullable()
-        .optional()
-        .describe('The sealed universe the items belong to, when the plan names one.'),
+        .optional(),
     })
     .nullable()
     .optional()
-    .describe(
-      'When this fan-out runs under a frozen work contract, name the requirement so each worker can bind its '
-      + 'business call directly (work_call with requirement_id + its canonical item id) instead of burning a '
-      + 'refusal discovering the plan. The harness fills this automatically when it is unambiguous.',
-    ),
+    .describe('Frozen-contract requirement each item discharges; the harness fills it when unambiguous.'),
 });
 
 export type WorkerToolInput = z.infer<typeof WorkerToolInputSchema>;
@@ -142,19 +131,19 @@ export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
   // remains optional for durable pre-upgrade packets recovered from disk.
   externalMcpToolNames: ExternalMcpToolNamesSchema
     .nullable()
-    .describe('Required typed exact external MCP capability lease. Use [] or null for no external MCP.'),
+    .describe('Required typed exact external MCP lease (`server__tool`); [] or null for none.'),
   item: z
     .string()
     .min(1)
     .nullable()
     .optional()
-    .describe('The single item to process: id, name, domain, row, record, URL, or other concrete identifier. Omit when passing `items`.'),
+    .describe('One concrete item identifier; omit when passing `items`.'),
   items: z
     .array(z.string().min(1))
     .max(256)
     .nullable()
     .optional()
-    .describe('PREFERRED for 2+ independent same-shape items: the full list of up to 256 item identifiers. The harness runs them as one concurrency-bounded pool (wall time follows the slowest pool waves) with a per-item honest ledger — no need to call run_worker once per item.'),
+    .describe('PREFERRED for 2+ items: the full list (up to 256), run as one pool.'),
 });
 
 export type WorkerToolCall = z.infer<typeof WorkerToolCallSchema>;
