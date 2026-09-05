@@ -525,7 +525,14 @@ export function trustedCompactedHostResultMatches(input: {
   const clipped = describeCanonicalClippedToolResult(input.result.item as AgentInputItem);
   if (!clipped || clipped.toolName === null) return false;
   const clippedAtMs = Date.parse(clipped.clippedAt);
-  if (!Number.isFinite(clippedAtMs)) return false;
+  const receiptAtMs = Date.parse(input.receipt.recordedAt);
+  // Same chronology leg as the logical twin: a host clip can only postdate the
+  // receipt it presents; a stub dated before its own receipt is not a host clip.
+  if (
+    !Number.isFinite(clippedAtMs)
+    || !Number.isFinite(receiptAtMs)
+    || receiptAtMs > clippedAtMs
+  ) return false;
 
   const retained = getToolOutput(input.sessionId, clipped.callId);
   if (

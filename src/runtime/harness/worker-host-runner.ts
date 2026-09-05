@@ -84,7 +84,10 @@ export async function runPacketWorkerWithHost(input: {
       // 100%, all sixteen worker turns ran on Claude, and every worker label
       // still said codex. The parent's `worker_result` reads this event.
       try {
-        const routed = listEvents(session.id, { types: ['turn_model_routed'] });
+        // THIS attempt only: the child session id is deterministic per lineage,
+        // so a replayed dispatch reuses it and an earlier attempt's fallover
+        // must not label this run.
+        const routed = listEvents(session.id, { types: ['turn_model_routed'], sinceSeq: childSource.seq - 1 });
         const last = routed.length ? routed[routed.length - 1]!.data as { model?: unknown; provider?: unknown; routeKind?: unknown; fallover?: unknown } : undefined;
         const executedModel = typeof last?.model === 'string' && last.model ? last.model : input.modelId;
         const executedProvider = typeof last?.provider === 'string' && last.provider

@@ -1062,15 +1062,23 @@ function hasExplicitJudgeBinding(checker: ResolvedRoleModel): boolean {
  * lane still said brainFamily codex / selfJudge false). The configured brain
  * remains the answer when no fallover has been recorded for this session. */
 export function executedBrainFamily(configured: ModelProviderClass): ModelProviderClass {
-  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+  const store = harnessRunContextStorage.getStore();
+  const sessionId = store?.sessionId;
   if (!sessionId) return configured;
   try {
-    const events = listEvents(sessionId, { types: ['turn_model_routed'] });
-    for (let i = events.length - 1; i >= 0; i -= 1) {
-      const data = events[i]!.data as { provider?: unknown; fallover?: unknown; routeKind?: unknown };
-      if (data.fallover !== true && data.routeKind !== 'harness_fallover') continue;
-      if (typeof data.provider === 'string' && data.provider) return data.provider as ModelProviderClass;
-    }
+    // THIS turn's routes only: the accepted user event's seq is the turn's
+    // floor, so an earlier turn's fallover (quota since reset) cannot label a
+    // turn that routed normally. The LATEST route decides — a pre-turn
+    // non-fallover route after a fallover means the brain is back on plan.
+    const sourceUserSeq = store?.sourceUserSeq;
+    const events = listEvents(sessionId, {
+      types: ['turn_model_routed'],
+      ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sinceSeq: (sourceUserSeq as number) - 1 } : {}),
+    });
+    const last = events.length ? events[events.length - 1]!.data as { provider?: unknown; fallover?: unknown; routeKind?: unknown } : undefined;
+    if (!last) return configured;
+    if (last.fallover !== true && last.routeKind !== 'harness_fallover') return configured;
+    if (typeof last.provider === 'string' && last.provider) return last.provider as ModelProviderClass;
   } catch {
     // an unreadable ledger never changes judge routing; fall back to the plan
   }
@@ -1167,7 +1175,8 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
   // 3) Last resort: a downshifted same-family lane (a tagged self-judge beats no
   //    verdict). Deduped, so this is a no-op when member 1 already covers it.
   if (chain.length < 3) {
-    try { push(resolveSameFamilyBoundaryJudge(resolveRoleModel('brain'))); } catch { /* skip */ }
+    // The executing family, as member 1 sees it — never the configured plan.
+    try { push(resolveSameFamilyBoundaryJudge({ ...resolveRoleModel('brain'), provider: brainFamily })); } catch { /* skip */ }
   }
 
   return chain.slice(0, 3);

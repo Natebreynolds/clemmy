@@ -776,4 +776,23 @@ test('trusted local compaction of a HOST-settled result keeps provenance, tamper
       && error.code === 'host_result_projection_mismatch',
     'a stub whose recall target no longer matches the receipt is still refused',
   );
+
+  // Chronology leg (shared with the logical twin): a stub dated BEFORE its own
+  // receipt cannot be a host clip of it, even when the bytes reverse exactly
+  // and a later condenser event would account for it.
+  const backdatedAt = new Date(Date.parse(clippedAt) - 3_600_000).toISOString();
+  const backdated = textResult({ callId, toolName, text: 'x'.repeat(refusalText.length) });
+  assert.equal(compaction.clipOldToolResults([backdated, retainedSentinel], 1, { now: () => backdatedAt }), 1);
+  const backdatedRequest = modelRequest({ task, callId, toolName, result: backdated });
+  assert.throws(
+    () => provenance.recordModelRequestDispatchProvenance({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      request: backdatedRequest as never,
+      hostProjection: promptCache.canonicalPromptCacheRequest(backdatedRequest as never),
+    }),
+    (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+      && error.code === 'host_result_projection_mismatch',
+    'a stub that predates the receipt it presents is refused',
+  );
 });

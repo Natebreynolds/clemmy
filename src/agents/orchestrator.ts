@@ -443,12 +443,21 @@ interface ChatWorkerModelRoute {
 /** The executed model/provider recorded by the child run for this item (a
  * post-run `worker_model_routed` with `executed:true`), so `worker_result`
  * attributes the route that actually ran, not the packet's plan. */
-function executedWorkerRoute(sessionId: string, item: string): { executedModel?: string; executedProvider?: string; model?: string; provider?: string } {
+function executedWorkerRoute(
+  sessionId: string,
+  item: string,
+  scope: { packetKey: string; parentLogicalCallId: string | null },
+): { executedModel?: string; executedProvider?: string; model?: string; provider?: string } {
+  // Scoped to THIS logical call's packet: an earlier run of the same item in
+  // this session (a prior turn, a prior batch) must never label a result —
+  // least of all a pre-run refusal — with a route that did not execute now.
+  if (!scope.parentLogicalCallId) return {};
   try {
     const events = listEvents(sessionId, { types: ['worker_model_executed'] });
     for (let i = events.length - 1; i >= 0; i -= 1) {
-      const data = events[i]!.data as { executed?: unknown; item?: unknown; model?: unknown; provider?: unknown };
+      const data = events[i]!.data as { executed?: unknown; item?: unknown; model?: unknown; provider?: unknown; packetKey?: unknown; parentLogicalCallId?: unknown };
       if (data.executed !== true || data.item !== item) continue;
+      if (data.packetKey !== scope.packetKey || data.parentLogicalCallId !== scope.parentLogicalCallId) continue;
       const out: { executedModel?: string; executedProvider?: string; model?: string; provider?: string } = {};
       if (typeof data.model === 'string') { out.executedModel = data.model; out.model = data.model; }
       if (typeof data.provider === 'string') { out.executedProvider = data.provider; out.provider = data.provider; }
@@ -2793,7 +2802,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, ...executedWorkerRoute(sessionId, input.item), packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
+          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, ...executedWorkerRoute(sessionId, input.item, { packetKey, parentLogicalCallId }), packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
           batchLease?.assertCurrent();
