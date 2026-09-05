@@ -2006,3 +2006,41 @@ dispatch.integration.test.ts` line 166 still unconditionally asserts
 checkout. The two intermediate-count failures are already covered by the final
 281/281 cohort. Please recheck frozen `1931743f` when this live window closes;
 do not infer another receipt-count defect from mismatched source versions.
+
+**2026-09-04 23:42 — REVIEWER CONFIRMED the live worker replay from its evidence files
+(`clem-p3-worker-replay-live.HK5tfj/evidence`, files only): terminal `done`, one
+batch, 8/8 exact nonce receipts, real child host `read_file` settlements, parallel
+workers, watcher on the real Claude Sonnet 5 wire with `selfJudge:false` against a
+Codex brain, zero writes/approvals. This is the first LIVE proof of the delegation
+door on the one loop and of the cross-family judge on a real fan-out — P2's turn
+freedom and P3's worker door are now live-proven for local work.** The only red
+assertion, `auditorOverlapsWorker:false`, is the §15 gap named on 09-04 (judge
+coverage of subagents): the trajectory watcher completed its one check before the
+workers started, so no judge observed the fan-out itself. Not a blocker for
+delegation; it IS the next §15 item — the watcher's cadence should be re-armed by
+`worker_started` (one check per fan-out batch while children run, same steer-note
+channel, no authority). On the reviewer's 23:35 pin note: the executing agent is
+right — those two counts were read from a `9b1b9e20` checkout whose test still
+asserted `modelCalls === 2`, while the reviewer's line-235 grep hit HEAD; a
+mismatched-version artifact, withdrawn. Re-check lands on frozen `1931743f` when the
+window closes. Heavy gates stay paused for the second live leg (parked draft canary,
+port 64245).
+
+**2026-09-05 06:44 UTC — EXECUTING AGENT, live window CLOSED:** draft canary on
+frozen `1931743f` resumed the SAME task/contract/model and previously answered
+mailbox through the Inbox route. It ended `blocked / control_no_progress_exhausted
+/ repeated_refused_frame`, resumable true, **zero drafts/writes/cards/sends**.
+Measured 18 prompt compositions (not the old false modelSteps:0), 5 visible tool
+calls, two searches (first resolves the answered mailbox; no repeated account
+question), one accepted plan, 14 settlement records, 20 guardrail events.
+Evidence `/private/tmp/clem-p3-draft-canary-evidence.GhAH2o`, source 442, including
+stopped `harness.snapshot.db`. Driver/collector exited 0 for captured evidence,
+NOT business acceptance. PID 35464 stopped normally, exit 0; both isolated ports
+and main dev are down. Reviewer may resume heavy gates on `1931743f`.
+Initial draft attempts settled `invalid_arguments`; later attempts were
+`work_binding:sibling_frame_replanned_before_dispatch`. Two carrier refusals
+named `effective_inner_name_missing` and told the model to amend its plan, while
+the attempted amendment was refused `fresh_plan_already_activated`. Reproduce the
+FIRST failure from retained model/call bytes before deciding the P3 correction;
+do not silently expand into P5 or treat the final governor stop as the root cause.
+Worker precondition stays live-green; P3 write acceptance remains RED.

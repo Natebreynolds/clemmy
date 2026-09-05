@@ -205,6 +205,56 @@ do not satisfy this list.
 
 ## Release status
 
+### Same draft canary on `1931743f` — RED, no write occurred
+
+Resume used the unchanged task/contract/model and the previously accepted mailbox
+answer through the supported Inbox route. Evidence is
+`/private/tmp/clem-p3-draft-canary-evidence.GhAH2o` (including the stopped database
+snapshot); accepted source 442, session
+`background:bg-graph-driver-tag-canary-20260904`. The task resumed at
+06:38:54 UTC and its terminal committed at 06:43:55.664 UTC. It is
+`blocked / control_no_progress_exhausted / repeated_refused_frame`, resumable true.
+**Zero distinct drafts, zero write-success events, zero approval requests and zero
+send crossings. P3 acceptance remains RED.** Driver and collector exit 0 mean
+evidence captured, never business success. PID 35464/64245 stopped normally, exit 0,
+before database collection. Main dev remains down.
+
+The repaired measurement instrument records 18 prompt compositions and 18 accepted
+model batches (overlapping, never summed), 26 emitted calls, five visible tool
+invocations, 14 settlements and 20 guardrail events. Account-answer repair is live
+confirmed: the first search resolves the already-selected mailbox, there is no
+repeated account question; total searches two, versus eleven on P2. The second
+search was an unsuccessful attempt to find a plan-reset tool, not account recovery.
+
+Measured causal chain from canonical model-facing results:
+
+1. Discovery supplies the exact draft operation, account, provider schema, and
+   carrier example. `plan_task` accepts five distinct draft operations, each over
+   the same five company-name universe members: 25 planned instances for the
+   user's five-draft objective.
+2. First draft frame selects `/to_recipients/0` (an email) while its universe item
+   is a company name. Actual refusal: `work_cardinality_mismatch`, selected
+   argument members do not match the accepted universe instance. The alternative
+   `/arguments/to_recipients/0` does not resolve in normalized arguments.
+3. Correctly shaped singleton envelopes without the selector then hit
+   `bound_catalog_call_does_not_match_exact_schema_and_arguments` despite a durable
+   matching operation/account/schema binding. That exact comparison still needs a
+   P3 reproduction; the narrower mechanism is NOT inferred from code alone.
+   `policy_denial / work_binding:sibling_frame_replanned_before_dispatch` is the
+   nominal settlement cleanup label, not the diagnostic the model received.
+4. Two later malformed carriers receive `effective_inner_name_missing`, whose
+   guidance says to amend the plan. The attempted five-single-write amendment is
+   itself refused before the plan body: `fresh_plan_already_activated`.
+5. Repeated carrier variations exhaust the frame governor. No provider write was
+   dispatched; no failed write is being retried blindly.
+
+Scope boundary is explicit: the exact bound-call comparison is approved P3 D3
+work and is being reproduced first. Retiring the frozen model-created census or
+globally reopening its topology is the document's P5 ceremony, not silently
+authorized by P3. Repairing call matching alone does not prove the already-frozen
+25-instance plan becomes the requested five-draft task. If that remains necessary,
+report this phase conflict for owner/reviewer arbitration before expanding scope.
+
 ### Reviewer §12 23:06 — current-byte verification and correction
 
 The owner prioritized this family before live replay. Measured on `5b8dd86a`
