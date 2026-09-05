@@ -4889,10 +4889,27 @@ test('a local call_tool carrier rejection cannot manufacture ambiguity or replac
     assert.equal(result.status, 'completed');
     assert.equal(modelSteps, 1, 'a proven pre-dispatch refusal never starts a reconciliation model turn');
     assert.equal(providerDispatches, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0);
+    assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 0);
     assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
-    const [failed] = listEvents(session.id, { types: ['external_write_failed'] });
-    assert.equal(failed?.data.callId, 'call-workspace-cadence-loop-replay');
-    assert.equal(failed?.data.sourceUserSeq, listEvents(session.id, { types: ['user_input_received'] })[0]?.seq);
+    const [source] = listEvents(session.id, { types: ['user_input_received'] });
+    assert.ok(source);
+    const redeemed = fixtureSettlements.redeemDurableLogicalCallSettlementForHost({
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      acceptedTaskId: fixtureIdentities.acceptedTaskIdFor(session.id, source.seq),
+      logicalToolCallId: 'call-workspace-cadence-loop-replay',
+    });
+    assert.equal(redeemed.status, 'ok');
+    assert.equal(redeemed.settlement.toolName, 'call_tool');
+    assert.equal(redeemed.settlement.executionKind, 'refused_pre_dispatch');
+    assert.equal(redeemed.settlement.outcome.kind, 'invalid_arguments');
+    assert.equal(redeemed.settlement.outcome.evidence, 'nominal');
+    assert.equal(redeemed.settlement.outcome.directive.action, 'repair_arguments');
+    assert.equal(redeemed.settlement.physicalCrossingCount, 0);
+    assert.equal(redeemed.settlement.hostCrossingCount, 0);
+    assert.equal(redeemed.settlement.resultHandleId, undefined);
+    assert.equal(redeemed.settlement.recovery.creditedProgress, false);
     const selfResolve = listEvents(session.id, { types: ['guardrail_tripped'] })
       .filter((event) => event.data.kind === 'self_resolve_nudge');
     assert.equal(selfResolve.length, 0);

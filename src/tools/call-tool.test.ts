@@ -46,6 +46,8 @@ const {
   resetEventLog,
 } = await import('../runtime/harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { acceptedTaskIdFor } = await import('../runtime/harness/attempt-identity.js');
+const settlements = await import('../runtime/harness/logical-call-settlement-store.js');
 const { closeOperationalTelemetryDb } = await import('../runtime/operational-telemetry.js');
 const { getLocalToolSchemas } = await import('./local-runtime-tools.js');
 const { deriveOrchestratorDiscoveryNames } = await import('./tool-registry.js');
@@ -353,7 +355,7 @@ test('invalid JSON in args_json returns arg_validation with no dispatch', async 
   assert.equal(out.error, 'arg_validation');
 });
 
-test('a wrapped write-shaped carrier rejection records typed no-dispatch instead of an orphan', async () => {
+test('a wrapped write-shaped carrier rejection settles typed no-dispatch instead of an orphan', async () => {
   const previous = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   resetEventLog();
@@ -395,14 +397,25 @@ test('a wrapped write-shaped carrier rejection records typed no-dispatch instead
     assert.match(output, /slug.*not a field.*tool_slug/);
     assert.match(output, /repair/);
     assert.equal(providerDispatches, 0, 'validation stops before the provider boundary');
-    const failed = listEvents(session.id, { types: ['external_write_failed'] });
-    assert.equal(failed.length, 1, 'the canonical attempt receives one retry-safe settlement');
-    assert.equal(failed[0]?.data.callId, 'call-workspace-cadence-invalid-carrier');
-    assert.equal(failed[0]?.data.sourceUserSeq, accepted.sourceUserSeq, 'settlement remains owned by the accepted request');
-    assert.equal(failed[0]?.data.dispatch, 'not_started');
-    assert.equal(failed[0]?.data.effect, 'none');
     assert.equal(listEvents(session.id, { types: ['external_write'] }).length, 0, 'the carrier creates no outer reservation');
+    assert.equal(listEvents(session.id, { types: ['external_write_failed'] }).length, 0, 'no write attempt existed to fail');
     assert.equal(listEvents(session.id, { types: ['external_write_orphaned'] }).length, 0);
+    const redeemed = settlements.redeemDurableLogicalCallSettlementForHost({
+      sessionId: session.id,
+      sourceUserSeq: accepted.sourceUserSeq,
+      acceptedTaskId: acceptedTaskIdFor(session.id, accepted.sourceUserSeq),
+      logicalToolCallId: 'call-workspace-cadence-invalid-carrier',
+    });
+    assert.equal(redeemed.status, 'ok');
+    assert.equal(redeemed.settlement.toolName, 'call_tool');
+    assert.equal(redeemed.settlement.executionKind, 'refused_pre_dispatch');
+    assert.equal(redeemed.settlement.outcome.kind, 'invalid_arguments');
+    assert.equal(redeemed.settlement.outcome.evidence, 'nominal');
+    assert.equal(redeemed.settlement.outcome.directive.action, 'repair_arguments');
+    assert.equal(redeemed.settlement.physicalCrossingCount, 0);
+    assert.equal(redeemed.settlement.hostCrossingCount, 0);
+    assert.equal(redeemed.settlement.resultHandleId, undefined);
+    assert.equal(redeemed.settlement.recovery.creditedProgress, false);
   } finally {
     _setInnerDispatchToolsForTests(null);
     if (previous === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
