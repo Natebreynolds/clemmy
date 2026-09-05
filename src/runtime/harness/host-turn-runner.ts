@@ -599,7 +599,8 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     ].join(' ');
   }
   if (
-    consequence.stage === 'plan_incomplete:missing_write'
+    (consequence.stage === 'plan_incomplete:missing_write'
+      || consequence.stage.startsWith('plan_incomplete:missing_write:'))
     && consequence.recoveryToolNames.length === 1
     && consequence.recoveryToolNames[0] === 'tool_search'
   ) {

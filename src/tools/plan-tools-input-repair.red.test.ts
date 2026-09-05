@@ -169,3 +169,53 @@ test('type-less anyOf wrappers in the published schema materialize and parse (nu
   await assert.doesNotReject(async () => { await parser(JSON.stringify(materialized)); },
     'the materialized emission round-trips the real SDK parser');
 });
+
+test('the real tool body reports shape and independent lineage issues in one refusal', async () => {
+  const args = JSON.parse(`{"preamble":"Shall I collect and write these?","draft":{"version":1,"criteria":["Collect two records into one document"],"cardinality":{"count":2,"fields":["title"]},"destination":{"posture":"create_new","family":"document","handleRequired":true},"topology":{"version":1,"operations":[{"id":"read-source","effect":"read","coverage":"complete_set","dependsOn":[],"dataFrom":[],"cardinality":{"kind":"once"}},{"id":"write-once","effect":"local_write","coverage":null,"dependsOn":["read-source"],"dataFrom":[],"cardinality":{"kind":"once"}}],"universes":[]},"bindings":[{"operationId":"read-source","role":"source","capabilityRef":"read-source","evidence":["payload"]},{"operationId":"write-once","role":"write","capabilityRef":"write-document","evidence":["local_commit_receipt"]}],"deliverables":[{"id":"document","kind":"artifact"}],"evidenceRequirements":["local_commit_receipt"]}}`);
+  const result = JSON.parse(String(await planTaskInvokable().invoke({}, JSON.stringify(args))));
+  assert.equal(result.code, 'plan_invalid_input');
+  assert.match(result.detail, /preamble/);
+  assert.match(result.detail, /version/);
+  assert.match(result.detail, /dataFrom/,
+    'an unrelated schema error must not hide the already knowable write lineage repair');
+  assert.match(result.detail, /write-once/);
+  assert.match(result.repairKey, /^[a-f0-9]{32}$/);
+});
+
+test('the full issue set owns repair identity, including issues after the eighth', async () => {
+  const args = liveMismatchArgs();
+  const draft = args.draft as Record<string, unknown>;
+  draft.bindings = Array.from({ length: 10 }, (_, index) => ({
+    operationId: `op-${index}`, role: 'read', capabilityRef: 'workflow_run_status',
+    evidence: ['a prose evidence kind'],
+  }));
+  const invoke = async () => JSON.parse(String(await planTaskInvokable().invoke({}, JSON.stringify(args))));
+  const first = await invoke();
+  assert.equal(first.code, 'plan_invalid_input');
+  const bindings = draft.bindings as Array<{ evidence: string[] }>;
+  bindings[9]!.evidence = ['different invalid prose'];
+  assert.equal((await invoke()).repairKey, first.repairKey,
+    'changing invalid values without changing the violated paths is not progress');
+  bindings[9]!.evidence = ['payload'];
+  const repairedOne = await invoke();
+  assert.notEqual(repairedOne.repairKey, first.repairKey,
+    'fixing the tenth issue changes the full issue set even when the first eight are identical');
+  assert.match(first.detail, /draft\.bindings\.9\.evidence\.0/,
+    'all bounded issues are available together in the same response');
+});
+
+test('the permissive SDK boundary retains the exact advertised schema and strict body checks', async () => {
+  const tool = planTaskInvokable() as ReturnType<typeof planTaskInvokable> & { parameters: unknown };
+  assert.deepEqual(tool.parameters, schema, 'moving validation must not silently remove model-facing constraints');
+  for (const raw of ['null', '[]', '{}', '{invalid']) {
+    const refusal = JSON.parse(String(await tool.invoke({}, raw)));
+    assert.equal(refusal.code, 'plan_invalid_input', raw);
+  }
+  for (const preamble of [' ', 'x'.repeat(1_001)]) {
+    const args = liveMismatchArgs();
+    args.preamble = preamble;
+    const refusal = JSON.parse(String(await tool.invoke({}, JSON.stringify(args))));
+    assert.equal(refusal.code, 'plan_invalid_input');
+    assert.match(refusal.detail, /preamble/);
+  }
+});

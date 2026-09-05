@@ -923,9 +923,10 @@ function controlConsequence(input: {
       // Missing a write and missing its payload edge are distinct, finite plan
       // repairs. Keeping them distinct lets the model advance through both in
       // one turn without prose, arguments, or call ids minting new stages.
-      stage: payload.code === 'plan_incomplete_missing_write'
+      stage: (payload.code === 'plan_incomplete_missing_write'
         ? 'plan_incomplete:missing_write'
-        : 'plan_incomplete:data_lineage',
+        : 'plan_incomplete:data_lineage')
+        + (typeof payload.repairKey === 'string' ? `:${payload.repairKey.slice(0, 16)}` : ''),
       recovery: 'repair_model',
       effectState: 'not_started',
       // A current card write makes this a plan-only repair. When the exact
@@ -949,7 +950,8 @@ function controlConsequence(input: {
       : stablePlanDetailPrefix(payload.detail);
     const recoveryTool = planRefusal?.recoveryTool;
     return createNoProgressConsequence({
-      stage: `semantic_admission:${prefix}`,
+      stage: `semantic_admission:${prefix}`
+        + (typeof payload.repairKey === 'string' ? `:${payload.repairKey.slice(0, 16)}` : ''),
       recovery: recoveryTool === 'stop_factual'
         ? 'stop_factual'
         : recoveryTool === 'retry_host'

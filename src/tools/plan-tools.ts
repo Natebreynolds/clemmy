@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { zodResponsesFunction } from 'openai/helpers/zod';
 import type { RuntimeContextValue } from '../types.js';
 import {
   exactOrderedLiteralListSchema,
@@ -304,6 +305,9 @@ export const PlanTaskInputSchema = z.object({
   preamble: z.string().min(1).max(MAX_PREAMBLE_CHARS).refine(
     (value) => !value.includes('?'),
     'preamble must be settled and must not ask a question',
+  ).refine(
+    (value) => value.trim().length > 0,
+    'preamble must contain a bounded conversational acknowledgement',
   ).describe(
     'One brief conversational acknowledgement shown immediately before work. It must state the concrete reading, make no completion claim, and ask no question.',
   ),
@@ -313,6 +317,86 @@ export const PlanTaskInputSchema = z.object({
 }).strict();
 
 export type PlanTaskInput = z.infer<typeof PlanTaskInputSchema>;
+
+// Keep the exact model-facing schema, but let the SDK parse JSON only. Strict
+// validation belongs to the body so independent repairs arrive together.
+const PlanTaskSdkSchema = zodResponsesFunction({ name: 'plan_task', parameters: PlanTaskInputSchema }).parameters as {
+  type: 'object'; properties: Record<string, unknown>; required: string[]; additionalProperties: false;
+};
+
+function planRepairKey(issues: readonly string[]): string {
+  // Hash every issue before display bounding. Different invalid argument
+  // values do not manufacture progress when the violated paths are unchanged.
+  return createHash('sha256').update(JSON.stringify([...new Set(issues)].sort())).digest('hex').slice(0, 32);
+}
+
+function planSchemaIssues(issues: readonly { path?: readonly PropertyKey[]; message?: unknown }[]): string[] {
+  return issues.map((issue) => `${issue.path?.length ? issue.path.map(String).join('.') : '(root)'}: ${String(issue.message ?? 'invalid')}`);
+}
+
+function planInputRefusal(issues: readonly string[]): string {
+  return JSON.stringify({
+    ok: false,
+    code: 'plan_invalid_input',
+    detail: (issues.length
+      ? `plan_task input did not match its schema — ${[...new Set(issues)].join('; ')}`
+      : 'plan_task input was not one parseable JSON object matching its schema').slice(0, 4_000),
+    repair: 'Fix all the named paths together and call plan_task again; do not resend the identical arguments.',
+    recoveryTool: 'plan_task',
+    ...(issues.length ? { repairKey: planRepairKey(issues) } : {}),
+  });
+}
+
+const PLAN_MISSING_WRITE_DETAIL = 'This draft binds a write operation to a capability the host has not attested. Bind the exact disclosed write, or drop the write to gather and validate first.';
+const PLAN_LINEAGE_REPAIR = 'Keep dependsOn for ordering and set each affected write dataFrom to the exact immediate read/compute operation whose bytes construct the artifact; that dataFrom chain must reach a source read. Do not ask the user about this internal topology repair.';
+
+function planLineageIssues(lineage: CollectConstructLineageCompleteness): string[] {
+  return lineage.ok ? [] : lineage.writeOperationIds.map((id) => (
+    `draft.topology.${id}.dataFrom: dependsOn does not authorize or retain payload consumption; set dataFrom to the immediate source whose chain reaches ${lineage.sourceOperationIds.join(', ')}`
+  ));
+}
+
+function planCompletenessCapabilities(
+  planning: HostFreshPlanningContextV1,
+  bindings: PlanTaskInput['draft']['bindings'],
+): readonly HostCapabilityDescriptorV1[] {
+  const staged = snapshotPrimaryModelSelectedStagedPlanningDescriptors({
+    authority: planning.authority,
+    identity: planning.identity,
+    selectedRefs: new Set(bindings.map((binding) => binding.capabilityRef)),
+  });
+  return [...planning.capabilities, ...staged.filter((candidate) => (
+    !planning.capabilities.some((bounded) => bounded.id === candidate.id)
+  ))];
+}
+
+/** Invalid siblings cannot conceal repairs whose own inputs pass the same
+ * strict field schemas. This reads only the current source/catalog; it never
+ * compiles, persists, invokes a model, or treats partial input as authority. */
+function independentPlanInputIssues(raw: unknown, planning: HostFreshPlanningContextV1 | undefined): string[] {
+  const draft = raw && typeof raw === 'object' ? (raw as Record<string, unknown>).draft : undefined;
+  const fields = FreshActionPlanDraftSchema.shape;
+  const lineageInput = z.object({ topology: fields.topology, cardinality: fields.cardinality, destination: fields.destination }).safeParse(draft);
+  const issues = lineageInput.success ? planLineageIssues(collectConstructLineageCompleteness(lineageInput.data)) : [];
+  const boundInput = z.object({ topology: fields.topology, bindings: fields.bindings }).safeParse(draft);
+  const context = harnessRunContextStorage.getStore();
+  if (boundInput.success && planning && context?.sessionId && context.sourceUserSeq) {
+    const source = listEvents(context.sessionId, { sinceSeq: context.sourceUserSeq - 1, types: ['user_input_received'], limit: 1 })
+      .find((event) => event.seq === context.sourceUserSeq);
+    const continuation = context.taskContinuation;
+    const objective = continuation && continuation.consumingSourceUserSeq === context.sourceUserSeq
+      && continuation.parentSourceUserSeq < context.sourceUserSeq && continuation.parentInput.trim()
+      ? continuation.parentInput.trim()
+      : String(source?.data.displayText || source?.data.text || '').trim();
+    const scope = requestedCapabilityEffectScope(objective);
+    if ((scope === 'write' || scope === 'mixed')
+      && boundInput.data.topology.operations.some((operation) => PLAN_WRITE_EFFECTS.has(operation.effect))
+      && !planDraftHasHostAttestedWrite({ draft: boundInput.data, capabilities: planCompletenessCapabilities(planning, boundInput.data.bindings) })) {
+      issues.push(`draft.bindings: ${PLAN_MISSING_WRITE_DETAIL}`);
+    }
+  }
+  return issues;
+}
 
 function settledPreamble(raw: string): string {
   const text = raw.trim();
@@ -1291,18 +1375,7 @@ async function executePlanTask(
     });
   }
   const requestedEffectScope = requestedCapabilityEffectScope(objective);
-  const selectedRefs = new Set(input.draft.bindings.map((binding) => binding.capabilityRef));
-  const selectedStagedCapabilities = snapshotPrimaryModelSelectedStagedPlanningDescriptors({
-    authority: planning.authority,
-    identity: planning.identity,
-    selectedRefs,
-  });
-  const completenessCapabilities = [
-    ...planning.capabilities,
-    ...selectedStagedCapabilities.filter((descriptor) => (
-      !planning.capabilities.some((bounded) => bounded.id === descriptor.id)
-    )),
-  ];
+  const completenessCapabilities = planCompletenessCapabilities(planning, input.draft.bindings);
   // A plan whose operations are ALL reads is a legitimate GATHERING STAGE, not
   // an incomplete write — reads never need a write bound (owner directive
   // 2026-08-29 "she validates against the ask before a write"; live 2026-09-02
@@ -1323,6 +1396,8 @@ async function executePlanTask(
   // `accountSelection` is non-null exactly when a CITED write is waiting on a
   // connected-account choice — computed above, reused here.
   const accountBlockedWriteInDraft = accountSelection !== null;
+  const lineage = collectConstructLineageCompleteness(input.draft);
+  const lineageIssues = planLineageIssues(lineage);
   if (
     (requestedEffectScope === 'write' || requestedEffectScope === 'mixed')
     && draftHasWriteOperation
@@ -1340,7 +1415,8 @@ async function executePlanTask(
     return JSON.stringify({
       ok: false,
       code: 'plan_incomplete_missing_write',
-      detail: 'This draft binds a write operation to a capability the host has not attested. Bind the exact disclosed write, or drop the write to gather and validate first.',
+      detail: [PLAN_MISSING_WRITE_DETAIL, ...lineageIssues].join('; ').slice(0, 4_000),
+      repairKey: planRepairKey([`draft.bindings: ${PLAN_MISSING_WRITE_DETAIL}`, ...lineageIssues]),
       requestedEffectScope,
       // The detail names TWO doors; the repair used to name only the first,
       // and when the write is unbindable that is the impossible one. Live
@@ -1350,21 +1426,22 @@ async function executePlanTask(
       // comment above describes was open the whole time. Name the achievable
       // door first when the blocked write is waiting on an account choice
       // rather than on discovery.
-      repair: accountBlockedWriteInDraft
+      repair: (accountBlockedWriteInDraft
         ? 'The write you bound is waiting on an account choice, so it cannot be bound yet. Plan the READ operations only and call plan_task again — an all-read draft is a legitimate gathering stage. Do the gathering, then plan the write as a separate accepted action once the account is settled.'
-        : 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation.',
+        : 'Use tool_search for the exact missing write capability, then call plan_task again with that exact capabilityRef bound to a local_write, external_write, or admin topology operation.')
+        + (lineage.ok ? '' : ` Also repair the named dataFrom paths in that same draft. ${PLAN_LINEAGE_REPAIR}`),
       recoveryTool: accountBlockedWriteInDraft ? 'plan_task' : 'tool_search',
     });
   }
-  const lineage = collectConstructLineageCompleteness(input.draft);
   if (!lineage.ok) {
     return JSON.stringify({
       ok: false,
       code: 'plan_incomplete_data_lineage',
       detail: `The collected record set is destined for an artifact, but write operation(s) ${lineage.writeOperationIds.join(', ')} name only ordering dependencies. dependsOn does not authorize or retain payload consumption.`,
+      repairKey: planRepairKey(lineageIssues),
       writeOperationIds: lineage.writeOperationIds,
       sourceOperationIds: lineage.sourceOperationIds,
-      repair: 'Call plan_task again in this same turn. Keep dependsOn for ordering and set each affected write dataFrom to the exact immediate read/compute operation whose bytes construct the artifact; that dataFrom chain must reach one of sourceOperationIds. Do not ask the user about this internal topology repair.',
+      repair: `Call plan_task again in this same turn. ${PLAN_LINEAGE_REPAIR}`,
       recoveryTool: 'plan_task',
     });
   }
@@ -1500,6 +1577,7 @@ async function executePlanTask(
       ok: false,
       code: 'plan_not_admitted',
       detail: planned.reason,
+      repairKey: planRepairKey(planned.reason.split(';').map((issue) => issue.trim()).filter(Boolean)),
       reasonCode: boundedPlanAdmissionReasonCode(planned.reason),
       admissibleCapabilities,
       ceiling: repairPlanning.effectCeiling,
@@ -1640,7 +1718,7 @@ export function buildPlanTaskTool(input: {
       'Use topology as the sole operation DAG. Put capabilityRef/role/evidence annotations in bindings; do not copy effects or dependencies into bindings. coverage is required for reads and null for non-reads. dependsOn means ORDER only. When a later operation consumes prior result bytes, also name its exact immediate source in dataFrom; for example read_source once with dataFrom:[], then write_once with dependsOn:["read_source"] and dataFrom:["read_source"]. Use cardinality each only for genuine per-member work; a counted collection written once stays once.',
       `Exact host planning catalog: ${planningCatalogText(input.planning.capabilities)}`,
     ].join(' '),
-    parameters: PlanTaskInputSchema,
+    parameters: PlanTaskSdkSchema,
     // A plan can only be admitted against a capability the host DISCLOSED, so
     // an actually empty live catalog keeps this door absent. Foreground
     // tool_search may disclose an exact ref later in the same agent run. The
@@ -1656,9 +1734,14 @@ export function buildPlanTaskTool(input: {
       );
     },
     execute: async (args) => {
+      const parsed = PlanTaskInputSchema.safeParse(args);
       const planning = snapshotPrimaryModelPlanningContext(input.planning.authority);
+      if (!parsed.success) return planInputRefusal([
+        ...planSchemaIssues(parsed.error.issues),
+        ...independentPlanInputIssues(args, planning ?? undefined),
+      ]);
       if (!planning) throw new Error('plan_task requires a live host-minted planning catalog');
-      return executePlanTask(args as PlanTaskInput, planning);
+      return executePlanTask(parsed.data, planning);
     },
     // Input-shape rejections return the typed plan_invalid_input refusal with
     // the violated paths (see planTaskInvalidInputRefusal). Everything else
@@ -1692,34 +1775,7 @@ function planTaskInvalidInputRefusal(error: unknown): string | null {
   const rawIssues = original && typeof original === 'object'
     ? (original as { issues?: unknown }).issues
     : undefined;
-  const issues = Array.isArray(rawIssues)
-    ? (rawIssues as Array<{ path?: unknown; message?: unknown }>).slice(0, 8).map((issue) => {
-        const path = Array.isArray(issue.path) && issue.path.length > 0
-          ? issue.path.join('.')
-          : '(root)';
-        return `${path}: ${String(issue.message ?? 'invalid')}`;
-      })
-    : [];
-  const detail = issues.length > 0
-    ? `plan_task input did not match its schema — ${issues.join('; ')}`
-    : 'plan_task input was not one parseable JSON object matching its schema';
-  // Host-authored repair key over the violated PATHS and their messages (no
-  // argument values): the no-progress projection keys the stage on it, so a
-  // draft that fixes one complaint and receives a different one registers
-  // as progress instead of "the same schema failure again" (live 2026-09-01:
-  // four distinct plan_task complaints in a row terminalized a converging
-  // authoring turn). Same paths → same key → the loop floor still holds.
-  const repairKey = issues.length > 0
-    ? createHash('sha256').update(JSON.stringify([...new Set(issues)].sort())).digest('hex').slice(0, 32)
-    : undefined;
-  return JSON.stringify({
-    ok: false,
-    code: 'plan_invalid_input',
-    detail: detail.slice(0, 4_000),
-    repair: 'Fix exactly the named paths and call plan_task again; do not resend the identical arguments.',
-    recoveryTool: 'plan_task',
-    ...(repairKey ? { repairKey } : {}),
-  });
+  return planInputRefusal(Array.isArray(rawIssues) ? planSchemaIssues(rawIssues) : []);
 }
 
 /** plan_task is a first-class host control only. It is deliberately absent
