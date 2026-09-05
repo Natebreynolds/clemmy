@@ -244,7 +244,7 @@ import {
   freezeCatalogSnapshotForSource,
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
-  resolveProvenLiveReadCatalogEntry,
+  resolveProvenLiveCatalogEntry,
   type RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
 import {
@@ -3450,7 +3450,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // host had itself just proved. A worker session with no
     // same-turn proof still binds its current catalog read.
     const provenReadCandidate = candidates.length === 0
-      ? resolveProvenLiveReadCatalogEntry({
+      ? resolveProvenLiveCatalogEntry({
           capabilityId: readDescent?.capabilityId
             ?? canonicalResolvedCapabilityId(effectiveName.trim().toLowerCase()),
           effectiveName: readDescent?.effectiveName ?? effectiveName,

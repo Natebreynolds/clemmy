@@ -98,7 +98,7 @@ test('NEGATIVE: two current BATCH_GET reads are a read, not a write', () => {
   );
   assert.equal(isMutatingExternalWrite('composio_execute_tool', args), false);
   assert.equal(currentManifestOperationContract('GOOGLESHEETS_BATCH_GET')?.effect, 'read');
-  const bound = catalogs.resolveProvenLiveReadCatalogEntry({
+  const bound = catalogs.resolveProvenLiveCatalogEntry({
     capabilityId: 'cap:resolved:googlesheets_batch_get',
     effectiveName: 'GOOGLESHEETS_BATCH_GET',
   });

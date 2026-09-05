@@ -158,7 +158,7 @@ test('a read whose durable manifest predates the builder shape registers against
   assert.equal(entry.manifestDigest, staleDigest, 'the registration carries the INSTALLED identity, not a rebuilt one');
   assert.equal(store.get(BASE_ID)?.digest, staleDigest, 'the durable row is untouched');
   assert.equal(entry.effect, 'read');
-  const resolved = catalogs.resolveProvenLiveReadCatalogEntry({
+  const resolved = catalogs.resolveProvenLiveCatalogEntry({
     capabilityId: BASE_ID,
     effectiveName: SLUG,
     accountIdentity: CONNECTION_ID,

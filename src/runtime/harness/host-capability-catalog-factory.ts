@@ -582,7 +582,7 @@ export function accountPartitionedResolvedCapabilityId(
 }
 
 /**
- * THE READ BAR.
+ * Current callable capability resolution, shared by reads and mutations.
  *
  * A proven read binds on three facts and nothing else: the sealed manifest
  * says read, the row is a current callable catalog entry for that operation,
@@ -602,25 +602,30 @@ export function accountPartitionedResolvedCapabilityId(
  * Two current rows for one operation in one account are two transports of
  * one read: the proven capability id wins, else the first by id. Several
  * accounts with no proof of which one is the only ambiguity left, and that
- * is an input question, not a catalog one.
+ * is an input question, not a catalog one. Mutations require the caller's
+ * exact effect and retain the same sealed manifest/account/port identity.
+ * Resolution is not write authority: consent and physical settlement remain
+ * at the existing dispatch boundary.
  */
-export function resolveProvenLiveReadCatalogEntry(input: {
+export function resolveProvenLiveCatalogEntry(input: {
   capabilityId: string;
   effectiveName: string;
   accountIdentity?: string | null;
+  effect?: RegisteredHostCapability['effect'];
 }): RegisteredHostCapability | null {
   const factory = peekHostCapabilityCatalogFactory();
   if (!factory || !input.effectiveName.trim()) return null;
   const store = peekCapabilityManifestStore();
   const account = input.accountIdentity?.trim() || null;
-  const reads = factory.snapshot()
+  const effect = input.effect ?? 'read';
+  const matches = factory.snapshot()
     .filter((entry): entry is RegisteredHostCapability & {
       manifest: import('./capability-manifest.js').CapabilityManifestV1;
       manifestDigest: string;
     } => (
       isCurrentCallableCatalogEntry(entry)
-      && entry.effect === 'read'
-      && entry.manifest.effect === 'read'
+      && entry.effect === effect
+      && entry.manifest.effect === effect
       && store?.get(entry.capabilityId)?.manifest.lifecycle.state !== 'revoked'
       && (
         catalogOperationIdentitiesEqual(entry.manifest.operationId, input.effectiveName)
@@ -629,12 +634,12 @@ export function resolveProvenLiveReadCatalogEntry(input: {
       && (!account || entry.account === account)
     ))
     .sort((left, right) => left.capabilityId.localeCompare(right.capabilityId));
-  if (reads.length === 0) return null;
-  const proven = reads.find((entry) => entry.capabilityId === input.capabilityId);
+  if (matches.length === 0) return null;
+  const proven = matches.find((entry) => entry.capabilityId === input.capabilityId);
   if (proven) return proven;
-  if (account) return reads[0]!;
-  const accounts = new Set(reads.map((entry) => entry.account ?? ''));
-  return accounts.size === 1 ? reads[0]! : null;
+  if (account) return matches[0]!;
+  const accounts = new Set(matches.map((entry) => entry.account ?? ''));
+  return accounts.size === 1 ? matches[0]! : null;
 }
 
 export function resolveRuntimeCapabilityCatalog(
