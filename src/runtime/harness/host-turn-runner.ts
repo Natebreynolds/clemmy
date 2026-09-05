@@ -222,6 +222,7 @@ import {
   prepareHostWorkCall,
   resolveHostPlanningReadCapability,
 } from '../../tools/work-call-mode.js';
+import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
 import {
   acceptedTurnCallAuthorityFor,
   armHostCallAuthority,
@@ -600,6 +601,10 @@ export function hostProvenOperationRepair(input: {
   requestedOperation: string;
   provenOperations: readonly string[];
   limit?: number;
+  /** Connected identities this turn's search said the operation still needs the
+   * user to choose between. Present only when the host already knows the
+   * capability exists and the missing fact is the user's. */
+  accountChoices?: readonly string[];
 }): string {
   const toolkitOf = (operationId: string): string => operationId.split('_')[0] ?? '';
   const requested = input.requestedOperation.trim().toUpperCase();
@@ -620,6 +625,20 @@ export function hostProvenOperationRepair(input: {
   // eighteen times. When the named operation is absent from the proven set,
   // say that first and name the door; the proven list is context, not the
   // answer.
+  // ASK, DO NOT SUBSTITUTE. When the host already knows the operation exists
+  // and the only missing fact is which connected account it runs as, that is an
+  // input question, not a missing capability. plan_task has said this since
+  // 2026-08-29; the direct carrier said "absent" and offered other providers
+  // instead, which is how a mailbox choice became eighteen searches and a dead
+  // turn on 2026-09-05.
+  const accountChoices = [...new Set((input.accountChoices ?? [])
+    .map((choice) => choice.trim())
+    .filter((choice) => choice.length > 0))].slice(0, 8);
+  if (requested.length > 0 && accountChoices.length > 0) {
+    return ` ${requested} is available, but it still needs you to say which connected account it runs as.`
+      + ` Ask the user with ask_user_question, offering exactly these: ${accountChoices.join(', ')}.`
+      + ' Do not substitute another provider, another operation, or a recipient address for that choice.';
+  }
   const requestedIsProven = requested.length > 0
     && proven.some((operationId) => operationId.trim().toUpperCase() === requested);
   if (requested.length > 0 && !requestedIsProven) {
@@ -4238,9 +4257,24 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           return '';
         }
       })();
+      const accountChoicesForRequest = ((): readonly string[] => {
+        if (!requestedOperation) return [];
+        try {
+          return thisTurnSearchAccountSelectionBlockers({
+            sessionId: refusalIdentity.sessionId,
+            sourceUserSeq: refusalIdentity.sourceUserSeq,
+          }).find((blocker) => blocker.name.trim().toUpperCase() === requestedOperation)?.choices ?? [];
+        } catch {
+          return [];
+        }
+      })();
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use available discovery or read tools if needed, then reissue the call under the existing plan with its exact requirement_id and corrected inner name and arguments.`
-        : hostProvenOperationRepair({ requestedOperation, provenOperations });
+        : hostProvenOperationRepair({
+          requestedOperation,
+          provenOperations,
+          accountChoices: accountChoicesForRequest,
+        });
       const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
       if (literalOperation) {
         return `Tool '${name}' was refused before dispatch because this step names the operation ${literalOperation} but the host did not provision it into this run's frozen catalog. Failed check: ${lastExactProductionMiss}. This is a host provisioning fault, not an argument error: no correction or substitute capability can be dispatched, and no local or external mutation was attempted.`;

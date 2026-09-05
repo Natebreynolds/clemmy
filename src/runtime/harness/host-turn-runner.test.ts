@@ -140,6 +140,24 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     hostProvenOperationRepair({ requestedOperation: '', provenOperations: [] }),
     /No operation is bound to this turn yet/,
   );
+
+  // ASK, DO NOT SUBSTITUTE. When the host knows the operation exists and the
+  // only missing fact is which connected account it runs as, the refusal is an
+  // input question. plan_task has said this since 2026-08-29; the direct
+  // carrier said "absent" and offered other providers, which is how a mailbox
+  // choice became eighteen searches and a dead turn on 2026-09-05.
+  const needsAccount = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_CREATE_DRAFT',
+    provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
+    accountChoices: ['first@example.test', 'second@example.test'],
+  });
+  assert.match(needsAccount, /still needs you to say which connected account/);
+  assert.match(needsAccount, /ask_user_question/);
+  assert.match(needsAccount, /first@example\.test, second@example\.test/);
+  assert.ok(!/plan_task/.test(needsAccount),
+    'a question the user must answer is not routed through planning');
+  assert.ok(!/Use one of those exactly/.test(needsAccount),
+    'and never answered with a menu of other operations');
 });
 
 test('returned nested-call repair requires exact zero-crossing invalid-arguments settlement truth', () => {
