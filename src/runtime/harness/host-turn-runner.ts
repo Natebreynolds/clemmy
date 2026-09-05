@@ -95,12 +95,16 @@ import {
 } from './objective-judge.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import {
+  currentWatcherJudge,
   MAX_WATCHER_CHECKS,
   MAX_WATCHER_INJECTIONS,
-  runWatcherJudge,
+  observeWorkerFanoutStart,
+  rearmedWatcherCadence,
   shouldStartWatcherCheck,
+  summarizeWorkerProgressForWatcher,
   watcherCheckIntervalTools,
   watcherJudgeEnabled,
+  type WatcherGateInput,
   type WatcherVerdict,
 } from './watcher-judge.js';
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
@@ -2383,6 +2387,74 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let hostWatcherInjectionsUsed = 0;
   let hostWatcherLastCheckedAt = 0;
   let hostWatcherCheckInFlight = false;
+  /** Parent business tool calls so far (control tools never move the cadence). */
+  const hostWatcherToolCalls = (): number => history.filter((item) => {
+    const row = item as { type?: unknown; name?: unknown };
+    return row.type === 'function_call'
+      && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
+  }).length;
+  const hostWatcherGate = (watcherToolCalls: number): WatcherGateInput => ({
+    enabled: true,
+    totalToolCalls: watcherToolCalls,
+    lastCheckedAtToolCalls: hostWatcherLastCheckedAt,
+    checkIntervalTools: hostWatcherIntervalTools,
+    injectionsUsed: hostWatcherInjectionsUsed,
+    maxInjections: MAX_WATCHER_INJECTIONS,
+    checksUsed: hostWatcherChecksUsed,
+    maxChecks: MAX_WATCHER_CHECKS,
+    checkInFlight: hostWatcherCheckInFlight,
+  });
+  /** One NON-BLOCKING trajectory check (the caller has already passed the
+   * gate). Reads the parent trajectory plus whatever the children have logged
+   * so far; a drift verdict parks in hostWatcherSteer for the next boundary. */
+  const startHostWatcherCheck = (watcherToolCalls: number): void => {
+    hostWatcherCheckInFlight = true;
+    hostWatcherChecksUsed += 1;
+    hostWatcherLastCheckedAt = watcherToolCalls;
+    const watcherObjective = judgedObjective();
+    const watcherSessionId = exactHostIdentity().sessionId;
+    const watcherJudge = currentWatcherJudge();
+    void (async () => {
+      try {
+        const verdict = await watcherJudge({
+          objective: watcherObjective,
+          toolCallSummary: [
+            summarizeToolCallsForJudge(watcherSessionId),
+            summarizeWorkerProgressForWatcher(watcherSessionId),
+          ].filter(Boolean).join('; '),
+          latestAssistantNote: '',
+          toolCallCount: watcherToolCalls,
+        });
+        if (verdict && !verdict.onTrack) hostWatcherSteer.pending = verdict;
+      } catch { /* the watcher is silent on any failure */ }
+      finally { hostWatcherCheckInFlight = false; }
+    })();
+  };
+  /** A worker fan-out is one parent tool call that can hold this loop for
+   * minutes, so no continuation boundary (and no cadence check) happens while
+   * the children run. Scoped to the invocation: when the parent's eventlog
+   * records the batch's first worker_started, the cadence is re-armed and the
+   * SAME gate/check runs — same budgets, same steer channel, no authority.
+   * A call that starts no workers, or a run with the watcher off, is untouched. */
+  const withHostWatcherFanoutRearm = async <T>(
+    sessionId: string | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> => {
+    if (!hostProduction || !hostWatcherEnabled || !sessionId) return run();
+    const parentScope = harnessRunContextStorage.getStore();
+    const stop = observeWorkerFanoutStart(sessionId, () => {
+      const watcherToolCalls = hostWatcherToolCalls();
+      if (!shouldStartWatcherCheck(rearmedWatcherCadence(hostWatcherGate(watcherToolCalls)))) return;
+      const start = (): void => startHostWatcherCheck(watcherToolCalls);
+      if (parentScope) harnessRunContextStorage.run(parentScope, start);
+      else start();
+    });
+    try {
+      return await run();
+    } finally {
+      stop();
+    }
+  };
   let lastContinueMarkerNote: string | undefined;
   let objectiveJudgeContinuations = itemsOrState instanceof HostInterruptState
     || itemsOrState instanceof HostRecoveryState
@@ -4269,7 +4341,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             throw new HostCallAuthorityBoundaryError('host_invocation_authority_missing');
           }
           observation.invocationEntered = true;
-          return tool.invoke!(runContext, argumentsJson, details);
+          return withHostWatcherFanoutRearm(
+            ambient?.sessionId,
+            () => tool.invoke!(runContext, argumentsJson, details),
+          );
         }
         const exactAmbient = ambient!;
         const effect = exactProduction?.effect
@@ -4406,13 +4481,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                   },
                 }
               : {}),
-            invoke: ({ signal: callSignal }) => exactProduction
-              ? exactProduction.invoke(callSignal)
-              : tool.invoke!(
-                  runContext,
-                  argumentsJson,
-                  { ...details, signal: callSignal },
-                ),
+            invoke: ({ signal: callSignal }) => withHostWatcherFanoutRearm(
+              exactSource.sessionId,
+              () => exactProduction
+                ? exactProduction.invoke(callSignal)
+                : tool.invoke!(
+                    runContext,
+                    argumentsJson,
+                    { ...details, signal: callSignal },
+                  ),
+            ),
           });
           if (preserveWorkCallCarrier) {
             const redeemed = redeemDurableLogicalCallSettlementForHost({
@@ -6365,39 +6443,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           });
         } catch { /* telemetry never blocks the turn */ }
       }
-      const watcherToolCalls = history.filter((item) => {
-        const row = item as { type?: unknown; name?: unknown };
-        return row.type === 'function_call'
-          && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
-      }).length;
-      if (shouldStartWatcherCheck({
-        enabled: true,
-        totalToolCalls: watcherToolCalls,
-        lastCheckedAtToolCalls: hostWatcherLastCheckedAt,
-        checkIntervalTools: hostWatcherIntervalTools,
-        injectionsUsed: hostWatcherInjectionsUsed,
-        maxInjections: MAX_WATCHER_INJECTIONS,
-        checksUsed: hostWatcherChecksUsed,
-        maxChecks: MAX_WATCHER_CHECKS,
-        checkInFlight: hostWatcherCheckInFlight,
-      })) {
-        hostWatcherCheckInFlight = true;
-        hostWatcherChecksUsed += 1;
-        hostWatcherLastCheckedAt = watcherToolCalls;
-        const watcherObjective = judgedObjective();
-        const watcherSessionId = exactHostIdentity().sessionId;
-        void (async () => {
-          try {
-            const verdict = await runWatcherJudge({
-              objective: watcherObjective,
-              toolCallSummary: summarizeToolCallsForJudge(watcherSessionId),
-              latestAssistantNote: '',
-              toolCallCount: watcherToolCalls,
-            });
-            if (verdict && !verdict.onTrack) hostWatcherSteer.pending = verdict;
-          } catch { /* the watcher is silent on any failure */ }
-          finally { hostWatcherCheckInFlight = false; }
-        })();
+      const watcherToolCalls = hostWatcherToolCalls();
+      if (shouldStartWatcherCheck(hostWatcherGate(watcherToolCalls))) {
+        startHostWatcherCheck(watcherToolCalls);
       }
     }
     const pendingDirectiveForStep = pendingHostModelDirective;

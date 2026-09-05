@@ -12,6 +12,7 @@ import {
   MAX_WATCHER_CHECKS,
   MAX_WATCHER_INJECTIONS,
   parseWatcherVerdict,
+  rearmedWatcherCadence,
   shouldStartWatcherCheck,
   WATCHER_JUDGE_SYSTEM_PROMPT,
   watcherCheckIntervalTools,
@@ -121,4 +122,18 @@ test('knobs: chat defaults on, workflow mount defaults off, and the global kill-
     if (prevWorkflowOn === undefined) delete process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE; else process.env.CLEMMY_WORKFLOW_WATCHER_JUDGE = prevWorkflowOn;
     if (prevInt === undefined) delete process.env.CLEMMY_WATCHER_INTERVAL_TOOLS; else process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = prevInt;
   }
+});
+
+test('gate: a fan-out re-arm waives only the interval — every other cap still holds', () => {
+  // One parent tool call holds the loop for the whole batch, so the interval
+  // can never elapse while children run; the re-arm makes a check due now.
+  const midBatch = { ...baseGate, totalToolCalls: 1, lastCheckedAtToolCalls: 0 };
+  assert.equal(shouldStartWatcherCheck(midBatch), false, 'the plain cadence is silent mid-batch');
+  assert.equal(shouldStartWatcherCheck(rearmedWatcherCadence(midBatch)), true, 're-armed: due now');
+  assert.equal(shouldStartWatcherCheck(rearmedWatcherCadence({ ...midBatch, checkInFlight: true })), false, 'never stacks on an in-flight check');
+  assert.equal(shouldStartWatcherCheck(rearmedWatcherCadence({ ...midBatch, checksUsed: MAX_WATCHER_CHECKS })), false, 'same check budget');
+  assert.equal(shouldStartWatcherCheck(rearmedWatcherCadence({ ...midBatch, injectionsUsed: MAX_WATCHER_INJECTIONS })), false, 'same injection budget');
+  assert.equal(shouldStartWatcherCheck(rearmedWatcherCadence({ ...midBatch, enabled: false })), false, 'kill-switch still wins');
+  // Re-arming is pure: the caller's gate input is untouched.
+  assert.equal(midBatch.lastCheckedAtToolCalls, 0);
 });
