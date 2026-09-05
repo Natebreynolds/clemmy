@@ -6119,7 +6119,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
 	        // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
 	        const remainingWallMs = Math.max(1, wallClockDeadlineMs - Date.now());
-	        const requestedModel = task.model ?? MODELS.deep;
+	        const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+	        const requestedModel = task.model ?? resolveRoleModel('brain').modelId;
 	        response = await backgroundResponseExecutor(assistant, {
 	          sessionId: task.runSessionId,
 	          channel: task.channel ?? 'background',

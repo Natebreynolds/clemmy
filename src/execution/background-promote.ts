@@ -22,6 +22,7 @@
  * do not disappear into the background.
  */
 import { MODELS } from '../config.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
 import { createBackgroundTask, listBackgroundTasks, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskRecord } from './background-tasks.js';
@@ -393,7 +394,16 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     userId: input.userId,
     channel: input.channel,
     reportBackTarget: input.reportBackTarget,
-    model: input.model ?? MODELS.deep,
+    // THE BACKGROUND TASK RUNS THE BRAIN THE USER IS TALKING TO. This used to
+    // pin the OpenAI "deep" tier, a provider-specific constant that ignores the
+    // configured brain entirely: live 2026-09-05, a home whose brain is
+    // claude-sonnet-5 (and whose Codex login was unavailable) promoted an
+    // ordinary chat request to a task pinned gpt-5.4, and the very first model
+    // call of that task failed — "I've started it as a background task"
+    // followed by an immediate error, with a healthy brain sitting right there.
+    // resolveRoleModel is the same resolver the settings surface reports, so
+    // backgrounding never silently changes which brain is doing the work.
+    model: input.model ?? resolveRoleModel('brain').modelId,
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
   });

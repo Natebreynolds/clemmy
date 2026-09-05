@@ -227,6 +227,39 @@ test('enqueueDurableChatTask creates a pending durable task wired for report-bac
   assert.ok(stored!.maxMinutes >= 1 && stored!.maxMinutes <= 240);
 });
 
+test('a promoted chat task runs the configured brain, never a provider tier constant', async () => {
+  // Live 2026-09-05: a home whose brain is claude-sonnet-5, with the Codex
+  // login unavailable, promoted an ordinary request to a task pinned gpt-5.4
+  // (the OpenAI "deep" tier). The reply said "I've started it as a background
+  // task" and that task's first model call failed immediately, with a healthy
+  // brain sitting right there. Backgrounding must not change which brain does
+  // the work.
+  const roles = await import('../runtime/harness/model-roles.js');
+  const task = enqueueDurableChatTask({
+    message: '/background draft the quarterly update and save it',
+    sessionId: 'sess-brain-default',
+    channel: 'desktop',
+    source: 'desktop',
+  });
+  const stored = getBackgroundTask(task.id);
+  assert.ok(stored);
+  assert.equal(stored!.model, roles.resolveRoleModel('brain').modelId,
+    'the promoted task pins the brain the settings surface reports');
+
+  // Source pin: this home resolves its brain to the same id as the legacy
+  // tier default, so the behavioural assertion above cannot tell the two
+  // apart. What must never come back is the tier constant as the DEFAULT —
+  // that is the line that sent a Claude-brain home to an unavailable Codex.
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./background-promote.ts', import.meta.url), 'utf8');
+  assert.ok(source.includes("model: input.model ?? resolveRoleModel('brain').modelId"),
+    'the promoted task defaults to the configured brain');
+  for (const tier of ['deep', 'fast', 'primary']) {
+    assert.ok(!source.includes(`model: input.model ?? MODELS.${tier}`),
+      `a provider-specific tier constant (MODELS.${tier}) is never the default brain for a background task`);
+  }
+});
+
 test('renderDurableTaskQueued states the three trust-earning facts', () => {
   const msg = renderDurableTaskQueued({ id: 'bg-abc', title: 'Build the homepage' });
   assert.match(msg, /Build the homepage/);
