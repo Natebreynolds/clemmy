@@ -2853,6 +2853,14 @@ export async function runAdmittedTurnGraph(input: {
   if (admission.ok) admissionRef.digest = admission.admission.admissionDigest;
   if (!admission.ok) {
     lastBlockReason = admission.errors.join('; ');
+    // SAY WHY A TURN FAILED. The user-visible text for this branch is the
+    // generic "something went wrong", by design — an admission error is not
+    // user-facing prose. But nothing recorded the reason either, so a live
+    // failure left no trace at all: 2026-09-05 19:55, a phone turn died in
+    // four seconds with the generic sentence, no tool calls, and not one line
+    // in the daemon log to say what refused it.
+    // eslint-disable-next-line no-console
+    console.error(`[construct-admission] turn failed: ${lastBlockReason.slice(0, 400)}`);
     if (identity && terminalIdentity) {
       commitTerminal({
         version: 2,
