@@ -2551,3 +2551,13 @@ disclosure, the 0600 key fix, and the live-test plan. Next: full gates on these
 bytes; the owner's words on: "defer", the tester's scope (own install vs the
 owner's daemon), the UI branch in the live mobile build, and the canary re-run on
 Claude fallover.
+
+**2026-09-05 06:51 — OWNER'S DECISIONS:** (1) the tester pairs to the OWNER's daemon,
+supervised (owner parity accepted for the test; revoke ready); (2) the live mobile
+bundle is built from the latest UI (`ui/main-window`); (3) **no deferrals — all
+three remaining journeys must be FIXED before the mobile test** (the skip patch is
+reverted; three fix lanes launched: read-plan-cannot-stop-at-prose, legacy
+input-digest staged identity, and the cold-surface byte ceiling — 28.8 KB → <16 KiB
+step-1, 37.6 KB → <32 KiB pre-activation); (4) the draft canary re-runs on Claude
+Sonnet 5 explicitly pinned (Codex quota is out until 09-11), after the current gate
+pass. Push/tag still only on the owner's words.
