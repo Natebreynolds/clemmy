@@ -206,7 +206,7 @@ import {
   isPlainOrClementineLocalTool,
 } from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
-import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool } from '../../tools/tool-registry.js';
+import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
 import { readPersistedHealth } from '../../integrations/cli-catalog/auth-health.js';
 import {
   isHostPlanRequiredWorkCall,
@@ -503,10 +503,10 @@ export const HOST_LOCAL_CONTINUATION_UNAVAILABLE_TEXT =
 // read as a person saying what happened and what she needs. The machine
 // reason rides separately on the terminal (blockedReason/blockedDetail).
 export const HOST_NO_PROGRESS_BLOCKED_TEXT =
-  'I got stuck: I hit the same wall twice in a row, so I stopped rather than loop. Nothing was sent or changed, and everything I already gathered is kept. Tell me how you want to proceed, or ask me to try a different way.';
+  'This step needs a different executable path. The gathered work and recorded call results are preserved.';
 
 export const HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT =
-  'I could not finish this step: the same call kept ending the same way, so I stopped rather than repeat it. Nothing was sent or changed, and what I already gathered is kept. Point me at what to change and I will pick it back up.';
+  'This call has a recorded outcome. The gathered work and settled results are preserved.';
 
 /** Best-effort `file:line` of the caller that authored a terminal.
  *
@@ -528,10 +528,20 @@ function terminalCallerSite(depth = 3): string | undefined {
   }
 }
 
-function hostNoProgressBlockedText(state: NoProgressGovernorState | null): string {
-  return state?.lastConsequence?.effectState === 'known_terminal'
+export function hostNoProgressBlockedText(state: NoProgressGovernorState | null, stoppedOn?: string): string {
+  const consequence = state?.lastConsequence;
+  const summary = consequence?.effectState === 'known_terminal'
     ? HOST_NO_PROGRESS_KNOWN_RESULT_BLOCKED_TEXT
     : HOST_NO_PROGRESS_BLOCKED_TEXT;
+  const stage = stoppedOn ?? consequence?.stage ?? 'no_new_evidence';
+  const next = consequence?.recovery === 'ask_user' && consequence.userInput
+    ? `Answer: ${consequence.userInput.question} Then resume this saved task.`
+    : consequence?.recovery === 'stop_factual'
+      ? 'Inspect the recorded result, choose an alternative for the unfinished work, then resume this saved task.'
+      : consequence?.recoveryToolNames.length
+        ? `Use ${consequence.recoveryToolNames.join(' or ')} to resolve this step, then resume this saved task from its retained results.`
+        : 'Use the available discovery or read tools to resolve the next executable step, then resume this saved task from its retained results.';
+  return `${summary}\nStopped at: ${stage}.\nNext: ${next}`;
 }
 
 
@@ -546,9 +556,31 @@ export const HOST_DUPLICATE_MODEL_CALL_BLOCKED_TEXT =
 
 const HOST_NO_PROGRESS_RECOVERY_DIRECTIVE = [
   'BOUNDED CONTROL RECOVERY — the prior fully settled control step did not establish a new executable path.',
-  'Use the results already present to call one available planning control, ask for the missing input, or explain the blocker.',
-  'Do not perform another discovery, dependency, provider, or business call, and do not combine planning with work.',
+  'Use retained results and available tools to resolve the next unfinished requirement or change approach.',
+  'Every call still passes its existing authority and consent checks; repeating unchanged discovery does not earn more retries.',
 ].join(' ');
+
+/** Recovery selects from tools the current turn already owns. Host-side
+ * repairs retain local reads/discovery and carriers for proven reads; final
+ * dispatch still revalidates the exact operation, account, schema and consent. */
+export function hostNoProgressRecoveryToolNames(
+  consequence: NoProgressGovernorState['lastConsequence'],
+  toolNames: readonly string[],
+  provenReads: readonly string[] = [],
+): Set<string> {
+  if (!consequence) return new Set(toolNames);
+  const exact = new Set(consequence.recoveryToolNames);
+  return new Set(toolNames.filter((name) => {
+    const bare = bareTerminalToolName(name);
+    if (consequence.recovery === 'ask_user') return bare === 'ask_user_question';
+    if (consequence.recovery === 'stop_factual' || consequence.recovery === 'reconcile') return false;
+    if (exact.has(name)) return true;
+    if (consequence.effectState !== 'not_started' || consequence.recovery !== 'repair_model') return false;
+    return isRegistryDeclaredRead(bare)
+      || provenReads.includes(name)
+      || (provenReads.length > 0 && (bare === 'call_tool' || bare === 'work_call'));
+  }));
+}
 
 export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState): string {
   const consequence = state.lastConsequence;
@@ -578,7 +610,7 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     return [
       'BOUNDED AUTO RECOVERY — the accepted plan is missing an exact write and the current planning card has no write repair.',
       'Call tool_search exactly once for the exact missing write capability named by the accepted request.',
-      'Do not call plan_task until that search returns a citable write, and do not call a dependency, provider, or business tool.',
+      'Use available discovery and read controls to resolve missing details; a corrected write still needs its own exact authority and consent.',
     ].join(' ');
   }
   if (
@@ -589,7 +621,7 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     return [
       'BOUNDED AUTO RECOVERY — plan_task proved this is graph-neutral read work.',
       'Call call_tool exactly once with the exact read operation and schema already present in the result.',
-      'Do not call plan_task, tool_search, a write, or any other tool.',
+      'Available discovery and read controls can resolve missing details before that call; no plan compilation is required.',
     ].join(' ');
   }
   if (
@@ -600,7 +632,7 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     return [
       'BOUNDED AUTO RECOVERY — plan_task proved the accepted request uniquely names an existing workflow.',
       'Call workflow_run exactly once with the exact workflowName present in the plan_task result.',
-      'Do not call plan_task, workflow_get, tool_search, or any other tool.',
+      'Available discovery and read controls can resolve missing details before that call; no plan compilation is required.',
     ].join(' ');
   }
   if (
@@ -612,7 +644,7 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     return [
       `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
       'Call tool_search exactly once for the exact missing capability or verifier named by the refusal.',
-      'Do not call plan_task until that search returns a citable ref, and do not call a provider or business tool.',
+      'Available discovery and read controls may resolve missing details before the corrected call; use only proven capabilities.',
     ].join(' ');
   }
   if (
@@ -638,20 +670,18 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
     return [
       `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
       'Call plan_task exactly once with the exact disclosed capabilities and correction named by the refusal.',
-      'Do not rediscover, substitute capabilities, or call a provider or business tool.',
+      'Available discovery and read controls may resolve missing details or another unfinished requirement before the corrected call.',
     ].join(' ');
   }
   if (
     consequence.stage.startsWith('schema_invalid')
     && consequence.recoveryToolNames.length === 1
   ) {
-    // Directive and surface derive from the same consequence: the surface is
-    // exactly the refused carrier, so the text must never send the model to a
-    // control that surface does not contain.
+    // The refused carrier remains available alongside proven read controls.
     return [
       'BOUNDED AUTO RECOVERY — the last call was refused before dispatch because its arguments did not match the exact schema; the refusal lists the exact failing paths and required shape.',
       `Call ${consequence.recoveryToolNames[0]} exactly once with one corrected JSON object for the same operation.`,
-      'Do not call tool_search, plan_task, or another operation.',
+      'The available discovery and read controls may resolve a missing detail or another unfinished requirement before the corrected call.',
     ].join(' ');
   }
   if (
@@ -675,8 +705,8 @@ export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState):
   }
   return [
     `BOUNDED AUTO RECOVERY — the host validated consequence stage ${consequence.stage}.`,
-    'Use the exact result already present and make one corrective call from the restricted tool surface.',
-    'Do not repeat discovery or claim that the user must continue an internal repair.',
+    'Use retained results and the available recovery tools to correct the call or resolve another unfinished requirement.',
+    'Repeating unchanged discovery does not earn retries. Do not ask the user to continue an internal repair.',
   ].join(' ');
 }
 
@@ -2373,28 +2403,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     });
     throw error;
   };
-  /**
-   * GUIDE, NOT GATE — one last-word turn before a resumable harness terminal.
-   *
-   * A harness-authored terminal means the model was never given a path to
-   * completion (live 2026-09-02: two pre-dispatch refusals, then a dead turn,
-   * then prose the model never wrote). Before the host ends a turn for a
-   * resumable, non-safety reason it hands the reply to the model ONCE, with
-   * what it observed and three exits. The next exhaustion is terminal. Safety
-   * floors (uncertain external effect, duplicate committed call, write
-   * verification) never get this turn: they are the verifiable hard gates.
-   */
-  let lastWordTurnUsed = false;
   let consecutiveFrameRefusals = 0;
-  /** The refusal check behind a RETIRED frame, captured before its
-   *  diagnostic-less receipts hide it — so the terminal can still say why. */
-  let lastRetiredFrameRefusalDetail: string | undefined;
-  const LAST_WORD_EXCLUDED_REASONS: ReadonlySet<string> = new Set([
-    'tool_effect_uncertain',
-    'model_reused_committed_call_id',
-    'write_committed_verification_pending',
-    'write_verification_retry_pending',
-  ]);
   const journalHostGuide = (kind: string, data: Record<string, unknown>): void => {
     if (!hostProduction) return;
     try {
@@ -2408,40 +2417,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
     } catch { /* telemetry never blocks the turn */ }
   };
-  const retainedWorkSummary = (): string => {
-    if (!hostProduction) return '';
-    try {
-      const identity = exactHostIdentity();
-      return renderFailureWithRetainedWork({
-        sessionId: identity.sessionId,
-        sourceUserSeq: identity.sourceUserSeq,
-        fallbackText: '',
-      }).trim().slice(0, 1200);
-    } catch {
-      return '';
-    }
-  };
-  const tryLastWordTurn = (reason: string, observed: readonly string[]): boolean => {
-    if (!hostProduction || lastWordTurnUsed || LAST_WORD_EXCLUDED_REASONS.has(reason)) return false;
-    lastWordTurnUsed = true;
-    const retained = retainedWorkSummary();
-    const directive = [
-      `HOST CHECKPOINT (${reason}) — the harness will not re-ask again after this. You own the reply now.`,
-      observed.length > 0 ? `Observed: ${observed.join(' | ').slice(0, 1500)}` : '',
-      retained,
-      'Do exactly ONE of: (1) answer the user in plain words with what you already have; (2) ask the user ONE specific question; (3) name the single exact tool call you are blocked on (tool + arguments) and stop.',
-      'Do not repeat a refused call unchanged, and do not describe internal errors — speak to the user.',
-    ].filter(Boolean).join(' ');
-    pendingHostModelDirective = [pendingHostModelDirective, directive].filter(Boolean).join(' ');
-    journalHostGuide('last_word_turn', { reason, observed: observed.slice(0, 8) });
-    hostTurnLogger.warn({ reason, observed: observed.slice(0, 4) }, 'host handed the reply to the model before a terminal');
-    return true;
-  };
 
   const blockedOutcome = (
     text = HOST_STOP_AND_EXPLAIN_BLOCKED_TEXT,
     reason = 'durable_stop_and_explain',
     resumable = true,
+    stoppedOn?: string,
   ): RunOutcome => {
     const renderedText = hostProduction
       ? (() => {
@@ -2460,9 +2441,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // kept refusing, so the last frame's refusal check (or the governor's
     // last consequence stage) rides along as bounded machine detail.
     const blockedDetail = reason === 'control_no_progress_exhausted'
-      ? lastHostRefusalDetail(history)
-        ?? lastRetiredFrameRefusalDetail
-        ?? (noProgressState?.lastConsequence?.stage
+      ? stoppedOn ?? (noProgressState?.lastConsequence?.stage
           ? boundedBlockedDetail(noProgressState.lastConsequence.stage)
           : undefined)
       : reason === 'continue_marker_exhausted' && lastContinueMarkerNote
@@ -2494,6 +2473,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     };
     return outcome;
   };
+
+  const stopNoProgress = (stoppedOn?: string): RunOutcome => blockedOutcome(
+    hostNoProgressBlockedText(noProgressState, stoppedOn),
+    'control_no_progress_exhausted',
+    true,
+    stoppedOn ?? noProgressState?.lastConsequence?.stage ?? 'no_new_evidence',
+  );
 
   /** The request this turn is judged against: the accepted source event's
    * text, else the last user message of the initial input. */
@@ -6357,7 +6343,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         })();
       }
     }
-    let modelInputDirective = pendingHostModelDirective;
+    const pendingDirectiveForStep = pendingHostModelDirective;
+    let modelInputDirective = pendingDirectiveForStep;
     let writingNoProgressRecoveryDirective = false;
     if (!consumingRecoveredFrame) {
       if (
@@ -6367,11 +6354,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const identity = exactHostIdentity();
       const taskKey = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
       if (noProgressState && noProgressState.taskKey !== taskKey) {
-        return blockedOutcome(
-          hostNoProgressBlockedText(noProgressState),
-          'control_no_progress_exhausted',
-          false,
-        );
+        return stopNoProgress('accepted_source_changed');
       }
       const authority = projectHostNoProgressAuthority(identity);
       if (authority.status === 'ok') {
@@ -6446,23 +6429,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               gained: (decision.gained ?? []).slice(0, 8),
             });
             if (decision.action === 'terminalize') {
-              // GUIDE, NOT GATE: the model gets one last-word turn with what
-              // the governor observed before the harness ends the turn with
-              // prose the model never wrote. The next exhaustion is terminal.
-              const lastRefusal = lastHostRefusalDetail(history);
-              if (tryLastWordTurn('control_no_progress_exhausted', [
-                `the no-progress governor exhausted its budget (${decision.state.lastConsequence?.stage ?? 'no consequence stage'})`,
-                ...(lastRefusal ? [`last refusal: ${lastRefusal}`] : []),
-              ])) {
-                noProgressRecoveryOnly = false;
-                noProgressRecoveryDirectiveWritten = false;
-              } else {
-                return blockedOutcome(
-                  hostNoProgressBlockedText(decision.state),
-                  'control_no_progress_exhausted',
-                  false,
-                );
-              }
+              // The retained ledger already supplies the factual stop. A
+              // final model call cannot add execution evidence to that stop.
+              return stopNoProgress(attempt.consequence?.stage ?? `${attempt.attemptClass}:no_new_evidence`);
             }
             if (decision.action === 'reconcile') {
               return blockedOutcome(HOST_TOOL_UNCERTAIN_BLOCKED_TEXT, 'tool_effect_uncertain');
@@ -6471,11 +6440,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               noProgressRecoveryOnly = true;
               noProgressRecoveryDirectiveWritten = false;
               if (!latestAcceptedModelBatchRef) {
-                return blockedOutcome(
-                  hostNoProgressBlockedText(decision.state),
-                  'control_no_progress_exhausted',
-                  false,
-                );
+                return stopNoProgress('accepted_model_checkpoint_unavailable');
               }
               return recoveryContinuationOutcome(
                 latestAcceptedModelBatchRef,
@@ -6496,11 +6461,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               // forced the model into an unrelated plan_task.  Discovery and
               // every typed repair/ask consequence remain recovery-only; the
               // governor still terminalizes the next no-gain attempt.
-              noProgressRecoveryOnly = !(
-                decision.reason === 'retry_available'
-                && attempt.attemptClass === 'dependency_lookup'
-                && attempt.consequence === undefined
-              );
+              noProgressRecoveryOnly = attempt.consequence !== undefined;
               if (!noProgressRecoveryOnly) {
                 noProgressRecoveryDirectiveWritten = false;
               }
@@ -6538,21 +6499,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
 
       if (noProgressRecoveryOnly) {
         const consequence = noProgressState?.lastConsequence;
-        const exactRecoveryToolNames = new Set(consequence?.recoveryToolNames ?? []);
-        const recoveryTools = tools.filter((tool) => consequence?.recovery === 'ask_user'
-          ? bareTerminalToolName(tool.name) === 'ask_user_question'
-          : consequence?.recovery === 'stop_factual'
-            ? false
-            : exactRecoveryToolNames.size > 0
-              ? exactRecoveryToolNames.has(tool.name)
-              : hostControlFrameFor(tool.name) === 'sole'
-                || bareTerminalToolName(tool.name) === 'ask_user_question');
-        permittedNoProgressRecoveryToolNames = new Set(recoveryTools.map((tool) => tool.name));
+        if (consequence?.recovery === 'stop_factual') return stopNoProgress();
+        const provenReads = provenCapabilityEntriesForTurn(identity)
+          .filter((entry) => entry.effectClass === 'read')
+          .map((entry) => entry.identifier);
+        permittedNoProgressRecoveryToolNames = hostNoProgressRecoveryToolNames(
+          consequence ?? null,
+          tools.map((tool) => tool.name),
+          provenReads,
+        );
+        const recoveryTools = tools.filter((tool) => permittedNoProgressRecoveryToolNames!.has(tool.name));
         modelStepSchemas = serializedTools(recoveryTools);
         if (!noProgressRecoveryDirectiveWritten) {
-          modelInputDirective = noProgressState
+          const recoveryDirective = noProgressState
             ? hostNoProgressRecoveryDirective(noProgressState)
             : HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
+          modelInputDirective = [modelInputDirective, recoveryDirective].filter(Boolean).join('\n');
           writingNoProgressRecoveryDirective = true;
         }
       }
@@ -6660,7 +6622,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (ranModelStep && writingNoProgressRecoveryDirective) {
       noProgressRecoveryDirectiveWritten = true;
     }
-    if (ranModelStep && pendingHostModelDirective === modelInputDirective) {
+    if (ranModelStep && pendingHostModelDirective === pendingDirectiveForStep) {
       pendingHostModelDirective = undefined;
     }
     // ADMIT BEFORE COMMIT.
@@ -6698,46 +6660,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // ask_user_question call. Prose cannot substitute a broader question
         // or publish before the call boundary validates options and purpose —
         // publishing it would manufacture an ungated ask the user then answers.
-        // GUIDE, NOT GATE: say what is missing once, rather than replacing an
-        // answer she wrote with harness prose she never wrote.
         history.push(...admission.frame.history);
         if (step.responseId !== undefined) lastResponseId = step.responseId;
-        if (tryLastWordTurn('control_no_progress_exhausted', [
-          'this turn can only end through the exact ask_user_question call —'
-          + ' prose cannot carry the question, its options, or its purpose',
-        ])) {
-          continue;
-        }
-        return blockedOutcome(
-          hostNoProgressBlockedText(noProgressState),
-          'control_no_progress_exhausted',
-          false,
-        );
-      }
-      if (noProgressRecovery === 'stop_factual') {
-        const decision = toOrchestratorDecision(admission.frame.text);
-        if (
-          decision?.nextAction === 'awaiting_user_input'
-          || decision?.nextAction === 'awaiting_approval'
-        ) {
-          // A known terminal may be explained once, but it cannot convert
-          // itself into new user work or resumable authority. Same rule as
-          // above: name the constraint once before the harness answers.
-          history.push(...admission.frame.history);
-          if (step.responseId !== undefined) lastResponseId = step.responseId;
-          if (tryLastWordTurn('control_no_progress_exhausted', [
-            'this task already has a known outcome, so a new question or'
-            + ' approval request cannot come out of it — say what you found in'
-            + ' plain words instead',
-          ])) {
-            continue;
-          }
-          return blockedOutcome(
-            hostNoProgressBlockedText(noProgressState),
-            'control_no_progress_exhausted',
-            false,
-          );
-        }
+        return stopNoProgress('required_question_not_issued');
       }
       if (hostProduction && !acceptedReadPlanContinuationUsed) {
         const identity = exactHostIdentity();
@@ -6812,14 +6737,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           lastContinueMarkerNote = note.slice(0, 400) || undefined;
           history.push(...admission.frame.history);
           if (step.responseId !== undefined) lastResponseId = step.responseId;
-          // GUIDE, NOT GATE: one last-word turn before the harness answers
-          // for the model. A further bare CONTINUE after it is terminal.
-          if (tryLastWordTurn('continue_marker_exhausted', [
-            `you wrote CONTINUE ${MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1} times without making the call`
-              + (note ? ` (${note.slice(0, 200)})` : ''),
-          ])) {
-            continue;
-          }
           return blockedOutcome(
             `I planned the next step ${MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1} times without making the call`
               + (note ? ` (${note.slice(0, 300)})` : '')
@@ -6910,41 +6827,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       if (resultCommitBlock) return resultCommitBlock;
       recordZeroCrossingRefusal(paired.frameDigest);
-      // NOT guided. Attempted TWICE on 2026-09-03 and reverted both times; the
-      // pin "repeated discovery gets one control-only recovery and no third
-      // discovery crossing" caught each attempt. Recording what actually
-      // blocks it so the next attempt starts further along:
-      //
-      //   1. Offering a last-word turn here means `continue`, and this site's
-      //      recovery surface admits sole-control frames — tool_search among
-      //      them — so the extra step permits a third discovery crossing.
-      //   2. Handing that step an EMPTY tool surface does not fix it either:
-      //      the `if (noProgressRecoveryOnly)` block below re-derives
-      //      modelStepSchemas after the per-step reset, and the step AFTER the
-      //      last word returns to the full catalog.
-      //
-      // A correct fix needs the recovery surface (or a tool-free one) to
-      // persist across the extra step AND the turn to end on that step's
-      // answer, not merely to withhold tools once. That is a control-flow
-      // change to the loop, not a guard at this site.
-      //
-      // The cost of leaving it: a cold multi-family task terminates here with
-      // harness prose, never having been told which tools this state permits
-      // (live 2026-09-03, the five-prospect run died here twice). The
-      // invariant still outranks the guidance.
-      return blockedOutcome(
-        hostNoProgressBlockedText(noProgressState),
-        'control_no_progress_exhausted',
-        false,
-      );
+      return stopNoProgress(nonCanonicalNoProgressAsk
+        ? 'required_question_not_issued'
+        : 'recovery_surface_mismatch');
     }
     const canonicalFrameDigest = semanticFrameDigest(canonicalCalls);
     if (retiredZeroCrossingFrames.has(canonicalFrameDigest)) {
       // A semantically repeated frame with fresh ids takes the ordinary
       // admitted/receipt path. Reused ids were already stopped above.
-      // The retired receipts carry no diagnostic, so capture the refusal check
-      // the model actually saw BEFORE they land in history (say why).
-      lastRetiredFrameRefusalDetail = lastHostRefusalDetail(history) ?? lastRetiredFrameRefusalDetail;
       const paired = pairLocallyRefusedFrame(canonicalCalls, true);
       const resultCommitBlock = commitAdmittedToolFrame({
         acceptedFrame,
@@ -6953,17 +6843,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         responseId: step.responseId,
       });
       if (resultCommitBlock) return resultCommitBlock;
-      // GUIDE, NOT GATE: after the model's last word, an exact repeat of a
-      // retired frame is the typed terminal WITH its detail — never harness
-      // prose passed off as a completed answer.
-      if (lastWordTurnUsed) {
-        return blockedOutcome(
-          hostNoProgressBlockedText(noProgressState),
-          'control_no_progress_exhausted',
-          false,
-        );
-      }
-      return await completedOutcome(capabilityUnavailableTextFor(canonicalCalls));
+      return stopNoProgress('repeated_refused_frame');
     }
     let frameDisposition: HostModelFrameDisposition;
     // What the host proved this turn — the ONLY authority a carrier's shape is
@@ -7017,6 +6897,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               toolSlug: completed.toolSlug,
               changes: completed.changes,
             }, 'host completed a provider carrier from the turn\'s proven disclosure');
+            journalHostGuide('carrier_repaired', {
+              callId: call.callId,
+              carrier: call.name,
+              operation: completed.toolSlug,
+              changes: ['carrier_arguments_completed'],
+            });
+            const repairLine = `Host repair for call ${call.callId}: ${completed.changes.join('; ').slice(0, 300)}. Use the corrected carrier shape on subsequent calls.`;
+            pendingHostModelDirective = [pendingHostModelDirective, repairLine].filter(Boolean).join('\n').slice(0, 2400);
           }
         }
         let argumentsValue = parsedArgs(argumentsJson);
@@ -7122,9 +7010,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         consecutiveFrameRefusals,
       });
       hostTurnLogger.warn({ detail, calls: canonicalCalls.map((call) => call.name) }, 'host could not materialize a call frame');
-      if (consecutiveFrameRefusals >= 2) {
-        tryLastWordTurn('frame_refused', [`the host could not materialize ${consecutiveFrameRefusals} consecutive call frames (${detail})`]);
-      }
       continue;
     }
     if (frameDisposition.kind === 'refused') {
@@ -7184,13 +7069,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         calls: canonicalCalls.map((call) => call.name),
         consecutiveFrameRefusals,
       }, 'host refused a call frame before dispatch');
-      if (consecutiveFrameRefusals >= 2) {
-        tryLastWordTurn('frame_refused', [
-          `the host refused ${consecutiveFrameRefusals} consecutive call frames before dispatch (${reason})`,
-          ...(offendingOperation ? [`the operation you named, "${offendingOperation}", is not proven this turn`] : []),
-          ...(provenReads.length > 0 ? [`proven reads this turn: ${provenReads.slice(0, 12).join(', ')}`] : []),
-        ]);
-      }
       continue;
     }
     /* Retain the legacy direct/effective policy assertion as a consistency

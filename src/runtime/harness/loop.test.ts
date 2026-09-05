@@ -9400,6 +9400,60 @@ test('runConversation: propagates SDK-level awaiting_approval status from runTur
   assert.equal((terminals[0].data.presentation as { approvalId?: string }).approvalId, pending[0].approvalId);
 });
 
+test('runConversation: host governor stop reaches the public terminal verbatim with its current next edge', async () => {
+  const { hostNoProgressBlockedText } = await import('./host-turn-runner.js');
+  const { createNoProgressConsequence, initializeNoProgressGovernor, observeNoProgress } = await import('./no-progress-governor.js');
+  const initial = initializeNoProgressGovernor({
+    taskKey: 'public-stop:current-stage',
+    authority: { operation: [], account: [], target: [], evidence: [], effect: [] },
+  });
+  const state = observeNoProgress(initial, {
+    taskKey: initial.taskKey,
+    attemptClass: 'plan_admission',
+    authority: initial.authority,
+    consequence: createNoProgressConsequence({
+      stage: 'schema_invalid:historical_missing_subject',
+      recovery: 'repair_model',
+      effectState: 'not_started',
+      recoveryToolNames: ['tool_search'],
+    }),
+  }).state;
+  const currentStage = 'recovery_lookup:no_new_evidence';
+  const typedStopText = hostNoProgressBlockedText(state, currentStage);
+  assert.match(typedStopText, /Stopped at: recovery_lookup:no_new_evidence\./);
+  assert.match(typedStopText, /Next: Use tool_search.*resume this saved task/);
+  assert.doesNotMatch(typedStopText, /historical_missing_subject/);
+
+  const sess = HarnessSession.create({ kind: 'chat', title: 'public governor stop' });
+  let hostRuns = 0;
+  const result = await runConversation({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'Prepare the report from my local notes.',
+    makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, items) => {
+      hostRuns += 1;
+      return {
+        history: items,
+        lastResponseId: undefined,
+        finalOutput: typedStopText,
+        terminal: { status: 'blocked', reason: 'control_no_progress_exhausted' },
+        blockedDetail: currentStage,
+      };
+    },
+  });
+  assert.equal(hostRuns, 1, 'publishing the typed stop costs no last-word model call');
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.error, typedStopText);
+  assert.equal(result.publicPresentation?.text, typedStopText);
+  assert.equal(result.publicPresentation?.resumable, true);
+  const terminals = listEventsForConv(sess.id, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 1, 'one durable public terminal owns the stop');
+  assert.equal(terminals[0].data.blockedReason, 'control_no_progress_exhausted');
+  assert.equal(terminals[0].data.blockedDetail, currentStage);
+  assert.equal((terminals[0].data.presentation as { text?: string }).text, typedStopText);
+});
+
 test('runConversation: bails out at maxSteps when the orchestrator keeps recursing', async () => {
   const sess = HarnessSession.create({ kind: 'chat' });
   const recurseForever = scriptedRunner([

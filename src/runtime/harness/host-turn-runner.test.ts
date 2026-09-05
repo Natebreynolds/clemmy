@@ -876,9 +876,7 @@ test('production host keeps the no-progress recovery directive out of the exact 
   const model = stubModel([
     [toolCall('checkpoint-before-recovery', recovery.name, {})],
     [toolCall('checkpoint-during-recovery', recovery.name, {})],
-    // GUIDE, NOT GATE (2026-09-02): when the governor exhausts, the host
-    // hands the reply to the model once instead of answering for it. A plain
-    // answer here is the model's own last word and completes the turn.
+    // Exhaustion publishes retained state directly, before this unused prose.
     [textMsg('I could not find a way to run that step; here is what I have so far.')],
   ]);
   const agent = { model, tools: [recovery] };
@@ -886,18 +884,19 @@ test('production host keeps the no-progress recovery directive out of the exact 
 
   const outcome = await runProductionHost(fixture, agent);
 
-  assert.notEqual(outcome.terminal?.status, 'blocked',
-    'the model was given the last word and took it — no harness-authored terminal');
-  assert.match(String(outcome.finalOutput), /here is what I have so far/,
-    'the reply is the model\'s own words');
+  assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
+  assert.notEqual(outcome.terminal?.resumable, false);
+  assert.match(String(outcome.finalOutput), /Stopped at:.*\nNext:/,
+    'the retained-state terminal names the current stage and a next edge');
   assert.doesNotMatch(String(outcome.finalOutput), /checkpoint|reconcil/i,
     'ordinary host bookkeeping is never rendered as a user-facing effect failure');
-  assert.equal(model.calls(), 3, 'the exact one-shot recovery, then the governor hands the model its last word');
+  assert.equal(model.calls(), 2, 'one repair attempt, then direct publication without a last-word call');
   assert.equal(bodies, 0, 'neither unowned fixture crosses its body boundary');
-  assert.ok(
+  assert.equal(
     eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
       .some((event) => event.data.kind === 'last_word_turn'),
-    'the last-word hand-off is journaled',
+    false,
+    'exhaustion adds no last-word model turn',
   );
   const rows = eventlog.openEventLog().prepare(`
     SELECT admission.batch_ordinal, admission.call_ids_json,
@@ -1032,7 +1031,7 @@ test('production host turns an exact plan account choice into one question with 
   }
 });
 
-test('consequence-free dependency lookup keeps result readers for one step while repeated authority acquisition stays control-only', async () => {
+test('consequence-free dependency lookup and bounded authority retries retain available result readers', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   const inertTool = (name: string) => ({
@@ -1164,7 +1163,7 @@ test('consequence-free dependency lookup keeps result readers for one step while
     const authorityAgent = { model: authorityModel, tools: authorityTools };
     bindHostCanarySurface(authorityFixture, authorityAgent, authorityTools);
 
-    const authorityOutcome = await runProductionHost(authorityFixture, authorityAgent);
+    const authorityOutcome = await runProductionHostSteps(authorityFixture, authorityAgent, 6);
 
     const authorityDelta = authorityOutcome.history.filter((item) => (
       (item as { callId?: unknown }).callId === 'authority-acquisition-1'
@@ -1174,16 +1173,13 @@ test('consequence-free dependency lookup keeps result readers for one step while
       sourceUserSeq: authorityFixture.source.seq,
       historyDelta: authorityDelta,
     }), { status: 'ok', attemptClass: 'authority_acquisition' });
-    assert.deepEqual(authorityOutcome.terminal, {
-      status: 'blocked',
-      reason: 'control_no_progress_exhausted',
-      resumable: false,
-    });
-    assert.equal(authorityModel.calls(), 2);
-    assert.deepEqual(authoritySurfaces[1], ['plan_task'],
-      'authority acquisition incorrectly inherited the ordinary result-reader surface');
-    assert.equal(authorityBodies, 1,
-      'the repeated authority acquisition crossed despite the control-only surface');
+    assert.equal(authorityOutcome.terminal?.status, 'blocked');
+    assert.equal(authorityOutcome.terminal?.reason, 'control_no_progress_exhausted');
+    assert.notEqual(authorityOutcome.terminal?.resumable, false);
+    assert.equal(authorityModel.calls(), 5, 'one binding gain plus the bounded no-progress retry sequence');
+    assert.deepEqual(authoritySurfaces[1], authoritySurfaces[0],
+      'a consequence-free retry retains the tools that can discover or consume evidence');
+    assert.equal(authorityBodies, 5, 'unchanged discovery stops when its finite budget is exhausted');
   } finally {
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
@@ -5606,6 +5602,7 @@ test('production host external reads require one exact frozen manifest/account/s
     shouldExecute: boolean;
     providerKind?: 'native_mcp' | 'composio';
     withPreparation?: boolean;
+    completeCarrier?: boolean;
   }) => {
     const fixture = acceptHostCanarySource(`production-external-${input.label}`);
     const providerKind = input.providerKind ?? 'native_mcp';
@@ -5748,13 +5745,33 @@ test('production host external reads require one exact frozen manifest/account/s
         throw new Error('the generic carrier body must not replace the exact production port');
       },
     });
-    const model = stubModel([
+    if (input.completeCarrier) {
+      capabilityResolution.recordAdmissionCapabilityResolution({
+        sessionId: fixture.session.id,
+        sourceUserSeq: fixture.source.seq,
+        acceptedInput: String(fixture.source.data.text),
+        entries: [{
+          intent: 'Read the accepted records', kind: 'composio', identifier: operationId,
+          status: 'proven', connection: 'active', effectClass: 'read',
+        }],
+      });
+    }
+    const scriptedModel = stubModel([
       [toolCall(`${input.label}-external-call`, 'call_tool', {
-        name: operationId,
+        name: input.completeCarrier ? 'composio_execute_tool' : operationId,
         args_json: JSON.stringify({ city: 'Seattle', practiceArea: 'personal injury' }),
       })],
+      ...(input.completeCarrier ? [[textMsg('CONTINUE: report the settled read now')]] : []),
       [textMsg(`${input.label} external read settled`)],
     ]);
+    const requests: string[] = [];
+    const model = {
+      ...scriptedModel,
+      async getResponse(request: unknown) {
+        requests.push(JSON.stringify(request));
+        return scriptedModel.getResponse();
+      },
+    };
     const agent = { model, tools: [carrier] };
     bindHostCanarySurface(fixture, agent, [carrier]);
     const outcome = await runProductionHost(fixture, agent);
@@ -5773,6 +5790,34 @@ test('production host external reads require one exact frozen manifest/account/s
     }));
     assert.equal(outerBodies, 0);
     assert.equal(portBodies, input.shouldExecute ? 1 : 0);
+    if (input.completeCarrier) {
+      const repair = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+        .filter((event) => event.data.kind === 'carrier_repaired');
+      assert.equal(repair.length, 1);
+      assert.equal(repair[0]?.data.callId, `${input.label}-external-call`);
+      assert.equal(repair[0]?.data.operation, operationId);
+      assert.deepEqual(repair[0]?.data.changes, ['carrier_arguments_completed']);
+      assert.ok(requests[1]?.includes(`Host repair for call ${input.label}-external-call:`),
+        'the next model request receives the bounded per-call correction');
+      assert.ok(requests[1]?.includes('Use the corrected carrier shape on subsequent calls.'));
+      assert.equal(requests[2]?.includes(`Host repair for call ${input.label}-external-call:`), false,
+        'the correction is consumed once and does not leak into later model steps');
+      const authority = noProgressProjection.projectHostNoProgressAuthority({
+        sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq,
+      });
+      assert.equal(authority.status, 'ok');
+      if (authority.status === 'ok') {
+        const repairToken = sha256(JSON.stringify({
+          version: 1,
+          kind: 'evidence',
+          owner: 'host_carrier_repair',
+          parts: ['call_tool', operationId, ['carrier_arguments_completed']],
+        }));
+        assert.ok(authority.authority.evidence.includes(repairToken),
+          'the deterministic repair becomes a durable progress token');
+      }
+      assert.equal(model.calls(), 3, 'the repair adds no turn beyond the scripted call, continuation and answer');
+    }
     if (input.withPreparation && input.shouldExecute) {
       assert.deepEqual(
         preparationOrder,
@@ -5828,6 +5873,16 @@ test('production host external reads require one exact frozen manifest/account/s
       registerPort: true,
       shouldExecute: true,
       providerKind: 'composio',
+      withPreparation: true,
+    }));
+    await t.test('a deterministic carrier repair dispatches once, records progress and teaches the next frame', () => runVariant({
+      label: 'completed-carrier',
+      accountMatches: true,
+      schemaMatches: true,
+      registerPort: true,
+      shouldExecute: true,
+      providerKind: 'composio',
+      completeCarrier: true,
       withPreparation: true,
     }));
     await t.test('foreign account', () => runVariant({
@@ -7632,11 +7687,10 @@ test('a retired frame is retryable after the user speaks again', async () => {
     [{ type: 'message', role: 'user', content: 'run the update' }] as never,
     { maxTurns: 6 },
   );
-  assert.equal(
-    first.finalOutput,
-    HOST_CAPABILITY_UNAVAILABLE_TEXT,
-    'the anti-thrash guard must still retire a frame refused twice inside one turn',
-  );
+  assert.equal(first.terminal?.reason, 'control_no_progress_exhausted');
+  assert.notEqual(first.terminal?.resumable, false);
+  assert.match(String(first.finalOutput), /Stopped at: repeated_refused_frame\.\nNext:/,
+    'the anti-thrash guard retires the frame and preserves a resumable next edge');
 
   // Turn 2: the user acts on the advice and says so. The same frame must be
   // attempted again rather than refused from history.
@@ -7927,7 +7981,7 @@ test('the last refusal check survives a text-only give-up frame after the refuse
   assert.equal(lastHostRefusalDetail([call, refused, readCall, clean, giveUp] as never), undefined, 'a later clean frame hides the older refusal');
 });
 
-test('a no-progress terminal carries the last host refusal check as bounded blockedDetail (say why)', async () => {
+test('a no-progress terminal carries the current typed stage as bounded blockedDetail', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
   const priorPorts = productionPorts.listProductionCapabilityPorts();
@@ -7946,29 +8000,23 @@ test('a no-progress terminal carries the last host refusal check as bounded bloc
       [sameCall('catalog-miss-1')],
       [sameCall('catalog-miss-2')],
       [sameCall('catalog-miss-3')],
-      // GUIDE, NOT GATE (2026-09-02): the governor hands the model one
-      // last-word turn before terminalizing. A model that repeats the same
-      // miss even then gets the typed terminal — with the detail.
       [sameCall('catalog-miss-4')],
       [textMsg('must not outrun the no-progress governor')],
     ]);
     const agent = { model, tools: [carrier] };
     bindHostCanarySurface(fixture, agent, [carrier]);
 
-    // One more step than before: the last-word turn is a real model step.
     const outcome = await runProductionHostSteps(fixture, agent, 10);
 
-    assert.deepEqual(outcome.terminal, {
-      status: 'blocked',
-      reason: 'control_no_progress_exhausted',
-      resumable: false,
-    }, JSON.stringify({ terminal: outcome.terminal, calls: model.calls(), finalOutput: String(outcome.finalOutput).slice(0, 200) }));
-    assert.ok(model.calls() >= 3 && model.calls() <= 4,
-      `the misses, one last word spent on another miss, then the typed terminal (calls=${model.calls()})`);
+    assert.equal(outcome.terminal?.status, 'blocked');
+    assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
+    assert.notEqual(outcome.terminal?.resumable, false);
+    assert.equal(model.calls(), 2, 'a repeated typed refusal publishes without another model call');
     assert.equal(
       hostBlockedTerminalDetail(outcome),
-      'catalog_entry_or_manifest_missing:candidates=0:proven=none',
+      'host_disposition:refused_pre_dispatch',
     );
+    assert.match(String(outcome.finalOutput), /Stopped at: host_disposition:refused_pre_dispatch\.\nNext:/);
     assert.ok((hostBlockedTerminalDetail(outcome) ?? '').length <= 160);
     assert.equal(outerBodies(), 0);
   } finally {
@@ -8218,9 +8266,7 @@ test('production host keeps the turn open for a CONTINUE marker and runs the pro
 test('production host bounds CONTINUE markers and then stops typed, resumable, with the note as detail — never the note as the answer', async () => {
   const { MAX_HOST_CONTINUE_MARKER_CONTINUATIONS } = await import('./host-turn-runner.js');
   const fixture = acceptHostCanarySource('continue-marker-budget');
-  // GUIDE, NOT GATE (2026-09-02): once the budget is spent the host hands the
-  // model one last-word turn. A model that writes CONTINUE even then gets the
-  // typed stop — so the fixture carries one extra marker.
+  // The first marker beyond the budget publishes retained state immediately.
   const frames = Array.from({ length: MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 2 }, (_, index) => (
     [textMsg(`CONTINUE: still going ${index}`)]
   ));
@@ -8228,7 +8274,7 @@ test('production host bounds CONTINUE markers and then stops typed, resumable, w
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const outcome = await runProductionHostSteps(fixture, agent, 10);
-  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 2, 'budget spent, one last word offered, then a typed stop');
+  assert.equal(model.calls(), MAX_HOST_CONTINUE_MARKER_CONTINUATIONS + 1, 'exhaustion publishes without a last-word model call');
   assert.equal(outcome.terminal?.status, 'blocked');
   assert.equal(outcome.terminal?.reason, 'continue_marker_exhausted');
   assert.notEqual(outcome.terminal?.resumable, false, 'resumable: "continue" re-enters');
@@ -8505,7 +8551,7 @@ test('a permanently unadmittable frame spends one shared budget and stops with a
 // the fix: in this state the prose IS an ask, and publishing it manufactures an
 // ungated question the user answers, restarting the loop (pinned by
 // host-no-progress-governor.integration.test.ts). She gets told once instead.
-test('ask_user recovery guides a prose answer instead of silently answering for it', async () => {
+test('ask_user recovery rejects noncanonical prose with a resumable typed stop and no extra model call', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   try {
@@ -8542,8 +8588,7 @@ test('ask_user recovery guides a prose answer instead of silently answering for 
             responseId: `offers-last-word-${modelCalls}`,
           };
         }
-        // Prose in a state that requires the canonical call — twice, so the
-        // budget of exactly one last-word turn is spent and then terminal.
+        // Prose cannot replace the canonical ask; the host publishes its stop.
         return {
           usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
           output: [textMsg('Tell me whatever account details you have and ask me to continue.')],
@@ -8558,20 +8603,20 @@ test('ask_user recovery guides a prose answer instead of silently answering for 
 
     const outcome = await runProductionHostSteps(fixture, agent, 6);
 
-    // She is TOLD what the state requires, exactly once, before any terminal.
+    // The causal repair names the canonical ask; no extra last-word turn runs.
     const lastWord = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
       .filter((event) => event.data.kind === 'last_word_turn');
-    assert.equal(lastWord.length, 1, 'exactly one last-word turn is offered');
-    assert.equal(lastWord[0]?.data.reason, 'control_no_progress_exhausted');
+    assert.equal(lastWord.length, 0, 'no extra last-word turn is offered');
+    assert.equal(model.calls(), 2);
     assert.ok(
-      directives.some((seen) => seen.includes('ask_user_question call')),
+      directives.some((seen) => seen.includes('Use ask_user_question once')),
       'the directive must name the exact call the state requires',
     );
 
     // The invariant still holds: ask-shaped prose is never published, and no
     // user-input authority is minted from it.
     assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');
-    assert.equal(outcome.terminal?.resumable, false);
+    assert.notEqual(outcome.terminal?.resumable, false);
     assert.equal(
       eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length,
       0,
