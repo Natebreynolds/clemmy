@@ -1435,6 +1435,20 @@ function recordDiscoveredComposioCapabilities(
     })
     // A search hint without an executable schema is not continuity evidence.
     .filter((capability) => Boolean(capability.schemaFingerprint));
+  // SAY WHEN A DISCLOSURE DID NOT BECOME PROOF. Live 2026-09-05: a cold turn
+  // searched for the operation it needed, the search returned exactly that one
+  // result, nothing was recorded as discovered, and the write then refused with
+  // "candidates=0" while the refusal listed twenty operations from unrelated
+  // toolkits. From the outside the two states are identical — a search that
+  // found nothing and a search whose only hit carried no executable schema.
+  const droppedSlugs = matches
+    .filter((match) => match.slug && match.slug !== '__toolkit_error__')
+    .slice(0, 10)
+    .map((match) => match.slug)
+    .filter((slug) => !capabilities.some((capability) => capability.identifier === slug));
+  if (droppedSlugs.length > 0) {
+    console.error(`[capability-discovery] ${droppedSlugs.length} disclosed operation(s) had no live executable schema and were not recorded as discovered: ${droppedSlugs.join(', ')}`);
+  }
   if (capabilities.length === 0) return;
   try {
     appendEvent({
