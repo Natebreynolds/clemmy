@@ -602,7 +602,8 @@ export function hostProvenOperationRepair(input: {
   limit?: number;
 }): string {
   const toolkitOf = (operationId: string): string => operationId.split('_')[0] ?? '';
-  const requestedToolkit = toolkitOf(input.requestedOperation.trim().toUpperCase());
+  const requested = input.requestedOperation.trim().toUpperCase();
+  const requestedToolkit = toolkitOf(requested);
   const proven = input.provenOperations.filter((operationId) => operationId.trim().length > 0);
   const sameToolkit = requestedToolkit
     ? proven.filter((operationId) => toolkitOf(operationId) === requestedToolkit)
@@ -611,13 +612,29 @@ export function hostProvenOperationRepair(input: {
     !requestedToolkit || toolkitOf(operationId) !== requestedToolkit
   ));
   const ranked = [...sameToolkit, ...otherToolkits].slice(0, Math.max(1, input.limit ?? 12));
+  // THE OPERATION THE CALL NAMED IS THE SUBJECT. Live 2026-09-05: the model
+  // asked for a write this turn had not proven, one unrelated READ from the
+  // same toolkit happened to be in the proven set, and the reply was a menu
+  // headed "use one of those exactly" — a list of reads offered in place of a
+  // write, with no mention of the door a write actually takes. It re-searched
+  // eighteen times. When the named operation is absent from the proven set,
+  // say that first and name the door; the proven list is context, not the
+  // answer.
+  const requestedIsProven = requested.length > 0
+    && proven.some((operationId) => operationId.trim().toUpperCase() === requested);
+  if (requested.length > 0 && !requestedIsProven) {
+    const context = ranked.length === 0
+      ? ' Nothing is proven for this step yet.'
+      : sameToolkit.length > 0
+        ? ` Proven for this step so far: ${ranked.join(', ')} — reads you can call directly.`
+        : ` Nothing from ${requestedToolkit} is proven for this step; do not substitute another provider for it.`
+          + ` What IS proven here: ${ranked.join(', ')}.`;
+    return ` ${requested} is not proven for this step.${context}`
+      + ' A read becomes callable the moment tool_search discloses it; a WRITE or SEND does not —'
+      + ' name the exact operation in plan_task first, then reissue it through work_call under that plan.';
+  }
   if (ranked.length === 0) {
     return ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that order.';
-  }
-  if (requestedToolkit && sameToolkit.length === 0) {
-    return ` Nothing from ${requestedToolkit} is proven for this step, so no ${requestedToolkit} operation can be dispatched yet — do not substitute another provider for it.`
-      + ` What IS proven here: ${ranked.join(', ')}.`
-      + ` If this step needs ${requestedToolkit}, call tool_search for the exact ${requestedToolkit} operation and reissue with the slug it returns.`;
   }
   return ` The operations proven for this step are: ${ranked.join(', ')}. Use one of those exactly, with tool_slug spelled exactly as listed.`;
 }

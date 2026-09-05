@@ -97,36 +97,47 @@ const composioSchemas = await import('../../tools/composio-schema-cache.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 
-test('a pre-dispatch repair names the provider the call asked for, never a substitute', async () => {
-  // Live 2026-09-05, cold "create one Outlook draft": the model disclosed an
-  // Outlook operation, composed the exact draft, and this refusal answered with
-  // twenty proven operations from Greenhouse, OpenAI, Airtable, Slack and
-  // Firecrawl — none of them Outlook. It searched six more times and the turn
-  // died at the no-progress floor.
+test('a pre-dispatch repair names the door the call actually needs', async () => {
+  // Live 2026-09-05, from the phone: the model asked for OUTLOOK_CREATE_DRAFT,
+  // which this turn had not proven. One unrelated Outlook READ was in the
+  // proven set, so the reply was a menu headed "use one of those exactly" —
+  // reads offered in place of a write, with no mention of plan_task, the only
+  // door a write takes. It re-searched eighteen times and the turn died.
   const { hostProvenOperationRepair } = await import('./host-turn-runner.js');
   const foreign = [
     'GREENHOUSE_CREATE_USER_EMAIL', 'OPENAI_CREATE_MESSAGE', 'AIRTABLE_CREATE_RECORD',
     'SLACK_GET_WORKSPACE_CONNECTIONS_FOR_CHANNEL', 'FIRECRAWL_SEARCH',
   ];
+
+  // The live shape: a same-toolkit READ present, the requested WRITE absent.
+  const withStaleRead = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_CREATE_DRAFT',
+    provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
+  });
+  assert.match(withStaleRead, /OUTLOOK_CREATE_DRAFT is not proven for this step/);
+  assert.match(withStaleRead, /plan_task/, 'the write door is named');
+  assert.ok(!/Use one of those exactly/.test(withStaleRead),
+    'a menu of reads is never offered as the answer to a write');
+
+  // No same-toolkit proof at all: still names the door, still refuses to
+  // substitute another provider.
   const wrongProvider = hostProvenOperationRepair({
     requestedOperation: 'OUTLOOK_CREATE_MAIL_FOLDER_MESSAGE',
     provenOperations: foreign,
   });
-  assert.match(wrongProvider, /Nothing from OUTLOOK is proven for this step/);
+  assert.match(wrongProvider, /Nothing from OUTLOOK is proven/);
   assert.match(wrongProvider, /do not substitute another provider/);
-  assert.match(wrongProvider, /call tool_search for the exact OUTLOOK operation/);
-  assert.ok(!/^ The operations proven for this step are/.test(wrongProvider),
-    'a menu from the wrong providers must not be presented as the answer');
+  assert.match(wrongProvider, /plan_task/);
 
-  const sameProvider = hostProvenOperationRepair({
-    requestedOperation: 'OUTLOOK_CREATE_MAIL_FOLDER_MESSAGE',
-    provenOperations: [...foreign, 'OUTLOOK_CREATE_DRAFT'],
+  // A spelling slip on an operation that IS proven keeps the exact-list reply.
+  const spellingSlip = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_GET_DRAFTS_MAIL_FOLDER',
+    provenOperations: ['OUTLOOK_GET_DRAFTS_MAIL_FOLDER', ...foreign],
   });
-  assert.match(sameProvider, /The operations proven for this step are: OUTLOOK_CREATE_DRAFT/,
-    'the toolkit the call named leads the list');
+  assert.match(spellingSlip, /The operations proven for this step are: OUTLOOK_GET_DRAFTS_MAIL_FOLDER/);
 
   assert.match(
-    hostProvenOperationRepair({ requestedOperation: 'OUTLOOK_CREATE_DRAFT', provenOperations: [] }),
+    hostProvenOperationRepair({ requestedOperation: '', provenOperations: [] }),
     /No operation is bound to this turn yet/,
   );
 });
