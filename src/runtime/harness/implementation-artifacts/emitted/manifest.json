@@ -279,7 +279,7 @@
           "bytes": 16251
         },
         "src/tools/shared.ts": {
-          "bytes": 31573
+          "bytes": 31996
         },
         "src/execution/workflow-run-record.ts": {
           "bytes": 24314
@@ -336,7 +336,7 @@
           "bytes": 20061
         },
         "src/runtime/schema-normalizer.ts": {
-          "bytes": 18961
+          "bytes": 23014
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -735,7 +735,7 @@
           "bytes": 16140
         },
         "src/runtime/harness/watcher-judge.ts": {
-          "bytes": 10157
+          "bytes": 14373
         },
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
@@ -768,7 +768,7 @@
           "bytes": 4082
         },
         "src/runtime/read-path/capability-candidates.ts": {
-          "bytes": 50876
+          "bytes": 50864
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -924,7 +924,7 @@
           "bytes": 8538
         },
         "src/memory/skill-store.ts": {
-          "bytes": 57846
+          "bytes": 57839
         },
         "src/tools/catalog.ts": {
           "bytes": 843
@@ -1113,7 +1113,7 @@
           "bytes": 22244
         },
         "src/tools/memory-tools.ts": {
-          "bytes": 59757
+          "bytes": 59579
         },
         "src/tools/focus-tools.ts": {
           "bytes": 14081
@@ -1254,10 +1254,10 @@
           "bytes": 2563
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 72081
+          "bytes": 71758
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 79940
+          "bytes": 81174
         },
         "src/tools/plan-tools.ts": {
           "bytes": 89646
@@ -1302,7 +1302,7 @@
           "bytes": 19727
         },
         "src/agents/harness-context.ts": {
-          "bytes": 26105
+          "bytes": 26022
         },
         "src/agents/external-mcp-scope-lock.ts": {
           "bytes": 17601
@@ -1416,13 +1416,13 @@
           "bytes": 20745
         },
         "src/agents/worker-job-packet.ts": {
-          "bytes": 18466
+          "bytes": 19857
         },
         "src/agents/worker-output.ts": {
           "bytes": 3752
         },
         "src/runtime/harness/worker-host-runner.ts": {
-          "bytes": 5499
+          "bytes": 7216
         },
         "src/agents/sub-agents.ts": {
           "bytes": 25163
@@ -1488,7 +1488,7 @@
           "bytes": 13128
         },
         "src/agents/worker-batch-execution.ts": {
-          "bytes": 19290
+          "bytes": 19627
         },
         "src/agents/worker-model-fallover.ts": {
           "bytes": 3356
@@ -1515,7 +1515,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 198647
+          "bytes": 203719
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -1578,7 +1578,7 @@
           "bytes": 17528
         },
         "src/runtime/harness/atomic-content-commit-proof.ts": {
-          "bytes": 18190
+          "bytes": 20919
         },
         "src/runtime/harness/typed-physical-authority-proof.ts": {
           "bytes": 9962
@@ -1923,7 +1923,7 @@
           "bytes": 21056
         },
         "src/execution/background-promote.ts": {
-          "bytes": 36381
+          "bytes": 37170
         },
         "src/execution/approved-plan-tasks.ts": {
           "bytes": 10484
@@ -1959,7 +1959,7 @@
           "bytes": 5351
         },
         "src/tools/file-query-tools.ts": {
-          "bytes": 6115
+          "bytes": 5713
         },
         "src/tools/time-slots-tools.ts": {
           "bytes": 7234
@@ -2094,7 +2094,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 22688
+          "bytes": 22169
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -2154,7 +2154,7 @@
           "bytes": 5206
         },
         "src/tools/autonomy-action-tools.ts": {
-          "bytes": 28087
+          "bytes": 27947
         },
         "src/tools/browser-harness-tools.ts": {
           "bytes": 9090
@@ -2172,7 +2172,7 @@
           "bytes": 40812
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 49255
+          "bytes": 52416
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 21416
@@ -2184,7 +2184,7 @@
           "bytes": 26670
         },
         "src/tools/call-tool.ts": {
-          "bytes": 63166
+          "bytes": 65092
         },
         "src/tools/work-call-mode.ts": {
           "bytes": 6038
@@ -2211,10 +2211,10 @@
           "bytes": 4626
         },
         "src/runtime/harness/compaction.ts": {
-          "bytes": 58181
+          "bytes": 58578
         },
         "src/runtime/harness/model-request-provenance.ts": {
-          "bytes": 62848
+          "bytes": 70118
         },
         "src/runtime/harness/no-progress-governor.ts": {
           "bytes": 29959
@@ -2232,7 +2232,7 @@
           "bytes": 7456
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 350213
+          "bytes": 365608
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2313,7 +2313,7 @@
           "bytes": 8409
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 296559
+          "bytes": 297005
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -2326,6 +2326,9 @@
         },
         "src/tools/composio-read-settlement.ts": {
           "bytes": 5994
+        },
+        "src/integrations/composio/staged-file-transfer-plan.ts": {
+          "bytes": 36366
         },
         "src/runtime/harness/terminal-physical-dispatch-owner.ts": {
           "bytes": 2752
@@ -2355,7 +2358,7 @@
           "bytes": 6337
         },
         "src/tools/composio-tools.ts": {
-          "bytes": 261257
+          "bytes": 264366
         },
         "src/runtime/harness/composio-attested-transport.ts": {
           "bytes": 5970
@@ -2376,7 +2379,7 @@
           "bytes": 48911
         },
         "src/runtime/harness/debate-model.ts": {
-          "bytes": 101928
+          "bytes": 104038
         },
         "src/runtime/harness/grounding-gate.ts": {
           "bytes": 41010
@@ -2391,7 +2394,7 @@
           "bytes": 133472
         },
         "src/runtime/harness/attempt-settlement.ts": {
-          "bytes": 56862
+          "bytes": 57864
         },
         "src/runtime/harness/callable-surface.ts": {
           "bytes": 6949
@@ -2409,7 +2412,7 @@
           "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 241182
+          "bytes": 242227
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -2419,9 +2422,6 @@
         },
         "src/runtime/harness/resolution-ledger.ts": {
           "bytes": 59583
-        },
-        "src/integrations/composio/staged-file-transfer-plan.ts": {
-          "bytes": 36366
         },
         "src/integrations/composio/staged-file-blob-store.ts": {
           "bytes": 33373
@@ -2472,7 +2472,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 152704
+          "bytes": 153495
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -2493,7 +2493,7 @@
           "bytes": 86806
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 322956
+          "bytes": 323202
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 43211
@@ -2799,7 +2799,7 @@
           "bytes": 16251
         },
         "src/tools/shared.ts": {
-          "bytes": 31573
+          "bytes": 31996
         },
         "src/execution/workflow-run-record.ts": {
           "bytes": 24314
@@ -2856,7 +2856,7 @@
           "bytes": 20061
         },
         "src/runtime/schema-normalizer.ts": {
-          "bytes": 18961
+          "bytes": 23014
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17262
@@ -3255,7 +3255,7 @@
           "bytes": 16140
         },
         "src/runtime/harness/watcher-judge.ts": {
-          "bytes": 10157
+          "bytes": 14373
         },
         "src/runtime/harness/host-durable-continuation.ts": {
           "bytes": 774
@@ -3288,7 +3288,7 @@
           "bytes": 4082
         },
         "src/runtime/read-path/capability-candidates.ts": {
-          "bytes": 50876
+          "bytes": 50864
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -3444,7 +3444,7 @@
           "bytes": 8538
         },
         "src/memory/skill-store.ts": {
-          "bytes": 57846
+          "bytes": 57839
         },
         "src/tools/catalog.ts": {
           "bytes": 843
@@ -3633,7 +3633,7 @@
           "bytes": 22244
         },
         "src/tools/memory-tools.ts": {
-          "bytes": 59757
+          "bytes": 59579
         },
         "src/tools/focus-tools.ts": {
           "bytes": 14081
@@ -3774,10 +3774,10 @@
           "bytes": 2563
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 72081
+          "bytes": 71758
         },
         "src/tools/tool-search-provider-sources.ts": {
-          "bytes": 79940
+          "bytes": 81174
         },
         "src/tools/plan-tools.ts": {
           "bytes": 89646
@@ -3822,7 +3822,7 @@
           "bytes": 19727
         },
         "src/agents/harness-context.ts": {
-          "bytes": 26105
+          "bytes": 26022
         },
         "src/agents/external-mcp-scope-lock.ts": {
           "bytes": 17601
@@ -3936,13 +3936,13 @@
           "bytes": 20745
         },
         "src/agents/worker-job-packet.ts": {
-          "bytes": 18466
+          "bytes": 19857
         },
         "src/agents/worker-output.ts": {
           "bytes": 3752
         },
         "src/runtime/harness/worker-host-runner.ts": {
-          "bytes": 5499
+          "bytes": 7216
         },
         "src/agents/sub-agents.ts": {
           "bytes": 25163
@@ -4008,7 +4008,7 @@
           "bytes": 13128
         },
         "src/agents/worker-batch-execution.ts": {
-          "bytes": 19290
+          "bytes": 19627
         },
         "src/agents/worker-model-fallover.ts": {
           "bytes": 3356
@@ -4035,7 +4035,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 198647
+          "bytes": 203719
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -4098,7 +4098,7 @@
           "bytes": 17528
         },
         "src/runtime/harness/atomic-content-commit-proof.ts": {
-          "bytes": 18190
+          "bytes": 20919
         },
         "src/runtime/harness/typed-physical-authority-proof.ts": {
           "bytes": 9962
@@ -4443,7 +4443,7 @@
           "bytes": 21056
         },
         "src/execution/background-promote.ts": {
-          "bytes": 36381
+          "bytes": 37170
         },
         "src/execution/approved-plan-tasks.ts": {
           "bytes": 10484
@@ -4479,7 +4479,7 @@
           "bytes": 5351
         },
         "src/tools/file-query-tools.ts": {
-          "bytes": 6115
+          "bytes": 5713
         },
         "src/tools/time-slots-tools.ts": {
           "bytes": 7234
@@ -4614,7 +4614,7 @@
           "bytes": 7054
         },
         "src/tools/recall-tools.ts": {
-          "bytes": 22688
+          "bytes": 22169
         },
         "src/tools/artifact-claim-tools.ts": {
           "bytes": 3735
@@ -4674,7 +4674,7 @@
           "bytes": 5206
         },
         "src/tools/autonomy-action-tools.ts": {
-          "bytes": 28087
+          "bytes": 27947
         },
         "src/tools/browser-harness-tools.ts": {
           "bytes": 9090
@@ -4692,7 +4692,7 @@
           "bytes": 40812
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 49255
+          "bytes": 52416
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 21416
@@ -4704,7 +4704,7 @@
           "bytes": 26670
         },
         "src/tools/call-tool.ts": {
-          "bytes": 63166
+          "bytes": 65092
         },
         "src/tools/work-call-mode.ts": {
           "bytes": 6038
@@ -4731,10 +4731,10 @@
           "bytes": 4626
         },
         "src/runtime/harness/compaction.ts": {
-          "bytes": 58181
+          "bytes": 58578
         },
         "src/runtime/harness/model-request-provenance.ts": {
-          "bytes": 62848
+          "bytes": 70118
         },
         "src/runtime/harness/no-progress-governor.ts": {
           "bytes": 29959
@@ -4752,7 +4752,7 @@
           "bytes": 7456
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 350213
+          "bytes": 365608
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4833,7 +4833,7 @@
           "bytes": 8409
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 296559
+          "bytes": 297005
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -4846,6 +4846,9 @@
         },
         "src/tools/composio-read-settlement.ts": {
           "bytes": 5994
+        },
+        "src/integrations/composio/staged-file-transfer-plan.ts": {
+          "bytes": 36366
         },
         "src/runtime/harness/terminal-physical-dispatch-owner.ts": {
           "bytes": 2752
@@ -4875,7 +4878,7 @@
           "bytes": 6337
         },
         "src/tools/composio-tools.ts": {
-          "bytes": 261257
+          "bytes": 264366
         },
         "src/runtime/harness/composio-attested-transport.ts": {
           "bytes": 5970
@@ -4896,7 +4899,7 @@
           "bytes": 48911
         },
         "src/runtime/harness/debate-model.ts": {
-          "bytes": 101928
+          "bytes": 104038
         },
         "src/runtime/harness/grounding-gate.ts": {
           "bytes": 41010
@@ -4911,7 +4914,7 @@
           "bytes": 133472
         },
         "src/runtime/harness/attempt-settlement.ts": {
-          "bytes": 56862
+          "bytes": 57864
         },
         "src/runtime/harness/callable-surface.ts": {
           "bytes": 6949
@@ -4929,7 +4932,7 @@
           "bytes": 8922
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 241182
+          "bytes": 242227
         },
         "src/agents/tool-taxonomy.ts": {
           "bytes": 36678
@@ -4939,9 +4942,6 @@
         },
         "src/runtime/harness/resolution-ledger.ts": {
           "bytes": 59583
-        },
-        "src/integrations/composio/staged-file-transfer-plan.ts": {
-          "bytes": 36366
         },
         "src/integrations/composio/staged-file-blob-store.ts": {
           "bytes": 33373
@@ -4992,7 +4992,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 152704
+          "bytes": 153495
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -5013,7 +5013,7 @@
           "bytes": 86806
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 322956
+          "bytes": 323202
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 43211
@@ -5085,7 +5085,7 @@
           "bytes": 2569
         },
         "src/runtime/schema-normalizer.ts": {
-          "bytes": 18961
+          "bytes": 23014
         },
         "src/runtime/harness/mutation-verification-contract.ts": {
           "bytes": 33409
