@@ -440,6 +440,24 @@ startup record is recorded in the phase closure below.
 
 P3 has not started. No tag was created by P2. The report does not authorize one.
 
+Main DEV was restarted once after the final implementation and report were
+committed. The supported build/settings/active-work APIs returned exit 0 and:
+
+- PID `51650`, listener `127.0.0.1:8520`.
+- Boot `2026-09-05T05:00:04.510Z`, clean SHA
+  `c2623d016b6fbe4d18b82839cddbaccc224f0635`, `gitDirty:false`.
+- Source fingerprint
+  `f54fc9788e4885c915c5e8a522718d34479bb20df92719e37a0aeed2961fa451`,
+  version `3.16.0`, schema `77/77`, entry
+  `/Users/nathan.reynolds/clementine-next/src/index.ts`.
+- Brain/default worker Codex Terra; judge Claude Sonnet 5; both providers ready.
+- Both watcher flags on, chat interval 4 and workflow interval 2; routing off.
+- Zero active sessions, background tasks, or pending approvals at verification.
+
+The subsequent phase-closure commit records this boot and changes documentation
+only; the running production source is the final P2 implementation. Existing
+session-specific model pins are not overwritten by the new default configuration.
+
 The P2 code and local behavior checks are delivered. The original live run now
 has a resumable next edge; the final direct-auditor acceptance is green. The
 stronger worker test remains red, and the whole-canary ≤1-wasted-step bound was
