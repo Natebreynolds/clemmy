@@ -843,7 +843,7 @@ async function visibleToolNames(
   });
 }
 
-test('GATE surface: fresh discovery has no worker/business I/O; admitted plan swaps discovery controls for run_worker in the same agent', async () => {
+test('GATE surface: workers are plan-optional and listing the fresh surface performs no worker/business I/O', async () => {
   const text = 'Find the top 5 widgets based on ratings and add them to a new workbook for me.';
   const session = eventlog.createSession({ id: 'long-task-surface', kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -872,9 +872,13 @@ test('GATE surface: fresh discovery has no worker/business I/O; admitted plan sw
   assert.equal(before.includes('tool_search'), true);
   assert.equal(before.includes('plan_task'), false,
     'an empty planning catalog cannot expose plan_task before exact capability disclosure');
-  assert.equal(before.includes('run_worker'), false);
+  assert.equal(before.includes('run_worker'), true, 'scoped delegation is callable without compiling a plan');
   assert.equal(before.includes('write_file'), false);
   assert.equal(before.includes('composio_execute_tool'), false);
+  assert.equal(eventlog.listEvents(session.id, { types: ['worker_started', 'worker_result', 'external_write_succeeded'] }).length, 0,
+    'advertising delegation is not execution');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 0, 'surface discovery crosses no provider or worker tool edge');
   if (before.includes('work_call')) {
     assert.match(
       String(prePlanWorkCall?.description ?? ''),
@@ -899,6 +903,52 @@ test('GATE surface: fresh discovery has no worker/business I/O; admitted plan sw
     workerAvailable: true,
     businessCarrierAvailable: true,
   }, 'the one foreground loop must refresh its callable surface from durable plan state');
+});
+
+test('GATE surface: an advertised worker with a valid packet still requires exact accepted call authority', async (t) => {
+  const { RouterModelProvider } = await import('../runtime/harness/router-model.js');
+  const { WorkerToolCallSchema } = await import('../agents/worker-job-packet.js');
+  let childModelCalls = 0;
+  t.mock.method(RouterModelProvider.prototype, 'getModel', () => {
+    childModelCalls += 1;
+    throw new Error('an unowned call cannot reach a child model');
+  });
+  const session = eventlog.createSession({ id: 'long-task-worker-packet-refusal', kind: 'chat' });
+  const text = 'Review one item locally.';
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text } });
+  const agent = await buildOrchestratorAgent({ userInput: text,
+    sessionId: session.id, sourceUserSeq: source.seq, allowedToolNames: ['run_worker'],
+    hostFreshPlanning: { authority: { scope: 'primary_model_planning_catalog_v1' },
+      identity: { sessionId: session.id, sourceUserSeq: source.seq }, capabilities: [], digest: '0'.repeat(64) } as never });
+  assert.ok((await visibleToolNames(agent, { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 })).includes('run_worker'));
+  const packet = WorkerToolCallSchema.parse({ objective: text, item: 'one', resolvedTools: 'none needed',
+    externalMcpToolNames: null, context: 'The supplied item is local.',
+    instructions: 'Return one short review.', expectedOutput: 'One review.', intent: 'research' });
+  const worker = agent.tools.find((entry) => entry.name === 'run_worker') as {
+    invoke: (context: unknown, input: string, details: unknown) => Promise<unknown>;
+  };
+  const packetJson = JSON.stringify(packet);
+  // A caller cannot turn surface visibility into authority by borrowing the
+  // session and inventing an accepted source sequence. Use the real wrapper.
+  await assert.rejects(() => brackets.withHarnessRunContext({ sessionId: session.id,
+    sourceUserSeq: source.seq + 1, counter: new brackets.ToolCallsCounter(8) }, () => worker.invoke(
+      new RunContext({ sessionId: session.id, sourceUserSeq: source.seq + 1 }), packetJson,
+      { toolCall: { name: 'run_worker', callId: 'unowned-worker-packet', arguments: packetJson } },
+    )), (error: unknown) => {
+      assert.ok(error instanceof identities.LogicalCallPreDispatchAuthorityError);
+      assert.equal(error.status, 'missing');
+      assert.match(error.reason, /accepted task|source|authority/i);
+      t.diagnostic(error.message);
+      return true;
+    });
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 0);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM logical_tool_calls WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 0, 'no forged accepted source opens a logical call');
+  assert.equal(childModelCalls, 0);
+  assert.equal(eventlog.listEvents(session.id, { types: ['worker_started', 'worker_result', 'turn_graph_compiled', 'approval_requested'] }).length, 0);
 });
 
 test('GATE context: repeated identical small results become one model-visible value plus recall references', () => {

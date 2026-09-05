@@ -434,7 +434,10 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
                 },
                 {
                   id: WRITE_NODE, effect: 'external_write', coverage: null,
-                  dependsOn: [CREATE_NODE], dataFrom: [CREATE_NODE], cardinality: { kind: 'once' },
+                  // The created receipt supplies the destination, not the
+                  // literal header content already supplied by the user.
+                  // dependsOn retains exact verified-resource targeting.
+                  dependsOn: [CREATE_NODE], dataFrom: [], cardinality: { kind: 'once' },
                 },
               ],
               universes: [],

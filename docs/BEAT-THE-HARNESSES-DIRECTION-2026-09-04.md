@@ -1919,3 +1919,29 @@ journeys as classified in the P3 report (two need the journey updated to the
 new contract, one Home `transferred`→error mapping, one literal-content
 `dataFrom` over-refusal — a real fix), the 11 older journeys decision, the two
 machine-stable-red unit tests on the CI runner, and the live proof list.
+
+**2026-09-04 23:30 — VERIFIED `25831504` (interrupted recovery marker transfers to its exact
+successor): full Workspace family (acceptance + async-pages + host-e2e, 3 files) =
+**15 pass / 0 fail, EXIT 0**, zero refusals, zero runner crashes, isolated checkout.
+ACCEPTED.** The change is a conservative CAS extension in `eventlog.ts`: the
+`__run_in_flight_owner` marker moves only when the previous owner is an
+`interrupted` + finished attempt for the SAME `sourceUserSeq`, the taker is the
+`active` unfinished attempt for that source, and the marker carries exactly its
+three expected keys — supersession, a stale attempt, or an older source cannot take
+it; the terminal CAS is untouched; pinned by "same-source recovery transfers an
+interrupted physical marker … without stale takeover" and by the three-PID
+hard-crash journey. The owner's canonical local flow (Search → verified Batch →
+visible Workspace, with crash/cold-process survival) is green on current bytes.
+Tag list now: worker-child attestation (live red) · 4 new journeys (2 contract
+updates, Home `transferred` mapping, literal-content `dataFrom` over-refusal) · the
+11 older journeys decision · 2 machine-stable-red unit tests on the CI runner · the
+live proof list · then a full gate run on the final bytes.
+
+**2026-09-04 23:31 — VERIFIED `18ac00d4` (a `transferred` terminal is a successful durable
+handoff on every surface): `cross-surface-terminal-parity.acceptance` = **1/1, EXIT
+0** in an isolated checkout — the P1-introduced "release row 15" journey is green
+again. ACCEPTED (one-line bridge mapping + a pin that the public request closes
+`success`, replays byte-identical, one model loop, one terminal). New-journey
+scoreboard: 1 of 4 closed (Home parity); open: two-operation request
+`blocked≠done`/literal-content `dataFrom` over-refusal, and the two
+discovery-gate journeys that need the new-contract update.
