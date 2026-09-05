@@ -2416,3 +2416,40 @@ found the SAME split one step later (`atomic-content-commit-proof` compares the
 admission-time RAW binding digest against the now-EFFECTIVE projection digest →
 a refined create's content-commit evidence would be refused after the provider
 write succeeded); part 2 is in flight, both halves land together.
+
+**2026-09-05 02:12 — INTERIM FULL GATES on `cf7a3f23` (the five takeover fixes; isolated
+checkout; the deferral patch NOT included): light gates 4/4 ✅ · proof:selftest
+239/239 ✅ · test:measurement 97/97 ✅ · **journeys 169 / 172 — the only three reds are
+exactly the three proposed deferrals** (read plan cannot stop at prose; legacy
+input-digest staged identity; competitive byte ledger). Every other journey that was
+red today is green on these bytes: the 6 repair-path subtests + parent, the 4
+introduced by P1/early-P2, and the 8 remaining old ones (4 fixed by the outbound
+resume fix, 3 re-pinned, 1 fixed earlier today). With the owner's "defer" the gate
+reads 172/172 (169 pass + 3 skipped with written reasons). npm test, bench and the
+evals are still running on the same bytes.
+
+**2026-09-05 02:22 — INTERIM `npm test` on `cf7a3f23`: 14,519 pass / 2 fail / 1 skipped;
+bench:gates ✅.** The two are exactly the machine-stable-red pair that also fails on
+the pre-today baseline ("daemon rehash reprovisions the reviewed read when
+executable bytes drift" — `skipped:[salesforce]` where a reprovision was expected;
+"private key is written 0600" — mode 0644). Nothing today's fixes touched is red.
+Rather than leave them to the CI runner, a fixer + verifier are making them
+hermetic: if the 0600 case is production code relying on umask, that is a real
+security fix (keys must be written 0600 regardless of umask); if the reviewed-CLI
+case reads real machine state, it gets the stubbed seam its siblings use; a
+precondition skip with a named reason is the last resort; nothing is deleted or
+weakened.
+
+**2026-09-05 02:35 — SWEEP SITE 4 (+ its sibling) FIXED: `56243176`.** A refined documented
+create (host-only keys stripped by the gateway) no longer fails its own attestation
+at dispatch, and its content-commit proof no longer conflicts after the provider
+write: the projection reads the ledger's refined row and freezes on the effective
+digest; the atomic proof joins the admission-time binding (immutable by schema
+trigger — the verifier confirmed no second writer is possible) to the crossing
+through the ledger's single refinement. Edited/unrefined/stale/conflicted calls
+still conflict (8 negative shapes). Pins red-without/green-with by stash; 227/227
+across 13 suites; typecheck ✅; hygiene ✅. **The materialization/identity-split
+class is now closed at every site the sweep confirmed** (24 sites already correct,
+4 fixed today across `39d00400` `0c63a90b` `9ac532df` `56243176` + the 41aaabb1
+laundering seam). Remaining before the final gates: the hermetic fix for the two
+machine-dependent unit tests (in flight) and the owner's "defer".
