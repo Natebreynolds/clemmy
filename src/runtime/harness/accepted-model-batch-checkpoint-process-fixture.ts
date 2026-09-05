@@ -161,9 +161,9 @@ function acceptedSource() {
     eventlog.recordRunAttemptUserInput(attempt, {
       turn: 1,
       role: 'user',
-      data: {
-        text: PROMPT,
-      },
+      data: mode === 'start-after-write-missing-input'
+        ? { malformedFixtureInput: true }
+        : { text: PROMPT },
     }, { armRunInFlight: true });
   }
   const sources = eventlog.listEvents(SESSION_ID, { types: ['user_input_received'] });
@@ -179,7 +179,8 @@ function acceptedSource() {
     identity: { sessionId: SESSION_ID, sourceUserSeq: source.seq, turn: 1 },
     surface: 'discord',
     allowedToolNames: [READ_TOOL, WRITE_TOOL],
-  });
+  }) ?? eventlog.listEvents(SESSION_ID, { types: ['turn_graph_compiled'] })
+    .find((event) => event.data.sourceUserSeq === source.seq);
   assert.ok(graph, 'one durable graph must reopen for the accepted Discord source');
   let root = authority.acceptedTurnCallAuthorityFor(SESSION_ID, source.seq);
   if (root.status !== 'ok') {
@@ -557,7 +558,7 @@ if (mode === 'start-after-read') {
     ...checkpointIdentity(source, resumed.write),
     ...resumed.publication,
   });
-} else if (mode === 'start-after-write') {
+} else if (mode === 'start-after-write' || mode === 'start-after-write-missing-input') {
   const read = await executeReadBatch(source, runOwner);
   const write = await executeWriteBatch(source, runOwner, read);
   signal('READY', { crashPoint: 'after-write-checkpoint', ...checkpointIdentity(source, write) }, true);
@@ -578,6 +579,38 @@ if (mode === 'start-after-read') {
     resumePoint: 'after-write',
     ...checkpointIdentity(source, resumed.write),
     ...resumed.publication,
+  });
+} else if (mode === 'resume-after-write-no-dispatcher') {
+  const summary = restartRecovery.recoverInterruptedChatRuns(Date.now);
+  leases.revokeDispatchLease(runOwner.lease);
+  const recoveryStatePresent = Boolean(
+    (await import('./session.js')).HarnessSession.load(source.task.sessionId)?.loadRecoveryState(),
+  );
+  eventlog.closeEventLog();
+  signal('DONE', {
+    resumePoint: 'after-write-no-dispatcher',
+    autoResumed: summary.records[0]?.autoResumed ?? null,
+    autoResumeSkipped: summary.records[0]?.autoResumeSkipped ?? null,
+    recoveryStatePresent,
+  });
+} else if (mode === 'resume-after-write-missing-input') {
+  const ready = recover(source, 2);
+  let dispatches = 0;
+  const summary = restartRecovery.recoverInterruptedChatRuns(Date.now, async () => {
+    dispatches += 1;
+  });
+  leases.revokeDispatchLease(runOwner.lease);
+  const recoveryStatePresent = Boolean(
+    (await import('./session.js')).HarnessSession.load(source.task.sessionId)?.loadRecoveryState(),
+  );
+  eventlog.closeEventLog();
+  signal('DONE', {
+    resumePoint: 'after-write-missing-input',
+    batchOrdinal: ready.batchOrdinal,
+    autoResumed: summary.records[0]?.autoResumed ?? null,
+    autoResumeSkipped: summary.records[0]?.autoResumeSkipped ?? null,
+    dispatches,
+    recoveryStatePresent,
   });
 } else {
   throw new Error(`unsupported fixture mode: ${mode}`);

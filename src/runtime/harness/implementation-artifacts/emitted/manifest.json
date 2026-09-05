@@ -2238,7 +2238,7 @@
           "bytes": 49515
         },
         "src/runtime/harness/restart-recovery.ts": {
-          "bytes": 68717
+          "bytes": 73216
         },
         "src/runtime/harness/verify-delivered.ts": {
           "bytes": 16840
@@ -4749,7 +4749,7 @@
           "bytes": 49515
         },
         "src/runtime/harness/restart-recovery.ts": {
-          "bytes": 68717
+          "bytes": 73216
         },
         "src/runtime/harness/verify-delivered.ts": {
           "bytes": 16840
