@@ -479,12 +479,22 @@ function trustedCompactedLogicalResultMatches(input: {
     logicalModelResultProjectionReceiptMatchesItem(input.receipt, candidate)
   ))) return false;
 
-  const visibleAtTimestamp = input.visibleResults.filter((candidate) => (
-    describeCanonicalClippedToolResult(candidate.item as AgentInputItem)?.clippedAt
-      === clipped.clippedAt
+  return layer1ClipAccountedFor(input.sessionId, clipped.clippedAt, clippedAtMs, input.visibleResults);
+}
+
+/** The shared third leg of both stub proofs: a later host `condenser_applied`
+ * event accounts for every visible stub carrying this clip timestamp. */
+function layer1ClipAccountedFor(
+  sessionId: string,
+  clippedAt: string,
+  clippedAtMs: number,
+  visibleResults: readonly VisibleFunctionResult[],
+): boolean {
+  const visibleAtTimestamp = visibleResults.filter((candidate) => (
+    describeCanonicalClippedToolResult(candidate.item as AgentInputItem)?.clippedAt === clippedAt
   )).length;
   if (visibleAtTimestamp < 1) return false;
-  return listEvents(input.sessionId, { types: ['condenser_applied'] }).some((event) => {
+  return listEvents(sessionId, { types: ['condenser_applied'] }).some((event) => {
     const eventAtMs = Date.parse(event.createdAt);
     const layer1 = event.data.layer1;
     if (!layer1 || typeof layer1 !== 'object' || Array.isArray(layer1)) return false;
@@ -495,6 +505,57 @@ function trustedCompactedLogicalResultMatches(input: {
       && Number.isSafeInteger(row.clipped)
       && Number(row.clipped) >= visibleAtTimestamp;
   });
+}
+
+/** The host-receipt twin of `trustedCompactedLogicalResultMatches`: a Layer-1
+ * stub of a HOST-settled result (a pre-dispatch refusal, a host disposition) is
+ * a presentation of the immutable receipt, not a new result. Live 2026-09-05:
+ * the parked draft canary died pre-dispatch on every resume because compaction
+ * had clipped two refused `work_call` frames and only the logical branch knew
+ * how to reverse a clip. Same three durable owners: the receipt still matches
+ * the losslessly parked bytes once the clip is reversed; the tool-output row
+ * proves call/tool/character count and is the stub's recall target; a later
+ * `condenser_applied` event accounts for every visible stub at this timestamp. */
+export function trustedCompactedHostResultMatches(input: {
+  sessionId: string;
+  result: VisibleFunctionResult;
+  receipt: ReturnType<typeof hostModelResultReceiptFromRow>;
+  visibleResults: readonly VisibleFunctionResult[];
+}): boolean {
+  const clipped = describeCanonicalClippedToolResult(input.result.item as AgentInputItem);
+  if (!clipped || clipped.toolName === null) return false;
+  const clippedAtMs = Date.parse(clipped.clippedAt);
+  if (!Number.isFinite(clippedAtMs)) return false;
+
+  const retained = getToolOutput(input.sessionId, clipped.callId);
+  if (
+    !retained
+    || retained.truncatedAtWrite
+    || retained.tool !== clipped.toolName
+    || retained.output.length !== clipped.originalChars
+  ) return false;
+
+  const originalBase = { ...input.result.item } as Record<string, unknown>;
+  delete originalBase.__clipped;
+  delete originalBase.__clippedMeta;
+  const originalCandidates = [
+    { ...originalBase, output: { type: 'text', text: retained.output } },
+    { ...originalBase, output: retained.output },
+  ] as AgentInputItem[];
+  const reversed = originalCandidates.some((candidate) => {
+    let rebuilt: VisibleFunctionResult | undefined;
+    try {
+      rebuilt = visibleFunctionResults(candidate)[0];
+    } catch {
+      return false;
+    }
+    return rebuilt !== undefined
+      && rebuilt.outputBytes === input.receipt.outputBytes
+      && rebuilt.outputSha256 === input.receipt.outputSha256
+      && hostModelResultReceiptMatchesItem(input.receipt, candidate as never);
+  });
+  if (!reversed) return false;
+  return layer1ClipAccountedFor(input.sessionId, clipped.clippedAt, clippedAtMs, input.visibleResults);
 }
 
 function acceptedBatchAdmissionCountForResult(input: {
@@ -860,14 +921,20 @@ function buildManifest(input: {
       const receiptRow = receiptRows[0]!;
       const receipt = hostModelResultReceiptFromRow(receiptRow);
       const receiptSource = sourceRow(db, input.sessionId, receipt.sourceUserSeq);
+      const projectionMismatch = receipt.outputBytes !== result.outputBytes
+        || receipt.outputSha256 !== result.outputSha256
+        || !hostModelResultReceiptMatchesItem(receipt, result.item as never);
       if (
         receipt.sourceUserSeq > input.sourceUserSeq
         || receipt.sourceEventId !== receiptSource.id
         || receipt.callId !== result.callId
         || receipt.toolName !== result.toolName
-        || receipt.outputBytes !== result.outputBytes
-        || receipt.outputSha256 !== result.outputSha256
-        || !hostModelResultReceiptMatchesItem(receipt, result.item as never)
+        || (projectionMismatch && !trustedCompactedHostResultMatches({
+          sessionId: input.sessionId,
+          result,
+          receipt,
+          visibleResults,
+        }))
       ) throw new ModelRequestProvenanceError('host_result_projection_mismatch');
       hostResults.push({
         receiptId: receipt.receiptId,
@@ -1409,9 +1476,12 @@ function validateManifestSources(input: {
       || ref.outputBytes !== receipt.outputBytes
       || ref.outputSha256 !== receipt.outputSha256
       || result.toolName !== receipt.toolName
-      || result.outputBytes !== receipt.outputBytes
-      || result.outputSha256 !== receipt.outputSha256
-      || !hostModelResultReceiptMatchesItem(receipt, result.item as never)
+      || (
+        (result.outputBytes !== receipt.outputBytes
+          || result.outputSha256 !== receipt.outputSha256
+          || !hostModelResultReceiptMatchesItem(receipt, result.item as never))
+        && !trustedCompactedHostResultMatches({ sessionId: ref.sessionId, result, receipt, visibleResults: [...resultsByCallId.values()] })
+      )
     ) throw new ModelRequestProvenanceError('host_result_source_mismatch');
   }
 

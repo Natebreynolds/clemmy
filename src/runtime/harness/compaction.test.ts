@@ -135,6 +135,29 @@ test('clipOldToolResults — skips small outputs that wouldn\'t benefit', () => 
   assert.equal(clipped, 0, 'small outputs should be left alone');
 });
 
+test('clipOldToolResults — never clips a host disposition, however old or long', () => {
+  // A pre-dispatch refusal / host-settled verdict is a few hundred bytes the
+  // model must keep reading verbatim, and the frame provenance guards most
+  // tightly (live 2026-09-05: two clipped refusals killed every resume).
+  const disposition = JSON.stringify({
+    protocol: 'host_tool_disposition_v1', disposition: 'refused_pre_dispatch', frameDigest: 'f'.repeat(64),
+    frameIndex: 0, frameSize: 1, effect: 'none', retry: 'replan', requiresReconciliation: false,
+    message: 'This call was refused before execution. No effect occurred; correct the call or choose another capability.',
+    diagnostic: JSON.stringify({ error: 'work_cardinality_mismatch', detail: 'x'.repeat(600) }),
+  });
+  assert.ok(disposition.length >= 400, 'the fixture must be clip-eligible by size');
+  const items: AgentInputItem[] = [];
+  for (let i = 0; i < 8; i++) {
+    items.push(userMessage(`t${i}`));
+    items.push(toolCall(`call_${i}`, 'work_call'));
+    items.push(toolResult(`call_${i}`, i === 0 ? disposition : 'y'.repeat(900)));
+  }
+  const clipped = clipOldToolResults(items, 1);
+  const first = items[2] as unknown as Record<string, unknown>;
+  assert.equal(first.__clipped, undefined, 'the host disposition stays verbatim');
+  assert.ok(clipped >= 1, 'ordinary old results are still clipped');
+});
+
 test('clipOldToolResults — leaves structured projections exact for receipt verification', () => {
   const structured = {
     type: 'function_call_result',

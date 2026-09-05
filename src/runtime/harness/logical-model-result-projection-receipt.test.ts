@@ -710,3 +710,70 @@ test('v69 backfills exact ready structured projections without copying their pay
     raw.close();
   }
 });
+
+test('trusted local compaction of a HOST-settled result keeps provenance, tampering still refuses', () => {
+  // Live 2026-09-05: two refused work_call frames (host receipts, no logical
+  // settlement) had been clipped by layer-1 compaction and the host-receipt
+  // branch of provenance had no stub allowance — every resume of the parked
+  // task died pre-dispatch. The host branch now reverses a clip exactly like
+  // the logical branch. Compaction itself no longer clips a host disposition,
+  // so the stub here is produced from a same-length placeholder: the stub only
+  // carries tool, char count, call id and time — byte-identical to what a clip
+  // of the real disposition would have written on the older bytes.
+  const task = accept('host clip');
+  const callId = `host-clipped-${Date.now()}`;
+  const toolName = 'work_call';
+  const admission = admit({ task, callId, toolName });
+  const refusal = hostResults.buildHostToolDispositionResult({
+    callId, toolName, disposition: 'refused_pre_dispatch', frameDigest: 'a'.repeat(64), frameIndex: 0, frameSize: 1,
+    countsRefusal: true,
+    diagnostic: JSON.stringify({ error: 'work_cardinality_mismatch', detail: 'selected argument members do not match the accepted universe instance '.repeat(6) }),
+  });
+  hostResults.recordHostModelResultReceipts({ admission, resultItems: [refusal] });
+  assert.equal(hostResults.hostModelResultReceiptRowsForCall(eventlog.openEventLog(), task.sessionId, callId).length, 1,
+    'exactly one host receipt and no logical settlement for this call');
+  const refusalText = (refusal as unknown as { output: { text: string } }).output.text;
+  assert.ok(refusalText.length >= 400, 'the disposition must be clip-eligible by size on the older bytes');
+  eventlog.writeToolOutput({ sessionId: task.sessionId, callId, tool: toolName, output: refusalText });
+
+  const placeholder = textResult({ callId, toolName, text: 'x'.repeat(refusalText.length) });
+  const retainedSentinel = textResult({ callId: `retain-${callId}`, toolName, text: 'small recent result' });
+  const clippedAt = new Date().toISOString();
+  assert.equal(compaction.clipOldToolResults([placeholder, retainedSentinel], 1, { now: () => clippedAt }), 1);
+  const clipped = placeholder;
+  assert.ok(compaction.describeCanonicalClippedToolResult(clipped));
+  eventlog.appendEvent({
+    sessionId: task.sessionId, turn: 0, role: 'system', type: 'condenser_applied',
+    data: {
+      layer1: { applied: true, clipped: 1, collapsedToolPairs: 0 },
+      layer2: { applied: false, removedItems: 0, summaryItems: 0 },
+      layer3: { applied: false, forkRequested: false },
+    },
+  });
+
+  const request = modelRequest({ task, callId, toolName, result: clipped });
+  const recorded = provenance.recordModelRequestDispatchProvenance({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    request: request as never,
+    hostProjection: promptCache.canonicalPromptCacheRequest(request as never),
+  });
+  const projection = provenance.projectModelRequestProvenance(recorded.record.recordId);
+  assert.equal(projection.status, 'ok',
+    `a Layer-1 stub of a host-settled result is a presentation of the receipt, not a new result: ${JSON.stringify(projection)}`);
+
+  const forged = structuredClone(clipped) as AgentInputItem & { __clippedMeta: { bytes: number } };
+  forged.__clippedMeta.bytes += 1;
+  const forgedRequest = modelRequest({ task, callId, toolName, result: forged as AgentInputItem });
+  assert.throws(
+    () => provenance.recordModelRequestDispatchProvenance({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      request: forgedRequest as never,
+      hostProjection: promptCache.canonicalPromptCacheRequest(forgedRequest as never),
+    }),
+    (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+      && error.code === 'host_result_projection_mismatch',
+    'a stub whose recall target no longer matches the receipt is still refused',
+  );
+});

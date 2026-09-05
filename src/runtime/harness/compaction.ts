@@ -412,6 +412,11 @@ export function clipOldToolResults(
     // Skip if the original is already small (clipping doesn't help and
     // adds tokens).
     if (originalText.length < 400) continue;
+    // Never clip a host disposition (a pre-dispatch refusal or host-settled
+    // verdict): it is a few hundred bytes the model must keep reading verbatim,
+    // and it is the frame provenance guards most tightly. Live 2026-09-05: two
+    // clipped refusals made every resume of a parked task die pre-dispatch.
+    if (originalText.includes('"protocol":"host_tool_disposition_v1"')) continue;
 
     // Tool name lives in metadata-ish places; pull from a `name` field
     // if present, otherwise null.
