@@ -586,15 +586,16 @@ export function hostNoProgressRecoveryToolNames(
 
 /** The repair sentence for a pre-dispatch miss with no plan-bound operation.
  *
- * NAME THE PROVIDER THE MODEL ACTUALLY ASKED FOR. Live 2026-09-05, a cold
- * "create one Outlook draft": the model disclosed an Outlook operation through
- * tool_search, composed the exact draft, and the refusal answered with twenty
- * proven operations from Greenhouse, OpenAI, Airtable, Slack and Firecrawl —
- * not one of them Outlook. It searched six more times and the turn died at the
- * no-progress floor. A menu drawn from the wrong providers is worse than no
+ * NAME THE TOOLKIT THE MODEL ACTUALLY ASKED FOR. Live 2026-09-05, a cold
+ * single-draft request: the model disclosed an exact operation for the toolkit
+ * the user named, composed the exact payload, and this refusal answered with
+ * twenty proven operations belonging to five OTHER toolkits — none from the one
+ * it had asked for. It searched six more times and the turn died at the
+ * no-progress floor. A menu drawn from the wrong toolkits is worse than no
  * menu: it invites substituting a different service for the one the user named.
- * So rank the proven set by the toolkit the call names, and when that toolkit
- * has nothing proven, say exactly that instead of offering the others. */
+ * So rank the proven set by the toolkit prefix the call names, and when that
+ * toolkit has nothing proven, say exactly that instead of offering the others.
+ * No toolkit is named here; the prefix comes from the call at runtime. */
 export function hostProvenOperationRepair(input: {
   requestedOperation: string;
   provenOperations: readonly string[];
