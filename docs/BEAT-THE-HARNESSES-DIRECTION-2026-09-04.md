@@ -2453,3 +2453,18 @@ class is now closed at every site the sweep confirmed** (24 sites already correc
 4 fixed today across `39d00400` `0c63a90b` `9ac532df` `56243176` + the 41aaabb1
 laundering seam). Remaining before the final gates: the hermetic fix for the two
 machine-dependent unit tests (in flight) and the owner's "defer".
+
+**2026-09-05 02:37 — the last two unit reds closed: `42b09dd3`. One was a REAL security defect,
+not a flaky test:** `mobile-tls.ts` tightened the private key with
+`writeFileSync(path, bytes, {mode: 0o600})`, which Node applies only on CREATE —
+so the mobile TLS private key stayed at the umask default (0644 with macOS
+LibreSSL) on every host whose openssl does not write 0600 itself. Fixed by creating
+the key 0600 before openssl truncates into it + an explicit chmod after; verified
+under umask 022/000/077; the existing test is the pin. The reviewed-CLI reprovision
+test was hashing the REAL `sf` on this machine because `augmentPath` prepends
+`/usr/local/bin` ahead of a PATH that lacks it — the fixture now sits ahead of the
+augmented PATH (two sibling tests swept for the same latent collision; no
+production change). Flagged for later, not fixed: production has a documented
+tension on PATH precedence (`spawn-env` pins prepend-first; `guest-harness` pins
+user-PATH-first after the 07-30 stale-nvm incident). `npm test` should now be
+green on this machine and on the runner. FINAL GATE PASS on these bytes starts now.
