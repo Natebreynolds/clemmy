@@ -48,11 +48,13 @@ export function buildContinueInput(
       : 'You hit a step / time budget on the previous turn and the user has now replied `continue`.',
     'Pick up where you left off; do not restart the workflow from scratch.',
     lastSummary
-      ? `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
+      ? opts.missing?.length
+        ? `Your previous reply in this turn was: ${JSON.stringify(lastSummary)}.`
+        : `Your last summary on the prior turn was: "${lastSummary.slice(0, 400)}".`
       : 'Use the conversation history above to figure out where you were.',
     ...(opts.missing?.length ? [
       `Remaining accepted local items: ${JSON.stringify(opts.missing)}.`,
-      'Dispatch only these missing items, keeping their existing packet/manifest identity. Reuse successful item receipts; do not rerun successful siblings or replay prior writes. If a tool fails, use the retained error to repair the missing item. Do not claim completion until every required result exists.',
+      'Dispatch only these missing items, keeping their existing packet/manifest identity. Reuse successful item receipts; do not rerun successful siblings or replay prior writes. Obey the accepted retry and tool limits; this continuation grants no new permission. If a tool fails, use the retained error to repair the missing item. Do not claim completion until every required result exists.',
     ] : ['Continue with the next step of your plan. If you have nothing left to do, set done=true and nextAction=completed.']),
   ].join('\n\n');
 }

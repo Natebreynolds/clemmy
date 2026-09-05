@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   listEvents,
   openEventLog,
@@ -98,6 +98,75 @@ export class StaleDispatchLeaseError extends Error {
   }
 }
 
+/** A coordinator may parent a delegated worker's ordinary lease across
+ * session namespaces. Metadata alone is not permission: the exact accepted
+ * packet source, open parent call and host-recorded child linkage must agree. */
+function delegatedWorkerLeaseParentMatches(
+  sessionId: string,
+  runAttemptId: string | undefined,
+  parent: Pick<DispatchLeaseRef, 'sessionId' | 'scopeId' | 'leaseId'>,
+): boolean {
+  if (!runAttemptId) return false;
+  try {
+    const db = openEventLog();
+    const child = db.prepare(`
+      SELECT s.metadata_json, e.data_json, e.parent_event_id, e.seq
+        FROM sessions s JOIN run_attempts a ON a.session_id = s.id
+        JOIN events e ON e.session_id = s.id AND e.seq = a.source_user_seq
+       WHERE s.id = ? AND s.kind = 'agent' AND a.attempt_id = ?
+         AND a.finished_at IS NULL AND e.role = 'user' AND e.type = 'user_input_received'
+    `).get(sessionId, runAttemptId) as { metadata_json: string; data_json: string; parent_event_id: string; seq: number } | undefined;
+    if (!child) return false;
+    const metadata = JSON.parse(child.metadata_json);
+    const delegated = JSON.parse(child.data_json).delegatedWorker;
+    if (!delegated || delegated.composeOnly !== true || metadata.workerScope !== true
+      || metadata.source !== 'delegated_worker' || delegated.parentSessionId !== parent.sessionId
+      || !Number.isSafeInteger(delegated.parentSourceUserSeq) || delegated.parentSourceUserSeq <= 0
+      || delegated.parentAcceptedTaskId !== `task:${parent.sessionId}#${delegated.parentSourceUserSeq}`
+      || typeof delegated.parentLogicalCallId !== 'string' || !delegated.parentLogicalCallId
+      || typeof delegated.packetKey !== 'string' || !delegated.packetKey
+      || typeof delegated.item !== 'string' || !delegated.item
+      || !delegated.packet || delegated.packet.item !== delegated.item
+      || createHash('sha256').update(JSON.stringify(delegated.packet)).digest('hex') !== delegated.packetDigest) return false;
+    for (const key of ['parentSessionId', 'parentSourceUserSeq', 'parentAcceptedTaskId', 'parentLogicalCallId', 'packetKey', 'packetDigest', 'item']) {
+      if (metadata[key] !== delegated[key]) return false;
+    }
+    const parentSource = db.prepare(`SELECT id FROM events WHERE session_id = ? AND seq = ? AND role = 'user' AND type = 'user_input_received'`)
+      .get(parent.sessionId, delegated.parentSourceUserSeq) as { id: string } | undefined;
+    if (parentSource?.id !== child.parent_event_id) return false;
+    const call = db.prepare(`SELECT tool_name FROM logical_tool_calls
+      WHERE session_id = ? AND source_user_seq = ? AND accepted_task_id = ? AND logical_tool_call_id = ? AND state = 'open'`)
+      .get(parent.sessionId, delegated.parentSourceUserSeq, delegated.parentAcceptedTaskId, delegated.parentLogicalCallId) as { tool_name: string } | undefined;
+    if (call?.tool_name !== 'run_worker') return false;
+    // The provided generation must descend from THIS coordinator call, not
+    // from an unrelated live lease in the same parent session.
+    let ownerScope: string | null = parent.scopeId;
+    let ownerLease: string | null = parent.leaseId;
+    let ownsCall = false;
+    const seen = new Set<string>();
+    while (ownerScope && ownerLease) {
+      const key = `${ownerScope}\0${ownerLease}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      const row = db.prepare(`SELECT source_user_seq, accepted_task_id, logical_tool_call_id, parent_scope_id, parent_lease_id
+        FROM run_dispatch_leases WHERE scope_id = ? AND lease_id = ? AND session_id = ? AND revoked_at IS NULL`)
+        .get(ownerScope, ownerLease, parent.sessionId) as { source_user_seq: number | null; accepted_task_id: string | null;
+          logical_tool_call_id: string | null; parent_scope_id: string | null; parent_lease_id: string | null } | undefined;
+      if (!row) return false;
+      if (row.source_user_seq === delegated.parentSourceUserSeq && row.accepted_task_id === delegated.parentAcceptedTaskId
+        && row.logical_tool_call_id === delegated.parentLogicalCallId) { ownsCall = true; break; }
+      ownerScope = row.parent_scope_id;
+      ownerLease = row.parent_lease_id;
+    }
+    if (!ownsCall) return false;
+    return Boolean(db.prepare(`SELECT 1 FROM events WHERE session_id = ? AND type = 'worker_started' AND role = 'system'
+      AND json_extract(data_json, '$.childSessionId') = ? AND json_extract(data_json, '$.childSourceUserSeq') = ?
+      AND json_extract(data_json, '$.childAttemptId') = ? AND json_extract(data_json, '$.parentLogicalCallId') = ?
+      AND json_extract(data_json, '$.packetKey') = ? AND json_extract(data_json, '$.packetDigest') = ? AND json_extract(data_json, '$.item') = ?`)
+      .get(parent.sessionId, sessionId, child.seq, runAttemptId, delegated.parentLogicalCallId, delegated.packetKey, delegated.packetDigest, delegated.item));
+  } catch { return false; }
+}
+
 export function activateDispatchLease(input: {
   sessionId: string;
   scopeId: string;
@@ -178,7 +247,8 @@ export function activateDispatchLease(input: {
     ) throw new Error('Dispatch call-lease recovery arguments are not reconstructable.');
   }
   if (input.parentLease) {
-    if (input.parentLease.sessionId !== input.sessionId) {
+    if (input.parentLease.sessionId !== input.sessionId
+      && !delegatedWorkerLeaseParentMatches(input.sessionId, input.runAttemptId, input.parentLease)) {
       throw new Error('Dispatch lease parent must belong to the same session.');
     }
     assertDispatchLeaseCurrent(input.parentLease);
@@ -414,6 +484,7 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
   if (!lease) return true;
   const lookup = openEventLog().prepare(`
     SELECT lease.scope_id,
+           lease.session_id,
            lease.lease_id,
            lease.parent_scope_id,
            lease.parent_lease_id,
@@ -429,11 +500,11 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
       LEFT JOIN run_attempts AS attempt
         ON attempt.attempt_id = lease.run_attempt_id
      WHERE lease.scope_id = ?
-       AND lease.session_id = ?
        AND lease.lease_id = ?
   `);
   type LeaseRow = {
     scope_id: string;
+    session_id: string;
     lease_id: string;
     parent_scope_id: string | null;
     parent_lease_id: string | null;
@@ -449,13 +520,18 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
   let scopeId = lease.scopeId;
   let leaseId = lease.leaseId;
   let first = true;
+  let previous: LeaseRow | undefined;
   const seen = new Set<string>();
   while (true) {
     const lineageKey = `${scopeId}\0${leaseId}`;
     if (seen.has(lineageKey)) return false;
     seen.add(lineageKey);
-    const row = lookup.get(scopeId, lease.sessionId, leaseId) as LeaseRow | undefined;
+    const row = lookup.get(scopeId, leaseId) as LeaseRow | undefined;
     if (!row || row.revoked_at !== null) return false;
+    if (first && row.session_id !== lease.sessionId) return false;
+    if (previous && previous.session_id !== row.session_id
+      && !delegatedWorkerLeaseParentMatches(previous.session_id, previous.run_attempt_id ?? undefined,
+        { sessionId: row.session_id, scopeId: row.scope_id, leaseId: row.lease_id })) return false;
     if (
       first
       && (
@@ -468,13 +544,14 @@ export function isDispatchLeaseCurrent(lease: DispatchLeaseRef | undefined): boo
       row.run_attempt_id !== null
       && (
         row.attempt_id !== row.run_attempt_id
-        || row.attempt_session_id !== lease.sessionId
+        || row.attempt_session_id !== row.session_id
         || row.attempt_finished_at !== null
       )
     ) return false;
     if (row.parent_scope_id === null && row.parent_lease_id === null) return true;
     if (!row.parent_scope_id || !row.parent_lease_id) return false;
     first = false;
+    previous = row;
     scopeId = row.parent_scope_id;
     leaseId = row.parent_lease_id;
   }

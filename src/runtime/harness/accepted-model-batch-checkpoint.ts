@@ -10,6 +10,7 @@ import {
 } from './conversation-protocol.js';
 import { durableConversationProtocolEvidenceForCall } from './conversation-protocol-session.js';
 import { openEventLog } from './eventlog.js';
+import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { proveHostPlannedResolutionCoexistenceInTransaction } from './host-planned-resolution-coexistence.js';
 import {
   canonicalHostModelResultClass,
@@ -937,13 +938,45 @@ function settledNonSuccessProjectionDisposition(input: {
     'auth_failure',
     'policy_denial',
   ]).has(settlement.outcome_kind);
+  // A returned local coordinator may truthfully report failed children. Its
+  // local_write bit describes control-state bookkeeping, not a business write
+  // acknowledgement. The exact binding and producer-owned failure receipt let
+  // those already-returned bytes reach the model; they grant no replay or
+  // completion authority and never manufacture a successful result handle.
+  let returnedCoordinatorFailure = false;
+  if (settlement.outcome_kind === 'unknown'
+    && settlement.execution_kind === 'local_execution'
+    && settlement.mutating === 1
+    && settlement.business_call === 0
+    && settlement.physical_crossing_count === 0
+    && settlement.host_crossing_count === 1
+    && settlement.nonreturned_crossing_count === 0
+    && settlement.requires_reconciliation === 0
+    && input.hostClass === null) {
+    const bound = loadHostCallCapabilityBinding({
+      db: input.db, sessionId: input.row.session_id,
+      sourceUserSeq: input.row.source_user_seq, logicalToolCallId: input.logicalToolCallId,
+    });
+    returnedCoordinatorFailure = bound.status === 'ok'
+      && bound.binding.acceptedTaskId === input.row.accepted_task_id
+      && bound.binding.bindingKind === 'local_envelope'
+      && bound.binding.effect === 'local_write'
+      && Boolean(input.db.prepare(`SELECT 1 FROM events
+        WHERE session_id = ? AND seq > ? AND role = 'system' AND type = 'worker_result'
+          AND json_extract(data_json, '$.sourceUserSeq') = ?
+          AND json_extract(data_json, '$.parentLogicalCallId') = ?
+          AND json_type(data_json, '$.ok') = 'false'
+          AND json_type(data_json, '$.item') = 'text'
+          AND json_type(data_json, '$.packetKey') = 'text' LIMIT 1`)
+        .get(input.row.session_id, input.row.source_user_seq, input.row.source_user_seq, input.logicalToolCallId));
+  }
   const reconciliationRequired = settlement.requires_reconciliation === 1
     || settlement.outcome_kind === 'uncertain_write'
     || (
       settlement.mutating === 1
       && (
         settlement.nonreturned_crossing_count > 0
-        || !mutatingSafeFailure
+        || (!mutatingSafeFailure && !returnedCoordinatorFailure)
       )
     );
   if (reconciliationRequired) {

@@ -106,6 +106,33 @@ test('settleToolAttempt commits once and an exact carrier replay returns the per
   );
 });
 
+test('worker settlement follows exact typed item receipts, not a successful summary or another call', () => {
+  for (const variant of ['failed', 'recovered', 'unrelated-call', 'unrelated-source'] as const) {
+    const task = accept(`worker-${variant}`);
+    const callId = `logical:worker-${variant}`;
+    const args = { item: 'audit-1' };
+    admitReturnedProviderCall({ task, logicalToolCallId: callId, tool: 'run_worker', args });
+    const receipt = {
+      item: 'audit-1', packetKey: 'packet-audit-1', toolCallId: `${callId}-i0`,
+      parentLogicalCallId: variant === 'unrelated-call' ? 'some-other-call' : callId,
+      sourceUserSeq: variant === 'unrelated-source' ? task.sourceUserSeq + 1 : task.sourceUserSeq,
+      ok: false, reason: 'read failed',
+    };
+    eventlog.appendEvent({ sessionId: task.sessionId, turn: 1, role: 'system', type: 'worker_result', data: receipt });
+    if (variant === 'recovered') {
+      eventlog.appendEvent({ sessionId: task.sessionId, turn: 1, role: 'system', type: 'worker_result',
+        data: { ...receipt, ok: true } });
+    }
+    const result = settlement.settleToolAttempt({ ...task, lane: 'agents_runner', toolName: 'run_worker',
+      callId, args, businessCall: false, mutating: false, result: { successful: true } });
+    assert.equal(result.outcome.kind, variant === 'failed' ? 'unknown' : 'succeeded', variant);
+    if (variant === 'failed') {
+      assert.equal(result.outcome.evidence, 'nominal');
+      assert.equal(result.outcome.detail, 'worker_item_failed:read failed');
+    }
+  }
+});
+
 test('candidate elimination survives cache reset without spending an already-unused discovery epoch', () => {
   const task = accept('unsupported candidate');
   const governor = new governorModule.DiscoveryGovernor();

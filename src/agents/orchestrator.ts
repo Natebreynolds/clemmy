@@ -19,6 +19,7 @@ import { buildPlannerTool } from './planner.js';
 // approval surface of its own (sticky approvals from the parent cover
 // composio writes); it just does one job and returns.
 import { buildWorkerAgent } from './sub-agents.js';
+import { runPacketWorkerWithHost } from '../runtime/harness/worker-host-runner.js';
 import {
   workerPacketMcpToolScope,
 } from './external-mcp-scope-lock.js';
@@ -117,7 +118,7 @@ import { discoveryGovernor } from '../runtime/harness/discovery-governor.js';
 import { dynamicReasoningEnabled } from '../runtime/harness/reasoning-effort.js';
 import { openPlanScope } from './plan-scope.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
-import { buildWorkerJobPrompt, resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolInputSchema, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
+import { resolveWorkerMaxTurns, uniformFailureSignature, workerPacketKey, WorkerToolCallSchema, workerCallItems, workerResultIndicatesFailure, type WorkerToolInput, type WorkerToolCall } from './worker-job-packet.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from './worker-respawn-guard.js';
 import { acquireWorkerSlot, workerBatchPoolWidth } from './worker-concurrency.js';
 import {
@@ -158,7 +159,8 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, wrapToolForHarness, workerThrashGuardEnabled, withHarnessRunContext, ToolCallsCounter, defaultToolCallsPerTurn, type WrappableTool } from '../runtime/harness/brackets.js';
+import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
+import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
 import { claudeAgentSdkWorkerEnabled, runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { falloverBrainModelIds } from '../runtime/harness/model-role-options.js';
@@ -2227,6 +2229,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const workerAgentForPacket = async (
     input: WorkerToolInput,
     model: string,
+    child?: { sessionId: string; sourceUserSeq: number },
   ): Promise<{ agent: BuiltWorkerAgent; scope: McpToolScope | null | undefined }> => {
     const scope = workerPacketMcpToolScope({
       buildScope: mcpToolScope,
@@ -2239,19 +2242,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       : scope === null
         ? 'scope:deny'
         : `scope:exact:${JSON.stringify(scope)}`;
-    const key = `${model}\0${scopeKey}`;
+    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}`;
     let pending = workerAgentCache.get(key);
     if (!pending) {
-      // A worker dispatches under the PARENT's accepted source, so it must be
-      // built with that identity or it cannot know it is under contract and
-      // will assemble a surface the admission wall refuses.
+      // The child owns its scoped catalog namespace; explicit packet lineage
+      // links it to the parent without borrowing the parent's mutable root.
       pending = buildWorkerAgent({
         model,
         workerInput: input,
         mcpToolScope: scope,
-        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
-        ...(Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
-          ? { sourceUserSeq: options.sourceUserSeq }
+        ...(child?.sessionId ?? options.sessionId ? { sessionId: child?.sessionId ?? options.sessionId } : {}),
+        ...(Number.isSafeInteger(child?.sourceUserSeq ?? options.sourceUserSeq) && ((child?.sourceUserSeq ?? options.sourceUserSeq) ?? 0) > 0
+          ? { sourceUserSeq: child?.sourceUserSeq ?? options.sourceUserSeq }
           : {}),
       });
       workerAgentCache.set(key, pending);
@@ -2295,13 +2297,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       'COMPOSE → SINGLE COMMIT for external mutations: workers may execute reads and reason, but the Composio gateway mechanically refuses worker writes/sends. Require each worker to return one exact {id, composioSlug, args, account_alias?} payload. Validate and aggregate every returned payload, then call run_batch action="propose" ONCE; its immutable pending batch is the one payload the user approves and the parent executes. Never approve a summary before the workers materialize the final payloads, and never ask workers to call run_batch or pending_action tools.',
       'When NOT to use: tasks that need cross-item memory or a single coherent output stream — those stay on you.',
     ].join(' ');
-  const runWorkerAsToolOptions = {
-    toolName: 'run_worker',
-    toolDescription: runWorkerToolDescription,
-    parameters: WorkerToolInputSchema,
-    inputBuilder: buildWorkerJobPrompt,
-    ...(workerThrashGuardEnabled() ? { runOptions: { maxTurns: workerMaxTurns } } : {}),
-  };
   const runWorkerTool = tool({
     name: 'run_worker',
     description: runWorkerToolDescription,
@@ -2544,52 +2539,31 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     },
   }) as Tool<RuntimeContextValue>;
 
-  // Per-worker tool-call budget (2026-07-22 live: 30 nested workers SHARED the
-  // parent turn's counter — the first ~23 items drained it and the last 7 had
-  // their scrapes refused with "tool-call limit exceeded". The SDK lane already
-  // gives each worker its own generous counter (sub-agents.ts); this is the
-  // orchestrator-lane twin). The counter bounds a single runaway worker; the
-  // real limits remain per-worker maxTurns, the pool cap, and the run token
-  // budget. Parent context fields (sessionId, sourceUserSeq) carry through.
-  let workerBudgetScopeSeq = 0;
+  // One existing host loop per packet. The child keeps its own model context,
+  // call budget and ledger namespace while the parent owns fan-out/cancellation.
   const invokeWorkerWithOwnBudget = async (
-    nestedTool: { invoke: (ctx: any, payload: string, det: any) => Promise<unknown> },
+    packet: WorkerToolInput,
+    model: string,
     ctx: any,
-    payload: string,
     det: any,
     maxTurnsForItem: number,
-    mcpToolScopeOverride?: McpToolScope | null,
     dispatchLeaseOverride?: DispatchLeaseRef,
+    signal?: AbortSignal,
   ): Promise<unknown> => {
     const parent = harnessRunContextStorage.getStore();
     const sessionId = parent?.sessionId ?? extractSessionId(ctx) ?? '';
-    const counter = new ToolCallsCounter(Math.max(defaultToolCallsPerTurn(), maxTurnsForItem * 4));
-    return withHarnessRunContext(
-      {
-        sessionId,
-        counter,
-        // Worker identity is authority, not a loop-guard side effect. Keep it
-        // present even when CLEMMY_WORKER_THRASH_GUARD=off so the central
-        // Composio gateway can enforce compose -> parent batch commit.
-        workerScope: true,
-        ...(parent?.sourceUserSeq ? { sourceUserSeq: parent.sourceUserSeq } : {}),
-        ...(mcpToolScopeOverride !== undefined
-          ? { mcpToolScope: mcpToolScopeOverride }
-          : parent?.mcpToolScope !== undefined
-            ? { mcpToolScope: parent.mcpToolScope }
-            : {}),
-        ...(dispatchLeaseOverride
-          ? { dispatchLease: dispatchLeaseOverride }
-          : parent?.dispatchLease
-            ? { dispatchLease: parent.dispatchLease }
-            : {}),
-        ...(parent?.runAttemptId ? { runAttemptId: parent.runAttemptId } : {}),
-        ...(workerThrashGuardEnabled()
-          ? { guardrailScopeId: `${sessionId}::wkr:${Date.now()}-${(workerBudgetScopeSeq = (workerBudgetScopeSeq + 1) % 1_000_000)}` }
-          : {}),
-      },
-      () => nestedTool.invoke(ctx, payload, det),
-    );
+    const sourceUserSeq = parent?.sourceUserSeq ?? extractSourceUserSeq(ctx);
+    if (!sessionId || !sourceUserSeq) return 'ERROR: worker packet has no accepted parent source.';
+    const scope = workerPacketMcpToolScope({ buildScope: mcpToolScope,
+      runtimeScope: parent?.mcpToolScope, resolvedTools: packet.resolvedTools,
+      externalMcpToolNames: packet.externalMcpToolNames }) ?? null;
+    const signals = [signal, det?.signal].filter((entry): entry is AbortSignal => Boolean(entry));
+    return runPacketWorkerWithHost({
+      input: packet, modelId: model, parentSessionId: sessionId, sourceUserSeq, maxTurns: maxTurnsForItem,
+      buildAgent: async (child) => (await workerAgentForPacket(packet, model, child)).agent,
+      mcpToolScope: scope, dispatchLease: dispatchLeaseOverride ?? parent?.dispatchLease,
+      ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
+    });
   };
 
   const runOneOrchestratorWorker = async (
@@ -2620,6 +2594,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       };
       const turn = extractTurn(runContext);
       const toolCallId = details?.toolCall?.callId ?? null;
+      const parentLogicalCallId = currentLogicalCall()?.logicalToolCallId ?? null;
       // Workflow-level worker pin (owner ask, 2026-07-24): a step session
       // registered by the workflow runner overrides the global worker role.
       let workerModel = getSessionWorkerModelOverride(sessionId)
@@ -2702,7 +2677,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
+          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
           batchLease?.assertCurrent();
@@ -2939,9 +2914,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         });
       } catch { /* telemetry is best-effort */ }
       if (sessionId) {
-        try {
-          appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
-        } catch { /* telemetry is best-effort */ }
+        if (claudeAgentSdkWorkerEnabled(workerModel)) {
+          try {
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
+          } catch { /* telemetry is best-effort */ }
+        }
         if (manifestBinding) {
           try {
             checkpointPreparedWorker(sessionId, manifestBinding, input.item, 'running', {
@@ -3018,21 +2995,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             modelId: next.modelId, provider: next.provider,
             transport: 'worker_fallover_from_claude', source: 'fallover', toolUses: [],
           });
-          const fbOptions = workerThrashGuardEnabled()
-            ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
-            : runWorkerAsToolOptions;
           if (!runContext) throw new Error('run_worker requires an SDK run context');
           try {
             assertWorkerMayStart();
-            const scopedWorker = await workerAgentForPacket(input, next.modelId);
             const output = await invokeWorkerWithOwnBudget(
-              scopedWorker.agent.asTool(fbOptions),
+              input,
+              next.modelId,
               runContext,
-              JSON.stringify(input),
               details,
               resolveWorkerMaxTurns(input.intent, workerMaxTurns),
-              scopedWorker.scope,
               batchLease?.dispatchLease,
+              batchLease?.signal,
             );
             batchLease?.assertCurrent();
             recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), next.modelId);
@@ -3070,22 +3043,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // 12/12 workers dead on gpt-5.4 -> z.ai).
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       try {
-        const scopedWorker = await workerAgentForPacket(input, workerModel);
-        // Intent-aware cap on the nested lane too (non-Claude worker setups).
-        // asTool captures runOptions at BUILD time, so rebuild per call.
-        const nestedAsToolOptions = workerThrashGuardEnabled()
-          ? { ...runWorkerAsToolOptions, runOptions: { maxTurns: resolveWorkerMaxTurns(input.intent, workerMaxTurns) } }
-          : runWorkerAsToolOptions;
-        const nestedWorkerTool = scopedWorker.agent.asTool(nestedAsToolOptions);
         assertWorkerMayStart();
         const output = await invokeWorkerWithOwnBudget(
-          nestedWorkerTool,
+          input,
+          workerModel,
           runContext,
-          JSON.stringify(input),
           details,
           resolveWorkerMaxTurns(input.intent, workerMaxTurns),
-          scopedWorker.scope,
           batchLease?.dispatchLease,
+          batchLease?.signal,
         );
         batchLease?.assertCurrent();
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), workerModel);

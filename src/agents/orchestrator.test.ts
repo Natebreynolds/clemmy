@@ -58,6 +58,7 @@ const { HarnessSession } = await import('../runtime/harness/session.js');
 const { boundAgentMcpToolScope } = await import('../runtime/mcp-tool-authority.js');
 const { TOOL_JIT_CORE } = await import('./tool-jit.js');
 const { RunContext, Usage } = await import('@openai/agents');
+const { RouterModelProvider } = await import('../runtime/harness/router-model.js');
 const { setClaudeAgentSdkWorkerRunForTest } = await import('../runtime/harness/claude-agent-worker.js');
 const { summarizeWorkManifest } = await import('../runtime/harness/work-manifest.js');
 const { _setInnerDispatchToolsForTests } = await import('../tools/inner-dispatch.js');
@@ -798,7 +799,7 @@ test('chat run_worker intent routing kill-switch keeps legacy role-wide worker',
   }
 });
 
-test('run_worker invokes the nested Worker on the routed intent model (offline SDK path)', async () => {
+test('run_worker invokes the host Worker on the routed intent model (offline provider)', async (t) => {
   resetEventLog();
   const session = createSession({ kind: 'chat', title: 'run_worker intent route' });
   const prev: Record<string, string | undefined> = {
@@ -838,8 +839,10 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
           responseId: 'resp_worker_done',
         } as unknown as import('@openai/agents').ModelResponse;
       },
-      async *getStreamedResponse() {
-        throw new Error('not used in this test');
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
       },
     };
     const stubProvider: import('@openai/agents').ModelProvider = {
@@ -854,6 +857,7 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
     assert.ok(runWorker, 'expected run_worker on orchestrator surface');
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
 
     const packet = {
       objective: 'Generate one design variation for the parent batch.',
@@ -1007,7 +1011,7 @@ test('run_worker invokes the nested Worker on the routed intent model (offline S
   }
 });
 
-test('run_worker route and result telemetry use the effective post-repair BYO model', async () => {
+test('run_worker route and result telemetry use the effective post-repair BYO model', async (t) => {
   resetEventLog();
   clearByoNotServedForTest();
   const session = createSession({ kind: 'chat', title: 'run_worker repaired route truth' });
@@ -1049,8 +1053,10 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
           responseId: 'resp_worker_repaired',
         } as unknown as import('@openai/agents').ModelResponse;
       },
-      async *getStreamedResponse() {
-        throw new Error('not used in this test');
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
       },
     };
     const stubProvider: import('@openai/agents').ModelProvider = {
@@ -1084,6 +1090,7 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
       },
     };
     const input = JSON.stringify(packet);
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
     const anchor = anchorAcceptedTask(session.id, 'Produce one fictional SEO note.');
     const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(
       new RunContext({ sessionId: session.id }),
@@ -1120,7 +1127,7 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
   }
 });
 
-test('a Claude brain executes a durable Codex worker binding on the host worker lane', async () => {
+test('a Claude brain executes a durable Codex worker binding on the host worker lane', async (t) => {
   resetEventLog();
   const session = createSession({ kind: 'chat', title: 'claude brain codex worker route' });
   const authFile = path.join(TMP_HOME, 'state', 'auth.json');
@@ -1175,8 +1182,10 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
           responseId: 'resp_codex_worker_done',
         } as unknown as import('@openai/agents').ModelResponse;
       },
-      async *getStreamedResponse() {
-        throw new Error('not used in this test');
+      async *getStreamedResponse(request) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
       },
     };
     const stubProvider: import('@openai/agents').ModelProvider = {
@@ -1191,6 +1200,7 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
       invoke: (runContext: unknown, input: string, details?: unknown) => Promise<unknown>;
     } | undefined;
     assert.ok(runWorker, 'expected run_worker on the Claude-brain orchestrator surface');
+    t.mock.method(RouterModelProvider.prototype, 'getModel', stubProvider.getModel.bind(stubProvider));
 
     const packet = {
       objective: 'Research one fictional account.',

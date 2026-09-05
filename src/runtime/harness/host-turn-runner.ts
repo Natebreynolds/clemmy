@@ -3968,7 +3968,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       return `Tool '${name}' was refused before dispatch because the selected host engine only admits configured harness-bounded tools. No local or external mutation was attempted.`;
     }
     if (hostProduction) {
-      if (exactProductionHostCall(
+      const exact = exactProductionHostCall(
         name,
         args,
         argumentsJson,
@@ -3976,7 +3976,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         logicalToolCallId,
         runContext,
         details,
-      )) return undefined;
+      );
+      if (exact) {
+        if (harnessRunContextStorage.getStore()?.workerScope
+          && (exact.effect === 'external_write' || exact.effect === 'admin')) {
+          return `WORKER_COMPOSE_ONLY: ${name} is an external mutation. Return its exact proposed payload to the parent; no provider dispatch or approval was started.`;
+        }
+        return undefined;
+      }
       // Name the operations this turn actually bound.
       //
       // Live 2026-08-26: the plan bound one write operation, the model read the
@@ -6810,18 +6817,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
             toolCalls: harnessRunContextStorage.getStore()?.counter.currentCount ?? 0,
           });
-          history.push(...admission.frame.history);
-          if (step.responseId !== undefined) lastResponseId = step.responseId;
-          if (!continuation.resume) return {
-            ...await completedOutcome(admission.frame.text),
-            blockedDetail: continuation.reason,
-          };
+          if (!continuation.resume) {
+            history.push(...admission.frame.history);
+            if (step.responseId !== undefined) lastResponseId = step.responseId;
+            return {
+              ...await completedOutcome(admission.frame.text),
+              blockedDetail: continuation.reason,
+            };
+          }
           const { buildContinueInput } = await import('./continue-directive.js');
           // The host owns the next edge; record its cost before giving the
           // model another step. This never mints a new accepted user source.
+          // A text-only reply is not a sealed tool checkpoint. Retain its
+          // exact bytes in the event/directive, not the canonical history or
+          // response chain from which the next call-bearing frame is admitted.
           appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
             kind: 'local_work_continuation', sourceUserSeq: identity.sourceUserSeq,
-            attempt: continuation.attempt, missing: pending.missing,
+            attempt: continuation.attempt, missing: pending.missing, partialReply: admission.frame.text,
           } });
           pendingHostModelDirective = buildContinueInput(admission.frame.text, { auto: true, missing: pending.missing });
           continue;

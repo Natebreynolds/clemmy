@@ -22,6 +22,7 @@ const hostBindings = await import('./host-call-capability-binding.js');
 const leases = await import('./dispatch-lease.js');
 const brackets = await import('./brackets.js');
 const invocation = await import('./host-tool-invocation.js');
+const observations = await import('./tool-invocation-observation-context.js');
 const protocol = await import('./conversation-protocol.js');
 const protocolSession = await import('./conversation-protocol-session.js');
 const hostResults = await import('./host-model-result-receipt.js');
@@ -98,7 +99,8 @@ function productionAttestation(input: {
   callId: string;
   toolName: string;
   args: unknown;
-  effect: 'read' | 'external_write';
+  effect: authority.HostCallAttestation['effect'];
+  localEnvelope?: boolean;
 }): authority.HostCallAttestation {
   const root = authority.acceptedTurnCallAuthorityFor(
     input.task.sessionId,
@@ -123,14 +125,14 @@ function productionAttestation(input: {
     toolName: contract.toolName,
     argumentDigest: contract.argumentDigest,
     effect: input.effect,
-    bindingKind: 'catalog_manifest' as const,
+    bindingKind: input.localEnvelope ? 'local_envelope' as const : 'catalog_manifest' as const,
     capabilityId: `cap:${contract.toolName}`,
     schemaFingerprint: digest(`schema:${contract.toolName}`),
-    accountId: 'conn-checkpoint-fixture',
+    accountId: input.localEnvelope ? '' : 'conn-checkpoint-fixture',
     invokePortId: 'fixture:execute',
     operationId: contract.toolName.toUpperCase(),
-    manifestId: `manifest:${contract.toolName}`,
-    manifestDigest: digest(`manifest:${contract.toolName}`),
+    manifestId: input.localEnvelope ? '' : `manifest:${contract.toolName}`,
+    manifestDigest: input.localEnvelope ? '' : digest(`manifest:${contract.toolName}`),
     engineVersion: root.authority.engineVersion,
     surfaceVersion: root.authority.surfaceVersion,
     authorityDigest: root.authority.authorityDigest,
@@ -150,7 +152,9 @@ function runCall<T>(input: {
   callId: string;
   toolName: string;
   args: unknown;
-  effect: 'read' | 'external_write';
+  effect: authority.HostCallAttestation['effect'];
+  localEnvelope?: boolean;
+  businessCall?: boolean;
   boundary?: 'host_owned_local' | 'host_owned_external';
   deadlineMs?: number;
   invoke: () => Promise<T>;
@@ -168,6 +172,7 @@ function runCall<T>(input: {
       },
       parentLease: input.task.parentLease,
       effect: input.effect,
+      ...(input.businessCall === undefined ? {} : { businessCall: input.businessCall }),
       boundary: input.boundary ?? 'host_owned_external',
       deadlineMs: input.deadlineMs ?? 200,
       invoke: input.invoke,
@@ -471,6 +476,54 @@ for (const candidate of [
     assert.equal(resultText(recovered.checkpoint.history, callId), JSON.stringify(payload));
     assert.equal(physicalRows(task, callId).length, 1);
     assert.equal(bodies, 1, 'checkpoint recovery cannot repeat the body');
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+for (const variant of ['local_control', 'business_local', 'external', 'admin', 'wrong_parent', 'wrong_source', 'no_failure', 'catalog_binding'] as const) {
+  test(`only the exact returned local coordinator failure may checkpoint model feedback (${variant})`, async () => {
+    const task = fixture(`Retain the exact ${variant} result, without replay or success.`);
+    const callId = `call:coordinator-failure:${variant}`;
+    const toolName = 'fixture_coordinator';
+    const args = { items: ['item-1'] };
+    const admitted = checkpoints.admitAcceptedModelBatch({
+      sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+      preHistory: preHistory(task), frameHistory: openFrame({ callId, toolName, args }),
+    });
+    assert.equal(admitted.status, 'admitted');
+    if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+    const payload = 'The item failed; retain this exact failure for the next step.';
+    let bodies = 0;
+    const invoked = await runCall({
+      task, callId, toolName, args,
+      effect: variant === 'external' ? 'external_write' : variant === 'admin' ? 'admin' : 'local_write',
+      localEnvelope: variant !== 'catalog_binding',
+      businessCall: variant === 'business_local',
+      boundary: 'host_owned_local',
+      invoke: async () => {
+        bodies += 1;
+        eventlog.appendEvent({ sessionId: task.sessionId, turn: 1, role: 'system', type: 'worker_result', data: {
+          item: 'item-1', packetKey: 'exact-packet', ok: variant === 'no_failure',
+          parentLogicalCallId: variant === 'wrong_parent' ? 'another-call' : callId,
+          sourceUserSeq: variant === 'wrong_source' ? task.sourceUserSeq + 1 : task.sourceUserSeq,
+        } });
+        observations.noteHostToolInvocationObservation({ signals: { executionFailed: true } });
+        return payload;
+      },
+    });
+    assert.equal(invoked.settlement.outcome.kind, 'unknown');
+    const resultItem = projectedTextResult({ callId, toolName, value: payload });
+    recordLogicalResult(admitted.admission, resultItem);
+    const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+    if (variant === 'local_control') {
+      assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
+      const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+      assert.equal(recovered.status, 'ready');
+      if (recovered.status !== 'ready') throw new Error(recovered.reason);
+      assert.equal(resultText(recovered.checkpoint.history, callId), payload);
+    } else assert.equal(finalized.status, 'evidence_unavailable', 'unknown mutations and unrelated receipts cannot borrow coordinator feedback authority');
+    assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ?').get(task.sessionId) as { n: number }).n, 0);
+    assert.equal(bodies, 1, 'failure projection never re-enters the body');
     leases.revokeDispatchLease(task.parentLease);
   });
 }

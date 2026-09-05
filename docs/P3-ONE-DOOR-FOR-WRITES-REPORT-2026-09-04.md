@@ -46,10 +46,47 @@ write after the model request froze its empty catalog and proves one dispatch.
 Thus this is a connected write fallback, not only a read resolver or a claim that
 consent makes resolution unnecessary.
 
-Reviewer accepted judge/worker dispatch changes and local completion's grading
-half. Reviewer requires bounded automatic re-entry for `local_work_incomplete`,
-with exact missing items, before its next-edge half can close. That work is not
-waived by marking the terminal resumable.
+`5b8dd86a` adds bounded automatic re-entry for `local_work_incomplete` in the
+existing loop: only missing accepted items, no new permission, no replay of
+successful siblings. Unchanged missing work stops with its typed next edge rather
+than spinning. The actual-child follow-up below also pins checkpoint continuity.
+
+### Worker-child connection and failed-receipt follow-up
+
+Reviewer §12 23:40 A–C are now covered by real host-child fixtures, not replaced
+tool bodies. The coordinator records each packet's exact parent source/logical
+call and item scope, then uses the existing host runner in an ordinary child
+session namespace. Each child acquires its own exact tool attestation through the
+same pre-dispatch door; it cannot modify the parent's call root. Existing dispatch
+leases follow only the verified owning parent call, carry cancellation, and reject
+another live lease in that same parent session. Compose-only children cannot
+dispatch external writes/admin or mint approval cards.
+
+Typed `worker_result` receipts retain exact parent logical call plus accepted
+source. A failed batch settles failure, not a successful prose summary or poisoned
+parent root. Only an exactly bound, returned, nonbusiness local coordinator failure
+can project its failure bytes through the existing checkpoint boundary: zero
+provider/nonreturned crossings, one returned host crossing, no reconciliation,
+local-envelope/local-write binding and same-call/source failed receipts. No
+successful handle or replay permission results. Unknown business-local/external/
+admin writes and unrelated receipts remain held.
+
+The real 7/8 → 8/8 repair exposed a second connection gap: partial completion text
+had changed canonical history without a settled checkpoint. Continuing now retains
+the full partial reply in the existing guardrail event/directive and leaves the
+canonical response chain at its settled checkpoint. Only missing `audit-8` retries;
+successful siblings do not. **That retry fixture explicitly authorizes the retry;
+it is not the byte-identical live canary, which forbids a second worker batch.**
+
+Measured local evidence (overlapping counts, all real exit 0): actual worker/
+checkpoint/host-completion cohort 281/281
+(`/private/tmp/p3-worker-recovery-final-regression.log`), manifests 32/32,
+source-backed obligations 5/5, routing 73/73
+(`/private/tmp/p3-worker-route-fixtures-green3.log`), lease/basic 13/13,
+independent final authority review 16/16
+(`/private/tmp/p3-final-worker-authority-review.log`), and typecheck.
+Uniform 0/8 failure, full 8/8 success and failed-item-only recovery are all pinned.
+Live replay remains a separate acceptance requirement; these are offline models.
 
 ## First live P3 precondition replay — RED, retained
 
@@ -169,12 +206,33 @@ plus the explicitly uncommitted worker fixes (no live daemon):
   `/private/tmp/p3-plan-head-reviewer-recheck.log`. `cf50388e` changed that producer
   and fixture after the review's tested `72565801`; no second speculative fix.
 
-The four new journey failures are reproduced separately, real exit 1
-(`/private/tmp/p3-four-journeys-current.log`). Two still require the removed
-hidden-until-plan worker surface; one maps Home `transferred` to error; one calls
-created-resource target lineage `dataFrom` despite literal, user-supplied content.
-They remain assigned; neither the stale-unit attribution nor the Workspace
-correction waives those failures.
+The four new journey failures were reproduced separately, real exit 1
+(`/private/tmp/p3-four-journeys-current.log`), and are now green:
+
+- `18ac00d4`: Home `transferred` is successful request delivery, not `error`;
+  durable task truth stays `transferred`, not `done`. Full bridge/parity cohort
+  93/93, exit 0 (`/private/tmp/p3-transferred-bridge-regression.log`).
+- `9b1b9e20`: the two obsolete hidden-until-plan worker assertions now follow the
+  approved plan-optional surface. A schema-valid call with invented accepted
+  source is refused by the real wrapper; listing tools causes zero worker/provider
+  I/O. Original natural Discord business/receipt/replay assertions are retained.
+  Both full files pass 12/12, exit 0
+  (`/private/tmp/p3-plan-optional-surface-full.log`); exact authority pin 2/2.
+- `9b1b9e20`: literal user-supplied header content has `dataFrom: []`, while
+  `dependsOn` still binds the verified created destination. All four derived-write
+  tests pass, exit 0 (`/private/tmp/p3-derived-contract-green.log`), including
+  wrong-target zero update, exact four provider phases and zero-crossing replay.
+  No runtime provenance or destination validation was weakened.
+- Final cited unit recheck: 5/5, exit 0
+  (`/private/tmp/p3-plan-final-release-recheck.log`).
+
+Separate newly measured debt, not silently waived: an SDK-malformed `run_worker`
+packet (`items` without required fields) returns the historical generic worker
+error envelope but its parent settlement can say `succeeded` with zero children.
+Actual RED: `/private/tmp/p3-worker-surface-journey-first.log`, exit 1. This is
+distinct from the schema-valid authority/live replay and is not fixed by updating
+surface tests. Retain for the release-debt decision; do not claim malformed-packet
+settlement truth is proven.
 
 Reviewer heavy-gate measurements on `64c3bfa5` are baseline evidence, not results
 on final P3 bytes. Preserve their exact counts and exits in direction §12. Re-emit

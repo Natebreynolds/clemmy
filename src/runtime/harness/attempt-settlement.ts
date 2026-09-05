@@ -945,6 +945,29 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // A lane's own nominal knowledge outranks anything extracted here.
     ...(input.signals ?? {}),
   };
+  // A coordinator's returned summary is not item completion authority. Read
+  // the typed receipts for this exact invocation, retaining the newest result
+  // per packet so successful in-call recovery supersedes an earlier failure.
+  let workerFailure: string | undefined;
+  if (input.toolName === 'run_worker' && input.sessionId && input.sourceUserSeq && input.callId) {
+    const rows = openEventLog().prepare(`SELECT data_json FROM events
+      WHERE session_id = ? AND seq > ? AND type = 'worker_result' AND role = 'system'
+        AND json_extract(data_json, '$.sourceUserSeq') = ?
+        AND json_extract(data_json, '$.parentLogicalCallId') = ? ORDER BY seq DESC`)
+      .all(input.sessionId, input.sourceUserSeq, input.sourceUserSeq, input.callId) as Array<{ data_json: string }>;
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const receipt = JSON.parse(row.data_json);
+      if (typeof receipt.packetKey !== 'string' || typeof receipt.item !== 'string') continue;
+      const key = `${receipt.packetKey}\0${receipt.item}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (receipt.ok === false) {
+        workerFailure = `worker_item_failed:${typeof receipt.reason === 'string' ? receipt.reason : receipt.item}`.slice(0, 160);
+        extracted.executionFailed = true;
+      }
+    }
+  }
   if (input.toolName === 'run_shell_command' && isShellPolicyDenialResult(input.result)) {
     extracted.preDispatch = true;
     extracted.policyRefused = true;
@@ -1082,6 +1105,9 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   }
 
   let outcome = classifyAttemptOutcome(extracted);
+  if (workerFailure && ['unknown', 'succeeded', 'empty_result'].includes(outcome.kind)) {
+    outcome = { ...classifyAttemptOutcome({ executionFailed: true }), detail: workerFailure };
+  }
   if (
     outcome.kind === 'succeeded'
     && inspectProviderEnvelope(input.result).verdict === 'contradicted'
