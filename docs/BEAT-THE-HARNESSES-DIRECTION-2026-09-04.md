@@ -2357,3 +2357,21 @@ replay on the final bytes. Reviewer's remaining-work list: malformed
 owner's "defer" on the three skips · full gates on final bytes · cold worker
 replay + draft canary on the final frozen SHA · packaged rehearsal · push/tag on
 the owner's words.
+
+**2026-09-05 01:21 — MALFORMED / NO-CHILD `run_worker` CLASS CLOSED: `41aaabb1`.** Every exit of
+`run_worker` that dispatches nothing is now a typed carrier settlement reads: SDK
+input validation → `invalid_arguments` naming every violated path; every body-level
+refusal (empty/junk/blank/absent items, uniform-failure memo, quantified gate,
+manifest binding, missing lease, batch identity/ownership) through ONE helper; a
+generation cancelled before any body was admitted (the batch runner now counts
+started bodies on the error) → a new `CancelledPreDispatchResult`
+(refused_pre_dispatch, no handle, no progress); any other body throw → the
+local-failure carrier, never a laundered string. No settlement-side "zero receipts
+⇒ failed" rule (durable-completion reuse and the atomic pin's unrelated-call
+variant are legitimate). Two adversarial verifications drove 8 + 6 shapes through
+the real door with ledger rows read back; the last seam (a body throw at a spent
+outer deadline settling `succeeded` + a handle) is pinned with the honest race
+outcomes: paired refusal, or a host-held resumable checkpoint — never done, never
+"retry the item". Pin 10/10, neighbors green, typecheck ✅. Remaining before the
+gates: the materialization-split sweep result (in flight) and the owner's word on
+the three deferrals.
