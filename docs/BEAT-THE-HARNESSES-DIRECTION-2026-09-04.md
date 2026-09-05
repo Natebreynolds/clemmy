@@ -769,6 +769,157 @@ occurrence resumes → the effect ledger is intact → zero duplicate external w
 
 ---
 
+## 14. Pocket + proactive: the backend contract the UI phase needs (2026-09-04 ~19:30)
+
+Owner's ask, his words: *"With Claude Code I open a terminal and it creates a folder for
+anything. I can't grab my phone and toggle through projects, create one, or feel like my
+workflows are in my pocket. And Clem isn't proactive with me the way I want. What's
+missing in the backend? Next up is the UI phase — desktop and mobile."*
+
+Three code-grounded probes (322 file reads, working tree). **None of this is weekend
+scope.** It is the v3.17 backend prerequisite list the UI phase will build on — a UI
+can only render what the engine durably holds.
+
+### 14.1 What already exists (verified) — more than the phone shows
+
+- **The project entity is ~80% built and is called a Space/Workspace**
+  (`src/spaces/store.ts` `SpaceRecord`; file truth `spaces/<slug>/space.json`; SQLite
+  index `src/spaces/workspace-db-schema.ts`, schema v5). It carries slug, title,
+  status, a durable **contract** {objective, successCriteria, invariants},
+  originSessionId, focusId, data sources, actions, re-engage triggers, revisions,
+  mobile prefs. It is reachable from chat (deterministic session `space-<slug>` mounted
+  as kind `workspace` by `session-composition.ts`), workflows
+  (`workspace_workflow_bindings`), memory (observation bridge → `memory_episodes`),
+  and the phone (`GET /m/api/workspaces`, `/:id`, `/refresh`, workspace-scoped chat).
+- **"Clem proposes, owner approves, durable Space is created" already exists** as a
+  primitive (`automation-read-pilot-workspace-control-plane.ts:608`,
+  `createIfAbsent` behind a resumable approval card with a `create_new` choice) —
+  but only wired for canonical-entity pilots.
+- **The phone is NOT a reduced projection.** It reads the same harness event log,
+  public projection, Working-Now snapshot, and run collector as desktop
+  (`src/channels/mobile-routes.ts`, ~90 `/m` routes; pinned-TLS door on by default,
+  Bonjour + off-LAN relay; device-bound P-256 sessions; Web Push + APNs). Verified
+  from the phone today: list/open/continue/start conversations (SSE with resume);
+  list + full-detail + **run** workflows (409 names missing inputs); workflow run
+  events + terminal + cancel-at-boundary; **mid-run steer** (durable steer note);
+  **approve/deny a formal approval and the run resumes** — Claude Code Remote
+  Control parity EXISTS; cancel/resume background tasks; switch brain. And
+  `GET /m/api/runs/:sessionId` already renders `external_write*` **receipts** — the
+  phone is *ahead of desktop* on the ledger (desktop renders zero, §13.4 item 2).
+- **The proactive lane is fully built and switched OFF.** One gate:
+  `proactiveWorkAllowed = policy.enabled && !quietHours`
+  (`src/agents/proactivity-policy.ts:233-241`, `src/daemon/runner.ts:3541-3590`).
+  Behind it: git/inbox/calendar monitors, the execution controller, autonomy-v2
+  standing agents (opted in via `AUTONOMY_V2_AGENTS`, dark), self-driving goal
+  resumption, hourly briefs, and five check-in templates (shipped disabled; only
+  `seed-friday-wrap` ever fired, 2026-05-14). **Live state:**
+  `state/proactivity-policy.json` has `enabled:false` AND quiet hours `00:00→23:59`,
+  set 2026-08-15 — 4,962 "paused by policy" log lines. The OFF door was the console
+  Usage panel's **cost trim** (`POST /api/console/usage/trim kind=proactivity`), i.e.
+  it was turned off to save tokens, never as a consent decision.
+
+### 14.2 What is missing — the backend contracts, ranked for the UI phase
+
+Every item is a projection over existing truth or one durable link. No new session
+kind, store, executor, door, or flag. Sizes are the probes' estimates.
+
+1. **ONE owner principal across first-party surfaces** (medium). Today a phone turn
+   into a desktop-origin conversation **forks an `identity_split` child** instead of
+   continuing it (`accepted-source-session-branch.ts:211-229`: desktop principal
+   `{provider:'desktop', audienceId:'desktop'}` ≠ mobile `{provider:'mobile',
+   audienceId:deviceId}`). Contract: first-party providers (desktop/mobile/cli)
+   normalize to one canonical owner audience; the originating device is recorded as
+   **provenance** on the receipt. This is *the* "pick up on my phone what I started
+   on the desktop" blocker, and Antigravity's one-harness-many-surfaces bar.
+2. **Durable `pending_interactions`** (large; **shares its entity with P4's durable
+   barrier, §13.4 item 1**). Formal approvals are durable and phone-answerable;
+   conversational asks (`autonomous_send_consent` today, the P4 question list
+   tomorrow) are not — no row any surface can list, push on, or answer. Contract:
+   ONE row written by the ONE consent reducer / ask barrier: {id idempotent per
+   callId, sessionId, attemptId, callId, kind consent|question, payload = question
+   list, effect/reversibility/account pass-through, status pending|answered|expired}.
+   Push on it = bb's `interaction.pending`. Also project chat asks as a 4th
+   `InboxQuestionSource` ('chat') from open continuity packets so the inbox is
+   complete.
+3. **Project identity as a session MOUNT, not a name prefix** (medium). Sessions,
+   background tasks, goals, deliverables, and continuity packets are keyed by
+   session_id only; the only project attribution anywhere is the `^space-` regex
+   (`workspace-context.ts:17`). `workspaces.focus_id`, `workspace_memory_scope`,
+   `workspace_embeddings`, and `workspace_state_events.run_id` exist in schema with
+   **zero production writers**; desktop's workflow↔space link is a text grep of
+   workflow files. Contract: extend the existing validated session mount
+   (`__session_mount {kind:'workspace', workspaceSlug}`) so ANY session may carry
+   it; write `focus_id` through the existing `createFocus`/`activateFocus`
+   primitive so **"current project" becomes one cross-surface switch**; emit
+   `workspace.changed` on the action bus; write `workspace_workflow_bindings` via the
+   existing `putWorkflowSurfaceBinding` when a workflow is saved/run from a mounted
+   session. Then "everything in this project" is a JOIN, on every surface.
+4. **Create a project from one sentence, from anywhere** (small). `space_save` is
+   already a host-owned local write with no plan exam, but its create branch
+   **refuses without `view_html`/`view_path`** (`space-tools.ts` ~520) — so "start a
+   scraping project for X" forces the model to author HTML first. The console route
+   already writes a `PLACEHOLDER_VIEW`. Contract: same fallback in `space_save`;
+   add `POST /m/api/workspaces {title, objective?, successCriteria?, invariants?}`
+   = the same `spaceStore.save` + `mergeSpaceContract`; generalize the existing
+   propose→approve→`createIfAbsent` primitive beyond canonical-entity pilots. **This
+   is the Claude Code "folder for anything" equivalent**: one sentence → a Space
+   with a contract → focus switches → every session/run/deliverable from then on
+   carries the mount.
+5. **Proactivity as consent, not a cost trim** (small). Expose the policy snapshot
+   **with a reason** (`enabled:false` vs quiet hours) on `GET/POST
+   /m/api/settings/proactivity` + console, over the existing
+   `loadProactivityPolicy`/`saveProactivityPolicy`; the per-lane fields already exist
+   (`inboxWatchEnabled`, `calendarWatchEnabled`, `allowDiscordCheckIns`,
+   `briefCadenceMinutes`, `checkInMinutes`) — the policy IS the consent record.
+   Per-Space re-engage triggers become owner-editable (`PATCH /m/api/workspaces/:id
+   {reengage}`) and defer (never drop) under quiet hours. **Owner action, zero code:
+   the lane is off today because of a 24-hour quiet window set on 08-15.**
+6. **Clem-initiated speech needs an origin session; suggestions need one projection**
+   (medium). Briefs, monitor cards, and template check-ins are created **without a
+   sessionId**, so they can only be templated notifications (a standing-voice-rule
+   violation waiting to happen) and the owner's answer cannot flow back as an
+   accepted source. Contract: one per-user Clem-initiated origin session (an
+   ordinary chat session, `metadata.origin:'clem'`, discovered at runtime, no new
+   kind); route briefs/check-ins through the existing `deliverOutcome` path so the
+   words are **model-authored**; `answerCheckInCas` appends the reply there as an
+   accepted source. Plus `listSuggestions()` — a PROJECTION over the seven existing
+   proposal stores with one envelope {id, sourceKind, title, rationale, proposedAt,
+   expiresAt, decisions approve|decline|later, effectClass}. That is "here's what I
+   found, want me to run X?" on the phone, bounded by the existing loud/quiet
+   notification fan-out — never a second loop.
+7. **Phone reach completions** (small each): `GET /m/api/tasks(+/:id)` with
+   `outcomeSnapshot {outcome, blocker, nextAction, resumable}` via ONE serializer
+   shared with console; `POST /m/api/workflows/:name/set-enabled` and `/schedule`
+   over `prepareWorkflowEnableForWrite`; chat-list paging/search/workspace filter
+   (today: hard cap 80); APNs parity for chat report-backs (one
+   `isOwnerDeviceDestination` predicate) and **asks always push** (needs_input /
+   awaiting_approval bypass the elapsed-time threshold); let
+   `conversation_check_in`/`conversation_preamble` through the mobile projection so
+   the phone can read "what she did while I was away."
+8. **Run-ledger projection** (medium; = §13.4 item 2): one `run_ledger` function
+   consumed by both console and `/m/api/runs/:sessionId` — per accepted call
+   {callId, tool, effect class, account, resolved authority, lease/dispatch state,
+   settlement disposition, result handle}. Phone renders receipts already; desktop
+   renders nothing.
+9. Engine items behind the above: a `paused` occurrence state at a step boundary
+   (pause-a-run exists on no surface); optional: wire `workspace_memory_scope` so
+   recall boosts project-scoped facts.
+
+### 14.3 Order and guardrails for the UI phase
+
+Order: **1 → 2 → 3+4 → 5+6 → 7 → 8 → 9.** Item 1 first because every other phone
+behavior is wrong while a phone turn forks the conversation; item 2 second because it
+is the same entity P4 needs and it unlocks push-on-ask; 3+4 make "project" real; 5+6
+make Clem proactive *in her own words* with consent; 7–8 are surface completions.
+
+Guardrails (binding, from the owner rules): the Space stays a **projection with zero
+execution authority**; one effect kernel, no second loop; no new session kind or
+store; proactivity is bounded by the existing policy + quiet hours + loud/quiet
+fan-out; first-party surfaces only (desktop + mobile), no new channels; Clem-initiated
+speech must originate in a session so it is model-authored, never a template.
+
+---
+
 ## 12. Reviewer log (append-only — executing agent: re-read at every phase boundary)
 
 The reviewer session watches every commit and canary outcome against this doc.
@@ -901,3 +1052,13 @@ blocked-terminal payload; the tree's first journey asserting
 Also: the P0 report + push/fast-forward ask are still owed (branch not on origin
 at 19:05). Starting P1 in parallel is fine under the approvals block; the push ask
 must not get lost behind P1.
+
+**2026-09-04 ~19:30 — §14 ADDED (pocket + proactive backend contract). NOT weekend
+scope; do not start any of it before the v3.16 tag.** Two things matter for work
+already in flight: (a) **P4's durable barrier and §14.2 item 2 are the same entity**
+— when P4 lands this weekend as an in-step barrier, name its row shape so the v3.17
+`pending_interactions` persistence extends it rather than replacing it (question
+list payload, idempotent per-callId id, effect/reversibility/account pass-through);
+(b) §14.1 records that the proactive lane is OFF via a 24 h quiet window + cost
+trim set 08-15 — an owner config decision, not a defect; do not "fix" it in code.
+After the tag, §14.3 is the UI-phase backend order: 1 → 2 → 3+4 → 5+6 → 7 → 8 → 9.
