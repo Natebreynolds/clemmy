@@ -22,6 +22,8 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const { PUBLIC_RUN_FAILURE_TEXT } = await import('../runtime/harness/public-presentation.js');
+const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+const { presentationEventForOutcome, turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
 const {
   appendEvent,
   claimRunAttemptLease,
@@ -39,6 +41,21 @@ type StreamEvent = { type?: string; sessionId?: string; clientRequestId?: string
 const RAW_MODEL_REASONING = 'Clementine is recovering from a stalled step.';
 const okConfigure = (async () => ({ ok: true })) as never;
 const fakeAgentBuilder = (async () => ({})) as never;
+
+function stubAnswerPresentation(opts: StubRunOptions, text: string) {
+  const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === opts.sourceUserSeq);
+  assert.ok(source, 'the bridge must establish the accepted source before runConversation');
+  const identity = { sessionId: opts.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  return presentationEventForOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  });
+}
 
 test.after(() => {
   delete process.env.CLEMMY_TURN_ENGINE;
@@ -72,7 +89,7 @@ async function boot(runConversation?: (opts: StubRunOptions) => Promise<unknown>
           done: true,
           nextAction: 'completed',
         },
-        publicPresentation: { kind: 'answer', text: 'done' },
+        publicPresentation: stubAnswerPresentation(opts, 'done'),
       };
     })) as never,
   });
@@ -161,8 +178,6 @@ test('home chat stream emits terminal error event when assistant throws', async 
 test('Home stream and JSON ordinary requests branch held parents and replay the same child once', async () => {
   resetEventLog();
   const approvalRegistry = await import('../runtime/harness/approval-registry.js');
-  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
-  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
   const seenSessions: string[] = [];
   const h = await boot(async (opts) => {
     seenSessions.push(opts.sessionId);
@@ -170,14 +185,14 @@ test('Home stream and JSON ordinary requests branch held parents and replay the 
       .find((event) => event.seq === opts.sourceUserSeq);
     assert.ok(source);
     const identity = { sessionId: opts.sessionId, turn: source!.turn, sourceUserSeq: source!.seq };
-    commitTurnOutcome({
+    const publicPresentation = commitTurnOutcome({
       version: 2,
       id: turnOutcomeId(identity),
       identity,
       status: 'done',
       resumable: false,
       presentation: { kind: 'answer', text: 'Fresh Home work completed.' },
-    });
+    }).presentation;
     return {
       sessionId: opts.sessionId,
       status: 'completed',
@@ -189,7 +204,7 @@ test('Home stream and JSON ordinary requests branch held parents and replay the 
         done: true,
         nextAction: 'completed',
       },
-      publicPresentation: { kind: 'answer', text: 'Fresh Home work completed.' },
+      publicPresentation,
     };
   });
   try {

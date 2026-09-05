@@ -33,9 +33,28 @@ const adapters = await import('../read-path/read-lane-adapters.js');
 const { productionScope } = await import('../read-path/read-lane-chat.js');
 const { promoteFromVerifiedReceipt } = await import('../../memory/procedure-receipts.js');
 const eventlog = await import('./eventlog.js');
+const { presentationEventForOutcome, turnOutcomeId } = await import('./turn-outcome.js');
 const { closeOperationalTelemetryDb } = await import('../operational-telemetry.js');
 type AssistantRequest = import('../../types.js').AssistantRequest;
 type DurableReceiptRecord = import('../../memory/procedure-receipts.js').DurableReceiptRecord;
+
+function stubAnswerPresentation(
+  opts: { sessionId: string; sourceUserSeq?: number },
+  text: string,
+) {
+  const source = eventlog.listEvents(opts.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === opts.sourceUserSeq);
+  assert.ok(source, 'the bridge must establish the accepted source before runConversation');
+  const identity = { sessionId: opts.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  return presentationEventForOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  });
+}
 
 test.after(() => {
   adapters._setProductionReadAdapterDependenciesForTests(null);
@@ -208,7 +227,7 @@ test('zero body: cron and background ignore an executable warm artifact and ente
       brainRuns += 1;
       return {
         status: 'completed',
-        publicPresentation: { kind: 'answer', text: 'ordinary harness brain' },
+        publicPresentation: stubAnswerPresentation(options, 'ordinary harness brain'),
         sessionId: options.sessionId,
       } as never;
     },

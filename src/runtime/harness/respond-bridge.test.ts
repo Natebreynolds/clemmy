@@ -73,7 +73,7 @@ const { HarnessSession } = await import('./session.js');
 // eslint-disable-next-line import/first
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 // eslint-disable-next-line import/first
-const { turnOutcomeId } = await import('./turn-outcome.js');
+const { presentationEventForOutcome, turnOutcomeId } = await import('./turn-outcome.js');
 // eslint-disable-next-line import/first
 const { inspectDurableMaterialSourceContinuation } = await import('./task-continuity-runtime.js');
 // eslint-disable-next-line import/first
@@ -146,6 +146,24 @@ function stubBuildIdentity(opts: { sessionId: string; sourceUserSeq?: number }):
     } catch { /* keep the loop's direct_reply fallback */ }
   }
   return { sessionId: opts.sessionId, sourceUserSeq, route };
+}
+
+function stubAnswerPresentation(
+  opts: { sessionId: string; sourceUserSeq?: number },
+  text: string,
+) {
+  const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+    .find((event) => event.seq === opts.sourceUserSeq);
+  assert.ok(source, 'the bridge must establish the accepted source before runConversation');
+  const identity = { sessionId: opts.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  return presentationEventForOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'done',
+    resumable: false,
+    presentation: { kind: 'answer', text },
+  });
 }
 
 /** Install the smallest claim-linked semantic record whose checked projection
@@ -422,7 +440,7 @@ test('respondPreferHarness owns one runtime config capture across route, build, 
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        publicPresentation: { kind: 'answer', text: 'snapshot-owned' },
+        publicPresentation: stubAnswerPresentation(options, 'snapshot-owned'),
       };
     }) as never,
   });
@@ -476,7 +494,7 @@ test('accepted plain build skips live candidate recall while an unproven direct 
           status: 'completed',
           steps: 1,
           lastTurn: 1,
-          publicPresentation: { kind: 'answer', text: variant.label },
+          publicPresentation: stubAnswerPresentation(options, variant.label),
         };
       }) as never,
     });
@@ -529,7 +547,7 @@ test('host chat freezes engine ownership before semantic graph work', async () =
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        publicPresentation: { kind: 'answer', text: 'HOST ENGINE READY' },
+        publicPresentation: stubAnswerPresentation(options, 'HOST ENGINE READY'),
       };
     }) as never,
   });
@@ -619,7 +637,7 @@ test('fresh host candidate recall stays advisory and cannot carry source authori
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        publicPresentation: { kind: 'answer', text: 'candidate context ready' },
+        publicPresentation: stubAnswerPresentation(options, 'candidate context ready'),
       };
     }) as never,
   });
@@ -709,7 +727,7 @@ test('fresh structural work reaches the model without a historical source bindin
           status: 'completed',
           steps: 1,
           lastTurn: 1,
-          publicPresentation: { kind: 'answer', text: `started ${variant.label}` },
+          publicPresentation: stubAnswerPresentation(options, `started ${variant.label}`),
         };
       }) as never,
     });
@@ -780,7 +798,7 @@ test('a resolver-returned fresh source binding is ignored without creating a che
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        publicPresentation: { kind: 'answer', text: 'fresh task accepted' },
+        publicPresentation: stubAnswerPresentation(options, 'fresh task accepted'),
       };
     }) as never,
   });
@@ -823,7 +841,7 @@ test('production host_v1 owns fresh chat at the bridge before legacy semantics o
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        publicPresentation: { kind: 'answer', text: 'PRODUCTION HOST READY' },
+        publicPresentation: stubAnswerPresentation(options, 'PRODUCTION HOST READY'),
       };
     }) as never,
   });
@@ -2600,7 +2618,7 @@ test('active-Claude cron stays on the shared host-owned lane', async () => {
         status: 'completed',
         steps: 1,
         lastTurn: 1,
-        publicPresentation: { kind: 'answer', text: 'cron complete' },
+        publicPresentation: stubAnswerPresentation(opts, 'cron complete'),
       };
     }) as never,
     claudeAgentBrain: (async () => {
