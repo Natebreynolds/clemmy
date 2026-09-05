@@ -1445,3 +1445,47 @@ outage and asserts the extraction still validates on `MODELS.fast` in one call.
 Nothing else in the commit. Reviewer's open queue on P3: nothing owed to the
 executing agent right now — proceed; heavy-gate results (journeys / npm test /
 bench / evals) land here as they finish.
+
+**2026-09-05 05:32 UTC — EXECUTING AGENT, P3 live window:** P3 was explicitly
+approved by the owner. Its three precondition fixes are committed through
+`b699ad38`; the exact captured worker call passes the real coordinator/pool
+fixture, and 7/8 item receipts remain incomplete at both host and public delivery.
+Preparing one isolated live worker/judge replay on frozen `b699ad38`, port 64244,
+with a disposable home; the main daemon remains DOWN. Reviewer: please yield any
+daemon-sensitive heavy gates during this live window; their prior baseline results
+remain separate evidence. The write/consent implementation continues in the working
+tree, never in this frozen live checkout. No P3 acceptance, push or tag is claimed.
+
+**2026-09-04 23:00 — REVIEW of `8cb61013` (proven live writes resolve by exact
+effect + account) — ACCEPTED as plumbing; the CONNECTION is still owed.** The
+resolver is generalized (`effect` param, entry AND manifest effect must match, same
+account discipline) and the pins are the right shape: cannot borrow another effect,
+account, altered manifest or a revoked capability; two unselected accounts force an
+input choice. But `host-turn-runner.ts` still calls it with NO `effect` (defaults to
+`read`) — runner behavior is byte-identical to before; no mutation reaches this door
+yet. Per "pins prove CONNECTION": the write-bar extension counts as landed only when a
+runner-level pin shows a proven live mutation resolving through this path and then
+stopping at the SAME consent/physical-settlement boundary (allow|deny|ask, one CAS).
+Suggested order: the P2-derived red journey first (the accepted request whose write
+was refused for census reasons), then the runner wiring, so the journey flips.
+
+**2026-09-04 23:10 — REVIEW of `b699ad38` (declared local completion derived from
+item receipts) — ACCEPTED for the grading half of P2 finding #2; ONE finding on
+the stop it produces.** Right: completion truth now comes from host-owned
+`worker_result` receipts keyed by packet, never from prose; a 7/8 result publishes
+the honest partial BYTE-FOR-BYTE as `blocked` + `resumable`, names the missing item
+(`verificationMissing` ⊇ `audit-8`), and the 8/8 case completes normally; the pin
+replays the frozen-P2 capture through the real host completion AND the public
+boundary. **Finding (dead end by construction):** `blockedOutcome(…,
+'local_work_incomplete')` is NOT in `isContinueCompletionReason()`
+(`continue-directive.ts:23` — only `awaiting_continue | limit_exceeded |
+step_budget_parked | sdk_step_budget_parked`), so the never-stall policy never
+re-enters: the harness parks on a human while holding the exact list of what is
+missing. That violates NO DEAD ENDS / ONLY FAIL WHEN A TOOL IS DOWN — the next edge
+is known and cheap. Fix: (a) add `local_work_incomplete` to the continue reasons on
+BOTH lanes (`chatAutoContinueDecision` and the background `selfResumeDecision`) under
+the same guards (tool progress, attempt cap, preset); (b) `buildContinueInput` carries
+the `missing` item list so re-entry dispatches exactly those packets, not a restart;
+(c) pin: the 7/8 fixture → one host-owned re-entry → 8/8 → `done`, and a
+worker-down variant that stops at `cap_exhausted`/`no_progress` (typed, resumable,
+no loop). Until then a partial local task still needs a human "continue".
