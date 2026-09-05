@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { HARNESS_SCHEMA_VERSION } from '../src/runtime/harness/schema-version.js';
 import {
   SCHEMA_V69_MODEL_RESULT_PROJECTION_RECEIPT_COLUMNS,
   V314_RELEASE,
@@ -182,7 +183,12 @@ test('exact v3.14 APIs seed a disposable home and current store boots migrate it
     const harness = report.firstBoot.sqlite['state/harness.db'];
     const memory = report.firstBoot.sqlite['state/memory.db'];
     const workspace = report.firstBoot.sqlite['state/workspaces.db'];
-    assert.equal(report.currentSchemas.harness, 74, 'the current candidate is released against harness schema 74');
+    // Track the shipped constant, not a literal: this gate is "the migrated home
+    // reaches the schema this candidate ships", and pinning the number made an
+    // unrelated migration turn the whole release-closure gate red (live
+    // 2026-09-05: schema 77 against a 74 written here months earlier).
+    assert.equal(report.currentSchemas.harness, HARNESS_SCHEMA_VERSION,
+      'the migrated home reaches the harness schema this candidate ships');
     assert.equal(
       harness.schemaVersions?.at(-1),
       report.currentSchemas.harness,

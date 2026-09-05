@@ -1562,12 +1562,17 @@ function buildChecks(
     'session_id:events.session_id:CASCADE|amendment_event_id:events.id:CASCADE',
     'session_id:sessions.id:CASCADE',
   ].sort();
+  // The amendment shape is a v70 invariant, not a v74 fact. Pinning the CURRENT
+  // schema by equality made this check fail on the next migration that had
+  // nothing to do with amendments (live 2026-09-05: schema 77, every foreign
+  // key and both immutability triggers exactly as expected, gate red anyway).
+  // Floor it like its neighbours so a bump is reviewed on its own merits.
   add('schema_v70_amendments_have_exact_retention_cascade_and_keep_standalone_immutability',
-    currentSchemas.harness === 74
-      && firstHarness?.schemaVersions?.includes(70) === true
+    currentSchemas.harness < 70
+      || (firstHarness?.schemaVersions?.includes(70) === true
       && stable(amendmentCascadeShape) === stable(expectedAmendmentCascadeShape)
       && firstHarnessTriggers.has('trg_expected_work_universe_amendment_update_immutable')
-      && firstHarnessTriggers.has('trg_expected_work_universe_amendment_delete_immutable'), {
+      && firstHarnessTriggers.has('trg_expected_work_universe_amendment_delete_immutable')), {
         targetHarnessSchema: currentSchemas.harness,
         actualForeignKeys: amendmentCascadeShape,
         expectedForeignKeys: expectedAmendmentCascadeShape,
