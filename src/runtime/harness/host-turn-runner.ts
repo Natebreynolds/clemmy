@@ -328,10 +328,6 @@ import {
 import {
   AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
 } from './live-read-planning-authority.js';
-import {
-  evaluateQuantifiedWorkManifestGate,
-  type QuantifiedWorkManifestGateInput,
-} from './quantified-work-manifest.js';
 import { bareTerminalToolName } from './terminal-tool.js';
 import {
   initializeNoProgressGovernor,
@@ -3855,42 +3851,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
   };
 
-  /** A large direct run_worker call is graph-neutral coordination, but it is
-   * not unplanned when the existing quantified-work gate proves that the
-   * packet covers this accepted request's exact full item contract and carries
-   * the required durable manifest. This check grants only host-side fan-out
-   * admission; the worker body re-runs the same gate and its children remain
-   * compose-only. Small/ad-hoc worker calls keep the ordinary uncovered-
-   * mutation repair path. */
-  const exactQuantifiedWorkerControl = (input: {
-    name: string;
-    args: Record<string, unknown>;
-    sessionId: string;
-    sourceUserSeq: number;
-  }): boolean => {
-    if (!isPlainOrClementineLocalTool(input.name, 'run_worker')) return false;
-    const items = Array.isArray(input.args.items)
-      ? input.args.items.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      : typeof input.args.item === 'string' && input.args.item.trim()
-        ? [input.args.item]
-        : [];
-    if (items.length === 0) return false;
-    const workManifest = input.args.workManifest;
-    if (!workManifest || typeof workManifest !== 'object' || Array.isArray(workManifest)) return false;
-    try {
-      const gateInput: QuantifiedWorkManifestGateInput = {
-        sessionId: input.sessionId,
-        sourceUserSeq: input.sourceUserSeq,
-        items,
-        workManifest: workManifest as QuantifiedWorkManifestGateInput['workManifest'],
-      };
-      const gate = evaluateQuantifiedWorkManifestGate(gateInput);
-      return gate.ok && gate.required && gate.expectedCount === items.length;
-    } catch {
-      return false;
-    }
-  };
-
   const readOnlyCanaryRefusal = (
     name: string,
     args: Record<string, unknown> | null,
@@ -6386,14 +6346,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                 stage: refusedStage,
                 recoveryToolNames: attempt.consequence?.recoveryToolNames ?? [],
                 refusalDetail: lastHostRefusalDetail(history),
-                calls: historyDelta.slice(0, 8).map((entry) => {
+                calls: historyDelta.filter((entry) => (
+                  (entry as { type?: unknown }).type === 'function_call'
+                )).slice(0, 8).map((entry) => {
                   const row = entry as unknown as Record<string, unknown>;
                   const call = (row.call ?? row) as Record<string, unknown>;
+                  const argumentsJson = call.argumentsJson ?? call.arguments;
                   return {
                     name: typeof call.name === 'string' ? call.name : null,
                     callId: typeof call.callId === 'string' ? call.callId : null,
-                    argumentsJson: typeof call.argumentsJson === 'string'
-                      ? call.argumentsJson.slice(0, 1000)
+                    argumentsJson: typeof argumentsJson === 'string'
+                      ? argumentsJson.slice(0, 1000)
                       : null,
                   };
                 }),
@@ -7269,30 +7232,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       const runtimeEffect = currentFrameEffects.get(call.callId)
         ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
-      const quantifiedWorkerControl = Boolean(
+      // Delegation is a host coordinator, not an uncovered write. The exact
+      // configured packet still passes schema/source/catalog checks above; its
+      // body owns manifest validation, child leases and compose-only effects.
+      // A prose census (or an optional plan) cannot license the advertised tool.
+      const workerControl = Boolean(
         !canaryRefusal
         && hostProduction
         && parsedArguments
-        && (() => {
-          const identity = exactHostIdentity();
-          return exactQuantifiedWorkerControl({
-            name: call.name,
-            args: parsedArguments,
-            sessionId: identity.sessionId,
-            sourceUserSeq: identity.sourceUserSeq,
-          });
-        })(),
+        && approvalExactProduction
+        && isPlainOrClementineLocalTool(call.name, 'run_worker'),
       );
       const mutation = Boolean(
         !canaryRefusal
         && hostProduction
         && parsedArguments
         && approvalExactProduction
-        && !quantifiedWorkerControl
+        && !workerControl
         && ['local_write', 'external_write', 'admin'].includes(runtimeEffect),
       );
       let needs = false;
-      let consentOwned = quantifiedWorkerControl;
+      let consentOwned = workerControl;
       let consentSubject: HostInteractiveConsentSubjectV1 | undefined;
       if (mutation && parsedArguments && tool && approvalExactProduction) {
         consentOwned = true;
@@ -7345,6 +7305,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               args: approvalExactProduction.logicalArgs,
             }));
         if (!consent || consent.status !== 'decided') {
+          if (!preApprovalRepairDiagnostics.has(call.callId)) {
+            preApprovalRepairDiagnostics.set(call.callId, {
+              diagnostic: `Host refused ${call.name} before dispatch (${consent?.reason ?? 'consent_preparation_unavailable'}).`,
+            });
+          }
           preApprovalRefused = true;
           break;
         }
@@ -7380,6 +7345,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           case 'repair':
           case 'refuse':
           case 'reconcile':
+            preApprovalRepairDiagnostics.set(call.callId, {
+              diagnostic: `Host refused ${call.name} before dispatch (${consent.decision.reason}).`,
+            });
             preApprovalRefused = true;
             break;
         }

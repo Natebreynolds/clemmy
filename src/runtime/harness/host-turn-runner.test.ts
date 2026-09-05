@@ -5504,7 +5504,7 @@ test('production host carries generic user-question and worker envelopes through
       'the graphless control still owns one exact v53 child generation');
     });
 
-    await t.test('an unplanned run_worker call is paired back for repair without crossing either ledger', async () => {
+    await t.test('an unplanned run_worker call dispatches as exact host coordination', async () => {
       const fixture = acceptHostCanarySource('production-typed-worker');
       let bodies = 0;
       const exactWorkerResult = {
@@ -5560,18 +5560,18 @@ test('production host carries generic user-question and worker envelopes through
       assert.equal(Boolean(outcome.hasInterruptions), false);
       assert.equal(outcome.terminal, undefined);
       assert.equal(outcome.finalOutput, 'worker result aggregated');
-      assert.equal(bodies, 0, 'repair precedes the wrapper or worker body');
+      assert.equal(bodies, 1, 'an optional plan does not license the configured worker body');
       assert.equal(model.calls(), 2, 'run_worker is a tool capability, not a nested host/model loop');
       const providerProjection = seenInputs[1] as Array<Record<string, unknown>>;
       const result = providerProjection.find((entry) => entry.type === 'function_call_result');
       assert.equal(result?.callId, 'worker-call');
-      assert.match(JSON.stringify(result), /replan/);
+      assert.match(JSON.stringify(result), /worker-fixture-1/);
       const db = eventlog.openEventLog();
       for (const table of ['logical_tool_calls', 'physical_dispatches']) {
         assert.equal((db.prepare(`
           SELECT COUNT(*) AS n FROM ${table}
            WHERE session_id = ? AND source_user_seq = ?
-        `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0, table);
+        `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 1, table);
       }
       const root = callAuthorities.acceptedTurnCallAuthorityFor(
         fixture.session.id,
@@ -6693,6 +6693,21 @@ test('production host pairs an unplanned connected external write back for repai
     assert.equal(portBodies, 0, 'repair precedes the exact external port');
     assert.equal(outerBodies, 0);
     const db = eventlog.openEventLog();
+    assert.match(JSON.stringify(outcome.history), /before dispatch \(coverage_missing\)/,
+      'the actual consent refusal survives the model-facing result');
+    const checkpoint = db.prepare(`
+      SELECT history_json FROM accepted_model_batch_checkpoints
+       WHERE session_id = ? AND source_user_seq = ? ORDER BY batch_ordinal DESC LIMIT 1
+    `).get(fixture.session.id, fixture.source.seq) as { history_json: string };
+    assert.match(checkpoint.history_json, /before dispatch \(coverage_missing\)/,
+      'the named refusal survives durable checkpoint projection as well');
+    const refusalEvent = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+      .find((event) => event.data.kind === 'refused_pre_dispatch');
+    assert.equal(refusalEvent?.data.refusalDetail, 'coverage_missing');
+    assert.deepEqual(refusalEvent?.data.calls, [{
+      name: 'call_tool', callId: 'external-write-call',
+      argumentsJson: JSON.stringify({ name: operationId, args_json: JSON.stringify({ name: 'Fixture Attorney', city: 'Seattle' }) }),
+    }], 'journal retains the actual refused call bytes, not null reasoning/result placeholders');
     for (const table of ['logical_tool_calls', 'physical_dispatches']) {
       assert.equal((db.prepare(`
         SELECT COUNT(*) AS n FROM ${table}
