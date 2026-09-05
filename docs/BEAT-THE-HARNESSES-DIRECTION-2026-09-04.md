@@ -2561,3 +2561,14 @@ input-digest staged identity, and the cold-surface byte ceiling — 28.8 KB → 
 step-1, 37.6 KB → <32 KiB pre-activation); (4) the draft canary re-runs on Claude
 Sonnet 5 explicitly pinned (Codex quota is out until 09-11), after the current gate
 pass. Push/tag still only on the owner's words.
+
+**2026-09-05 06:55 — LATEST UI MERGED AND BUILT.** `ui/main-window` committed (`0cd6ccd7`:
+command-center home, customizable panes/nav/landing/quick actions persisted per user
+via `/api/console/settings/home` + `/m/api/settings/home`, phone floating ask
+capsule, impeccable v4.2), merged with the wave branch with zero conflicts
+(`ac3d64dd`, now the wave tip). Verified in the main checkout: typecheck ✅ ·
+`build:console-web` ✅ · `build:mobile-web` ✅ (both `dist/` rebuilt 06:54, the
+bundles the live daemon serves at `/` and `/m`) · mobile-web unit tests 95/95 ✅ ·
+hygiene ✅. The phone finish review on a real device is still owed — that is the
+live test itself. Next: journey fixes land → final gates on the merged bytes →
+owner starts the daemon on the live home and mints the QR.
