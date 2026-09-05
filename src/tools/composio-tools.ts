@@ -1267,6 +1267,9 @@ function currentDocumentedCreateProjection(input: {
   connectionId: string | undefined;
   providerSchemaLeaseFingerprint: string | undefined;
   providerInputSchemaDigest: string | undefined;
+  /** The dispatch ledger's own raw -> effective refinement of this logical
+   * call, when the trusted resolver performed one before this projection. */
+  refinedLogicalCall: { rawArgumentDigest: string; effectiveArgumentDigest: string } | null;
 }): RuntimeDocumentedCreateProjection {
   const attestation = currentHostCallAttestation();
   const work = currentExpectedWorkBinding();
@@ -1290,12 +1293,27 @@ function currentDocumentedCreateProjection(input: {
   if (attestation.bindingKind !== 'catalog_manifest') {
     return { status: 'refused', reason: 'documented create lacks catalog-manifest authority' };
   }
+  // The attestation was frozen at ADMISSION over the model's exact inner
+  // arguments; `input.args` are the provider-ready bytes the gateway resolved
+  // from them (host-only keys such as `artifact_key` or an inline
+  // `connected_account_id` deleted). The ledger records that as ONE raw ->
+  // effective refinement of the same logical call, and the physical crossing,
+  // the host capability binding and the settlement all speak the effective
+  // digest. Comparing the raw attestation against the effective contract
+  // refused the host's own planned create although nothing changed
+  // semantically. Accept the attestation on the raw side of the refined row
+  // — the same rule logical admission applies — and project the authority
+  // on the effective digest every later proof compares against.
+  const attestationCoversContract = attestation.argumentDigest === contract.argumentDigest
+    || (input.refinedLogicalCall !== null
+      && input.refinedLogicalCall.effectiveArgumentDigest === contract.argumentDigest
+      && input.refinedLogicalCall.rawArgumentDigest === attestation.argumentDigest);
   if (
     attestation.acceptedTaskId !== logical.acceptedTaskId
     || attestation.logicalToolCallId !== logical.logicalToolCallId
     || attestation.operationId !== input.toolSlug
     || attestation.toolName !== contract.toolName
-    || attestation.argumentDigest !== contract.argumentDigest
+    || !attestationCoversContract
     || attestation.effect !== 'external_write'
   ) return { status: 'refused', reason: 'host call attestation conflicts with the exact provider call' };
   if (
@@ -1345,7 +1363,7 @@ function currentDocumentedCreateProjection(input: {
       operationId: attestation.operationId,
       accountId: attestation.accountId,
       providerInputSchemaDigest: attestation.providerInputSchemaDigest,
-      argumentDigest: attestation.argumentDigest,
+      argumentDigest: contract.argumentDigest,
       submittedContentDigest: submitted.submittedContentDigest,
       resultIdentity: submitted.resultIdentity,
       effect: 'external_write',
@@ -3961,13 +3979,17 @@ async function runComposioExecuteInner(
   }
   args = resolved.args;
   const resolvedRun = harnessRunContextStorage.getStore();
+  // The ledger's verdict on the gateway's raw -> provider-ready rewrite. Every
+  // later identity compare on this call (projection, crossing, settlement)
+  // must read the same refined row rather than re-digesting raw bytes.
+  let refinedLogicalCall: { rawArgumentDigest: string; effectiveArgumentDigest: string } | null = null;
   if (
     currentLogicalCall()
     && resolvedRun?.sessionId
     && Number.isSafeInteger(resolvedRun.sourceUserSeq)
     && (resolvedRun.sourceUserSeq ?? 0) > 0
   ) {
-    authorizeResolvedLogicalCallContract({
+    refinedLogicalCall = authorizeResolvedLogicalCallContract({
       sessionId: resolvedRun.sessionId,
       sourceUserSeq: resolvedRun.sourceUserSeq as number,
       turn: resolvedRun.turn,
@@ -3984,6 +4006,7 @@ async function runComposioExecuteInner(
     connectionId: effectiveConnectionId,
     providerSchemaLeaseFingerprint: resolved.schemaFingerprint,
     providerInputSchemaDigest: resolved.providerInputSchemaDigest,
+    refinedLogicalCall,
   });
   if (documentedCreateProjection.status === 'refused') {
     settleComposioPreDispatchRefusal(toolSlug, 'constraint', args);

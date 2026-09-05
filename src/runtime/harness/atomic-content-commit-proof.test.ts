@@ -25,6 +25,8 @@ const WRITE_NODE = 'write_once';
 const PROVIDER_OPERATION = 'GOOGLESHEETS_SHEET_FROM_JSON';
 const LOGICAL_TOOL = 'googlesheets_sheet_from_json';
 const ARGUMENT_DIGEST = 'b'.repeat(64);
+/** The provider-ready identity after the gateway strips host-only keys. */
+const EFFECTIVE_DIGEST = '1'.repeat(64);
 const SCHEMA_DIGEST = 'a'.repeat(64);
 const ACCOUNT = 'conn-googlesheets';
 const PHYSICAL = 'physical-sheet-create';
@@ -132,9 +134,23 @@ function sealed(overrides: Partial<SealedNodeBinding> = {}): SealedNodeBinding {
   };
 }
 
-function fixtureDb(): Database.Database {
+interface LedgerRow {
+  raw: string;
+  effective: string | null;
+  current?: string;
+  state?: 'open' | 'settled' | 'conflict';
+  acceptedTaskId?: string;
+  toolName?: string;
+}
+
+function fixtureDb(input: { expectedWorkDigest?: string; ledger?: LedgerRow } = {}): Database.Database {
   const db = new Database(':memory:');
   db.exec(`
+    CREATE TABLE logical_tool_calls (
+      session_id TEXT, source_user_seq INTEGER, accepted_task_id TEXT,
+      logical_tool_call_id TEXT, tool_name TEXT, argument_digest TEXT,
+      raw_argument_digest TEXT, effective_argument_digest TEXT, state TEXT
+    );
     CREATE TABLE expected_work_call_bindings (
       session_id TEXT, source_user_seq INTEGER, accepted_task_id TEXT,
       contract_id TEXT, requirement_id TEXT, logical_tool_call_id TEXT,
@@ -175,8 +191,16 @@ function fixtureDb(): Database.Database {
   `);
   insertBinding.run(
     SESSION, SOURCE_SEQ, TASK, CONTRACT, WRITE_NODE, WRITE_CALL,
-    LOGICAL_TOOL, ARGUMENT_DIGEST, 'external_write',
+    LOGICAL_TOOL, input.expectedWorkDigest ?? ARGUMENT_DIGEST, 'external_write',
   );
+  if (input.ledger) {
+    db.prepare(`INSERT INTO logical_tool_calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      SESSION, SOURCE_SEQ, input.ledger.acceptedTaskId ?? TASK, WRITE_CALL,
+      input.ledger.toolName ?? LOGICAL_TOOL,
+      input.ledger.current ?? input.ledger.effective ?? input.ledger.raw,
+      input.ledger.raw, input.ledger.effective, input.ledger.state ?? 'settled',
+    );
+  }
   insertBinding.run(
     SESSION, SOURCE_SEQ, TASK, CONTRACT, READ_NODE, READ_CALL,
     'restaurants_search', 'e'.repeat(64), 'read',
@@ -213,8 +237,19 @@ function prove(input: {
   rootKind?: 'turn_graph' | 'host_v1';
   plantHostLookalike?: boolean;
   typedAuthority?: 'exact' | 'missing' | 'conflict';
+  /** The admission-time identity frozen on the expected-work binding. */
+  expectedWorkDigest?: string;
+  /** The dispatch ledger's raw -> effective refinement of the logical call. */
+  ledger?: LedgerRow;
+  /** The identity every crossing-side authority (result, sealed node, typed
+   * physical authority) speaks. */
+  crossingDigest?: string;
 }) {
-  const db = fixtureDb();
+  const crossing = input.crossingDigest ?? ARGUMENT_DIGEST;
+  const db = fixtureDb({
+    ...(input.expectedWorkDigest ? { expectedWorkDigest: input.expectedWorkDigest } : {}),
+    ...(input.ledger ? { ledger: input.ledger } : {}),
+  });
   try {
     if (input.rootKind) {
       db.prepare(`UPDATE accepted_turn_call_authorities SET authority_kind = ?`).run(input.rootKind);
@@ -235,12 +270,15 @@ function prove(input: {
       node: writeNode,
       logicalToolCallId: WRITE_CALL,
       created: {
-        rawPayload: input.rawPayload ?? projected(),
+        rawPayload: input.rawPayload ?? projected({ ...authority, argumentDigest: crossing }),
         toolName: input.toolName ?? LOGICAL_TOOL,
         executionSite: input.executionSite ?? 'provider',
         physicalDispatchId: PHYSICAL,
       },
-      resolveSealedNodeAuthority: () => ({ ok: true, binding: input.binding ?? sealed() }),
+      resolveSealedNodeAuthority: () => ({
+        ok: true,
+        binding: input.binding ?? sealed({ argumentDigest: crossing }),
+      }),
       resolveTypedPhysicalAuthority: () => input.typedAuthority === 'missing'
         ? { status: 'missing', reason: 'typed physical authority is absent' }
         : input.typedAuthority === 'conflict'
@@ -260,7 +298,7 @@ function prove(input: {
                 manifestDigest: '9'.repeat(64),
                 operationVersion: sealed().schemaVersion,
                 providerInputSchemaDigest: SCHEMA_DIGEST,
-                logicalArgumentDigest: ARGUMENT_DIGEST,
+                logicalArgumentDigest: crossing,
                 canonicalArgumentDigest: '8'.repeat(64),
                 accountId: ACCOUNT,
                 resolvedEffect: 'external_write',
@@ -294,5 +332,79 @@ test('atomic content proof binds the canonical result to sealed account, schema,
   ]) {
     assert.deepEqual(candidate.ok, false);
     if (!candidate.ok) assert.equal(candidate.status, 'conflict');
+  }
+});
+
+/**
+ * ADMIT bytes vs SETTLE bytes. The expected-work binding is frozen at
+ * admission over the model's exact inner arguments and never updated; the
+ * gateway then strips host-only keys (`artifact_key`, an inline
+ * `connected_account_id`, ...) and the dispatch ledger records ONE raw ->
+ * effective refinement. The result projection, the sealed/host authority and
+ * the settlement all speak the effective digest. Comparing the admission
+ * identity against the crossing identity refused the proof of every refined
+ * documented create AFTER the provider had written it.
+ */
+test('atomic content proof joins the admission-time binding to the crossing through the ledger refinement', () => {
+  const refined = prove({
+    expectedWorkDigest: ARGUMENT_DIGEST,
+    ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST },
+    crossingDigest: EFFECTIVE_DIGEST,
+  });
+  assert.deepEqual(refined.ok, true, JSON.stringify(refined));
+
+  // An unrefined call still holds on its one identity, with or without a ledger row.
+  assert.equal(prove({ ledger: { raw: ARGUMENT_DIGEST, effective: null } }).ok, true);
+});
+
+test('atomic content proof still refuses an edited call whose identities the ledger did not refine together', () => {
+  const edited = 'f'.repeat(64);
+  for (const [label, candidate] of Object.entries({
+    // The model's admitted call is not the one the ledger refined.
+    admitted_call_differs: prove({
+      expectedWorkDigest: edited,
+      ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST },
+      crossingDigest: EFFECTIVE_DIGEST,
+    }),
+    // The provider crossing is not the refinement the ledger sealed.
+    crossing_differs: prove({
+      expectedWorkDigest: ARGUMENT_DIGEST,
+      ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST },
+      crossingDigest: edited,
+    }),
+    // The ledger never refined this call: two identities without a join.
+    no_refinement: prove({
+      expectedWorkDigest: ARGUMENT_DIGEST,
+      ledger: { raw: ARGUMENT_DIGEST, effective: null },
+      crossingDigest: EFFECTIVE_DIGEST,
+    }),
+    no_ledger_row: prove({ expectedWorkDigest: ARGUMENT_DIGEST, crossingDigest: EFFECTIVE_DIGEST }),
+    // The ledger's current contract is not its own refinement (stale row).
+    stale_current_contract: prove({
+      expectedWorkDigest: ARGUMENT_DIGEST,
+      ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST, current: ARGUMENT_DIGEST },
+      crossingDigest: EFFECTIVE_DIGEST,
+    }),
+    conflicted_ledger_row: prove({
+      expectedWorkDigest: ARGUMENT_DIGEST,
+      ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST, state: 'conflict' },
+      crossingDigest: EFFECTIVE_DIGEST,
+    }),
+    other_task_ledger_row: prove({
+      expectedWorkDigest: ARGUMENT_DIGEST,
+      ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST, acceptedTaskId: 'task:other#1' },
+      crossingDigest: EFFECTIVE_DIGEST,
+    }),
+    other_tool_ledger_row: prove({
+      expectedWorkDigest: ARGUMENT_DIGEST,
+      ledger: { raw: ARGUMENT_DIGEST, effective: EFFECTIVE_DIGEST, toolName: `${LOGICAL_TOOL}_lookalike` },
+      crossingDigest: EFFECTIVE_DIGEST,
+    }),
+  })) {
+    assert.deepEqual(candidate.ok, false, label);
+    if (!candidate.ok) {
+      assert.equal(candidate.status, 'conflict', label);
+      assert.equal(candidate.reason, 'atomic create has no exact expected-work binding', label);
+    }
   }
 });

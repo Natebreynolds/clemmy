@@ -121,6 +121,59 @@ function sameExactAtomicOperation(left: string, right: string): boolean {
 }
 
 /**
+ * ADMIT bytes vs SETTLE bytes. The expected-work binding is written ONCE at
+ * admission over the model's exact inner arguments (the raw carrier) and is
+ * never updated. The Composio gateway then deletes host-only keys before
+ * dispatch (`artifact_key`, `output_key`, an inline `connected_account_id`,
+ * `account_alias`), and the dispatch ledger records that as ONE raw ->
+ * effective refinement of the same logical call; the projection, the host
+ * capability binding and the settlement all speak the EFFECTIVE digest.
+ * Comparing the admission-time identity against the effective identity
+ * refused every refined documented create AFTER the provider wrote it.
+ *
+ * The binding holds against its own admission-time identity; the crossing
+ * holds against the effective identity; the ledger's refined row is the one
+ * durable fact that joins them. Any other pair is still a conflict: an edited
+ * call cannot pass because the ledger admits exactly one refinement, sealed
+ * before any physical crossing, and both sides must be that refinement.
+ */
+function expectedWorkBindingCoversCrossing(input: {
+  db: Database.Database;
+  sessionId: string;
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  logicalToolCallId: string;
+  toolName: string;
+  admittedArgumentDigest: string;
+  crossingArgumentDigest: string;
+}): boolean {
+  if (input.admittedArgumentDigest === input.crossingArgumentDigest) return true;
+  const logical = input.db.prepare(`
+    SELECT accepted_task_id, tool_name, argument_digest, raw_argument_digest,
+           effective_argument_digest, state
+      FROM logical_tool_calls
+     WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+  `).get(input.sessionId, input.sourceUserSeq, input.logicalToolCallId) as {
+    accepted_task_id: string;
+    tool_name: string;
+    argument_digest: string;
+    raw_argument_digest: string;
+    effective_argument_digest: string | null;
+    state: string;
+  } | undefined;
+  return Boolean(
+    logical
+    && logical.state !== 'conflict'
+    && logical.accepted_task_id === input.acceptedTaskId
+    && logical.tool_name === input.toolName
+    && logical.effective_argument_digest !== null
+    && logical.argument_digest === logical.effective_argument_digest
+    && logical.raw_argument_digest === input.admittedArgumentDigest
+    && logical.effective_argument_digest === input.crossingArgumentDigest,
+  );
+}
+
+/**
  * Re-prove acknowledged committed content from exact durable facts. This does
  * not claim provider readback: the returned digest is the frozen submitted
  * content digest, bound to a clean provider acknowledgement and the exact
@@ -182,7 +235,16 @@ export function verifyAtomicContentCommit(input: {
     || binding.accepted_task_id !== input.acceptedTaskId
     || binding.requirement_id !== input.node.operationId
     || binding.tool_name !== input.node.resolvedTool
-    || binding.argument_digest !== projected.binding.argumentDigest
+    || !expectedWorkBindingCoversCrossing({
+      db: input.db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      logicalToolCallId: input.logicalToolCallId,
+      toolName: binding.tool_name,
+      admittedArgumentDigest: binding.argument_digest,
+      crossingArgumentDigest: projected.binding.argumentDigest,
+    })
     || binding.effect_kind !== 'external_write'
   ) return { ok: false, status: 'conflict', reason: 'atomic create has no exact expected-work binding' };
 
