@@ -584,6 +584,43 @@ export function hostNoProgressRecoveryToolNames(
   }));
 }
 
+/** The repair sentence for a pre-dispatch miss with no plan-bound operation.
+ *
+ * NAME THE PROVIDER THE MODEL ACTUALLY ASKED FOR. Live 2026-09-05, a cold
+ * "create one Outlook draft": the model disclosed an Outlook operation through
+ * tool_search, composed the exact draft, and the refusal answered with twenty
+ * proven operations from Greenhouse, OpenAI, Airtable, Slack and Firecrawl —
+ * not one of them Outlook. It searched six more times and the turn died at the
+ * no-progress floor. A menu drawn from the wrong providers is worse than no
+ * menu: it invites substituting a different service for the one the user named.
+ * So rank the proven set by the toolkit the call names, and when that toolkit
+ * has nothing proven, say exactly that instead of offering the others. */
+export function hostProvenOperationRepair(input: {
+  requestedOperation: string;
+  provenOperations: readonly string[];
+  limit?: number;
+}): string {
+  const toolkitOf = (operationId: string): string => operationId.split('_')[0] ?? '';
+  const requestedToolkit = toolkitOf(input.requestedOperation.trim().toUpperCase());
+  const proven = input.provenOperations.filter((operationId) => operationId.trim().length > 0);
+  const sameToolkit = requestedToolkit
+    ? proven.filter((operationId) => toolkitOf(operationId) === requestedToolkit)
+    : [];
+  const otherToolkits = proven.filter((operationId) => (
+    !requestedToolkit || toolkitOf(operationId) !== requestedToolkit
+  ));
+  const ranked = [...sameToolkit, ...otherToolkits].slice(0, Math.max(1, input.limit ?? 12));
+  if (ranked.length === 0) {
+    return ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that order.';
+  }
+  if (requestedToolkit && sameToolkit.length === 0) {
+    return ` Nothing from ${requestedToolkit} is proven for this step, so no ${requestedToolkit} operation can be dispatched yet — do not substitute another provider for it.`
+      + ` What IS proven here: ${ranked.join(', ')}.`
+      + ` If this step needs ${requestedToolkit}, call tool_search for the exact ${requestedToolkit} operation and reissue with the slug it returns.`;
+  }
+  return ` The operations proven for this step are: ${ranked.join(', ')}. Use one of those exactly, with tool_slug spelled exactly as listed.`;
+}
+
 export function hostNoProgressRecoveryDirective(state: NoProgressGovernorState): string {
   const consequence = state.lastConsequence;
   if (!consequence) return HOST_NO_PROGRESS_RECOVERY_DIRECTIVE;
@@ -4176,11 +4213,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               .map((entry) => entry.identifier.trim().toUpperCase()),
             ...(currentAcceptedSourceCatalogManifestScope()?.operationIds ?? []),
           ].filter((operationId) => operationId && operationId !== name.toUpperCase()))];
+      const requestedOperation = (() => {
+        try {
+          return (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim().toUpperCase();
+        } catch {
+          return '';
+        }
+      })();
       const repair = boundOperations.length > 0
         ? ` This turn bound: ${boundOperations.join(', ')}. Use available discovery or read tools if needed, then reissue the call under the existing plan with its exact requirement_id and corrected inner name and arguments.`
-        : provenOperations.length > 0
-          ? ` The operations proven for this step are: ${provenOperations.join(', ')}. Use one of those exactly, with tool_slug spelled exactly as listed.`
-          : ' No operation is bound to this turn yet. If this call writes or sends: call tool_search for the exact operation, then plan_task naming it, then work_call — that is the door for a write no plan has bound. If it only reads: call tool_search and retry with the exact operation name it returns.';
+        : hostProvenOperationRepair({ requestedOperation, provenOperations });
       const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
       if (literalOperation) {
         return `Tool '${name}' was refused before dispatch because this step names the operation ${literalOperation} but the host did not provision it into this run's frozen catalog. Failed check: ${lastExactProductionMiss}. This is a host provisioning fault, not an argument error: no correction or substitute capability can be dispatched, and no local or external mutation was attempted.`;

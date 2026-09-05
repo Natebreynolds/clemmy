@@ -97,6 +97,40 @@ const composioSchemas = await import('../../tools/composio-schema-cache.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 
+test('a pre-dispatch repair names the provider the call asked for, never a substitute', async () => {
+  // Live 2026-09-05, cold "create one Outlook draft": the model disclosed an
+  // Outlook operation, composed the exact draft, and this refusal answered with
+  // twenty proven operations from Greenhouse, OpenAI, Airtable, Slack and
+  // Firecrawl — none of them Outlook. It searched six more times and the turn
+  // died at the no-progress floor.
+  const { hostProvenOperationRepair } = await import('./host-turn-runner.js');
+  const foreign = [
+    'GREENHOUSE_CREATE_USER_EMAIL', 'OPENAI_CREATE_MESSAGE', 'AIRTABLE_CREATE_RECORD',
+    'SLACK_GET_WORKSPACE_CONNECTIONS_FOR_CHANNEL', 'FIRECRAWL_SEARCH',
+  ];
+  const wrongProvider = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_CREATE_MAIL_FOLDER_MESSAGE',
+    provenOperations: foreign,
+  });
+  assert.match(wrongProvider, /Nothing from OUTLOOK is proven for this step/);
+  assert.match(wrongProvider, /do not substitute another provider/);
+  assert.match(wrongProvider, /call tool_search for the exact OUTLOOK operation/);
+  assert.ok(!/^ The operations proven for this step are/.test(wrongProvider),
+    'a menu from the wrong providers must not be presented as the answer');
+
+  const sameProvider = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_CREATE_MAIL_FOLDER_MESSAGE',
+    provenOperations: [...foreign, 'OUTLOOK_CREATE_DRAFT'],
+  });
+  assert.match(sameProvider, /The operations proven for this step are: OUTLOOK_CREATE_DRAFT/,
+    'the toolkit the call named leads the list');
+
+  assert.match(
+    hostProvenOperationRepair({ requestedOperation: 'OUTLOOK_CREATE_DRAFT', provenOperations: [] }),
+    /No operation is bound to this turn yet/,
+  );
+});
+
 test('returned nested-call repair requires exact zero-crossing invalid-arguments settlement truth', () => {
   const returnedAttempt = {
     outcome: { kind: 'invalid_arguments', directive: { action: 'repair_arguments' } },
