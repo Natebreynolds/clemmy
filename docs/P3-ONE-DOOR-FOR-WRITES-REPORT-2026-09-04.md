@@ -32,6 +32,19 @@ unless explicitly marked live.
 | `ddccda93` | Six consent adapters use one call/coverage value builder; exact graph-neutral catalog call uses existing reducer and durable approval | `/private/tmp/p3-consent-direct-red.log` 0/4, exit 1; final expanded suite 54/54, typecheck exit 0. Covers reversible draft, send/delete/admin ask, args/account/schema drift, exact approval replay and uncertain-crossing reconciliation |
 | `79686a6b` | An unavailable judge pin does not prevent non-judgment structured extraction | Actual extractor invocation RED; extraction plus judge regression 14/14, exit 0 |
 | `64c3bfa5` | Release hygiene fixture and dynamic release-schema assertion | Release assets RED 52/53 → GREEN 53/53. Hygiene green after reviewer corrected their own quoted URL; reviewer changes committed verbatim |
+| `72565801` | Existing consent effect/account/risk fields survive live and replayed approval presentation; authority stays private | Targeted card 3/3, public 41/41, loop 27/27, isolated chat 19/19; typecheck exit 0. One combined process flake passed isolation; not chased |
+| `cf50388e` | Strict plan validation happens once inside the tool body; aggregate shape/missing-write/lineage repairs and hash the full issue set | Actual invocation RED 2 failures, exit 1; `/private/tmp/p3-plan-singlepass-final.log` 80/80, typecheck exit 0 |
+| `f616da92` | Exact live write resolution, logical admission, existing consent and existing direct invoke happen in one model step; exact approval resume shares that call | `/private/tmp/p3-direct-core-final.log` 258/258, typecheck exit 0. Pins draft allow, send/delete/admin ask, rejection/changed/wrong/expired approval zero dispatch, uncertain write no replay, and JIT read→write reclassification before consent |
+| `9358dc08` | Resumed accepted source includes the original objective plus the actual answer, not private host instructions | Real producer→bridge RED exit 1; lifecycle/bridge 25/25 and account regressions 22/22, typecheck exit 0. Existing answer selects the right account and remains recoverable on continuation; unknown answer still asks |
+
+Response to reviewer §12 22:57 write-bar question: `f616da92` connects the
+mutation resolver in `host-turn-runner.ts` (`provenWriteCandidate`): it calls
+`resolveProvenLiveCatalogEntry` with `effect: decision.effect` for external_write
+or admin. No explicit capability reference means a unique current account is
+required, not a synthetic default-account id. The fixture registers the exact
+write after the model request froze its empty catalog and proves one dispatch.
+Thus this is a connected write fallback, not only a read resolver or a claim that
+consent makes resolution unnecessary.
 
 Reviewer accepted judge/worker dispatch changes and local completion's grading
 half. Reviewer requires bounded automatic re-entry for `local_work_incomplete`,
@@ -55,6 +68,13 @@ waived by marking the terminal resumable.
   `LogicalCallPreDispatchAuthorityError: host call lacks exact live capability attestation`.
   Nested SDK execution attempted a tool without the host attestation; the parent
   accepted authority was then poisoned and could not settle/reopen its checkpoint.
+- Required follow-up to reviewer §12 23:40: the full stopped home database has
+  **one session, the parent**, no child sessions. Its `host_v1` authority is
+  `conflict` with that exact close reason. Only five parent logical rows exist
+  (two searches/two reads settled, `run_worker` open); there are no admitted child
+  rows. All eight errors explicitly report `(conflict)`, not `missing`. This
+  resolves the reviewer's two-site hypothesis at the host-attestation match before
+  child-row admission; it is not evidence of a missing isolated child database.
 - Terminal: `blocked`, `resumable:true`, retained two package-read handles, no
   external changes. This is not a successful fan-out or P3 acceptance.
 - One real Claude Sonnet 5 watcher call succeeded on `claude_code_headless`,
@@ -67,8 +87,18 @@ waived by marking the terminal resumable.
   reproduces both missing attestation and parent authority poisoning.
 
 This exposed a gap in the earlier pool fixture: stubbing `asTool.invoke` proved
-the coordinator/pool but skipped the child SDK tool boundary. Keep both tests;
-do not relabel that fixture as end-to-end worker execution.
+the coordinator/pool but skipped the child SDK tool boundary. The original RED
+log remains retained. The replacement pin keeps a byte-identical captured
+coordinator boundary case, and replaces the child-provider response only for
+full/partial/uniform-failure cases; genuine `read_file` dispatch and settlements
+are required. Those local child cases substitute only an isolated nonce-file
+path. They are not the byte-identical live replay.
+
+The next cold live replay uses a fresh ledger, the new frozen implementation,
+and the exact prior `submitted-prompt.json` prompt/packet, including original
+read-only package/nonce paths. Setup copies the original nonce expectations into
+the new collector home without changing the original files. Record prompt and
+packet hashes plus byte-equality checks; no revised task or stronger prompt.
 
 ## Same canary — invocation contract
 

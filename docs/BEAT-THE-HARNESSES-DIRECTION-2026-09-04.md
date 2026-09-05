@@ -1722,3 +1722,93 @@ from "23:00" through "2026-09-05 00:10" above were written between ~22:35 and 22
 machine time (the reviewer estimated instead of reading the clock; drift grew to
 ~80 min). Entry ORDER is correct; the executing agent's commit times are the
 authoritative timeline. From here on reviewer stamps are read from `date`.
+
+**2026-09-04 22:57 — REVIEW of `f616da92` (consent + dispatch of an exact live write in ONE
+step) — ACCEPTED at the fixture level; this is P3's core item.** The authored-step
+call authority is generalized into `HostConsentCallAuthority` (`host_consent_call`),
+minted only from a DECIDED reducer consent whose coverage contract is
+`authored-workflow:<sha>` or `accepted-call:<sha>` — no other minter. The pin
+(`host-direct-write.integration.test.ts`) proves the three outcomes on the real
+runner: allow → one model call, one provider call, one preparation, zero carrier
+bodies, zero approval rows, no `awaiting_user_input`, no graph compile, adapter
+receives the exact grant + account binding; ask → `send/delete/admin` pause BEFORE
+I/O and an unchanged durable approval resumes the exact call; deny/changed →
+rejected, edited-args, wrong-approval, expired all cannot execute and stay paired in
+model history, and an uncertain state is reconciliation, never a new approval. The
+`kind` discriminator is not persisted, so the rename is safe. Still owed: the LIVE
+proof (five ordinary reversible draft writes, zero approval cards, zero sends —
+the P3 acceptance list), and the runner still resolves proven-live capabilities
+read-only (23:00 entry) — either wire `effect` for mutations or state in the P3
+report why the consent path makes that resolver unnecessary for writes.
+
+**2026-09-04 22:57 — REVIEW of `cf50388e` (aggregate plan repairs in one strict body pass) —
+ACCEPTED; closes the P3 "single-pass plan validation" item.** `plan_task` validates
+against the strict SDK schema and returns ALL issues in one `plan_invalid_input`
+refusal (shape + semantic together; pinned: preamble, version, dataFrom, missing
+attestation in one detail) with a `repairKey` = sha of the sorted issue set; the
+no-progress projection suffixes the stage with that key, so a different repair
+round counts as progress while an identical refusal loop still trips the governor
+(pinned: distinct consequence keys, historical unkeyed members still valid). This
+is the right shape under "shape rejections must never end a turn": the model gets
+one complete repair list, not a drip. P3 checklist: ✅ one attestation builder ·
+✅ same-step consent+dispatch (fixture) · ✅ single-pass plan validation · ⏳ live
+proof · ⏳ write-bar resolver decision · ❗ worker-child attestation (live red).
+
+**2026-09-04 22:58 — JOURNEYS CLASSIFIED (same 9 files, pre-today `38fa83ad` vs candidate
+`64c3bfa5`, isolated homes, real exit codes): 11 pre-existing · 4 NEW TODAY · 1
+fixed today.** NEW today — forward-only regressions unless the journey encodes a
+hoop that P0–P2 deliberately removed (then update the journey to the new contract
+WITH the same evidence; never delete, never leave red): (1) "GATE surface: fresh
+discovery has no worker/business I/O; admitted plan swaps discovery controls for
+run_worker in the same agent" (`true !== false`); (2) "cold natural Discord request
+performs one restaurant read and one new-Sheet create in one foreground loop" — the
+primary loop's tool set now advertises `run_worker` alongside `ask_user_question`
+/`call_tool`; (3) "release row 15: Home, Discord, mobile, CLI, and cron share one
+host_v1 owner and typed outcome algebra" — Home no longer returns the exact durable
+session; (4) "the two-operation business request produces exactly four verified
+provider phases" — canonical terminal `'blocked' !== 'done'` (smells like the P1
+completion judge / delivery hold). FIXED today: "100 cold 10K-catalog permutations
+stay bounded". PRE-EXISTING (the 08-31 wave debt, 11): three outbound-draft approval
+subtests, legacy input-digest staged identity, plan-with-no-exact-verifier, accepted
+read plan cannot stop at prose, competitive byte ledger, external plans without a
+random gate, local-llm content workspace e2e, firecrawl Search→Batch→Workspace,
+zero-crossing retirement scope. Note (1) and (2) are on the CANDIDATE, which predates
+`752603bf` — they come from the P1/P2 commits, not from the worker-dispatch change.
+The reviewer is attributing the four to a phase boundary next (same files at the P2
+frozen SHA `4ed325eb`), then HEAD. The release workflow runs `npm run journeys` as a
+blocking gate: the tag needs the 4 fixed AND a decision on the 11 (fix, or move
+them out of the release gate explicitly with the reason in `docs/releases/v3.16.0.md`
+— silently red is not an option).
+
+**2026-09-04 22:59 — `9358dc08` (resumed background tasks journal the accepted answer) —
+ACCEPTED; this is §16 fix #1, the single largest measured waste (~164 s of the
+222 s P2 leg).** `displayMessage` is now `task.prompt + "\n\n" + answer`, so the
+accepted `user_input_received` text carries the account answer the scanners read;
+pinned: the accepted text is exactly prompt+answer, no host wrapper leaks into the
+journal, the task contract is not rewritten, the resolution stays
+single-consumption, and ONE account lookup at the model-loop boundary resolves to
+the answered account. Measure it the way it was found: re-run the P2 resumed leg
+cold and expect zero re-asks and ≤3 `tool_search` (was 11 of 17 steps). Fixes #3
+(governor stops re-admitting an already-answered search) and #2 (host-relayed
+clarification) still stand as the belt-and-braces behind this.
+
+**2026-09-04 23:03 — ATTRIBUTION of the 4 new journey failures (same 4 files run at end-of-P1
+`2bd49667`, isolated homes):** already red at end of P1 → **P0/P1 introduced:**
+(a) "two-operation business request produces exactly four verified provider phases"
+— canonical terminal `'blocked' !== 'done'`: the P1 completion judge / delivery
+hold now blocks a two-operation request the ledger says completed; check the hold
+reason on that fixture (judge unavailable? read-plan-pending? local-work
+projection?) — a verified completion must publish `done`; (b) "release row 15: Home,
+Discord, mobile, CLI, cron share one host_v1 owner and typed outcome algebra" —
+Home no longer returns the exact durable session. Green at end of P1, red on the
+candidate → **P2 introduced:** (c) "GATE surface: fresh discovery has no
+worker/business I/O; admitted plan swaps discovery controls for run_worker"; (d)
+"cold natural Discord request … one foreground loop" — both see `run_worker`
+advertised in the primary loop's tool set from step 1. If P2 deliberately advertises
+the worker from step 1 (plan-optional, D5), these two journeys encode the removed
+hoop: update them to assert the NEW contract with the same evidence (fresh discovery
+still performs no worker/business I/O because pre-dispatch admission refuses it —
+assert the refusal receipt, not the tool's absence). If it was not deliberate, it is
+a regression. Early-vs-late P2 split (`4ed325eb`) follows. Ignore "GATE scheduling
+latency … p95" in this run: it failed under three concurrent test runs on one
+machine (CPU contention), not on the candidate's full run.
