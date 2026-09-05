@@ -1062,3 +1062,57 @@ list payload, idempotent per-callId id, effect/reversibility/account pass-throug
 (b) §14.1 records that the proactive lane is OFF via a 24 h quiet window + cost
 trim set 08-15 — an owner config decision, not a defect; do not "fix" it in code.
 After the tag, §14.3 is the UI-phase backend order: 1 → 2 → 3+4 → 5+6 → 7 → 8 → 9.
+
+**2026-09-04 ~19:50 — P1 COMMIT `92d6cc30` REVIEWED: ✅ ACCEPTED as the D1 class fix.**
+16 files, +1,514/−111. What was verified:
+- Ledger authority applied across every completion-grading path (live settlement,
+  boot repair, fallback, approval drain, construct run, respond bridge, MCP shim) —
+  wider than `background-tasks.ts` alone, and correctly so: completion is graded in
+  all of them, and the owner rule is fix the CLASS.
+- **Veto proven both directions** (§12 note 1 closed): an ambiguous draft settles
+  `blocked` with the "may duplicate the action" reason, AND "a later ambiguous
+  readback row cannot poison an exact earlier effect settlement" — the false-RED
+  half is pinned by test, not just the false-green half.
+- Prose gates were not deleted but **subordinated**: `taskRequiresExternalSendReceipt`
+  / `completionLacksDeliverableEvidence` now run only when `externalEffectRequired
+  === null` / `!ledgerCompletedExternalEffect` — i.e. only when the ledger is
+  silent. A ledger-successful task can no longer be downgraded by prose. Acceptable
+  and arguably better than deletion: the heuristics become the underdelivery guard
+  for the ledger-silent case, which the audit found unguarded. (Note 2 closed: the
+  fallback line stays ledger-attributed and is asserted by test.)
+- §6 instrument work shipped alongside: build sha/dirty/fingerprint in the blocked
+  terminal (`host-turn-runner.ts`), the tree's first `external_write_succeeded`
+  journey (`journey-smoke.test.ts`). Artifacts re-emitted in-commit; reviewer
+  re-ran `--verify-current`: EXIT=0. Banned-pattern scan clean. Tree at 0 dirty.
+
+**P1 acceptance still requires (in this order):**
+1. `npm run typecheck` + the isolated suite on THIS HEAD with real exit codes — the
+   only full suite today ran before P1 (+1,514 lines since).
+2. **Daemon restart on HEAD.** No daemon has run ANY of today's ~40 commits: the
+   last boot line is `git 38fa83ad` (this morning). The boot log line must show
+   `git 92d6cc30` (or later) before a canary run counts.
+3. The §10.3 byte-identical canary re-run + the 34d9dd63 judge-on-the-wire check.
+4. The P1 report: verdict flip in BOTH directions, HEAD sha, judge family observed.
+The push/fast-forward ask (P0) is still owed to the owner and must go in the same
+report if not already sent.
+- Reviewer corroboration 19:58: `typecheck` on `92d6cc30` → **EXIT=0** (real exit
+  code, no pipe). Item 1 above still needs YOUR suite run on this HEAD; the
+  typecheck half is independently confirmed.
+
+**2026-09-04 ~20:00 — OWNER DIRECTIVE (relayed by the reviewer): "I want them to
+continue to work on what we need to."** Operationally: **never idle on an approval.**
+Approvals are unchanged — push, tag, and `Start Pn?` still require the owner's own
+words and must NOT be self-granted or inferred from this directive. But while any
+approval is pending, keep working the approval-free lanes, in this order:
+1. Finish P1 acceptance evidence (suite on HEAD, daemon restart on HEAD, canary
+   re-run, the two-direction verdict-flip report + judge-wire check).
+2. **Instrument work is always allowed (§6):** write the red journeys that encode the
+   NEXT phase's failure classes before that phase starts — for P2: a stalled attempt
+   burns no retry budget; a provider-proven failure buys exactly one bounded retry
+   through an armed cooldown; two different `schema_invalid` shapes are two stages;
+   the recovery surface for a host-side refusal includes the turn's proven read
+   controls. Red journeys change no behavior and need no phase-start.
+3. Keep the P0 push/fast-forward ask and the `Start P2?` ask visible at the top of
+   every report until answered.
+Post every report to the owner's session AND note it here in one line so the
+reviewer can see the phase state without the transcript.
