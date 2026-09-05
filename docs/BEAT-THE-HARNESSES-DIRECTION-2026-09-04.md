@@ -2598,3 +2598,13 @@ re-emitted for the final bytes); (5) the owner's live phone check on the built
 bundle. Then: push the wave branch to `origin/main` (preflight requires tag SHA ==
 origin/main) and push the single tag `v3.16.0` explicitly — never `git push --tags`.
 If any condition fails, no tag, and the reason goes here.
+
+**2026-09-05 07:09 — GATES on `685f28fd`: all green except ONE nondeterministic unit test:**
+`proof-provisioned-selected-revalidation` :: "a label-only operation-version move
+rebinds to the live definition instead of refusing forever" — refuses
+`selected_definition_exact_refresh_unavailable` where a rebind is expected; on the
+SAME bytes it passed 2 of 3 solo runs (and 14,527/0 earlier tonight), so it is a
+timing race, present since `b6fbaf9f` (09-02), not today's work. A flake in a
+release gate is a defect: root-cause + fix lane launched (no retries, no relaxed
+assertion; production fix or injected-clock determinism). Journeys 169/172 (the
+three under repair), everything else ✅.
