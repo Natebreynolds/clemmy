@@ -797,9 +797,23 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
       })],
       exact: true,
     },
+    {
+      // The governor has no choices and the tool declares `options` as a
+      // required strict-nullable field. A brain that omits it emits the bytes
+      // the host will materialize to options: null — the canonical ask — so
+      // the authority compare must read the materialized call, not raw bytes.
+      label: 'omitted-nullable-options',
+      choices: [] as readonly string[],
+      output: [functionCall('omitted-options-ask', 'ask_user_question', {
+        question,
+        purpose: 'clarification',
+      })],
+      exact: true,
+    },
   ] as const;
 
   for (const fixtureCase of cases) {
+    const caseChoices = 'choices' in fixtureCase ? fixtureCase.choices : choices;
     eventlog.resetEventLog();
     catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
     const session = eventlog.createSession({
@@ -825,7 +839,7 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
         stage: 'input_required:account_selection',
         recovery: 'ask_user',
         effectState: 'not_started',
-        userInput: { question, choices, purpose: 'clarification' },
+        userInput: { question, choices: caseChoices, purpose: 'clarification' },
       }),
     });
     assert.equal(asked.action, 'continue');
@@ -898,7 +912,7 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
       }));
       assert.equal(asks.length, 1);
       assert.equal(asks[0]?.data.question, question);
-      assert.deepEqual(asks[0]?.data.options, choices);
+      assert.deepEqual(asks[0]?.data.options ?? null, caseChoices.length > 0 ? caseChoices : null);
       assert.equal(asks[0]?.data.purpose, 'clarification');
     } else {
       assert.equal(outcome.terminal?.reason, 'control_no_progress_exhausted');

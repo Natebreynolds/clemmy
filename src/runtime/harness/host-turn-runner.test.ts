@@ -7460,6 +7460,83 @@ test('host approval resume re-enters with an exact durable call lease before the
   }, 'approval resume finalizes the same V5 batch exactly once');
 });
 
+// The model omitted a required strict-nullable field; the pause persisted the
+// MATERIALIZED bytes (scope: null) while the checkpoint keeps the RAW bytes.
+// At resume the tool surface cannot be refreshed, so no schema exists to
+// re-materialize anything. The pending call still carries the exact bytes the
+// pause admitted, so the unchanged approval is unchanged: the paused frame is
+// paired as one clean zero-I/O refusal and the model is never told the user
+// edited the approval. (Red at HEAD: with no tool the compare degraded to
+// raw-vs-materialized, flagged a phantom "APPROVAL EDIT" that the user never
+// made, and wrote the RAW checkpoint bytes onto the pending call — for a call
+// with a durable row that overwrite then missed the admitted digest:
+// resumed_pre_dispatch_settlement_unavailable.)
+test('host approval resume without a refreshable tool surface keeps the admitted bytes and never reports a phantom edit', async () => {
+  const fixture = acceptHostCanarySource('approval-resume-surface-unavailable');
+  let bodies = 0;
+  const boundedRead = brackets.wrapToolForHarness({
+    type: 'function',
+    name: 'workspace_roots',
+    description: 'List directories Clementine is allowed to inspect or operate in.',
+    parameters: {
+      type: 'object',
+      properties: { scope: { type: ['string', 'null'] } },
+      required: ['scope'],
+      additionalProperties: false,
+    },
+    needsApproval: async () => true,
+    invoke: async () => { bodies += 1; return 'roots'; },
+  });
+  const outputs = [
+    [toolCall('resume-surface-call', 'workspace_roots', {})],
+    [textMsg('refused without the surface')],
+  ];
+  const requests: unknown[] = [];
+  const model = {
+    async getResponse(request: unknown) {
+      requests.push(request);
+      const output = outputs[Math.min(requests.length - 1, outputs.length - 1)]!;
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+        output,
+        responseId: `resp-surface-${requests.length}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent: Record<string, unknown> = { model, tools: [boundedRead] };
+  bindHostCanarySurface(fixture, agent, [boundedRead]);
+  const paused = await runProductionHost(fixture, agent);
+  assert.equal(paused.hasInterruptions, true);
+  assert.equal(bodies, 0);
+  assert.equal(paused.interruptions![0]!.rawArgs, JSON.stringify({ scope: null }), 'the pause persisted the materialized bytes');
+  const checkpointed = paused.history.find((item) => (item as { callId?: string }).callId === 'resume-surface-call') as { arguments: string };
+  assert.equal(checkpointed.arguments, '{}', 'the checkpoint keeps the raw model bytes; this pin only bites if they differ');
+  const state = HostInterruptState.fromString(paused.serializedState!);
+  state.approve(state.getInterruptions()[0]);
+  // The surface refresh throws at resume (a failing tool listing). The
+  // accepted host root is untouched: no surface digest changed.
+  agent.getHandoffs = () => { throw new Error('fixture: tool surface refresh failed at resume'); };
+  const resumed = await runProductionHost(fixture, agent, state);
+  assert.equal((resumed as { hold?: unknown }).hold, undefined,
+    `an unavailable surface is a paired refusal, not a recovery hold: ${JSON.stringify(resumed)}`);
+  assert.equal(bodies, 0);
+  assert.equal(resumed.hasInterruptions ?? false, false);
+  assert.equal(resumed.finalOutput, 'refused without the surface');
+  assert.ok(resumed.history.some((item) => (
+    (item as { type?: string }).type === 'function_call_result'
+    && (item as { callId?: string }).callId === 'resume-surface-call'
+  )), 'the refused call stays paired in model history');
+  assert.equal(requests.length, 2, 'the paired refusal is ordinary model input for exactly one more step');
+  assert.doesNotMatch(JSON.stringify(requests[1]), /APPROVAL EDIT/,
+    'an omitted nullable field on an unrefreshable surface is not a user edit');
+  assert.equal(state.pending[0]!.rawItem.arguments, JSON.stringify({ scope: null }),
+    'the pending call keeps its admitted bytes; the raw checkpoint bytes are never written onto it');
+  assert.equal((eventlog.openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
+  `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0);
+});
+
 test('host approval rejection checkpoints the exact V5 batch without executing the body', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';

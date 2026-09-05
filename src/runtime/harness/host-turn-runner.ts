@@ -350,7 +350,7 @@ import {
   projectHostNoProgressAuthority,
 } from './host-no-progress-projection.js';
 import { inspectConversationProtocol } from './conversation-protocol.js';
-const HOST_STATE_VERSION = 5;
+const HOST_STATE_VERSION = 6;
 const HOST_STATE_KEY = '__clemHostInterrupt';
 const HOST_RECOVERY_STATE_VERSION = 1;
 const HOST_RECOVERY_STATE_KEY = '__clemHostRecovery';
@@ -888,6 +888,16 @@ interface PendingHostCall {
   name: string;
   /** Mutable: the resume owner writes user-edited args onto rawItem.arguments. */
   rawItem: { name: string; arguments: string; callId: string };
+  /**
+   * V6: the exact bytes the pre-approval loop ADMITTED for this call —
+   * strict-nullable materialization and any host carrier completion already
+   * applied, the same bytes its durable argument digest was minted from.
+   * rawItem.arguments starts equal to it; the only later writer of
+   * rawItem.arguments is the owner's edit-and-approve flow, so an approval
+   * edit is exactly a divergence from this snapshot. The checkpointed model
+   * history keeps the RAW bytes and is never the "unchanged" reference.
+   */
+  admittedArgumentsJson?: string;
   decision?: 'approved' | 'rejected';
   /** V3: exact reducer subject for a high-consequence mutation. */
   consentSubject?: HostInteractiveConsentSubjectV1;
@@ -1154,7 +1164,13 @@ export class HostInterruptState {
     public readonly acceptedModelBatchRef?: AcceptedModelBatchRef,
     /** The completion-judge budget belongs to the accepted source, not a re-entry. */
     public readonly objectiveJudgeContinuations: number = 0,
-  ) {}
+  ) {
+    // At construction a pending call's bytes ARE the bytes the pause admitted:
+    // the pause loop builds rawItem from its admitted arguments, and a pre-V6
+    // blob persisted exactly those. An edit can only arrive later, through
+    // rawItem.arguments, so the snapshot is taken here once and never again.
+    for (const call of pending) call.admittedArgumentsJson ??= call.rawItem.arguments;
+  }
 
   static isHostState(blob: string): boolean {
     return blob.trimStart().startsWith(`{"${HOST_STATE_KEY}"`);
@@ -1172,7 +1188,10 @@ export class HostInterruptState {
       objectiveJudgeContinuations?: unknown;
     };
     const version = parsed[HOST_STATE_KEY];
-    if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== HOST_STATE_VERSION) {
+    if (
+      version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5
+      && version !== HOST_STATE_VERSION
+    ) {
       throw new Error('paused state is not a host-owned interrupt state');
     }
     // Backward compatible: accepted response identity was optional in V1, and
@@ -1203,6 +1222,17 @@ export class HostInterruptState {
       // authority merely by carrying an unrecognized lookalike field.
       for (const call of pending) delete call.consentSubject;
     }
+    if (version >= 6) {
+      for (const call of pending) {
+        if (typeof call.admittedArgumentsJson !== 'string') {
+          throw new Error('paused host state has no exact admitted argument bytes');
+        }
+      }
+    } else {
+      // A pre-V6 pause persisted exactly its admitted bytes as rawItem.arguments;
+      // the constructor snapshots them. A lookalike field carries no authority.
+      for (const call of pending) delete call.admittedArgumentsJson;
+    }
     return new HostInterruptState(
       parsed.history ?? [],
       pending,
@@ -1214,7 +1244,7 @@ export class HostInterruptState {
             (parsed.history ?? []).length,
           )
         : undefined,
-      version === HOST_STATE_VERSION
+      version >= 5
         ? parseAcceptedModelBatchRef(parsed.acceptedModelBatchRef)
         : undefined,
       parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
@@ -5845,7 +5875,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const admitted = admittedCalls[index]![0] as unknown as {
           callId?: unknown;
           name?: unknown;
-          arguments?: unknown;
         };
         if (
           pending.callId !== callIds[index]
@@ -5858,23 +5887,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             resumedAcceptedFrame.ref,
           );
         }
-        // The pause loop persisted this pending call with its strict-nullable
-        // MATERIALIZED bytes (and minted the logical argument digest from them);
-        // the checkpointed model history keeps the RAW bytes the model emitted.
-        // Compare both under the same materialization: an omitted nullable field
-        // is not an approval edit. Unmaterializable bytes fall back to the raw
-        // compare. (Red since the 08-31 wave added nullable fields to work_call:
-        // every unchanged approval resumed as an "edit" and never dispatched.)
-        const resumedTool = toolByName.get(pending.name);
-        let pendingArgumentsJson = pending.rawItem.arguments;
-        let admittedArgumentsJson = String(admitted.arguments);
-        try {
-          pendingArgumentsJson = materializedArgumentsJson(resumedTool, pendingArgumentsJson);
-          admittedArgumentsJson = materializedArgumentsJson(resumedTool, admittedArgumentsJson);
-        } catch {
-          // keep the raw bytes
+        // The pause loop persisted this pending call with the exact bytes it
+        // ADMITTED — strict-nullable materialization and any host carrier
+        // completion applied, the bytes its durable argument digest was minted
+        // from — and snapshotted them as admittedArgumentsJson. The checkpointed
+        // model history keeps the RAW bytes the model emitted, so it can never
+        // be the "unchanged" reference: an omitted nullable field or a
+        // host-completed carrier is not an approval edit. The only later writer
+        // of rawItem.arguments is the owner's edit-and-approve flow, so an edit
+        // is exactly a divergence from the snapshot — no re-materialization and
+        // no tool surface is needed to tell. (Red twice: the 08-31 nullable
+        // fields on work_call, then every host-completed carrier write.)
+        const admittedArgumentsJson = pending.admittedArgumentsJson;
+        if (admittedArgumentsJson === undefined) {
+          return approvalRecoveryOutcome(
+            'host_result_checkpoint_mismatch',
+            resumedAcceptedFrame.ref,
+          );
         }
-        if (pendingArgumentsJson !== admittedArgumentsJson) {
+        if (pending.rawItem.arguments !== admittedArgumentsJson) {
           // An approval edit is input for a NEW model frame, not authority to
           // execute different bytes under the old accepted batch.  Pair the
           // old frame as no-effect below and let the model reissue the edit.
@@ -5884,6 +5915,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             `Issue one fresh ${pending.name} call with these exact approved argument bytes: ${pending.rawItem.arguments}`,
             'Do not reuse the prior call id.',
           ].join(' ');
+          // The old frame settles under the bytes that admitted it; the edit
+          // travels to the model in the directive, never onto this call.
           pending.rawItem.arguments = admittedArgumentsJson;
         }
       }
@@ -6942,11 +6975,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       && noProgressState?.lastConsequence?.recovery === 'ask_user'
       ? noProgressState.lastConsequence.userInput
       : undefined;
+    // Judge the ask by the bytes the host will admit and dispatch, not the raw
+    // model bytes: `options`/`purpose` are required strict-nullable fields, so
+    // a brain that omits `options` when the governor has no choices emitted
+    // exactly the canonical ask once materialized (options: null).
+    const admittedAskArguments = (call: CanonicalHostCall): Record<string, unknown> | null => {
+      try {
+        return parsedArgs(materializedArgumentsJson(toolByName.get(call.name), call.argumentsJson));
+      } catch {
+        return parsedArgs(call.argumentsJson);
+      }
+    };
     const nonCanonicalNoProgressAsk = exactAskInput !== undefined && (
       canonicalCalls.length !== 1
       || bareTerminalToolName(canonicalCalls[0]!.name) !== 'ask_user_question'
       || !isCanonicalNoProgressAskArguments(
-        parsedArgs(canonicalCalls[0]!.argumentsJson),
+        admittedAskArguments(canonicalCalls[0]!),
         exactAskInput,
       )
     );
@@ -7561,6 +7605,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         callId: call.callId,
         name: call.name,
         rawItem: { name: call.name, arguments: argumentsJson, callId: call.callId },
+        // The bytes this loop admitted (materialized + host-completed) and
+        // minted the durable digest from; the resume compares against these.
+        admittedArgumentsJson: argumentsJson,
         ...(consentSubject ? { consentSubject } : {}),
         ...(consentCall ? { consentCall } : {}),
       };

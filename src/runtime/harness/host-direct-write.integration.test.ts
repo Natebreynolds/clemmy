@@ -36,6 +36,7 @@ const { digestSchema } = await import('../../tools/tool-contract-store.js');
 const { buildWorkCall } = await import('../../tools/work-call.js');
 const { hostRunRunner, HostInterruptState } = await import('./host-turn-runner.js');
 const approvals = await import('./approval-registry.js');
+const completion = await import('./carrier-completion-registry.js');
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
 const INPUT_SCHEMA = { type: 'object', properties: { body: { type: 'string' } }, required: ['body'], additionalProperties: false };
 const ARGS = { body: 'Prepared and validated local draft content.' };
@@ -55,8 +56,23 @@ async function* modelStream(this: { getResponse(request: unknown): Promise<any> 
   yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
 }
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' = 'draft', suffix = '', uncertain = false) {
+// A provider-neutral completer for the fixture's own carrier shape: the model
+// wrote `args` (an object) where the carrier takes `args_json` (a string), and
+// the host completes it before admission — the same args→args_json rewrite
+// composio-carrier-completion applies to a live carrier. Claims nothing else.
+const FIXTURE_ALIAS_OPERATIONS = new Set<string>();
+completion.registerCarrierCompleter((argumentsJson) => {
+  let outer: Record<string, unknown>;
+  try { outer = JSON.parse(argumentsJson) as Record<string, unknown>; } catch { return null; }
+  if (!outer || typeof outer !== 'object' || typeof outer.name !== 'string' || !FIXTURE_ALIAS_OPERATIONS.has(outer.name)) return null;
+  if ('args_json' in outer || !('args' in outer) || !outer.args || typeof outer.args !== 'object') return null;
+  const { args, ...rest } = outer;
+  return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
+});
+
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json') {
   const operationId = { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE', delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY' }[kind];
+  if (outerShape === 'args') FIXTURE_ALIAS_OPERATIONS.add(operationId);
   const capabilityId = `cap:resolved:${operationId.toLowerCase()}`;
   const accountId = 'account:direct:owner';
   const providerInputSchemaDigest = digestSchema(INPUT_SCHEMA);
@@ -122,6 +138,12 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     ? { requirement_id: 'create_draft', universe_item_id: null, universe_selector: null, seal_amendment: null,
         source_call_ids: null, source_record_ids: null, name: operationId, args_json: JSON.stringify(ARGS) }
     : { name: operationId, args_json: JSON.stringify(ARGS) };
+  // The bytes the MODEL emits. With the `args` shape the host completes them
+  // (args → args_json) before admission, so the pause persists bytes that never
+  // appeared in the checkpointed model history.
+  const modelArgs: Record<string, unknown> = outerShape === 'args'
+    ? (({ args_json: _dropped, ...rest }) => ({ ...rest, args: ARGS }))(outerArgs)
+    : outerArgs;
   const model = {
     async getResponse(request: { tools?: Array<{ name?: string }> }) {
       modelCalls += 1;
@@ -133,7 +155,7 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
       }
       return { responseId: `direct-write-${carrierName}-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
         output: modelCalls === 1
-          ? [{ type: 'function_call', callId: 'exact-draft', name: carrierName, arguments: JSON.stringify(outerArgs) }]
+          ? [{ type: 'function_call', callId: 'exact-draft', name: carrierName, arguments: JSON.stringify(modelArgs) }]
           : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The draft was created.' }] }],
       };
     }, getStreamedResponse: modelStream,
@@ -151,7 +173,7 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${session.id}::turn:1` },
   () => hostRunRunner(runner as never, agent as never, input,
     { maxTurns: 3, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq }, ...extra } as never));
-  return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, prompt,
+  return { run, session, source, agent, runner, manifest, accountId, operationId, outerArgs, modelArgs, prompt,
     counts: () => ({ providerCalls, modelCalls, preparationCalls, carrierBodies }) };
 }
 
@@ -226,6 +248,38 @@ for (const kind of ['send', 'delete', 'admin'] as const) test(`exact ${kind} pau
   const resumed = await fixture.run(state, { hostApprovalIds: [approval.approvalId] });
   assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(resumed.history));
   assert.equal(Boolean(resumed.hasInterruptions), false);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 1);
+});
+
+// The pause persists the bytes the host ADMITTED — here completed from the
+// model's `args` alias into the carrier's `args_json` — while the checkpointed
+// model history keeps the raw bytes. An unchanged approval must compare against
+// what was admitted, never against the checkpoint: otherwise every host-completed
+// carrier write reads as a user edit on resume and the send never dispatches.
+test('an approved carrier write whose pause bytes the host completed resumes unchanged and dispatches exactly once', async () => {
+  const fixture = await directWriteFixture('work_call', 'send', 'completed-carrier', false, 'args');
+  assert.ok(fixture);
+  const paused = await fixture.run();
+  assert.equal(paused.hasInterruptions, true, JSON.stringify(paused.history));
+  assert.equal(fixture.counts().providerCalls, 0);
+  const checkpointed = paused.history.find((item) => (item as any).type === 'function_call' && (item as any).callId === 'exact-draft') as any;
+  assert.ok(checkpointed, 'the raw model call is checkpointed');
+  assert.ok('args' in JSON.parse(checkpointed.arguments), 'the checkpoint keeps the raw model shape');
+  const interruption = paused.interruptions![0]!;
+  const persisted = JSON.parse(interruption.rawArgs!) as Record<string, unknown>;
+  assert.equal(typeof persisted.args_json, 'string', 'the pause persisted the completed carrier bytes');
+  assert.equal('args' in persisted, false);
+  assert.notEqual(interruption.rawArgs, checkpointed.arguments, 'this pin only bites if the pause bytes differ from the checkpoint bytes');
+  const approval = approvals.registerResumable({ sessionId: fixture.session.id,
+    subject: 'Approve the exact send.', tool: interruption.toolName, args: interruption.args,
+    resumeKey: interruption.approvalResumeKey! }).row;
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'direct-host-fixture').ok, true);
+  const state = HostInterruptState.fromString(paused.serializedState!);
+  state.approve(state.getInterruptions()[0]);
+  const resumed = await fixture.run(state, { hostApprovalIds: [approval.approvalId] });
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(resumed.history));
+  assert.equal(Boolean(resumed.hasInterruptions), false);
+  assert.equal((resumed as { hold?: unknown }).hold, undefined);
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_succeeded'] }).length, 1);
 });
 
