@@ -411,6 +411,8 @@ await import('./restaurant-sheet-natural-request.integration.test.js');
   buildCodexRequestBody: (modelId: string, request: never) => JsonRecord;
 });
 const reflection = await import('../memory/reflection.js');
+const eventlog = await import('../runtime/harness/eventlog.js');
+const COLD_SESSION_ID = 'discord-natural-restaurant-sheet';
 reflection._testOnly_setReflectionExtractor(async (serialized) => {
   backgroundModelCandidates.push({
     kind: 'memory_reflection',
@@ -653,12 +655,23 @@ test('competitive byte ledger: cold natural request stays below planning and dis
     'blank cold pre-plan exposes metadata discovery');
   assert.equal(toolNamesAt(1).includes('plan_task'), false,
     'blank cold pre-plan cannot advertise plan_task before exact disclosure');
-  assert.equal(toolNamesAt(1).includes('run_worker'), false,
-    'worker dispatch stays hidden before plan activation');
+  assert.equal(toolNamesAt(1).includes('run_worker'), true,
+    'scoped delegation is plan-optional on the first primary surface');
   assert.equal(toolNamesAt(2).includes('plan_task'), true,
     'exact discovery enables the plan control');
-  assert.equal(toolNamesAt(2).includes('run_worker'), false,
-    'discovery alone grants no worker authority');
+  assert.equal(toolNamesAt(2).includes('run_worker'), true,
+    'discovery keeps the plan-optional worker advertised without granting call authority');
+  // Advertising the worker is not execution: the cold journey performs its
+  // two business operations without any worker I/O, and no run_worker call
+  // ever crosses the physical dispatch edge without exact accepted authority.
+  const coldWorkerEvents = eventlog.listEvents(COLD_SESSION_ID, { types: ['worker_started', 'worker_result'] });
+  assert.equal(coldWorkerEvents.length, 0,
+    `an advertised worker performed no worker I/O in the cold journey: ${json(coldWorkerEvents.map((event) => event.type))}`);
+  const coldWorkerDispatches = (eventlog.openEventLog().prepare(
+    'SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND tool_name = ?',
+  ).get(COLD_SESSION_ID, 'run_worker') as { n: number }).n;
+  assert.equal(coldWorkerDispatches, 0,
+    'no run_worker physical dispatch exists for the cold journey (visibility is not authority)');
   assert.equal(toolNamesAt(3).includes('plan_task'), false,
     'the plan control retires after durable activation');
   assert.equal(toolNamesAt(3).includes('work_call'), true,

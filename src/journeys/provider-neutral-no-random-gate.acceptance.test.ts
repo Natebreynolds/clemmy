@@ -4143,11 +4143,12 @@ test('zero-crossing retirement is scoped to one accepted source and never suppre
   const sourceAFirst = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[0]!)!);
   const sourceASecond = JSON.parse(functionResultTextFor(outcomeA.history, sourceACallIds[1]!)!);
   assert.deepEqual([sourceAFirst.retry, sourceASecond.retry], ['replan', 'replan']);
-  assert.deepEqual(outcomeA.terminal, {
-    status: 'blocked',
-    reason: 'control_no_progress_exhausted',
-    resumable: false,
-  });
+  // Since 7bd17d6f the no-progress stop is a typed, RESUMABLE terminal: the
+  // retained results and next edge survive, so `resumable: false` is gone.
+  assert.equal(outcomeA.terminal?.status, 'blocked');
+  assert.equal(outcomeA.terminal?.reason, 'control_no_progress_exhausted');
+  assert.notEqual(outcomeA.terminal?.resumable, false,
+    'the no-progress governor stops typed and resumable, never a dead end');
   retirementSession.recordTurnResult({
     history: outcomeA.history,
     lastResponseId: outcomeA.lastResponseId,
