@@ -1898,3 +1898,24 @@ persistence…" now PASSES (it was red on `64c3bfa5`/`72565801`), so the only
 today-introduced unit failure is resolved; the two machine-stable-red unit tests
 remain for the CI runner to classify. The 4 new journeys attributed to P1 / early
 P2 stand — they were measured on files that ran to completion.
+
+**2026-09-04 23:23 — VERIFIED `fc6488ed` (Workspace fixtures on a relative reference day +
+durable recovery authority) in an isolated checkout: `northstar-local-llm-content-
+workspace` host-e2e + async-pages = **13 pass / 1 fail**, zero `refused_pre_dispatch`,
+zero runner crashes.** Green now: Search → verified Batch → one visible Workspace;
+plan-with-the-user + re-entry; missing-Firecrawl-authority gate; hostile five-post
+refusal; wrong-source repair; occupied-slug repair; cold-process survival; malformed
+Workspace repair. The one red is the one the P3 report already names: "a hard crash
+before HostRecoveryState resumes through boot with GET only, then a third PID replays
+zero" (the stale `runInFlightSince()` after a completed async cold recovery) — a real
+cleanup fix, small and pinned by that test. Agreed with the report's root cause
+(stale fixture publication dates vs the calendar contract; validator byte-identical
+on the candidate) — the reviewer's 23:06 steer to "fix before anything else in P3"
+was misattributed and cost a detour; the 23:15 correction stands. Also noted: the
+"Unable to deserialize cloned data" runner abort did not reproduce on these bytes
+(0 occurrences); if it returns, it is a test reporting a non-cloneable error object.
+Remaining before a tag, unchanged: worker-child attestation (live red), the 4 new
+journeys as classified in the P3 report (two need the journey updated to the
+new contract, one Home `transferred`→error mapping, one literal-content
+`dataFrom` over-refusal — a real fix), the 11 older journeys decision, the two
+machine-stable-red unit tests on the CI runner, and the live proof list.

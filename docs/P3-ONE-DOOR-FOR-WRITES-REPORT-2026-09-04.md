@@ -150,9 +150,20 @@ plus the explicitly uncommitted worker fixes (no live daemon):
   accepted call-authority digest/root, retain all exact writes/receipts/zero-replay
   checks, and pass both real-process recoveries: 2/2, exit 0,
   `/private/tmp/p3-workspace-recovery-authority-green.log`.
-- One real cleanup issue remains assigned: completed async cold recovery leaves
-  `runInFlightSince()` non-null although its private recovery state is gone and
-  its Workspace committed exactly once. No full-family green claim yet.
+- The remaining real cleanup issue was the crashed attempt's running-marker
+  ownership, not execution: a finished/interrupted attempt still owned the marker
+  after its same-source successor completed. The existing producer now transfers
+  that marker only from an interrupted owner to the active same-source attempt;
+  mere supersession, a stale attempt, or an older source cannot take it. Terminal
+  CAS is unchanged. Actual cold-crash RED and producer RED are retained in
+  `/private/tmp/p3-workspace-cleanup-red.log` and
+  `/private/tmp/p3-recovery-owner-red.log` (both exit 1). Recovery regressions
+  pass 117/117, exit 0 (`/private/tmp/p3-recovery-owner-regression.log`).
+- **Full Workspace family: 15/15, real exit 0** on `fc6488ed` plus the explicit
+  recovery fix and uncommitted worker/bridge candidate, no live daemon:
+  `/private/tmp/p3-workspace-complete-family-final.log`. This includes the exact
+  Search → verified Batch → visible Workspace and the three-PID hard-crash,
+  GET-only resume, then zero-replay journey. No runner crash reproduced.
 - The cited new unit failure already passes on current bytes: all five tests in
   `plan-tools-completeness.red.test.ts`, exit 0,
   `/private/tmp/p3-plan-head-reviewer-recheck.log`. `cf50388e` changed that producer
