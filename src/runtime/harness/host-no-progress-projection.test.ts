@@ -589,6 +589,97 @@ test('resolution alternatives remain candidates until a task-needed binding sele
   assert.equal(projected.authority.account.length, 0);
 });
 
+test('a selected host call gains authority without an expected-work graph; retry identities do not', () => {
+  const identity = accepted('graph-neutral-host-binding');
+  const db = new Database(':memory:');
+  // Minting/FK contracts are exercised at the host-call binding boundary. This
+  // projection fixture has no graph rows, so a call's real progress cannot be
+  // accidentally supplied by graph compilation.
+  db.exec(`
+    CREATE TABLE accepted_task_work_contracts (session_id TEXT, source_user_seq INTEGER, contract_id TEXT, graph_hash TEXT);
+    CREATE TABLE expected_work_call_bindings (session_id TEXT, source_user_seq INTEGER, logical_tool_call_id TEXT);
+    CREATE TABLE host_call_capability_bindings (
+      session_id TEXT, source_user_seq INTEGER, logical_tool_call_id TEXT,
+      capability_id TEXT, operation_id TEXT, schema_fingerprint TEXT,
+      account_id TEXT, attested_argument_digest TEXT
+    );
+    CREATE TABLE logical_call_settlements (session_id TEXT, source_user_seq INTEGER, progress_key_digest TEXT, progress_claimed INTEGER);
+    CREATE TABLE evidence_receipts (session_id TEXT, source_user_seq INTEGER, manifest_id TEXT, node_id TEXT, obligation TEXT);
+    CREATE TABLE write_evidence_bindings (session_id TEXT, source_user_seq INTEGER, requirement_id TEXT, target_digest TEXT);
+    CREATE TABLE write_evidence_proofs (session_id TEXT, source_user_seq INTEGER, manifest_id TEXT, node_id TEXT, obligation TEXT);
+    CREATE TABLE discovery_governor_roles (session_id TEXT, source_user_seq INTEGER, role_key TEXT);
+  `);
+  try {
+    const baseline = projectHostNoProgressAuthority(identity, db);
+    assert.equal(baseline.status, 'ok');
+    if (baseline.status !== 'ok') return;
+    const insert = db.prepare(`
+      INSERT INTO host_call_capability_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const bind = (callId: string, ref: string, args: string, schema = 'schema-one', source = identity.sourceUserSeq) => {
+      insert.run(identity.sessionId, source, callId, ref, 'selected.operation', schema, 'selected-account', args);
+    };
+    bind('call-one', 'ref-one', 'args-one');
+    const selected = projectHostNoProgressAuthority(identity, db);
+    assert.equal(selected.status, 'ok');
+    if (selected.status !== 'ok') return;
+    assert.equal(selected.authority.operation.length, baseline.authority.operation.length + 1);
+    assert.equal(selected.authority.account.length, baseline.authority.account.length + 1);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM expected_work_call_bindings').get() as { n: number }).n, 0);
+    assert.doesNotMatch(JSON.stringify(selected.authority), /selected.operation|selected-account|call-one|args-one/);
+
+    bind('call-two', 'ref-two', 'args-two');
+    bind('unrelated-call', 'unrelated-ref', 'unrelated-args', 'unrelated-schema', identity.sourceUserSeq + 1);
+    const repeated = projectHostNoProgressAuthority(identity, db);
+    assert.deepEqual(repeated, selected, 'call, argument and catalog-ref churn are not new authority');
+
+    bind('call-three', 'ref-three', 'args-three', 'schema-two');
+    const refined = projectHostNoProgressAuthority(identity, db);
+    assert.equal(refined.status, 'ok');
+    if (refined.status === 'ok') {
+      assert.equal(refined.authority.operation.length, selected.authority.operation.length + 1);
+      assert.deepEqual(refined.authority.account, selected.authority.account);
+    }
+  } finally { db.close(); }
+});
+
+test('host carrier repair is bounded same-source progress and dedupes reordered labels and call ids', () => {
+  const identity = accepted('host-carrier-repair-progress');
+  const emit = (data: Record<string, unknown>, role = 'system') => appendEvent({
+    sessionId: identity.sessionId,
+    turn: 1,
+    role,
+    type: 'guardrail_tripped',
+    data: {
+      kind: 'carrier_repaired', sourceUserSeq: identity.sourceUserSeq,
+      carrier: 'work_call', operation: 'selected.operation',
+      changes: ['arguments_wrapped', 'operation_bound'],
+      ...data,
+    },
+  });
+  const baseline = projectHostNoProgressAuthority(identity);
+  assert.equal(baseline.status, 'ok');
+  if (baseline.status !== 'ok') return;
+  emit({ callId: 'first-call' });
+  const repaired = projectHostNoProgressAuthority(identity);
+  assert.equal(repaired.status, 'ok');
+  if (repaired.status !== 'ok') return;
+  assert.equal(repaired.authority.evidence.length, baseline.authority.evidence.length + 1);
+  assert.doesNotMatch(JSON.stringify(repaired.authority), /selected.operation|work_call|first-call|arguments_wrapped/);
+  emit({ callId: 'different-call', changes: ['operation_bound', 'arguments_wrapped', 'operation_bound'] });
+  emit({ sourceUserSeq: identity.sourceUserSeq + 1, operation: 'other-source' });
+  emit({ operation: 'model-authored' }, 'assistant');
+  emit({ operation: 'wrong-kind', kind: 'carrier_refused' });
+  emit({ operation: 'empty-change', changes: [] });
+  emit({ operation: 'free-text', changes: ['tool argument changed to arbitrary model prose'] });
+  emit({ operation: 'oversized-changes', changes: Array.from({ length: 9 }, (_, index) => `repair_${index}`) });
+  assert.deepEqual(projectHostNoProgressAuthority(identity), repaired);
+  for (let index = 0; index < 12; index += 1) emit({ operation: `operation_${index}` });
+  const bounded = projectHostNoProgressAuthority(identity);
+  assert.equal(bounded.status, 'ok');
+  if (bounded.status === 'ok') assert.equal(bounded.authority.evidence.length, baseline.authority.evidence.length + 8);
+});
+
 test('new authoritative resolution alternatives do not mint task progress before a task-needed binding', () => {
   const identity = accepted('resolution-alternatives-are-not-progress');
   const baseline = projectHostNoProgressAuthority(identity);

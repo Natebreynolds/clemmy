@@ -117,6 +117,7 @@ function exactSourceEvents(identity: HostNoProgressIdentity): EventRow[] {
       'discovery_governor_outcome',
       'planning_catalog_disclosed',
       'expected_work_progress',
+      'guardrail_tripped',
     ],
   }).filter((event) => event.data.sourceUserSeq === identity.sourceUserSeq);
 }
@@ -166,6 +167,39 @@ const MAX_DISCLOSED_READ_REF_TOKENS = 8;
  * keeps a model from manufacturing an unbounded walk through operation names.
  */
 const MAX_EXACT_SCHEMA_REFRESH_TOKENS = 8;
+
+/** Host repairs are real progress, but repeating a repair for new physical
+ * calls is not. Record a bounded set of structural repair facts for this source
+ * without making argument values, call ids, or diagnostic prose identities. */
+const MAX_HOST_CARRIER_REPAIR_TOKENS = 8;
+const HOST_REPAIR_KIND = /^[a-z][a-z0-9_:-]{0,63}$/;
+
+function hostCarrierRepairTokens(
+  events: readonly EventRow[],
+  tokens: Record<AuthorityProgressKind, Set<string>>,
+): void {
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (seen.size >= MAX_HOST_CARRIER_REPAIR_TOKENS) break;
+    if (event.role !== 'system' || event.type !== 'guardrail_tripped' || event.data.kind !== 'carrier_repaired') continue;
+    const carrier = nonEmptyString(event.data.carrier);
+    const operation = nonEmptyString(event.data.operation);
+    const changes = event.data.changes;
+    if (
+      !carrier || carrier.length > 512
+      || !operation || operation.length > 512
+      || !Array.isArray(changes) || changes.length === 0 || changes.length > 8
+      || !changes.every((change) => typeof change === 'string' && HOST_REPAIR_KIND.test(change))
+    ) continue;
+    const repaired = token('evidence', 'host_carrier_repair', [
+      carrier,
+      operation,
+      [...new Set(changes)].sort(),
+    ]);
+    seen.add(repaired);
+    tokens.evidence.add(repaired);
+  }
+}
 
 function exactSchemaRefreshAuthorityTokens(
   events: readonly EventRow[],
@@ -238,6 +272,7 @@ function eventCapabilityTokens(
   tokens: Record<AuthorityProgressKind, Set<string>>,
 ): void {
   exactSchemaRefreshAuthorityTokens(events, tokens);
+  hostCarrierRepairTokens(events, tokens);
   const disclosedWriteRefs: string[] = [];
   const disclosedReadRefs: string[] = [];
   for (const event of events) {
@@ -511,28 +546,23 @@ function durableAuthorityTokens(
   }
 
   for (const row of rows<{
-    capability_id: string;
     operation_id: string;
     schema_fingerprint: string;
     account_id: string;
   }>(db, `
-    SELECT host.capability_id, host.operation_id,
-           host.schema_fingerprint, host.account_id
-      FROM host_call_capability_bindings host
-      JOIN expected_work_call_bindings work
-        ON work.session_id = host.session_id
-       AND work.source_user_seq = host.source_user_seq
-       AND work.logical_tool_call_id = host.logical_tool_call_id
-     WHERE host.session_id = ? AND host.source_user_seq = ?
+    SELECT operation_id, schema_fingerprint, account_id
+      FROM host_call_capability_bindings
+     WHERE session_id = ? AND source_user_seq = ?
   `, params)) {
-    // Logical call id and argument digest are deliberately absent: retries or
-    // pagination over one selected accepted node remain one operation fact.
-    tokens.operation.add(token('operation', 'expected_work_capability_binding', [
-      row.capability_id,
+    // The call boundary has selected this operation/account/schema whether or
+    // not chat projected an expected-work graph. Logical call ids, arguments
+    // and refreshed catalog refs do not change that selected authority tuple.
+    tokens.operation.add(token('operation', 'host_call_capability_binding', [
       row.operation_id,
+      row.account_id,
       row.schema_fingerprint,
     ]));
-    if (row.account_id) tokens.account.add(token('account', 'expected_work_capability_binding', [
+    if (row.account_id) tokens.account.add(token('account', 'host_call_capability_binding', [
       row.account_id,
     ]));
   }
