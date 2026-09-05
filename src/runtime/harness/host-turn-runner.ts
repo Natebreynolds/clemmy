@@ -774,6 +774,57 @@ export function pendingUniqueWorkflowNameFromHistory(
   return queued ? null : workflowName;
 }
 
+/** Planning, discovery, and asking are not reading. Anything else the model
+ * dispatched after the nomination is its attempt at the read, and that call's
+ * settlement (a result or a typed refusal) is the turn's truth. */
+function graphNeutralReadAttemptIssued(item: unknown): boolean {
+  const row = item as { type?: unknown; name?: unknown; arguments?: unknown };
+  if (row.type !== 'function_call' || typeof row.name !== 'string') return false;
+  const unwrapped = unwrapRuntimeEffectiveToolIdentity(row.name, row.arguments);
+  const name = unwrapped.toolName ?? row.name;
+  const tail = name.split('__').at(-1) ?? name;
+  return tail !== 'plan_task' && tail !== 'tool_search' && tail !== 'ask_user_question';
+}
+
+/** After plan_task proves the request is ONE graph-neutral read (plan-optional
+ * delegation: `plan_not_required` + `recoveryTool: call_tool`), the model must
+ * make that call — not answer. The host has already pinned the read; a prose
+ * stop with nothing dispatched is the same dead end as a frozen read plan with
+ * zero settlements, in the shape plan-optional delegation gave it. Sibling of
+ * pendingUniqueWorkflowNameFromHistory. */
+export function pendingGraphNeutralReadFromHistory(
+  history: readonly AgentInputItem[],
+): boolean {
+  let pending = false;
+  const planCallIds = new Set<string>();
+  for (const item of history) {
+    if (pending && graphNeutralReadAttemptIssued(item)) pending = false;
+    const row = item as unknown as { type?: unknown; callId?: unknown; name?: unknown };
+    if (
+      row.type === 'function_call'
+      && typeof row.callId === 'string'
+      && row.name === 'plan_task'
+    ) {
+      planCallIds.add(row.callId);
+      continue;
+    }
+    if (
+      row.type !== 'function_call_result'
+      || typeof row.callId !== 'string'
+      || !planCallIds.has(row.callId)
+    ) continue;
+    const text = functionResultText(item as AgentInputItem);
+    if (!text) continue;
+    const refusal = parseExactPlanTaskRefusal(text);
+    if (
+      refusal
+      && refusal.payload.code === 'plan_not_required'
+      && refusal.recoveryTool === 'call_tool'
+    ) pending = true;
+  }
+  return pending;
+}
+
 /**
  * The write operations this turn's accepted graph actually bound.
  *
@@ -6817,6 +6868,25 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ].join(' ');
           continue;
         }
+      }
+      if (
+        hostProduction
+        && !acceptedReadPlanContinuationUsed
+        && pendingGraphNeutralReadFromHistory(history)
+      ) {
+        // One read continuation per turn, whichever shape pinned the read:
+        // a frozen read plan or plan_task's own graph-neutral nomination.
+        acceptedReadPlanContinuationUsed = true;
+        pendingHostModelDirective = [
+          'ACCEPTED READ EXECUTION — plan_task proved this request is one graph-neutral read, and nothing has been read yet.',
+          'Call call_tool now with the exact read operation and schema already disclosed for this request.',
+          'Do not call plan_task again. Do not answer or declare completion until that read settles and you can report its actual result.',
+        ].join(' ');
+        hostTurnLogger.info({
+          sessionId: exactHostIdentity().sessionId,
+          sourceUserSeq: exactHostIdentity().sourceUserSeq,
+        }, 'host retained the nominated graph-neutral read instead of publishing a prose stop');
+        continue;
       }
       if (hostProduction && !acceptedUniqueWorkflowContinuationUsed) {
         const workflowName = pendingUniqueWorkflowNameFromHistory(history);

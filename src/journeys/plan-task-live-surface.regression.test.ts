@@ -366,11 +366,11 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
     invoke: invoke as never,
   });
   catalogs.installHostCapabilityCatalogFactory(factory);
+  // The exact invoke port is deliberately ABSENT (the server went away between
+  // disclosure and the call): the continued read must settle as one typed
+  // pre-dispatch refusal with zero crossings, never as a dead-end prose stop
+  // and never as a crossing on an unproven binding.
   productionPorts.clearProductionCapabilityPorts();
-  assert.deepEqual(productionPorts.registerFixtureCapabilityPort(
-    productionPorts.productionPortIdentityFromManifest(manifest),
-    { invoke: invoke as never },
-  ), { ok: true });
 
   const prompt = 'Read the single most recent message in my Outlook Inbox and return only its subject and received time.';
   const session = eventlog.createSession({
@@ -458,14 +458,15 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
           ? [assistantText('I have not read the mailbox yet.')]
           : modelCalls === 3
             ? (() => {
-                assert.match(serialized, /ACCEPTED PLAN EXECUTION/);
-                assert.ok(tools.includes('work_call'));
-                assert.equal(tools.includes('plan_task'), false);
-                return [functionCall('execute-outlook-read-plan', 'work_call', {
-                  requirement_id: requirementId,
-                  universe_item_id: null,
-                  universe_selector: null,
-                  seal_amendment: null,
+                // Plan-optional delegation: plan_task refused the single read
+                // as plan_not_required and nominated call_tool. The prose stop
+                // after that nomination is not a finished turn; the host
+                // continues once, naming the carrier it nominated.
+                assert.match(serialized, /ACCEPTED READ EXECUTION/);
+                assert.match(serialized, /\\"code\\":\\"plan_not_required\\"/);
+                assert.match(serialized, /\\"recoveryTool\\":\\"call_tool\\"/);
+                assert.ok(tools.includes('call_tool'));
+                return [functionCall('execute-outlook-read-plan', 'call_tool', {
                   name: operationId,
                   args_json: JSON.stringify({
                     folder: 'inbox',
@@ -475,8 +476,10 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
                 })];
               })()
             : (() => {
-                assert.match(serialized, /exact_mcp_binding_missing/,
+                assert.match(serialized, /refused_pre_dispatch/,
                   'the forced downstream call settles with an exact bounded refusal');
+                assert.match(serialized, /production_port_or_invoke_identity_mismatch/,
+                  'the refusal names the exact failed binding check');
                 return [assistantText('I could not read the mailbox because its exact live binding is unavailable.')];
               })();
       return {
@@ -544,11 +547,20 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
   assert.equal(modelCalls, 4, 'the first prose stop is converted into one downstream execution step');
   assert.equal(providerCalls, 0,
     'an exact native-MCP binding refusal remains zero-crossing and bounded');
-  assert.match(JSON.stringify(outcome.history), /exact_mcp_binding_missing/);
+  const serializedHistory = JSON.stringify(outcome.history);
+  assert.match(serializedHistory, /refused_pre_dispatch/);
+  assert.match(serializedHistory, /production_port_or_invoke_identity_mismatch/);
+  assert.equal(
+    outcome.history.filter((item) => (item as { type?: unknown }).type === 'function_call').length,
+    2,
+    'exactly one nomination and one forced read attempt: the continuation is spent once',
+  );
   assert.ok(surfaces[0]?.includes('plan_task'));
-  assert.equal(surfaces[2]?.includes('plan_task'), false);
+  assert.ok(surfaces[2]?.includes('call_tool'));
+  // Plan-optional delegation freezes nothing for one graph-neutral read; the
+  // host's own plan_not_required nomination is the accepted read.
   const frozen = expectedWork.loadExpectedWorkContract(session.id, source.seq);
-  assert.equal(frozen.status, 'ok');
+  assert.equal(frozen.status, 'missing');
   const db = eventlog.openEventLog();
   assert.equal((db.prepare(`
     SELECT COUNT(*) AS n FROM accepted_task_operations
@@ -557,8 +569,24 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
   'a pre-dispatch refusal cannot masquerade as an accepted operation');
   assert.equal((db.prepare(`
     SELECT COUNT(*) AS n FROM logical_call_settlements
-     WHERE session_id = ? AND source_user_seq = ?
-       AND business_call = 1 AND outcome_kind = 'policy_denial'
-  `).get(session.id, source.seq) as { n: number }).n, 1,
-  'the continued work_call reaches one durable, non-success business settlement');
+     WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
+  `).get(session.id, source.seq) as { n: number }).n, 0,
+  'nothing crossed: a pre-dispatch refusal leaves no business settlement');
+  const refusals = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .map((event) => event.data as {
+      kind?: unknown;
+      refusalDetail?: unknown;
+      calls?: Array<{ callId?: unknown }>;
+    })
+    .filter((data) => data.kind === 'refused_pre_dispatch');
+  assert.equal(refusals.length, 1, 'the continued call reaches one durable typed refusal');
+  assert.equal(refusals[0]?.refusalDetail, 'production_port_or_invoke_identity_mismatch');
+  assert.deepEqual(refusals[0]?.calls?.map((call) => call.callId), ['execute-outlook-read-plan']);
+  assert.equal(
+    eventlog.listEvents(session.id, { types: ['provider_dispatch_started'] })
+      .filter((event) => (event.data as { logicalToolCallId?: unknown }).logicalToolCallId === 'execute-outlook-read-plan')
+      .length,
+    0,
+    'the forced read never opened a physical dispatch',
+  );
 });
