@@ -161,6 +161,47 @@ test('a blocked resume remains blocked and cannot be reported as approved', asyn
   assert.notEqual(result.status, 'approved');
 });
 
+test('a blocked resume preserves the machine reason that identifies readback-only uncertainty', async () => {
+  const result = await resolveDrainApproval({
+    approvalId: 'apr-readback-only-1',
+    approved: true,
+    registryForTest: {
+      get: () => ({ sessionId: 'sess-readback-only', status: 'resolved', resolution: 'approved' }),
+      resolve: () => ({ ok: true }),
+      listPending: () => [],
+    },
+    resumeForTest: async () => ({
+      status: 'blocked',
+      error: 'The write settled, but the authoritative readback is unavailable.',
+      blockedReason: 'authoritative_terminal_verification_incomplete',
+      blockedDetail: 'readback returned no authoritative value',
+      lastDecision: { reply: 'Done.', summary: 'Done.' },
+      publicPresentation: {
+        version: 1,
+        id: 'presentation:readback-only',
+        outcomeId: 'outcome:readback-only',
+        audience: 'user',
+        phase: 'final',
+        identity: { sessionId: 'sess-readback-only', turn: 1, sourceUserSeq: 1 },
+        status: 'blocked',
+        kind: 'blocked',
+        text: 'The write settled, but the final readback remains unverified.',
+        resumable: false,
+      },
+    }),
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.text, 'The write settled, but the final readback remains unverified.');
+  assert.equal(
+    result.status === 'blocked' ? result.blockedReason : undefined,
+    'authoritative_terminal_verification_incomplete',
+  );
+  assert.equal(
+    result.status === 'blocked' ? result.blockedDetail : undefined,
+    'readback returned no authoritative value',
+  );
+});
+
 test('a peer-held resume remains explicitly host-owned and in progress', async () => {
   const result = await resolveDrainApproval({
     approvalId: 'apr-held-1',

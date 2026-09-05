@@ -1650,18 +1650,33 @@ export function sweepInvalidDoneBackgroundTasks(
     if (Number.isFinite(refMs) && maxAgeMs > 0 && now - refMs > maxAgeMs) continue;
     scanned += 1;
 
+    // Boot and live settlement share the same effect-ledger truth. A settled
+    // effect defeats prose, but never an ambiguous crossing or an incomplete
+    // logical work manifest.
+    const effectLedger = backgroundEffectLedgerDisposition(task);
+    const ledgerBlockReason = backgroundEffectLedgerBlockReason(effectLedger);
+    const coverageBlock = fanoutCoverageBlock(task.runSessionId);
     const resultText = storedResultTextForIntegrityCheck(task).trim();
+    const blockedExecution = blockedExecutionOutcome(task);
+    if (effectLedger.complete && !ledgerBlockReason && !coverageBlock && !blockedExecution) continue;
+
     // Reclassify a settled `done` only on a positive/structural non-deliverable
     // signal — never on the self-reported-blocked TEXT heuristic, which is
     // past-tense-blind and would flip a genuine success whose report merely
     // recounts a blocker it overcame (finding A). No saved result, a blocked
     // execution row, or a fabricated transcript still reclassify.
-    const outcome = resultText
-      ? classifyBackgroundTaskOutcome(task, resultText, undefined, {
-        ignoreFanoutCoverage: true,
-        ignoreSelfReportedBlockedText: true,
-      })
-      : { outcome: 'blocked' as const, reason: 'Completed task has no saved result.' };
+    const outcome = ledgerBlockReason
+      ? { outcome: 'blocked' as const, reason: ledgerBlockReason }
+      : coverageBlock
+        ? coverageBlock
+        : blockedExecution
+          ? blockedExecution
+        : resultText
+          ? classifyBackgroundTaskOutcome(task, resultText, undefined, {
+            ignoreFanoutCoverage: true,
+            ignoreSelfReportedBlockedText: true,
+          })
+          : { outcome: 'blocked' as const, reason: 'Completed task has no saved result.' };
     if (outcome.outcome !== 'blocked') continue;
 
     const updated = markBackgroundTaskBlocked(
@@ -2584,7 +2599,11 @@ function workerParkMayProceed(task: BackgroundTaskRecord): boolean {
 }
 
 function workerDoneMayProceed(task: BackgroundTaskRecord): boolean {
-  return task.status === 'done' || WORKER_ACTIVE_OR_PARKED_STATUSES.includes(task.status);
+  // A live approval, question, or continue authorization is a stronger owner
+  // than a worker's completion claim. The real resolution paths re-queue the
+  // task as `pending` before execution resumes, so accepting a direct `done`
+  // from a parked state would only bypass that unresolved human/budget floor.
+  return task.status === 'done' || task.status === 'pending' || task.status === 'running';
 }
 
 function workerBlockedMayProceed(task: BackgroundTaskRecord): boolean {
@@ -2753,29 +2772,77 @@ function completionHasSubstance(result: string, notificationBody?: string): bool
   return (notificationBody ?? result ?? '').trim().length > 0;
 }
 
+function ledgerCompletionReportFallback(
+  id: string,
+  readbackUnverified = false,
+): string | null {
+  const task = getBackgroundTask(id);
+  if (!task) return null;
+  const disposition = backgroundEffectLedgerDisposition(task);
+  if (!disposition.complete) return null;
+  const count = disposition.durableSuccesses;
+  const settled = `Completed — the durable effect ledger records ${count} successful external write${count === 1 ? '' : 's'} for this task.`;
+  return readbackUnverified
+    ? `${settled} The final readback remains unverified.`
+    : settled;
+}
+
+function ensureReadbackUnverifiedDisclosure(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed || /\breadback\b[^.\n]{0,80}\bunverified\b|\bunverified\b[^.\n]{0,80}\breadback\b/i.test(trimmed)) {
+    return text;
+  }
+  return `${text}\n\nSystem verification: the external write is settled in the durable effect ledger; the final readback remains unverified.`;
+}
+
 export function markBackgroundTaskDone(
   id: string,
   result: string,
-  opts?: { notificationBody?: string },
+  opts?: { notificationBody?: string; readbackUnverified?: boolean },
 ): BackgroundTaskRecord | null {
+  const baseResult = result.trim()
+    ? result
+    : ledgerCompletionReportFallback(id, opts?.readbackUnverified) ?? result;
+  const effectiveResult = opts?.readbackUnverified
+    ? ensureReadbackUnverifiedDisclosure(baseResult)
+    : baseResult;
+  const effectiveNotificationBody = opts?.notificationBody && opts.readbackUnverified
+    ? ensureReadbackUnverifiedDisclosure(opts.notificationBody)
+    : opts?.notificationBody;
   // A settlement with nothing to report is not a completion. Route it to the
   // blocked path instead, which is the honest outcome — and, in the live case,
   // the outcome the task itself reached under its own steam minutes later.
-  if (!completionHasSubstance(result, opts?.notificationBody)) {
-    return markBackgroundTaskBlocked(
+  if (!completionHasSubstance(effectiveResult, effectiveNotificationBody)) {
+    return markBackgroundTaskBlockedWhere(
       id,
+      workerDoneMayProceed,
       'The run ended without producing any result text, so there is nothing to hand over.',
       'The worker settled with an empty result. Nothing was saved, so this is reported as blocked rather than as a completion with no content.',
+      'unknown',
     );
   }
   if (!prepareWorkerSettlementForCas(id)) return null;
   let terminalEnvelopePersisted = false;
+  let settlementRefusalReason: string | null = null;
   // Cancellation is a terminal authority boundary. The result file and task
   // completion are created only after the latest record is checked while the
   // task transition lease is held, so a stale worker cannot complete after a
   // cross-process stop committed.
-  const updated = updateBackgroundTaskWhere(id, workerDoneMayProceed, (task) => {
-    const resultPath = writeFullResultFile(task, result);
+  const updated = updateBackgroundTaskWhere(id, (task) => {
+    if (!workerDoneMayProceed(task)) return false;
+    // Re-read after the settlement hook and inside the task transition lock.
+    // This is the final authority check: a direct caller cannot bypass live
+    // verification with prose, and late ambiguity cannot race a prior snapshot
+    // into a false `done`.
+    const structuralRefusal = blockedExecutionOutcome(task)?.reason ?? null;
+    const ledgerRefusal = backgroundEffectLedgerBlockReason(
+      backgroundEffectLedgerDisposition(task),
+    );
+    const coverageRefusal = fanoutCoverageBlock(task.runSessionId)?.reason ?? null;
+    settlementRefusalReason = structuralRefusal ?? ledgerRefusal ?? coverageRefusal;
+    return settlementRefusalReason === null;
+  }, (task) => {
+    const resultPath = writeFullResultFile(task, effectiveResult);
     const completedAt = nowIso();
     const outcomeSnapshot = buildBackgroundTaskOutcomeSnapshot(task, 'done');
     const completedTask: BackgroundTaskRecord = {
@@ -2783,16 +2850,16 @@ export function markBackgroundTaskDone(
       ...clearParkedBackgroundState(),
       status: 'done',
       completedAt,
-      result: resultPath ? `${result.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : result,
+      result: resultPath ? `${effectiveResult.slice(0, RESULT_TRUNCATE_CHARS)}\n...[full result saved to ${resultPath}]` : effectiveResult,
       resultPath,
       error: undefined,
       outcomeSnapshot,
     };
     if (!task.internal && !task.terminalReportBack) {
-      const notificationBody = opts?.notificationBody ?? humanizeReportBody(result);
+      const notificationBody = effectiveNotificationBody ?? humanizeReportBody(effectiveResult);
       completedTask.terminalReportBack = buildBackgroundTaskDoneReportBack(
         completedTask,
-        result,
+        effectiveResult,
         notificationBody,
         completedAt,
       );
@@ -2805,6 +2872,15 @@ export function markBackgroundTaskDone(
     }
     return completedTask;
   });
+  if (!updated && settlementRefusalReason) {
+    return markBackgroundTaskBlockedWhere(
+      id,
+      workerDoneMayProceed,
+      settlementRefusalReason,
+      effectiveResult || settlementRefusalReason,
+      'unknown',
+    );
+  }
   if (updated) {
     if (terminalEnvelopePersisted) {
       backgroundTaskTerminalReportBackFaultForTests?.('after_persist');
@@ -3360,6 +3436,23 @@ export function markBackgroundTaskFailed(id: string, error: string, status: Extr
 // so the cron/gateway/autonomy honesty chokepoint and this richer background-task
 // classifier share one blocked-text vocabulary.
 
+function blockedExecutionOutcome(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+): { outcome: 'blocked'; reason: string; blockerType: BlockerType } | null {
+  try {
+    const blockedExecution = new ExecutionStore()
+      .list(Number.MAX_SAFE_INTEGER)
+      .find((e) => e.sessionId === task.runSessionId && e.status === 'blocked');
+    if (blockedExecution) {
+      const reason = blockedExecution.blocker || 'Execution marked blocked by the agent.';
+      return { outcome: 'blocked', reason, blockerType: classifyBlocker(reason) };
+    }
+  } catch {
+    // Store read is best-effort; the other independent completion floors remain.
+  }
+  return null;
+}
+
 export function classifyBackgroundTaskOutcome(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,
   finalText: string,
@@ -3369,17 +3462,8 @@ export function classifyBackgroundTaskOutcome(
   // 1) Structured signal: did the worker explicitly mark an execution
   //    blocked in its own session? This is the strongest signal — it's
   //    the agent telling us, in code, that it could not proceed.
-  try {
-    const blockedExecution = new ExecutionStore()
-      .list(40)
-      .find((e) => e.sessionId === task.runSessionId && e.status === 'blocked');
-    if (blockedExecution) {
-      const reason = blockedExecution.blocker || 'Execution marked blocked by the agent.';
-      return { outcome: 'blocked', reason, blockerType: classifyBlocker(reason) };
-    }
-  } catch {
-    // store read is best-effort; fall through to text heuristics
-  }
+  const blockedExecution = blockedExecutionOutcome(task);
+  if (blockedExecution) return blockedExecution;
 
   // 2) The runtime stopped while still pending an approval but the caller
   //    didn't catch it (defense-in-depth; the explicit pendingApprovalId
@@ -3526,7 +3610,55 @@ export interface BackgroundCompletionEvidence {
   artifactBindings: number;
   extractedDeliverables: number;
   externalWriteReceipts: number;
+  /** Explicit success terminals whose reservation and terminal both belong to
+   * a non-ambiguous accepted source that requested an external effect. */
+  durableExternalWriteSuccesses: number;
   ambiguousExternalWrites: number;
+}
+
+interface AcceptedExternalEffectAuthority {
+  requirement: boolean | null | 'ambiguous';
+  acceptedSources: Array<{ sourceUserSeq: number; acceptedTaskId: string }>;
+}
+
+/** Background auto-continuation re-admits the byte-identical task prompt under
+ * a fresh source sequence. Completion therefore remains run-wide, as D1
+ * requires: any exact, non-ambiguous accepted effect source may own the settled
+ * write. Ambiguous/readback-only rows cannot mint that authority. */
+function acceptedTaskExternalEffectAuthority(
+  sessionId: string,
+): AcceptedExternalEffectAuthority {
+  try {
+    const rows = openEventLog().prepare(`
+      SELECT source_user_seq, accepted_task_id, state, external_effect_requested
+        FROM accepted_task_resolutions
+       WHERE session_id = ?
+       ORDER BY source_user_seq DESC
+    `).all(sessionId) as Array<{
+      source_user_seq: number;
+      accepted_task_id: string;
+      state: string;
+      external_effect_requested: number;
+    }>;
+    if (rows.length === 0) return { requirement: null, acceptedSources: [] };
+    const acceptedSources = rows
+      .filter((row) => row.external_effect_requested === 1 && row.state !== 'legacy_ambiguous')
+      .map((row) => ({
+        sourceUserSeq: row.source_user_seq,
+        acceptedTaskId: row.accepted_task_id,
+      }));
+    if (acceptedSources.length > 0) return { requirement: true, acceptedSources };
+    const ambiguousExternal = rows.some((row) => (
+      row.external_effect_requested === 1 && row.state === 'legacy_ambiguous'
+    ));
+    if (ambiguousExternal) return { requirement: 'ambiguous', acceptedSources: [] };
+    return {
+      requirement: false,
+      acceptedSources: [],
+    };
+  } catch {
+    return { requirement: 'ambiguous', acceptedSources: [] };
+  }
 }
 
 /**
@@ -3535,12 +3667,14 @@ export interface BackgroundCompletionEvidence {
  * successful deliverable-return rows, and uncompensated external-write receipts
  * prove that promised effects exist. No model call and no semantic verdict.
  */
-export function backgroundCompletionEvidence(
+function backgroundCompletionEvidenceWithAuthority(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+  acceptedExternal: AcceptedExternalEffectAuthority,
 ): BackgroundCompletionEvidence {
   let artifactBindings = 0;
   let extractedDeliverables = 0;
   let externalWriteReceipts = 0;
+  let durableExternalWriteSuccesses = 0;
   let ambiguousExternalWrites = 0;
   try { artifactBindings = listRunArtifacts(task.runSessionId).length; } catch { /* unreadable evidence stays absent */ }
   try { extractedDeliverables = extractDeliverables(task.runSessionId).length; } catch { /* unreadable evidence stays absent */ }
@@ -3573,6 +3707,13 @@ export function backgroundCompletionEvidence(
           : '';
       if (callId) lifecycleCallIds.add(callId);
     }
+    const acceptedTaskBySource = new Map(
+      acceptedExternal.acceptedSources.map((source) => [
+        source.sourceUserSeq,
+        source.acceptedTaskId,
+      ]),
+    );
+    const confirmedReservationById = new Map<string, (typeof lifecycleEvents)[number]>();
     for (const event of resolveWriteEvidence(lifecycleEvents).confirmed) {
       const data = (event.data ?? {}) as Record<string, unknown>;
       const callId = typeof data.canonicalCallId === 'string' && data.canonicalCallId.trim()
@@ -3580,8 +3721,39 @@ export function backgroundCompletionEvidence(
         : typeof data.callId === 'string'
           ? data.callId.trim()
           : '';
+      const sourceUserSeq = typeof data.sourceUserSeq === 'number' ? data.sourceUserSeq : 0;
+      const acceptedTaskId = typeof data.acceptedTaskId === 'string' ? data.acceptedTaskId : '';
+      if (
+        callId
+        && sourceUserSeq > 0
+        && acceptedTaskBySource.get(sourceUserSeq) === acceptedTaskId
+      ) confirmedReservationById.set(event.id, event);
       receiptKeys.add(callId ? `call:${callId}` : `event:${event.seq}`);
     }
+    const succeededReservationIds = new Set<string>();
+    for (const event of lifecycleEvents) {
+      if (event.type !== 'external_write_succeeded') continue;
+      const reservation = event.parentEventId
+        ? confirmedReservationById.get(event.parentEventId)
+        : undefined;
+      if (!reservation) continue;
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      const rawCallId = data.canonicalCallId ?? data.callId;
+      const callId = typeof rawCallId === 'string' ? rawCallId.trim() : '';
+      const reservationData = (reservation.data ?? {}) as Record<string, unknown>;
+      const reservationCallId = typeof reservationData.canonicalCallId === 'string'
+        ? reservationData.canonicalCallId.trim()
+        : typeof reservationData.callId === 'string'
+          ? reservationData.callId.trim()
+          : '';
+      if (
+        callId
+        && callId === reservationCallId
+        && data.sourceUserSeq === reservationData.sourceUserSeq
+        && data.acceptedTaskId === reservationData.acceptedTaskId
+      ) succeededReservationIds.add(reservation.id);
+    }
+    durableExternalWriteSuccesses = succeededReservationIds.size;
     // Restart safety deliberately treats a lone external-write return as
     // write-touched even when its result failed. Completion is stricter: only
     // a successful return for a call whose canonical lifecycle is absent can
@@ -3604,7 +3776,74 @@ export function backgroundCompletionEvidence(
     }
     externalWriteReceipts = receiptKeys.size;
   } catch { /* unreadable evidence stays absent */ }
-  return { artifactBindings, extractedDeliverables, externalWriteReceipts, ambiguousExternalWrites };
+  return {
+    artifactBindings,
+    extractedDeliverables,
+    externalWriteReceipts,
+    durableExternalWriteSuccesses,
+    ambiguousExternalWrites,
+  };
+}
+
+export function backgroundCompletionEvidence(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+): BackgroundCompletionEvidence {
+  const acceptedExternal = acceptedTaskExternalEffectAuthority(task.runSessionId);
+  return backgroundCompletionEvidenceWithAuthority(task, acceptedExternal);
+}
+
+/**
+ * The accepted-task row already freezes the TurnGraph's external-effect
+ * classification. Graphless historical tasks retain the compatibility gates
+ * below; unreadable or invalid structured authority fails closed.
+ */
+function acceptedTaskExternalEffectRequirement(
+  sessionId: string,
+): boolean | null | 'ambiguous' {
+  return acceptedTaskExternalEffectAuthority(sessionId).requirement;
+}
+
+interface BackgroundEffectLedgerDisposition {
+  requirement: boolean | null | 'ambiguous';
+  durableSuccesses: number;
+  ambiguousWrites: number;
+  complete: boolean;
+}
+
+/** One provider-neutral completion predicate shared by live settlement, boot
+ * repair, and the empty-report fallback. Prose explains the outcome; these
+ * accepted-source ledger facts decide whether the requested effect exists. */
+function backgroundEffectLedgerDisposition(
+  task: Pick<BackgroundTaskRecord, 'runSessionId'>,
+  evidence?: BackgroundCompletionEvidence,
+  acceptedExternal = acceptedTaskExternalEffectAuthority(task.runSessionId),
+): BackgroundEffectLedgerDisposition {
+  const completionEvidence = evidence
+    ?? backgroundCompletionEvidenceWithAuthority(task, acceptedExternal);
+  const requirement = acceptedExternal.requirement;
+  const durableSuccesses = completionEvidence.durableExternalWriteSuccesses;
+  const ambiguousWrites = completionEvidence.ambiguousExternalWrites;
+  return {
+    requirement,
+    durableSuccesses,
+    ambiguousWrites,
+    complete: requirement === true && durableSuccesses > 0 && ambiguousWrites === 0,
+  };
+}
+
+function backgroundEffectLedgerBlockReason(
+  disposition: BackgroundEffectLedgerDisposition,
+): string | null {
+  if (disposition.ambiguousWrites > 0) {
+    return 'An external mutation started but has no durable success or proven-failure receipt. Check the external system before continuing; replay may duplicate the action.';
+  }
+  if (disposition.requirement === 'ambiguous') {
+    return 'The accepted task\'s external-effect requirement is unreadable or ambiguous.';
+  }
+  if (disposition.requirement === true && !disposition.complete) {
+    return 'The accepted task required an external effect, but the run has no durable external-write success receipt.';
+  }
+  return null;
 }
 
 function latestConcreteToolFailure(
@@ -3886,14 +4125,50 @@ export async function verifyBackgroundTaskDelivery(
   task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title' | 'startedAt' | 'createdAt'>,
   finalText: string,
   stoppedReason?: RunStoppedReason,
+  opts?: { terminalBlockReason?: string },
 ): Promise<{ outcome: 'done' | 'blocked'; reason?: string; blockerType?: BlockerType }> {
   // The on-disk mtime floor is the TASK's birth, not the current attempt's
   // start: a resume resets startedAt, which disqualified files a PRIOR attempt
   // of the same task legitimately wrote (proved live 2026-08-04 — the resumed
   // run re-verified its own deliverables and the floor rejected them).
   const deliverableFloor = task.createdAt ?? task.startedAt;
-  let classified = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, { ignoreFanoutCoverage: true });
-  if (classified.outcome === 'blocked') {
+  if (backgroundCompletionVerificationPauseForTests) await backgroundCompletionVerificationPauseForTests();
+  const acceptedExternal = acceptedTaskExternalEffectAuthority(task.runSessionId);
+  const completionEvidence = backgroundCompletionEvidenceWithAuthority(task, acceptedExternal);
+  const effectLedger = backgroundEffectLedgerDisposition(task, completionEvidence, acceptedExternal);
+  const externalEffectRequired = effectLedger.requirement;
+  const ledgerCompletedExternalEffect = effectLedger.complete;
+  const terminalReadbackOnly = stoppedReason === 'unverified'
+    || (
+      stoppedReason === 'blocked'
+      && opts?.terminalBlockReason === 'authoritative_terminal_verification_incomplete'
+    );
+  // Only the exact machine-typed readback advisory may be downgraded. A generic
+  // `blocked` terminal, a pending approval, a runtime failure, or a blocked
+  // ExecutionStore row remains a structural floor even when an earlier write
+  // settled successfully.
+  const effectiveStoppedReason: RunStoppedReason | undefined = terminalReadbackOnly
+    ? 'unverified'
+    : stoppedReason;
+  const structural = classifyBackgroundTaskOutcome(task, finalText, effectiveStoppedReason, {
+    ignoreFanoutCoverage: true,
+    ignoreSelfReportedBlockedText: true,
+  });
+  if (structural.outcome === 'blocked') return structural;
+
+  const ledgerBlockReason = backgroundEffectLedgerBlockReason(effectLedger);
+  if (ledgerBlockReason) {
+    return {
+      outcome: 'blocked',
+      reason: ledgerBlockReason,
+      blockerType: 'unknown',
+    };
+  }
+
+  const classified = classifyBackgroundTaskOutcome(task, finalText, effectiveStoppedReason, {
+    ignoreFanoutCoverage: true,
+  });
+  if (classified.outcome === 'blocked' && !ledgerCompletedExternalEffect) {
     // The self-reported-blocked TEXT heuristic is past-tense-blind: an honest
     // success narrative recounting an obstacle it already OVERCAME ("the
     // earlier report was wrong — nothing had been written — so I wrote all
@@ -3903,34 +4178,26 @@ export async function verifyBackgroundTaskDelivery(
     // execution row, stoppedReason, fake transcript) all say done — and the
     // named deliverables verify on disk, reality outranks the prose. The
     // structural block paths are untouched.
-    const structural = classifyBackgroundTaskOutcome(task, finalText, stoppedReason, {
-      ignoreFanoutCoverage: true,
-      ignoreSelfReportedBlockedText: true,
-    });
     if (structural.outcome === 'done' && verifiedOnDiskDeliverables(finalText, deliverableFloor) > 0) {
-      classified = structural;
+      // The structural classification above already proved that this is only a
+      // prose false-positive. Continue with the evidence checks below.
     } else {
       return classified;
     }
   }
-  if (backgroundCompletionVerificationPauseForTests) await backgroundCompletionVerificationPauseForTests();
-
-  const completionEvidence = backgroundCompletionEvidence(task);
-  if (completionEvidence.ambiguousExternalWrites > 0) {
-    return {
-      outcome: 'blocked',
-      reason: 'An external mutation started but has no durable success or proven-failure receipt. Check the external system before continuing; replay may duplicate the action.',
-      blockerType: 'unknown',
-    };
-  }
-  if (taskRequiresExternalSendReceipt(task) && completionEvidence.externalWriteReceipts === 0) {
+  if (
+    externalEffectRequired === null
+    && taskRequiresExternalSendReceipt(task)
+    && completionEvidence.externalWriteReceipts === 0
+  ) {
     return {
       outcome: 'blocked',
       reason: 'The task required an external send or publish, but the run has no committed external-write receipt.',
       blockerType: 'unknown',
     };
   }
-  if (completionLacksDeliverableEvidence(task)
+  if (!ledgerCompletedExternalEffect
+    && completionLacksDeliverableEvidence(task)
     && verifiedOnDiskDeliverables(finalText, deliverableFloor) === 0) {
     return {
       outcome: 'blocked',
@@ -4014,7 +4281,13 @@ export async function verifyBackgroundTaskDelivery(
       const objective = probeObjectiveForTask(task, getActiveGoalForSession(task.runSessionId));
       if (objective.trim()) {
         const probe = await probeSessionDeliverables(task.runSessionId, objective);
-        if (probe.failures.length > 0) {
+        const readbackDisprovedDeliverable = probe.probed.some((verdict) => (
+          !verdict.pass && verdict.method === 'probe'
+        ));
+        if (
+          probe.failures.length > 0
+          && (!ledgerCompletedExternalEffect || readbackDisprovedDeliverable)
+        ) {
           return { outcome: 'blocked', reason: probe.summary.slice(0, 400) };
         }
       }
@@ -5097,7 +5370,8 @@ async function finishWorkerRun(
     logger.info({ taskId: task.id }, 'Background task remains owned by exact-source recovery');
     return;
   }
-  if (response.stoppedReason === 'unverified') {
+  const acceptedExternalEffectRequired = acceptedTaskExternalEffectRequirement(task.runSessionId);
+  if (response.stoppedReason === 'unverified' && acceptedExternalEffectRequired !== true) {
     // The turn could not verify its own work, and there is no question for
     // the user to answer. Park BLOCKED (needs attention) — never as a
     // clarifying question. Parked-as-a-question, this exact state idled 45
@@ -5166,7 +5440,12 @@ async function finishWorkerRun(
   // settle above): a first artifact-less completion on an artifact-committed
   // task earns ONE auto-queued continuation with the objective re-pinned; the
   // verify below blocks honestly on repeat.
-  if (completionLacksDeliverableEvidence(task) && !task.deliverableContinueQueuedAt) {
+  if (
+    acceptedExternalEffectRequired !== true
+    && acceptedExternalEffectRequired !== 'ambiguous'
+    && completionLacksDeliverableEvidence(task)
+    && !task.deliverableContinueQueuedAt
+  ) {
     const reAnchored = updateBackgroundTaskWhere(task.id, (latest) => latest.status === 'running', {
       status: 'pending',
       deliverableContinueQueuedAt: nowIso(),
@@ -5260,7 +5539,9 @@ async function finishWorkerRun(
     logger.warn({ taskId: task.id, reason: outcome.reason, stoppedReason: response.stoppedReason }, 'Background task did not complete cleanly (blocked, not done)');
     return;
   }
-  const done = markBackgroundTaskDone(task.id, response.text);
+  const done = markBackgroundTaskDone(task.id, response.text, {
+    readbackUnverified: response.stoppedReason === 'unverified',
+  });
   if (!acceptWorkerTransition(done, 'done')) return;
   finishRun(run.id, { status: 'completed', message: `Background task ${task.id} completed.`, outputPreview: response.text });
   clearLedger(task.runSessionId);
@@ -5493,13 +5774,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // approve → "Approval not found" → task failed, row still pending).
 	        const resolveDrainApproval = drainApprovalResolverForTests
               ?? (await import('./approval-drain.js')).resolveDrainApproval;
-		        const result = await resolveDrainApproval({
-		          approvalId: resolution.approvalId,
-		          approved: resolution.approved,
-		          sessionId: task.runSessionId,
-		        });
+	        const result = await resolveDrainApproval({
+	          approvalId: resolution.approvalId,
+	          approved: resolution.approved,
+	          sessionId: task.runSessionId,
+	        });
         if (heartbeatTimer) clearInterval(heartbeatTimer);
-
         switch (result.status) {
           case 'rejected': {
             const aborted = markBackgroundTaskFailed(task.id, result.text || `Approval ${resolution.approvalId} rejected.`, 'aborted');
@@ -5545,17 +5825,41 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
             continue;
           }
           case 'blocked': {
-            const blocked = markBackgroundTaskBlocked(task.id, result.reason, result.text);
+            const postApprovalOutcome = await verifyBackgroundTaskDelivery(
+              task,
+              result.text,
+              'blocked',
+              { terminalBlockReason: result.blockedReason },
+            );
+            if (postApprovalOutcome.outcome === 'done') {
+              const done = markBackgroundTaskDone(task.id, result.text, {
+                readbackUnverified: result.blockedReason === 'authoritative_terminal_verification_incomplete',
+              });
+              if (!acceptApprovalTransition(done, 'done', result.text)) continue;
+              finishRun(run.id, {
+                status: 'completed',
+                message: `Background task ${task.id} completed after approval ${resolution.approvalId}.`,
+                outputPreview: result.text,
+              });
+              clearLedger(task.runSessionId);
+              logger.info(
+                { taskId: task.id, approvalId: resolution.approvalId },
+                'Background task completed after approval continuation',
+              );
+              continue;
+            }
+            const reason = result.reason || postApprovalOutcome.reason || 'Task could not be completed.';
+            const blocked = markBackgroundTaskBlocked(task.id, reason, result.text);
             if (!acceptApprovalTransition(blocked, 'blocked', result.text)) continue;
             finishRun(run.id, {
               status: 'blocked',
-              message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${result.reason}`,
+              message: `Background task ${task.id} blocked after approval ${resolution.approvalId}: ${reason}`,
               outputPreview: result.text,
               needsAttention: true,
             });
             clearLedger(task.runSessionId);
             logger.warn(
-              { taskId: task.id, approvalId: resolution.approvalId, reason: result.reason },
+              { taskId: task.id, approvalId: resolution.approvalId, reason },
               'Background task remained blocked after approval continuation',
             );
             continue;
@@ -5649,7 +5953,13 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
         // FULL original objective — the exact manual intervention the owner's
         // runs needed, automated. A second artifact-less completion falls
         // through to the verify below and blocks honestly.
-        if (completionLacksDeliverableEvidence(task) && !task.deliverableContinueQueuedAt) {
+        const postApprovalExternalEffectRequired = acceptedTaskExternalEffectRequirement(task.runSessionId);
+        if (
+          postApprovalExternalEffectRequired !== true
+          && postApprovalExternalEffectRequired !== 'ambiguous'
+          && completionLacksDeliverableEvidence(task)
+          && !task.deliverableContinueQueuedAt
+        ) {
           // The continue prompt renders task.result as the "continuation note"
           // (it wins over continueResolution.reason), so the corrective framing
           // lives THERE — guaranteed in front of the model on the next turn.

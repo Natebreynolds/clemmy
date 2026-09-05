@@ -57,6 +57,7 @@ const {
   probeObjectiveForTask,
   selfResumeDecision,
   assessBackgroundTaskRestartSafety,
+  verifyBackgroundTaskDelivery,
   _setBackgroundTaskSettlementCasHookForTests,
   _setBackgroundTaskApprovalDispatchCheckHookForTests,
   _setDrainApprovalResolverForTests,
@@ -69,12 +70,14 @@ const {
 const { enqueueDurableChatTask } = await import('./background-promote.js');
 const { isAutoApprovedByScope, getPlanScope } = await import('../agents/plan-scope.js');
 const { SessionStore } = await import('../memory/session-store.js');
+const { ExecutionStore } = await import('./store.js');
 const { recordWorkerResult, clearLedger, summarizeLedger } = await import('../runtime/harness/fanout-ledger.js');
 const {
   createSession,
   appendEvent,
   getSession,
   listEvents,
+  openEventLog,
   writeToolOutput,
 } = await import('../runtime/harness/eventlog.js');
 const { renderRunStrategiesForContext } = await import('../memory/run-strategy-store.js');
@@ -95,6 +98,11 @@ const {
   getProspectiveIntention,
 } = await import('../runtime/prospective-intentions.js');
 const { syncProspectiveIntentions } = await import('../runtime/prospective-sync.js');
+const { recordTurnGraphShadow, turnGraphFromShadowEvent } = await import('../runtime/graph/turn-graph-shadow.js');
+const {
+  ensureAcceptedTaskResolutionOpenInTransaction,
+  expectedTaskFor,
+} = await import('../runtime/harness/resolution-ledger.js');
 
 _setBackgroundResponseExecutorForTests((assistant, request) => assistant.respond(request));
 
@@ -212,7 +220,25 @@ test('a running task accepts a versioned course correction and revalidates durab
   assert.equal(manifest?.phases[0]?.needsValidation, 1);
   assert.equal(manifest?.evidenceCount, 1, 'old evidence stays visible while awaiting revalidation');
 
-  markBackgroundTaskDone(task.id, 'finished');
+  checkpointWorkItem({
+    sessionId: task.runSessionId,
+    manifestId: 'accounts',
+    contractVersion: 2,
+    phase: 'research',
+    itemId: 'account-a',
+    status: 'succeeded',
+    evidence: [{ kind: 'source', ref: 'chatgpt-research:account-a' }],
+  });
+  checkpointWorkItem({
+    sessionId: task.runSessionId,
+    manifestId: 'accounts',
+    contractVersion: 2,
+    phase: 'merge',
+    itemId: 'account-a',
+    status: 'succeeded',
+    evidence: [{ kind: 'artifact', ref: 'merged-account-a' }],
+  });
+  assert.equal(markBackgroundTaskDone(task.id, 'finished')?.status, 'done');
   assert.equal(
     reviseBackgroundTaskContract(task.id, { instruction: 'Too late to alter a terminal task.' }),
     null,
@@ -1996,6 +2022,43 @@ test('a blocked approval continuation is blocked in both task and activity ledge
   }
 });
 
+test('a post-approval blocked readback cannot erase its durable write success', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const approvalId = 'approval-written-readback-blocked';
+  const task = createBackgroundTask({
+    title: 'Create the approved external workbook',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  assert.equal(markBackgroundTaskAwaitingApproval(task.id, approvalId, 'Ready to create it.')?.status, 'awaiting_approval');
+  assert.equal(queueBackgroundTaskApprovalResolution(approvalId, true)?.status, 'pending');
+  _setDrainApprovalResolverForTests((async () => {
+    appendDurableWriteSuccess(task, identity, 'approved-ledger-complete-workbook');
+    return {
+      approvalId,
+      status: 'blocked' as const,
+      text: 'The workbook was created, but its readback could not be verified.',
+      sessionId: task.runSessionId,
+      reason: 'Readback verification failed after the write returned success.',
+      blockedReason: 'authoritative_terminal_verification_incomplete',
+    };
+  }) as never);
+
+  try {
+    assert.equal(await processBackgroundTasks({
+      getRuntime() { return {} as never; },
+      async respond() { throw new Error('approval continuation must not start new model work'); },
+    } as any, 1), 1);
+    assert.equal(getBackgroundTask(task.id)?.status, 'done');
+    const tracked = listRuns(40).find((candidate) => candidate.sessionId === task.runSessionId);
+    assert.equal(tracked?.status, 'completed');
+    assert.equal(tracked?.events.some((event) => event.type === 'blocked'), false);
+  } finally {
+    _setDrainApprovalResolverForTests(null);
+    archiveBackgroundTask(task.id);
+  }
+});
+
 test('processBackgroundTasks clears per-turn fanout coverage before automatic continuation', async () => {
   const task = createBackgroundTask({ title: 'Recover failed fanout', prompt: 'process every prospect' });
   clearLedger(task.runSessionId);
@@ -2226,7 +2289,12 @@ test('markBackgroundTaskFailed with status=interrupted does NOT report back (aut
 test('markBackgroundTaskDone still reports after an earlier needs-input report-back', () => {
   const sessionId = 'sess-reportback-after-input';
   const task = createBackgroundTask({ title: 'Finish outreach', prompt: 'do it', originSessionId: sessionId });
-  markBackgroundTaskAwaitingInput(task.id, 'q-reportback-after-input', 'Which segment should I use?');
+  const questionId = 'q-reportback-after-input';
+  markBackgroundTaskAwaitingInput(task.id, questionId, 'Which segment should I use?');
+  assert.equal(
+    queueBackgroundTaskInputResolution(questionId, 'Use the healthcare segment.')?.status,
+    'pending',
+  );
   markBackgroundTaskDone(task.id, 'Finished the healthcare segment.');
 
   const turns = new SessionStore().get(sessionId).turns
@@ -2256,6 +2324,7 @@ test('markBackgroundTaskDone still reports after an earlier continue-needed repo
   const sessionId = 'sess-reportback-after-continue';
   const task = createBackgroundTask({ title: 'Long build', prompt: 'do it', originSessionId: sessionId });
   markBackgroundTaskAwaitingContinue(task.id, 'hit turn budget', 'partial notes');
+  assert.equal(queueBackgroundTaskContinue(task.id)?.status, 'pending');
   markBackgroundTaskDone(task.id, 'Finished after continuing.');
 
   const turns = new SessionStore().get(sessionId).turns
@@ -2264,6 +2333,38 @@ test('markBackgroundTaskDone still reports after an earlier continue-needed repo
   assert.match(turns[0].text, /NEEDS INPUT/);
   assert.match(turns[1].text, /completed/);
   assert.match(turns[1].text, /Finished after continuing/);
+});
+
+test('markBackgroundTaskDone preserves unresolved approval, input, and continue floors', () => {
+  const approval = createBackgroundTask({ title: 'Approval floor', prompt: 'wait for approval' });
+  assert.equal(
+    markBackgroundTaskAwaitingApproval(approval.id, 'approval-floor-1', 'Approve the exact action.')?.status,
+    'awaiting_approval',
+  );
+
+  const input = createBackgroundTask({ title: 'Input floor', prompt: 'wait for input' });
+  assert.equal(
+    markBackgroundTaskAwaitingInput(input.id, 'input-floor-1', 'Which account should I use?')?.status,
+    'awaiting_input',
+  );
+
+  const continuation = createBackgroundTask({ title: 'Continue floor', prompt: 'wait for more budget' });
+  assert.equal(
+    markBackgroundTaskAwaitingContinue(continuation.id, 'turn budget exhausted', 'Partial progress.')?.status,
+    'awaiting_continue',
+  );
+
+  for (const task of [approval, input, continuation]) {
+    assert.equal(markBackgroundTaskDone(task.id, 'Done.'), null);
+    assert.equal(markBackgroundTaskDone(task.id, ''), null);
+  }
+  assert.equal(getBackgroundTask(approval.id)?.status, 'awaiting_approval');
+  assert.equal(getBackgroundTask(input.id)?.status, 'awaiting_input');
+  assert.equal(getBackgroundTask(continuation.id)?.status, 'awaiting_continue');
+
+  archiveBackgroundTask(approval.id);
+  archiveBackgroundTask(input.id);
+  archiveBackgroundTask(continuation.id);
 });
 
 test('terminal background states clear stale parked input and continue metadata', () => {
@@ -2610,6 +2711,7 @@ test('background completion evidence reduces committed, compensated, and ambiguo
     artifactBindings: 0,
     extractedDeliverables: 0,
     externalWriteReceipts: 1,
+    durableExternalWriteSuccesses: 0,
     ambiguousExternalWrites: 0,
   });
 
@@ -2694,6 +2796,7 @@ test('background completion and restart safety require exact settlement for pre-
     artifactBindings: 0,
     extractedDeliverables: 0,
     externalWriteReceipts: 0,
+    durableExternalWriteSuccesses: 0,
     ambiguousExternalWrites: 1,
   });
   assert.deepEqual(assessBackgroundTaskRestartSafety(pendingTask), {
@@ -2728,6 +2831,11 @@ test('background completion and restart safety require exact settlement for pre-
     data: reservationData,
   });
   assert.equal(backgroundCompletionEvidence(succeededTask).externalWriteReceipts, 1);
+  assert.equal(
+    backgroundCompletionEvidence(succeededTask).durableExternalWriteSuccesses,
+    0,
+    'an exact write lifecycle without accepted external-effect authority is restart evidence, not completion authority',
+  );
   assert.equal(backgroundCompletionEvidence(succeededTask).ambiguousExternalWrites, 0);
   assert.equal(assessBackgroundTaskRestartSafety(succeededTask).reason, 'external_write_history');
 
@@ -3983,6 +4091,558 @@ test('an honest overcame-the-obstacle success narrative with verified files comp
     'success' as never,
   );
   assert.equal(hollow.outcome, 'blocked', 'a live blocker narrative with no deliverable still blocks');
+});
+
+function anchorBackgroundAcceptedTurn(task: {
+  runSessionId: string;
+}, text: string, turn = 1): {
+  sourceUserSeq: number;
+  acceptedTaskId: string;
+  externalEffectRequested: boolean;
+} {
+  const session = getSession(task.runSessionId)
+    ?? createSession({ id: task.runSessionId, kind: 'execution' });
+  const source = appendEvent({
+    sessionId: session.id,
+    turn,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text },
+  });
+  const graph = recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn },
+    surface: 'background',
+  });
+  assert.ok(graph, 'the accepted external-effect objective is frozen before completion');
+  const externalEffectRequested = turnGraphFromShadowEvent(graph)?.classification.externalEffectRequested === true;
+  const expected = expectedTaskFor(session.id, source.seq);
+  assert.equal(expected.status, 'ok');
+  if (expected.status !== 'ok') throw new Error(expected.reason);
+  const db = openEventLog();
+  assert.equal(db.transaction(() => (
+    ensureAcceptedTaskResolutionOpenInTransaction(db, expected.expectation)
+  )).immediate(), true);
+  return {
+    sourceUserSeq: source.seq,
+    acceptedTaskId: expected.expectation.acceptedTaskId,
+    externalEffectRequested,
+  };
+}
+
+function anchorBackgroundExternalEffect(task: {
+  runSessionId: string;
+  prompt: string;
+}): { sourceUserSeq: number; acceptedTaskId: string } {
+  const accepted = anchorBackgroundAcceptedTurn(task, task.prompt);
+  assert.equal(accepted.externalEffectRequested, true, 'the frozen accepted task requires an external effect');
+  return accepted;
+}
+
+function appendDurableWriteSuccess(
+  task: { runSessionId: string },
+  identity: { sourceUserSeq: number; acceptedTaskId: string },
+  callId: string,
+): void {
+  const data = {
+    preDispatch: true,
+    callId,
+    canonicalCallId: callId,
+    sourceUserSeq: identity.sourceUserSeq,
+    acceptedTaskId: identity.acceptedTaskId,
+    shapeKey: 'CREATE_REVERSIBLE_DRAFT',
+    targets: ['draft:test-recipient'],
+  };
+  const reservation = appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data,
+  });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write_succeeded',
+    parentEventId: reservation.id,
+    data,
+  });
+}
+
+function appendBlockedExecution(
+  task: { runSessionId: string; prompt: string },
+  blocker: string,
+): void {
+  const executionStore = new ExecutionStore();
+  const execution = executionStore.create({
+    sessionId: task.runSessionId,
+    channel: 'cli',
+    title: 'Complete the accepted background task',
+    objective: task.prompt,
+    reason: 'Track the accepted task through its remaining required work.',
+    startedFromMessage: task.prompt,
+    confidence: 1,
+    reasons: ['test structural completion floor'],
+  });
+  executionStore.update(execution.id, { status: 'blocked', blocker });
+}
+
+test('structured external-effect completion blocks a prose success with no durable write success', async () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  anchorBackgroundExternalEffect(task);
+  const outcome = await verifyBackgroundTaskDelivery(
+    task,
+    'Done — I created the requested draft.',
+    'success' as never,
+  );
+  assert.equal(outcome.outcome, 'blocked');
+  assert.match(outcome.reason ?? '', /no durable external-write success receipt/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('durable write success outranks failed readback, while generic blocks and ambiguity still win', async () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'ledger-complete-draft');
+
+  const unverified = await verifyBackgroundTaskDelivery(
+    task,
+    'The draft write succeeded, but I could not verify the readback.',
+    'unverified' as never,
+  );
+  assert.equal(unverified.outcome, 'done', 'failed readback must not erase a settled write');
+
+  const typedReadbackOnly = await verifyBackgroundTaskDelivery(
+    task,
+    'The draft write succeeded, but authoritative terminal verification is unavailable.',
+    'blocked' as never,
+    { terminalBlockReason: 'authoritative_terminal_verification_incomplete' },
+  );
+  assert.equal(typedReadbackOnly.outcome, 'done', 'the exact machine readback terminal is advisory after settlement');
+
+  const genericBlocked = await verifyBackgroundTaskDelivery(
+    task,
+    'The first draft succeeded, but required work remains blocked.',
+    'blocked' as never,
+  );
+  assert.equal(genericBlocked.outcome, 'blocked', 'a generic blocked terminal may still describe incomplete work');
+
+  _setBackgroundCompletionVerificationPauseForTests(async () => {
+    appendEvent({
+      sessionId: task.runSessionId,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: {
+        preDispatch: true,
+        callId: 'ledger-ambiguous-draft',
+        canonicalCallId: 'ledger-ambiguous-draft',
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedTaskId: identity.acceptedTaskId,
+        shapeKey: 'CREATE_REVERSIBLE_DRAFT',
+        targets: ['draft:second-recipient'],
+      },
+    });
+  });
+  try {
+    const ambiguous = await verifyBackgroundTaskDelivery(
+      task,
+      'Done — both drafts were created.',
+      'success' as never,
+    );
+    assert.equal(ambiguous.outcome, 'blocked');
+    assert.match(ambiguous.reason ?? '', /may duplicate the action/i);
+  } finally {
+    _setBackgroundCompletionVerificationPauseForTests(null);
+  }
+  archiveBackgroundTask(task.id);
+});
+
+test('a blocked execution row remains a completion floor after a durable write success', async () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook with remaining required work',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'ledger-complete-but-execution-blocked');
+
+  appendBlockedExecution(task, 'The required source validation is still incomplete.');
+
+  const outcome = await verifyBackgroundTaskDelivery(
+    task,
+    'The workbook write succeeded.',
+    'success' as never,
+  );
+  assert.equal(outcome.outcome, 'blocked');
+  assert.match(outcome.reason ?? '', /source validation is still incomplete/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('a newer readback-only accepted turn cannot hide an earlier task write', async () => {
+  const task = createBackgroundTask({
+    title: 'Create then verify one external workbook',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'prior-turn-ledger-complete-workbook');
+  const readback = anchorBackgroundAcceptedTurn(
+    task,
+    'Report what the existing run already completed. Do not make any further changes.',
+    2,
+  );
+  assert.equal(readback.externalEffectRequested, false, 'the newer accepted source is readback-only');
+
+  const outcome = await verifyBackgroundTaskDelivery(
+    task,
+    'The write completed on the prior turn, but this readback could not be verified.',
+    'unverified' as never,
+  );
+  assert.equal(outcome.outcome, 'done', 'task-level ledger truth survives a readback-only continuation');
+  openEventLog().prepare(`
+    UPDATE accepted_task_resolutions
+       SET state = 'legacy_ambiguous'
+     WHERE session_id = ? AND source_user_seq = ?
+  `).run(task.runSessionId, readback.sourceUserSeq);
+  const afterUnrelatedLegacyRow = await verifyBackgroundTaskDelivery(
+    task,
+    'The original write remains settled; the later readback authority is unavailable.',
+    'unverified' as never,
+  );
+  assert.equal(
+    afterUnrelatedLegacyRow.outcome,
+    'done',
+    'a later ambiguous readback row cannot poison an exact earlier effect settlement',
+  );
+  archiveBackgroundTask(task.id);
+});
+
+test('a same-task auto-continuation retains the run-wide exact write settlement', async () => {
+  const task = createBackgroundTask({
+    title: 'Create one workbook across an automatic continuation',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const first = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, first, 'prior-source-ledger-complete-workbook');
+  const newer = anchorBackgroundAcceptedTurn(task, task.prompt, 2);
+  assert.equal(newer.externalEffectRequested, true);
+
+  const outcome = await verifyBackgroundTaskDelivery(
+    task,
+    'The prior attempt created the workbook; this continuation only verified and reported it.',
+    'unverified' as never,
+  );
+  assert.equal(outcome.outcome, 'done');
+  archiveBackgroundTask(task.id);
+});
+
+test('a readback-only source success cannot satisfy a different source external objective', async () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook under its accepted source',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  anchorBackgroundExternalEffect(task);
+  const readback = anchorBackgroundAcceptedTurn(
+    task,
+    'Inspect the retained result and report it. Do not make any external changes.',
+    2,
+  );
+  assert.equal(readback.externalEffectRequested, false);
+  appendDurableWriteSuccess(task, readback, 'wrong-source-write-success');
+
+  const outcome = await verifyBackgroundTaskDelivery(task, 'Done.', 'success' as never);
+  assert.equal(outcome.outcome, 'blocked');
+  assert.match(outcome.reason ?? '', /no durable external-write success receipt/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('ambiguous accepted-task authority vetoes a durable write success', async () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook under exact authority',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'ambiguous-authority-workbook');
+  openEventLog().prepare(`
+    UPDATE accepted_task_resolutions
+       SET state = 'legacy_ambiguous'
+     WHERE session_id = ? AND source_user_seq = ?
+  `).run(task.runSessionId, identity.sourceUserSeq);
+
+  const outcome = await verifyBackgroundTaskDelivery(task, 'Done.', 'success' as never);
+  assert.equal(outcome.outcome, 'blocked');
+  assert.match(outcome.reason ?? '', /authority.*ambiguous|requirement.*ambiguous/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('a settled write forgives unavailable readback but never a probe that proves an empty deliverable', async () => {
+  const task = createBackgroundTask({
+    title: 'Create the external workbook and validation file',
+    prompt: 'Create an external workbook with the data and write a populated local validation file with the contents.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'write-with-empty-validation');
+  const emptyFile = path.join(TMP_HOME, `empty-validation-${Date.now()}.md`);
+  writeFileSync(emptyFile, '');
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'tool',
+    type: 'tool_returned',
+    data: {
+      tool: 'write_file',
+      callId: 'empty-validation-file',
+      ok: true,
+      preview: `Wrote ${emptyFile}`,
+    },
+  });
+
+  const outcome = await verifyBackgroundTaskDelivery(task, 'Done.', 'success' as never);
+  assert.equal(outcome.outcome, 'blocked');
+  assert.match(outcome.reason ?? '', /EMPTY \(0 bytes\)/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('ledger-backed completion has a nonempty handoff and survives the boot integrity sweep', () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook with a durable handoff',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'ledger-handoff-workbook');
+
+  const settled = markBackgroundTaskDone(task.id, '');
+  assert.equal(settled?.status, 'done');
+  assert.match(settled?.result ?? '', /durable effect ledger records 1 successful external write/i);
+  updateBackgroundTask(task.id, {
+    result: '**Tool: read**\n\n*(No path was provided; the harness will supply it.)*',
+  });
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+  assert.equal(repaired.ids.includes(task.id), false, 'the sweep cannot restore prose as completion authority');
+  assert.equal(getBackgroundTask(task.id)?.status, 'done');
+  archiveBackgroundTask(task.id);
+});
+
+test('an empty ledger-backed handoff names an unverified final readback', () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook with an unavailable readback',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'ledger-unverified-handoff-workbook');
+
+  const settled = markBackgroundTaskDone(task.id, '', { readbackUnverified: true });
+  assert.equal(settled?.status, 'done');
+  assert.match(settled?.result ?? '', /final readback remains unverified/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('a nonempty ledger-backed handoff still discloses an unverified readback', () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook with a confident stale reply',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'ledger-stale-reply-workbook');
+
+  const settled = markBackgroundTaskDone(task.id, 'Done — the workbook was created.', {
+    readbackUnverified: true,
+  });
+  assert.equal(settled?.status, 'done');
+  assert.match(settled?.result ?? '', /System verification:/i);
+  assert.match(settled?.result ?? '', /final readback remains unverified/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('the exported done finalizer cannot bypass a structured external-effect settlement', () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook without prose authority',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  anchorBackgroundExternalEffect(task);
+
+  const settled = markBackgroundTaskDone(task.id, 'Done — the workbook was created.');
+  assert.equal(settled?.status, 'blocked');
+  assert.match(settled?.error ?? '', /no durable external-write success receipt/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('the exported done finalizer cannot erase a blocked execution after a settled write', () => {
+  const task = createBackgroundTask({
+    title: 'Create one workbook with unfinished structured work',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'direct-finalizer-structured-block-success');
+  appendBlockedExecution(task, 'Required validation remains blocked in the execution store.');
+
+  const settled = markBackgroundTaskDone(task.id, 'The workbook write succeeded.');
+  assert.equal(settled?.status, 'blocked');
+  assert.match(settled?.error ?? '', /validation remains blocked/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('the done finalizer rechecks late write ambiguity after its settlement hook', () => {
+  const task = createBackgroundTask({
+    title: 'Create one external workbook without a settlement race',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'settlement-race-success');
+  _setBackgroundTaskSettlementCasHookForTests(() => {
+    _setBackgroundTaskSettlementCasHookForTests(null);
+    appendEvent({
+      sessionId: task.runSessionId,
+      turn: 1,
+      role: 'system',
+      type: 'external_write',
+      data: {
+        preDispatch: true,
+        callId: 'settlement-race-ambiguous',
+        canonicalCallId: 'settlement-race-ambiguous',
+        sourceUserSeq: identity.sourceUserSeq,
+        acceptedTaskId: identity.acceptedTaskId,
+        shapeKey: 'CREATE_REVERSIBLE_DRAFT',
+        targets: ['draft:late'],
+      },
+    });
+  });
+  try {
+    const settled = markBackgroundTaskDone(task.id, 'Done — the first write settled.');
+    assert.equal(settled?.status, 'blocked');
+    assert.match(settled?.error ?? '', /may duplicate the action/i);
+  } finally {
+    _setBackgroundTaskSettlementCasHookForTests(null);
+    archiveBackgroundTask(task.id);
+  }
+});
+
+test('the done finalizer cannot bypass incomplete fanout coverage', () => {
+  const task = createBackgroundTask({
+    title: 'Finish every prospect before reporting done',
+    prompt: 'Process every prospect in the accepted list.',
+  });
+  clearLedger(task.runSessionId);
+  createSession({ id: task.runSessionId, kind: 'execution' });
+  appendEvent({
+    sessionId: task.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'worker_result',
+    data: {
+      callId: 'direct-finalizer-partial-worker',
+      item: 'Prospect B',
+      ok: false,
+      reason: 'ERROR: the required item did not finish',
+    },
+  });
+
+  const settled = markBackgroundTaskDone(task.id, 'Done — all prospects finished.');
+  assert.equal(settled?.status, 'blocked');
+  assert.match(settled?.error ?? '', /partial coverage/i);
+  clearLedger(task.runSessionId);
+  archiveBackgroundTask(task.id);
+});
+
+test('the boot sweep applies the same structured effect floors as live settlement', () => {
+  const missing = createBackgroundTask({
+    title: 'Historical false completion without its required write',
+    prompt: 'Create a new external workbook with the requested data.',
+  });
+  anchorBackgroundExternalEffect(missing);
+  updateBackgroundTask(missing.id, {
+    status: 'done',
+    result: 'Done.',
+    completedAt: new Date().toISOString(),
+  });
+
+  const ambiguous = createBackgroundTask({
+    title: 'Historical false completion with write ambiguity',
+    prompt: 'Create a new external workbook with the requested data.',
+  });
+  const identity = anchorBackgroundExternalEffect(ambiguous);
+  appendDurableWriteSuccess(ambiguous, identity, 'boot-sweep-success');
+  appendEvent({
+    sessionId: ambiguous.runSessionId,
+    turn: 1,
+    role: 'system',
+    type: 'external_write',
+    data: {
+      preDispatch: true,
+      callId: 'boot-sweep-ambiguous',
+      canonicalCallId: 'boot-sweep-ambiguous',
+      sourceUserSeq: identity.sourceUserSeq,
+      acceptedTaskId: identity.acceptedTaskId,
+      shapeKey: 'CREATE_REVERSIBLE_DRAFT',
+      targets: ['draft:unsettled'],
+    },
+  });
+  updateBackgroundTask(ambiguous.id, {
+    status: 'done',
+    result: 'Done.',
+    completedAt: new Date().toISOString(),
+  });
+
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+  assert.equal(repaired.ids.includes(missing.id), true);
+  assert.equal(repaired.ids.includes(ambiguous.id), true);
+  assert.equal(getBackgroundTask(missing.id)?.status, 'blocked');
+  assert.equal(getBackgroundTask(ambiguous.id)?.status, 'blocked');
+  archiveBackgroundTask(missing.id);
+  archiveBackgroundTask(ambiguous.id);
+});
+
+test('the boot sweep cannot preserve done over a blocked execution row', () => {
+  const task = createBackgroundTask({
+    title: 'Historical settled write with unfinished structured work',
+    prompt: 'Create a new external workbook with the requested data.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'boot-sweep-structured-block-success');
+  appendBlockedExecution(task, 'Required validation remains blocked at boot.');
+  updateBackgroundTask(task.id, {
+    status: 'done',
+    result: 'The workbook write succeeded.',
+    completedAt: new Date().toISOString(),
+  });
+
+  const repaired = sweepInvalidDoneBackgroundTasks({ now: Date.now(), maxAgeMs: 60_000 });
+  assert.equal(repaired.ids.includes(task.id), true);
+  assert.equal(getBackgroundTask(task.id)?.status, 'blocked');
+  assert.match(getBackgroundTask(task.id)?.error ?? '', /validation remains blocked at boot/i);
+  archiveBackgroundTask(task.id);
+});
+
+test('the worker finish path does not park an unverified terminal after a durable write succeeded', async () => {
+  for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+  const task = createBackgroundTask({
+    title: 'Create one external workbook through the worker',
+    prompt: 'Find the page for example.com and put the result in a new workbook for me.',
+  });
+  const identity = anchorBackgroundExternalEffect(task);
+  appendDurableWriteSuccess(task, identity, 'worker-ledger-complete-draft');
+
+  const processed = await processBackgroundTasks({
+    getRuntime() { return {} as never; },
+    async respond(request: { sessionId: string }) {
+      return {
+        text: 'The draft was created, but its readback could not be verified.',
+        sessionId: request.sessionId,
+        stoppedReason: 'unverified' as const,
+      };
+    },
+  } as any, 1);
+
+  assert.equal(processed, 1);
+  assert.equal(getBackgroundTask(task.id)?.status, 'done');
+  const tracked = listRuns(40).find((run) => run.sessionId === task.runSessionId);
+  assert.equal(tracked?.status, 'completed');
+  archiveBackgroundTask(task.id);
 });
 
 test('a resumed task credits files a PRIOR attempt wrote (floor = task creation, not attempt start)', async () => {

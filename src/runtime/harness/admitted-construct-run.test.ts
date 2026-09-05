@@ -7,8 +7,9 @@ import test from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-admitted-construct-run-'));
 process.env.CLEMENTINE_HOME = HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { appendEvent, createSession, resetEventLog } = await import('./eventlog.js');
+const { appendEvent, createSession, listEvents, resetEventLog } = await import('./eventlog.js');
 const { admitAndCompileAcceptedSource } = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
 const { buildTurnSemanticHostViewV1 } = await import('../semantic-boundary/build-semantic-host-view.js');
 const { saveProactivityPolicy } = await import('../../agents/proactivity-policy.js');
@@ -387,6 +388,80 @@ test('vertical create and readback are once-only across replay', async () => {
   assert.equal(replay.providerCalls.readback, 0);
   assert.equal(replay.providerCalls.sourceRead, 0);
   assert.equal(replay.providerCalls.collectionRead, 0);
+});
+
+test('production admitted create records one exact parented external-write lifecycle', async () => {
+  resetEventLog();
+  const sessionId = 'sess-production-write-lifecycle';
+  createSession({ id: sessionId, kind: 'chat', userId: 'user-1' });
+  const compiled = await compileGraph(sessionId);
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) return;
+  const identity = {
+    sessionId,
+    turn: 1,
+    sourceUserSeq: compiled.compiled.graph.identity.sourceUserSeq,
+  };
+  const tracked = trackingProviders();
+  let reservationSeenAtProviderBoundary = false;
+  const ports = {
+    ...tracked,
+    async create(records: Array<Record<string, unknown>>) {
+      const atBoundary = listEvents(sessionId, {
+        types: ['external_write', 'external_write_succeeded'],
+      });
+      assert.equal(atBoundary.filter((event) => event.type === 'external_write').length, 1);
+      assert.equal(atBoundary.filter((event) => event.type === 'external_write_succeeded').length, 0);
+      reservationSeenAtProviderBoundary = true;
+      return tracked.create(records);
+    },
+  };
+  const first = await runAdmittedTurnGraph({
+    identity,
+    capabilityCatalog: catalogFromConstructProviders(ports),
+  });
+  if (first.status !== 'success') {
+    assert.fail(JSON.stringify({ status: first.status, error: first.error, calls: first.providerCalls }));
+  }
+  assert.equal(ports.calls.create, 1);
+  assert.equal(reservationSeenAtProviderBoundary, true, 'reservation is durable before provider I/O');
+
+  const lifecycle = listEvents(sessionId, {
+    types: [
+      'external_write',
+      'external_write_succeeded',
+      'external_write_failed',
+      'external_write_orphaned',
+    ],
+  });
+  assert.equal(lifecycle.length, 2, 'one create has one reservation and one settlement');
+  const reservation = lifecycle.find((event) => event.type === 'external_write');
+  const success = lifecycle.find((event) => event.type === 'external_write_succeeded');
+  assert.ok(reservation);
+  assert.ok(success);
+  assert.equal(reservation.data.preDispatch, true);
+  assert.equal(reservation.data.sourceUserSeq, identity.sourceUserSeq);
+  assert.equal(typeof reservation.data.acceptedTaskId, 'string');
+  assert.ok(String(reservation.data.acceptedTaskId).length > 0);
+  assert.match(String(reservation.data.canonicalCallId), /^logical:/);
+  assert.equal(reservation.data.callId, reservation.data.canonicalCallId);
+  assert.equal(success.parentEventId, reservation.id);
+  assert.equal(success.data.sourceUserSeq, reservation.data.sourceUserSeq);
+  assert.equal(success.data.acceptedTaskId, reservation.data.acceptedTaskId);
+  assert.equal(success.data.canonicalCallId, reservation.data.canonicalCallId);
+  assert.equal(success.data.callId, reservation.data.callId);
+  assert.equal(success.data.physicalDispatchId, reservation.data.physicalDispatchId);
+  assert.equal(success.data.resourceId, 'art-1');
+  assert.equal(success.data.receipt, 'prov-receipt-art-1');
+
+  await runAdmittedTurnGraph({
+    identity,
+    priorHandles: first.handles,
+    capabilityCatalog: catalogFromConstructProviders(ports),
+  });
+  assert.equal(ports.calls.create, 1, 'replay never crosses the provider again');
+  assert.equal(listEvents(sessionId, { types: ['external_write'] }).length, 1);
+  assert.equal(listEvents(sessionId, { types: ['external_write_succeeded'] }).length, 1);
 });
 
 test('unknown node roles fail closed at admission and never publish', async () => {

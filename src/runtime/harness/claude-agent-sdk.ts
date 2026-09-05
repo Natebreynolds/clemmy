@@ -152,7 +152,7 @@ import { discoveryGovernor } from './discovery-governor.js';
 import { progressNarration } from '../activity-format.js';
 import { composeRunProgressLine } from './run-progress.js';
 import { WorkCallInputSchema } from '../../tools/work-call.js';
-import { withLogicalToolCall } from './attempt-identity.js';
+import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { settleToolAttempt } from './attempt-settlement.js';
 import { satisfyObservedConnectionDependencyForContinuation } from './dependency-request.js';
 
@@ -1158,6 +1158,11 @@ function appendNativeExternalWriteEvent(
   if (!isReservation && !reservationEventId) {
     throw new Error(`Native external-write settlement ${type} is missing its reservation event id.`);
   }
+  const sourceUserSeq = typeof extra.sourceUserSeq === 'number'
+    && Number.isSafeInteger(extra.sourceUserSeq)
+    && extra.sourceUserSeq > 0
+    ? extra.sourceUserSeq
+    : undefined;
   const event = appendEvent({
     sessionId,
     turn: 0,
@@ -1174,6 +1179,12 @@ function appendNativeExternalWriteEvent(
       canonicalCallId: attempt.callId,
       correlationFingerprint: attempt.correlationFingerprint,
       nativeMcp: true,
+      ...(sourceUserSeq !== undefined
+        ? {
+            sourceUserSeq,
+            acceptedTaskId: acceptedTaskIdFor(sessionId, sourceUserSeq),
+          }
+        : {}),
       ...(attempt.retryOfCallId ? {
         retryOfCallId: attempt.retryOfCallId,
         retryAuthorizationSeq: attempt.retryAuthorizationSeq,

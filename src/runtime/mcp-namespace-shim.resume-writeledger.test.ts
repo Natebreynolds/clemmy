@@ -186,10 +186,14 @@ test('ordinary native MCP writes reserve before dispatch and settle only a clean
 
   assert.equal(dispatches, 1);
   const [reservation] = listEvents(sid, { types: ['external_write'] });
+  const [success] = listEvents(sid, { types: ['external_write_succeeded'] });
   assert.equal(reservation?.data.preDispatch, true);
   assert.equal(reservation?.data.irreversible, false);
   assert.equal(reservation?.data.sourceUserSeq, source.seq);
-  assert.equal(listEvents(sid, { types: ['external_write_succeeded'] }).length, 1);
+  assert.equal(reservation?.data.acceptedTaskId, `task:${sid}#${source.seq}`);
+  assert.equal(success?.parentEventId, reservation?.id, 'success settles the exact pre-dispatch reservation');
+  assert.equal(success?.data.sourceUserSeq, source.seq);
+  assert.equal(success?.data.acceptedTaskId, reservation?.data.acceptedTaskId);
   assert.equal(listEvents(sid, { types: ['external_write_orphaned'] }).length, 0);
 });
 

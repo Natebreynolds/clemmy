@@ -24,7 +24,14 @@ export type DrainApprovalResolutionResult =
       | { kind: 'dispatched' }
       | { kind: 'held'; hold: RunConversationHold; recoveredContract: boolean };
   })
-  | (ApprovalDrainBase & { status: 'blocked'; reason: string })
+  | (ApprovalDrainBase & {
+    status: 'blocked';
+    reason: string;
+    /** Machine terminal facts from the resumed harness run. They distinguish
+     * an advisory readback failure from a real unfinished/denied operation. */
+    blockedReason?: string;
+    blockedDetail?: string;
+  })
   | (ApprovalDrainBase & { status: 'awaiting_continue'; reason: string })
   | (ApprovalDrainBase & { status: 'cancelled'; reason: string });
 
@@ -66,7 +73,7 @@ export async function resolveDrainApproval(opts: {
   };
   resumeForTest?: (args: { sessionId: string; approvalId: string; decision: 'approve' | 'reject'; resolver?: string }) => Promise<Pick<
     RunConversationResult,
-    'status' | 'error' | 'lastDecision' | 'hold' | 'limitKind'
+    'status' | 'error' | 'lastDecision' | 'hold' | 'limitKind' | 'blockedReason' | 'blockedDetail' | 'publicPresentation'
   >>;
 }): Promise<DrainApprovalResolutionResult> {
   const registry = opts.registryForTest
@@ -123,7 +130,10 @@ export async function resolveDrainApproval(opts: {
     decision: 'approve',
     resolver,
   });
-  const text = result.lastDecision?.reply ?? result.lastDecision?.summary ?? '';
+  const text = result.publicPresentation?.text
+    ?? result.lastDecision?.reply
+    ?? result.lastDecision?.summary
+    ?? '';
   const base = {
     approvalId: opts.approvalId,
     text,
@@ -165,7 +175,13 @@ export async function resolveDrainApproval(opts: {
       };
     case 'blocked': {
       const reason = result.error?.trim() || text || `Approval ${opts.approvalId} resumed into a blocked execution.`;
-      return { ...base, status: 'blocked', reason };
+      return {
+        ...base,
+        status: 'blocked',
+        reason,
+        ...(result.blockedReason ? { blockedReason: result.blockedReason } : {}),
+        ...(result.blockedDetail ? { blockedDetail: result.blockedDetail } : {}),
+      };
     }
     case 'limit_exceeded': {
       const reason = result.error?.trim()

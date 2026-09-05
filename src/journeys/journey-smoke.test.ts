@@ -65,7 +65,7 @@ const { listNotifications } = await import('../runtime/notifications.js');
 const { setProactiveReportFireForTest } = await import('../runtime/outcome.js');
 const { appendEvent, getSession } = await import('../runtime/harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
-const { withHarnessRunContext, ToolCallsCounter } = await import('../runtime/harness/brackets.js');
+const { withHarnessRunContext, ToolCallsCounter, wrapToolForHarness } = await import('../runtime/harness/brackets.js');
 
 /**
  * A dispatch settles durably against the accepted source that authorized it,
@@ -271,11 +271,44 @@ test('J3: dead data source → empty-result advisory → data-quality checkpoint
     assert.equal(writeDispatches, 0, 'the typed checkpoint proves no provider write started');
 
     // A deliberate second attempt proceeds — autonomy redirected, never dead-ended.
+    const wrappedWrite = wrapToolForHarness({
+      name: 'composio_execute_tool',
+      execute: (input: unknown) =>
+        runComposioExecuteForTestInSession(
+          'AIRTABLE_CREATE_BASE',
+          (input as { arguments: Record<string, unknown> }).arguments,
+          writeExec,
+          sid,
+        ),
+    });
+    const beforeSuccessfulWriteSeq = listEvents(sid).at(-1)?.seq ?? 0;
     const proceeded = await inTurn(() =>
-      runComposioExecuteForTestInSession('AIRTABLE_CREATE_BASE', { name: 'J3 Intel' }, writeExec, sid));
+      wrappedWrite.execute!({
+        tool_slug: 'AIRTABLE_CREATE_BASE',
+        arguments: { name: 'J3 Intel' },
+      }));
     assert.equal(writeDispatches, 1, 'the repaired retry crosses the provider boundary exactly once');
     assert.doesNotMatch(proceeded, /DATA-QUALITY CHECKPOINT/);
     assert.match(proceeded, /appJ3/);
+    const writeLifecycle = listEvents(sid, {
+      sinceSeq: beforeSuccessfulWriteSeq,
+      types: [
+        'external_write',
+        'external_write_succeeded',
+        'external_write_failed',
+        'external_write_orphaned',
+      ],
+    });
+    assert.deepEqual(
+      writeLifecycle.map((event) => event.type),
+      ['external_write', 'external_write_succeeded'],
+      'the successful retry owns one exact reservation and one success terminal, with no failure/orphan ambiguity',
+    );
+    const [reservation, success] = writeLifecycle;
+    assert.equal(reservation?.data.preDispatch, true, 'the write is reserved before provider dispatch');
+    assert.equal(success?.parentEventId, reservation?.id, 'the success settles its exact reservation');
+    assert.equal(success?.data.canonicalCallId, reservation?.data.canonicalCallId,
+      'reservation and success share one canonical call identity');
   } finally {
     resetDataQualityForTest();
   }

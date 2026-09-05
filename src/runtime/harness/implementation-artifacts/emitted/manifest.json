@@ -698,6 +698,12 @@
         "src/runtime/harness/codex-one-step.ts": {
           "bytes": 36337
         },
+        "src/runtime/source-fingerprint.ts": {
+          "bytes": 3159
+        },
+        "src/runtime/build-info.ts": {
+          "bytes": 10169
+        },
         "src/runtime/graph/admission-envelope.ts": {
           "bytes": 10427
         },
@@ -870,7 +876,7 @@
           "bytes": 19873
         },
         "src/runtime/mcp-namespace-shim.ts": {
-          "bytes": 96914
+          "bytes": 97267
         },
         "src/integrations/composio/mcp-scope-adapter.ts": {
           "bytes": 5046
@@ -1659,7 +1665,7 @@
           "bytes": 2537
         },
         "src/runtime/harness/admitted-construct-run.ts": {
-          "bytes": 119764
+          "bytes": 123813
         },
         "src/runtime/harness/connected-goal-catalog.ts": {
           "bytes": 17965
@@ -1704,7 +1710,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 126229
+          "bytes": 126877
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 5022
@@ -2115,7 +2121,7 @@
           "bytes": 4575
         },
         "src/runtime/harness/claude-agent-sdk.ts": {
-          "bytes": 187573
+          "bytes": 187956
         },
         "src/runtime/harness/claude-agent-workflow-step.ts": {
           "bytes": 29001
@@ -2217,7 +2223,7 @@
           "bytes": 49423
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 348416
+          "bytes": 348643
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2274,7 +2280,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 666882
+          "bytes": 667164
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2295,10 +2301,10 @@
           "bytes": 12765
         },
         "src/execution/approval-drain.ts": {
-          "bytes": 7883
+          "bytes": 8409
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 282882
+          "bytes": 296430
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -2475,7 +2481,7 @@
           "bytes": 2934
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
-          "bytes": 86844
+          "bytes": 86806
         },
         "src/runtime/harness/eventlog.ts": {
           "bytes": 321524
@@ -3203,6 +3209,12 @@
         "src/runtime/harness/codex-one-step.ts": {
           "bytes": 36337
         },
+        "src/runtime/source-fingerprint.ts": {
+          "bytes": 3159
+        },
+        "src/runtime/build-info.ts": {
+          "bytes": 10169
+        },
         "src/runtime/graph/admission-envelope.ts": {
           "bytes": 10427
         },
@@ -3375,7 +3387,7 @@
           "bytes": 19873
         },
         "src/runtime/mcp-namespace-shim.ts": {
-          "bytes": 96914
+          "bytes": 97267
         },
         "src/integrations/composio/mcp-scope-adapter.ts": {
           "bytes": 5046
@@ -4164,7 +4176,7 @@
           "bytes": 2537
         },
         "src/runtime/harness/admitted-construct-run.ts": {
-          "bytes": 119764
+          "bytes": 123813
         },
         "src/runtime/harness/connected-goal-catalog.ts": {
           "bytes": 17965
@@ -4209,7 +4221,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 126229
+          "bytes": 126877
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 5022
@@ -4620,7 +4632,7 @@
           "bytes": 4575
         },
         "src/runtime/harness/claude-agent-sdk.ts": {
-          "bytes": 187573
+          "bytes": 187956
         },
         "src/runtime/harness/claude-agent-workflow-step.ts": {
           "bytes": 29001
@@ -4722,7 +4734,7 @@
           "bytes": 49423
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 348416
+          "bytes": 348643
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4779,7 +4791,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 666882
+          "bytes": 667164
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4800,10 +4812,10 @@
           "bytes": 12765
         },
         "src/execution/approval-drain.ts": {
-          "bytes": 7883
+          "bytes": 8409
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 282882
+          "bytes": 296430
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -4980,7 +4992,7 @@
           "bytes": 2934
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
-          "bytes": 86844
+          "bytes": 86806
         },
         "src/runtime/harness/eventlog.ts": {
           "bytes": 321524

@@ -39,6 +39,7 @@ import {
   ToolAttemptSettlementAuthorityError,
 } from './harness/attempt-settlement.js';
 import {
+  acceptedTaskIdFor,
   currentLogicalCall,
   PhysicalDispatchPreDispatchError,
   preflightPhysicalDispatchSourceAdmission,
@@ -134,13 +135,20 @@ const MCP_INVALID_RESULT_PREFIX = 'ERROR: MCP_RESULT_INVALID';
 
 function currentExternalWriteEventAttribution(): {
   sourceUserSeq?: number;
+  acceptedTaskId?: string;
   runScopeId?: string;
   executionId?: string;
 } {
   const ctx = harnessRunContextStorage.getStore();
+  const sourceUserSeq = Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
+    ? ctx?.sourceUserSeq as number
+    : undefined;
   return {
-    ...(Number.isSafeInteger(ctx?.sourceUserSeq) && (ctx?.sourceUserSeq ?? 0) > 0
-      ? { sourceUserSeq: ctx?.sourceUserSeq as number }
+    ...(sourceUserSeq !== undefined
+      ? {
+          sourceUserSeq,
+          acceptedTaskId: acceptedTaskIdFor(ctx!.sessionId, sourceUserSeq),
+        }
       : {}),
     ...(ctx?.behaviorScopeId ? { runScopeId: ctx.behaviorScopeId } : {}),
     ...(ctx?.executionId ? { executionId: ctx.executionId } : {}),
@@ -1896,6 +1904,9 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
             turn: 0,
             role: 'system',
             type,
+            ...(externalWriteReservationEventId
+              ? { parentEventId: externalWriteReservationEventId }
+              : {}),
             data: {
               ...currentExternalWriteEventAttribution(),
               shapeKey: integrityShapeKey,

@@ -906,10 +906,16 @@ function durableWarmReadPolicyMatches(request: AssistantRequest, event: EventRow
 
 function stoppedReasonForPresentation(
   presentation: PresentationEvent,
+  blockedReason?: unknown,
 ): NonNullable<AssistantResponse['stoppedReason']> {
   if (presentation.status === 'done') return 'success';
   if (presentation.status === 'cancelled') return 'cancelled';
-  if (presentation.status === 'blocked' || presentation.status === 'uncertain') return 'blocked';
+  if (presentation.status === 'blocked') {
+    return blockedReason === 'authoritative_terminal_verification_incomplete'
+      ? 'unverified'
+      : 'blocked';
+  }
+  if (presentation.status === 'uncertain') return 'blocked';
   if (presentation.status !== 'needs_input') return 'error';
   if (presentation.needs?.kind === 'approval') return 'pending-approval';
   if (presentation.needs?.kind === 'continue') return 'max-turns-with-grace';
@@ -926,7 +932,9 @@ function responseForCommittedTerminal(
   return {
     text,
     sessionId: event.sessionId,
-    stoppedReason: presentation ? stoppedReasonForPresentation(presentation) : 'error',
+    stoppedReason: presentation
+      ? stoppedReasonForPresentation(presentation, event.data.blockedReason)
+      : 'error',
     turnsUsed: event.turn,
     ...(presentation?.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
     ...(extraRaw ? { raw: extraRaw } : {}),
@@ -941,7 +949,7 @@ function responseForAcceptedSourceTerminal(
   return {
     text: presentation.text,
     sessionId: event.sessionId,
-    stoppedReason: stoppedReasonForPresentation(presentation),
+    stoppedReason: stoppedReasonForPresentation(presentation, event.data.blockedReason),
     turnsUsed: event.turn,
     ...(presentation.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
     ...(extraRaw ? { raw: extraRaw } : {}),
@@ -1802,7 +1810,7 @@ export async function respondViaHarness(
       return withRouteDiagnostics({
         text: presentation.text,
         sessionId,
-        stoppedReason: stoppedReasonForPresentation(presentation),
+        stoppedReason: stoppedReasonForPresentation(presentation, result.blockedReason),
         turnsUsed: result.lastTurn,
         ...(presentation.approvalId ? { pendingApprovalId: presentation.approvalId } : {}),
       }, routeForHarness(surface, request, opts.modelOverride));
@@ -2043,7 +2051,13 @@ export async function respondViaHarness(
           text: result.error
             || 'I could not admit this turn, so I stopped before using any tools.',
           sessionId,
-          stoppedReason: 'blocked',
+          // This machine terminal says the requested effect may already be
+          // settled and only its final authoritative readback failed. Preserve
+          // that distinction for the background effect-ledger reducer; every
+          // other blocked terminal remains a hard floor.
+          stoppedReason: result.blockedReason === 'authoritative_terminal_verification_incomplete'
+            ? 'unverified'
+            : 'blocked',
           turnsUsed: result.lastTurn,
         }, routeForHarness(surface, request, opts.modelOverride));
       case 'failed':

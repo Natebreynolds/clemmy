@@ -1305,6 +1305,101 @@ test('a typed blocked terminal remains blocked when the executor returned normal
   assert.equal(response.text, 'The host stopped after bounded recovery made no progress.');
 });
 
+test('only the machine-typed terminal readback failure maps to unverified', async () => {
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+      const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === opts.sourceUserSeq)!;
+      const identity = { sessionId: opts.sessionId, turn: source.turn, sourceUserSeq: source.seq };
+      const committed = commitTurnOutcome({
+        version: 2,
+        id: turnOutcomeId(identity),
+        identity,
+        status: 'blocked',
+        resumable: false,
+        presentation: {
+          kind: 'blocked',
+          text: 'The effect settled, but its authoritative readback is unavailable.',
+        },
+      }, {
+        legacyReason: 'verification_required',
+        metadata: { blockedReason: 'authoritative_terminal_verification_incomplete' },
+      });
+      return {
+        sessionId: opts.sessionId,
+        status: 'blocked',
+        steps: 1,
+        lastTurn: source.turn,
+        blockedReason: 'authoritative_terminal_verification_incomplete',
+        publicPresentation: committed.presentation,
+      };
+    }) as never,
+  });
+  const readbackOnly = await respondViaHarness('background', {
+    message: 'Create the requested draft.',
+    sessionId: 'typed-readback-only-through-bridge',
+  });
+  assert.equal(readbackOnly.stoppedReason, 'unverified');
+
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: fakeRun({
+      status: 'blocked',
+      error: 'Required work remains blocked.',
+      blockedReason: 'control_no_progress_exhausted',
+    }),
+  });
+  const realBlock = await respondViaHarness('background', {
+    message: 'Create the requested draft.',
+    sessionId: 'typed-real-block-through-bridge',
+  });
+  assert.equal(realBlock.stoppedReason, 'blocked');
+});
+
+test('an exact replay preserves the machine-typed readback-only terminal', async () => {
+  const sessionId = 'typed-readback-only-terminal-replay';
+  createSession({ id: sessionId, kind: 'chat' });
+  const attempt = beginRunAttempt(sessionId, { runId: `${sessionId}:run` });
+  const source = recordRunAttemptUserInput(attempt, {
+    turn: 1,
+    role: 'user',
+    data: { text: 'Create the requested draft.' },
+  }, { armRunInFlight: true });
+  const identity = { sessionId, turn: source.turn, sourceUserSeq: source.seq };
+  commitTurnOutcome({
+    version: 2,
+    id: turnOutcomeId(identity),
+    identity,
+    status: 'blocked',
+    resumable: false,
+    presentation: {
+      kind: 'blocked',
+      text: 'The draft settled, but its authoritative readback is unavailable.',
+    },
+  }, {
+    legacyReason: 'verification_required',
+    metadata: { blockedReason: 'authoritative_terminal_verification_incomplete' },
+  });
+  finishRunAttempt(attempt, 'completed');
+  _setBridgeImplsForTests({
+    configure: (async () => { throw new Error('a terminal replay must not configure'); }) as never,
+    buildAgent: (async () => { throw new Error('a terminal replay must not build'); }) as never,
+    runConversation: (async () => { throw new Error('a terminal replay must not run'); }) as never,
+  });
+
+  const replay = await respondPreferHarness('home', {
+    message: 'Create the requested draft.',
+    sessionId,
+    sourceUserSeq: source.seq,
+    runId: attempt.runId ?? undefined,
+  }, async () => { throw new Error('a terminal replay must not enter legacy'); });
+  assert.equal(replay.stoppedReason, 'unverified');
+  assert.match(replay.text, /authoritative readback is unavailable/i);
+});
+
 test('exact-source model directive binds a new attempt without a synthetic user event', async () => {
   const sessionId = 'exact-source-private-directive';
   createSession({ id: sessionId, kind: 'chat' });

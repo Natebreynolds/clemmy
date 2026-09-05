@@ -37,6 +37,7 @@ import {
 import { toSmartString } from '@openai/agents-core/utils';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
+import { getBuildInfo } from '../build-info.js';
 import type { Agent, AgentInputItem, ModelRequest } from '@openai/agents';
 import {
   boundAgentCapabilityEnvelope,
@@ -2470,7 +2471,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // Never silent by construction: every blocked terminal names its reason
     // in the process log (live 2026-09-02: a stalled turn ended with no line).
     const site = terminalCallerSite();
+    const build = getBuildInfo();
     hostTurnLogger.warn({
+      gitSha: build.gitSha ?? 'unknown',
+      gitDirty: build.gitDirty ?? null,
+      sourceFingerprint: build.sourceFingerprint ?? 'unknown',
       reason,
       resumable,
       ...(site ? { site } : {}),

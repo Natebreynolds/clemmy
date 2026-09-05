@@ -585,6 +585,7 @@ test('loop takes the sole deterministic HOLD edge for an irreversible uncertain 
     assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), true);
     assert.equal(repairCalls, 1, 'the exact loop terminal must spend the sealed repair');
     assert.equal(result.status, 'blocked');
+    assert.equal(result.blockedReason, 'authoritative_terminal_verification_incomplete');
     assert.equal(result.publicPresentation?.status, 'blocked');
     assertRetainedReadTerminal(result.publicPresentation?.text, hold);
     const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] }).at(-1);
@@ -632,6 +633,7 @@ test('approval-resume loop asks the shared gate and takes HOLD for an irreversib
   assert.equal(delivery.deliveryMustHoldForHuman(settlementAudit), true);
   assert.equal(repairCalls, 1, 'the approval-resume terminal called the sealed repair port');
   assert.equal(result.status, 'blocked');
+  assert.equal(result.blockedReason, 'authoritative_terminal_verification_incomplete');
   assert.equal(result.publicPresentation?.status, 'blocked');
   assertRetainedReadTerminal(result.publicPresentation?.text, REPAIRED_REPLY);
   const terminal = eventlog.listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);

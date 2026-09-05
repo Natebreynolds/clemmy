@@ -8611,6 +8611,8 @@ async function runConversationCore(
                 steps: stepIndex,
                 lastDecision: decision,
                 lastTurn,
+                blockedReason: 'authoritative_terminal_verification_incomplete',
+                blockedDetail: repaired.missing.join(', '),
                 publicPresentation,
               };
             }
@@ -12548,6 +12550,8 @@ async function runConversationFromResumeCore(opts: {
                 steps: stepIndex,
                 lastDecision: decision ?? undefined,
                 lastTurn,
+                blockedReason: 'authoritative_terminal_verification_incomplete',
+                blockedDetail: repaired.missing.join(', '),
                 publicPresentation,
               };
             }

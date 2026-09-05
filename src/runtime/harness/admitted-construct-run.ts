@@ -111,6 +111,13 @@ import { derivePhysicalDispatchId } from './physical-crossing-identity.js';
 import { claimPhysicalIo, physicalIoClaimed } from './physical-io-claim.js';
 import { activationOwnerIsGone, mintActivationOwner } from './activation-liveness.js';
 import { configureTypedExecutionRuntime, refreshTypedExecutionReadiness } from '../semantic-boundary/configure-typed-execution-runtime.js';
+import {
+  describeExternalWriteEvent,
+  projectExternalWriteReservation,
+  projectExternalWriteTerminal,
+  type ExternalWriteEventDescriptor,
+  type ExternalWriteReservationRef,
+} from './external-write-event-projection.js';
 
 export interface ConstructProviderPorts {
   sourceRead: (digest: string) => Promise<unknown>;
@@ -1261,6 +1268,96 @@ export async function runAdmittedTurnGraph(input: {
       : {}),
   });
 
+  const exactExternalWriteProjection = (
+    node: TurnGraphNode,
+    binding: BoundNodeCapability,
+    payload: unknown,
+    physicalDispatchId: string,
+  ): {
+    reservation: ExternalWriteReservationRef;
+    descriptor: ExternalWriteEventDescriptor;
+  } | undefined => {
+    if (binding.effect !== 'external_write') return undefined;
+    if (!identity || !acceptedTaskId) {
+      throw new Error('external-write lifecycle requires exact accepted-task identity');
+    }
+    const logicalToolCallId = `logical:${node.id}`;
+    const args = logicalArgsFor(node, binding, payload);
+    const contract = durableLogicalCallContract(acceptedTaskId, binding.toolName, args);
+    if (!contract) {
+      throw new Error('external-write lifecycle arguments are not canonicalizable');
+    }
+    const descriptor = describeExternalWriteEvent({
+      toolName: binding.toolName,
+      shapeKey: binding.manifest?.operationId ?? binding.toolName,
+      args,
+      forceMutating: true,
+      ...(binding.destination
+        ? { targets: [`${binding.destination.family}:${binding.destination.posture}`] }
+        : {}),
+    });
+    if (!descriptor) {
+      throw new Error('external-write lifecycle descriptor is unavailable');
+    }
+    const reservation = projectExternalWriteReservation({
+      sessionId: identity.sessionId,
+      turn: identity.turn,
+      sourceUserSeq: identity.sourceUserSeq,
+      acceptedTaskId,
+      callId: logicalToolCallId,
+      physicalDispatchId,
+      descriptor,
+      data: {
+        admittedConstruct: true,
+        nodeId: node.id,
+        graphId: graph.graphId,
+        graphHash: graph.compiler.graphHash,
+        argumentDigest: contract.argumentDigest,
+      },
+    });
+    return { reservation, descriptor };
+  };
+
+  const settleExternalWriteLifecycle = (
+    node: TurnGraphNode,
+    binding: BoundNodeCapability,
+    payload: unknown,
+    result: { id: string; receipt?: string },
+  ): void => {
+    if (!identity || !acceptedTaskId || binding.effect !== 'external_write') return;
+    const logicalToolCallId = `logical:${node.id}`;
+    const crossing = physicalCrossingsForLogicalCall(
+      identity.sessionId,
+      identity.sourceUserSeq,
+      logicalToolCallId,
+    ).find((candidate) => candidate.outcome === 'returned');
+    if (!crossing) {
+      throw new Error('external-write success lacks one exact returned physical crossing');
+    }
+    const projection = exactExternalWriteProjection(
+      node,
+      binding,
+      payload,
+      crossing.physicalDispatchId,
+    );
+    if (!projection) return;
+    projectExternalWriteTerminal({
+      sessionId: identity.sessionId,
+      turn: identity.turn,
+      sourceUserSeq: identity.sourceUserSeq,
+      acceptedTaskId,
+      physicalDispatchId: crossing.physicalDispatchId,
+      reservation: projection.reservation,
+      descriptor: projection.descriptor,
+      type: 'external_write_succeeded',
+      reason: 'logical call settled with an independent provider receipt',
+      data: {
+        resourceId: result.id,
+        ...(result.receipt ? { receipt: result.receipt } : {}),
+      },
+    });
+  };
+
   const writeJudgeForSource = (): { identity: string; digest: string } | null => {
     if (!identity) return null;
     const linked = readClaimLinkedSemanticInterpretation(identity.sessionId, identity.sourceUserSeq);
@@ -1481,6 +1578,7 @@ export async function runAdmittedTurnGraph(input: {
       if (!mutate || !binding.reconcile) {
         throw new Error('reconciliation_required: started provider I/O has no exact recovery probe');
       }
+      exactExternalWriteProjection(node, binding, payload, started.physicalDispatchId);
       const persistedAuthority = loadPersistedCallAuthority({
         sessionId: identity.sessionId,
         sourceUserSeq: identity.sourceUserSeq,
@@ -1873,6 +1971,14 @@ export async function runAdmittedTurnGraph(input: {
         throw new Error(`physical dispatch refused: ${crossing.status} ${'reason' in crossing ? crossing.reason : ''}`);
       }
     }
+    if (mutate && binding.effect === 'external_write') {
+      exactExternalWriteProjection(
+        node,
+        binding,
+        payload,
+        crossing.identity.physicalDispatchId,
+      );
+    }
     if (mutate && (testFault === 'after_reservation' || testFault === 'before_write')) {
       throw new Error('forced crash after reservation');
     }
@@ -2176,6 +2282,10 @@ export async function runAdmittedTurnGraph(input: {
             ) {
               return { status: 'blocked', reason: 'bound artifact has no authoritative independent receipt' };
             }
+            settleExternalWriteLifecycle(graphNode!, createBinding, records, {
+              id: reused.id,
+              receipt: reused.receipt,
+            });
             rememberArtifact(node.id, role, {
               ...reused,
               writtenDigest: intendedContentDigest,
@@ -2205,6 +2315,16 @@ export async function runAdmittedTurnGraph(input: {
               }
             }
             if (redeemed) {
+              const settledValue = value as { id?: unknown; receipt?: unknown };
+              if (
+                typeof settledValue?.id === 'string'
+                && isIndependentReceipt(settledValue.receipt, settledValue.id, settledValue)
+              ) {
+                settleExternalWriteLifecycle(graphNode!, createBinding, records, {
+                  id: settledValue.id,
+                  receipt: settledValue.receipt,
+                });
+              }
               rememberArtifact(node.id, role, value, handles[node.id]);
               return { status: 'completed', outputRef: handles[node.id] };
             }
@@ -2221,6 +2341,11 @@ export async function runAdmittedTurnGraph(input: {
       if (!isIndependentReceipt(value.receipt, value.id, value)) {
         return { status: 'blocked', reason: 'create did not return an independent provider receipt' };
       }
+      const createBinding = boundCapabilities.get(node.id);
+      if (!createBinding) {
+        return { status: 'blocked', reason: 'create has no exact capability binding at settlement' };
+      }
+      settleExternalWriteLifecycle(graphNode!, createBinding, records, value);
       const stored = { ...value, receipt: value.receipt, writtenDigest: contentDigestOf(records) };
       rememberArtifact(node.id, role, stored, handles[node.id]);
       if (identity && acceptedTaskId) {
@@ -2228,21 +2353,6 @@ export async function runAdmittedTurnGraph(input: {
           resourceId: value.id,
           uri: value.handle,
         }, `logical:${node.id}`, artifactRunScopeId);
-        appendEvent({
-          sessionId: identity.sessionId,
-          turn: identity.turn,
-          role: 'system',
-          type: 'external_write',
-          data: {
-            sourceUserSeq: identity.sourceUserSeq,
-            callId: `logical:${node.id}`,
-            canonicalCallId: `logical:${node.id}`,
-            toolName: 'write_file',
-            preDispatch: false,
-            resourceId: value.id,
-            receipt: value.receipt,
-          },
-        });
       }
       return { status: 'completed', outputRef: handles[node.id] };
     }
