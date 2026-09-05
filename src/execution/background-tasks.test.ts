@@ -1470,6 +1470,83 @@ test('processBackgroundTasks embeds origin transcript and action ledger in the w
   assert.equal(updated?.modelTransport, undefined);
 });
 
+test('a resumed background task journals the accepted answer through the bridge without promoting host instructions', async (t) => {
+  const { respondViaHarness, _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
+  const { planningConnectionForOperation } = await import('../tools/tool-search-provider-sources.js');
+  t.after(() => {
+    _setBridgeImplsForTests({});
+    _setBackgroundResponseExecutorForTests((assistant, request) => assistant.respond(request));
+  });
+  const connections = [
+    { slug: 'outlook', connectionId: 'ca_answered', status: 'ACTIVE', accountEmail: 'sender@chosen.example' },
+    { slug: 'outlook', connectionId: 'ca_other', status: 'ACTIVE', accountEmail: 'sender@other.example' },
+  ] as unknown as Parameters<typeof planningConnectionForOperation>[2];
+
+  for (const [answer, expectedSelection] of [
+    ['Use account sender@chosen.example.', 'resolved'],
+    ['I have not chosen an account yet.', 'account_selection_required'],
+  ] as const) {
+    for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+    const task = createBackgroundTask({
+      title: 'Draft the follow-up',
+      prompt: 'Create a draft follow-up for prospect@example.net.',
+    });
+    const questionId = `account-question:${task.id}`;
+    assert.ok(markBackgroundTaskAwaitingInput(task.id, questionId, 'Which connected account should I use?'));
+    assert.ok(queueBackgroundTaskInputResolution(questionId, answer));
+    let privateMessage = '';
+    const selections: ReturnType<typeof planningConnectionForOperation>[] = [];
+    _setBridgeImplsForTests({
+      runConversation: (async (opts: { sessionId: string; sourceUserSeq?: number }) => {
+        const source = listEvents(opts.sessionId, { types: ['user_input_received'] })
+          .find((event) => event.seq === opts.sourceUserSeq);
+        if (source) {
+          selections.push(planningConnectionForOperation(
+            'OUTLOOK_CREATE_DRAFT', String(source.data.text), connections,
+            { sessionId: opts.sessionId, sourceUserSeq: source.seq },
+          ));
+        }
+        return {
+          sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+          lastDecision: { summary: 'Account selection checked.', reply: 'Account selection checked.', done: true, nextAction: 'completed' },
+        };
+      }) as never,
+    });
+    // Exercise the real producer and bridge journal; only the model loop is
+    // replaced. The assistant fallback must never run and no provider is called.
+    _setBackgroundResponseExecutorForTests((_assistant, request) => {
+      privateMessage = request.message;
+      return respondViaHarness('background', request, { turnEngine: 'host_v1' });
+    });
+    const assistant = {
+      getRuntime() { return {} as never; },
+      async respond() { throw new Error('The real bridge must own this test turn'); },
+    };
+    assert.equal(await processBackgroundTasks(assistant as never, 1), 1);
+    const accepted = listEvents(task.runSessionId, { types: ['user_input_received'] });
+    assert.equal(accepted.length, 1);
+    assert.equal(accepted[0]?.data.text, `${task.prompt}\n\n${answer}`,
+      'the accepted source must contain the original contract and the actual answer, not only the private directive');
+    assert.equal(accepted[0]?.data.modelDirectiveApplied, true);
+    assert.match(privateMessage, /Resume THIS SAME task/);
+    assert.match(privateMessage, /## Durable Task Contract/);
+    assert.doesNotMatch(String(accepted[0]?.data.text), /Resume THIS SAME task|Durable Task Contract|Original request:/);
+    assert.equal(getBackgroundTask(task.id)?.prompt, task.prompt, 'answering must not rewrite the task contract');
+    assert.equal(getBackgroundTask(task.id)?.inputResolution, undefined, 'the resolution remains single-consumption state');
+    assert.equal(selections.length, 1, 'one account lookup at the actual model-loop boundary');
+    assert.equal(selections[0]?.kind, expectedSelection);
+    if (selections[0]?.kind === 'resolved') {
+      assert.equal(selections[0].connection.connectionId, 'ca_answered');
+      const laterSelection = planningConnectionForOperation(
+        'OUTLOOK_CREATE_DRAFT', task.prompt, connections,
+        { sessionId: task.runSessionId, sourceUserSeq: accepted[0]!.seq + 1 },
+      );
+      assert.equal(laterSelection.kind, 'resolved', 'later continuation can recover the account from accepted history');
+      if (laterSelection.kind === 'resolved') assert.equal(laterSelection.connection.connectionId, 'ca_answered');
+    }
+  }
+});
+
 test('an in-flight contract correction preserves partial work and re-queues the same task/session at the model boundary', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
   const task = createBackgroundTask({
