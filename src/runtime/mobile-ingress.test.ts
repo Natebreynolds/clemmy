@@ -31,6 +31,59 @@ const {
   restrictDirectAppIngressToMobile,
 } = await import('./mobile-ingress.js');
 
+test('the relay ceremony block decides on the path, not on its spelling', () => {
+  // Audited and reproduced 2026-09-05: the block matched a literal Set against
+  // the raw pathname, so "/m/auth/login/", "//m/auth/login" and a
+  // percent-encoded spelling all missed it and reached the handler. The PIN box
+  // and the pairing consumer were therefore reachable from the public internet
+  // on an install whose relay is on by default.
+  const blocked = [
+    '/m/auth/login',
+    '/m/auth/login/',
+    '/m/auth/login//',
+    '//m/auth/login',
+    '/m//auth//login',
+    '/m/auth/%6Cogin',
+    '/M/Auth/Login',
+    '/m/auth/pair',
+    '/m/auth/pair/',
+    '//m/auth/pair',
+  ];
+  for (const requestPath of blocked) {
+    let status = 0;
+    let nexted = false;
+    restrictDirectAppIngressToMobile(
+      { clemIngress: 'relay', path: requestPath } as never,
+      {
+        status(code: number) { status = code; return this; },
+        type() { return this; },
+        send() { return this; },
+      } as never,
+      () => { nexted = true; },
+    );
+    assert.equal(nexted, false, `relay must not reach ${requestPath}`);
+    assert.equal(status, 404, `relay must be refused ${requestPath}`);
+  }
+
+  // The neighbouring ceremony that MUST stay reachable at the relay origin.
+  let adopted = false;
+  restrictDirectAppIngressToMobile(
+    { clemIngress: 'relay', path: '/m/auth/origin-adopt' } as never,
+    { status() { return this; }, type() { return this; }, send() { return this; } } as never,
+    () => { adopted = true; },
+  );
+  assert.equal(adopted, true, 'origin-adopt stays reachable through the relay');
+
+  // On the LAN door the same paths are the whole point of the ceremony.
+  let lanReached = false;
+  restrictDirectAppIngressToMobile(
+    { clemIngress: 'direct-app', path: '/m/auth/login' } as never,
+    { status() { return this; }, type() { return this; }, send() { return this; } } as never,
+    () => { lanReached = true; },
+  );
+  assert.equal(lanReached, true, 'the LAN door still serves the PIN box');
+});
+
 function buildApp() {
   const app = express();
   app.use(classifyIngress);

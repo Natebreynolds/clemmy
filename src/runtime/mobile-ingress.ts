@@ -148,11 +148,37 @@ export function restrictDirectAppIngressToMobile(req: Request, res: Response, ne
   // deadlock). Its token can only be minted by an already-authenticated
   // request on a LAN door, so the trust decision still happens at home.
   // Minting — /m/auth/origin-handoff — stays LAN-only, enforced at the route.
-  if (req.clemIngress === 'relay' && RELAY_FORBIDDEN_PATHS.has(req.path)) {
+  if (req.clemIngress === 'relay' && RELAY_FORBIDDEN_PATHS.has(canonicalIngressPath(req.path))) {
     res.status(404).type('text/plain').send('Not found');
     return;
   }
   next();
+}
+
+/**
+ * The path this rule decides on, not the bytes the caller happened to send.
+ *
+ * `req.path` is the raw pathname: Express does not decode it, does not collapse
+ * repeated separators, and does not drop a trailing slash. Matching a literal
+ * Set against it meant `/m/auth/login/`, `//m/auth/login` and `/m/auth/%6Cogin`
+ * all missed the rule and reached the handler — so the two ceremonies this
+ * block exists to delete from the internet were reachable through the relay by
+ * appending one character. Audited and reproduced 2026-09-05, on an install
+ * whose relay is on by default.
+ *
+ * Router matching is itself lenient about these forms, so the guard has to be
+ * at least as lenient as the thing it guards.
+ */
+function canonicalIngressPath(raw: string): string {
+  let path = raw;
+  try {
+    path = decodeURIComponent(raw);
+  } catch {
+    // Undecodable bytes keep their exact form; the literal compare still runs.
+  }
+  const collapsed = path.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  const trimmed = collapsed.length > 1 ? collapsed.replace(/\/+$/, '') : collapsed;
+  return trimmed.toLowerCase();
 }
 
 const RELAY_FORBIDDEN_PATHS = new Set(['/m/auth/pair', '/m/auth/login']);
