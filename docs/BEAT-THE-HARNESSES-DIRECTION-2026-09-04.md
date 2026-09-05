@@ -2375,3 +2375,44 @@ outcomes: paired refusal, or a host-held resumable checkpoint — never done, ne
 "retry the item". Pin 10/10, neighbors green, typecheck ✅. Remaining before the
 gates: the materialization-split sweep result (in flight) and the owner's word on
 the three deferrals.
+
+**2026-09-05 01:23 — MATERIALIZATION-SPLIT SWEEP (two auditors by symbol / by boundary, one
+merging verifier; read-only): 24 sites materialized, 5 raw-looking sites rejected
+with reasons, 4 CONFIRMED — fixers + adversarial verifiers launched.**
+(1) HIGH `host-turn-runner.ts` ~6945 — the no-progress `ask_user` recovery checks the
+RAW bytes of the single `ask_user_question` call against the canonical key set
+`['options','purpose','question']`; `options`/`purpose` are strict-nullable, so a
+native-lane brain that omits `options` (the directive never says to pass `null`)
+fails the check and the turn stops `required_question_not_issued` although the
+materialized call is canonical. (2) HIGH — the resume "approval edit" compare has a
+SECOND axis `0c63a90b` did not cover: the pause persists the host's CARRIER-COMPLETED
+bytes (completion rewrites writes too: bare name → gateway form, `args`→`args_json`,
+wrapping/serialization) while the checkpoint keeps the raw model bytes and is only
+re-materialized, never re-completed — an approved, unchanged carrier write (a
+`GMAIL_SEND_EMAIL` via `work_call`) would still read as an edit and never dispatch.
+General fix: snapshot the exact ADMITTED bytes on the pending call at the pause and
+compare the pending call against its own snapshot (never against checkpoint
+history; never overwrite `rawItem.arguments` with checkpoint bytes); bump
+`HOST_STATE_VERSION`. (3) MEDIUM — the same compare when the paused tool is absent
+at resume degrades to raw-vs-materialized and writes raw checkpoint bytes onto the
+pending call → `resumed_*_unavailable` recovery outcomes; the snapshot fix removes
+the dependency on the tool. (4) MEDIUM sibling class (host-side key deletion) —
+`composio-tools.ts` ~1284 documented-create projection compares a frozen
+admission attestation digest against dispatch-time `resolved.args` after host
+normalization; to be PROVEN by a fixture before any fix. Coverage gap named by the
+verifier: everything was by reading; the two medium sites need their fixtures.
+
+**2026-09-05 02:00 — SWEEP SITES 1–3 FIXED: `9ac532df`.** One primitive closes the resume axis
+for good: the pause snapshots the exact ADMITTED bytes on the pending call
+(`admittedArgumentsJson`, HOST_STATE_VERSION 6, older states backfilled) and resume
+compares only against that snapshot — so host-completed carrier writes resume and
+dispatch exactly once, a genuine edit is still refused, and a resume without the
+paused tool on the surface no longer manufactures a phantom edit; the no-progress
+ask is judged on materialized bytes (an omitted nullable `options` is the
+canonical ask). Verified on this checkout: 348/348 across 11 pin files, journey
+56/56, typecheck ✅; verifier red/green by file swap + V4–V7 paused-state probes.
+Site 4 (composio documented-create digest) is fixed at its site and its verifier
+found the SAME split one step later (`atomic-content-commit-proof` compares the
+admission-time RAW binding digest against the now-EFFECTIVE projection digest →
+a refined create's content-commit evidence would be refused after the provider
+write succeeded); part 2 is in flight, both halves land together.
