@@ -18,14 +18,17 @@ import type {
 import { NO_PROGRESS_RECOVERY_TOOL_NAME_CAP, createNoProgressConsequence } from './no-progress-governor.js';
 import { parseExactPlanTaskRefusal } from './plan-task-result-contract.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
+import { stableJsonDigest } from '../../shared/stable-json-digest.js';
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 
 /**
  * Exact, same-source projection for the pure no-progress reducer.
  *
  * Raw operation/account/target ids never leave this module: every token is a
  * domain-separated digest of a host-owned durable row. Model prose, query
- * text, physical call ids, provider names, and returned payload bytes are not
- * inputs and therefore cannot reset the governor.
+ * text, physical call ids, provider names, and returned payload bytes cannot
+ * reset authority progress. A typed schema refusal may use canonical attempted
+ * arguments only to discriminate its finite repair stages when no path key exists.
  */
 
 export type HostNoProgressProjection =
@@ -716,9 +719,30 @@ function schemaInvalidStage(repairKeys: readonly string[]): string {
   return `schema_invalid:${prefixes.join('.')}`;
 }
 
+/** A typed schema refusal without failing-path material still identifies the
+ * operation and exact attempted arguments. Reuse the ordinary carrier reader
+ * and canonical JSON digest so formatting/call-id churn cannot mint stages.
+ * This identifies only a bounded repair stage, never execution authority or a
+ * fresh retry budget; the governor's finite transition cap remains in force. */
+function fallbackSchemaInvalidStage(call: HistoryCall): string {
+  const effective = unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments);
+  let args = effective.toolName ? effective.args : call.arguments;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { /* unreadable bytes keep their exact refusal identity */ }
+  }
+  const digest = stableJsonDigest({
+    domain: 'schema-repair-call',
+    version: 1,
+    operation: effective.toolName ?? call.name,
+    arguments: args,
+  });
+  return `schema_invalid:call:${digest.slice(0, 16)}`;
+}
+
 interface HistoryCall {
   callId: string;
   name: string;
+  arguments: unknown;
 }
 
 function historyCalls(history: readonly unknown[]): HistoryCall[] {
@@ -727,7 +751,7 @@ function historyCalls(history: readonly unknown[]): HistoryCall[] {
     if (row?.type !== 'function_call') return [];
     const callId = nonEmptyString(row.callId);
     const name = nonEmptyString(row.name);
-    return callId && name ? [{ callId, name }] : [];
+    return callId && name ? [{ callId, name, arguments: row?.arguments }] : [];
   });
 }
 
@@ -877,12 +901,12 @@ function controlConsequence(input: {
     // Keyed on the host-authored digest of the violated paths when present:
     // a draft that repaired one complaint and met a different one is a new
     // stage (progress), an identical complaint is the same stage (the loop
-    // floor). Legacy payloads without a key keep the flat stage.
+    // floor). Older payloads fall back to the canonical attempted call.
     const planRepairKey = typeof payload.repairKey === 'string' && REPAIR_KEY_RE.test(payload.repairKey)
       ? payload.repairKey
       : null;
     return createNoProgressConsequence({
-      stage: planRepairKey ? schemaInvalidStage([planRepairKey]) : 'schema_invalid',
+      stage: planRepairKey ? schemaInvalidStage([planRepairKey]) : fallbackSchemaInvalidStage(input.call),
       recovery: 'repair_model',
       effectState: 'not_started',
       recoveryToolNames: [input.call.name],
@@ -1032,10 +1056,10 @@ function settlementConsequence(input: {
         });
       }
       // A host-authored repair key in the bounded outcome detail keys the
-      // stage on the failing-path set; without one the stage is unchanged.
+      // stage on the failing-path set; otherwise identify the attempted call.
       const repairKey = /^validation:([a-f0-9]{16,64})$/.exec(settlement.outcome_detail ?? '')?.[1];
       return createNoProgressConsequence({
-        stage: repairKey ? schemaInvalidStage([repairKey]) : 'schema_invalid',
+        stage: repairKey ? schemaInvalidStage([repairKey]) : fallbackSchemaInvalidStage(call),
         recovery: 'repair_model',
         effectState,
         recoveryToolNames: [call.name],
@@ -1094,7 +1118,8 @@ function settlementConsequence(input: {
 
 /**
  * Classify one already-committed history delta by durable topology/effect
- * facts. Tool/provider vocabulary and argument text are deliberately ignored.
+ * facts. Canonical call arguments only distinguish a proven schema refusal's
+ * repair stage; they never classify effect, disposition or execution authority.
  */
 /** Readers of THIS turn's own parked tool output. Paging a result the turn
  *  already fetched is consuming evidence it paid for, not a fresh attempt at an

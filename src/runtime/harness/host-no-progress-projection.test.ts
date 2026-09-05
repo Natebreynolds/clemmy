@@ -1291,7 +1291,7 @@ test('typed plan consequences advance by host stage while ids, args, and detail 
     && semanticOne.status === 'ok'
     && semanticTwo.status === 'ok'
   ) {
-    assert.equal(schema.consequence?.stage, 'schema_invalid');
+    assert.match(schema.consequence?.stage ?? '', /^schema_invalid:call:[a-f0-9]{16}$/);
     assert.equal(missingWrite.consequence?.stage, 'plan_incomplete:missing_write');
     assert.equal(missingWrite.consequence?.recovery, 'repair_model');
     assert.deepEqual(missingWrite.consequence?.recoveryToolNames, ['plan_task']);
@@ -1474,7 +1474,7 @@ for (const [label, toolName] of [
     assert.equal(projected.status, 'ok');
     if (projected.status === 'ok') {
       assert.equal(projected.attemptClass, 'zero_crossing_repair');
-      assert.equal(projected.consequence?.stage, 'schema_invalid');
+      assert.match(projected.consequence?.stage ?? '', /^schema_invalid:call:[a-f0-9]{16}$/);
       assert.equal(projected.consequence?.recovery, 'repair_model');
       assert.equal(projected.consequence?.effectState, 'not_started');
       assert.deepEqual(projected.consequence?.recoveryToolNames, [toolName]);
@@ -1771,6 +1771,18 @@ test('a refusal marker carrying a repair key projects a keyed schema_invalid sta
   assert.equal(projected.consequence?.recovery, 'repair_model');
   assert.equal(projected.consequence?.effectState, 'not_started');
   assert.deepEqual(projected.consequence?.recoveryToolNames, ['opaque_provider_carrier']);
+  const changedArguments = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [
+      { ...call('call-keyed-again', 'opaque_provider_carrier'), arguments: '{"changed":"payload"}' },
+      refusalMarker({ callId: 'call-keyed-again', toolName: 'opaque_provider_carrier', repairKey: REPAIR_KEY_A }),
+    ],
+  });
+  assert.equal(changedArguments.status, 'ok');
+  if (changedArguments.status === 'ok') {
+    assert.equal(changedArguments.consequence?.key, projected.consequence?.key,
+      'an explicit failing-path repair key still owns the stage, regardless of argument changes');
+  }
 });
 
 test('a settlement whose outcome detail carries validation:<key> projects the same keyed stage as the marker path', () => {
@@ -1822,7 +1834,7 @@ test('a settlement whose outcome detail carries validation:<key> projects the sa
   }, proseDb);
   proseDb.close();
   assert.equal(prose.status, 'ok');
-  if (prose.status === 'ok') assert.equal(prose.consequence?.stage, 'schema_invalid');
+  if (prose.status === 'ok') assert.match(prose.consequence?.stage ?? '', /^schema_invalid:call:[a-f0-9]{16}$/);
 });
 
 test('two repair keys mint two consequence keys; the same key re-enters one and terminalizes', () => {
@@ -1866,6 +1878,84 @@ test('two repair keys mint two consequence keys; the same key re-enters one and 
   if (progressed.action === 'continue') assert.equal(progressed.reason, 'consequence_progress');
   const repeatedB = observe(progressed.state, firstB);
   assert.equal(repeatedB.action, 'terminalize');
+});
+
+test('unkeyed schema refusals distinguish canonical operation and arguments without minting an unbounded retry', () => {
+  const identity = accepted('unkeyed-schema-call-discriminator');
+  const ids = Array.from({ length: 10 }, (_, index) => `unkeyed-${index}`);
+  const db = settlementDb(ids.map((callId) => ({
+    callId, outcomeKind: 'invalid_arguments', recoveryAction: 'repair_arguments',
+  })), identity);
+  try {
+    const project = (callId: string, operation: string, argumentsJson: string) => {
+      const projected = projectHostNoProgressAttempt({
+        ...identity,
+        historyDelta: [
+          { ...call(callId, 'call_tool'), arguments: JSON.stringify({ name: operation, args_json: argumentsJson }) },
+          result(callId, 'call_tool', `untrusted diagnostic for ${callId}`),
+        ],
+      }, db);
+      assert.equal(projected.status, 'ok');
+      if (projected.status !== 'ok' || !projected.consequence) throw new Error('expected schema consequence');
+      return projected.consequence;
+    };
+    const a = project(ids[0]!, 'fixture_lookup', '{"limit":"5","where":{"owner":"Tim","open":true}}');
+    const equivalent = project(ids[1]!, 'fixture_lookup', '{ "where": {"open":true,"owner":"Tim"}, "limit":"5" }');
+    const corrected = project(ids[2]!, 'fixture_lookup', '{"limit":5,"where":{"owner":"Tim","open":true}}');
+    const otherOperation = project(ids[3]!, 'fixture_lookup_other', '{"limit":"5","where":{"owner":"Tim","open":true}}');
+    assert.equal(a.key, equivalent.key, 'object order, whitespace, call IDs and result prose are not a new repair');
+    assert.notEqual(a.key, corrected.key, 'corrected argument shape is a different repair attempt');
+    assert.notEqual(a.key, otherOperation.key, 'the effective operation participates even under one carrier');
+    assert.match(a.stage, /^schema_invalid:call:[a-f0-9]{16}$/);
+    assert.deepEqual(corrected.recoveryToolNames, ['call_tool']);
+
+    const authority = { operation: [], account: [], target: [], evidence: [], effect: [] } as const;
+    const reduce = (state: ReturnType<typeof initializeNoProgressGovernor>, consequence: typeof a) => (
+      observeNoProgress(state, { taskKey: state.taskKey, attemptClass: 'zero_crossing_repair', authority, consequence })
+    );
+    const first = reduce(initializeNoProgressGovernor({ taskKey: 'unkeyed-schema-fallback', authority }), a);
+    const second = reduce(first.state, corrected);
+    assert.equal(second.action, 'continue', 'a missing repairKey cannot turn distinct schema repairs into a cycle');
+    assert.equal(reduce(second.state, corrected).action, 'terminalize', 'an unchanged repair still stops');
+    let cursor = first;
+    for (let index = 1; index < ids.length; index += 1) {
+      cursor = reduce(cursor.state, project(ids[index]!, 'fixture_lookup', JSON.stringify({ limit: index })));
+      if (cursor.action === 'terminalize') break;
+    }
+    assert.equal(cursor.action, 'terminalize', 'argument churn cannot escape the finite stage transition budget');
+  } finally {
+    db.close();
+  }
+});
+
+test('plan_invalid_input without a repair key uses the same canonical call fallback', () => {
+  const identity = accepted('unkeyed-plan-call-discriminator');
+  const db = settlementDb(['plan-one', 'plan-two', 'plan-repeat'].map((callId) => ({
+    callId, outcomeKind: 'invalid_arguments', recoveryAction: 'repair_arguments',
+  })), identity);
+  try {
+    const project = (callId: string, args: unknown) => {
+      const projected = projectHostNoProgressAttempt({
+        ...identity,
+        historyDelta: [
+          { ...call(callId, 'plan_task'), arguments: JSON.stringify(args) },
+          result(callId, 'plan_task', JSON.stringify({
+            ok: false, code: 'plan_invalid_input', detail: 'schema invalid', repair: 'correct the shape',
+          })),
+        ],
+      }, db);
+      assert.equal(projected.status, 'ok');
+      if (projected.status !== 'ok' || !projected.consequence) throw new Error('expected plan repair');
+      return projected.consequence;
+    };
+    const first = project('plan-one', { nodes: {} });
+    const corrected = project('plan-two', { nodes: [] });
+    assert.notEqual(first.key, corrected.key);
+    assert.equal(corrected.key, project('plan-repeat', { nodes: [] }).key);
+    assert.match(first.stage, /^schema_invalid:call:[a-f0-9]{16}$/);
+  } finally {
+    db.close();
+  }
 });
 
 test('a refusal marker without a repair key keeps the unkeyed stage, also inside a mixed frame', () => {

@@ -220,7 +220,7 @@ test('a keyed plan_invalid_input refusal parses as the structural plan_task memb
     assert.equal(first.consequence?.stage, `schema_invalid:${'a'.repeat(16)}`);
     assert.equal(second.consequence?.stage, `schema_invalid:${'b'.repeat(16)}`);
     assert.notEqual(first.consequence?.key, second.consequence?.key, 'a different violated-path set is a different stage');
-    assert.equal(legacy.consequence?.stage, 'schema_invalid');
+    assert.match(legacy.consequence?.stage ?? '', /^schema_invalid:call:[a-f0-9]{16}$/);
     assert.deepEqual(first.consequence?.recoveryToolNames, ['plan_task']);
   }
 });
