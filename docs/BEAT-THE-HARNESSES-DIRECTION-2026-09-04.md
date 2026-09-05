@@ -1356,7 +1356,7 @@ wire. The gap is subagents + selfJudge carry + one audit door; the contract and 
 order are in §15.4 and are **v3.17, after P3**. Do not start it this weekend; do not
 add a second loop; a judge never gains write/approval authority.
 
-**2026-09-04 ~23:20 — TAG BLOCKERS FOUND BY THE REVIEWER'S RELEASE-GATE DRY RUN
+**2026-09-04 ~22:20 — TAG BLOCKERS FOUND BY THE REVIEWER'S RELEASE-GATE DRY RUN
 (detached checkout of `2cc40895`, real exit codes; these are gates the release
 workflow runs on a tag push):** typecheck ✅ · test:public-hygiene ✅ ·
 **check:public-hygiene ❌ · test:release-assets ❌**. Three concrete fixes, none of
@@ -1364,7 +1364,7 @@ them harness work — fold them into P3 or a `chore(release)` commit before the 
 1. `docs/P2-FREE-THE-TURN-REPORT-2026-09-04.md` contains a personal home path
    (`/Users/<user>/…`, one occurrence) → replace with `~/…` or `<repo>/…`.
 2. `apps/ios/ClemTests/PendingPushNavigationTests.swift:283` — the fixture
-   `https://user:secret@192.168.1.11:43117/m/` trips `credential-bearing-url`. It is
+   (a URL carrying a `user:secret@` userinfo before a LAN host) trips `credential-bearing-url`. It is
    an intentional negative test (asserts `.cancel`), but the checker cannot know
    that. Use the checker's placeholder form if it has one, else an obviously fake
    value (e.g. `https://user:PLACEHOLDER@example.invalid/m/`). NOTE: this line is on
@@ -1381,3 +1381,19 @@ agent is not using. Until all gates are green on the release bytes, the tag is a
 no-go by the procedure's own rule ("packed-candidate green on those bytes").
 
 **2026-09-04 — EXECUTING AGENT P2 REPORT:** [P2 report](./P2-FREE-THE-TURN-REPORT-2026-09-04.md) records green local runs (252/252, 414/414, 96/96, reviewer follow-up 91/91; overlapping counts, real exit 0), typecheck/artifact verify exit 0, and the cooldown test receipt (`p2-floor-final.log`, test 50; model-transport cooldown is distinct from tool `provider_repair`). Same fixed canary on clean `4ed325eb` reached `input_required:account_selection`/`needs_input`, resumable true with retained results, zero writes and zero bare-schema/last-word events; global ≤1 wasted-step metric not claimed. Eight-worker acceptance FAILED: an advertised call was refused before dispatch, zero workers despite terminal `done`. Five genuine Claude watchers overlapped Codex brain calls. Separate final-source direct-auditor test on clean `5b8c3267` PASSED all three exact reads/results plus real Claude/Codex overlap, exit 0. Main DEV rebooted clean `c2623d01`, PID 51650/8520, requested pairing and both watchers on. No P2 push or tag; P3 has not started. `Start P3?` is the next owner decision, with mixed live results preserved rather than waived.
+
+**2026-09-04 22:30 — REVIEWER VERIFIED the repair `64c3bfa5` on its own bytes
+(detached dry-run checkout, real exit codes):** test:release-assets **53/53 ✅** —
+the test now reads the real `HARNESS_SCHEMA_VERSION` and demands a matching
+`## Schema(s) … v77` heading in the current notes; better than a pin, and the notes
+already carry it. check:public-hygiene went ❌→✅: the only finding left was the
+reviewer's OWN previous entry quoting the offending URL literal; corrected in place
+(the one non-append edit in this log, nothing else touched) and that entry's stamp
+fixed to 22:20. Working-tree hygiene scan now passes. **Light gates on `64c3bfa5` +
+this doc fix: typecheck ✅ · check:public-hygiene ✅ · test:public-hygiene ✅ ·
+test:release-assets ✅.** Heavy gates are next: the daemon is DOWN on 8520/8420 right
+now, so the reviewer is starting `npm test`, `journeys`, `proof:selftest`,
+`test:measurement` in the detached checkout (isolated homes via
+`run-tests-isolated`). Executing agent: if you need the daemon or the test ports in
+the next ~40 min, say so here and the reviewer yields; nothing here touches the
+live home. Results land in this log with exit codes.
