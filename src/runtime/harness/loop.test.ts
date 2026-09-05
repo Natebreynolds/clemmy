@@ -2965,11 +2965,14 @@ test('persistent approval registration failure holds, then a fresh recovery pass
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });
   const rawArgs = JSON.stringify({ subject: 'Authorize the restart-safe exact action.' });
+  const consentCall = { effect: 'external_write' as const, accountId: 'account:exact-owner',
+    risk: { reversibility: 'irreversible' as const, consequence: 'send' as const, destructive: false } };
   const state = new HostInterruptState(
     [],
     [{
       callId: 'approval-registration-restart-call',
       name: 'request_approval',
+      consentCall,
       rawItem: {
         name: 'request_approval',
         arguments: rawArgs,
@@ -3007,6 +3010,7 @@ test('persistent approval registration failure holds, then a fresh recovery pass
         toolName: 'request_approval',
         rawArgs,
         args: JSON.parse(rawArgs) as Record<string, unknown>,
+        consentCall,
       }],
     }),
   });
@@ -3030,6 +3034,8 @@ test('persistent approval registration failure holds, then a fresh recovery pass
   const approvalEvents = listEvents(sess.id, { types: ['approval_requested'] });
   assert.equal(approvalEvents.length, 1);
   assert.equal(approvalEvents[0]?.data.approvalId, row.approvalId);
+  assert.deepEqual(approvalEvents[0]?.data.consentCall, consentCall,
+    'a fresh-process card carries the exact reducer effect/risk/account, not a reclassification');
 
   const replay = recoverParkedApprovalSurfaces();
   assert.equal(replay.alreadyComplete, 1);

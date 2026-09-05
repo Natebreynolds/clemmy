@@ -23,6 +23,20 @@ function event(type: EventType, data: Record<string, unknown> = {}): EventRow {
   };
 }
 
+test('approval projection preserves exact consent facts without publishing private authority', () => {
+  const consentCall = { effect: 'external_write', accountId: 'account:exact-owner',
+    risk: { reversibility: 'irreversible', consequence: 'send', destructive: false } };
+  const projected = projectHarnessEventForPublic(event('approval_requested', {
+    approvalId: 'apr-exact', subject: 'Send this exact message.',
+    consentCall: { ...consentCall, bindingDigest: 'private-authority',
+      risk: { ...consentCall.risk, privateProviderData: 'private' } },
+    consentSubject: { callDigest: 'private-authority' }, rawArgs: '{"private":"body"}',
+  }));
+  assert.deepEqual(projected?.data.consentCall, consentCall);
+  assert.equal(projected?.data.consentSubject, undefined);
+  assert.equal(projected?.data.rawArgs, undefined);
+});
+
 function typedTerminalEvent(input: {
   seq: number;
   sourceUserSeq: number;

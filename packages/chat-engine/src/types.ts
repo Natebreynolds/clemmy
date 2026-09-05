@@ -74,6 +74,12 @@ export interface ChatMessage {
     subject: string;
     reason?: string;
     approvalId?: string | null;
+    /** Host reducer facts, passed through unchanged for display, not authority. */
+    consentCall?: {
+      effect: string;
+      accountId: string | null;
+      risk: { reversibility: string; consequence: string; destructive: boolean };
+    };
   };
   planProposalId?: string;
   planProposalStatus?: 'pending' | 'approved' | 'rejected';

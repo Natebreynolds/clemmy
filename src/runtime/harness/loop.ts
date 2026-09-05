@@ -281,6 +281,7 @@ import {
   reopenAcceptedModelBatch,
 } from './accepted-model-batch-checkpoint.js';
 import { hostInteractiveConsentApprovalResumeKey } from './host-interactive-consent.js';
+import type { CapabilityRiskAttestationV1 } from './interactive-consent-policy.js';
 import {
   isHostTurnEngine,
   requireFreshHostTurnEngine,
@@ -2518,6 +2519,9 @@ function registerAndEmitApprovalsOnce(
             rawArgs: registered.interruption.rawArgs,
             pendingAction: pendingActionApprovalViewFromArgs(row.args),
             approvalId: row.approvalId,
+            ...(registered.interruption.consentCall
+              ? { consentCall: registered.interruption.consentCall }
+              : {}),
             ...(row.presentation ? {
               approvalPresentation: 'conversation',
               question: row.presentation.question,
@@ -2636,6 +2640,7 @@ function interruptionInfosFromPending(pending: readonly unknown[]): Interruption
       rawItem?: { name?: unknown; arguments?: unknown };
       toolName?: unknown;
       approvalResumeKey?: unknown;
+      consentCall?: InterruptionInfo['consentCall'];
     };
     const rawName = interruption.rawItem?.name ?? interruption.toolName;
     const rawArgs = interruption.rawItem?.arguments;
@@ -2652,6 +2657,7 @@ function interruptionInfosFromPending(pending: readonly unknown[]): Interruption
       toolName,
       args,
       rawArgs: rawArguments,
+      ...(interruption.consentCall ? { consentCall: interruption.consentCall } : {}),
       ...(typeof interruption.approvalResumeKey === 'string'
         ? { approvalResumeKey: interruption.approvalResumeKey }
         : {}),
@@ -2795,6 +2801,8 @@ export interface InterruptionInfo {
   rawArgs: string;
   /** Opaque host-minted identity for one exact reducer consent subject. */
   approvalResumeKey?: string;
+  /** Reducer facts for presentation only; never an approval/dispatch grant. */
+  consentCall?: Pick<CapabilityRiskAttestationV1, 'effect' | 'accountId' | 'risk'>;
 }
 
 export interface RunOutcome {
