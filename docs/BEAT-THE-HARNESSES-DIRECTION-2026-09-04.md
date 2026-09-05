@@ -1945,3 +1945,13 @@ again. ACCEPTED (one-line bridge mapping + a pin that the public request closes
 scoreboard: 1 of 4 closed (Home parity); open: two-operation request
 `blocked≠done`/literal-content `dataFrom` over-refusal, and the two
 discovery-gate journeys that need the new-contract update.
+
+**2026-09-05 06:33 UTC — EXECUTING AGENT, P3 live-window request:** Workspace
+15/15 and the four cited journeys are green; the cited plan unit recheck is 5/5.
+Worker-child repair is committed `8b9cbc07` (real child dispatch and bounded
+failed-receipt recovery 281/281; independent authority adversaries 16/16).
+Implementation artifact emit/verify both exited 0; preparing a clean frozen SHA
+and fresh isolated ledger for the byte-identical 05:34Z worker replay, port 64244.
+Reviewer: please yield daemon-sensitive heavy gates for this window. Main dev
+stays down. No live success, P3 acceptance, push or tag claimed; the prior RED is
+retained. After the worker precondition, the same draft canary resume remains owed.

@@ -117,7 +117,7 @@
           "bytes": 674
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 45647
+          "bytes": 46215
         },
         "src/assistant/request-segments.ts": {
           "bytes": 4916
@@ -677,8 +677,11 @@
         "src/execution/workflow-capability-digest.ts": {
           "bytes": 645
         },
+        "src/runtime/harness/host-consent-evidence.ts": {
+          "bytes": 2231
+        },
         "src/runtime/harness/accepted-turn-call-authority.ts": {
-          "bytes": 188789
+          "bytes": 188249
         },
         "src/runtime/harness/logical-call-settlement-store.ts": {
           "bytes": 53555
@@ -720,13 +723,13 @@
           "bytes": 2643
         },
         "src/runtime/harness/dispatch-lease.ts": {
-          "bytes": 20200
+          "bytes": 25621
         },
         "src/runtime/harness/exact-checkpoint-reentry.ts": {
           "bytes": 3563
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 48158
+          "bytes": 48217
         },
         "src/runtime/harness/skill-execution.ts": {
           "bytes": 16140
@@ -813,7 +816,7 @@
           "bytes": 57872
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
-          "bytes": 13861
+          "bytes": 14208
         },
         "src/runtime/harness/tool-correlation.ts": {
           "bytes": 1804
@@ -1140,7 +1143,7 @@
           "bytes": 11799
         },
         "src/runtime/harness/graph-node-capability.ts": {
-          "bytes": 5718
+          "bytes": 5721
         },
         "src/integrations/composio/selected-definition-revalidation.ts": {
           "bytes": 17392
@@ -1257,7 +1260,7 @@
           "bytes": 79940
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 85954
+          "bytes": 89646
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -1374,10 +1377,10 @@
           "bytes": 27003
         },
         "src/runtime/harness/accepted-model-batch-checkpoint.ts": {
-          "bytes": 60121
+          "bytes": 62060
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 47898
+          "bytes": 47349
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
@@ -1418,8 +1421,11 @@
         "src/agents/worker-output.ts": {
           "bytes": 3752
         },
+        "src/runtime/harness/worker-host-runner.ts": {
+          "bytes": 5499
+        },
         "src/agents/sub-agents.ts": {
-          "bytes": 28704
+          "bytes": 25163
         },
         "src/tools/batch-shape-directive.ts": {
           "bytes": 4176
@@ -1509,7 +1515,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 200275
+          "bytes": 198647
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -1710,7 +1716,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 126877
+          "bytes": 127070
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 5022
@@ -1863,7 +1869,7 @@
           "bytes": 25768
         },
         "src/runtime/harness/continue-directive.ts": {
-          "bytes": 4245
+          "bytes": 5093
         },
         "src/execution/workflow-runner.ts": {
           "bytes": 724942
@@ -1959,7 +1965,7 @@
           "bytes": 7234
         },
         "src/tools/extract-structured-tools.ts": {
-          "bytes": 12181
+          "bytes": 12459
         },
         "src/execution/batch-runner.ts": {
           "bytes": 44604
@@ -2166,7 +2172,7 @@
           "bytes": 40812
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 46312
+          "bytes": 49255
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 21416
@@ -2193,7 +2199,7 @@
           "bytes": 9085
         },
         "src/runtime/harness/authored-call-authority.ts": {
-          "bytes": 4009
+          "bytes": 3431
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -2220,10 +2226,13 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 52024
+          "bytes": 52214
+        },
+        "src/runtime/harness/local-work-completion.ts": {
+          "bytes": 7456
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 342921
+          "bytes": 350213
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -2235,7 +2244,7 @@
           "bytes": 25417
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 49515
+          "bytes": 49805
         },
         "src/runtime/harness/restart-recovery.ts": {
           "bytes": 73216
@@ -2280,7 +2289,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 667164
+          "bytes": 667693
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -2304,7 +2313,7 @@
           "bytes": 8409
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 296430
+          "bytes": 296559
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -2367,7 +2376,7 @@
           "bytes": 48911
         },
         "src/runtime/harness/debate-model.ts": {
-          "bytes": 101504
+          "bytes": 101928
         },
         "src/runtime/harness/grounding-gate.ts": {
           "bytes": 41010
@@ -2382,7 +2391,7 @@
           "bytes": 133472
         },
         "src/runtime/harness/attempt-settlement.ts": {
-          "bytes": 55333
+          "bytes": 56862
         },
         "src/runtime/harness/callable-surface.ts": {
           "bytes": 6949
@@ -2484,10 +2493,10 @@
           "bytes": 86806
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 321524
+          "bytes": 322956
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
-          "bytes": 42837
+          "bytes": 43211
         },
         "src/runtime/harness/current-manifest-operation-semantics.ts": {
           "bytes": 6688
@@ -2628,7 +2637,7 @@
           "bytes": 674
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 45647
+          "bytes": 46215
         },
         "src/assistant/request-segments.ts": {
           "bytes": 4916
@@ -3188,8 +3197,11 @@
         "src/execution/workflow-capability-digest.ts": {
           "bytes": 645
         },
+        "src/runtime/harness/host-consent-evidence.ts": {
+          "bytes": 2231
+        },
         "src/runtime/harness/accepted-turn-call-authority.ts": {
-          "bytes": 188789
+          "bytes": 188249
         },
         "src/runtime/harness/logical-call-settlement-store.ts": {
           "bytes": 53555
@@ -3231,13 +3243,13 @@
           "bytes": 2643
         },
         "src/runtime/harness/dispatch-lease.ts": {
-          "bytes": 20200
+          "bytes": 25621
         },
         "src/runtime/harness/exact-checkpoint-reentry.ts": {
           "bytes": 3563
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 48158
+          "bytes": 48217
         },
         "src/runtime/harness/skill-execution.ts": {
           "bytes": 16140
@@ -3324,7 +3336,7 @@
           "bytes": 57872
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
-          "bytes": 13861
+          "bytes": 14208
         },
         "src/runtime/harness/tool-correlation.ts": {
           "bytes": 1804
@@ -3651,7 +3663,7 @@
           "bytes": 11799
         },
         "src/runtime/harness/graph-node-capability.ts": {
-          "bytes": 5718
+          "bytes": 5721
         },
         "src/integrations/composio/selected-definition-revalidation.ts": {
           "bytes": 17392
@@ -3768,7 +3780,7 @@
           "bytes": 79940
         },
         "src/tools/plan-tools.ts": {
-          "bytes": 85954
+          "bytes": 89646
         },
         "src/memory/session-briefs.ts": {
           "bytes": 10739
@@ -3885,10 +3897,10 @@
           "bytes": 27003
         },
         "src/runtime/harness/accepted-model-batch-checkpoint.ts": {
-          "bytes": 60121
+          "bytes": 62060
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 47898
+          "bytes": 47349
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
@@ -3929,8 +3941,11 @@
         "src/agents/worker-output.ts": {
           "bytes": 3752
         },
+        "src/runtime/harness/worker-host-runner.ts": {
+          "bytes": 5499
+        },
         "src/agents/sub-agents.ts": {
-          "bytes": 28704
+          "bytes": 25163
         },
         "src/tools/batch-shape-directive.ts": {
           "bytes": 4176
@@ -4020,7 +4035,7 @@
           "bytes": 2813
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 200275
+          "bytes": 198647
         },
         "src/runtime/harness/canonical-context.ts": {
           "bytes": 4291
@@ -4221,7 +4236,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 126877
+          "bytes": 127070
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 5022
@@ -4374,7 +4389,7 @@
           "bytes": 25768
         },
         "src/runtime/harness/continue-directive.ts": {
-          "bytes": 4245
+          "bytes": 5093
         },
         "src/execution/workflow-runner.ts": {
           "bytes": 724942
@@ -4470,7 +4485,7 @@
           "bytes": 7234
         },
         "src/tools/extract-structured-tools.ts": {
-          "bytes": 12181
+          "bytes": 12459
         },
         "src/execution/batch-runner.ts": {
           "bytes": 44604
@@ -4677,7 +4692,7 @@
           "bytes": 40812
         },
         "src/runtime/harness/host-interactive-consent.ts": {
-          "bytes": 46312
+          "bytes": 49255
         },
         "src/runtime/harness/nested-tool-approval-admission.ts": {
           "bytes": 21416
@@ -4704,7 +4719,7 @@
           "bytes": 9085
         },
         "src/runtime/harness/authored-call-authority.ts": {
-          "bytes": 4009
+          "bytes": 3431
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -4731,10 +4746,13 @@
           "bytes": 63119
         },
         "src/runtime/harness/host-no-progress-projection.ts": {
-          "bytes": 52024
+          "bytes": 52214
+        },
+        "src/runtime/harness/local-work-completion.ts": {
+          "bytes": 7456
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 342921
+          "bytes": 350213
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -4746,7 +4764,7 @@
           "bytes": 25417
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 49515
+          "bytes": 49805
         },
         "src/runtime/harness/restart-recovery.ts": {
           "bytes": 73216
@@ -4791,7 +4809,7 @@
           "bytes": 9120
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 667164
+          "bytes": 667693
         },
         "src/runtime/outcome.ts": {
           "bytes": 33240
@@ -4815,7 +4833,7 @@
           "bytes": 8409
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 296430
+          "bytes": 296559
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -4878,7 +4896,7 @@
           "bytes": 48911
         },
         "src/runtime/harness/debate-model.ts": {
-          "bytes": 101504
+          "bytes": 101928
         },
         "src/runtime/harness/grounding-gate.ts": {
           "bytes": 41010
@@ -4893,7 +4911,7 @@
           "bytes": 133472
         },
         "src/runtime/harness/attempt-settlement.ts": {
-          "bytes": 55333
+          "bytes": 56862
         },
         "src/runtime/harness/callable-surface.ts": {
           "bytes": 6949
@@ -4995,10 +5013,10 @@
           "bytes": 86806
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 321524
+          "bytes": 322956
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
-          "bytes": 42837
+          "bytes": 43211
         },
         "src/runtime/harness/current-manifest-operation-semantics.ts": {
           "bytes": 6688
