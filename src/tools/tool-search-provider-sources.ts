@@ -1154,15 +1154,24 @@ async function materializeExactProviderBatch(input: {
       : isSchemaRecord(tool.outputParameters)
         ? tool.outputParameters
         : undefined;
-    if (
-      !operationVersion
-      || !Number.isFinite(observedAt)
-      || observedAt! < 0
-      || observedAt! > Date.now()
-      || !outputWasObserved
-      || outputSchema === undefined
-      || !discoveryStillActive(input)
-    ) continue;
+    const missing = !operationVersion
+      ? 'operation_version'
+      : !Number.isFinite(observedAt) || observedAt! < 0 || observedAt! > Date.now()
+        ? 'provider_observation'
+        : !outputWasObserved || outputSchema === undefined
+          ? 'output_schema'
+          : null;
+    if (missing) {
+      // SAY WHY AN EXACT MATERIALIZATION WAS DROPPED. This is the repair edge
+      // the host fires when a carried operation has no callable entry, so a
+      // silent `continue` here is the difference between "that provider row is
+      // incomplete" and "the capability does not exist". Live 2026-09-05: a
+      // write the user had asked for was dropped here twice, the model was
+      // told the capability was missing, and it re-searched eighteen times.
+      // eslint-disable-next-line no-console
+      console.error(`[exact-materialization] ${slug} dropped: provider row has no ${missing}`);
+    }
+    if (missing || !discoveryStillActive(input)) continue;
 
     // The same provider observation is deposited once; a response that settles
     // after timeout/abort is consumed by awaitBounded but can never reach here.
