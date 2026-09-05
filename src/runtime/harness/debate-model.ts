@@ -54,6 +54,7 @@ import {
 // boundary-judge.test (chooseBoundaryJudgeFamily), and any judgeCrossFamilyEnabled use.
 export { debateBrainsAvailable, judgeCrossFamilyEnabled, chooseBoundaryJudgeFamily };
 import { harnessRunContextStorage } from './brackets.js';
+import { listEvents } from './eventlog.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { redactSensitiveText, redactSensitiveValue } from '../security.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -1053,9 +1054,33 @@ function hasExplicitJudgeBinding(checker: ResolvedRoleModel): boolean {
  * not silently fall back when unavailable; callers retain their existing
  * unjudged/error handling. Unpinned defaults may use a tagged self-judge when
  * no independent lane is available. The cross-family opt-out is unchanged. */
+/** The brain family that is actually EXECUTING this session's turn. A rate-limit
+ * fallover (fallback-model.ts, `turn_model_routed` with routeKind
+ * `harness_fallover`) can move the brain to another family mid-run; the judge
+ * routing must see that, or a same-family judge reports itself as cross-family
+ * (live 2026-09-05: Codex quota exhausted, everything ran on Claude, the judge
+ * lane still said brainFamily codex / selfJudge false). The configured brain
+ * remains the answer when no fallover has been recorded for this session. */
+export function executedBrainFamily(configured: ModelProviderClass): ModelProviderClass {
+  const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+  if (!sessionId) return configured;
+  try {
+    const events = listEvents(sessionId, { types: ['turn_model_routed'] });
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const data = events[i]!.data as { provider?: unknown; fallover?: unknown; routeKind?: unknown };
+      if (data.fallover !== true && data.routeKind !== 'harness_fallover') continue;
+      if (typeof data.provider === 'string' && data.provider) return data.provider as ModelProviderClass;
+    }
+  } catch {
+    // an unreadable ledger never changes judge routing; fall back to the plan
+  }
+  return configured;
+}
+
 export function resolveBoundaryJudge(): BoundaryJudgeRouting {
-  const brain = resolveRoleModel('brain');
-  const brainFamily = brain.provider;
+  const configuredBrain = resolveRoleModel('brain');
+  const brainFamily = executedBrainFamily(configuredBrain.provider);
+  const brain = { ...configuredBrain, provider: brainFamily };
   if (!judgeCrossFamilyEnabled()) {
     return resolveSameFamilyBoundaryJudge(brain);
   }
@@ -1117,7 +1142,7 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
 
   const haveClaude = claudeAvailable();
   const haveCodex = codexAvailable();
-  const brainFamily = chain[0]?.brainFamily ?? resolveRoleModel('brain').provider;
+  const brainFamily = chain[0]?.brainFamily ?? executedBrainFamily(resolveRoleModel('brain').provider);
 
   // 2) The other connected flagship family's cheap judge (independent second family).
   const flagships: Array<{ provider: 'claude' | 'codex'; modelId: string; available: boolean }> = [

@@ -374,6 +374,10 @@ export const EVENT_TYPES = [
   // role registry) — records the attempted intent, whether it matched, and the
   // resolved model/provider, so a trace can show "ran on Opus because 'design'".
   'worker_model_routed',
+  // The route a worker child ACTUALLY executed on, appended after its run (a
+  // rate-limit fallover can move it off the planned model); worker_result
+  // attributes from this, never from the plan (live 2026-09-05).
+  'worker_model_executed',
   // A fan-out worker COMPLETED — durable record of {item, ok, model, toolUses,
   // tokens} (Move 5). The honest N-of-M coverage map was in-memory only, so a
   // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker

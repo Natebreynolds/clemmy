@@ -78,6 +78,25 @@ export async function runPacketWorkerWithHost(input: {
           context: { sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1 },
           ...(input.signal ? { signal: input.signal } : {}),
         } as never);
+      // Attribution is the EXECUTED route, never the plan: a rate-limit fallover
+      // (`turn_model_routed` routeKind harness_fallover in the CHILD session) can
+      // move this worker to another family. Live 2026-09-05: Codex quota at
+      // 100%, all sixteen worker turns ran on Claude, and every worker label
+      // still said codex. The parent's `worker_result` reads this event.
+      try {
+        const routed = listEvents(session.id, { types: ['turn_model_routed'] });
+        const last = routed.length ? routed[routed.length - 1]!.data as { model?: unknown; provider?: unknown; routeKind?: unknown; fallover?: unknown } : undefined;
+        const executedModel = typeof last?.model === 'string' && last.model ? last.model : input.modelId;
+        const executedProvider = typeof last?.provider === 'string' && last.provider
+          ? last.provider
+          : resolveEffectiveProviderForModel(executedModel);
+        appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_model_executed', data: {
+          ...lineage, executed: true, childSessionId: session.id,
+          plannedModel: input.modelId, plannedProvider: resolveEffectiveProviderForModel(input.modelId),
+          model: executedModel, effectiveModel: executedModel, provider: executedProvider,
+          fallover: last?.fallover === true || last?.routeKind === 'harness_fallover',
+        } });
+      } catch { /* attribution is best-effort telemetry, never a result */ }
       if (outcome.hasInterruptions || outcome.terminal?.status === 'blocked') {
         return `ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`;
       }

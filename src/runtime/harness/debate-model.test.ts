@@ -1369,3 +1369,21 @@ test('debate uses executor-first verify for tool-bearing turns and full debate f
     assert.equal(draftACalls, 1, 'tool-less turns still full-debate');
   });
 });
+
+test('executedBrainFamily follows a recorded fallover for the session, else the configured family', async () => {
+  // Live 2026-09-05: Codex quota at 100%, the brain fell over to Claude for
+  // the whole run, and the judge lane still reported brainFamily codex /
+  // selfJudge false — a self-judge presented as cross-family.
+  const { executedBrainFamily } = await import('./debate-model.js');
+  const eventlog = await import('./eventlog.js');
+  const brackets = await import('./brackets.js');
+  const session = eventlog.createSession({ id: `judge-executed-family-${Date.now()}`, kind: 'chat' });
+  const ctx = { sessionId: session.id, sourceUserSeq: 1, counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${session.id}::turn:1` };
+  assert.equal(await brackets.withHarnessRunContext(ctx, async () => executedBrainFamily('codex')), 'codex', 'no fallover recorded → configured family');
+  eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'turn_model_routed', data: {
+    model: 'claude-sonnet-5', provider: 'claude', transport: 'host_harness', routeKind: 'harness_fallover', fallover: true,
+    reason: 'preselected-rate-limited', fromModel: 'gpt-5.6-terra', fromProvider: 'codex',
+  } });
+  assert.equal(await brackets.withHarnessRunContext(ctx, async () => executedBrainFamily('codex')), 'claude', 'a recorded fallover names the executing family');
+  assert.equal(executedBrainFamily('codex'), 'codex', 'outside a run context there is no session to read');
+});

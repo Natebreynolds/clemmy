@@ -440,6 +440,24 @@ interface ChatWorkerModelRoute {
   };
 }
 
+/** The executed model/provider recorded by the child run for this item (a
+ * post-run `worker_model_routed` with `executed:true`), so `worker_result`
+ * attributes the route that actually ran, not the packet's plan. */
+function executedWorkerRoute(sessionId: string, item: string): { executedModel?: string; executedProvider?: string; model?: string; provider?: string } {
+  try {
+    const events = listEvents(sessionId, { types: ['worker_model_executed'] });
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const data = events[i]!.data as { executed?: unknown; item?: unknown; model?: unknown; provider?: unknown };
+      if (data.executed !== true || data.item !== item) continue;
+      const out: { executedModel?: string; executedProvider?: string; model?: string; provider?: string } = {};
+      if (typeof data.model === 'string') { out.executedModel = data.model; out.model = data.model; }
+      if (typeof data.provider === 'string') { out.executedProvider = data.provider; out.provider = data.provider; }
+      return out;
+    }
+  } catch { /* best-effort attribution */ }
+  return {};
+}
+
 function resolveChatWorkerModel(input: Pick<WorkerToolInput, 'intent' | 'item' | 'model'>): ChatWorkerModelRoute {
   // ONE LOOP, MANY BRAINS: an exact per-packet model wins — Clem spreads a
   // fleet across models per item ("these five on codex, those on grok").
@@ -2775,7 +2793,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
-          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
+          resultEvent = appendEvent({ sessionId, turn, role: 'system', type: 'worker_result', data: { ...eventData, ...executedWorkerRoute(sessionId, input.item), packetKey, toolCallId, parentLogicalCallId, sourceUserSeq, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}) } });
         } catch { /* durable trace is best-effort */ }
         if (manifestBinding && checkpointManifest) {
           batchLease?.assertCurrent();
