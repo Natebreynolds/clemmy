@@ -930,10 +930,17 @@ export function planningConnectionForOperation(
 
 /**
  * Deposit identity/schema facts for only the provider candidates the visible
- * tool_search result actually returned. Writes remain staging-only until
- * plan_task. Exact proven reads also materialize a current callable entry so
- * an ordinary foreground read does not need to manufacture a graph merely to
- * look at its source; every crossing still reopens the same live definition.
+ * tool_search result actually returned, and materialize a current callable
+ * entry for each one the turn proved — reads and writes alike.
+ *
+ * Writes were staging-only here until 2026-09-05, so an operation the user had
+ * asked for by name, whose exact definition the host already held, refused at
+ * the pre-dispatch wall with `catalog_entry_or_manifest_missing:candidates=0`
+ * and the model was told the capability was absent. Owner's call the same day:
+ * a proven write provisions itself like a proven read. Nothing about consent
+ * moves — the effect gate still runs at the write boundary, every crossing
+ * still reopens the same live definition against the current manifest,
+ * account, schema and port, and an irreversible send still asks.
  */
 export async function stageDisclosedPlanningProviderCandidates(input: {
   sessionId: string;
@@ -1044,16 +1051,16 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
       entries: [...entries.values()],
     });
   }
-  const provenReads = composioCandidates.filter((candidate) => {
+  const provenOperations = composioCandidates.filter((candidate) => {
     const proof = entries.get(`composio:${candidate.name.trim().toLowerCase()}`);
-    return proof?.effectClass === 'read';
+    return proof?.effectClass === 'read' || proof?.effectClass === 'write';
   });
-  if (provenReads.length > 0 && discoveryStillActive(guard)) {
+  if (provenOperations.length > 0 && discoveryStillActive(guard)) {
     await registerProofProvisionedCapabilities(
       { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
       {
-        allowedIdentifiers: provenReads.map((candidate) => candidate.name.trim()),
-        expectedSchemaDigests: provenReads.map((candidate) => ({
+        allowedIdentifiers: provenOperations.map((candidate) => candidate.name.trim()),
+        expectedSchemaDigests: provenOperations.map((candidate) => ({
           identifier: candidate.name.trim(),
           schemaDigest: digestSchema(candidate.schema as Record<string, unknown>),
         })),
