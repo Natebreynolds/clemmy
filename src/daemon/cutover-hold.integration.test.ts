@@ -110,6 +110,27 @@ function childProcessesOf(pid: number): Array<{ pid: number; command: string }> 
   });
 }
 
+
+/** A detached daemon can still flush a log line between its exit and this
+ * cleanup, and `rm -r` on a directory that grows mid-walk throws ENOTEMPTY.
+ * Live 2026-09-05: the full suite went red on exactly that while the file
+ * passed 3/3 alone. Retry briefly instead of failing a green test on its own
+ * teardown; every assertion has already run by then. */
+function removeHomeTree(home: string): void {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      rmSync(home, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== 'ENOTEMPTY' && code !== 'EBUSY') throw error;
+      const until = Date.now() + 25;
+      while (Date.now() < until) { /* brief settle before the next walk */ }
+    }
+  }
+  rmSync(home, { recursive: true, force: true });
+}
+
 test('cutover configuration refuses read-only, legacy, missing, and unknown engine selectors', () => {
   for (const selector of ['host_v1_read_only', 'legacy_sdk', '', 'future_engine']) {
     const probe = spawnSync(
@@ -161,7 +182,7 @@ test('held entry rejects missing or weak auth before lease or migration mutation
       assert.match(`${probe.stdout}${probe.stderr}`, /requires a strong WEBHOOK_SECRET/);
       assert.deepEqual(listFilesRecursively(home), [], 'auth refusal happens before lease or schema writes');
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      removeHomeTree(home);
     }
   }
 });
@@ -190,7 +211,7 @@ test('migration helper refuses a direct invocation without the live parent lease
     assert.match(`${probe.stdout}${probe.stderr}`, /requires the live parent that owns the singleton daemon lease/);
     assert.deepEqual(listFilesRecursively(home), [], 'lease refusal happens before schema writes');
   } finally {
-    rmSync(home, { recursive: true, force: true });
+    removeHomeTree(home);
   }
 });
 
@@ -394,7 +415,7 @@ test('cutover daemon holds durable work inert and exposes only authenticated bui
   } finally {
     await stopChild(child);
     await new Promise<void>((resolve) => trap.close(() => resolve()));
-    rmSync(home, { recursive: true, force: true });
+    removeHomeTree(home);
   }
 });
 
@@ -482,6 +503,6 @@ test('held start detaches the exact foreground entry, owns its port and lease, a
         await waitForProcessExit(heldPid, 2_000);
       }
     }
-    rmSync(home, { recursive: true, force: true });
+    removeHomeTree(home);
   }
 });

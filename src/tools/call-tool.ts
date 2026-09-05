@@ -286,7 +286,7 @@ const DESCRIPTION = [
 
 const CONTROL_ONLY_DESCRIPTION = [
   'Invoke one deferred built-in control, recovery, or READ tool returned by tool_search: exact `name` plus `args_json` (a JSON object string).',
-  'Business/provider WRITES and external MCP tools belong inside `work_call`; local reads are direct here. The target keeps its own schema, approval class, admission, and settlement.',
+  'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are direct here, and the target keeps its own schema, approval class, admission, and settlement.',
   'Invalid arguments dispatch nothing — retry once with the exact schema from tool_search.',
 ].join(' ');
 
