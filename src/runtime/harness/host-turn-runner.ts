@@ -5780,7 +5780,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             resumedAcceptedFrame.ref,
           );
         }
-        if (pending.rawItem.arguments !== admitted.arguments) {
+        // The pause loop persisted this pending call with its strict-nullable
+        // MATERIALIZED bytes (and minted the logical argument digest from them);
+        // the checkpointed model history keeps the RAW bytes the model emitted.
+        // Compare both under the same materialization: an omitted nullable field
+        // is not an approval edit. Unmaterializable bytes fall back to the raw
+        // compare. (Red since the 08-31 wave added nullable fields to work_call:
+        // every unchanged approval resumed as an "edit" and never dispatched.)
+        const resumedTool = toolByName.get(pending.name);
+        let pendingArgumentsJson = pending.rawItem.arguments;
+        let admittedArgumentsJson = String(admitted.arguments);
+        try {
+          pendingArgumentsJson = materializedArgumentsJson(resumedTool, pendingArgumentsJson);
+          admittedArgumentsJson = materializedArgumentsJson(resumedTool, admittedArgumentsJson);
+        } catch {
+          // keep the raw bytes
+        }
+        if (pendingArgumentsJson !== admittedArgumentsJson) {
           // An approval edit is input for a NEW model frame, not authority to
           // execute different bytes under the old accepted batch.  Pair the
           // old frame as no-effect below and let the model reissue the edit.
@@ -5790,7 +5806,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             `Issue one fresh ${pending.name} call with these exact approved argument bytes: ${pending.rawItem.arguments}`,
             'Do not reuse the prior call id.',
           ].join(' ');
-          pending.rawItem.arguments = String(admitted.arguments);
+          pending.rawItem.arguments = admittedArgumentsJson;
         }
       }
     }

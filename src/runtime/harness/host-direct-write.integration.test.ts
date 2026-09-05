@@ -112,7 +112,11 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   const carrier = brackets.wrapToolForHarness(carrierName === 'work_call'
     ? buildWorkCall({ requireHostPlan: true, hostPlanningReady: () => true }) as never
     : { type: 'function', name: 'call_tool', description: 'Invoke one exact current tool.',
-        parameters: { type: 'object', properties: { name: { type: 'string' }, args_json: { type: 'string' } }, required: ['name', 'args_json'] },
+        // `note` is a required strict-nullable field the fixture model never emits:
+        // the pause persists materialized bytes (note: null) while the checkpoint
+        // history keeps the raw bytes, so every resume case in this file also pins
+        // that an omitted nullable field is not an approval edit.
+        parameters: { type: 'object', properties: { name: { type: 'string' }, args_json: { type: 'string' }, note: { type: ['string', 'null'] } }, required: ['name', 'args_json', 'note'] },
         invoke: async () => { carrierBodies += 1; throw new Error('must use the already resolved exact port'); } } as never);
   const outerArgs = carrierName === 'work_call'
     ? { requirement_id: 'create_draft', universe_item_id: null, universe_selector: null, seal_amendment: null,
