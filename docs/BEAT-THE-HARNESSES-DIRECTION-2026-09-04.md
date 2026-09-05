@@ -2263,3 +2263,35 @@ competitive gate until the cold surface is genuinely bounded, so it moves to the
 compacting the `run_worker` description/schema (a 9 KB tool description is prompt
 prose masquerading as schema) is the single biggest cut available. Applying the
 three patches to this checkout now; the files re-run here before they are committed.
+
+**2026-09-05 00:42 — BISECTED the "approved exact outbound never dispatches on resume" group
+(four journeys, one file, isolated worktrees, one file per SHA):** 56/56 green at the
+v3.16.0 cut `d3bc85ca` (08-30 13:39) and at `81b7e2f7` (08-30 22:07); red from the
+six-commit batch landed together at 08-31 21:51 (the host_v1 wave: `f593aeab`,
+`4b20b158`, `a5709bed`, `36c5b311`, `d3a35922`, `08c81c8a`) and every SHA since
+(`2b7bbbac`, `548741b5`, `38fa83ad`: 52/56 → 51/56). `git bisect run` names
+**`36c5b311` "feat(workspace): reviewed space_set_data carrier/executor
+(workspace_dataset_v1), host-local write commit + derivation"** as first bad, with
+`a5709bed` untestable (the file did not run there) and `d3a35922` (authored workflow
+write authority, async-read receipts) also red — so the culprit is inside that
+batch, most likely `36c5b311` or `d3a35922`. This has been red for five days and was
+counted as "wave debt"; it is P3's acceptance line. Root-cause workflow (diff +
+runtime investigators, adversarial refutation) launched; the fix follows the
+`f616da92` repair-path patch in the same region. Also: the journey contract commit
+`4e819434` landed (three journeys re-pinned to the current contracts).
+
+**2026-09-05 00:45 — `f616da92` REPAIR-PATH REGRESSION FIXED: `39d00400`.** Mechanism (two
+independent investigators, four adversarial verifiers, all reproduced it):
+`evaluateExactHostMutationConsent` admits the logical-call row from the
+MATERIALIZED arguments (omitted strict-nullable fields → `null`) before the
+reducer decides; on a `repair` decision the refusal path settled the call with the
+RAW model bytes → digest mismatch → `settlePendingCallBeforeDispatch` false →
+`prepared_frame_release_failed`. f616da92's own pin never tripped because its
+fixture schema had no nullable field (raw == materialized). Any Composio/draft
+operation with nullable fields the model omits hits the same split — the likely
+draft-canary link. Fix: one hunk, settle with the same materialized bytes; new pin
+drives an uncovered write with an omitted nullable field through the real door
+(zero bodies, paired repair, row settled under the admitted digest). Verified on
+this checkout: pins 252/252 ✅ · `provider-neutral-no-random-gate` **52/56** (the
+six repair subtests + parent green; the four left are the bisected 08-31
+approved-outbound group) · typecheck ✅.
