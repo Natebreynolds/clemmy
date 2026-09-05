@@ -4,7 +4,7 @@
  * with deterministic validation — required fields verified, never invented.
  * The model call is injected; these tests pin the CONTRACT around it.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -12,7 +12,7 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'clemmy-extract-'));
 process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
-import { test, afterEach } from 'node:test';
+import { test, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { registerExtractStructuredTools, focusSource } = await import('./extract-structured-tools.js');
@@ -24,7 +24,7 @@ test.after(() => rmSync(TMP, { recursive: true, force: true }));
 afterEach(() => resetToolSchemaCache());
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
-function capture(extractor: (schemaJson: string, fields: string, source: string, priorFailure?: string) => Promise<string>): ToolHandler {
+function capture(extractor?: (schemaJson: string, fields: string, source: string, priorFailure?: string) => Promise<string>): ToolHandler {
   let handler: ToolHandler | undefined;
   const fake = { tool: (_n: string, _d: string, _s: unknown, h: ToolHandler) => { handler = h; } };
   (registerExtractStructuredTools as (s: unknown, e?: unknown) => void)(fake, extractor);
@@ -40,6 +40,35 @@ const CONTACT_SCHEMA = JSON.stringify({
     email: { type: 'string', description: 'Email address' },
     company: { type: 'string' },
   },
+});
+
+test('an unavailable judge pin does not prevent ordinary structured extraction on the fast lane', async () => {
+  const { Runner } = await import('@openai/agents');
+  const { MODELS } = await import('../config.js');
+  const keys = ['AUTH_MODE', 'OPENAI_MODEL_PRIMARY', 'CLEMMY_JUDGE_CROSS_FAMILY', 'CLEMMY_MODEL_ROLES', 'CLEMMY_DEBATE_JUDGE', 'MODEL_ROUTING_MODE'];
+  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  Object.assign(process.env, {
+    AUTH_MODE: 'codex_oauth', OPENAI_MODEL_PRIMARY: 'gpt-5.6-terra', CLEMMY_JUDGE_CROSS_FAMILY: 'on',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'judge', modelId: 'claude-sonnet-5', scope: 'durable', source: 'settings' }]),
+    CLEMMY_DEBATE_JUDGE: '', MODEL_ROUTING_MODE: 'off',
+  });
+  writeFileSync(path.join(TMP, 'state', 'auth.json'), JSON.stringify({ codexOauth: { accessToken: 'fixture-access', refreshToken: 'fixture-refresh' } }));
+  writeFileSync(path.join(TMP, 'state', 'claude-auth.json'), JSON.stringify({ accessToken: 'sk-ant-api03-not-subscription', expiresAt: Date.now() + 3_600_000 }));
+  const run = mock.method(Runner.prototype, 'run', async (agent: { model?: unknown }) => {
+    assert.equal(agent.model, MODELS.fast, 'extraction is not a completion verdict');
+    return { finalOutput: '{"name":"Amy Chen","email":"amy@firm.example"}' } as never;
+  });
+  try {
+    const response = await capture()({ schema: CONTACT_SCHEMA, text: 'Amy Chen — amy@firm.example' });
+    assert.doesNotMatch(textOf(response), /^ERROR:/);
+    assert.equal(JSON.parse(textOf(response)).validated, true);
+    assert.equal(run.mock.callCount(), 1);
+  } finally {
+    run.mock.restore();
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+    }
+  }
 });
 
 test('a clean extraction validates and returns the payload', async () => {

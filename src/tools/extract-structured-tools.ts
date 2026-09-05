@@ -21,6 +21,7 @@ import path from 'node:path';
 import { Agent, Runner } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { MODELS } from '../config.js';
 import { resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
@@ -71,7 +72,12 @@ export function focusSource(text: string, schema: SchemaShape): string {
 }
 
 async function callExtractor(schemaJson: string, fieldSummary: string, source: string, priorFailure?: string): Promise<string> {
-  const routing = resolveBoundaryJudge();
+  // Extraction is not a verdict: an unavailable judge pin must not strand it.
+  let model: ConstructorParameters<typeof Agent>[0]['model'] = MODELS.fast;
+  try {
+    const routing = resolveBoundaryJudge();
+    model = routing.model ?? routing.modelId;
+  } catch { /* Keep the historical fast extraction lane. */ }
   const agent = new Agent({
     name: 'StructuredExtractor',
     instructions: [
@@ -80,7 +86,7 @@ async function callExtractor(schemaJson: string, fieldSummary: string, source: s
       'NEVER invent a value: a field the source does not state is omitted (or null). Copy identifiers (emails, ids, amounts, dates) EXACTLY as written.',
       'Dates convert to ISO (YYYY-MM-DD) only when the source is unambiguous; otherwise keep the source text.',
     ].join(' '),
-    model: routing.model ?? routing.modelId,
+    model,
     modelSettings: { reasoning: { effort: 'low' } },
     tools: [],
   });
