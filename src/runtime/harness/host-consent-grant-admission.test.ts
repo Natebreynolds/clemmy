@@ -57,6 +57,46 @@ function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+function canonicalGraphValue(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalGraphValue(entry ?? null)).join(',')}]`;
+  if (!value || typeof value !== 'object') return 'null';
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalGraphValue(record[key])}`)
+    .join(',')}}`;
+}
+
+function persistGraphWithoutConsentProjection(
+  graph: import('../graph/turn-graph-ir.js').TurnGraphIR,
+): void {
+  const operation = graph.nodes.find((node) => node.operationId === 'send-email-once');
+  assert.ok(operation);
+  if (!operation) return;
+  operation.capabilities = [];
+  if (graph.classification.goalConstraints) {
+    delete graph.classification.goalConstraints.destination;
+    delete graph.classification.goalConstraints.destinations;
+  }
+  const { graphHash: _graphHash, ...compiler } = graph.compiler;
+  graph.compiler.graphHash = sha256(canonicalGraphValue({ ...graph, compiler }));
+  const graphEvent = eventlog.getTurnGraphEventForSource(
+    graph.identity.sessionId,
+    graph.identity.sourceUserSeq,
+  );
+  assert.ok(graphEvent);
+  if (!graphEvent) return;
+  const data = structuredClone(graphEvent.data);
+  data.graph = graph;
+  data.graphHash = graph.compiler.graphHash;
+  eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+    .run(JSON.stringify(data), graphEvent.id);
+}
+
 test('once-null transport repair reaches real host consent, grants only A, rejects sibling B, and redeems once', async () => {
   const operationId = 'EXAMPLE_SEND_EMAIL';
   const accountId = 'account:consent:email-owner';
@@ -262,10 +302,12 @@ test('once-null transport repair reaches real host consent, grants only A, rejec
   });
   assert.equal(compiled.ok, true, compiled.ok ? '' : compiled.reason);
   if (!compiled.ok) return;
+  const graph = structuredClone(compiled.compiled.graph);
+  persistGraphWithoutConsentProjection(graph);
   const frozen = expectedContracts.freezeActionExpectedWorkContract({
     sessionId: session.id,
     sourceUserSeq: source.seq,
-    graph: compiled.compiled.graph,
+    graph,
     proposal: {
       version: 1,
       operations: [{
@@ -399,11 +441,29 @@ test('once-null transport repair reaches real host consent, grants only A, rejec
   assert.ok(captured);
   if (!captured) return;
 
+  // Once the opaque preparation has reopened and retained the immutable work,
+  // call, and capability ledgers, the amendable graph projection is no longer
+  // a consent entrance. Simulate a stale projector after preparation without
+  // touching any of those ledgers.
+  const projected = eventlog.getTurnGraphEventForSource(session.id, source.seq);
+  assert.ok(projected);
+  if (!projected) return;
+  const staleProjection = structuredClone(projected.data);
+  (staleProjection.graph as import('../graph/turn-graph-ir.js').TurnGraphIR)
+    .compiler.graphHash = '0'.repeat(64);
+  eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+    .run(JSON.stringify(staleProjection), projected.id);
+
   const ungranted = await consent.evaluatePreparedHostWorkCallConsent({
     preparation: prepared.preparation,
   });
   assert.equal(ungranted.status, 'decided', JSON.stringify(ungranted));
   assert.equal(ungranted.status === 'decided' ? ungranted.decision.kind : null, 'needs_user');
+  assert.equal(
+    ungranted.status === 'decided' ? ungranted.call.destination.posture : null,
+    'named_existing',
+    'the exact bound manifest supplies destination risk when graph projection is absent',
+  );
   if (
     ungranted.status !== 'decided'
     || ungranted.decision.kind !== 'needs_user'

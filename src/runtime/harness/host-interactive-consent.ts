@@ -1,10 +1,11 @@
 /**
  * Production-host adapter for the single provider-neutral consent reducer.
  *
- * This module owns I/O projection only: reopen the exact accepted graph,
+ * This module owns I/O projection only: reopen the immutable work contract,
  * work binding, local capability definition, logical/crossing state and v57
- * host capability binding, then call `evaluateInteractiveConsentV1`. Tool and
- * provider names never enter the reducer as policy branches.
+ * host capability binding, then call `evaluateInteractiveConsentV1`. The graph
+ * is an amendable projection, not a later consent authority. Tool and provider
+ * names never enter the reducer as policy branches.
  */
 import { createHash } from 'node:crypto';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
@@ -23,7 +24,6 @@ import {
 } from './interactive-consent-policy.js';
 import type { HostCallAttestation } from './accepted-turn-call-authority.js';
 import { openEventLog } from './eventlog.js';
-import { expectedTaskFor } from './resolution-ledger.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
   localPlanningArgumentsMatch,
@@ -45,6 +45,16 @@ import {
   get as getApproval,
 } from './approval-registry.js';
 import { approvalAuthorityMatchesToolCall } from './approval-authority.js';
+import {
+  peekCapabilityManifestStore,
+  resolveCapabilityManifestStore,
+} from './capability-manifest-store.js';
+import {
+  capabilityManifestDigest,
+  currentCapabilityManifest,
+} from './capability-manifest.js';
+import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
+import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 
 export interface HostInteractiveConsentSubjectV1 {
   version: 1;
@@ -110,6 +120,8 @@ export type HostInteractiveConsentResult =
       consentSubject?: HostInteractiveConsentSubjectV1;
       nestedAdmission?: object;
     }
+  | { status: 'repair'; reason: string; retryable: true }
+  | { status: 'hold'; reason: string; retryable: true }
   | { status: 'conflict'; reason: string };
 
 /**
@@ -436,8 +448,8 @@ function sourceFromHostBinding(binding: PreparedHostWorkCallV1['hostCapabilityBi
 }
 
 function localDestinationFor(input: {
-  graphHash: string;
-  nodeId: string;
+  requirementId: string;
+  binding: PreparedHostWorkCallV1['hostCapabilityBinding'];
   definition: AuthorizedLocalPlanningDefinitionV1;
 }): InteractiveConsentDestination {
   const posture = input.definition.descriptor.destinationPosture;
@@ -445,8 +457,9 @@ function localDestinationFor(input: {
     posture: posture ?? 'not_applicable',
     digest: digest({
       version: 1,
-      graphHash: input.graphHash,
-      nodeId: input.nodeId,
+      requirementId: input.requirementId,
+      hostCapabilityBinding: input.binding.durableBindingDigest,
+      effectiveArgumentDigest: input.binding.effectiveArgumentDigest,
       capabilityRef: input.definition.capabilityRef,
       posture,
       deliverableKind: input.definition.descriptor.deliverableKind,
@@ -455,57 +468,45 @@ function localDestinationFor(input: {
   };
 }
 
-function nodeOwnsExplicitCapability(
-  node: { capabilities: Array<{ kind: string; resolution: string; names?: string[] }> },
-  capabilityId: string,
-): boolean {
-  return node.capabilities.some((entry) => (
-    entry.kind === 'tool'
-    && entry.resolution === 'explicit'
-    && (entry.names ?? []).length === 1
-    && entry.names?.[0] === capabilityId
-  ));
-}
-
 function externalDestinationFor(input: {
-  graph: ReturnType<typeof expectedTaskFor> & { status: 'ok' };
-  nodeId: string;
+  requirementId: string;
   binding: PreparedHostWorkCallV1['hostCapabilityBinding'];
 }): InteractiveConsentDestination | null {
-  const goals = input.graph.graph.classification.goalConstraints;
-  const destinations = goals?.destinations?.length
-    ? goals.destinations
-    : goals?.destination ? [goals.destination] : [];
-  // Every catalog mutation must be covered by one exact destination frozen in
-  // the accepted graph. Absence is unknown coverage, never "not applicable".
-  if (destinations.length === 0) return null;
-  const exact = destinations.filter((destination) => {
-    const binding = destination.binding;
-    return Boolean(
-      binding
-      && binding.manifestId === input.binding.manifestId
-      && binding.manifestDigest === input.binding.manifestDigest
-      && binding.accountId === input.binding.accountId
-      && binding.operationId === input.binding.operationId
-      && binding.definitionFingerprint === input.binding.schemaFingerprint
-      && binding.effect === input.binding.effect
-      && binding.posture === destination.posture,
-    );
-  });
-  if (exact.length !== 1) return null;
-  const destination = exact[0]!;
+  if (input.binding.bindingKind !== 'catalog_manifest') return null;
+  const store = peekCapabilityManifestStore() ?? resolveCapabilityManifestStore();
+  const installed = store.get(input.binding.manifestId);
+  const manifest = currentCapabilityManifest(installed?.manifest);
+  if (
+    !installed
+    || !manifest
+    || installed.digest !== input.binding.manifestDigest
+    || capabilityManifestDigest(manifest) !== input.binding.manifestDigest
+    || manifest.manifestId !== input.binding.manifestId
+    || manifest.operationId !== input.binding.operationId
+    || manifest.definitionFingerprint !== input.binding.schemaFingerprint
+    || manifest.accountId !== input.binding.accountId
+    || manifest.effect !== input.binding.effect
+    || manifest.invokePortId !== input.binding.invokePortId
+    || (manifest.externalDefinition?.providerInputSchemaDigest ?? null)
+      !== (input.binding.providerInputSchemaDigest ?? null)
+  ) return null;
+  const posture = manifest.destination?.posture ?? 'not_applicable';
+  if (posture !== 'create_new' && posture !== 'named_existing' && posture !== 'not_applicable') {
+    return null;
+  }
   return {
-    posture: destination.posture,
+    posture,
     digest: digest({
       version: 1,
-      graphHash: input.graph.graph.compiler.graphHash,
-      nodeId: input.nodeId,
+      requirementId: input.requirementId,
+      hostCapabilityBinding: input.binding.durableBindingDigest,
+      effectiveArgumentDigest: input.binding.effectiveArgumentDigest,
       capabilityId: input.binding.capabilityId,
       manifestDigest: input.binding.manifestDigest,
       accountId: input.binding.accountId,
       operationId: input.binding.operationId,
       schemaFingerprint: input.binding.schemaFingerprint,
-      posture: destination.posture,
+      destination: manifest.destination ?? null,
     }),
   };
 }
@@ -642,38 +643,39 @@ function localRisk(definition: AuthorizedLocalPlanningDefinitionV1): {
 }
 
 async function exactLocalDefinitionForPrepared(input: {
-  prepared: PreparedHostWorkCallV1;
-  graph: ReturnType<typeof expectedTaskFor> & { status: 'ok' };
-}): Promise<{
-  definition: AuthorizedLocalPlanningDefinitionV1;
-  nodeId: string;
-} | null> {
-  const nodes = input.graph.graph.nodes.filter((node) => (
-    node.operationId === input.prepared.binding.requirementId
-  ));
-  const candidates: Array<{ definition: AuthorizedLocalPlanningDefinitionV1; nodeId: string }> = [];
-  for (const node of nodes) {
-    const refs = node.capabilities
-      .filter((entry) => entry.kind === 'tool' && entry.resolution === 'explicit')
-      .flatMap((entry) => entry.names ?? []);
-    for (const capabilityRef of refs) {
-      const loaded = await loadDurableAuthorizedLocalPlanningDefinition({
-        sessionId: input.prepared.sessionId,
-        sourceUserSeq: input.prepared.sourceUserSeq,
-        capabilityRef,
-      });
-      if (
-        loaded.ok
-        && loaded.definition.name === input.prepared.targetName
-        && loaded.definition.carrier === 'work_call'
-      ) candidates.push({ definition: loaded.definition, nodeId: node.id });
-    }
+  prepared: PreparedConsentTarget;
+}): Promise<AuthorizedLocalPlanningDefinitionV1 | null> {
+  const binding = input.prepared.hostCapabilityBinding;
+  if (binding.bindingKind !== 'local_envelope') return null;
+  const observed = await observeCurrentLocalPlanningDefinitions({
+    name: input.prepared.targetName,
+    carrier: 'work_call',
+  });
+  if (!observed.ok) return null;
+  const definitions = binding.capabilityId.startsWith('cap:local:')
+    ? observed.definitions.filter((definition) => definition.capabilityRef === binding.capabilityId)
+    : observed.definitions;
+  const candidates: AuthorizedLocalPlanningDefinitionV1[] = [];
+  for (const current of definitions) {
+    const loaded = await loadDurableAuthorizedLocalPlanningDefinition({
+      sessionId: input.prepared.sessionId,
+      sourceUserSeq: input.prepared.sourceUserSeq,
+      capabilityRef: current.capabilityRef,
+    });
+    if (
+      loaded.ok
+      && loaded.definition.capabilityRef === current.capabilityRef
+      && loaded.definition.name === input.prepared.targetName
+      && loaded.definition.carrier === 'work_call'
+      && loaded.definition.schemaFingerprint === current.schemaFingerprint
+      && loaded.definition.envelopeFingerprint === current.envelopeFingerprint
+      && localPlanningArgumentsMatch(loaded.definition, input.prepared.targetArgs)
+    ) candidates.push(loaded.definition);
   }
   return candidates.length === 1 ? candidates[0]! : null;
 }
 
 interface PreparedConsentSemanticBasis {
-  nodeId: string;
   operationId: string;
   schemaFingerprint: string;
   effect: CapabilityRiskAttestationV1['effect'];
@@ -684,6 +686,24 @@ interface PreparedConsentSemanticBasis {
   safety: CapabilityRiskAttestationV1['safety'];
   requirementCapabilityIdentity: string;
 }
+
+type PreparedConsentTarget = Pick<
+  PreparedHostWorkCallV1,
+  | 'sessionId'
+  | 'sourceUserSeq'
+  | 'acceptedTaskId'
+  | 'logicalToolCallId'
+  | 'targetName'
+  | 'targetArgs'
+  | 'targetInputSchema'
+  | 'evidenceArgs'
+  | 'evidenceInputSchema'
+  | 'hostCapabilityBinding'
+>;
+
+type PreparedConsentSemanticBasisResolution =
+  | { status: 'ready'; semantic: PreparedConsentSemanticBasis }
+  | { status: 'repair' | 'hold'; reason: string };
 
 // Keep canonical-byte equality on the same closed domain as
 // canonicalExternalInputSchemaDigestV1; otherwise a large schema could match
@@ -752,7 +772,7 @@ export function selectExactPreparedExternalCall(input: {
 }
 
 function exactPreparedExternalCall(
-  prepared: PreparedHostWorkCallV1,
+  prepared: PreparedConsentTarget,
 ): ExactPreparedExternalCallV1 | null {
   const candidates: Array<{
     inputSchema: unknown;
@@ -779,72 +799,84 @@ function exactPreparedExternalCall(
   });
 }
 
-async function semanticBasisForPrepared(input: {
-  prepared: PreparedHostWorkCallV1;
-  graph: ReturnType<typeof expectedTaskFor> & { status: 'ok' };
-}): Promise<PreparedConsentSemanticBasis | null> {
+async function semanticBasisForExactCall(input: {
+  prepared: PreparedConsentTarget;
+  requirementId: string;
+  effect: CapabilityRiskAttestationV1['effect'];
+}): Promise<PreparedConsentSemanticBasisResolution> {
   const binding = input.prepared.hostCapabilityBinding;
   if (binding.bindingKind === 'local_envelope') {
     const local = await exactLocalDefinitionForPrepared(input);
-    const effect = local?.definition.descriptor.effect;
-    if (
-      !local
-      || !localPlanningArgumentsMatch(local.definition, input.prepared.targetArgs)
-      || effect !== input.prepared.binding.effect
-      || (effect !== 'read' && effect !== 'local_write')
-    ) return null;
-    return {
-      nodeId: local.nodeId,
-      operationId: local.definition.capabilityRef,
-      schemaFingerprint: local.definition.schemaFingerprint,
+    if (!local) {
+      return { status: 'hold', reason: 'bound_local_definition_unavailable' };
+    }
+    if (!localPlanningArgumentsMatch(local, input.prepared.targetArgs)) {
+      return { status: 'repair', reason: 'bound_local_arguments_do_not_match_definition' };
+    }
+    const effect = local.descriptor.effect;
+    if (effect !== input.effect) {
+      return { status: 'repair', reason: 'bound_local_effect_does_not_match_work' };
+    }
+    if (effect !== 'read' && effect !== 'local_write') {
+      return { status: 'repair', reason: 'bound_local_effect_is_not_consent_projectable' };
+    }
+    return { status: 'ready', semantic: {
+      operationId: local.capabilityRef,
+      schemaFingerprint: local.schemaFingerprint,
       effect,
-      accountId: local.definition.accountIdentity,
+      accountId: local.accountIdentity,
       destination: localDestinationFor({
-        graphHash: input.graph.graph.compiler.graphHash,
-        nodeId: local.nodeId,
-        definition: local.definition,
+        requirementId: input.requirementId,
+        binding,
+        definition: local,
       }),
-      risk: localRisk(local.definition),
+      risk: localRisk(local),
       semanticBasis: {
         kind: 'local_registry',
-        digest: local.definition.envelopeFingerprint,
+        digest: local.envelopeFingerprint,
       },
       safety: 'admissible',
-      requirementCapabilityIdentity: local.definition.capabilityRef,
-    };
+      requirementCapabilityIdentity: local.capabilityRef,
+    } };
   }
-  if (
-    binding.bindingKind !== 'catalog_manifest'
-    || binding.effect !== input.prepared.binding.effect
-    || (binding.effect !== 'external_write' && binding.effect !== 'admin')
-  ) return null;
+  if (binding.bindingKind !== 'catalog_manifest') {
+    return { status: 'repair', reason: 'bound_capability_kind_is_not_consent_projectable' };
+  }
+  if (binding.effect !== input.effect) {
+    return { status: 'repair', reason: 'bound_catalog_effect_does_not_match_work' };
+  }
+  if (binding.effect !== 'external_write' && binding.effect !== 'admin') {
+    return { status: 'repair', reason: 'bound_catalog_effect_is_not_a_mutation' };
+  }
   const externalCall = exactPreparedExternalCall(input.prepared);
-  if (!externalCall) return null;
+  if (!externalCall) {
+    return { status: 'repair', reason: 'bound_catalog_call_does_not_match_exact_schema_and_arguments' };
+  }
   const callSignals = deriveExternalCapabilityCallSignalsV1({
     version: 1,
     inputSchema: externalCall.inputSchema,
     arguments: externalCall.arguments,
   });
-  // Argument-dependent delivery is part of the exact risk subject. A schema
-  // that exposes such behavior but cannot close it repairs to the model; null
-  // is used only when the projector proved no affirmative signal.
-  if (callSignals.status !== 'projected') return null;
-  const nodes = input.graph.graph.nodes.filter((node) => (
-    node.operationId === input.prepared.binding.requirementId
-    && nodeOwnsExplicitCapability(node, binding.capabilityId)
-  ));
-  if (nodes.length !== 1) return null;
-  const node = nodes[0]!;
+  // Argument-dependent delivery is part of the exact risk subject. Keep an
+  // unresolved signal named and retryable; it is never permission evidence.
+  if (callSignals.status !== 'projected') {
+    return { status: 'repair', reason: `bound_catalog_call_signal_${callSignals.reason}` };
+  }
+  // The logical/work/catalog ledgers already bind the exact operation and
+  // arguments. Graph nodes are amendable bookkeeping, so consent must not
+  // demand a one-node join or explicit-capability spelling before reaching
+  // the reducer.
   const destination = externalDestinationFor({
-    graph: input.graph,
-    nodeId: node.id,
+    requirementId: input.requirementId,
     binding,
   });
-  if (!destination) return null;
+  if (!destination) {
+    return { status: 'hold', reason: 'bound_catalog_destination_projection_unavailable' };
+  }
   const loaded = loadCatalogManifestExternalRiskAttestationV1({
     version: 1,
     binding: {
-      bindingKind: 'catalog_manifest',
+      bindingKind: 'catalog_manifest' as const,
       capabilityId: binding.capabilityId,
       ...(binding.providerInputSchemaDigest
         ? { providerInputSchemaDigest: binding.providerInputSchemaDigest }
@@ -860,9 +892,16 @@ async function semanticBasisForPrepared(input: {
     inputSchema: externalCall.inputSchema,
     destination,
     callSignals: callSignals.callSignals,
-    safety: 'admissible',
+    safety: 'admissible' as const,
   });
-  if (!loaded.ok) return null;
+  if (!loaded.ok) {
+    return {
+      status: loaded.reason === 'schema_drift' || loaded.reason === 'malformed_input'
+        ? 'repair'
+        : 'hold',
+      reason: `bound_catalog_risk_projection_${loaded.reason}`,
+    };
+  }
   const external = loaded.attestation;
   if (
     external.manifest.manifestId !== binding.manifestId
@@ -871,9 +910,10 @@ async function semanticBasisForPrepared(input: {
     || external.manifest.definitionFingerprint !== binding.schemaFingerprint
     || external.manifest.accountId !== binding.accountId
     || external.projection.effect !== binding.effect
-  ) return null;
-  return {
-    nodeId: node.id,
+  ) {
+    return { status: 'hold', reason: 'bound_catalog_risk_projection_identity_mismatch' };
+  }
+  return { status: 'ready', semantic: {
     operationId: binding.operationId,
     schemaFingerprint: binding.schemaFingerprint,
     effect: external.projection.effect,
@@ -883,7 +923,7 @@ async function semanticBasisForPrepared(input: {
     semanticBasis: external.projection.semanticBasis,
     safety: external.projection.safety,
     requirementCapabilityIdentity: binding.capabilityId,
-  };
+  } };
 }
 
 /** Evaluate a fully materialized plan-bound work_call. */
@@ -898,34 +938,59 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
 }): Promise<HostInteractiveConsentResult> {
   const prepared = inspectPreparedHostWorkCall(input.preparation);
   if (!prepared) return { status: 'conflict', reason: 'work_call preparation is not host-issued' };
-  const expected = expectedTaskFor(prepared.sessionId, prepared.sourceUserSeq);
-  if (
-    expected.status !== 'ok'
-    || expected.expectation.acceptedTaskId !== prepared.acceptedTaskId
-    || expected.expectation.graphEventId !== prepared.contract.graphEventId
-    || expected.expectation.graphId !== prepared.contract.graphId
-    || expected.expectation.graphHash !== prepared.contract.graphHash
-    || expected.graph.compiler.graphHash !== prepared.contract.graphHash
-  ) return { status: 'conflict', reason: 'prepared work no longer matches its accepted graph' };
-  const semantic = await semanticBasisForPrepared({
-    prepared,
-    graph: expected as ReturnType<typeof expectedTaskFor> & { status: 'ok' },
+  const work = loadExpectedWorkCallBindingState({
+    sessionId: prepared.sessionId,
+    sourceUserSeq: prepared.sourceUserSeq,
+    logicalToolCallId: prepared.logicalToolCallId,
   });
-  if (!semantic) {
-    return { status: 'conflict', reason: 'prepared capability has no exact current semantic basis' };
+  const host = loadHostCallCapabilityBinding({
+    db: openEventLog(),
+    sessionId: prepared.sessionId,
+    sourceUserSeq: prepared.sourceUserSeq,
+    logicalToolCallId: prepared.logicalToolCallId,
+  });
+  const logical = durableLogicalCallContract(
+    prepared.acceptedTaskId,
+    prepared.targetName,
+    prepared.targetArgs,
+  );
+  if (
+    work.status !== 'ok'
+    || closedCanonicalJson(work.binding) !== closedCanonicalJson(prepared.binding)
+    || host.status !== 'ok'
+    || closedCanonicalJson(host.binding) !== closedCanonicalJson(prepared.hostCapabilityBinding)
+    || !logical
+    || logical.argumentDigest !== prepared.hostCapabilityBinding.effectiveArgumentDigest
+  ) {
+    return { status: 'hold', reason: 'prepared_work_durable_authority_reopen_mismatch', retryable: true };
   }
   const operation = prepared.contract.operations.find((entry) => (
     entry.id === prepared.binding.requirementId
   ));
   const cardinality = policyCardinality(prepared);
   const crossing = crossingFor(prepared);
-  if (
-    !operation
-    || operation.effect !== prepared.binding.effect
-    || operation.effect !== semantic.effect
-    || !cardinality
-    || !crossing
-  ) return { status: 'conflict', reason: 'prepared work binding is not the exact local contract operation' };
+  if (!operation || operation.effect !== prepared.binding.effect || !cardinality) {
+    return { status: 'repair', reason: 'prepared_work_binding_does_not_match_contract_operation', retryable: true };
+  }
+  if (!crossing) {
+    return { status: 'hold', reason: 'prepared_work_crossing_state_unavailable', retryable: true };
+  }
+  const semanticResolution = await semanticBasisForExactCall({
+    prepared,
+    requirementId: prepared.binding.requirementId,
+    effect: prepared.binding.effect,
+  });
+  if (semanticResolution.status !== 'ready') {
+    return {
+      status: semanticResolution.status,
+      reason: semanticResolution.reason,
+      retryable: true,
+    };
+  }
+  const semantic = semanticResolution.semantic;
+  if (operation.effect !== semantic.effect) {
+    return { status: 'repair', reason: 'prepared_semantic_effect_does_not_match_contract_operation', retryable: true };
+  }
 
   const source = sourceFromHostBinding(prepared.hostCapabilityBinding);
   const destination = semantic.destination;
