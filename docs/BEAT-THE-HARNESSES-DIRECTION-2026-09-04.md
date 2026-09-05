@@ -2087,3 +2087,106 @@ parity (verified at `18ac00d4`). Light gates + full journeys + npm test on the s
 bytes are running; the tag picture after that is: the 11 older journeys decision,
 the 2 machine-stable-red unit tests on the CI runner, and the P3 write acceptance
 (draft canary red).
+
+**2026-09-05 00:06 — FULL JOURNEYS on frozen `1931743f`: 156 pass / 16 fail (172 visible now
+that the Workspace file no longer crashes the runner).** Light gates 4/4 ✅, worker
+pins 123/123 ✅. Of the 16: **9 are the pre-existing list** (three outbound-draft
+approval subtests, legacy input-digest staged identity, plan-with-no-exact-verifier,
+accepted read plan cannot stop at prose, competitive byte ledger, external plans
+without a random gate, zero-crossing retirement) — two of the old eleven are now
+green. **7 are NEW since the candidate `64c3bfa5` and were green there: the parent
+"provider-neutral authorized requests cross unrelated capabilities without random
+gates" (`provider-neutral-no-random-gate.acceptance.test.ts`) and its six
+subtests "reversible local file create / Workspace create / Workspace edit /
+workflow author / workflow change / workflow run — without accepted coverage
+REPAIRS before I/O", every one now throwing `host call-authority boundary refused:
+prepared_frame_release_failed` (throw site `host-turn-runner.ts:7527`, present
+since 08-24; the PATH that now reaches it is today's).** This is the OPEN CLEM UP
+path — an uncovered reversible mutation must land in the zero-I/O repair matrix,
+not at a boundary refusal — and it smells like the same class as the draft canary's
+`sibling_frame_replanned_before_dispatch`: a prepared frame whose consent decision
+is `repair` cannot be released cleanly under the same-step consent+dispatch path.
+Attribution run (`f616da92^` vs `f616da92`) in flight; if it lands on `f616da92`,
+this is P3's own regression and the first thing to fix, with this journey as the
+pin. npm test on the same bytes still running.
+
+**2026-09-05 00:08 — ATTRIBUTED: the six "…without accepted coverage REPAIRS before I/O"
+failures are introduced by `f616da92` (same-step consent + dispatch).** Same file,
+isolated runs: at its parent `cf50388e` → 51 pass / 5 fail, all five on the
+pre-existing list, `prepared_frame_release_failed` ×0; at `f616da92` → 44 pass /
+12 fail, the six coverage-repair subtests + their parent added,
+`prepared_frame_release_failed` ×6. **Amending the 22:57 acceptance of `f616da92`:
+accepted for EXACT COVERED writes (allow → same-step dispatch; ask → pause before
+I/O; deny/changed → refused), but it REGRESSED the UNCOVERED-mutation path — a
+reversible local file create, a Workspace create/edit, and a workflow
+author/change/run that arrive without accepted coverage must land in the zero-I/O
+repair matrix (typed repair, zero bodies) and now die at the call-authority boundary
+with `prepared_frame_release_failed` (`host-turn-runner.ts:7527`).** That is the
+OPEN CLEM UP contract broken by construction, and it is almost certainly the same
+mechanism behind the draft canary's `sibling_frame_replanned_before_dispatch`: when
+the reducer's decision is `repair` (not allow/ask/deny), the prepared frame is
+never released on the repair edge. Fix in P3 before anything else; the pin already
+exists — `provider-neutral-no-random-gate.acceptance.test.ts` must return to
+51/56 (the five old ones stay on the debt list). Reviewer's own miss: the 22:57
+review checked the three consent outcomes and not the fourth (`repair`); the
+journey caught it, which is what the gate is for.
+
+**2026-09-05 00:09 — mechanism pointer for the `f616da92` regression (read-only, for the
+reproduction):** the throw is the pre-approval refusal path in `host-turn-runner.ts`
+~7510–7527: when any call in the batch is refused before approval, every prepared
+sibling is released with `releasePreparedHostWorkCallForRepair(candidate,
+'sibling_frame_replanned_before_dispatch')` and pending calls are settled; if ANY
+release returns false the whole batch dies with `prepared_frame_release_failed`.
+Before `f616da92` the six uncovered mutations were released and repaired (zero
+bodies). After it, a prepared frame on the same-step path appears to be in a state
+the repair release cannot unwind — the likely candidates are the immediate-invoke
+branch ("a proceed enters that invoke immediately, without preparing a plan") or
+the minted `HostConsentCallAuthority` leaving the frame armed/consumed before the
+reducer's `repair` decision is applied. The `sibling_frame_replanned_before_dispatch`
+label the draft canary showed is the same release call — one mechanism, two
+symptoms. Check the return value of `releasePreparedHostWorkCallForRepair` for a
+frame prepared through the new path; the fix is to make the repair edge releasable
+(or to decide `repair` BEFORE preparing/minting), never to swallow the false.
+
+**2026-09-05 00:16 — COMPLETE GATE TALLY on frozen `1931743f` (detached checkout, isolated
+homes, real exit codes):** typecheck ✅ · check:public-hygiene ✅ · test:public-hygiene
+4/4 ✅ · test:release-assets 53/53 ✅ · worker-door pins 123/123 ✅ · **npm test
+14,493 pass / 2 fail** — the two are exactly the machine-stable-red pair ("daemon
+rehash reprovisions the reviewed read…", "private key is written 0600"; both fail
+on the pre-today baseline; classify on the CI runner) — nothing introduced today
+remains red in the unit suite · **journeys 156 / 172** — 9 pre-existing + the 7
+introduced by `f616da92` (00:08 entry). Earlier on `64c3bfa5`, unchanged since:
+proof:selftest ✅ · test:measurement ✅ · bench:gates ✅ · eval:memory/passk/jobs ✅.
+**What stands between these bytes and a tag:** (1) the `f616da92` repair-path
+regression — fix + journey back to 51/56; (2) the 9 older journeys — fix or an
+explicit, written exclusion from the release gate with reasons in
+`docs/releases/v3.16.0.md`; (3) the 2 environment-suspect unit tests on the CI
+runner; (4) P3 write acceptance (draft canary red — same mechanism as (1) is the
+first thing to reproduce); (5) then the full gate set once more on the final bytes,
+and the packaged-app build/upgrade rehearsal. Everything else on the direction
+doc's list is done and live-proven or fixture-proven.
+
+**2026-09-05 00:21 — TAKEOVER: the owner handed the executing lane to the reviewer ("take over
+from here"). One owner again: the reviewer now owns this checkout, the log, and
+the tag list.** State at hand-over: HEAD `d8df7ec9`; no daemon or live home running
+(8420/8520/64244/64245 all down); 8 uncommitted files left by the executing agent
++ 1 intentionally-uncommitted local red test, backed up to the reviewer scratchpad
+before touching anything. Inventory of that WIP: (a) `host-interactive-consent.ts`
++93 — an `onMismatch` diagnostic on exact-prepared-candidate selection (schema
+digest / tool identity / argument digest / canonicalization) so
+`bound_catalog_call_does_not_match_exact_schema_and_arguments` finally says WHY;
+observability only, no authority change; (b) `host-turn-runner.ts` 1 line — the
+dead-end pair: the carrier refusal no longer tells the model to "call plan_task
+again to amend the plan" but to reissue under the existing plan (the 23:53 reading
+(2)); (c) `composio-tools.ts` — replaces the ad-hoc `file_uploadable` schema scan
+(which blocked a draft whose schema merely ALLOWS attachments with
+"PREPARATION-REQUIRED") with `planStagedFileUploads` — plausibly the canary's first
+`invalid_arguments`; (d) pins for a–c; (e) `p3-retained-draft-call.red.test.ts` —
+replays the canary's batch-6 bytes from the stopped snapshot: first refusal must be
+`work_cardinality_mismatch`, the corrected singleton must NOT hit the exact-schema
+mismatch and must dispatch once. Order from here: (1) prove/complete that WIP; (2)
+the `f616da92` repair-path regression (six subtests, one mechanism); (3) the
+draft-canary exact-schema mismatch; (4) malformed `run_worker` packet settling
+`succeeded` with zero children (newly measured debt); (5) the 9 old journeys —
+decision with the owner; (6) §15 watcher re-arm on `worker_started`; (7) full
+gates on final bytes + packaged rehearsal; push/tag only on the owner's words.
