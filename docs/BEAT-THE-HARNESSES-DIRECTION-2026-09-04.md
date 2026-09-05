@@ -1157,3 +1157,18 @@ intended (if it was not, nothing is published; a tag is still withheld) and answ
 `Start P2?`.** P2 design inputs are already in §12/§13.3: decrement-don't-zero,
 key discriminator, recovery-surface union, last-word deletion, the two Hermes-derived
 governor test cases, and typed-stop-payload-reaches-the-user verbatim.
+
+**2026-09-04 ~21:40 — OWNER: `Start P2` given (relayed by the reviewer; the owner
+said so directly to the executing agent as well).** P2 acceptance the reviewer will
+check on each commit: (1) `no-progress-governor.ts` decrements `retriesRemaining` on
+a typed consequence instead of zeroing it; (2) the consequence key carries an
+attempt/repair discriminator so two different `schema_invalid` shapes are two stages;
+(3) the recovery surface for a host-side refusal includes the turn's proven read
+controls (not only the refused carrier); (4) the tool-free "last word" round trip is
+deleted or handed the proven surface; (5) the two Hermes-derived cases: a stalled
+attempt burns no budget, a provider-proven failure buys exactly one bounded retry
+through an armed cooldown; (6) the typed stop payload reaches the user-facing
+terminal verbatim, `resumable:true` with a named next edge. Then the SAME canary:
+expected flip from `control_no_progress_exhausted / resumable:false` to a resumable
+typed stop, ≤1 wasted model step per failing run. One fix per commit, red journey
+first where possible. `Start P3?` follows the P2 report.
