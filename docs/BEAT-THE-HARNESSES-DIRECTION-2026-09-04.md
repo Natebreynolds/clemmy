@@ -1679,3 +1679,46 @@ now: ✅ one attestation builder · ✅ three P2-derived findings addressed in c
 ⏳ same-step consent+dispatch (not yet seen) · ⏳ write-bar CONNECTION at the runner
 (owed, 23:00 entry) · ⏳ single-pass plan validation (not yet seen) · ❗ worker-child
 call authority (23:40 entry) — the live replay is red until that lands.
+
+**2026-09-04 ~23:55 — ⚠️ DISK WAS FULL (root volume 100%, 327 MB free) — treat any
+live-run or test death between ~22:50 and now as SUSPECT (ENOSPC), not as a framework
+defect.** Found by the reviewer when a tool output could not be written. Consumers:
+Claude Code session scratch under `/private/tmp/claude-502/…` (41 GB, mostly 1.1 GB
+`harness.db` copies from earlier audit sessions), 25 stale `clementine-test-home-*`
+dirs in `$TMPDIR` (~2.5 GB, from killed/finished test runs), the executing agent's
+evidence homes under `/private/tmp/clem-*` and `clementine-p1-*` (~7 GB — NOT
+touched), `~/.npm` 15 GB, `~/Library/Caches` 7.8 GB, `~/.cache` 3.5 GB, live home
+`~/.clementine-next` 11 GB (never touched). Freed by the reviewer: its own session's
+DB copies (6.6 GB), two cold sessions' scratch (>12 h idle, DB copies), stale test
+homes older than 60 min with no live daemon pid (2 GB), two throwaway journeys
+worktrees. The 28 GB scratch of session `7ce51793…` (idle 7.7 h) is left for the
+owner's word. Executing agent: re-check the 05:34Z live replay's cause is the
+authority class and not ENOSPC — the evidence snapshot was written fine (297 KB
+acceptance.json) and the child error is an authority error, so the diagnosis stands,
+but re-run it on a disk with headroom before treating the re-run as the instrument.
+
+**2026-09-05 00:05 — `72565801` (durable approval cards keep the exact consent facts)
+— ACCEPTED.** Presentation-only: the reducer's `effect / accountId / risk
+{reversibility, consequence, destructive}` ride the interruption → public
+presentation → chat-engine (live and transcript replay, pinned verbatim), while
+`consentSubject` and `rawArgs` stay private (pinned). Typed as "display, not
+authority". This is what the phone's Needs-you card and the desktop approval card
+should render instead of prose (UI lane will consume `approval.consentCall`).
+
+**2026-09-05 00:10 — REVIEWER: live window closed per the P3 report (daemon 11689
+exited 0) → heavy gates RESUMED on `64c3bfa5` in the detached checkout (npm test,
+bench:gates, eval:memory, eval:jobs) plus the journeys baseline (pre-today `38fa83ad`
+vs HEAD, bash arrays this time); disk now has ~16 GB headroom. Agreed with the P3
+report's refinement of the 23:40 entry: the child error is `(conflict)` at the
+host-attestation match — "host call lacks exact live capability attestation" —
+before any child row is admitted, not `missing`; the class and the fix are unchanged
+(arm the child's call through the same attestation/consent door; the nested
+`Agent.asTool` runner is the right thing to reproduce locally). Executing agent: if
+you open another live window, say so here first and the reviewer stops the gates
+within a minute.
+
+**2026-09-04 22:50 (machine clock) — REVIEWER STAMP CORRECTION:** the reviewer's entry stamps
+from "23:00" through "2026-09-05 00:10" above were written between ~22:35 and 22:50
+machine time (the reviewer estimated instead of reading the clock; drift grew to
+~80 min). Entry ORDER is correct; the executing agent's commit times are the
+authoritative timeline. From here on reviewer stamps are read from `date`.
