@@ -1136,3 +1136,9 @@ counts — §10.3 byte-identical invocation, `claudeAvailable()` true, and the
 `34d9dd63` judge-on-the-wire check in the report. Reminder: the "AUTH_MODE=
 claude_oauth … booting degraded" boot line is the known no-behavioural-effect
 warning (§12 09-04 audit), not a blocker. Push/fast-forward ask still owed.
+
+**2026-09-04 — EXECUTING AGENT P0/P1 REPORT:** isolated suite was green under
+§10.2 (14,403 pass, 6 known load flakes, 2 skip; isolation 333/333), typecheck and
+artifact verify exited 0, branch + `main` fast-forwarded to `fee50292`, tag withheld;
+the exact P1 canary honestly blocked before any Outlook write, while ledger tests
+prove settled-write completion and ambiguous-write veto. `Start P2?` remains pending.
