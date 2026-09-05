@@ -7307,11 +7307,20 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       consecutiveFrameRefusals += 1;
       // Journaled with the RAW shape, so the next unknown dialect is learned
       // from one run instead of reconstructed from receipts.
+      // A refusal must also say what the host KNEW about the carrier it
+      // refused. Live 2026-09-05: a continuation turn's work_call was refused
+      // as "requires a plan sibling", which is the message for a carrier that
+      // is not the configured one — indistinguishable, from the journal alone,
+      // from a carrier that was never on this turn's surface at all.
+      const offendingTool = toolByName.get(offending.name);
       journalHostGuide('frame_refused', {
         reason,
         retryMode: 'replan',
         offendingCallId: offending.callId,
         offendingOperation,
+        carrierAdvertised: offendingTool !== undefined,
+        carrierPlanRequired: offendingTool !== undefined && isHostPlanRequiredWorkCall(offendingTool),
+        surfaceToolNames: [...toolByName.keys()].slice(0, 40),
         provenReads: provenReads.slice(0, 12),
         calls: canonicalCalls.map((call) => ({
           callId: call.callId,
