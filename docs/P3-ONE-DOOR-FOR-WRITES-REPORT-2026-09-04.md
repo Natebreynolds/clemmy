@@ -1,0 +1,103 @@
+# P3 — one door for writes
+
+Status: IN PROGRESS. Owner explicitly said “Start p3.” This is an evidence ledger,
+not a green phase report or a release authorization. No P3 push or tag has run.
+
+## Scope and invariants
+
+Execute direction §5 P3 and reviewer §12: fix the three P2-derived preconditions,
+connect exact nominated mutations to the existing consent reducer and existing
+external port in the same step, generalize live-catalog resolution, use one risk
+attestation builder, and aggregate `plan_task` repairs. Keep external-crossing CAS,
+exact source/account/schema binding, durable results and reconcile-only uncertain
+writes. Genuine sends/deletes/admin/sealed bulk still need exact consent.
+
+P4 same-turn asks, P5 remaining plan/account simplification, and §15 broader
+subagent auditing are not approved by this phase. Parallel trajectory auditing is
+already configured; do not claim it audits a child merely because it overlaps the
+parent's model call.
+
+## Landed batches and local evidence
+
+All commands below used the isolated test runner with actual exit codes. Counts
+overlap; do not add them together. Providers in unit/integration tests are stubs
+unless explicitly marked live.
+
+| Commit | Change | Evidence |
+| --- | --- | --- |
+| `27787ce5` | Explicit completion judge cannot lose to a different-provider hedge; unavailable pin is unjudged, not silent self-judging | `/private/tmp/p3-judge-pin-red.log`: exit 1, 5 failures/6; green 6/6; focused 170/170 and typecheck exit 0 |
+| `752603bf` | Remove the prose-census precondition for an already advertised, scoped `run_worker`; retain exact refusal reason/call | Captured call SHA256 `911ffe5ed7a731b2a130b5987db3e989a37c4f57a5843ac4ff2a5dc0aabc6695`; RED `coverage_missing`; `/private/tmp/p3-worker-final2.log` 371/371, receipt follow-up 224/224, exit 0 |
+| `b699ad38` | Accepted declared local item demand is completed by item receipts, not preceding package reads or final prose | `/private/tmp/p3-local-work-red.log` exit 1; final suite 258/258, typecheck exit 0; actual stopped P2 ledger projects exactly eight missing items |
+| `8cb61013` | One live catalog resolver accepts exact effect/account, retaining current manifest/port attestation and revocation | RED 11 pass/2 fail; `/private/tmp/p3-catalog-final.log` 24/24, typecheck exit 0; runner write wiring is a separate batch |
+| `ddccda93` | Six consent adapters use one call/coverage value builder; exact graph-neutral catalog call uses existing reducer and durable approval | `/private/tmp/p3-consent-direct-red.log` 0/4, exit 1; final expanded suite 54/54, typecheck exit 0. Covers reversible draft, send/delete/admin ask, args/account/schema drift, exact approval replay and uncertain-crossing reconciliation |
+| `79686a6b` | An unavailable judge pin does not prevent non-judgment structured extraction | Actual extractor invocation RED; extraction plus judge regression 14/14, exit 0 |
+| `64c3bfa5` | Release hygiene fixture and dynamic release-schema assertion | Release assets RED 52/53 → GREEN 53/53. Hygiene green after reviewer corrected their own quoted URL; reviewer changes committed verbatim |
+
+Reviewer accepted judge/worker dispatch changes and local completion's grading
+half. Reviewer requires bounded automatic re-entry for `local_work_incomplete`,
+with exact missing items, before its next-edge half can close. That work is not
+waived by marking the terminal resumable.
+
+## First live P3 precondition replay — RED, retained
+
+- Frozen SHA: `b699ad38760bdb2120ca69d1dc40c208f5f4e072`.
+- Clean source: `/private/tmp/clem-p3-workers-frozen.yC1vzr`.
+- Source fingerprint: `1a31417cf1471f518e106d6babd4f391dcef5a1228644cd532b71f7e8d9a326a`.
+- Isolated home/evidence: `/private/tmp/clem-p3-workers-live.GHYMN5`.
+- Port 64244; daemon PID 11689 stopped normally, exit 0. Main dev stayed down.
+- Session: `sess-desktop-45fc9a99b421dd4df963180b`.
+- Same acceptance shape as P2: two parent package reads, one eight-item local
+  nonce worker packet, Codex Terra brain/workers, pinned Claude Sonnet 5 judge.
+- Actual parent accepted and dispatched one eight-item worker call. Eight worker
+  starts, eight effective Codex routes, eight failed worker results, no nonce
+  outputs. Driver and offline collector both exited 4.
+- All child failures retained the same cause:
+  `LogicalCallPreDispatchAuthorityError: host call lacks exact live capability attestation`.
+  Nested SDK execution attempted a tool without the host attestation; the parent
+  accepted authority was then poisoned and could not settle/reopen its checkpoint.
+- Terminal: `blocked`, `resumable:true`, retained two package-read handles, no
+  external changes. This is not a successful fan-out or P3 acceptance.
+- One real Claude Sonnet 5 watcher call succeeded on `claude_code_headless`,
+  provider session recorded, 05:34:08.020–05:34:10.482 UTC, 2.462 seconds.
+  It audited alongside the parent, before the failed workers. No final completion
+  judge wire was exercised; the live completion-pin proof remains owed.
+- Stronger local reproduction now runs the actual nested `Agent.asTool` SDK
+  runner, not a replacement `asTool.invoke`. Only the model and local read body
+  are deterministic. `/private/tmp/p3-worker-sdk-red.log`: 3/4 pass, exit 1;
+  reproduces both missing attestation and parent authority poisoning.
+
+This exposed a gap in the earlier pool fixture: stubbing `asTool.invoke` proved
+the coordinator/pool but skipped the child SDK tool boundary. Keep both tests;
+do not relabel that fixture as end-to-end worker execution.
+
+## Same canary — invocation contract
+
+Resume `bg-graph-driver-tag-canary-20260904`, never recreate it. Original prompt:
+
+> Find five suitable prospects in Salesforce, enrich them with DataForSEO, use my outbound skill to prepare and validate the outreach locally, then create five Outlook drafts. Do not send anything.
+
+Prompt SHA256: `1a24a4992bf18e8031dc0cb4766d06025a543db699216756193a3c9c170dc1cf`.
+Keep Claude Sonnet 5, contract version 1 and zero contract revisions. The P2 home
+is `/private/tmp/clementine-p1-canary-ef04f7db.GBCFDh`; it is parked at the connected
+mailbox question. The mailbox answer already exists in its stopped event journal
+(seq 90). Resume that exact durable question via the supported Inbox answer route,
+not a direct task JSON edit or a fresh task. Preserve “drafts only; do not send.”
+
+Before live acceptance: freeze a clean implementation SHA, verify provider
+availability, use access-only isolated auth (never copy a rotating refresh token),
+record daemon SHA/fingerprint/schema, then invoke once. Inspect live state via
+API/task files; open SQLite only after the isolated daemon stops.
+
+Acceptance still owed: real Salesforce read, DataForSEO enrichment, local
+rehearsal, five ordinary reversible draft write receipts with zero approval cards
+and zero sends, terminal truth from the ledger; plus live worker success and
+actual pinned cross-family completion-judge transport evidence. Local tests alone
+do not satisfy this list.
+
+## Release status
+
+Reviewer heavy-gate measurements on `64c3bfa5` are baseline evidence, not results
+on final P3 bytes. Preserve their exact counts and exits in direction §12. Re-emit
+implementation artifacts once the implementation settles and run verification
+without a pipe. Re-read §12 before each themed batch and at the phase boundary.
+Do not start P4 or push/tag without the owner's separate approval.

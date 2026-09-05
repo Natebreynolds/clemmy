@@ -1016,6 +1016,107 @@ Order inside v3.17: visibility (15.3-2) → audit door (15.3-4) → selfJudge ca
 
 ---
 
+## 16. Measured latency + token profile (2026-09-04, isolated P2 evidence, read-only)
+
+**Method.** Two profiler agents over COPIES of the P2 evidence homes (`harness.db`,
+`model-route-metrics.db`, `operational-telemetry.db`, token-usage ndjson);
+`transport_mirror` double-counts excluded by construction; no adversarial verifier
+ran, so the reviewer source-checked every mechanism below (✓ = the cited line exists
+and does what is claimed; ○ = plausible, needs a pin before anyone acts on it). The
+"93% orchestration" in §1/§6 is the DEV-CYCLE number (boot-to-boot) and stands; it is
+not a statement about a run.
+
+**Headline.** The P2 canary resumed leg (221.7 s wall) is MODEL-BOUND: 17 brain
+calls = 200.7 s (90.5%); tool execution 16.8 s (7.6%); ALL host work — pre-model
+1.64 s + admission 1.38 s + post-tool 1.28 s — 4.3 s (1.9%); idle/backoff 0. Per-step
+ceremony is negligible (prompt composition ~2–10 ms; admit→dispatch 81 ms;
+settle→next request 80 ms). The harness cost is the NUMBER of round-trips it
+induced: 11 of 17 steps were `tool_search` loops (137 s = 62% of wall) re-finding an
+operation already found at step 3 and re-asking an account the user had ALREADY
+answered. The 8-worker audit (106 s): brain 73.8 s, judge critical path 32.8 s,
+tools 1.1 s; after the pre-dispatch refusal, 90.6 s were completion-judge/continue
+cycles. The direct audit (19 s): brain 94%, three serial `read_file` round-trips,
+plus a 20 s UNATTRIBUTED post-terminal Claude judge call.
+
+**Ranked fixes (by measured leverage; lane noted so P3 is not disturbed).**
+1. ✓ **Journal the resume answer into the accepted source.** `background-tasks.ts:6139`
+   hands the bridge `displayMessage: task.prompt` (the original objective) while the
+   user's answer rides only in `message`; `respond-bridge.ts:797/1401` journals
+   `text: displayMessage`; so every `user_input_received` on a resumed task carries
+   only the objective and the account scanners (`tool-search-provider-sources.ts:403/
+   418/663`, `plan-tools.ts:1257/1285/1348`) never see the answer →
+   `account_selection_required` on every resume → the model re-asks. Measured
+   ~164 s of 222 s (11/17 steps). Same class as HANDOFF 09-03 "the harness holds the
+   answer". Fix: journal the answer as the accepted text of the resumed source (or a
+   durable per-task account binding the scanners read). Lane: bridge/background — no
+   P3 overlap. Pin: resumed task with an answered account → zero re-asks, ≤3 searches.
+2. ✓ **Host-relayed clarification.** When `plan_task` returns
+   `account_selection_required` with the exact question + choices, park
+   `awaiting_user_input` from the host instead of spending a model step whose only
+   permitted tool is `ask_user_question`: 80,367 uncached tokens + 6.8 s on turn 229;
+   88,518 tokens + 40.2 s on the analogous stop step of turn 82. Lane:
+   `host-turn-runner.ts` ~6466–6490 (P3 territory — executing agent sequences it).
+   This IS the P4 same-turn ask, seen from the cost side.
+3. ✓ **Bound identical-operation re-discovery.** The governor re-admits each search
+   as `settled_continuation_admitted` (`discovery-governor.ts:1347`). When a role's
+   search already returned exactly one operation and the only blocker is account
+   selection, return the typed blocker as the tool result (the next edge) instead
+   of admitting another search. Caps the loop at ~3 steps (~100 s) even if #1 regresses.
+4. ✓ **Judge continuation budget must survive re-entry.** `let
+   objectiveJudgeContinuations = 0` (`host-turn-runner.ts:2364`) is per runner
+   invocation, while `noProgressCheckpoint` IS restored from
+   `HostRecoveryState`/`HostInterruptState` (:2365–2369) — so every
+   `admit_recovery_rebased` re-entry restarted the judge→continue cycle with
+   `continuationsUsed 0` and `MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS = 2` never bound
+   it (4 cycles, 54–80 s of 106 s). Carry it exactly like `noProgressCheckpoint`; and
+   never run a continuation when the only missing evidence is a tool whose receipt is
+   `refused_pre_dispatch` + `do_not_retry`. Lane: host-turn-runner (P3) — small.
+5. ✓ **Cache-prefix stability for the life of an accepted turn.** `plan_task` and
+   `work_call` flip `isEnabled` before every model request (`plan-tools.ts:1650`,
+   `work-call.ts:1864`) and the no-progress recovery mode shrinks the tool array
+   (`hostNoProgressRecoveryToolNames` :563/:6527); on the Anthropic wire the tools
+   block sits ABOVE system, so a catalog change is a full-prefix miss: 122,894 uncached
+   tokens on P2 = 61% of the run's uncached input. Fix: advertise one tool array per
+   accepted turn and enforce the permitted set at pre-dispatch admission (the
+   `refused_pre_dispatch` receipt already exists) — constrain effects, not methods.
+   Same family: pin the memory block per accepted source on the Codex lane (a
+   re-prime rewrote it 3× inside one turn) and move the planning card out of the
+   `plan_task` description into the dynamic system tail.
+6. ○ **Ledger truth, not wire.** `claude-model.ts:859` declares `cacheDialect:
+   'exclusive'`; the profiler reads the AI-SDK adapter as delivering INCLUSIVE totals,
+   which would overstate uncached input ~3.9× (turn 229: 1,105,549 → 202,582;
+   `sessions.tokens_used` 1.94 M → 0.50 M — run budgets accrue on the wrong number).
+   Pin against a recorded receipt pair BEFORE changing the dialect; also capture
+   cache-WRITE tokens (today redacted because undefined).
+7. ✓ **Condenser summarizer route.** `compaction.ts:269 getSummarizerModel()` returns
+   `MODELS.fast`; with `OPENAI_MODEL_FAST=gpt-5.4` the Codex/ChatGPT wire 400s on EVERY
+   turn start (507 ms failed call; layer 2 never applies; a 58k→11k clip instead of a
+   summary). Resolve through the role/provider resolver; skip layer 2 cleanly when
+   unreachable.
+8. **Compact `tool_search` results** (name + effect + one line + result handle; schema on
+   demand) and collapse rephrased searches under one role key: 11 searches = 83 KB
+   (~27k tokens) riding every later step.
+9. **Measurement first:** `firstByteMs` on the BYO/claude-model and Codex streaming
+   paths (0 first-byte events in all three DBs; `usage-log.ts:453` already accepts
+   it); tag every judge call with sessionId + seam (`usage-log.ts:226` files the 20 s
+   post-terminal judge as `other`); wire the zero-caller `comparePromptCacheRequests`
+   into `recordModelUsage`.
+10. **Do NOT chase:** per-step prompt composition (~0.1 s over 17 steps) or tool-schema
+    re-render (constant 9,910 tokens). Reasoning effort for background steps
+    (`reasoning-effort.ts:118` caps only interactive; one 66 s call drafted five emails
+    in thought before a `tool_search`) needs an A/B on quality before any default change.
+
+**Unmeasurable today (each is an instrument worth adding):** TTFT per call; thinking
+vs generation split (`reasoningTokens` redacted); `tool_search` sub-phases (composio
+search vs new-slug schema materialization — the slow 2.5–3.7 s searches are the ones
+that materialized new slugs); a true cold-vs-warm pair for the ≤70% cache gate (P2 is
+an in-place resume; 78% is a proxy).
+
+**Owner-facing translation.** P1+P2 cost 8m10s over two legs for zero drafts. Fixes 1–3
+remove the loop that burned ~75% of that; fix 4 removes the judge churn after a
+refusal; fixes 5–7 make the same turn ~60% cheaper in tokens without changing
+behavior. None of them is a new door.
+
 ## 12. Reviewer log (append-only — executing agent: re-read at every phase boundary)
 
 The reviewer session watches every commit and canary outcome against this doc.
@@ -1489,3 +1590,77 @@ the `missing` item list so re-entry dispatches exactly those packets, not a rest
 (c) pin: the 7/8 fixture → one host-owned re-entry → 8/8 → `done`, and a
 worker-down variant that stops at `cap_exhausted`/`no_progress` (typed, resumable,
 no loop). Until then a partial local task still needs a human "continue".
+
+**2026-09-04 23:25 — REVIEWER: §16 added (measured latency + token profile, ranked
+fixes with lanes); heavy-gate status; YIELDING for the live window.** (1) Journeys on
+`64c3bfa5`: **143 pass / 16 fail (EXIT=1, 699 s)** — a tag blocker by the workflow's
+own gate. Failing: release row 15 cross-surface parity (Home durable session);
+two-operation business request (`'blocked' !== 'done'`); plan with no exact verifier
+admitted; GATE surface fresh-discovery/run_worker swap (`true !== false`); firecrawl
+Search→Batch→Workspace (`/Created workspace/`); local-llm content workspace
+host-e2e; accepted read plan cannot stop at prose; legacy input-digest staged
+identity after restart (planning-card capability drifted); external plans without a
+random gate; zero-crossing retirement scope; cold Discord restaurant read+create ×2
+(tool set now advertises `run_worker` in the primary loop); competitive byte ledger
+(1 of 4 foreground steps captured); plus 3 outbound-draft approval subtests.
+Several of these smell like TODAY's contract changes (`752603bf` run_worker
+admission, `b699ad38` blocked-not-done) rather than the 08-31 wave debt — a baseline
+re-run of exactly those files on the pre-today SHA `38fa83ad` vs HEAD is queued (the
+first attempt died on a zsh word-split, not on the tests). Rule for the executing
+agent: a journey that flipped red today is either a forward-only regression (fix) or
+a journey that encodes the removed hoop (update it to the new contract WITH the same
+evidence) — never left red, never deleted. (2) `npm test` was mid-run; per the
+executing agent's 05:32 UTC request the reviewer has STOPPED all heavy gates for the
+live window and will resume them (npm test, bench:gates, eval:memory/jobs,
+journeys baseline) when the window closes — say so here. Already green on
+`64c3bfa5`: proof:selftest 239/239, test:measurement 97/97, eval:passk strict 100%,
+all four light gates. (3) Nothing in §16 is assigned into P3; items 2 and 4 sit in
+host-turn-runner and are the executing agent's to sequence; items 1, 3, 5–7 are
+free lanes.
+
+**2026-09-04 23:40 — REVIEWER READ THE P3 LIVE REPLAY (frozen `b699ad38`, port 64244,
+evidence `clem-p3-workers-live.GHYMN5`, 05:33:50–05:34:22Z): FAILED — 0/8 workers,
+terminal `blocked`. One defect class, one downstream symptom, one pin gap.**
+Timeline from the evidence snapshot: tool_search ×2 → two `call_tool`/`read_file`
+pairs succeed → `run_worker` dispatched at 05:34:15.4, manifest declared, 8
+children start in ONE batch (the P2 admission fix works) → EVERY child dies within
+~2 s: `ToolCallError: Failed to run function tools:
+LogicalCallPreDispatchAuthorityError` → `fanout_run_boundary
+uniform_failure_abort` at 05:34:20.6 → the parent's `run_worker` settlement throws
+`ToolAttemptSettlementAuthorityError: accepted-turn call authority is conflict` →
+`host_result_receipt_commit_failed` → 3 exact-checkpoint re-entries ("accepted
+model batch no longer has its exact open host root") → `exact_checkpoint_admission
+_exhausted` → `conversation_completed blocked`. Zero writes, zero approvals, watcher
+1/1 passed on the Claude wire (the cross-family judge is real on this run).
+**(A) The class:** a worker child's first tool call is refused at the pre-dispatch
+authority door (`attempt-identity.ts:320/351/432/470`) — the child runs with no
+logical-call frame owned by the accepted task (status `missing`: "trusted resolver has
+no logical call owned by this accepted task") or its admission fails against the
+parent's authority. Either way the CHILD has no arm of the parent's accepted-turn
+call authority. Same family as the 08-31 seam 4 (`host_invocation_authority_missing`
+on boot-recovery GET). Fix at the coordinator: arm one logical-call authority per
+child packet (parent acceptedTaskId + item scope, compose-only, deny-all external),
+so children pass the SAME door the parent passes — never a bypass. Read the exact
+status string from the child sessions in the live home's harness.db (they are not in
+the evidence snapshot, which holds only the parent) before choosing between the two
+throw sites. **(B) Downstream:** a uniform child failure must settle the parent call
+as a typed FAILED receipt (reason = the child error), not leave the parent authority
+in `conflict` and spend three recovery re-entries; the budget did its job (bounded,
+typed terminal) but the model never got to see WHY and loop around it. **(C) The pin
+gap — why the fixture was green while live was red:** `host-worker-dispatch
+.integration.test.ts:86` gives the mocked child a fake `read_file` tool that never
+passes through `attempt-identity` pre-dispatch admission; "pins prove CONNECTION"
+was not met for the child's door. The fixture's child call must go through the real
+host tool dispatch (same authority path), and the 7/8 → 8/8 pin should then be
+re-run on top. Then re-run THIS SAME cold replay (cold live run is the instrument);
+expected: 8/8 ok receipts, `done`, watcher still on the Claude wire.
+
+**2026-09-05 05:45 UTC — EXECUTING AGENT: live window CLOSED.** The isolated
+64244 daemon stopped normally (exit 0); both it and the main dev are down. Reviewer
+may resume isolated heavy gates. Actual SDK-child RED now exists in the worker
+integration fixture (3/4 pass, real exit 1, `/private/tmp/p3-worker-sdk-red.log`),
+reproducing missing exact attestation and parent authority poisoning. The worker
+dispatch agent takes that fix after the same-step write batch; local continuation
+is assigned after the plan-validation batch. §16 is retained as measured guidance,
+not an unbounded P3 scope expansion. Current report and live receipts are in
+`docs/P3-ONE-DOOR-FOR-WRITES-REPORT-2026-09-04.md`. P3 remains in progress.
