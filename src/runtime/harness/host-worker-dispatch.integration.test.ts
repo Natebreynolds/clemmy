@@ -31,6 +31,8 @@ const catalogs = await import('./host-capability-catalog-factory.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
 const { evaluateQuantifiedWorkManifestGate } = await import('./quantified-work-manifest.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
 const { primePrimaryModelPlanningCatalog } = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
 const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
 after(() => {
@@ -49,9 +51,10 @@ async function* modelStream(this: { getResponse(request: unknown): Promise<any> 
   yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
 }
 
-for (const realWorkerBody of [false, true]) test(`captured advertised eight-item worker call dispatches without a graph or approval (real worker body=${realWorkerBody})`, async (t) => {
+for (const variant of ['boundary', 'full', 'partial'] as const) test(`captured advertised eight-item worker call dispatches without a graph or approval (${variant})`, async (t) => {
+  const realWorkerBody = variant !== 'boundary';
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
-  const session = eventlog.createSession({ id: `p3-captured-worker-${realWorkerBody}`, kind: 'chat' });
+  const session = eventlog.createSession({ id: `p3-captured-worker-${variant}`, kind: 'chat' });
   const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: PROMPT } });
   const args = JSON.parse(CAPTURED_ARGUMENTS);
   const quantified = evaluateQuantifiedWorkManifestGate({ sessionId: session.id, sourceUserSeq: source.seq, items: args.items, workManifest: args.workManifest });
@@ -75,6 +78,7 @@ for (const realWorkerBody of [false, true]) test(`captured advertised eight-item
           assert.equal(scope?.sourceUserSeq, source.seq);
           assert.equal(scope?.mcpToolScope, null, 'the exact empty external packet keeps deny-all scope');
           children.push(packet.item);
+          if (variant === 'partial' && packet.item === 'audit-8') return 'ERROR: the local source has no usable result for audit-8.';
           return `ITEM=${packet.item} NONCE=fixture-${packet.item}`;
         },
       } as never;
@@ -102,7 +106,7 @@ for (const realWorkerBody of [false, true]) test(`captured advertised eight-item
         usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
         output: modelCalls === 1
           ? [{ type: 'function_call', callId: 'call_tBgF4tuqvCC6jxh3iTwnogOO', name: 'run_worker', arguments: CAPTURED_ARGUMENTS }]
-          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The worker returned all eight fixture results.' }] }],
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: variant === 'partial' ? 'Seven worker results are retained; audit-8 still needs a successful read.' : 'The worker returned all eight fixture results.' }] }],
       };
     },
     getStreamedResponse: modelStream,
@@ -143,7 +147,20 @@ for (const realWorkerBody of [false, true]) test(`captured advertised eight-item
     assert.deepEqual([...children].sort(), args.items);
     const receipts = eventlog.listEvents(session.id, { types: ['worker_result'] });
     assert.equal(receipts.length, 8);
-    assert.ok(receipts.every((receipt) => receipt.data.ok === true));
+    assert.equal(receipts.filter((receipt) => receipt.data.ok === true).length, variant === 'partial' ? 7 : 8);
+    if (variant === 'partial') {
+      assert.equal(outcome.terminal?.status, 'blocked');
+      assert.equal(outcome.terminal?.reason, 'local_work_incomplete');
+    } else {
+      assert.equal(outcome.terminal, undefined, 'all eight item receipts permit ordinary completion');
+    }
+    const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+    const committed = commitTurnOutcome({
+      version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+      presentation: { kind: 'answer', text: String(outcome.finalOutput) },
+    }, { terminalJudgeDisposition: 'deliver' });
+    assert.equal(committed.presentation.status, variant === 'partial' ? 'blocked' : 'done');
+    assert.equal(committed.presentation.resumable, variant === 'partial');
   }
   assert.equal(Boolean(outcome.hasInterruptions), false);
   assert.equal(modelCalls, 2);
@@ -151,5 +168,5 @@ for (const realWorkerBody of [false, true]) test(`captured advertised eight-item
   const settlement = db.prepare('SELECT physical_crossing_count, host_crossing_count FROM logical_call_settlements WHERE session_id = ? AND logical_tool_call_id = ?').get(session.id, 'call_tBgF4tuqvCC6jxh3iTwnogOO');
   assert.deepEqual(settlement, { physical_crossing_count: 0, host_crossing_count: 1 });
   assert.equal(eventlog.listEvents(session.id, { types: ['turn_graph_compiled', 'awaiting_user_input', 'external_write_succeeded'] }).length, 0);
-  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ? AND logical_tool_call_id = ?').get(session.id, 'call_tBgF4tuqvCC6jxh3iTwnogOO') as { n: number }).n, 1);
+  if (variant !== 'partial') assert.equal((db.prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ? AND logical_tool_call_id = ?').get(session.id, 'call_tBgF4tuqvCC6jxh3iTwnogOO') as { n: number }).n, 1);
 });

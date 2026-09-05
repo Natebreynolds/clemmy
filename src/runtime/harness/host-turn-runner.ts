@@ -2786,6 +2786,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
 
   const completedOutcome = async (text: string): Promise<RunOutcome> => {
     const guarded = await runOutputGuardrails(text);
+    if (hostProduction) {
+      const { pendingAcceptedLocalWork } = await import('./local-work-completion.js');
+      const pending = pendingAcceptedLocalWork(exactHostIdentity());
+      if (pending) return blockedOutcome(guarded, 'local_work_incomplete');
+    }
     emit('agent_end', runContext, agent, guarded);
     return {
       history,
