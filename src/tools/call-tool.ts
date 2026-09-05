@@ -955,11 +955,22 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
             // SAY THE EXACT CORRECTION, not a menu. Live 2026-09-02 (grok-4.6,
             // platform-49 cleanup): the old prose said "use tool_search", the
             // model wrapped tool_search in THIS carrier, was refused again, and
-            // the no-progress governor ended the turn. A first-class tool IS
-            // available this turn, just not through the carrier — name that
-            // exact move. An unknown name is a different problem and says so.
+            // the no-progress governor ended the turn — so the correction names
+            // the exact move instead.
+            //
+            // It must also be TRUE. This branch used to answer any
+            // registry-declared name with "it is a FIRST-CLASS tool on this
+            // turn: call it directly" — but the guard above has just
+            // established the opposite, so that advice fired exactly when it
+            // was false. Live 2026-09-05: a cold background turn asked for a
+            // built-in this turn's policy does not reach, was told three times
+            // to call it directly, could not (it is not on the surface), and
+            // the turn died at the no-progress floor.
             detail: isRegistryDeclaredTool(target)
-              ? `"${requestedTarget}" is a FIRST-CLASS tool on this turn: it is available, but not through this carrier. Call ${requestedTarget} DIRECTLY as its own tool call, with its own arguments, in your next response. Do not wrap it.${boundSourceCorrection(requestedTarget)}`
+              ? `"${requestedTarget}" is a Clementine built-in, but it is NOT on this turn's surface:`
+                + ' this turn\'s tool policy does not reach it, so neither this carrier nor a direct call can invoke it here.'
+                + ' Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to disclose the exact operation for this step,'
+                + ` then invoke that operation.${boundSourceCorrection(requestedTarget)}`
               : `"${requestedTarget}" is not a tool on this turn's surface. Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to find the exact operation, then invoke that operation. A connected external MCP tool is named <server>__<tool>.${boundSourceCorrection(requestedTarget)}`,
           });
         }

@@ -222,9 +222,46 @@ test('refuses a target that is not on the orchestrator surface (no escalation)',
   for (const target of ['cron_list', 'nonexistent_tool_xyz']) {
     const out = JSON.parse(String(await invokeCallTool('sess-auth', target, '{}')));
     assert.equal(out.error, 'not_reachable', `${target} should be refused`);
+    // The correction must be TRUE as well as exact. Live 2026-09-05: a
+    // registry-declared built-in this turn could not reach was answered with
+    // "it is a FIRST-CLASS tool on this turn ... call it directly"; the model
+    // could not (it is not on the surface), retried the carrier three times,
+    // and the turn died at the no-progress floor.
+    assert.ok(!/FIRST-CLASS tool on this turn/.test(String(out.detail ?? '')),
+      `${target} is not on this turn's surface, so the refusal must not claim it is`);
+    assert.match(String(out.detail ?? ''), /tool_search/,
+      `${target}'s refusal must name a door the model can actually take`);
   }
   // sanity: the guard is not refusing everything — an orchestrator tool is reachable.
   assert.ok(deriveOrchestratorDiscoveryNames().has('composio_execute_tool'));
+});
+
+test('an unreachable built-in is told it is off the surface, never to call it directly', async () => {
+  // Live 2026-09-05, cold background turn: the model wrapped a built-in this
+  // turn's policy does not reach in this carrier and was told "it is a
+  // FIRST-CLASS tool on this turn ... call it DIRECTLY". It is not on the
+  // surface, so a direct call was impossible; the model retried the carrier
+  // three times and the turn died at the no-progress floor. A refusal must
+  // name a door that exists.
+  const callTool = buildCallTool({
+    reachableBuiltinNames: new Set(['memory_recall']),
+    firstClassNames: new Set(['tool_search']),
+  }) as unknown as ToolLike;
+  const out = await withToolOutputContext({ sessionId: 'sess-offsurface-builtin' }, () =>
+    callTool.invoke!(
+      { context: { sessionId: 'sess-offsurface-builtin' } },
+      JSON.stringify({ name: 'background_task_status', args_json: '{"task_id":"bg-x"}' }),
+      { toolCall: { callId: 'offsurface-builtin' } },
+    ) as Promise<unknown>,
+  );
+  const refusal = JSON.parse(String(out));
+  assert.equal(refusal.error, 'not_reachable');
+  const detail = String(refusal.detail ?? '');
+  assert.ok(!/FIRST-CLASS tool on this turn/.test(detail),
+    'a tool the guard just proved unreachable must not be described as first-class');
+  assert.ok(!/Call background_task_status DIRECTLY/.test(detail),
+    'the refusal must not send the model at a door that is closed this turn');
+  assert.match(detail, /tool_search/, 'the refusal names the door that exists');
 });
 
 test('turn-scoped reachability refuses a built-in that was not advertised as deferred', async () => {
