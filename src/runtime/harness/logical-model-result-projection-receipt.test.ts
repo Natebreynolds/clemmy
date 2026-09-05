@@ -796,3 +796,85 @@ test('trusted local compaction of a HOST-settled result keeps provenance, tamper
     'a stub that predates the receipt it presents is refused',
   );
 });
+
+test('a clipped host refusal reverses from the sealed host frame, not from the parked message', () => {
+  // Live 2026-09-05, the canary that would not resume: the recall store parks
+  // the operator MESSAGE a refused call returned (352 characters), while the
+  // model was shown the canonical disposition ENVELOPE (758). An older build
+  // had clipped two such frames, so from then on every turn of that session
+  // refused host_result_projection_mismatch — the parked bytes could never
+  // rebuild the sealed ones. The reversal therefore has a second, stronger
+  // owner: the host's own accepted-model-batch history, written before the
+  // model ever replied and unreachable by it.
+  const task = accept('host clip reversed from the sealed frame');
+  const callId = `host-sealed-${Date.now()}`;
+  const toolName = 'work_call';
+  const admission = admit({ task, callId, toolName });
+  const refusal = hostResults.buildHostToolDispositionResult({
+    callId,
+    toolName,
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'b'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    countsRefusal: true,
+    diagnostic: `Tool '${toolName}' was refused before dispatch because its exact capability, effect, account, schema, or invoke binding is absent or changed. Failed check: effective_inner_name_missing.`,
+  });
+  hostResults.recordHostModelResultReceipts({ admission, resultItems: [refusal] });
+  const refusalText = (refusal as unknown as { output: { text: string } }).output.text;
+  assert.ok(refusalText.length >= 400, 'the disposition must be clip-eligible by size on the older bytes');
+
+  // PRODUCTION SHAPE: what the lossless store actually holds for this call.
+  const parkedMessage = `Tool '${toolName}' was refused before dispatch. No local or external mutation was attempted.`;
+  assert.notEqual(parkedMessage.length, refusalText.length,
+    'the parked message and the sealed envelope must differ, as they do in production');
+  eventlog.writeToolOutput({ sessionId: task.sessionId, callId, tool: toolName, output: parkedMessage });
+
+  // The host's sealed frame history: committing this accepted batch records the
+  // exact model-visible result the receipt attests.
+  const sealed = checkpoints.finalizeAcceptedModelBatch(admission, { committedResultItems: [refusal] });
+  assert.equal(sealed.status, 'committed', JSON.stringify(sealed));
+
+  const placeholder = textResult({ callId, toolName, text: 'x'.repeat(refusalText.length) });
+  const retainedSentinel = textResult({ callId: `retain-${callId}`, toolName, text: 'small recent result' });
+  const clippedAt = new Date().toISOString();
+  assert.equal(compaction.clipOldToolResults([placeholder, retainedSentinel], 1, { now: () => clippedAt }), 1);
+  eventlog.appendEvent({
+    sessionId: task.sessionId,
+    turn: 0,
+    role: 'system',
+    type: 'condenser_applied',
+    data: {
+      layer1: { applied: true, clipped: 1, collapsedToolPairs: 0 },
+      layer2: { applied: false, removedItems: 0, summaryItems: 0 },
+      layer3: { applied: false, forkRequested: false },
+    },
+  });
+
+  const request = modelRequest({ task, callId, toolName, result: placeholder });
+  const recorded = provenance.recordModelRequestDispatchProvenance({
+    sessionId: task.sessionId,
+    sourceUserSeq: task.sourceUserSeq,
+    request: request as never,
+    hostProjection: promptCache.canonicalPromptCacheRequest(request as never),
+  });
+  assert.equal(provenance.projectModelRequestProvenance(recorded.record.recordId).status, 'ok',
+    'the host frame the receipt sealed reverses the stub even when the parked message differs');
+
+  // Fail-closed: a stub whose character count matches no sealed frame is not a
+  // presentation of this receipt, and the parked message cannot rescue it.
+  const forged = structuredClone(placeholder) as AgentInputItem & { __clippedMeta: { bytes: number } };
+  forged.__clippedMeta.bytes += 1;
+  const forgedRequest = modelRequest({ task, callId, toolName, result: forged as AgentInputItem });
+  assert.throws(
+    () => provenance.recordModelRequestDispatchProvenance({
+      sessionId: task.sessionId,
+      sourceUserSeq: task.sourceUserSeq,
+      request: forgedRequest as never,
+      hostProjection: promptCache.canonicalPromptCacheRequest(forgedRequest as never),
+    }),
+    (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
+      && error.code === 'host_result_projection_mismatch',
+    'a stub that matches no sealed host frame is still refused',
+  );
+});

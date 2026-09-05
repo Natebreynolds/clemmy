@@ -534,6 +534,23 @@ export function trustedCompactedHostResultMatches(input: {
     || receiptAtMs > clippedAtMs
   ) return false;
 
+  const reversed = retainedToolOutputReversesHostStub(input, clipped)
+    || sealedHostFrameReversesStub(input.receipt, clipped);
+  if (!reversed) return false;
+  return layer1ClipAccountedFor(input.sessionId, clipped.clippedAt, clippedAtMs, input.visibleResults);
+}
+
+/** Reversal through the lossless recall store: the parked bytes rebuild the
+ * exact result the receipt sealed. This is the ordinary case — a clipped tool
+ * output whose recall target is the same text the model saw. */
+function retainedToolOutputReversesHostStub(
+  input: {
+    sessionId: string;
+    result: VisibleFunctionResult;
+    receipt: ReturnType<typeof hostModelResultReceiptFromRow>;
+  },
+  clipped: NonNullable<ReturnType<typeof describeCanonicalClippedToolResult>>,
+): boolean {
   const retained = getToolOutput(input.sessionId, clipped.callId);
   if (
     !retained
@@ -549,7 +566,7 @@ export function trustedCompactedHostResultMatches(input: {
     { ...originalBase, output: { type: 'text', text: retained.output } },
     { ...originalBase, output: retained.output },
   ] as AgentInputItem[];
-  const reversed = originalCandidates.some((candidate) => {
+  return originalCandidates.some((candidate) => {
     let rebuilt: VisibleFunctionResult | undefined;
     try {
       rebuilt = visibleFunctionResults(candidate)[0];
@@ -561,8 +578,82 @@ export function trustedCompactedHostResultMatches(input: {
       && rebuilt.outputSha256 === input.receipt.outputSha256
       && hostModelResultReceiptMatchesItem(input.receipt, candidate as never);
   });
-  if (!reversed) return false;
-  return layer1ClipAccountedFor(input.sessionId, clipped.clippedAt, clippedAtMs, input.visibleResults);
+}
+
+/** Reversal through the host's own sealed frame history.
+ *
+ * A host disposition is shown to the model as its canonical envelope, but the
+ * lossless recall store parks the plain operator message that call returned —
+ * so for a clipped refusal the two texts differ and the recall route above
+ * cannot reverse the stub. Live 2026-09-05: an earlier build clipped two
+ * refused `work_call` frames, and every later turn of that session died at
+ * `host_result_projection_mismatch` because 352 parked characters could never
+ * rebuild the 758-character envelope the receipt sealed.
+ *
+ * The accepted-model-batch checkpoint and admission rows are the host's own
+ * record of the exact frame history it sent, written before any model reply and
+ * unreachable by the model. Finding this receipt's item there, byte-identical
+ * to the receipt, proves the stub presents that settlement and nothing else. */
+function sealedHostFrameReversesStub(
+  receipt: ReturnType<typeof hostModelResultReceiptFromRow>,
+  clipped: NonNullable<ReturnType<typeof describeCanonicalClippedToolResult>>,
+): boolean {
+  if (clipped.callId !== receipt.callId || clipped.toolName !== receipt.toolName) return false;
+  const db = openEventLog();
+  const rows = [
+    ...(db.prepare(`
+      SELECT history_json AS items_json
+        FROM accepted_model_batch_checkpoints
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY batch_ordinal DESC
+    `).all(receipt.sessionId, receipt.sourceUserSeq) as Array<{ items_json: string }>),
+    ...(db.prepare(`
+      SELECT pre_history_json AS items_json
+        FROM accepted_model_batch_admissions
+       WHERE session_id = ? AND source_user_seq = ?
+       ORDER BY batch_ordinal DESC
+    `).all(receipt.sessionId, receipt.sourceUserSeq) as Array<{ items_json: string }>),
+  ];
+  for (const row of rows) {
+    let items: unknown;
+    try {
+      items = JSON.parse(row.items_json);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(items)) continue;
+    for (const raw of items) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const item = raw as Record<string, unknown>;
+      if (
+        item.type !== 'function_call_result'
+        || item.callId !== receipt.callId
+        || item.name !== receipt.toolName
+        // A stub can only be reversed by the unclipped frame it replaced.
+        || item.__clipped === true
+      ) continue;
+      const output = item.output as { type?: unknown; text?: unknown } | undefined;
+      const text = typeof output === 'string'
+        ? output
+        : output && typeof output === 'object' && typeof output.text === 'string'
+          ? output.text
+          : null;
+      if (text === null || text.length !== clipped.originalChars) continue;
+      let rebuilt: VisibleFunctionResult | undefined;
+      try {
+        rebuilt = visibleFunctionResults(item as AgentInputItem)[0];
+      } catch {
+        continue;
+      }
+      if (
+        rebuilt !== undefined
+        && rebuilt.outputBytes === receipt.outputBytes
+        && rebuilt.outputSha256 === receipt.outputSha256
+        && hostModelResultReceiptMatchesItem(receipt, item as never)
+      ) return true;
+    }
+  }
+  return false;
 }
 
 function acceptedBatchAdmissionCountForResult(input: {
