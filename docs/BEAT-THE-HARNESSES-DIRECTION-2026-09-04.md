@@ -2190,3 +2190,76 @@ draft-canary exact-schema mismatch; (4) malformed `run_worker` packet settling
 `succeeded` with zero children (newly measured debt); (5) the 9 old journeys —
 decision with the owner; (6) §15 watcher re-arm on `worker_started`; (7) full
 gates on final bytes + packaged rehearsal; push/tag only on the owner's words.
+
+**2026-09-05 00:24 — TAKEOVER, first commits.** The hand-over WIP was reviewed (guard fires only
+on a SUPPLIED file, not an allowed attachment schema; mismatch diagnostics are
+observability only; refusal text now names an edge the sealed plan can take) and
+verified in isolation: 266/266 across its five test files, typecheck ✅, hygiene ✅,
+and the local retained-byte replay of the canary's batch 6 passes (corrected
+singleton dispatches once, no exact-schema mismatch). Committed as `94e42ed5`; log
+as `a6bea8fe`. The retained-byte red test stays untracked on purpose (it reads
+private evidence). **Branch note for the owner:** this checkout is
+`wave/one-gate-and-hardcode-subtraction`, 46 commits ahead of `origin/main`
+(`ed12a63a`, 21:14) — the release preflight requires the tag SHA to equal
+`origin/main`, so a push of this branch to `main` will be needed before any tag;
+that push happens only on the owner's words. In flight now: the `f616da92`
+repair-path fix (root-cause → adversarial refutation → isolated fix + pin) and the
+malformed-`run_worker`-packet settlement fix + pin, both in isolated worktrees;
+patches land here with exact counts before they are applied to this checkout.
+
+**2026-09-05 00:32 — THE NINE OLD JOURNEYS, TRIAGED (three read-only readers, git history +
+log error blocks + the asserted code; no tests run). Proposed decision for the
+owner — fix 4, update 3, defer 2 with written reasons:**
+- **FIX NOW (one shared mechanism, four journeys, all in
+  `provider-neutral-no-random-gate.acceptance`):** "explicit outbound draft requests
+  one user approval before I/O", "approved outbound checkpoint recovery never
+  duplicates the send", "approved exact outbound with an unknown crossing holds
+  across restart", "exact accepted external plans execute ordinary Sheet and Google
+  Doc creates without a random gate". The pause DOES happen (one consent subject,
+  approval row registered + resolved) but on resume the approved exact outbound never
+  reaches the provider port: `bodies 0 !== 1` — the resume loop takes the
+  `resumeFrameRepair` branch (`releasePreparedHostWorkCallForRepair` +
+  `settlePendingCallBeforeDispatch(…,'approval_scope_changed_before_dispatch')`) and
+  pairs a zero-I/O repair back to the model. Red since between the v3.16.0 cut
+  (`d3bc85ca`, 08-30) and the 08-31 ring commits; the resume/consent files are
+  byte-identical across that window, so the break is upstream of the resume loop.
+  This IS P3's acceptance line ("genuine send/delete/admin still needs_user; one
+  authorized write crosses exactly once") — not deferrable. Method: bisect this one
+  file across d3bc85ca → 08c81c8a → 2b7bbbac → 548741b5 → 38fa83ad in throwaway
+  worktrees (~40 s each), then fix the class. Est 1–3 h.
+- **UPDATE TO THE CURRENT CONTRACT (test-only, evidence kept):** "competitive byte
+  ledger…" (asserts `run_worker` ABSENT from the step-1/2 surface — the
+  hidden-until-plan hoop removed at `658b12c2`; assert the refusal receipt instead,
+  keep the byte ceilings); "zero-crossing retirement…" (source-A terminal is now
+  `blocked/control_no_progress_exhausted`, resumable — flipped at `7bd17d6f`; every
+  other assertion stays); "a plan with no exact verifier…" (wording changed at
+  `5faf8eb7` to "wrote, could not verify"; assert the carried obligation). In flight
+  now in isolated worktrees; each must be green on its own evidence.
+- **DEFER PAST THE TAG, WRITTEN INTO `docs/releases/v3.16.0.md`:** "GATE: a legacy
+  input-digest disclosure rebuilds full staged identity after restart" (the failing
+  check is the planning-card freeze ceremony P5 retires; the fixture models
+  pre-`providerDefinition` rows whose upgrade is now an explicit door) and "an
+  accepted read plan cannot stop at prose: host continues once…" (the CONTRACT — a
+  frozen read plan with zero settlements is not a finished turn — is D1/no-dead-ends
+  and stays owed; the exact assertion is tied to a shape P5 changes; re-pin it in P4/P5
+  rather than green-wash it now).
+Owner: say "agree" or change any line; the fix-now group starts as soon as the
+`f616da92` repair-path patch lands (same file, same resume/consent region — one
+patch at a time in that region).
+
+**2026-09-05 00:38 — three journey contract updates came back from isolated worktrees (test-only,
+evidence kept byte-for-byte):** zero-crossing retirement → green (asserts
+`blocked/control_no_progress_exhausted` and `resumable ≠ false`, the `7bd17d6f`
+shape); no-exact-verifier → green (accepts "could not verify|confirm", adds "never
+claim done" and a non-empty `unverifiedMutations` obligation — strictly additive);
+competitive byte ledger → hoop assertions updated (run_worker advertised from step 1;
+zero `worker_started` / zero `physical_dispatches` as the evidence), and that
+UNMASKED the gate the journey was written for: **the cold step-1 model-visible
+surface is 28,843 B against a 16 KiB ceiling; pre-activation discovery/schema
+37,594 B against 32 KiB. `run_worker` alone is 8,836 B — the largest tool on the
+surface; P2 added it to step 1.** The file's own header says it is a RED
+competitive gate until the cold surface is genuinely bounded, so it moves to the
+"defer with a written reason" group — but it is real §16 token debt (fix #8 family):
+compacting the `run_worker` description/schema (a 9 KB tool description is prompt
+prose masquerading as schema) is the single biggest cut available. Applying the
+three patches to this checkout now; the files re-run here before they are committed.
