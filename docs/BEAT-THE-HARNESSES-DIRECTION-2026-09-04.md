@@ -2683,3 +2683,48 @@ advertised packet contract. The end-to-end condition ("confident I can run Clem 
 any task") is not met either: the canary still cannot create its five drafts. The next lane is
 the carrier/plan-authority class on continuation turns, with the new `frame_refused` fields to
 name the cause on the first run instead of the fourth.
+
+
+**2026-09-05 09:20 — COLD LIVE RUNS on a task the reviewer wrote ("create one Outlook
+draft to me, do not send"), isolated home, brain claude-sonnet-5. Three runs, three
+distinct defects, all now fixed or named:**
+
+1. **The task ran on a dead provider.** The promotion that turns a chat request into a
+background task pinned `MODELS.deep` — the OpenAI tier constant — so a home whose brain
+is claude-sonnet-5 and whose Codex login is unavailable answered "I've started it as a
+background task" and then failed on the task's FIRST model call. Fixed at `8fc00315`:
+both the promotion and the executor default resolve the configured brain
+(`resolveRoleModel('brain')`, the same resolver the settings surface reports).
+
+2. **A refusal sent the model at a door that was closed.** The carrier answered a
+registry-declared name with "it is a FIRST-CLASS tool on this turn: call it DIRECTLY" —
+chosen by registry membership while the guard directly above had just established the
+tool is neither first-class nor reachable. The model could not call it directly, retried
+the carrier three times, and the turn died at the no-progress floor. Fixed at `76d6a817`:
+the refusal says the built-in is not on this turn's surface and names the door that
+exists.
+
+3. **The harness held the answer and offered the wrong providers.** With the brain fix in,
+the third run behaved well for eighteen calls — it searched, recalled memory, and PARKED
+to ask a real question ("two Outlook accounts are connected, which mailbox should hold
+this draft?"). Answered, it composed a complete, correct draft payload and called
+work_call — and the pre-dispatch refusal replied: *"The operations proven for this step
+are: GREENHOUSE_CREATE_USER_EMAIL, OPENAI_CREATE_MESSAGE, AIRTABLE_CREATE_RECORD,
+SLACK_…, FIRECRAWL_…"* — twenty operations, not one of them Outlook, for a task about an
+Outlook draft. It searched six more times and died at the no-progress floor. `2b198d5d`
+fixes the ADVICE (the repair now ranks by the toolkit the call names and, when that
+toolkit has nothing proven, says so and forbids substituting another provider).
+
+**The root cause under (3) is still open and is the next lane.** `tool_search` disclosed
+`OUTLOOK_CREATE_MAIL_FOLDER_MESSAGE` (a single exact result, repeatedly), yet NO Outlook
+capability was ever recorded by `capability_discovered`/`capability_resolution` on that
+turn, while twenty operations from other toolkits were. The session's own
+`host_call_capability_bindings` table holds `cap:resolved:outlook_create_draft` — the
+exact capability this task needed. So the harness disclosed an operation it could not
+bind, never surfaced the one it HAD bound, and refused the write with a menu from
+unrelated providers. That is the "holds the answer, won't say it" class in its clearest
+form to date, and it is where the next fix belongs: the disclosure→proof path for the
+toolkit the request names.
+
+Evidence for all three runs (event trails, refusal texts, task records, snapshots):
+`scratchpad/takeover/live/cold-draft-{1,2,3}`.
