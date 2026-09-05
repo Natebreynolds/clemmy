@@ -6798,6 +6798,35 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           continue;
         }
       }
+      if (hostProduction) {
+        const { pendingAcceptedLocalWork, pendingLocalWorkContinuation } = await import('./local-work-completion.js');
+        const identity = exactHostIdentity();
+        const pending = pendingAcceptedLocalWork(identity);
+        const decision = toOrchestratorDecision(admission.frame.text);
+        if (pending && decision?.nextAction !== 'awaiting_user_input' && decision?.nextAction !== 'awaiting_approval') {
+          const { getHarnessBudgetSettings } = await import('./budget-settings.js');
+          const continuation = pendingLocalWorkContinuation({
+            ...identity, pending,
+            autoContinueOnLimit: getHarnessBudgetSettings().autoContinueOnLimit,
+            toolCalls: harnessRunContextStorage.getStore()?.counter.currentCount ?? 0,
+          });
+          history.push(...admission.frame.history);
+          if (step.responseId !== undefined) lastResponseId = step.responseId;
+          if (!continuation.resume) return {
+            ...await completedOutcome(admission.frame.text),
+            blockedDetail: continuation.reason,
+          };
+          const { buildContinueInput } = await import('./continue-directive.js');
+          // The host owns the next edge; record its cost before giving the
+          // model another step. This never mints a new accepted user source.
+          appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+            kind: 'local_work_continuation', sourceUserSeq: identity.sourceUserSeq,
+            attempt: continuation.attempt, missing: pending.missing,
+          } });
+          pendingHostModelDirective = buildContinueInput(admission.frame.text, { auto: true, missing: pending.missing });
+          continue;
+        }
+      }
       if (hostJudgeCompletion) {
         const judged = await judgeHostCompletion(admission.frame.text, admission.frame.history, step.responseId);
         if (judged === 'continue') continue;

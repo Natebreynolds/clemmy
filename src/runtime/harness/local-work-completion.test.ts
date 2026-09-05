@@ -199,3 +199,99 @@ test('a failed read followed by successful alternative remains completable', () 
   preflight(identity);
   assert.equal(publish(identity, 'Both package versions are 3.16.0.').presentation.status, 'done');
 });
+
+for (const variant of ['recover', 'worker_down'] as const) test(`the host completion consumer continues only the missing captured item (${variant})`, async () => {
+  const { hostRunRunner } = await import('./host-turn-runner.js');
+  const brackets = await import('./brackets.js');
+  const envelopes = await import('../../agents/capability-envelope.js');
+  const catalogs = await import('./host-capability-catalog-factory.js');
+  const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  try {
+    const session = events.createSession({ id: `host-local-continue-${variant}-${++serial}`, kind: 'chat' });
+    const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: PROMPT } });
+    const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+    const packet = JSON.parse(CAPTURED_ARGUMENTS);
+    let calls = 0;
+    const model = {
+      async getResponse(request: unknown) {
+        calls += 1;
+        brackets.harnessRunContextStorage.getStore()!.counter.increment();
+        if (calls === 1) {
+          admitRefusal(identity, PROMPT);
+          for (const item of workerCallItems(packet)!.slice(0, 7)) events.appendEvent({
+            ...identity, role: 'system', type: 'worker_result',
+            data: { sourceUserSeq: source.seq, item, ok: true, packetKey: workerPacketKey({ ...packet, item }), toolCallId: CALL_ID },
+          });
+        } else {
+          assert.match(JSON.stringify(request), /Remaining accepted local items/);
+          assert.match(JSON.stringify(request), /audit-8/);
+          assert.equal(events.listEvents(session.id, { types: ['worker_result'] }).filter((event) => event.data.ok === true).length, 7);
+          if (variant === 'recover') events.appendEvent({
+            ...identity, role: 'system', type: 'worker_result',
+            data: { sourceUserSeq: source.seq, item: 'audit-8', ok: true, packetKey: workerPacketKey({ ...packet, item: 'audit-8' }), toolCallId: 'repair-audit-8' },
+          });
+        }
+        return { responseId: `local-continue-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: calls > 1 && variant === 'recover' ? 'All eight worker results are available.' : 'Seven results are retained; audit-8 still needs its read.' }] }] };
+      },
+      async *getStreamedResponse(request: unknown) {
+        const response = await this.getResponse(request);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      },
+    };
+    const agent = { model, tools: [] };
+    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: session.id, universeTools: [], activeToolNames: [], policyHash: 'local-continuation', budget: { maxUncachedTokens: 10_000, maxModelCalls: 4, maxToolCalls: 20, maxElapsedMs: 60_000 } });
+    assert.ok(sealed.ok);
+    if (!sealed.ok) return;
+    envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+    envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+    const runner = Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not run'); } });
+    const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(20) }, () => hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: PROMPT }] as never, { maxTurns: 4, hostTurnEngine: 'host_v1', context: identity } as never));
+    assert.equal(calls, 2, 'one same-loop repair is attempted; unchanged missing items cannot spin');
+    assert.equal(outcome.terminal?.status, variant === 'recover' ? undefined : 'blocked');
+    if (variant === 'worker_down') assert.equal(outcome.blockedDetail, 'no_progress');
+    const committed = delivery.commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false, presentation: { kind: 'answer', text: String(outcome.finalOutput) } }, { terminalJudgeDisposition: 'deliver' });
+    assert.equal(committed.presentation.status, variant === 'recover' ? 'done' : 'blocked', JSON.stringify(committed));
+    assert.equal(events.listEvents(session.id, { types: ['user_input_received'] }).length, 1, 'the same accepted source owns the entire repair');
+    const resumes = events.listEvents(session.id, { types: ['guardrail_tripped'] }).filter((event) => event.data.kind === 'local_work_continuation');
+    assert.equal(resumes.length, 1);
+    assert.deepEqual(resumes[0]!.data.missing, [`${packet.workManifest.id}/${packet.workManifest.phase}/audit-8`]);
+    if (variant === 'worker_down') {
+      const { pendingAcceptedLocalWork, pendingLocalWorkContinuation } = await import('./local-work-completion.js');
+      const pending = pendingAcceptedLocalWork(identity)!;
+      assert.deepEqual(pendingLocalWorkContinuation({ ...identity, pending, autoContinueOnLimit: true, toolCalls: 100 }),
+        { resume: false, reason: 'no_progress' }, 'a fresh caller cannot reset the source-owned missing-item checkpoint');
+    }
+  } finally {
+    catalogs.installHostCapabilityCatalogFactory(priorCatalog);
+  }
+});
+
+test('local continuation preserves preset and cap guards and only new item receipts count as progress', async () => {
+  const { pendingAcceptedLocalWork, pendingLocalWorkContinuation } = await import('./local-work-completion.js');
+  const identity = fixture();
+  const pending = pendingAcceptedLocalWork(identity)!;
+  const base = { ...identity, pending, autoContinueOnLimit: true, toolCalls: 1 };
+  assert.deepEqual(pendingLocalWorkContinuation({ ...base, autoContinueOnLimit: false }), { resume: false, reason: 'preset_asks' });
+  assert.deepEqual(pendingLocalWorkContinuation({ ...base, toolCalls: 0 }), { resume: false, reason: 'no_progress' });
+  events.appendEvent({ ...identity, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'local_work_continuation', sourceUserSeq: identity.sourceUserSeq, missing: pending.missing, attempt: 1,
+  } });
+  assert.deepEqual(pendingLocalWorkContinuation(base), { resume: false, reason: 'no_progress' });
+  const packet = JSON.parse(CAPTURED_ARGUMENTS);
+  events.appendEvent({ ...identity, role: 'system', type: 'worker_result', data: {
+    sourceUserSeq: identity.sourceUserSeq, item: 'audit-1', ok: true, packetKey: workerPacketKey({ ...packet, item: 'audit-1' }),
+  } });
+  const advanced = { ...base, pending: pendingAcceptedLocalWork(identity)! };
+  assert.deepEqual(pendingLocalWorkContinuation(advanced), { resume: true, attempt: 2 });
+  const previousCap = process.env.CLEMMY_CHAT_AUTO_CONTINUE_CAP;
+  process.env.CLEMMY_CHAT_AUTO_CONTINUE_CAP = '1';
+  try {
+    assert.deepEqual(pendingLocalWorkContinuation(advanced), { resume: false, reason: 'cap_exhausted' },
+      'durably spent continuation cap survives re-entry even after some item progress');
+  } finally {
+    if (previousCap === undefined) delete process.env.CLEMMY_CHAT_AUTO_CONTINUE_CAP;
+    else process.env.CLEMMY_CHAT_AUTO_CONTINUE_CAP = previousCap;
+  }
+});

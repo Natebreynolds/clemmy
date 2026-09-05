@@ -8,10 +8,38 @@ import { listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { summarizeWorkManifest, type WorkEvidenceRef } from './work-manifest.js';
+import { chatAutoContinueCap, chatAutoContinueDecision } from './continue-directive.js';
 
 export interface PendingLocalWork {
   reason: string;
   missing: string[];
+}
+
+/** The existing event ledger owns continuation expenditure, including across
+ * checkpoint/daemon re-entry. Failed calls cannot count as item progress once
+ * the host has already returned the exact missing-item repair. */
+export function pendingLocalWorkContinuation(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  autoContinueOnLimit: boolean;
+  toolCalls: number;
+  pending: PendingLocalWork;
+}): { resume: true; attempt: number } | { resume: false; reason: string } {
+  const prior = listEvents(input.sessionId, { types: ['guardrail_tripped'], sinceSeq: input.sourceUserSeq })
+    .filter((event) => event.role === 'system' && event.data.kind === 'local_work_continuation'
+      && event.data.sourceUserSeq === input.sourceUserSeq);
+  const lastMissing = prior.at(-1)?.data.missing;
+  const remaining = new Set(input.pending.missing);
+  const itemProgress = Array.isArray(lastMissing)
+    ? lastMissing.filter((id) => typeof id === 'string' && !remaining.has(id)).length
+    : input.toolCalls;
+  const decision = chatAutoContinueDecision({
+    autoContinueOnLimit: input.autoContinueOnLimit,
+    attempts: prior.length,
+    cap: chatAutoContinueCap(),
+    stepsThisActivation: itemProgress,
+  });
+  return decision.resume ? { resume: true, attempt: prior.length + 1 } : decision;
 }
 
 /** Only existing accepted call bytes and host-owned receipts are consulted.
