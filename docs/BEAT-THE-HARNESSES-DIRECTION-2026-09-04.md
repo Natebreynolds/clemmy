@@ -2532,3 +2532,22 @@ host receipt, or host-disposition results exempt from clipping); typed stop must
 not contradict itself. Both fixes launched (isolated worktrees, pins, adversarial
 verification). Canary re-run after the fix needs the owner's word: with Codex at
 100% it would execute on Claude fallover (contract change + Claude billing).
+
+**2026-09-05 06:44 — BOTH LIVE-RUN DEFECTS FIXED BY HAND (subagent capacity exhausted until
+05:00 PT — no adversarial-verifier pass on these two; pins + 645/645 neighbors +
+typecheck are the evidence):** `686de7ed` — the provenance host-receipt branch (dispatch
+check AND projection-side re-validation) accepts a Layer-1 clip stub under the same
+three durable owners the logical branch requires, and compaction never clips a host
+disposition; pinned (clipped host result keeps provenance, forged stub still
+refuses, disposition stays verbatim). `680e45a5` — judge `brainFamily`/`selfJudge` derive
+from the session's EXECUTED route (recorded fallover), a new `worker_model_executed`
+event names each child's executed route and `worker_result` attributes from it;
+pinned (`executedBrainFamily`). Typed-stop consistency (task `resumable:true` vs
+turn `resumable:false`, opaque user text) is NOT changed here — with the allowance
+the dead end no longer occurs; the contradiction itself is a follow-up for the
+delivery committer. Also committed: `docs/MOBILE-RELAY-SECURITY-REVIEW-2026-09-05.md`
+(`a05c574c`) — the owner-parity finding, the public default relay, a minor status
+disclosure, the 0600 key fix, and the live-test plan. Next: full gates on these
+bytes; the owner's words on: "defer", the tester's scope (own install vs the
+owner's daemon), the UI branch in the live mobile build, and the canary re-run on
+Claude fallover.
