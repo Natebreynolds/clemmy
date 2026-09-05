@@ -2745,3 +2745,57 @@ spend live model calls.
 
 So the release machinery is green on these bytes; what is NOT met is the owner's other
 condition — running an ordinary task end to end — and that is where the open lane sits.
+
+
+**2026-09-05 12:12 — THE PHONE SESSION, and the write door. The owner ran Clem from the
+app against his real accounts.** Reads were excellent: "who's on my sales team" answered
+in seconds, Alex Murphy found in Salesforce with the reporting line already correct, the
+roster committed to memory, "how many open opps does Brett have" answered exactly, and a
+follow-up-email request pulled three opportunities plus live DataForSEO backlink metrics
+per domain and composed three on-brand drafts in 113 seconds. The DataForSEO crossing is
+proven in the host log (carrier completed with
+`DATAFORSEO_GET_BACKLINKS_BULK_PAGES_SUMMARY_LIVE`); every number in the drafts is a field
+of that endpoint. Nothing was sent and nothing was written, which is what he asked for.
+
+**Then "put these in my Outlook drafts folder" failed, and the root cause is architectural,
+not a bug.** Verified line by line, one lane standing out of five after adversarial
+verification: a Composio WRITE is staging-only by design.
+`stageDisclosedPlanningProviderCandidates` records proof for reads AND writes but calls
+`registerProofProvisionedCapabilities` with `allowedIdentifiers: provenReads` only — its
+own docstring says "Writes remain staging-only until plan_task". The pre-dispatch wall
+requires a current callable catalog entry, finds none, and emits
+`catalog_entry_or_manifest_missing:candidates=0`. Reads bypass that wall entirely (the READ
+BAR binds any current callable read with no turn proof), which is exactly why every read in
+the session ran and only the write died.
+
+Three things turned a design boundary into a dead end. (1) The search page renders a
+copy-pasteable `work_call` example with the slug pre-filled for a row that has no binding.
+(2) The JIT repair edge that fires on this exact miss does not filter by effect and would
+have provisioned the write, but `materializeExactProviderBatch` drops any provider row
+missing an operation version, a valid observation, or an output schema — with a bare
+`continue`. (3) The refusal steered away from the only remaining door, and that part was
+mine: this morning's toolkit ranking (`2b198d5d`) took the "use one of those exactly"
+branch because one stale OUTLOOK READ sat in the proven set, and only the empty-set branch
+named `plan_task`. The model re-searched eighteen times and died at the no-progress floor.
+
+Fixed since: `cb44f60b` the repair names the door a write takes when the operation the call
+named is absent (my regression, repaired); `12c7a676` the exact-materialization drop names
+the operation and the missing field; `abde6614` every invalid-arguments refusal now carries
+its failing paths and repair key (nine mint sites, one fed the channel before);
+`2ade543f` the relay's LAN-only block canonicalizes the path (a trailing slash reached the
+PIN box and the pairing consumer from the public internet — reproduced, then fixed);
+`8fc00315` a promoted background task runs the configured brain instead of an OpenAI tier
+constant; `76d6a817` an unreachable built-in is told the truth about its door.
+
+**The decision now with the owner:** whether a write may provision itself from proof it
+already holds (the effect gate staying at the write boundary), or stays plan-only with the
+product saying so at disclosure time instead of at refusal time. On his machine the full
+definition for `OUTLOOK_CREATE_DRAFT` is already materialized — input schema, output
+schema, version `20260903_00`, observed at 18:37:06.234Z, the second the turn died — so
+option one needs no provider work at all there. Not built either way; his call.
+
+**Also from the phone session, for the record:** a paired device has owner parity (verified
+by hand: unscoped `/api/approvals`, `/api/devices/revoke-all`, the Codex device-login write,
+and the `.env` brain rewrite), so there is no test-user mode to hand anyone yet; and the
+mobile settings screen cannot edit the worker or judge role, so a role pointing at an
+unavailable provider can only be fixed from the desktop.
