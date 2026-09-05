@@ -3878,7 +3878,7 @@ function latestConcreteToolFailure(
   return undefined;
 }
 
-function backgroundOutcomeEvidence(
+export function backgroundOutcomeEvidence(
   task: Pick<BackgroundTaskRecord, 'runSessionId'>,
   includeToolFailure = true,
 ): OutcomeEvidence | undefined {
@@ -3930,8 +3930,12 @@ function backgroundOutcomeEvidence(
   const evidence: OutcomeEvidence = {
     ...(work.length > 0 ? { work } : {}),
     ...(artifacts.length > 0 ? { artifacts } : {}),
-    ...(completion.externalWriteReceipts > 0
-      ? { committedExternalActions: completion.externalWriteReceipts }
+    // "Committed" means the effect ledger has a SUCCEEDED reservation — never a
+    // non-failed carrier return or a confirmed-but-unsettled receipt (live
+    // 2026-09-05: a task record said committedExternalActions 2 with zero
+    // external_write_succeeded events; eleven draft attempts, none crossed).
+    ...(completion.durableExternalWriteSuccesses > 0
+      ? { committedExternalActions: completion.durableExternalWriteSuccesses }
       : {}),
     ...(lastToolFailure ? { lastToolFailure } : {}),
   };

@@ -32,6 +32,7 @@ const {
   classifyBackgroundTaskOutcome,
   _setBackgroundCompletionVerificationPauseForTests,
   backgroundCompletionEvidence,
+  backgroundOutcomeEvidence,
   markBackgroundTaskAwaitingInput,
   markBackgroundTaskAwaitingContinue,
   queueBackgroundTaskInputResolution,
@@ -2914,6 +2915,15 @@ test('background completion and restart safety require exact settlement for pre-
     'an exact write lifecycle without accepted external-effect authority is restart evidence, not completion authority',
   );
   assert.equal(backgroundCompletionEvidence(succeededTask).ambiguousExternalWrites, 0);
+  // The task RECORD commits only ledger-succeeded writes: this lifecycle has a
+  // receipt (1) but no accepted external-effect success (0), so nothing is
+  // committed on the record. Live 2026-09-05: a record said committed 2 with zero
+  // external_write_succeeded events — eleven draft attempts, none crossed.
+  assert.equal(
+    backgroundOutcomeEvidence(succeededTask)?.committedExternalActions,
+    undefined,
+    'committedExternalActions follows durableExternalWriteSuccesses, never the receipt count',
+  );
   assert.equal(assessBackgroundTaskRestartSafety(succeededTask).reason, 'external_write_history');
 
   const failedTask = createLifecycleTask('failed');
@@ -2945,6 +2955,7 @@ test('background completion and restart safety require exact settlement for pre-
   assert.equal(backgroundCompletionEvidence(orphanedTask).ambiguousExternalWrites, 1);
   assert.equal(assessBackgroundTaskRestartSafety(orphanedTask).reason, 'ambiguous_external_write');
 });
+
 
 test('an ambiguous external send blocks once and never auto-replays the mutation', async () => {
   for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
