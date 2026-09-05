@@ -1921,10 +1921,22 @@ export async function primePrimaryModelPlanningCatalog(input: {
         : `durable initial planning card is unavailable: ${installedInitialCard.reason}`,
     };
   }
+  // The card just installed (or reopened) may cite this source's own durable
+  // disclosures: a staged row is never a live factory row until plan_task
+  // publishes it, yet it is current — durable replay rebuilt it from the exact
+  // current provider, account, manifest, schema, effect, and proof evidence
+  // above. Comparing the card against live rows alone would refuse the very
+  // identity the replay just rebuilt (a restart whose only card rows are
+  // legacy disclosures). Live rows keep precedence so a real live drift on a
+  // shared id still fails typed.
+  const currentPlanningById = new Map(livePlanningById);
+  for (const descriptor of replayed.descriptors) {
+    if (!currentPlanningById.has(descriptor.id)) currentPlanningById.set(descriptor.id, descriptor);
+  }
   const reopenedInitialCard = parseDurableInitialPlanningCard({
     snapshot: installedInitialCard,
     objective,
-    currentById: livePlanningById,
+    currentById: currentPlanningById,
   });
   if (!reopenedInitialCard.ok) return reopenedInitialCard;
   // New LIVE factory rows never repack the frozen initial card. This source's

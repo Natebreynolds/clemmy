@@ -401,3 +401,98 @@ test('same-id current manifest drift cannot be hidden behind the stored card dig
   assert.equal(replay.ok, false);
   if (!replay.ok) assert.match(replay.reason, /capability drifted: cap:resolved:news_lookup/);
 });
+
+test('a first prime whose only card rows are durable same-source disclosures reopens its own card', async () => {
+  // Restart class: the process is gone and the card snapshot was never
+  // stamped for this source (a pre-card session), but the durable disclosure
+  // rows survive. Replay rebuilds the staged identity from current evidence
+  // and the first prime freezes that identity into the card. The freeze
+  // ceremony must then accept the rows it just wrote: a staged disclosure is
+  // current without being a live factory row, so a live-only universe refuses
+  // the exact identity the replay rebuilt ("capability drifted") and the
+  // source can never be planned again.
+  const factory = resetFixture();
+  registerRead({ factory, slug: 'NEWS_LOOKUP', purpose: 'recent local LLM news research' });
+  const origin = eventlog.createSession({ id: 'primary-card-disclosure-origin', kind: 'chat' });
+  const originSource = eventlog.appendEvent({
+    sessionId: origin.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Read my current local user profile.' },
+  });
+  const primed = await semantic.primePrimaryModelPlanningCatalog({
+    sessionId: origin.id,
+    sourceUserSeq: originSource.seq,
+  });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  const ref = 'cap:local:user_profile_read:read';
+  const search = buildScopedLocalToolSearch(
+    new Set(['user_profile_read']),
+    'work_call',
+    undefined,
+    undefined,
+    (candidates) => semantic.disclosePrimaryModelPlanningCapabilities({
+      authority: primed.planning.authority,
+      candidates,
+    }),
+  );
+  const output = await search.invoke(
+    new RunContext({ sessionId: origin.id }),
+    JSON.stringify({ query: 'user_profile_read', role_key: null, limit: 8 }),
+  );
+  const disclosed = JSON.parse(String(output)) as { results: Array<{ capabilityRef?: string }> };
+  assert.equal(disclosed.results[0]?.capabilityRef, ref);
+  const durableRows = eventlog.listEvents(origin.id, { types: ['capability_discovered'] })
+    .flatMap((event) => Array.isArray(event.data.capabilities) ? event.data.capabilities : []);
+  assert.ok(durableRows.length > 0, 'the disclosure left durable rows to replay');
+
+  // A source that carries the durable disclosure rows but no card snapshot.
+  const restarted = eventlog.createSession({ id: 'primary-card-disclosure-restart', kind: 'chat' });
+  const source = eventlog.appendEvent({
+    sessionId: restarted.id,
+    turn: 1,
+    role: 'user',
+    type: 'user_input_received',
+    data: { text: 'Read my current local user profile.' },
+  });
+  eventlog.appendEvent({
+    sessionId: restarted.id,
+    turn: source.turn,
+    role: 'system',
+    type: 'capability_discovered',
+    data: { sourceUserSeq: source.seq, capabilities: durableRows },
+  });
+  assert.deepEqual(eventlog.listEvents(restarted.id, { types: [SNAPSHOT_TYPE] }), []);
+  eventlog.closeEventLog();
+
+  const identity = { sessionId: restarted.id, sourceUserSeq: source.seq };
+  const rePrimed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(rePrimed.ok, true, rePrimed.ok ? '' : rePrimed.reason);
+  if (!rePrimed.ok) return;
+  assert.equal(
+    rePrimed.planning.capabilities.find((entry) => entry.id === ref)?.effect,
+    'read',
+    'the replayed disclosure is on the first card',
+  );
+  assert.equal(rePrimed.planning.digest, sha256(JSON.stringify(rePrimed.planning.capabilities)));
+  const snapshots = eventlog.listEvents(restarted.id, { types: [SNAPSHOT_TYPE] });
+  assert.equal(snapshots.length, 1, 'the first prime stamps the card exactly once');
+  const payload = JSON.parse(String(snapshots[0]!.data.snapshotJson)) as { capabilities: Array<{ id: string }> };
+  assert.ok(payload.capabilities.some((entry) => entry.id === ref),
+    'the frozen card records the replayed disclosure');
+
+  // The frozen card now cites a staged row. A second prime must reopen it
+  // unchanged: the row is still not a live factory row and still current.
+  eventlog.closeEventLog();
+  const again = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(again.ok, true, again.ok ? '' : again.reason);
+  if (!again.ok) return;
+  assert.deepEqual(
+    again.planning.capabilities.map((entry) => entry.id),
+    rePrimed.planning.capabilities.map((entry) => entry.id),
+  );
+  assert.equal(again.planning.digest, rePrimed.planning.digest);
+  assert.equal(eventlog.listEvents(restarted.id, { types: [SNAPSHOT_TYPE] }).length, 1);
+});
