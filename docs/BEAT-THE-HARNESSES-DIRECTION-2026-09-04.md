@@ -2584,3 +2584,17 @@ across the session (a later pre-run refusal inherited an old model). All four
 fixed and pinned (two attack-test files, RED without the hunks); 452/452 across
 13 suites; typecheck ✅. Lesson recorded: a hand-made fix ships only with its
 adversarial pass, even when it costs an hour.
+
+**2026-09-05 07:07 — OWNER AUTHORIZATION (conditional): "Once all this passes and you are
+confident that I can now run Clem end to end on any task I give her, push and tag
+for the first time in weeks with all the new updates, including the new mobile app
+update and desktop UI changes."** Conditions the reviewer will hold before acting:
+(1) the three remaining journeys green (no skips); (2) a full gate pass on the FINAL
+bytes (wave tip incl. the UI merge) — all gates green; (3) the Claude-pinned draft
+canary produces its reversible drafts with zero cards and zero sends (the write-side
+live proof); (4) the packaged-candidate rehearsal the release procedure requires
+(`test:packed-candidate`, `test:packaged-upgrade`, implementation artifacts
+re-emitted for the final bytes); (5) the owner's live phone check on the built
+bundle. Then: push the wave branch to `origin/main` (preflight requires tag SHA ==
+origin/main) and push the single tag `v3.16.0` explicitly — never `git push --tags`.
+If any condition fails, no tag, and the reason goes here.
