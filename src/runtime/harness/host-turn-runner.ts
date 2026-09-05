@@ -45,7 +45,8 @@ import {
   toolSchemaFingerprint,
 } from '../../agents/capability-envelope.js';
 import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
-import { acceptedTaskIdFor } from './attempt-identity.js';
+import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
+import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import {
   durableLogicalCallContract,
   durableLogicalCallRecoveryMaterial,
@@ -293,7 +294,8 @@ import {
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
 import { evaluateAuthoredWorkflowMutationConsent } from './authored-workflow-write-authority.js';
-import { mintAuthoredCallAuthority } from './authored-call-authority.js';
+import { mintHostConsentCallAuthority } from './authored-call-authority.js';
+import type { CapabilityRiskAttestationV1 } from './interactive-consent-policy.js';
 import { settledPlanTaskActivationWinner } from './plan-task-post-settlement.js';
 import { pendingAcceptedReadPlan } from './accepted-task-terminal-preparation.js';
 import {
@@ -883,8 +885,10 @@ interface PendingHostCall {
   /** Mutable: the resume owner writes user-edited args onto rawItem.arguments. */
   rawItem: { name: string; arguments: string; callId: string };
   decision?: 'approved' | 'rejected';
-  /** V3: exact reducer subject for a high-consequence planned mutation. */
+  /** V3: exact reducer subject for a high-consequence mutation. */
   consentSubject?: HostInteractiveConsentSubjectV1;
+  /** Display-only reducer facts; the exact consentSubject remains authority. */
+  consentCall?: Pick<CapabilityRiskAttestationV1, 'effect' | 'accountId' | 'risk'>;
 }
 
 export interface HostNoProgressCheckpoint {
@@ -1217,12 +1221,14 @@ export class HostInterruptState {
     rawItem: PendingHostCall['rawItem'];
     toolName: string;
     approvalResumeKey?: string;
+    consentCall?: PendingHostCall['consentCall'];
   }> {
     return this.pending
       .filter((call) => !call.decision)
       .map((call) => ({
         rawItem: call.rawItem,
         toolName: call.name,
+        ...(call.consentCall ? { consentCall: call.consentCall } : {}),
         ...(call.consentSubject
           ? {
               approvalResumeKey: hostInteractiveConsentApprovalResumeKey(call.consentSubject)
@@ -1976,10 +1982,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     entries: readonly RegisteredHostCapability[];
   } | null = null;
   const nestedCallAdmissions = new Map<string, object>();
-  // Writes the authored-consent evaluator decided `proceed` for, by logical
+  // Writes the existing consent reducer decided `proceed` for, by logical
   // call id. The port invoke mints the adapter's call authority from this
   // grant plus the exact manifest and the schema-validated arguments.
-  const authoredCallGrants = new Map<string, { coverageContractId: string }>();
+  const consentCallGrants = new Map<string, { coverageContractId: string }>();
   const freshPlanControlConfigured = (): boolean => {
     const controls = [...configuredToolRefs].filter((tool) => (
       tool.name === 'plan_task'
@@ -3464,13 +3470,28 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             ?? readDescent?.liveReadDiscovery?.accountIdentity,
         }) ?? undefined
       : undefined;
+    // A current callable write is also a candidate on its exact effect/account
+    // terms. The catalog owns manifest/schema/account/port validity; chat's
+    // earlier snapshot does not force the model to compile a plan for it.
+    // With no explicit capability reference, require a unique current account
+    // rather than synthesizing an id that happens to select a default account.
+    const provenWriteCandidate = candidates.length === 0
+      && !provenReadCandidate
+      && attestedCarrier
+      && (decision.effect === 'external_write' || decision.effect === 'admin')
+      ? resolveProvenLiveCatalogEntry({
+          capabilityId: effectiveName.startsWith('cap:') ? effectiveName : '',
+          effectiveName,
+          effect: decision.effect,
+        }) ?? undefined
+      : undefined;
     // G2 (gate 10): the accepted source literally named this operation (a
     // workflow step's own catalog scope), yet it is neither in the frozen
-    // snapshot nor a proven live read. That is a host provisioning fault,
+    // snapshot nor a proven live callable entry. That is a host provisioning fault,
     // not a call the model can correct or substitute; name it so the turn
     // stops and explains instead of looping through generic refusals until
     // the no-progress governor terminalizes it as an internal error.
-    if (candidates.length === 0 && !provenReadCandidate) {
+    if (candidates.length === 0 && !provenReadCandidate && !provenWriteCandidate) {
       const literalOperation = acceptedSourceLiteralOperation(effectiveName);
       if (literalOperation) return miss(literalOperationNotFrozenReason(literalOperation));
     }
@@ -3507,11 +3528,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // inherit the local envelope as a fallback. A same-turn proven live read
     // carries catalog-manifest authority even when the name classifier could
     // not decide (OPEN-THE-GATES live miss: effect_unknown then catalog miss).
-    const authorityBinding = provenReadCandidate
+    const authorityBinding = provenReadCandidate || provenWriteCandidate
       ? 'catalog_manifest' as const
       : runtimeToolAuthorityBinding(decision);
     if (authorityBinding === 'unknown') return miss(`authority_binding_unknown:${decision.source}`);
-    const catalogEntry = candidates[0] ?? provenReadCandidate;
+    const catalogEntry = candidates[0] ?? provenReadCandidate ?? provenWriteCandidate;
     if (authorityBinding === 'catalog_manifest' || catalogEntry) {
       const manifest = currentCapabilityManifest(catalogEntry?.manifest);
       if (!catalogEntry || !manifest) {
@@ -3565,15 +3586,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         );
       };
       // Native MCP must cross the local exact carrier for both accepted
-      // work_call and direct call_tool. Bypassing call_tool here would skip its
-      // fresh, separately-accounted metadata proof and invoke the port body
-      // without the exact last-edge revalidation.
-      const preserveExternalCarrier = isPlainOrClementineLocalTool(name, 'work_call')
+      // graph-bound work_call and direct reads. Graph-neutral mutations use
+      // the existing direct port below, including its fresh last-edge proof,
+      // after the same consent reducer decides on the nominated exact call.
+      const directMutation = (dispatchEffect === 'external_write' || dispatchEffect === 'admin')
+        && !actionExpectedWorkRequired(identity);
+      const preserveExternalCarrier = !directMutation && (isPlainOrClementineLocalTool(name, 'work_call')
         || (
           manifest.providerKind === 'native_mcp'
           && manifest.provenance.issuer === 'host:native-mcp-live-materializer:v1'
           && isPlainOrClementineLocalTool(name, 'call_tool')
-        );
+        ));
       const attestation = { ...common, ...binding, bindingDigest };
       // Pre-dispatch account preparation is keyed on manifest and port facts,
       // never on a provider name: this kernel must not learn which service a
@@ -3662,17 +3685,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               }
             }
           : async () => invokeDirectPort(() => port.invoke({
-              // A write the authored-consent evaluator granted carries the
+              // A write the existing consent reducer granted carries the
               // host's call authority: the exact manifest bound above plus the
               // arguments this turn schema-validated. Reads and ungranted
               // calls pass none, exactly as before.
-              ...(authoredCallGrants.has(logicalToolCallId)
+              ...(consentCallGrants.has(logicalToolCallId)
                 ? {
-                    authority: mintAuthoredCallAuthority({
+                    authority: mintHostConsentCallAuthority({
                       manifest,
                       canonicalArgs: effectiveArgs,
                       grant: {
-                        coverageContractId: authoredCallGrants.get(logicalToolCallId)!.coverageContractId,
+                        coverageContractId: consentCallGrants.get(logicalToolCallId)!.coverageContractId,
                         sessionId: identity.sessionId,
                         sourceUserSeq: identity.sourceUserSeq,
                         acceptedTaskId,
@@ -3767,9 +3790,44 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
     | { status: 'refused'; reason: string };
 
-  /** Read-only material-source admission. This runs before approval is
-   * surfaced and again at the last edge before invocation. It never mints a
-   * logical call, physical row, approval, or provider crossing. */
+  /** Admit the exact nominated logical call using the existing ledger path,
+   * then let the existing reducer evaluate it. No graph or physical crossing
+   * is created here; invoke later adopts this same durable call identity. */
+  const evaluateExactHostMutationConsent = (
+    exact: ExactProductionHostCall,
+    durableApproval?: Parameters<typeof evaluateUncoveredHostMutationConsent>[0]['durableApproval'],
+  ) => withHostCallAttestation(exact.attestation, () => withLogicalToolCall({
+    sessionId: exact.attestation.sessionId,
+    sourceUserSeq: exact.attestation.sourceUserSeq,
+    logicalToolCallId: exact.attestation.logicalToolCallId,
+    tool: exact.logicalToolName,
+    args: exact.logicalArgs,
+    trustedEffectCarrier: exact.trustedEffectCarrier,
+  }, async () => {
+    // This is the same logical admission/binding used by invokeHostToolCall.
+    // Persist it before the existing reducer so an ask retains exact work and
+    // a proceed enters that invoke immediately, without preparing a plan.
+    const binding = persistHostCallCapabilityBinding({
+      db: openEventLog(),
+      attestation: exact.attestation,
+      sessionId: exact.attestation.sessionId,
+      sourceUserSeq: exact.attestation.sourceUserSeq,
+      logicalToolCallId: exact.attestation.logicalToolCallId,
+      acceptedTaskId: exact.attestation.acceptedTaskId,
+      toolName: exact.attestation.toolName,
+      argumentDigest: exact.attestation.argumentDigest,
+      effect: exact.effect,
+    });
+    if (binding.status !== 'bound' && binding.status !== 'replayed') {
+      return { status: 'hold' as const, retryable: true as const, reason: `host_capability_binding_${binding.status}` };
+    }
+    return evaluateUncoveredHostMutationConsent({
+      attestation: exact.attestation,
+      args: exact.logicalArgs,
+      ...(durableApproval ? { durableApproval } : {}),
+    });
+  }));
+
   const exactMaterialSourceGate = (input: {
     exactProduction: ExactProductionHostCall;
     sessionId: string;
@@ -4063,28 +4121,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const parsedArguments = parsedArgs(argumentsJson);
     let admittedEffect: RuntimeToolEffect = currentFrameEffects.get(call.callId)
       ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
-    let canaryRefusal = readOnlyCanaryRefusal(
+    const canaryRefusal = readOnlyCanaryRefusal(
       call.name,
       parsedArguments,
       argumentsJson,
       tool,
       call.callId,
     );
-    if (
-      canaryRefusal
-      && lastExactProductionMiss.startsWith('catalog_entry_or_manifest_missing')
-      && await jitProvisionCarriedOperation(call.name, parsedArguments)
-    ) {
-      // Re-run the exact check against the now-provisioned definition; the
-      // refusal (and the miss it names) is recomposed, never edited.
-      canaryRefusal = readOnlyCanaryRefusal(
-        call.name,
-        parsedArguments,
-        argumentsJson,
-        tool,
-        call.callId,
-      );
-    }
     // Read synchronously: sibling reads share a bounded pool, and the exact
     // miss belongs to the refusal composed on the line above.
     const literalFaultOperation = canaryRefusal
@@ -5823,6 +5866,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       toolName: pending.name,
       args: parsedArgs(pending.rawItem.arguments),
       rawArgs: pending.rawItem.arguments,
+      ...(pending.consentCall ? { consentCall: pending.consentCall } : {}),
       ...(pending.consentSubject
         ? {
             approvalResumeKey: hostInteractiveConsentApprovalResumeKey(pending.consentSubject)
@@ -5946,52 +5990,49 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           },
         },
       );
-      if (
-        !exactProduction
-        || !isPlainOrClementineLocalTool(pending.name, 'work_call')
-        || !isHostPlanRequiredWorkCall(tool)
-      ) {
+      if (!exactProduction) {
         resumeFrameRepair = true;
         break;
       }
-      const prepared = await withHostCallAttestation(
-        exactProduction.attestation,
-        () => prepareHostWorkCall(tool, {
-          sessionId: identity.sessionId,
-          sourceUserSeq: identity.sourceUserSeq,
-          logicalToolCallId: pending.callId,
-          outerArgs: args!,
-          runContext,
-          details: {
-            toolCall: {
-              type: 'function_call',
-              callId: pending.callId,
-              name: pending.name,
-              arguments: argumentsJson,
-            },
-          },
-        }),
-      );
-      if (prepared.status !== 'prepared') {
-        resumeFrameRepair = true;
-        break;
-      }
-      preparedMutations.push({ pending, preparation: prepared.preparation });
-
       if (pending.decision === 'rejected') continue;
-      const consent = await evaluatePreparedHostWorkCallConsent({
-        preparation: prepared.preparation,
-        ...(pending.consentSubject && exactApprovalId
-          ? {
-              durableApproval: {
-                approvalId: exactApprovalId,
-                persistedSubject: pending.consentSubject,
-                outerToolName: pending.name,
-                outerRawArguments: argumentsJson,
+      const durableApproval = pending.consentSubject && exactApprovalId
+        ? { approvalId: exactApprovalId, persistedSubject: pending.consentSubject,
+            outerToolName: pending.name, outerRawArguments: argumentsJson }
+        : undefined;
+      let consent: Awaited<ReturnType<typeof evaluateUncoveredHostMutationConsent>>;
+      if (exactProduction.boundary !== 'nested_owned' && !actionExpectedWorkRequired(identity)) {
+        consent = await evaluateExactHostMutationConsent(exactProduction, durableApproval);
+      } else {
+        if (!isPlainOrClementineLocalTool(pending.name, 'work_call') || !isHostPlanRequiredWorkCall(tool)) {
+          resumeFrameRepair = true;
+          break;
+        }
+        const prepared = await withHostCallAttestation(
+          exactProduction.attestation,
+          () => prepareHostWorkCall(tool, {
+            sessionId: identity.sessionId,
+            sourceUserSeq: identity.sourceUserSeq,
+            logicalToolCallId: pending.callId,
+            outerArgs: args!,
+            runContext,
+            details: {
+              toolCall: {
+                type: 'function_call', callId: pending.callId,
+                name: pending.name, arguments: argumentsJson,
               },
-            }
-          : {}),
-      });
+            },
+          }),
+        );
+        if (prepared.status !== 'prepared') {
+          resumeFrameRepair = true;
+          break;
+        }
+        preparedMutations.push({ pending, preparation: prepared.preparation });
+        consent = await evaluatePreparedHostWorkCallConsent({
+          preparation: prepared.preparation,
+          ...(durableApproval ? { durableApproval } : {}),
+        });
+      }
       if (
         consent.status !== 'decided'
         || consent.decision.kind !== 'proceed'
@@ -6002,6 +6043,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       if (consent.nestedAdmission) {
         nestedCallAdmissions.set(pending.callId, consent.nestedAdmission);
+      }
+      if (exactProduction.boundary === 'host_owned_external' && consent.coverage) {
+        consentCallGrants.set(pending.callId, { coverageContractId: consent.coverage.contractId });
       }
     }
 
@@ -6347,7 +6391,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             // it was simply never written down. Journal it with the frame so
             // the next failure is one query instead of an hour of inference.
             const refusedStage = attempt.consequence?.stage;
-            if (typeof refusedStage === 'string' && refusedStage.startsWith('host_disposition:refused')) {
+            if (historyDelta.some((item) => hostToolDispositionOutput(item)?.disposition === 'refused_pre_dispatch')) {
               journalHostGuide('refused_pre_dispatch', {
                 stage: refusedStage,
                 recoveryToolNames: attempt.consequence?.recoveryToolNames ?? [],
@@ -7153,13 +7197,24 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
       const parsedArguments = parsedArgs(argumentsJson);
       let approvalExactProduction: ExactProductionHostCall | null = null;
-      const canaryRefusal = readOnlyCanaryRefusal(
+      let canaryRefusal = readOnlyCanaryRefusal(
         call.name,
         parsedArguments,
         argumentsJson,
         tool,
         call.callId,
       );
+      if (
+        canaryRefusal
+        && lastExactProductionMiss.startsWith('catalog_entry_or_manifest_missing')
+        && await jitProvisionCarriedOperation(call.name, parsedArguments)
+      ) {
+        // Acquire before consent, not inside executeCall: the newly current
+        // catalog may establish a WRITE despite the earlier name estimate.
+        canaryRefusal = readOnlyCanaryRefusal(
+          call.name, parsedArguments, argumentsJson, tool, call.callId,
+        );
+      }
       if (!canaryRefusal && hostProduction && parsedArguments && tool) {
         const approvalToolCallItem = {
           type: 'function_call' as const,
@@ -7236,7 +7291,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           break;
         }
       }
-      const runtimeEffect = currentFrameEffects.get(call.callId)
+      // Live provisioning can replace a name-only READ estimate with an exact
+      // WRITE manifest. Consent follows that current binding, never the older
+      // frame estimate that would otherwise skip the reducer entirely.
+      const runtimeEffect = approvalExactProduction?.effect ?? currentFrameEffects.get(call.callId)
         ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
       // Delegation is a host coordinator, not an uncovered write. The exact
       // configured packet still passes schema/source/catalog checks above; its
@@ -7260,6 +7318,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let needs = false;
       let consentOwned = workerControl;
       let consentSubject: HostInteractiveConsentSubjectV1 | undefined;
+      let consentCall: PendingHostCall['consentCall'];
       if (mutation && parsedArguments && tool && approvalExactProduction) {
         consentOwned = true;
         const authoredWorkflowConsent = acceptedFrame.ref
@@ -7270,7 +7329,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               callIndex,
             })
           : null;
-        const consent = await (isPlainOrClementineLocalTool(call.name, 'work_call')
+        const consent = await (approvalExactProduction.boundary === 'nested_owned'
+          && isPlainOrClementineLocalTool(call.name, 'work_call')
           && isHostPlanRequiredWorkCall(tool)
           ? (async () => {
               const identity = exactHostIdentity();
@@ -7306,10 +7366,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               });
               return evaluated;
             })()
-          : authoredWorkflowConsent ?? evaluateUncoveredHostMutationConsent({
-              attestation: approvalExactProduction.attestation,
-              args: approvalExactProduction.logicalArgs,
-            }));
+          : authoredWorkflowConsent ?? evaluateExactHostMutationConsent(approvalExactProduction));
         if (!consent || consent.status !== 'decided') {
           if (!preApprovalRepairDiagnostics.has(call.callId)) {
             preApprovalRepairDiagnostics.set(call.callId, {
@@ -7325,18 +7382,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             if (consent.nestedAdmission) {
               nestedCallAdmissions.set(call.callId, consent.nestedAdmission);
             }
-            // An authored-step grant is the write's consent; the port invoke
-            // mints the adapter's call authority from it (see
-            // authored-call-authority.ts) so a consented generic external
-            // write no longer dies inside the shipped adapter.
+            // Both authored and exact accepted-call consent use the same
+            // existing adapter authority. The ledger owns dispatch lineage.
             if (
-              authoredWorkflowConsent
-              && consent === authoredWorkflowConsent
-              && authoredWorkflowConsent.status === 'decided'
-              && authoredWorkflowConsent.coverage
+              approvalExactProduction.boundary === 'host_owned_external'
+              && consent.coverage
             ) {
-              authoredCallGrants.set(call.callId, {
-                coverageContractId: authoredWorkflowConsent.coverage.contractId,
+              consentCallGrants.set(call.callId, {
+                coverageContractId: consent.coverage.contractId,
               });
             }
             break;
@@ -7347,6 +7400,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             }
             needs = true;
             consentSubject = consent.consentSubject;
+            consentCall = { effect: consent.call.effect, accountId: consent.call.accountId, risk: consent.call.risk };
             break;
           case 'repair':
           case 'refuse':
@@ -7379,6 +7433,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         name: call.name,
         rawItem: { name: call.name, arguments: argumentsJson, callId: call.callId },
         ...(consentSubject ? { consentSubject } : {}),
+        ...(consentCall ? { consentCall } : {}),
       };
       // Non-approval siblings are pre-authorized, but remain serialized with
       // the batch so none disappear while an approval sibling is paused.
@@ -7398,7 +7453,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         : undefined;
       const released = preparedInBatch.every((candidate) => (
         releasePreparedHostWorkCallForRepair(candidate, 'sibling_frame_replanned_before_dispatch')
-      ));
+      )) && canonicalCalls.every((call) => settlePendingCallBeforeDispatch({
+        callId: call.callId, name: call.name,
+        rawItem: { name: call.name, callId: call.callId, arguments: call.argumentsJson },
+      }, 'sibling_frame_replanned_before_dispatch'));
       for (const call of canonicalCalls) nestedCallAdmissions.delete(call.callId);
       if (!released) {
         throw new HostCallAuthorityBoundaryError('prepared_frame_release_failed');
@@ -7446,6 +7504,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           toolName: pending.name,
           args: parsedArgs(pending.rawItem.arguments),
           rawArgs: pending.rawItem.arguments,
+          ...(pending.consentCall ? { consentCall: pending.consentCall } : {}),
           ...(pending.consentSubject
             ? {
                 approvalResumeKey: hostInteractiveConsentApprovalResumeKey(pending.consentSubject)

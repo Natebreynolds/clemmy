@@ -6322,8 +6322,13 @@ test('production host consumes exact material-source A/Q/B authority before any 
       SELECT COUNT(*) AS n FROM physical_dispatches
        WHERE session_id = ? AND source_user_seq = ?
     `).get(fixture.session.id, fixture.source.seq) as { n: number }).n;
-    assert.equal(logicalCount, input.shouldExecute ? 1 : 0, input.label);
+    assert.equal(logicalCount, input.shouldExecute || input.expectRepair ? 1 : 0, input.label);
     assert.equal(physicalCount, input.shouldExecute ? 1 : 0, input.label);
+    if (input.expectRepair) {
+      const settlement = db.prepare('SELECT physical_crossing_count, host_crossing_count FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?')
+        .get(fixture.session.id, fixture.source.seq);
+      assert.deepEqual(settlement, { physical_crossing_count: 0, host_crossing_count: 0 }, 'exact consent admission is settled without an external crossing');
+    }
   };
 
   try {
@@ -6417,7 +6422,7 @@ test('production host consumes exact material-source A/Q/B authority before any 
       label: 'write-shaped', purpose: 'collect_records', effect: 'external_write',
       bindingMatches: false, shouldExecute: false,
     }));
-    await t.test('exact source authority without work coverage is paired back for repair', () => runVariant({
+    await t.test('exact source authority with no exact write schema is admitted then paired back for repair', () => runVariant({
       label: 'write-shaped-exact', purpose: 'collect_records', effect: 'external_write',
       expectRepair: true, shouldExecute: false,
     }));
@@ -6693,17 +6698,17 @@ test('production host pairs an unplanned connected external write back for repai
     assert.equal(portBodies, 0, 'repair precedes the exact external port');
     assert.equal(outerBodies, 0);
     const db = eventlog.openEventLog();
-    assert.match(JSON.stringify(outcome.history), /before dispatch \(coverage_missing\)/,
+    assert.match(JSON.stringify(outcome.history), /before dispatch \(bound_catalog_call_does_not_match_exact_schema_and_arguments\)/,
       'the actual consent refusal survives the model-facing result');
     const checkpoint = db.prepare(`
       SELECT history_json FROM accepted_model_batch_checkpoints
        WHERE session_id = ? AND source_user_seq = ? ORDER BY batch_ordinal DESC LIMIT 1
     `).get(fixture.session.id, fixture.source.seq) as { history_json: string };
-    assert.match(checkpoint.history_json, /before dispatch \(coverage_missing\)/,
+    assert.match(checkpoint.history_json, /before dispatch \(bound_catalog_call_does_not_match_exact_schema_and_arguments\)/,
       'the named refusal survives durable checkpoint projection as well');
     const refusalEvent = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
       .find((event) => event.data.kind === 'refused_pre_dispatch');
-    assert.equal(refusalEvent?.data.refusalDetail, 'coverage_missing');
+    assert.equal(refusalEvent?.data.refusalDetail, 'bound_catalog_call_does_not_match_exact_schema_and_arguments');
     assert.deepEqual(refusalEvent?.data.calls, [{
       name: 'call_tool', callId: 'external-write-call',
       argumentsJson: JSON.stringify({ name: operationId, args_json: JSON.stringify({ name: 'Fixture Attorney', city: 'Seattle' }) }),
@@ -6712,7 +6717,7 @@ test('production host pairs an unplanned connected external write back for repai
       assert.equal((db.prepare(`
         SELECT COUNT(*) AS n FROM ${table}
          WHERE session_id = ? AND source_user_seq = ?
-      `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, 0, table);
+      `).get(fixture.session.id, fixture.source.seq) as { n: number }).n, table === 'logical_tool_calls' ? 1 : 0, table);
     }
     assert.deepEqual(dispositionMarkers(outcome.history), [{
       disposition: 'refused_pre_dispatch',
@@ -8109,8 +8114,9 @@ test('a done claim after the host refused this source\'s only work before dispat
 // host refused it twice → no-progress terminal. The host holds the exact
 // provider definition: a carried READ absent from the snapshot is provisioned
 // once and dispatched through the proven-live-read path; a carried WRITE is
-// provisioned the same way but stays behind the frozen/authored bar.
-test('a carried provider READ absent from the frozen snapshot is provisioned once and dispatched; a WRITE stays refused', async (t) => {
+// provisioned the same way but must reach consent with its resolved WRITE
+// effect, never bypass it using the earlier READ-shaped name estimate.
+test('a carried provider READ is provisioned and dispatched; a newly resolved WRITE still requires exact consent evidence', async (t) => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
   const priorPorts = productionPorts.listProductionCapabilityPorts();
@@ -8209,9 +8215,9 @@ test('a carried provider READ absent from the frozen snapshot is provisioned onc
         assert.equal(physical >= 1, true);
         assert.doesNotMatch(JSON.stringify(outcome.history), /catalog_entry_or_manifest_missing/);
       } else {
-        assert.equal(portBodies, 0, 'a JIT-provisioned WRITE never crosses: the frozen/authored bar holds');
+        assert.equal(portBodies, 0, 'a newly bound WRITE cannot skip consent using its older read-shaped frame effect');
         assert.equal(physical, 0);
-        assert.match(JSON.stringify(outcome.history), /catalog_entry_or_manifest_missing/);
+        assert.match(JSON.stringify(outcome.history), /bound_catalog_call_does_not_match_exact_schema_and_arguments/);
       }
     } finally {
       _setHostJitReadProvisionerForTests(null);

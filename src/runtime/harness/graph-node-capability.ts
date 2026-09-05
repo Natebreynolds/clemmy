@@ -24,7 +24,7 @@ export interface GraphNodeCapabilityInvoke {
      * manifest-identity fields on both. */
     authority?:
       | import('./resolved-call-authority.js').ResolvedCallAuthorityV1
-      | import('./authored-call-authority.js').AuthoredCallAuthorityV1;
+      | import('./authored-call-authority.js').HostConsentCallAuthorityV1;
   }): Promise<unknown>;
 }
 

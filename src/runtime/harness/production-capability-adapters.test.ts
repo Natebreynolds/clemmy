@@ -527,12 +527,12 @@ test('opaque current external write crosses its exact sealed port once without p
   });
 });
 
-test('a host-granted authored write carries call authority the adapter accepts; without any authority the refusal is typed not-started', async () => {
+for (const coverageKind of ['authored-workflow', 'accepted-call']) test(`a host-granted ${coverageKind} write carries the same adapter authority; absent or drifted authority never crosses`, async () => {
   // Live 2026-09-01 (platform-49 run 23695e): the consented authored write
   // reached this adapter with no authority (only the construct lane minted
   // one), the plain Error settled as an uncertain mutation, and the run was
   // parked for a call that never left the process.
-  const { mintAuthoredCallAuthority } = await import('./authored-call-authority.js');
+  const { mintHostConsentCallAuthority } = await import('./authored-call-authority.js');
   const manifest = opaqueExternalWriteManifest();
   const canonicalArgs = { spreadsheet_id: 'sheet-q7x9', insert_dimension: { range: { sheet_id: 0, dimension: 'ROWS' } } };
   const calls: Array<{ operationId: string; args: Record<string, unknown>; accountId: string }> = [];
@@ -540,11 +540,11 @@ test('a host-granted authored write carries call authority the adapter accepts; 
     calls.push(call);
     return { ok: true };
   });
-  const authority = mintAuthoredCallAuthority({
+  const authority = mintHostConsentCallAuthority({
     manifest,
     canonicalArgs,
     grant: {
-      coverageContractId: 'authored-workflow:' + 'd'.repeat(64),
+      coverageContractId: coverageKind + ':' + 'd'.repeat(64),
       sessionId: identity.sessionId,
       sourceUserSeq: identity.sourceUserSeq,
       acceptedTaskId: identity.acceptedTaskId,
@@ -557,6 +557,16 @@ test('a host-granted authored write carries call authority the adapter accepts; 
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0]?.args, canonicalArgs, 'the schema-validated arguments cross, not a digest');
   assert.equal(calls[0]?.accountId, manifest.accountId);
+
+  for (const drift of [
+    { accountId: 'another-account' },
+    { manifestDigest: '0'.repeat(64) }, { resolvedEffect: 'read' },
+  ]) {
+    await assert.rejects(() => invokeForSealedManifest(manifest)({
+      ...invocation, authority: { ...authority, ...drift } as never,
+    }));
+    assert.equal(calls.length, 1, 'a consent authority cannot change account, manifest or effect');
+  }
 
   await assert.rejects(
     () => invokeForSealedManifest(manifest)({ ...invocation, authority: undefined }),
