@@ -1128,3 +1128,11 @@ unpushed. Scan clean. **Still pending: the daemon has NOT been restarted on HEAD
 still owed.** Note for the P0 report: the reviewer briefly wrote skill-update files
 into this checkout at ~20:20 and reverted them within minutes — if you saw 145
 dirty `.github/**` entries, that was the reviewer, and it is clean now.
+
+**2026-09-04 ~21:25 — DAEMON BOOTED ON HEAD `a58c34c0` (first boot on any of
+today's commits; P1 `92d6cc30` + recovery `ef04f7db` included).** P1 acceptance
+step 2 is done. The next `bg-graph-driver-tag-canary-20260904` run is the one that
+counts — §10.3 byte-identical invocation, `claudeAvailable()` true, and the
+`34d9dd63` judge-on-the-wire check in the report. Reminder: the "AUTH_MODE=
+claude_oauth … booting degraded" boot line is the known no-behavioural-effect
+warning (§12 09-04 audit), not a blocker. Push/fast-forward ask still owed.
