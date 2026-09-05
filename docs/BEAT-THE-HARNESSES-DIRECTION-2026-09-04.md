@@ -2468,3 +2468,17 @@ production change). Flagged for later, not fixed: production has a documented
 tension on PATH precedence (`spawn-env` pins prepend-first; `guest-harness` pins
 user-PATH-first after the 07-30 stale-nvm incident). `npm test` should now be
 green on this machine and on the runner. FINAL GATE PASS on these bytes starts now.
+
+**2026-09-05 02:59 — FINAL GATE PASS on `b69046aa` (all nine takeover fixes; isolated checkout,
+real exit codes): typecheck ✅ · check:public-hygiene ✅ · test:public-hygiene 4/4 ✅ ·
+test:release-assets 53/53 ✅ · proof:selftest 239/239 ✅ · test:measurement 97/97 ✅ ·
+**npm test 14,527 / 0 fail ✅** (first fully green unit run of the day; 1 pre-existing
+darwin skip) · bench:gates ✅ · eval:memory ✅ · eval:jobs ✅ · eval:passk strict ✅ ·
+**journeys 169 / 172 — the only reds are the three deferrals** (the skip patch is
+prepared and verified, waiting on the owner's word). Compared with the 09-04 21:00
+candidate: journeys 143/159 → 169/172, npm test 3 fails → 0, plus the live worker
+proof, the watcher re-arm, the malformed-packet class, the identity-split class at
+every confirmed site, and a real key-permission fix. LIVE PROOFS start now on these
+exact bytes: the cold 8-worker replay (must show `auditorOverlapsWorker:true` this
+time) and then the parked draft canary (five reversible drafts, zero cards, zero
+sends).
