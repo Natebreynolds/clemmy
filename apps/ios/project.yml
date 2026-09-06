@@ -27,9 +27,17 @@ targets:
     entitlements:
       path: Clem/Clem.entitlements
       properties:
-        # Xcode debug builds get sandbox APNs tokens; the daemon's APNS_ENV
-        # default (sandbox) matches. Flip both together for TestFlight.
-        aps-environment: development
+        # Driven by the build configuration, never by hand.
+        #
+        # THE DEFECT THIS FIXES. This was hardcoded to `development` with a
+        # comment saying to "flip both together for TestFlight" — a manual step
+        # before every upload, and the symptom of forgetting it is silent:
+        # a TestFlight build gets a SANDBOX token, the daemon sends to the
+        # production APNs host (apns.ts picks the host from APNS_ENV), Apple
+        # answers BadDeviceToken, and the owner simply never gets notified.
+        # A push product whose notifications quietly stop working in the
+        # shipped build is worse than one with no push at all.
+        aps-environment: $(APS_ENVIRONMENT)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem
@@ -41,6 +49,14 @@ targets:
         ENABLE_PREVIEWS: true
         CURRENT_PROJECT_VERSION: 13
         MARKETING_VERSION: 0.1.0
+      configs:
+        # Debug runs from Xcode against the sandbox, which is the daemon's
+        # APNS_ENV default. Release covers TestFlight and the App Store, both
+        # of which Apple serves from the production APNs environment.
+        Debug:
+          APS_ENVIRONMENT: development
+        Release:
+          APS_ENVIRONMENT: production
   ClemTests:
     type: bundle.unit-test
     platform: iOS

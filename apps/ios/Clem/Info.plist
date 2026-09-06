@@ -32,6 +32,8 @@
 	<string>Clem uses Face ID to make sure only you can reach your Mac from this app.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Clem uses the camera only to scan the pairing QR code shown on your Mac.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Clem uses the microphone only when you hold the mic button to talk instead of typing. Your speech is transcribed on your own Mac and never sent to a third party.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Clem finds your paired Mac on the local network; away from Wi-Fi, it can use a pinned encrypted relay to that same Mac.</string>
 	<key>NSBonjourServices</key>
