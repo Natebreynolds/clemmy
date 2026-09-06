@@ -39,6 +39,7 @@ import {
   detectTokenReuse,
   bindDeviceKey,
   needsDeviceUpgrade,
+  onDeviceRevoked,
   shouldRotate,
   type MobileSessionRecord,
 } from '../runtime/mobile-sessions.js';
@@ -48,10 +49,12 @@ import {
   isSupportedDeviceKey,
 } from '../runtime/mobile-device-proof.js';
 import {
-  checkAttempt,
+  reserveAttempt,
   recordFailure,
   recordSuccess,
+  type AttemptReservation,
   type MobileAttemptScope,
+  type MobileRateLimitOptions,
 } from '../runtime/mobile-rate-limit.js';
 import {
   addNotification,
@@ -820,6 +823,35 @@ function clientIp(req: express.Request): string {
 }
 
 /**
+ * Reserve an attempt slot for the lifetime of this response.
+ *
+ * THE DEFECT THIS EXISTS TO FIX. Every credential route here had the same
+ * shape: read the limiter, spend real time verifying (~50ms of scrypt for a
+ * PIN, a file-locked single-use consume for a pairing token), then record the
+ * failure. Nothing was written in between, so a concurrent burst was judged
+ * against one pre-burst counter and every request in it was admitted — a
+ * 5-attempt budget that bounded sequential guessing and nothing else.
+ *
+ * `reserveAttempt` counts an in-flight attempt as a failure that has not landed
+ * yet. The slot must then be held until the outcome is DURABLE, not merely
+ * known — releasing between the hash and `recordFailure` just moves the same
+ * window one level down. Binding the release to `res` 'close' gets that for
+ * free on every path a handler can take: a normal reply, an early return, a
+ * thrown error, or a client that hangs up mid-verification.
+ */
+function reserveForRequest(
+  res: express.Response,
+  ip: string,
+  opts?: MobileRateLimitOptions,
+): AttemptReservation {
+  const reservation = reserveAttempt(ip, opts);
+  // release() is idempotent, and a refused reservation holds nothing — so
+  // registering unconditionally is safe and keeps every call site one line.
+  res.on('close', () => reservation.release());
+  return reservation;
+}
+
+/**
  * Short-lived single-use tickets for SSE streams.
  *
  * EventSource cannot set request headers, so a stream cannot carry the
@@ -1386,6 +1418,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   const router = express.Router();
   const stateOpts = deps.stateDir ? { stateDir: deps.stateDir } : undefined;
 
+  // A revoked device must stop RECEIVING, not merely stop asking. Push
+  // subscriptions outlived every revoke path, so a phone the owner had signed
+  // out kept getting notification content — the body of a banner is real
+  // information about the owner's work, delivered to a device they cut off.
+  // (removeWebPushDestinationsByDeviceId drops the APNs rows for the device
+  // too; the name is narrower than the behaviour.) Registered once per router
+  // rather than per request, because the destination store is process-wide.
+  onDeviceRevoked((deviceId) => {
+    const removed = removeWebPushDestinationsByDeviceId(deviceId);
+    if (removed > 0) {
+      mobileDoorLog.info({ deviceId, removed }, 'revoked device: push destinations removed');
+    }
+  });
+
   // Every request through the phone's door, with the reason it was refused.
   //
   // A live pairing (2026-08-22) minted a session and the phone then went
@@ -1722,9 +1768,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   router.get('/auth/status', async (req, res) => {
     const token = readSessionCookie(req);
     const record = token ? await validateSession(token, stateOpts) : undefined;
+    // PIN posture is told to callers that can ACT on it, and to nobody else.
+    //
+    // This route has no session middleware, so it answered an anonymous
+    // internet caller who knew the relay origin — and told them whether a PIN
+    // was set and when it last changed. That is reconnaissance with no
+    // corresponding use: the PIN box and the pairing consumer are both deleted
+    // from the relay (RELAY_FORBIDDEN_PATHS), so a relay caller has nothing to
+    // do with the answer. The LAN login screen genuinely needs pinConfigured to
+    // choose between the PIN box and "scan the QR", so that stays where the
+    // login screen actually runs. pinUpdatedAt has no client at all.
+    const canSeePinPosture = Boolean(record) || req.clemIngress !== 'relay';
     res.json({
-      pinConfigured: hasPin(stateOpts),
-      pinUpdatedAt: readPinMeta(stateOpts)?.updatedAt ?? null,
+      pinConfigured: canSeePinPosture ? hasPin(stateOpts) : false,
+      pinUpdatedAt: record ? readPinMeta(stateOpts)?.updatedAt ?? null : null,
       authenticated: Boolean(record),
       deviceId: record?.deviceId ?? null,
       deviceLabel: record?.deviceLabel ?? null,
@@ -1749,7 +1806,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
 
-    const gate = checkAttempt(ip, stateOpts);
+    const gate = reserveForRequest(res, ip, stateOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -1828,7 +1885,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // shoulder-surfed QR noisy instead of silent. Budgeted separately from
     // 'pin' so PIN failures can never lock out the pairing recovery path.
     const pairOpts = { ...stateOpts, scope: 'pair' as const };
-    const gate = checkAttempt(ip, pairOpts);
+    const gate = reserveForRequest(res, ip, pairOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -1988,7 +2045,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       return;
     }
     const adoptOpts = { ...stateOpts, scope: 'pair' as const };
-    const gate = checkAttempt(ip, adoptOpts);
+    const gate = reserveForRequest(res, ip, adoptOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -2021,6 +2078,37 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(401).json({ error: 'INVALID_HANDOFF' });
       return;
     }
+    // Device binding must not be CLIENT-ELECTIVE on the relay door.
+    //
+    // readDeviceKeyFromBody returns undefined for any body that simply omits
+    // devicePublicKeyJwk, and prepareSession then issues a plain 14-day bearer
+    // cookie — which is exactly what the binding exists to prevent. On this
+    // route that is a downgrade attack with a free upgrade window attached:
+    // adopt is reachable over the relay, so anyone holding a handoff bearer
+    // could trade a key-bound phone's identity for a copyable cookie.
+    //
+    // The rule is no DOWNGRADE, rather than a flat requirement: a legacy
+    // cookie-bound phone still inside its upgrade grace has no key to send yet,
+    // and refusing it here would log out the devices the grace was written to
+    // protect. Once a device has proven it holds a key, it never gets to stop.
+    // A device with NO live row is not this check's business: the store refuses
+    // to mint for it and the handoff is answered INVALID_HANDOFF, which is the
+    // stronger and more specific refusal. Answering DEVICE_KEY_REQUIRED first
+    // would swap a "you are revoked" for a "try again with a key".
+    const adoptingKey = readDeviceKeyFromBody(req);
+    if (!adoptingKey) {
+      const keyBound = listSessions(stateOpts)
+        .some((row) => row.deviceId === handoff.deviceId && row.binding === 'key');
+      if (keyBound) {
+        mobileDoorLog.warn(
+          { deviceId: handoff.deviceId },
+          'origin-adopt refused: device key omitted for a key-bound device',
+        );
+        res.status(400).json({ error: 'DEVICE_KEY_REQUIRED' });
+        return;
+      }
+    }
+
     let adopted: Awaited<ReturnType<typeof createOrReuseSessionForExistingDevice>>;
     try {
       // The handoff bearer becomes the exact session bearer. If the response
@@ -2029,7 +2117,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       adopted = await createOrReuseSessionForExistingDevice(
         {
           deviceLabel: handoff.deviceLabel,
-          devicePublicKeyJwk: readDeviceKeyFromBody(req),
+          devicePublicKeyJwk: adoptingKey,
           ip,
           // Same device identity as the LAN session: one phone, one row in the
           // device list, revocable as one thing.
@@ -2149,7 +2237,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
 
     const ip = clientIp(req);
-    const gate = checkAttempt(ip, stateOpts);
+    const gate = reserveForRequest(res, ip, stateOpts);
     if (!gate.allowed) {
       res.status(429)
         .set('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)))
@@ -3320,6 +3408,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    */
   router.get('/api/chat/sessions/:sessionId/stream', requireMobileSession, (req, res) => {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const streamDeviceId = req.mobileSession!.record.deviceId;
     const session = harnessGetSession(sessionId);
     if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
     // SSE resume: when the browser reconnects after a drop, it sends
@@ -3423,7 +3512,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       clearInterval(heartbeat);
       detachViewer();
       unsubscribe();
+      dropRevocationCloser();
     };
+    // Authorization was checked ONCE, at attach. Without this the stream keeps
+    // writing turn content to a phone the owner has already revoked, until the
+    // socket happens to close — so Revoke did not revoke, it only stopped the
+    // NEXT request. Cutting the socket is what makes the button honest.
+    const dropRevocationCloser = onDeviceRevoked((deviceId) => {
+      if (deviceId !== streamDeviceId) return;
+      cleanup();
+      res.end();
+      res.destroy();
+    });
     res.on('close', cleanup);
     res.on('error', cleanup);
   });
