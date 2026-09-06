@@ -24,7 +24,7 @@ test.after(() => {
   try { rmSync(TMP_ROOT, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-const { encodeFrame, frameReader, FRAME, startMobileRelayClient, ensureRelayAuthToken, relayPairId, relayConfigFromEnv, loadRelayConfig, DEFAULT_RELAY_CONFIG } =
+const { encodeFrame, frameReader, FRAME, startMobileRelayClient, ensureRelayAuthToken, relayPairId, relayConfigFromEnv, loadRelayConfig, sanitizeRelayClientIp, DEFAULT_RELAY_CONFIG } =
   await import('./mobile-relay.js');
 const { startRelay, parseSni } = await import('../../apps/relay/server.mjs') as {
   startRelay: (opts: Record<string, unknown>) => Promise<{ port: number; tunnelCount(): number; close(): Promise<void> }>;
@@ -290,4 +290,36 @@ test('relayPairId is DNS-safe lowercase hex derived from the cert', () => {
   assert.match(pairId, /^[a-f0-9]{16}$/);
   assert.notEqual(pairId, relayPairId(ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'daemon-c') }).certPem));
   assert.equal(certFingerprint(identity.certPem).length > 0, true);
+});
+
+
+/**
+ * ── The relay does not get to choose a caller's rate-limit bucket ───────────
+ *
+ * The address in the OPEN frame keys every attempt budget on the phone door and
+ * was taken verbatim. One constant value collapses every remote caller into a
+ * single bucket (one attacker locks the owner out); a fresh value per request
+ * mints a new budget every time (the limiter stops existing).
+ */
+test('a relay-reported client address is admitted only when it is a usable address', () => {
+  assert.equal(sanitizeRelayClientIp('203.0.113.9'), '203.0.113.9');
+  assert.equal(sanitizeRelayClientIp('2001:db8::1'), '2001:db8::1');
+  // IPv4-mapped v6 normalizes, so one phone is one bucket however it connected.
+  assert.equal(sanitizeRelayClientIp('::ffff:203.0.113.9'), '203.0.113.9');
+  assert.equal(sanitizeRelayClientIp('  203.0.113.9  '), '203.0.113.9');
+});
+
+test('a value that is not an address is refused rather than used as a bucket key', () => {
+  for (const bad of ['', 'unknown', 'not-an-ip', 'example.com', '999.1.1.1', '../../etc', '203.0.113.9:443']) {
+    assert.equal(sanitizeRelayClientIp(bad), '',
+      `${JSON.stringify(bad)} must not become a rate-limit bucket`);
+  }
+});
+
+test('loopback survives, because a same-machine relay reports it honestly', () => {
+  // Refusing it would filter an honest deployment rather than an attack: a
+  // hostile relay would simply name a public address instead.
+  assert.equal(sanitizeRelayClientIp('127.0.0.1'), '127.0.0.1');
+  assert.equal(sanitizeRelayClientIp('::1'), '::1');
+  assert.equal(sanitizeRelayClientIp('::ffff:127.0.0.1'), '127.0.0.1');
 });
