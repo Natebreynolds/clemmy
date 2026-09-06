@@ -47,6 +47,47 @@ const scryptAsync = promisify(scrypt) as (
  */
 const SCRYPT_MAXMEM = 128 * 1024 * 1024;
 
+/**
+ * ── The hash is a shared resource, so it is queued ──────────────────────────
+ *
+ * N=2^15, r=8 costs ~32 MiB and runs on libuv's threadpool, which defaults to
+ * four threads and is the SAME pool serving every fs call in the daemon. The
+ * PIN door is unauthenticated by construction, so without a gate a caller who
+ * simply opens many connections to `POST /m/auth/login` stalls that pool and
+ * takes the whole daemon down with it — not just the phone surface. The rate
+ * limiter cannot help: it is what the hash runs *before*.
+ *
+ * Two attempts at a time keeps a real user's login instant (nobody taps a PIN
+ * twice at once) while leaving the pool room to breathe. Waiters queue rather
+ * than fail, so a legitimate login behind a burst is slow, never refused —
+ * refusing here would hand an attacker a denial of service by another name.
+ * The queue itself is bounded by the reservation in mobile-rate-limit.ts, which
+ * admits only a budget's worth of attempts before this point.
+ */
+const MAX_CONCURRENT_SCRYPT = 2;
+let scryptActive = 0;
+const scryptWaiters: Array<() => void> = [];
+
+async function withScryptSlot<T>(run: () => Promise<T>): Promise<T> {
+  // The slot is TRANSFERRED, never released-then-reclaimed. Decrementing and
+  // waking a waiter separately leaves a microtask in which the count reads low
+  // and a fresh caller takes the slot the waiter was just handed — which is the
+  // same check-then-act shape this whole change exists to remove.
+  if (scryptActive >= MAX_CONCURRENT_SCRYPT) {
+    await new Promise<void>((resolve) => scryptWaiters.push(resolve));
+  } else {
+    scryptActive += 1;
+  }
+  try {
+    return await run();
+  } finally {
+    const next = scryptWaiters.shift();
+    if (next) next();
+    else scryptActive -= 1;
+  }
+}
+
+
 export interface MobilePinRecord {
   version: 1;
   salt: string;
@@ -132,12 +173,12 @@ export async function setPin(pin: string, opts?: MobilePinStoreOptions): Promise
     throw new Error(validation.message);
   }
   const salt = randomBytes(16);
-  const derived = await scryptAsync(pin, salt, DEFAULT_PARAMS.keylen, {
+  const derived = await withScryptSlot(() => scryptAsync(pin, salt, DEFAULT_PARAMS.keylen, {
     N: DEFAULT_PARAMS.N,
     r: DEFAULT_PARAMS.r,
     p: DEFAULT_PARAMS.p,
     maxmem: SCRYPT_MAXMEM,
-  });
+  }));
   const record: MobilePinRecord = {
     version: 1,
     salt: salt.toString('hex'),
@@ -152,6 +193,12 @@ export async function setPin(pin: string, opts?: MobilePinStoreOptions): Promise
 }
 
 export async function verifyPin(pin: string, opts?: MobilePinStoreOptions): Promise<boolean> {
+  // Policy-free is about WEAKNESS, not SIZE. A pre-floor PIN must still log in
+  // (it lands in the rotation sandbox), but the caller here is unauthenticated
+  // and the string is whatever it posted, so an oversized input is refused
+  // before it reaches the KDF. A real PIN can never exceed the ceiling setPin
+  // already enforces.
+  if (pin.length > PIN_MAX_LENGTH) return false;
   const file = pinFile(opts);
   if (!existsSync(file)) return false;
   let record: MobilePinRecord;
@@ -163,12 +210,12 @@ export async function verifyPin(pin: string, opts?: MobilePinStoreOptions): Prom
   if (record.version !== 1 || !record.salt || !record.hash) return false;
   const salt = Buffer.from(record.salt, 'hex');
   const stored = Buffer.from(record.hash, 'hex');
-  const derived = await scryptAsync(pin, salt, record.params.keylen, {
+  const derived = await withScryptSlot(() => scryptAsync(pin, salt, record.params.keylen, {
     N: record.params.N,
     r: record.params.r,
     p: record.params.p,
     maxmem: SCRYPT_MAXMEM,
-  });
+  }));
   if (derived.length !== stored.length) return false;
   return timingSafeEqual(derived, stored);
 }
