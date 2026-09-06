@@ -468,8 +468,22 @@ test('reduceActivity: batch meter, deliverables roll-up, external write phrasing
   activity = reduceActivity(activity, ev(3, 'deliverable_saved', { name: 'brief.md' }));
   activity = reduceActivity(activity, ev(4, 'deliverable_saved', { name: 'notes.md' }));
   assert.ok(activity.some((a) => a.label === 'Saved 2 files · latest notes.md'));
-  activity = reduceActivity(activity, ev(5, 'external_write', { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@b.co'], irreversible: true }));
-  assert.ok(activity.some((a) => a.label === 'Sent a message to a@b.co'));
+  // A RESERVATION is not a receipt. `external_write` is appended before the
+  // call leaves this machine, so it must read as an intention in progress —
+  // past tense is a claim about the world and waits for a terminal.
+  activity = reduceActivity(activity, ev(5, 'external_write', { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@b.co'], irreversible: true, callId: 'call_1' }));
+  const reserved = activity.find((a) => a.label.includes('a@b.co'));
+  assert.equal(reserved?.label, 'Sending a message to a@b.co');
+  assert.equal(reserved?.status, 'running');
+
+  // The terminal REPLACES its own reservation rather than appearing beside it:
+  // both events carry the same callId by construction, which is what pairs
+  // them. Two rows here would be the double-receipt this pairing exists to stop.
+  activity = reduceActivity(activity, ev(6, 'external_write_succeeded', { shapeKey: 'GMAIL_SEND_EMAIL', targets: ['a@b.co'], callId: 'call_1' }));
+  const settledRows = activity.filter((a) => a.label.includes('a@b.co'));
+  assert.equal(settledRows.length, 1, 'the terminal settles the reservation, it does not join it');
+  assert.equal(settledRows[0].label, 'Sent a message to a@b.co');
+  assert.equal(settledRows[0].status, 'done');
 });
 
 test('renderMarkdown sanitizes and covers the reply structures', () => {
