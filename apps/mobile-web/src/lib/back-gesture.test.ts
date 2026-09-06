@@ -42,6 +42,7 @@ const {
   openBackEntry,
   closeBackEntry,
   abandonBackEntry,
+  withDepthTransition,
   _resetBackGestureForTest,
   _backGestureDepthForTest,
 } = await import('./back-gesture.js');
@@ -142,4 +143,42 @@ test('a blocked history API still opens and closes the view', () => {
     'the in-page arrow must keep working when history is unavailable');
   void closed;
   (globalThis as Record<string, any>).window.history = saved;
+});
+
+test('only depth animates, and a missing or refused transition never blocks it', () => {
+  const seen: string[] = [];
+  const supporting = { startViewTransition: (update: () => void) => { seen.push('wrapped'); update(); } };
+
+  withDepthTransition(() => seen.push('update'), supporting, false);
+  assert.deepEqual(seen, ['wrapped', 'update']);
+
+  seen.length = 0;
+  withDepthTransition(() => seen.push('update'), supporting, true);
+  assert.deepEqual(seen, ['update'], 'reduced motion runs the update with no transition');
+
+  seen.length = 0;
+  withDepthTransition(() => seen.push('update'), {}, false);
+  assert.deepEqual(seen, ['update'], 'a browser without the API still navigates');
+
+  seen.length = 0;
+  withDepthTransition(() => seen.push('update'), {
+    startViewTransition: () => { throw new Error('no'); },
+  }, false);
+  assert.deepEqual(seen, ['update'], 'a refused transition must not swallow the navigation');
+});
+
+test('the swipe-back close runs inside a depth transition when one is available', async () => {
+  reset();
+  const order: string[] = [];
+  (globalThis as Record<string, any>).document = {
+    startViewTransition: (update: () => void) => { order.push('transition'); update(); },
+  };
+  try {
+    openBackEntry(() => order.push('closed'));
+    popListener!();
+    assert.deepEqual(order, ['transition', 'closed']);
+  } finally {
+    delete (globalThis as Record<string, any>).document;
+  }
+  await settle();
 });

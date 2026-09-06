@@ -1,5 +1,6 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import type { WebClient } from '@slack/web-api';
 
 import {
@@ -106,19 +107,19 @@ function customIds(rows: ReturnType<typeof notificationDeliveryInternalsForTest.
   return ids;
 }
 
-test('mobile push is private and deep-links to the exact Inbox notification', () => {
+test('mobile push names the decision, keeps the prose off the relay, and deep-links to the exact Inbox notification', () => {
   const approval = notification({
     id: 'notify/private approval',
     kind: 'approval',
     title: 'Email the confidential renewal quote to Acme',
     body: 'Sensitive body that must not cross a push relay.',
-    metadata: { approvalId: 'approval-1' },
+    metadata: { approvalId: 'approval-1', tool: 'GMAIL_SEND_EMAIL' },
   });
   const payload = notificationDeliveryInternalsForTest.buildWebPushPayload(approval);
 
   assert.deepEqual(payload, {
-    title: 'Clem needs you',
-    body: 'Tap to review and respond.',
+    title: 'Approval needed',
+    body: 'Clem is waiting on a yes before she runs gmail send email.',
     url: '/m/?tab=inbox&notification=notify%2Fprivate%20approval',
     notificationId: approval.id,
     kind: 'approval',
@@ -127,20 +128,134 @@ test('mobile push is private and deep-links to the exact Inbox notification', ()
   assert.equal(JSON.stringify(payload).includes('Sensitive'), false);
 });
 
-test('ordinary mobile push also keeps notification content off the relay', () => {
-  const update = notification({
-    id: 'notify-update',
-    kind: 'execution',
-    title: 'Quarterly analysis for confidential customer',
+test('a finished workflow push says which workflow finished, without quoting its report', () => {
+  const done = notification({
+    id: 'workflow-run-9-completed',
+    kind: 'workflow',
+    title: 'Morning briefing',
+    body: 'Confidential: three renewals slipped at Acme.',
+    metadata: { workflow: 'Morning briefing', runId: 'run-9' },
   });
+  const payload = notificationDeliveryInternalsForTest.buildWebPushPayload(done);
+  assert.equal(payload.title, 'Morning briefing finished');
+  assert.equal(payload.body, 'Tap to see what it did.');
+  assert.equal(JSON.stringify(payload).includes('Acme'), false);
 
-  assert.deepEqual(notificationDeliveryInternalsForTest.buildWebPushPayload(update), {
-    title: 'Clementine',
-    body: 'You have an update.',
-    url: '/m/?tab=inbox&notification=notify-update',
-    notificationId: update.id,
+  const failed = notificationDeliveryInternalsForTest.buildPushCopy(notification({
+    kind: 'workflow',
+    metadata: { workflow: 'Morning briefing', status: 'error' },
+  }));
+  assert.equal(failed.title, 'Morning briefing failed');
+
+  const partial = notificationDeliveryInternalsForTest.buildPushCopy(notification({
+    kind: 'workflow',
+    metadata: { workflow: 'Outreach', forEachFailures: [{ item: 'a' }, { item: 'b' }] },
+  }));
+  assert.equal(partial.title, 'Outreach finished with 2 problems');
+
+  const noOp = notificationDeliveryInternalsForTest.buildPushCopy(notification({
+    kind: 'workflow',
+    metadata: { workflow: 'Outreach', noOp: true },
+  }));
+  assert.equal(noOp.title, 'Nothing new from Outreach');
+});
+
+test('a push never claims a write landed — the record carries no settlement', () => {
+  // packages/chat-engine/src/write-ledger.ts owns that vocabulary: a
+  // reservation is not a receipt, and a notification record has neither.
+  const settled = /\b(sent|delivered|created|posted|updated|saved) (the|a|an|\d)/i;
+  for (const record of [
+    notification({ kind: 'workflow', metadata: { workflow: 'Outreach' } }),
+    notification({ kind: 'workflow', metadata: { workflow: 'Outreach', forEachFailures: ['x'] } }),
+    notification({ kind: 'execution', title: 'Background task completed: send the recap' }),
+    notification({ kind: 'approval', metadata: { approvalId: 'a1', tool: 'GMAIL_SEND_EMAIL' } }),
+  ]) {
+    const copy = notificationDeliveryInternalsForTest.buildPushCopy(record);
+    assert.equal(settled.test(`${copy.title} ${copy.body}`), false, `${copy.title} / ${copy.body}`);
+  }
+});
+
+test('a run-bearing report-back lands on the run; a decision lands on its Inbox card', () => {
+  const finished = notification({
+    id: 'task-done',
     kind: 'execution',
+    title: 'Background task completed: recap',
+    metadata: { backgroundTaskId: 'task-1', runSessionId: 'sess-42', sessionId: 'sess-origin' },
   });
+  assert.equal(
+    notificationDeliveryInternalsForTest.pushTargetUrl(finished),
+    '/m/?tab=activity&run=sess-42',
+  );
+
+  const decision = notification({
+    id: 'approval-7',
+    kind: 'approval',
+    metadata: { approvalId: 'approval-7', sessionId: 'sess-42' },
+  });
+  assert.equal(
+    notificationDeliveryInternalsForTest.pushTargetUrl(decision),
+    '/m/?tab=inbox&notification=approval-7',
+  );
+
+  // A workflow runId is a different namespace from a harness session and would
+  // 404 on /m/api/runs/:sessionId, so it must never become a run link.
+  const workflowDone = notification({
+    id: 'workflow-run-9-completed',
+    kind: 'workflow',
+    metadata: { workflow: 'Morning briefing', runId: 'run-9' },
+  });
+  assert.equal(
+    notificationDeliveryInternalsForTest.pushTargetUrl(workflowDone),
+    '/m/?tab=inbox&notification=workflow-run-9-completed',
+  );
+});
+
+test('the phone is given the same run fact the push routes on', () => {
+  // pushTargetUrl prefers runSessionId, because for a background task the
+  // sessionId is the CHAT THAT ASKED, not the run (background-tasks.ts). The
+  // mobile Inbox row has to be able to make the same choice, so the mobile
+  // notification context must carry runSessionId — without it the tap on
+  // "Open run" and the tap on the push for the same record went to two
+  // different places.
+  const serializer = readFileSync(
+    new URL('../channels/mobile-routes.ts', import.meta.url),
+    'utf8',
+  );
+  const context = serializer.slice(
+    serializer.indexOf('function serializeInboxNotificationForMobile'),
+    serializer.indexOf('function mobileInboxNotifications'),
+  );
+  assert.ok(context.length > 0, 'the serializer moved — re-anchor this pin');
+  assert.match(
+    context,
+    /runSessionId: notificationMetadataString\(row\.metadata, 'runSessionId'\)/,
+    'the run the work actually used must cross the mobile boundary',
+  );
+  assert.match(
+    context,
+    /sessionId: notificationMetadataString\(row\.metadata, 'sessionId', 'targetSessionId'\)/,
+    'and the originating conversation stays, because a REPLY belongs there',
+  );
+});
+
+test('the APNs route stays inside the shape the native shell will park', () => {
+  // apps/ios PendingPushNavigationRoute.parse accepts ONLY /m/ with exactly
+  // tab=inbox and notification=<id>. Anything else is not parked at all, so
+  // the tap does nothing — a silent dead end on the device we most need.
+  const finished = notification({
+    id: 'task-done',
+    kind: 'execution',
+    title: 'Background task completed: recap',
+    metadata: { runSessionId: 'sess-42' },
+  });
+  const url = new URL(
+    notificationDeliveryInternalsForTest.inboxNotificationUrl(finished),
+    'https://phone.invalid',
+  );
+  assert.equal(url.pathname, '/m/');
+  assert.deepEqual([...url.searchParams.keys()], ['tab', 'notification']);
+  assert.equal(url.searchParams.get('tab'), 'inbox');
+  assert.equal(url.searchParams.get('notification'), 'task-done');
 });
 
 test('resolved Inbox receipts never present themselves as a fresh request', () => {
@@ -166,7 +281,7 @@ test('resolved Inbox receipts never present themselves as a fresh request', () =
   for (const receipt of receipts) {
     const payload = notificationDeliveryInternalsForTest.buildWebPushPayload(receipt);
     assert.equal(payload.title, 'Clementine');
-    assert.equal(payload.body, 'You have an update.');
+    assert.equal(payload.body, 'Tap to read the update.');
   }
 });
 

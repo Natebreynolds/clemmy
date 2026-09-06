@@ -57,6 +57,10 @@ interface Props {
   onAsk: (draft: string) => void;
   onOpenInbox: () => void;
   onOpenWorkspace: (id: string) => void;
+  /** Open a run's own screen. Every surface that shows running work must be
+   *  able to reach it — a row with a pulse and a progress bar that cannot be
+   *  opened is a typing indicator, not a work item. */
+  onOpenRun: (sessionId: string) => void;
   onCustomize: () => void;
   needsYouCount: number;
   needsYouCountKnown: boolean;
@@ -87,7 +91,7 @@ const EMPTY: HomeData = {
   approvals: [], plans: [], workspaceChoosers: [], questions: [], notifications: [], reminders: [], workspaces: [],
 };
 
-export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, needsYouCount, needsYouCountKnown }: Props) {
+export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onOpenRun, onCustomize, needsYouCount, needsYouCountKnown }: Props) {
   const { prefs } = useHomePreferences();
   const panes = phoneVisiblePanes(prefs);
   const paneSet = new Set<HomePaneId>(panes);
@@ -197,7 +201,7 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
         <h2 id="home-running" class="section-head pane-head">Running</h2>
         <div class="home-card">
           {workingView.entries.map((p, i) => (
-            <RunningRow key={p.entry.runKey} presented={p} index={i} onChanged={workingNow.refresh} />
+            <RunningRow key={p.entry.runKey} presented={p} index={i} onChanged={workingNow.refresh} onOpenRun={onOpenRun} />
           ))}
         </div>
       </section>
@@ -592,13 +596,17 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
 
 // ─── running ────────────────────────────────────────────────────────────────
 
-function RunningRow({ presented, index, onChanged }: {
+function RunningRow({ presented, index, onChanged, onOpenRun }: {
   presented: PresentedWorkingNowEntry<ActivityEntry>;
   index: number;
   onChanged: () => void | Promise<void>;
+  onOpenRun: (sessionId: string) => void;
 }) {
   const entry = presented.entry;
   const control = mobileRunControl(entry);
+  // Only a harness session has a run screen; a row without one stays static
+  // rather than offering a tap that goes nowhere.
+  const sessionId = entry.sessionId;
   const progress = entry.progress && entry.progress.total > 0
     ? entry.progress
     : entry.activity && typeof entry.activity.total === 'number' && entry.activity.total > 0
@@ -606,8 +614,8 @@ function RunningRow({ presented, index, onChanged }: {
       : null;
   const pct = progress ? Math.max(0, Math.min(100, Math.round((progress.completed / progress.total) * 100))) : null;
   const waiting = presented.presentation === 'needs_you';
-  return (
-    <article class={`home-row home-row-static home-run${waiting ? ' home-run-waiting' : ''}`} style={{ '--i': index }}>
+  const head = (
+    <>
       <div class="home-run-head">
         {/* The pulse is a certificate: it animates only when the server said
             liveness === 'live'. Anything else gets a quiet dot. */}
@@ -626,6 +634,20 @@ function RunningRow({ presented, index, onChanged }: {
           <div class="home-progress-fill" style={{ width: `${pct}%` }} />
         </div>
       ) : null}
+    </>
+  );
+  return (
+    <article class={`home-row home-row-static home-run${waiting ? ' home-run-waiting' : ''}`} style={{ '--i': index }}>
+      {sessionId ? (
+        <button
+          type="button"
+          class="home-run-open"
+          aria-label={`Open ${entry.headline || 'this run'}`}
+          onClick={() => onOpenRun(sessionId)}
+        >
+          {head}
+        </button>
+      ) : head}
       {control ? (
         <div class="home-run-control">
           <RunControl target={control.target} resumable={control.resumable} onChanged={() => void onChanged()} />

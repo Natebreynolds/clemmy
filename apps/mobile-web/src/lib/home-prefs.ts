@@ -68,7 +68,11 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
     more: ['/chat', '/memory', '/meetings', '/goals', '/agents'],
   },
   quickActions: [],
-  phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
+  // Work is a DESTINATION, not only a tap-through. The run screen — the best
+  // surface in the product — used to be reachable one way: Activity, which was
+  // not itself offered here, so it lived behind "More". No tenth section was
+  // added for it; the section that already exists was promoted.
+  phoneSwitcher: ['home', 'inbox', 'activity', 'chats', 'spaces', 'more'],
 };
 
 /** Pane ids in render order, honoring the user's order and hidden set. */

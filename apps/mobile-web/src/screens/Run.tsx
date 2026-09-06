@@ -27,9 +27,12 @@ import {
   type ActivityItem,
   type HarnessEvent,
 } from '@clem/chat-engine';
-import { getRun, isActiveRunStatus } from '../lib/api';
+import { getRun, runDetailPath } from '../lib/api';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
+import { lastGoodAt, lastGoodNotice } from '../lib/last-good';
+import { runElapsedLabel, runIsLive } from '../lib/run-liveness';
+import { runStateLabel } from '../lib/run-rows';
 import { useScreenData } from '../lib/use-screen-data';
 
 interface Props {
@@ -44,7 +47,17 @@ export function Run({ sessionId, onBack }: Props) {
     { intervalMs: 5_000 },
   );
   const run = data ?? null;
-  const live = run ? isActiveRunStatus(run.status) : false;
+  /**
+   * The SAME path api() fetched with, so the stamp lookup cannot miss. Spelling
+   * it a second time is how `background:task-1` lost its age disclosure.
+   */
+  const stampedAt = lastGoodAt(runDetailPath(sessionId));
+  // Status alone never certifies liveness: a remembered copy of a running run
+  // still says "running". See lib/run-liveness.ts.
+  const live = runIsLive({ status: run?.status, stampedAt });
+  const elapsedLabel = run
+    ? runElapsedLabel({ startedAt: run.startedAt, lastEventAt: run.lastEventAt, live, nowMs: Date.now() })
+    : null;
   /**
    * What changed out there, folded from the events rather than the route's
    * precomputed `receipts`. Two reasons: the events carry `callId`, so a
@@ -86,7 +99,13 @@ export function Run({ sessionId, onBack }: Props) {
       </div>
       <div class="workflow-detail-body">
         {loading && !run ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
-        <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={Boolean(run)} />
+        <ScreenNotice
+          error={error}
+          offline={offline}
+          onRetry={() => void refresh()}
+          hasData={Boolean(run)}
+          lastGood={lastGoodNotice(stampedAt, Date.now())}
+        />
 
         {run ? (
           <>
@@ -95,9 +114,13 @@ export function Run({ sessionId, onBack }: Props) {
                 {/* Status is not a liveness certificate: active reads active,
                     but only the server's liveness may animate a pulse. */}
                 {live ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
-                {run.status.replace(/_/g, ' ')}
-                {run.startedAt ? ` · ${elapsed(run.startedAt, run.lastEventAt, live)}` : ''}
+                {runStateLabel({ status: run.status })}
+                {/* No end point, no number: a remembered copy of an active run
+                    must not tick a clock up from a start time days old. */}
+                {elapsedLabel ? ` · ${elapsedLabel}` : ''}
               </span>
+              {/* Stop is an ACTION on a live process. A stamped copy cannot
+                  offer it: `live` is already false for one, which is the point. */}
               {live ? <RunControl target={{ kind: 'run', runId: run.id }} onChanged={() => void refresh()} /> : null}
             </div>
 
@@ -165,14 +188,4 @@ export function Run({ sessionId, onBack }: Props) {
       </div>
     </div>
   );
-}
-
-
-function elapsed(startedAt: number, lastEventAt: number | null, live: boolean): string {
-  const end = live ? Date.now() : (lastEventAt ?? Date.now());
-  const seconds = Math.max(0, Math.round((end - startedAt) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }

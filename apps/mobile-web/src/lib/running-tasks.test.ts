@@ -115,8 +115,10 @@ test('the mobile sheet is bounded, modal, keyboard dismissible, safe-area aware,
   // HEADER chip, mounted once in the shell header so running work stays
   // reachable from every screen and nothing floats at the bottom any more.
   const appShell = readFileSync(new URL('../app.tsx', import.meta.url), 'utf8');
-  assert.match(appShell, /class="meta"[\s\S]*?<RunningTasksSheet \/>/,
+  assert.match(appShell, /class="meta"[\s\S]*?<RunningTasksSheet[^>]*\/>/,
     'the running-tasks chip lives in the sticky header, not a bottom float');
+  assert.match(appShell, /<RunningTasksSheet onOpenRun=\{openRun\}/,
+    'a run listed in the sheet must open the run, not only expand in place');
   // Presenter contract: the chip exists ONLY while view.total > 0 — the
   // pill disappearing at zero is pinned behavior.
   assert.match(component, /if \(view\.total === 0\) return null/);

@@ -20,11 +20,15 @@ const MAX_VISIBLE_TASKS = 12;
  * chat with a dashboard or manufactures a task from assistant text. */
 export function RunningTasksSheet({
   composerRef,
+  onOpenRun,
 }: {
   /** Optional: only the Chat screen has a composer to return focus to. The
    *  sheet is mounted in the app shell so running work is visible on EVERY
    *  tab, and on non-chat tabs focus falls back to the document body. */
   composerRef?: { current: HTMLTextAreaElement | null };
+  /** Open the run's own screen. Expanding a row in place shows the three facts
+   *  this DTO carries; the run itself is where what it CHANGED lives. */
+  onOpenRun?: (sessionId: string) => void;
 }) {
   // ONE snapshot for the whole app: the shell keeps the poll alive and Home
   // renders from this same store, so the chip and the page cannot disagree.
@@ -171,7 +175,22 @@ export function RunningTasksSheet({
                             setSelected(expanded ? null : entry.runKey);
                           }}
                         >
-                          {expanded ? 'Close' : entry.needsAttention ? 'Review' : 'Open'}
+                          {expanded ? 'Close' : entry.needsAttention ? 'Review' : 'Details'}
+                        </button>
+                      ) : null}
+                      {/* The sheet is a glance; the run is the work. Only a
+                          harness session has a run screen, so a row without
+                          one shows no dead affordance. */}
+                      {onOpenRun && entry.sessionId ? (
+                        <button
+                          type="button"
+                          class="running-task-open"
+                          onClick={() => {
+                            close();
+                            onOpenRun(entry.sessionId as string);
+                          }}
+                        >
+                          Open run
                         </button>
                       ) : null}
                       {control ? (

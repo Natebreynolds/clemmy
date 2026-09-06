@@ -136,13 +136,179 @@ function exactSlackDeliveryIdentity(
   };
 }
 
+/** One short, sentence-case fact from a metadata value, or '' if it isn't one. */
+function pushFact(metadata: Record<string, unknown> | undefined, key: string, max = 60): string {
+  const value = metadata?.[key];
+  if (typeof value !== 'string') return '';
+  const single = value.replace(/\s+/g, ' ').trim();
+  if (!single) return '';
+  return single.length > max ? `${single.slice(0, max - 1)}…` : single;
+}
+
+/** A tool slug as words. Slugs are our own vocabulary, never user content. */
+function pushToolLabel(metadata: Record<string, unknown> | undefined): string {
+  const raw = pushFact(metadata, 'tool', 40) || pushFact(metadata, 'toolName', 40);
+  return raw.replace(/[_-]+/g, ' ').toLowerCase();
+}
+
+function pushCount(metadata: Record<string, unknown> | undefined, key: string): number {
+  const value = metadata?.[key];
+  return Array.isArray(value) ? value.length : 0;
+}
+
 /**
- * Sanitized payload for Web Push. We deliberately strip everything
- * beyond a short generic title + body so the push payload that lands
- * on Apple/Google's relay carries no sensitive content. The PWA fetches
- * the full notification from the authenticated mobile Inbox after the user
- * taps. The notification id is an address, not content; push relays still see
- * only generic copy.
+ * The sentence a banner says.
+ *
+ * WHY THIS IS DERIVED AND NOT COPIED. Both push transports used to send one of
+ * two fixed pairs ("Clem needs you" / "Clementine"), which is the defining
+ * chat-app ping: a banner that never names the thing teaches the user that
+ * banners carry no information. The daemon knows the run, the gate and the
+ * decision at the moment it sends, so it says which.
+ *
+ * WHY IT IS DERIVED FROM METADATA AND NOT FROM title/body. Those two fields
+ * carry the user's own material — recipients, quotes, results — and this
+ * payload is the one part of the product that crosses Apple's / Google's push
+ * relay in the clear. Typed metadata (a workflow's name, a tool slug, a failure
+ * count, a status) says what happened without shipping what it was about; the
+ * PWA still fetches the full notification from the authenticated Inbox after
+ * the tap. So: name the work, never quote it.
+ *
+ * WHAT IT NEVER CLAIMS. A notification record carries no write disposition
+ * (see packages/chat-engine/src/write-ledger.ts — a reservation is not a
+ * receipt), so no copy here says a send/create landed. "Finished" describes the
+ * RUN, which the record does settle; what it changed out there is a question
+ * only the run's own ledger answers, one tap away.
+ */
+function buildPushCopy(notification: NotificationRecord): { title: string; body: string } {
+  const meta = notification.metadata;
+  const workflow = pushFact(meta, 'workflow');
+  const status = pushFact(meta, 'status', 40);
+  const needsUser = !notification.read
+    && meta?.inboxOnly !== true
+    && (
+      notification.kind === 'approval'
+      || isNeedsAttentionNotification(notification)
+      || typeof meta?.checkInId === 'string'
+      || typeof meta?.questionId === 'string'
+    );
+
+  if (needsUser) {
+    if (typeof meta?.checkInId === 'string' || typeof meta?.questionId === 'string') {
+      return {
+        title: workflow ? `${workflow} has a question` : 'Clem has a question',
+        body: 'She paused there until you answer.',
+      };
+    }
+    if (typeof meta?.planProposalId === 'string') {
+      return { title: 'A plan is waiting on you', body: "Clem drafted the steps and won't start until you say go." };
+    }
+    if (meta?.kind === 'check_in_proposal') {
+      return { title: 'Clem suggested a check-in', body: 'Tap to approve or decline it.' };
+    }
+    if (meta?.kind === 'agent_proposal') {
+      return { title: 'Clem drafted an agent', body: 'Tap to review what it would do.' };
+    }
+    if (typeof meta?.trustProposalId === 'string') {
+      return { title: 'Standing permission request', body: 'Clem is asking to stop checking with you for one exact scope.' };
+    }
+    if (status === 'blocked_capability') {
+      return {
+        title: workflow ? `${workflow} is blocked` : 'A workflow is blocked',
+        body: 'A step needs an account before it can go on. Nothing was sent.',
+      };
+    }
+    if (notification.kind === 'approval' || typeof meta?.approvalId === 'string') {
+      const tool = pushToolLabel(meta);
+      return {
+        title: 'Approval needed',
+        body: tool ? `Clem is waiting on a yes before she runs ${tool}.` : 'Clem is holding a step until you decide.',
+      };
+    }
+    return {
+      title: workflow ? `${workflow} needs a look` : 'Something needs a look',
+      body: 'Tap to see what it is.',
+    };
+  }
+
+  if (workflow) {
+    if (status === 'error') return { title: `${workflow} failed`, body: 'Tap to see where it stopped.' };
+    if (status === 'cancelled') return { title: `${workflow} was cancelled`, body: 'Tap to see how far it got.' };
+    if (meta?.noOp === true) return { title: `Nothing new from ${workflow}`, body: 'She checked and there was nothing to do.' };
+    const failures = pushCount(meta, 'forEachFailures');
+    if (failures > 0) {
+      return {
+        title: `${workflow} finished with ${failures} problem${failures === 1 ? '' : 's'}`,
+        body: 'Tap to see which items failed.',
+      };
+    }
+    return { title: `${workflow} finished`, body: 'Tap to see what it did.' };
+  }
+
+  // Background tasks are titled by the daemon itself with these exact prefixes
+  // (src/execution/background-tasks.ts). Matching OUR prefix is not the same as
+  // forwarding the task's own name, which follows the colon and stays here.
+  if (notification.kind === 'execution') {
+    const title = notification.title.trim().toLowerCase();
+    if (title.startsWith('background task completed:')) {
+      return { title: 'A background task finished', body: 'Tap to see what it did.' };
+    }
+    if (title.startsWith('background task failed:')) {
+      return { title: 'A background task failed', body: 'Tap to see where it stopped.' };
+    }
+    if (title.startsWith('background task aborted:') || title.startsWith('background task interrupted:')) {
+      return { title: 'A background task stopped early', body: 'Tap to see how far it got.' };
+    }
+  }
+
+  return { title: 'Clementine', body: 'Tap to read the update.' };
+}
+
+/**
+ * The one route the native iOS shell will accept.
+ *
+ * apps/ios PendingPushNavigationRoute.parse REFUSES to park anything but
+ * `/m/?tab=inbox&notification=<id>` with exactly those two query items — a
+ * deliberately tiny contract so a push payload can never steer the pinned web
+ * view. A richer route sent to APNs is not a worse landing; it is no landing at
+ * all (park() fails and the tap does nothing).
+ */
+function inboxNotificationUrl(notification: NotificationRecord): string {
+  return `/m/?tab=inbox&notification=${encodeURIComponent(notification.id)}`;
+}
+
+/**
+ * Where the tap lands, for the transports that can navigate freely (Web Push;
+ * the service worker calls clients.navigate with this).
+ *
+ * A decision belongs in the Inbox, which focuses the exact card. Everything
+ * else that names a harness session belongs on that RUN — the screen that
+ * leads with what changed — because a finished run's Inbox row is a paragraph
+ * about work whose own page already exists. A record with neither stays on its
+ * Inbox row.
+ */
+function pushTargetUrl(notification: NotificationRecord): string {
+  const meta = notification.metadata;
+  const decides = notification.kind === 'approval'
+    || isNeedsAttentionNotification(notification)
+    || typeof meta?.approvalId === 'string'
+    || typeof meta?.planProposalId === 'string'
+    || typeof meta?.trustProposalId === 'string'
+    || typeof meta?.questionId === 'string'
+    || typeof meta?.checkInId === 'string';
+  if (decides) return inboxNotificationUrl(notification);
+  // Only a harness session id opens the run view (/m/api/runs/:sessionId is
+  // keyed on it); a workflow's own runId is a different namespace and would
+  // 404, so it is deliberately not used here.
+  const session = pushFact(meta, 'runSessionId', 200) || pushFact(meta, 'sessionId', 200);
+  return session
+    ? `/m/?tab=activity&run=${encodeURIComponent(session)}`
+    : inboxNotificationUrl(notification);
+}
+
+/**
+ * Sanitized payload for Web Push. The copy is derived from typed metadata (see
+ * buildPushCopy) so the banner names the work without any of the notification's
+ * own prose crossing the relay. The notification id is an address, not content.
  */
 function buildWebPushPayload(notification: NotificationRecord): {
   title: string;
@@ -151,20 +317,11 @@ function buildWebPushPayload(notification: NotificationRecord): {
   notificationId: string;
   kind: string;
 } {
-  const needsUser = !notification.read
-    && notification.metadata?.inboxOnly !== true
-    && (
-      notification.kind === 'approval'
-      || isNeedsAttentionNotification(notification)
-      || typeof notification.metadata?.checkInId === 'string'
-      || typeof notification.metadata?.questionId === 'string'
-    );
+  const copy = buildPushCopy(notification);
   return {
-    title: needsUser ? 'Clem needs you' : 'Clementine',
-    body: needsUser
-      ? 'Tap to review and respond.'
-      : 'You have an update.',
-    url: `/m/?tab=inbox&notification=${encodeURIComponent(notification.id)}`,
+    title: copy.title,
+    body: copy.body,
+    url: pushTargetUrl(notification),
     notificationId: notification.id,
     kind: notification.kind,
   };
@@ -355,12 +512,15 @@ export async function deliverNotificationToDestination(
       // instead of retrying into a wall.
       throw new Error('APNs is not configured yet (no signing key). See state/apns.json.');
     }
-    const content = buildWebPushPayload(notification);
+    const copy = buildPushCopy(notification);
     const result = await sendApnsAlert({
       deviceToken: destination.apnsDeviceToken,
-      title: content.title,
-      body: content.body,
-      url: content.url,
+      title: copy.title,
+      body: copy.body,
+      // The native shell parks ONLY the Inbox route (see inboxNotificationUrl).
+      // Web Push's richer target would be refused by its parser, which is a
+      // tap that does nothing at all — so this leg keeps the route it accepts.
+      url: inboxNotificationUrl(notification),
     });
     if (result.ok) return;
     if (isApnsTokenGone(result)) {
@@ -539,6 +699,9 @@ export async function testNotificationDestination(destination: NotificationDesti
 
 export const notificationDeliveryInternalsForTest = {
   buildWebPushPayload,
+  buildPushCopy,
+  pushTargetUrl,
+  inboxNotificationUrl,
   buildDiscordComponentsForNotification,
   buildSlackBlocksForNotification,
   shouldDeliverDiscordNotification,

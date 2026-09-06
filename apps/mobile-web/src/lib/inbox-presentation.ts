@@ -162,6 +162,30 @@ export function notificationLabel(row: Pick<InboxNotification, 'kind' | 'needsAt
   }
 }
 
+/**
+ * The run an Inbox row opens — the SAME one the push for that row opens.
+ *
+ * `sessionId` is the originating CONVERSATION (a reply belongs there). For a
+ * background task that is not the run: background-tasks.ts sets sessionId to
+ * the chat that asked and runSessionId to `background:<id>`. "Open run" keyed
+ * on sessionId therefore opened the origin transcript rendered as a run, while
+ * the push for the same notification opened the actual run.
+ *
+ * This is deliberately the same preference order as pushTargetUrl in
+ * src/runtime/notification-delivery.ts (runSessionId, then sessionId), so one
+ * notification can only ever have one run destination. Null means this row is
+ * about no run at all — and then no "Open run" affordance may be offered.
+ */
+export function notificationRunTarget(
+  row: Pick<InboxNotification, 'context'>,
+): string | null {
+  const runSession = row.context.runSessionId;
+  if (typeof runSession === 'string' && runSession.trim()) return runSession;
+  const session = row.context.sessionId;
+  if (typeof session === 'string' && session.trim()) return session;
+  return null;
+}
+
 export function notificationDedupeKey(row: InboxNotification): string {
   // A title or workflow name is presentation, not identity: one workflow can
   // have two unrelated blockers with the same generic title. Until a durable

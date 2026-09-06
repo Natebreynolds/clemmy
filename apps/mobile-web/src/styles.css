@@ -266,6 +266,25 @@ input, textarea, select { font: inherit; font-size: 16px; }
   transition: transform 0.14s var(--ease-out), background 0.16s ease;
 }
 .needs-pill:active .needs-pill-face { transform: scale(0.96); background: var(--accent-deep); }
+/*
+   A count that was not confirmed just now must not wear the same confident
+   solid as a live one. The pill already says the age in words (lib/needs-you.
+   ts); this is the glance-level half of the same disclosure — hollow, not
+   filled — and it applies identically to the two numeric badges, which have
+   no room for words at all.
+*/
+.needs-pill-stale .needs-pill-face {
+  background: transparent;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  font-weight: 600;
+}
+.needs-pill-stale:active .needs-pill-face { background: var(--bg-2); }
+.badge-stale {
+  background: transparent !important;
+  color: var(--accent) !important;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
 /* Direct is the quiet default: one dot. */
 .conn-dot-only {
   display: inline-block;
@@ -386,6 +405,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
   text-align: left;
   flex: 1 1 auto;
   min-width: 0;
+}
+/* What the run did, between its title and its state — the run's own output
+   line, not a status token dressed up as one. */
+.run-outcome {
+  margin-top: 2px;
+  color: var(--fg-2);
+  font-size: var(--t-sm);
 }
 
 .icon-btn {
@@ -3364,6 +3390,25 @@ textarea:focus-visible,
 .home-row-receipt { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--accent-2); font-size: var(--t-sm); font-weight: 700; }
 .home-row-receipt svg { width: 16px; height: 16px; }
 .home-row-error { margin: 0; color: var(--accent-fail); font-size: var(--t-xs); }
+/* A running row OPENS. It carried a pulse, an elapsed clock and a progress
+   bar while being untappable, which reads as a typing indicator rather than a
+   work item. The button wraps only the text block so the stop control beside
+   it stays independently tappable. */
+.home-run-open {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  min-width: 0;
+  border-radius: var(--r-md);
+  transition: transform 0.14s var(--ease-out);
+}
+.home-run-open:active { transform: scale(0.99); }
+.home-run-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .home-run-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .home-run-head .home-row-title { flex: 1 1 auto; min-width: 0; }
 .home-run-elapsed { flex: 0 0 auto; font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
@@ -3659,3 +3704,65 @@ textarea.cz-input { resize: vertical; }
 .cz-status-fail { color: var(--accent-fail); }
 .cz-retry { min-height: 44px; padding: 0 8px; border: 0; background: transparent; color: var(--accent); font-weight: 700; font-size: 12px; }
 .sheet-foot .cz-done { margin-left: auto; }
+
+/* ── long lists, cheaply ─────────────────────────────────────────── */
+/*
+   The transcript, the activity timeline and the card stacks are the only
+   places this app renders hundreds of similar rows, and they are exactly where
+   an older phone starts to feel like a web page: every offscreen row is still
+   laid out and painted on each frame.
+
+   `content-visibility: auto` skips that work for anything outside the viewport;
+   `contain-intrinsic-size` supplies a placeholder height so the scrollbar and
+   the scroll position stay honest while a row is skipped. The sizes are
+   deliberate over-estimates of a one-line row — an under-estimate is what makes
+   a list jitter as it scrolls.
+
+   Unsupported browsers ignore both properties and render exactly as before, so
+   this is a pure win with no fallback path. Deliberately NOT applied to the
+   composer, the header, or anything the user can focus off-screen.
+*/
+/*
+   Narrowed deliberately to the ROW-shaped cards. `.card settings-card` and
+   `.card settings-status` are 400-600px sections, and a 92px estimate for one
+   of those is the under-estimate this comment warns about; `.card-live` paints
+   a 9px expanding glow ring (.pulse-dot) that paint containment would clip.
+*/
+.turn,
+.activity-row,
+.card:not(.settings-card):not(.settings-status):not(.card-live),
+.running-task-card {
+  content-visibility: auto;
+}
+.turn { contain-intrinsic-size: auto 88px; }
+.activity-row { contain-intrinsic-size: auto 24px; }
+.card:not(.settings-card):not(.settings-status):not(.card-live),
+.running-task-card { contain-intrinsic-size: auto 92px; }
+/* Inbox cards are deliberately NOT in that list: a push tap scrolls one into
+   view and focuses it through a two-frame dance (screens/Inbox.tsx), and that
+   contract is not worth risking for a list that is bounded at 200 rows. */
+
+/* ── depth transitions ───────────────────────────────────────────── */
+/*
+   ONLY depth animates. lib/back-gesture.ts already models the distinction —
+   a deep view (a run, a chat, a workspace) pushes exactly one same-document
+   history entry; tabs are peers and push nothing — so wrapping that same
+   enter/close in startViewTransition() means a tab switch, which is
+   high-frequency and feels faster without motion, can never animate.
+
+   180ms is the app's default motion budget. Browsers without view transitions
+   simply run the update, and the reduced-motion block below removes the
+   animation for anyone who asked for less movement.
+*/
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 180ms;
+  animation-timing-function: var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}

@@ -24,6 +24,42 @@ interface Entry {
   close: () => void;
 }
 
+/** The subset of document this needs; absent wherever view transitions are not. */
+interface TransitionDocument {
+  startViewTransition?: (update: () => void) => unknown;
+}
+
+/**
+ * Animate a DEPTH change — and only a depth change.
+ *
+ * This module already models the distinction the animation needs: a deep view
+ * pushes exactly one same-document history entry, and tabs are peers that push
+ * nothing. So the cross-fade rides on the same two calls, which means a tab
+ * switch (high-frequency, feels faster without motion) can never accidentally
+ * animate.
+ *
+ * Degrades silently: an unsupported browser and a reduced-motion setting both
+ * just run the update.
+ */
+export function withDepthTransition(
+  update: () => void,
+  doc: TransitionDocument | undefined = typeof document === 'undefined' ? undefined : document,
+  reduceMotion: boolean = typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+): void {
+  if (!doc?.startViewTransition || reduceMotion) {
+    update();
+    return;
+  }
+  try {
+    doc.startViewTransition(update);
+  } catch {
+    // A transition that cannot start must never swallow the navigation itself.
+    update();
+  }
+}
+
 const stack: Entry[] = [];
 let sequence = 0;
 let installed = false;
@@ -43,7 +79,9 @@ function install(): void {
     if (!top) return;
     servicingPop = true;
     try {
-      top.close();
+      // The swipe-back close animates exactly like the in-page arrow's close,
+      // because both are the same depth pop.
+      withDepthTransition(() => top.close());
     } finally {
       // Cleared on a later task, not synchronously: the close() above sets
       // component state, and the effect that observes it runs after this

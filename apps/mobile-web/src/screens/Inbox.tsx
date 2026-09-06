@@ -27,6 +27,7 @@ import {
   collapseAttentionNotifications,
   notificationIsRepresentedByApprovals,
   notificationLabel,
+  notificationRunTarget,
   trustScopeSummary,
 } from '../lib/inbox-presentation';
 import { inboxNeedsCountKnown, mergeInboxLastGood, type InboxLastGood } from '../lib/inbox-last-good';
@@ -81,9 +82,12 @@ interface Props {
   onReply: (sessionId: string | null, draft: string) => void;
   onOpenSettings: () => void;
   onOpenWorkflows: () => void;
+  /** A row that names a run opens that run. The card is a paragraph ABOUT the
+   *  work; the run screen is the work — what it changed, what it produced. */
+  onOpenRun: (sessionId: string) => void;
 }
 
-export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings, onOpenWorkflows }: Props) {
+export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings, onOpenWorkflows, onOpenRun }: Props) {
   // Partial endpoint failures keep the last successful value for that exact
   // source. `undefined` means “never known”; an empty array means a successful
   // authoritative zero. This distinction prevents a transport miss from
@@ -415,8 +419,11 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             onReply={(sessionId, draft) => onReply(sessionId || null, draft)}
           />
 
-          {notificationNeeds.map(({ row, earlier }) => (
-            row.workflowCapability ? (
+          {notificationNeeds.map(({ row, earlier }) => {
+            // The run this row is ABOUT (see notificationRunTarget) — the same
+            // destination the push for this same notification lands on.
+            const runTarget = notificationRunTarget(row);
+            return row.workflowCapability ? (
               <WorkflowCapabilityCard
                 key={row.id}
                 row={row}
@@ -447,13 +454,25 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                       Reply to Clem
                     </button>
                   ) : null}
+                  {/* The run this is ABOUT — not the chat that started it.
+                      notificationRunTarget is the same choice the push makes. */}
+                  {runTarget ? (
+                    <button
+                      type="button"
+                      class="btn-reply"
+                      disabled={reading !== null}
+                      onClick={() => onOpenRun(runTarget)}
+                    >
+                      Open run
+                    </button>
+                  ) : null}
                   <button type="button" class="btn-reject" disabled={reading !== null} onClick={() => void markRead(row)}>
                     {reading === row.id ? 'Saving…' : 'Dismiss update'}
                   </button>
                 </div>
               </article>
-            )
-          ))}
+            );
+          })}
 
           {decidedToday.length > 0 ? (
             <section class="inbox-decided" aria-labelledby="inbox-decided-head">
@@ -487,26 +506,39 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
               <h2>Checking updates</h2>
               <p>Your last known update count is unchanged until this source responds.</p>
             </div>
-          ) : updates.map((row) => (
-            <article
-              key={row.id}
-              id={`inbox-notification:${row.id}`}
-              class={`inbox-card inbox-update-card${row.read ? ' read' : ''}`}
-              tabIndex={-1}
-            >
-              <CardMeta label={notificationLabel(row)} at={row.createdAt} unread={!row.read} />
-              <h2>{row.title || 'Update from Clem'}</h2>
-              {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
-              {row.deliveryError ? <p class="inbox-delivery-error">Delivery issue: {row.deliveryError}</p> : null}
-              {!row.read ? (
-                <div class="inbox-card-actions">
-                  <button type="button" class="btn-reply" disabled={reading !== null} onClick={() => void markRead(row)}>
-                    {reading === row.id ? 'Saving…' : 'Mark as read'}
-                  </button>
-                </div>
-              ) : null}
-            </article>
-          ))}
+          ) : updates.map((row) => {
+            const runTarget = notificationRunTarget(row);
+            return (
+              <article
+                key={row.id}
+                id={`inbox-notification:${row.id}`}
+                class={`inbox-card inbox-update-card${row.read ? ' read' : ''}`}
+                tabIndex={-1}
+              >
+                <CardMeta label={notificationLabel(row)} at={row.createdAt} unread={!row.read} />
+                <h2>{row.title || 'Update from Clem'}</h2>
+                {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
+                {row.deliveryError ? <p class="inbox-delivery-error">Delivery issue: {row.deliveryError}</p> : null}
+                {!row.read || runTarget ? (
+                  <div class="inbox-card-actions">
+                    {!row.read ? (
+                      <button type="button" class="btn-reply" disabled={reading !== null} onClick={() => void markRead(row)}>
+                        {reading === row.id ? 'Saving…' : 'Mark as read'}
+                      </button>
+                    ) : null}
+                    {/* An update about finished work is a summary of a run that
+                        already has its own screen — go to the work itself, which
+                        for a background task is NOT the chat that started it. */}
+                    {runTarget ? (
+                      <button type="button" class="btn-reply" disabled={reading !== null} onClick={() => onOpenRun(runTarget)}>
+                        Open run
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
         </div>
       ) : null}
     </div>

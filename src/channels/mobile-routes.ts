@@ -497,6 +497,8 @@ interface MobileInboxNotification {
     relatedApprovalIds: string[];
     questionId: string | null;
     sessionId: string | null;
+    /** The harness session the run itself used; see the serializer's note. */
+    runSessionId: string | null;
     runId: string | null;
     stepId: string | null;
     workflow: string | null;
@@ -565,6 +567,13 @@ function serializeInboxNotificationForMobile(row: NotificationRecord): MobileInb
       relatedApprovalIds,
       questionId: questionId ?? checkInId,
       sessionId: notificationMetadataString(row.metadata, 'sessionId', 'targetSessionId'),
+      // The session the WORK ran in, which for a background task is not the
+      // conversation that started it (background-tasks.ts sets sessionId to
+      // the origin chat and runSessionId to `background:<id>`). Without this
+      // the phone's "Open run" opened the originating transcript while the
+      // push for the same notification opened the run — one notification,
+      // two destinations. See pushTargetUrl in notification-delivery.ts.
+      runSessionId: notificationMetadataString(row.metadata, 'runSessionId'),
       runId,
       stepId,
       workflow: notificationMetadataString(row.metadata, 'workflow'),
