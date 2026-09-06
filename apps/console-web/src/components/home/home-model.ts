@@ -9,9 +9,12 @@
 import type { ActivityEntry } from '@/lib/activity';
 import type { CommandCenterItem } from '@/lib/types';
 import type { SpaceRecord } from '@/lib/spaces';
-import { humanizeCron } from '@/lib/cron';
-import { relativeTime } from '@/lib/inbox';
-import { unifiedChatSessionId } from '@/lib/last-session';
+// Relative for VALUES, `@/` for types. The alias is a bundler/tsconfig path,
+// so a type import is erased before Node ever sees it while a value import is
+// not — which is why this module had no unit test until now.
+import { humanizeCron } from '../../lib/cron';
+import { relativeTime } from '../../lib/inbox';
+import { unifiedChatSessionId } from '../../lib/last-session';
 
 /** The command-center DTO is deliberately loose; these are the extra,
  *  server-owned fields a home row may carry (all optional). */
@@ -136,13 +139,23 @@ export function steerTarget(entry: ActivityEntry): string | null {
   return `/chat/${encodeURIComponent(unifiedChatSessionId(entry.sessionId))}`;
 }
 
-/** The Tasks board deep link for an activity row. Mirrors the drawer's
- *  select rule (session, then run, then task id); the attempt is pinned only
- *  for chat turns, where one reusable session mints an attempt per turn. */
+/**
+ * Where "Open run" goes.
+ *
+ * A run with a session now has a real ADDRESS — /chat/:sessionId renders it as
+ * a run, and that page can be bookmarked, pinned, renamed, tagged and searched.
+ * This used to hand every row to the /tasks drawer, which was right when the
+ * drawer was the only run detail there was; sending a row there now would put
+ * the owner in front of transient overlay state when a durable page exists.
+ *
+ * A row with no session is genuinely still board-shaped — a queued task or a
+ * run scope that never minted a harness session has nothing to render at a
+ * session address — so it keeps the deep link it had, attempt and all.
+ */
 export function runningOpenTarget(entry: ActivityEntry): string {
-  const select = entry.taskId ?? entry.sessionId ?? entry.runId ?? entry.runKey;
+  if (entry.sessionId) return `/chat/${encodeURIComponent(unifiedChatSessionId(entry.sessionId))}`;
+  const select = entry.taskId ?? entry.runId ?? entry.runKey;
   const params = new URLSearchParams({ select });
-  if (entry.kind === 'chat' && entry.attemptId) params.set('attemptId', entry.attemptId);
   return `/tasks?${params.toString()}`;
 }
 
