@@ -56,6 +56,7 @@ import {
   type MobileAttemptScope,
   type MobileRateLimitOptions,
 } from '../runtime/mobile-rate-limit.js';
+import { classifyNotification } from '../runtime/notification-intent.js';
 import {
   addNotification,
   getNotification,
@@ -2610,7 +2611,21 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         if (trustProposalId && trustIds.has(trustProposalId)) continue;
         if (relatedApprovalIds.length > 0 && relatedApprovalIds.every((id) => approvalIds.has(id))) continue;
         if (actionItemId && questionActionIds.has(actionItemId)) continue;
-        if (!isNeedsAttentionNotification(notification)) {
+        // Rule (1) vs rule (2), decided in ONE place. The old predicate ended
+        // in a regex over the TITLE, so "Chat run blocked: …" — a past-tense
+        // report of something that already stopped — counted as a decision
+        // forever, because nothing ever edits that word out. Measured on the
+        // owner's store: a badge of 86 against ZERO pending approvals.
+        // classifyNotification asks instead whether there is something to
+        // ANSWER, and reads a terminal status before any flag stamped earlier.
+        const intent = classifyNotification(notification, {
+          approvalPending: (id) => approvalIds.has(id),
+          planPending: (id) => planIds.has(id),
+          trustPending: (id) => trustIds.has(id),
+        });
+        if (intent !== 'awaiting_you') {
+          // A finished run is worth telling someone about once; it is not an
+          // obligation, so it never enters the count that shapes the badge.
           unreadUpdates += 1;
           continue;
         }

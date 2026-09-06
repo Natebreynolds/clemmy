@@ -2,6 +2,7 @@ import webPush from 'web-push';
 import { createHash } from 'node:crypto';
 import type { NotificationDestination, NotificationRecord } from './notifications.js';
 import { isNeedsAttentionNotification, removeWebPushDestinationByEndpoint } from './notifications.js';
+import { isWorthNotifying } from './notification-intent.js';
 import {
   exactOriginDeliveryDestinationMatches,
   exactOriginDeliveryTarget,
@@ -457,6 +458,22 @@ export async function deliverNotificationToDestination(
   ) {
     throw new Error('Exact-origin delivery destination does not match its admitted target.');
   }
+  // THE TWO RULES, at the last gate before a phone buzzes.
+  //
+  // Owner directive 2026-09-06: Clem notifies when she needs an answer to
+  // continue, and when she finishes work. Nothing else. Before this, the same
+  // title regex that inflated the badge also decided the copy and the target,
+  // so a daemon restart and a two-day-old "Chat run blocked: …" both reached a
+  // lock screen. A banner that fires for everything teaches a person to ignore
+  // banners, which costs exactly the notification that mattered.
+  //
+  // Scoped to the PUSH transports on purpose. The desktop leg is the durable
+  // record on this machine, and the record is where history belongs; Slack and
+  // Discord are channel deliveries that already carry their own rules
+  // (shouldDeliverSlackNotification / shouldDeliverDiscordNotification) and a
+  // routed team message is not the same act as buzzing someone's pocket. This
+  // gate decides what may INTERRUPT a person, not what is written down or
+  // routed onward.
   if (destination.type === 'desktop') {
     // The durable notification store lives ON this machine — reaching it IS
     // desktop delivery; the app shell toasts loud unread records from its own
@@ -464,6 +481,9 @@ export async function deliverNotificationToDestination(
     // destination (never "deferred: no destinations", live 2026-07-22) and so
     // the delivery ledger records the surface.
     return;
+  }
+  if (destination.type === 'web_push' || destination.type === 'apns') {
+    if (!isWorthNotifying(notification)) return;
   }
   if (destination.type === 'web_push') {
     if (!destination.pushEndpoint || !destination.pushP256dh || !destination.pushAuth) {
