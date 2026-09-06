@@ -1,0 +1,121 @@
+/* ────────────────────────────────────────────────────────────────────────────
+   Clementine — the shared semantic token layer.
+
+   ONE file, plain CSS custom properties, no build step. The desktop console is
+   React + Tailwind and the mobile PWA is Preact + hand-written CSS; a CSS
+   variable is the only thing both can consume without either adopting the
+   other's toolchain. The Electron setup window (apps/desktop/src/setup-window.ts)
+   inlines these bytes verbatim, which is the other reason this must stay plain
+   CSS rather than a Tailwind layer.
+
+   WHAT LIVES HERE: the semantic decisions that were provably wrong or silently
+   divergent between the two surfaces — the accent's two roles, the ink ramp,
+   status colour, focus, motion.
+
+   WHAT DOES NOT LIVE HERE (yet): the surface ramps. Desktop sits white cards on
+   a cream canvas; mobile sits white cards on white and DARKENS toward parchment
+   as it elevates. Those are two coherent, deliberate systems, and unifying them
+   is a visual restructure, not a token fix. Each surface keeps its
+   own --bg- and --surface- names for now, and maps them below.
+
+   CONTRAST: every ratio in a comment here was computed from these exact hex
+   values against the exact surface named, and is asserted by a test that
+   recomputes it (see contrast.test.ts). Prose claims rot; the previous token
+   file carried a comment promising "4.6:1" for a colour that measured 3.77:1,
+   and that comment is why nobody caught it for months.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* ── The accent has TWO roles ──────────────────────────────────────────────
+     Orange you look AT is #f26419.  Orange you READ is #b94300.
+
+     This is the whole rule. The brand hero is untouched; only its *role* is
+     constrained. #f26419 is a 3.18:1 colour on white — a fine fill, and an
+     illegal one for 12px text, which is what 161 `text-primary` sites were
+     using it for. The mobile app had already reached the deeper tone
+     independently and for the same reason; this is desktop adopting mobile's
+     answer rather than a new colour being invented. */
+
+  --clem-primary:       #f26419;  /* FILL ONLY — buttons, the mic, the send circle */
+  --clem-primary-hover: #ff8442;  /* FILL ONLY */
+  --clem-primary-press: #de5a12;  /* was #d9520f; deepened so warm ink clears AA on press */
+  --clem-primary-tint:  #fff4ed;  /* selected/hover wash */
+
+  /* Text, meaningful icons, focus rings, and accent borders. Never a fill. */
+  --clem-primary-ink:   #b94300;  /* 5.43:1 on #ffffff · 5.08:1 on #faf7f2 · 5.02:1 on the tint */
+  /* Hover for accent TEXT (links). It must go DARKER, not brighter: the old
+     link hover was --primary-hover #ff8442 = 2.43:1, i.e. the single worst
+     value in the palette, applied to text at the moment of interaction.
+     This is mobile's --accent-deep, already shipping there. */
+  --clem-primary-ink-hover: #963400;  /* 7.53:1 on #ffffff · 7.05:1 on #faf7f2 */
+
+  /* The label on a filled primary button.
+     Warm ink, NOT white. White measures 3.18:1 at rest and — the part that
+     matters — 2.43:1 on hover, so today the most important control in the
+     product gets HARDER to read the moment you touch it. */
+  --clem-primary-fg:    #1f1b16;  /* 5.39:1 at rest · 7.04:1 on hover · 4.55:1 on press */
+
+  /* ── Ink ramp ───────────────────────────────────────────────────────────── */
+  --clem-ink:        #1f1b16;  /* 14.6:1 on canvas */
+  --clem-ink-muted:  #5c564b;  /* 6.80:1 on canvas — already correct, untouched */
+  --clem-ink-subtle: #75644f;  /* was #857e70 = 3.77:1 on canvas, an AA failure at
+                                  ~468 `text-faint` sites and on every placeholder.
+                                  Now 5.32:1 canvas · 5.69:1 surface · 5.01:1 subtle */
+
+  /* ── Status ─────────────────────────────────────────────────────────────── */
+  --clem-success:      #2e7d46;  --clem-success-tint: #e8f5ec;
+  --clem-info:         #1e6fb8;  --clem-info-tint:    #e6f1fa;
+  --clem-warning:      #8a6000;  --clem-warning-tint: #fcf1de;  /* was #b26c00 = 3.73:1 on
+                                                                   its own tint; now 5.00:1 */
+  --clem-danger:       #c0392b;  --clem-danger-tint:  #fbe9e7;
+
+  /* ── Focus ──────────────────────────────────────────────────────────────
+     An outline, not a box-shadow. The old ring was
+     color-mix(in srgb, var(--ring) 55%, transparent) = #f8aa80 = 1.90:1,
+     against SC 1.4.11's 3:1 floor. It also forced border-radius:6px onto every
+     focused pill and card, and — because it lived in @layer base — it was
+     silently deleted on any focusable element carrying a shadow-* utility,
+     since utilities beat base. An outline has none of those three problems. */
+  --clem-focus:        var(--clem-primary-ink);  /* 5.43:1 on white */
+  --clem-focus-width:  2px;
+  --clem-focus-offset: 2px;
+
+  /* ── Motion ─────────────────────────────────────────────────────────────
+     Adopted from mobile, which had reasoned it out and written it down:
+     "things arrive and settle, they do not bounce." Deliberately no overshoot.
+     Desktop tokenised duration but never easing, so ~95 of its 120 transitions
+     were running Tailwind's default curve. */
+  --clem-ease:       cubic-bezier(0.22, 1, 0.36, 1);
+  --clem-dur-fast:   150ms;
+  --clem-dur-base:   200ms;
+  --clem-dur-slow:   300ms;
+}
+
+/* ── Dark ────────────────────────────────────────────────────────────────────
+   Desktop only. Mobile is 100% light by owner directive (2026-08-25) and pins
+   that across its manifest, meta tags and the iOS container colour; it must
+   never pick these up. Applied on .dark, which only the console sets.
+
+   Dark was already in far better shape than light: #ff7a45 measures 7.12:1 on
+   the dark canvas, so in dark the accent needs no second role — ink IS primary.
+   Only one value was actually failing. */
+:root.dark,
+.dark {
+  --clem-primary:       #ff7a45;
+  --clem-primary-hover: #ff9466;
+  --clem-primary-press: #f26419;
+  --clem-primary-tint:  #2e2017;
+  --clem-primary-ink:   #ff7a45;  /* 7.12:1 canvas · 6.57:1 surface · 6.08:1 tint */
+  --clem-primary-ink-hover: #ff9466;  /* dark hovers BRIGHTER — 8.48:1 on canvas */
+  --clem-primary-fg:    #1f1b16;  /* 6.62:1 at rest · 7.89:1 on hover */
+
+  --clem-ink:        #f5f1e8;
+  --clem-ink-muted:  #b8b1a1;
+  --clem-ink-subtle: #9a9282;  /* was #8c8475 = 4.03:1 on --bg-subtle, the one dark
+                                  failure. Now 5.97:1 canvas · 5.51:1 surface · 4.83:1 subtle */
+
+  --clem-success:      #5bc97e;  --clem-success-tint: #15301f;
+  --clem-info:         #5ba8e0;  --clem-info-tint:    #122838;
+  --clem-warning:      #e0a030;  --clem-warning-tint: #2f2410;
+  --clem-danger:       #f0685a;  --clem-danger-tint:  #331715;
+}

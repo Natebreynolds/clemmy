@@ -42,6 +42,41 @@ const config: Config = {
         warning: { DEFAULT: 'var(--warning)', tint: 'var(--warning-tint)' },
         danger: { DEFAULT: 'var(--danger)', tint: 'var(--danger-tint)' },
       },
+      /* THE ACCENT'S TWO ROLES.
+       *
+       * `colors.primary` stays the FILL (bg-primary, and the sub-shades a
+       * filled control needs). These three overrides redirect the *reading*
+       * roles — text, border, ring — to --primary-ink.
+       *
+       * Why here and not at 161 call sites: Tailwind resolves text-primary,
+       * bg-primary, border-primary and ring-primary from one `colors.primary`
+       * entry, so rebinding --primary alone could not split them. Overriding
+       * the three role scales corrects every `text-primary` (161),
+       * `border-primary` (51) and `ring-primary` (8) usage with zero component
+       * edits — while `text-primary-fg` (9 sites: a label ON a fill) and
+       * `text-primary-hover` (the link hover) keep working, now at values that
+       * clear AA instead of 3.18:1 and 2.43:1.
+       */
+      textColor: {
+        primary: {
+          DEFAULT: 'var(--primary-ink)',
+          hover: 'var(--primary-ink-hover)',
+          press: 'var(--primary-press)',
+          fg: 'var(--primary-fg)',
+          tint: 'var(--primary-tint)',
+        },
+      },
+      borderColor: {
+        primary: {
+          DEFAULT: 'var(--primary-ink)',
+          hover: 'var(--primary-ink-hover)',
+        },
+      },
+      ringColor: {
+        primary: {
+          DEFAULT: 'var(--primary-ink)',
+        },
+      },
       fontFamily: {
         sans: ['"Plus Jakarta Sans Variable"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
         mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
@@ -71,9 +106,17 @@ const config: Config = {
         'warm-halo': '0 8px 28px color-mix(in srgb, var(--primary) 18%, transparent)',
       },
       transitionDuration: {
-        fast: '150ms',
-        base: '200ms',
-        slow: '300ms',
+        fast: 'var(--clem-dur-fast)',
+        base: 'var(--clem-dur-base)',
+        slow: 'var(--clem-dur-slow)',
+      },
+      /* Duration was tokenised here; easing never was, so ~95 of 120
+         transitions ran Tailwind's default curve. Adopted from mobile, which
+         reasoned it out first: "things arrive and settle, they do not bounce."
+         Deliberately no overshoot. */
+      transitionTimingFunction: {
+        DEFAULT: 'var(--clem-ease)',
+        out: 'var(--clem-ease)',
       },
       keyframes: {
         breathe: {

@@ -14,6 +14,18 @@
    contrast against light ground.
    ──────────────────────────────────────────────────────────────────── */
 
+/* The ONE semantic token layer, shared with the desktop console. Plain CSS, so
+   this Preact app and that React/Tailwind app consume the same bytes.
+
+   Mobile stays 100% LIGHT: the shared file's dark block is scoped to `.dark`,
+   a class only the console ever sets, so importing it cannot introduce a dark
+   ramp here. The owner directive and mobile-shell.test.ts both still hold.
+
+   Mobile keeps ONE accent (#b94300) for text and fill alike, because at 5.43:1
+   it is legal for both. Desktop additionally uses a brighter #f26419 as a fill.
+   Same family, same reading colour; the fill divergence is deliberate. */
+@import '../../../packages/design-tokens/tokens.css';
+
 :root {
   /* Warm paper surfaces: cream undertone, never clinical gray-white.
      Elevation DARKENS a step toward parchment — cards sit on the page the
@@ -32,13 +44,14 @@
   --fg-2: #6d5b47;
   --fg-3: #75644f;
 
-  --accent: #b94300;
+  --accent: var(--clem-primary-ink);
   --accent-hi: #c24b00;
-  --accent-deep: #963400;
+  --accent-deep: var(--clem-primary-ink-hover);
   --accent-soft: rgba(239, 95, 12, 0.10);
   --accent-glow: rgba(239, 95, 12, 0.26);
   --accent-2: #357b29;              /* leaf — connected / success */
-  --accent-warn: #8a6000;
+  --warn-soft: var(--clem-warning-tint);   /* was referenced with a fallback, never defined */
+  --accent-warn: var(--clem-warning);
   --accent-fail: #d0453a;
   --fail-soft: rgba(208, 69, 58, 0.10);
   --on-accent: #fff8f0;
@@ -73,7 +86,7 @@
   /* Smooth deceleration (ease-out-quint). Deliberately NO overshoot: things
      arrive and settle, they do not bounce. It was once called --ease-spring,
      which described motion this curve never had. */
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out: var(--clem-ease);
 
   /* Elevation is surface lightness plus a hairline, not a shadow.
      On a warm near-black ground a drop shadow barely renders anyway — it
@@ -233,6 +246,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .needs-pill {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   min-height: 44px;
   padding: 0;
   border: 0;
@@ -1638,10 +1652,14 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 /* Stop reads as a halt, not a second send: the accent is what you press to
    ADD, so taking it away is what tells you this one takes something back. */
+/* Stop is reached when a run has gone long with nothing to show, so it is the
+   last control that should look foreign. It was painting on --surface-2,
+   --text and --hairline: three desktop-shaped names this stylesheet has never
+   defined. The fallbacks kept it visible but cool grey, on a warm-paper app. */
 .chat-stop {
-  background: var(--surface-2, #eceae6);
-  color: var(--text, #1b1b1b);
-  border: 1px solid var(--hairline, rgba(0, 0, 0, 0.14));
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
   font-size: 13px;
   line-height: 1;
 }
@@ -2359,14 +2377,17 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 /* ── push prompt ────────────────────────────────────────────────── */
 
+/* A quiet prompt, not a campaign. This was a gradient wash inside an orange
+   border with a gradient-filled button — the loudest thing on a screen whose
+   job is to show what needs the owner. Accent now appears only on the verb. */
 .push-banner {
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  background: linear-gradient(180deg, rgba(239, 95, 12, 0.10), rgba(239, 95, 12, 0.04)), var(--bg-1);
-  border: 1px solid rgba(239, 95, 12, 0.26);
-  border-radius: var(--r-lg);
-  padding: var(--sp-4);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
   box-shadow: var(--shadow-card);
 }
 .push-banner-error { border-color: rgba(208, 69, 58, 0.35); }
@@ -2381,7 +2402,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .push-banner-actions { display: flex; gap: var(--sp-2); }
 .push-banner-primary {
   flex: 1;
-  background: linear-gradient(180deg, var(--accent-hi), var(--accent-deep));
+  background: var(--accent);
   color: var(--on-accent);
   border: none;
   border-radius: var(--r-md);

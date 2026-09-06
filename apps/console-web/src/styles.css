@@ -1,27 +1,42 @@
 /* Self-hosted brand font (no network dependency in the desktop app). */
 @import '@fontsource-variable/plus-jakarta-sans';
 
+/* The ONE semantic token layer, shared with the mobile PWA. Plain CSS so both
+   a React/Tailwind app and a Preact/hand-CSS app can consume it unchanged.
+   Contrast values there are asserted by design-tokens.contrast.test.ts, which
+   recomputes every ratio from the shipped hex rather than restating it. */
+@import '../../../packages/design-tokens/tokens.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 /*
- * Design tokens — warm, friendly-premium. Light is the DEFAULT
- * (`:root`); `.dark` on <html> swaps to a warm charcoal. The orange
- * brand stays the hero. Contrast targets: text 12.8:1, muted 5.9:1,
- * subtle/placeholder 4.6:1 (all >= WCAG AA on the cream canvas).
+ * Console surfaces + the local names components already use.
+ *
+ * Every colour decision that the mobile app also makes now comes from the
+ * shared layer above; what stays here is this surface's own paper ramp (white
+ * cards on a cream canvas) and the aliases that keep 43k lines of components
+ * from needing to change.
+ *
+ * NOTE ON A DELETED COMMENT: this block used to promise "text 12.8:1, muted
+ * 5.9:1, subtle/placeholder 4.6:1 (all >= WCAG AA)". The subtle value actually
+ * measured 3.77:1. Contrast claims now live in a test that computes them.
  */
 :root {
   color-scheme: light;
 
-  /* Brand orange (hero) */
-  --primary: #f26419;       /* orange-500 */
-  --primary-hover: #ff8442; /* orange-400 */
-  --primary-press: #d9520f; /* orange-600 */
-  --primary-fg: #ffffff;    /* text on primary fill */
-  --primary-tint: #fff4ed;  /* orange-50 — selected/hover wash */
+  /* Brand orange — TWO ROLES. Look at --primary; read --primary-ink.
+     See packages/design-tokens/tokens.css for why. */
+  --primary: var(--clem-primary);
+  --primary-hover: var(--clem-primary-hover);
+  --primary-press: var(--clem-primary-press);
+  --primary-fg: var(--clem-primary-fg);
+  --primary-tint: var(--clem-primary-tint);
+  --primary-ink: var(--clem-primary-ink);
+  --primary-ink-hover: var(--clem-primary-ink-hover);
 
-  /* Surfaces (warm paper) */
+  /* Surfaces (warm paper) — this surface's own ramp. */
   --bg-canvas: #faf7f2;
   --bg-surface: #ffffff;
   --bg-subtle: #f4f0e9;
@@ -30,28 +45,22 @@
   /* Lines */
   --border: #e7e1d6;
   --border-strong: #d6cfc0;
-  --ring: #f26419;
+  --ring: var(--clem-primary-ink);
 
   /* Text */
-  --text: #1f1b16;
-  --text-muted: #5c564b;
-  --text-subtle: #857e70;
+  --text: var(--clem-ink);
+  --text-muted: var(--clem-ink-muted);
+  --text-subtle: var(--clem-ink-subtle);
 
   /* Semantic */
-  --success: #2e7d46; --success-tint: #e8f5ec;
-  --info: #1e6fb8;    --info-tint: #e6f1fa;
-  --warning: #b26c00; --warning-tint: #fcf1de;
-  --danger: #c0392b;  --danger-tint: #fbe9e7;
+  --success: var(--clem-success); --success-tint: var(--clem-success-tint);
+  --info: var(--clem-info);       --info-tint: var(--clem-info-tint);
+  --warning: var(--clem-warning); --warning-tint: var(--clem-warning-tint);
+  --danger: var(--clem-danger);   --danger-tint: var(--clem-danger-tint);
 }
 
 .dark {
   color-scheme: dark;
-
-  --primary: #ff7a45;       /* brighter on charcoal */
-  --primary-hover: #ff9466;
-  --primary-press: #f26419;
-  --primary-fg: #1f1b16;
-  --primary-tint: #2e2017;
 
   --bg-canvas: #16140f;
   --bg-surface: #1f1c16;
@@ -60,16 +69,6 @@
 
   --border: #3a352b;
   --border-strong: #4e4839;
-  --ring: #ff7a45;
-
-  --text: #f5f1e8;
-  --text-muted: #b8b1a1;
-  --text-subtle: #8c8475;
-
-  --success: #5bc97e; --success-tint: #15301f;
-  --info: #5ba8e0;    --info-tint: #122838;
-  --warning: #e0a030; --warning-tint: #2f2410;
-  --danger: #f0685a;  --danger-tint: #331715;
 }
 
 @layer base {
@@ -89,13 +88,16 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
-  /* Visible focus ring everywhere — replaces the legacy outline:none. */
+  /* An OUTLINE, not a box-shadow. The old ring painted
+     color-mix(in srgb, var(--ring) 55%, transparent) = #f8aa80 = 1.90:1,
+     under SC 1.4.11's 3:1 floor. It also forced a 6px radius onto every
+     focused pill and card, and — living in @layer base — was silently
+     overridden on any focusable element carrying a shadow-* utility, because
+     utilities beat base. An outline fixes all three, follows the element's
+     own border-radius, and is asserted at 5.43:1 by the contrast test. */
   :focus-visible {
-    outline: none;
-    box-shadow:
-      0 0 0 2px var(--bg-surface),
-      0 0 0 4px color-mix(in srgb, var(--ring) 55%, transparent);
-    border-radius: 6px;
+    outline: var(--clem-focus-width) solid var(--clem-focus);
+    outline-offset: var(--clem-focus-offset);
   }
   ::placeholder { color: var(--text-subtle); }
 }
