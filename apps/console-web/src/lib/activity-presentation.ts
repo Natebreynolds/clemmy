@@ -229,8 +229,11 @@ export function activityTerminalOutcomeFromHarnessEvents(
 
 // ─── Working Now: the ONE presenter, consolidated in the shared package ──────
 // The desktop badge and drawer render Working-Now counts from the SAME
-// function the mobile PWA uses. (/tasks is the separate board feed and does
-// NOT render from this presenter yet — unifying it is its own slice.) It lives in @clem/chat-engine
+// function the mobile PWA uses — and so does /tasks, which used to derive its
+// own Running column straight from the board feed. That split meant the badge
+// that sends you to /tasks and the board you land on gave two answers to one
+// question; lib/board.ts (presentBoardWorkingNow) now routes the board's live
+// rows through this function too. It lives in @clem/chat-engine
 // (packages/chat-engine/src/activity-presentation.ts); the console re-exports
 // it here rather than keeping a private copy — a second derivation is exactly
 // how five surfaces came to disagree about one question.

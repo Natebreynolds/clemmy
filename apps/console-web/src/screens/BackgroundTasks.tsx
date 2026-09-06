@@ -30,8 +30,10 @@ import { DeliveredShelf } from '@/components/board/DeliveredShelf';
 import { LiveTraceDrawer } from '@/components/board/LiveTraceDrawer';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { listFocusSnapshot } from '@/lib/focus';
+import { pollIntervalForStream, useActionStreamStatus } from '@/lib/action-stream';
 import {
-  listBoard, COLUMNS, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
+  listBoard, COLUMNS, NEEDS_YOU_LANES, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
+  boardLanes,
   findBoardCardForRun, reconcileOpenBoardCard, resolveBoardRunSelection,
   type BoardCard, type BoardColumnId, type BoardButtonIntent, type BoardRunSelection,
 } from '@/lib/board';
@@ -41,9 +43,27 @@ interface Toast { tone: 'success' | 'danger'; text: string; }
 export function BackgroundTasks() {
   const qc = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
-  const board = usePoll(['board'], listBoard, 4000);
-  const focus = usePoll(['focus'], listFocusSnapshot, 4000);
+  // The shell holds the push subscription; this screen only asks whether it is
+  // carrying the updates, so its 4s poll can drop back to a safety net. When
+  // the stream is degraded the board polls exactly as it always did.
+  const stream = useActionStreamStatus();
+  const board = usePoll(['board'], listBoard, pollIntervalForStream(stream, 4000));
+  const focus = usePoll(['focus'], listFocusSnapshot, pollIntervalForStream(stream, 4000));
   const cards = useMemo(() => board.data?.cards ?? [], [board.data]);
+  // ONE answer to "what is running": the same presenter the shell badge and the
+  // phone render from, applied to the board's own rows, so a parked run stops
+  // sitting in Running here while the badge counts it as needing you.
+  //
+  // Only the LANES are taken from it — deliberately not its summary label. The
+  // board feed and the badge's activity feed are different populations (the
+  // board also carries approvals, schedules, guest runs and binding stops), so
+  // a sentence here would sooner or later print a different number from the
+  // badge two inches above it. Each column already counts itself, against the
+  // cards the user can see in it.
+  const { laneOf } = useMemo(
+    () => boardLanes(cards, board.data?.generatedAt ?? ''),
+    [cards, board.data?.generatedAt],
+  );
 
   const [active, setActive] = useState<BoardCard | null>(null);
   const [open, setOpen] = useState<BoardCard | null>(null);
@@ -73,7 +93,7 @@ export function BackgroundTasks() {
       selectedIdentity?.runScopeId ?? '',
     ],
     () => resolveBoardRunSelection(selectedIdentity!),
-    4000,
+    pollIntervalForStream(stream, 4000),
     { enabled: exactSelection && !boardSelectionMatch },
   );
   const outOfPageCard = !boardSelectionMatch ? selectedRun.data : undefined;
@@ -114,7 +134,27 @@ export function BackgroundTasks() {
     useSensor(KeyboardSensor),
   );
 
-  const byColumn = (col: BoardColumnId) => cards.filter((c) => c.column === col);
+  const byLane = (lane: BoardColumnId) => cards.filter((c) => laneOf.get(c.id) === lane);
+  // Two empty boxes where one used to say "Nothing here" is worse than the
+  // question it answers — with nothing waiting, the split collapses back to one
+  // quiet Needs-you lane.
+  const populatedNeedsYouLanes = NEEDS_YOU_LANES.filter((lane) => byLane(lane.id).length > 0);
+  const needsYouLanes = populatedNeedsYouLanes.length > 0
+    ? populatedNeedsYouLanes
+    : [{ id: 'needs_you' as BoardColumnId, label: 'Needs you' }];
+
+  const renderLane = (lane: { id: BoardColumnId; label: string }) => (
+    <BoardColumn
+      key={lane.id}
+      id={lane.id}
+      label={lane.label}
+      cards={byLane(lane.id)}
+      activeCard={active}
+      onOpen={setOpen}
+      onArchive={(card) => void onArchive(card)}
+      onAction={onCardAction}
+    />
+  );
 
   const flash = (t: Toast) => { setToast(t); window.setTimeout(() => setToast((cur) => (cur === t ? null : cur)), 3500); };
 
@@ -286,18 +326,16 @@ export function BackgroundTasks() {
           onDragEnd={onDragEnd}
         >
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-            {COLUMNS.map((col) => (
-              <BoardColumn
-                key={col.id}
-                id={col.id}
-                label={col.label}
-                cards={byColumn(col.id)}
-                activeCard={active}
-                onOpen={setOpen}
-                onArchive={(card) => void onArchive(card)}
-                onAction={onCardAction}
-              />
-            ))}
+            {COLUMNS.map((col) => (col.id === 'needs_you'
+              // "Needs you" is two different asks. Blocked cannot be cleared by
+              // a decision; Ready for review is one approve from carrying on.
+              // They share the column's grid cell so the board keeps its shape.
+              ? (
+                <div key={col.id} className="flex min-w-0 flex-col gap-4">
+                  {needsYouLanes.map(renderLane)}
+                </div>
+              )
+              : renderLane(col)))}
           </div>
           <DragOverlay>
             {active ? <DragPreview card={active} /> : null}

@@ -9,11 +9,25 @@
  */
 import { apiGet, apiPost } from './api';
 import { humanStatusLabel } from './work-status';
+import {
+  presentWorkingNow,
+  type WorkingNowEntryLike,
+  type WorkingNowView,
+} from './activity-presentation';
 import type { Tone } from '@/components/ui/StatusPill';
 import type { RunEnvironmentDetail } from './run-environment';
 import type { PendingActionApprovalView } from './types';
 
-export type BoardColumnId = 'queued' | 'running' | 'needs_you' | 'done';
+/** The column the SERVER assigns a card. Four values, and only four. */
+export type BoardServerColumnId = 'queued' | 'running' | 'needs_you' | 'done';
+
+/**
+ * The lane the board RENDERS a card in. "Needs you" splits into the two
+ * different human actions it always mixed — see boardNeedsYouGroup — so a lane
+ * is not always a server column. Nothing drops INTO a needs-you lane (no
+ * intent targets it), so the split costs the drag gesture nothing.
+ */
+export type BoardColumnId = BoardServerColumnId | 'needs_you_blocked' | 'needs_you_review';
 export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest';
 export type BoardPrimaryAction = 'approve' | 'continue' | 'retry_failed_items' | 'open_result' | 'none';
 export type BoardContinueMode = 'approval' | 'background' | 'workflow_failed_items' | 'workflow_resume' | 'open_result' | 'none';
@@ -56,7 +70,7 @@ export interface BoardCard {
   id: string;
   sourceKind: BoardSourceKind;
   title: string;
-  column: BoardColumnId;
+  column: BoardServerColumnId;
   status: string;
   progressHint: string;
   sessionId: string | null;
@@ -341,13 +355,172 @@ export const COLUMNS: { id: BoardColumnId; label: string }[] = [
   { id: 'done', label: 'Done' },
 ];
 
+/** The two lanes "Needs you" splits into, rendered in the same grid cell the
+ *  single Needs-you column used to own. Blocked leads: it is the one a person
+ *  cannot clear with a click, so it is the one that decays. */
+export const NEEDS_YOU_LANES: { id: BoardColumnId; label: string }[] = [
+  { id: 'needs_you_blocked', label: 'Blocked' },
+  { id: 'needs_you_review', label: 'Ready for review' },
+];
+
 export const listBoard = () => apiGet<{ cards: BoardCard[]; generatedAt: string }>('/api/console/board');
+
+// ─── Which human action a waiting card needs ─────────────────────────────────
+//
+// "Needs you" mixed two different asks, and the difference is the whole point:
+// a card that is BLOCKED cannot proceed until something is supplied (an answer,
+// an auth, a reconciliation, a binding) — reading it and deciding does not
+// unblock it. A card that is READY FOR REVIEW has finished its work and is one
+// approve/continue away from carrying on. Nine unread approvals and one run
+// stuck on missing auth are not the same backlog.
+
+export type BoardNeedsYouGroup = 'blocked' | 'review';
+
+/** Server statuses that mean Clementine cannot proceed on her own. Matched on
+ *  the board route's own status words, so a renamed status surfaces as the
+ *  unknown case (blocked) rather than silently claiming work is ready. */
+const BLOCKED_STATUSES: ReadonlySet<string> = new Set([
+  'awaiting_input',      // a question was asked — this needs an answer, not a click
+  'blocked',             // the background task stopped on its own blocker
+  'blocked_mutation',    // the provider outcome must be reconciled before anything resends
+  'blocked_capability',  // a proven-capability gate stopped the step before it sent
+  'needs_binding',       // the workflow cannot run until a resource is bound
+]);
+
+/** Statuses whose one offered decision resumes the work immediately. */
+const REVIEW_STATUSES: ReadonlySet<string> = new Set([
+  'awaiting_approval',
+  'awaiting_continue',
+  'parked',              // a workflow parked on approval consumption
+]);
+
+/**
+ * Which of the two asks a waiting card is making. Total, so it can also
+ * classify a card the server left in Running that the shared presenter says is
+ * actually waiting on a person.
+ */
+export function boardNeedsYouGroup(card: BoardCard): BoardNeedsYouGroup {
+  // An offered approve outranks the status word: a run flagged
+  // `needs_attention` that still carries its approval is a review, not a wall.
+  if (card.actions.includes('approve') || card.primaryAction === 'approve') return 'review';
+  if (card.approvalId || card.raw.pendingApprovalId) return 'review';
+  if (BLOCKED_STATUSES.has(card.status)) return 'blocked';
+  // Resume-or-skip on a held occurrence is a decision, not a wall — nothing has
+  // started and either answer settles it.
+  if (isWorkflowCatchupCard(card)) return 'review';
+  if (REVIEW_STATUSES.has(card.status)) return 'review';
+  // Fail closed. An unrecognised wait is at worst under-promised as blocked;
+  // calling it "ready for review" when nothing is offered is the lie.
+  return 'blocked';
+}
+
+// ─── One answer to "what is running" ─────────────────────────────────────────
+//
+// The badge, the drawer and mobile have rendered Working-Now through the shared
+// presenter for a while; /tasks kept deriving its own Running column straight
+// from the server column, so the badge that sends you to /tasks and the board
+// you land on were two answers to the same question (a parked run counted as
+// "needs you" in the badge and sat in Running on the board). The board now asks
+// the SAME presenter, and its lane follows that verdict.
+
+/** A board card as the shared Working-Now presenter reads it. */
+export interface BoardWorkingNowEntry extends WorkingNowEntryLike {
+  card: BoardCard;
+}
+
+/**
+ * The board feed carries no start time, and will not be made to invent one.
+ *
+ * `ageMs` is age since the card was last TOUCHED, not since the work began —
+ * the route computes it from `pending.lastEventAt` for a workflow, `updatedAt`
+ * for an execution, `guestUpdatedAt` for a guest run. Reconstructing a start
+ * from it would tell a run three hours in that it started 30 seconds ago, which
+ * is worse than saying nothing. The presenter renders '' for an unusable
+ * timestamp, and no elapsed at all is the honest answer here.
+ */
+function boardStartedAt(): string {
+  return '';
+}
+
+export function boardWorkingNowEntry(card: BoardCard): BoardWorkingNowEntry {
+  const waiting = card.status === 'parked'
+    || card.status.startsWith('awaiting')
+    || card.status.startsWith('waiting')
+    || card.status.startsWith('blocked');
+  return {
+    card,
+    runKey: card.id,
+    lifecycle: card.status,
+    // ALWAYS 'unknown'. The presenter's `liveness` is documented as lease
+    // truth, and the board feed carries no lease: its Running column is
+    // `pending.inFlightStepId ? 'running' : 'queued'` — a step id, which says a
+    // step was started, not that anything is still holding it. Minting 'live'
+    // from that would hand out the pulse certificate the presenter exists to
+    // keep unforgeable. 'unknown' still lands the card in the Running lane
+    // (the presenter's 'waiting'), it just does not claim a heartbeat nobody
+    // took. (`card.stale` is deliberately NOT mapped to the presenter's
+    // 'stale' either: that means a lost lease, while the board's flag means
+    // idle for over a week.)
+    liveness: 'unknown',
+    needsAttention: card.column === 'needs_you' || card.raw.needsAttention === true || waiting,
+    startedAt: boardStartedAt(),
+    ...(card.sessionId ? { sessionId: card.sessionId } : {}),
+    // A settled card is history, not current work — the presenter drops it, so
+    // the Done column keeps its own membership.
+    ...(card.column === 'done' ? { terminal: { status: card.status } } : {}),
+  };
+}
+
+/** The board's live rows, presented by the one Working-Now presenter. Queued
+ *  cards are excluded here (nothing has started, so they are not current work)
+ *  and Done cards fall out on the presenter's own terminal rule — what is left
+ *  is the same population the badge counts. */
+export function presentBoardWorkingNow(
+  cards: readonly BoardCard[],
+  generatedAt: string,
+): WorkingNowView<BoardWorkingNowEntry> {
+  const current = cards.filter((card) => card.column !== 'queued');
+  return presentWorkingNow(current.map((card) => boardWorkingNowEntry(card)), generatedAt);
+}
+
+/**
+ * Every card's lane, from ONE presenter pass over the whole board.
+ *
+ * Queued and Done stay exactly where the server put them. Everything else asks
+ * the presenter whether it is running or waiting on a person, and a waiting
+ * card then picks which of the two needs-you lanes it belongs in.
+ */
+export function boardLanes(
+  cards: readonly BoardCard[],
+  generatedAt: string,
+): { view: WorkingNowView<BoardWorkingNowEntry>; laneOf: Map<string, BoardColumnId> } {
+  const view = presentBoardWorkingNow(cards, generatedAt);
+  const laneOf = new Map<string, BoardColumnId>();
+  // Settled and not-yet-started cards never reach the presenter's entries.
+  for (const card of cards) {
+    if (card.column === 'queued' || card.column === 'done') laneOf.set(card.id, card.column);
+  }
+  for (const presented of view.entries) {
+    const { card } = presented.entry;
+    laneOf.set(card.id, presented.presentation !== 'needs_you'
+      ? 'running'
+      : boardNeedsYouGroup(card) === 'blocked' ? 'needs_you_blocked' : 'needs_you_review');
+  }
+  return { view, laneOf };
+}
+
+/** The lane ONE card renders in — for the paths that hold a single card (a drag
+ *  in flight) rather than the whole board. It delegates so the two entry points
+ *  cannot drift into two answers. */
+export function boardLaneId(card: BoardCard): BoardColumnId {
+  return boardLanes([card], '').laneOf.get(card.id) ?? card.column;
+}
 
 export interface ForegroundTaskControlCard {
   id: string;
   sourceKind: 'background' | 'run' | 'workflow';
   title: string;
-  column: BoardColumnId;
+  column: BoardServerColumnId;
   status: string;
   progressHint: string;
   sessionId: string | null;
@@ -424,7 +597,7 @@ export function boardCardFromRunDetail(
   const awaitingInput = rawState === 'waiting_for_input' || rawState === 'awaiting_input' || rawState === 'awaiting_user_input';
   const queued = rawState === 'queued' || rawState === 'received';
   const running = run.live === true || ['planning', 'executing', 'running', 'active', 'in_progress'].includes(rawState);
-  const column: BoardColumnId = awaitingApproval || awaitingInput
+  const column: BoardServerColumnId = awaitingApproval || awaitingInput
     ? 'needs_you'
     : queued
       ? 'queued'
@@ -684,7 +857,10 @@ export function runQueueRef(card: BoardCard): { slug: string; runId: string } | 
  * `actions` allowlist is the source of truth.
  */
 export function intentForDrop(card: BoardCard, target: BoardColumnId): 'cancel' | 'resume' | 'promote' | 'approve' | null {
-  if (target === card.column) return null; // no-op (in-column reorder is Phase 2)
+  // A no-op is a drop back into the lane the card is RENDERED in. Comparing
+  // against the server column instead would refuse the approve gesture on a
+  // parked run: the server calls it Running while the board shows it waiting.
+  if (target === boardLaneId(card)) return null; // in-lane reorder is Phase 2
   if (target === 'done' && card.actions.includes('cancel')) return 'cancel';
   if (target === 'running' && card.actions.includes('promote')) return 'promote';
   if (target === 'running' && card.actions.includes('resume')) return 'resume';
@@ -696,15 +872,45 @@ export function intentForDrop(card: BoardCard, target: BoardColumnId): 'cancel' 
   return null;
 }
 
-/** Why a drop was rejected, for the snap-back toast. */
+/**
+ * A drop that moves the card NOWHERE — silent, never a rejection.
+ *
+ * There are two of them, because the board now renders a card in a lane the
+ * server may not agree with. A parked workflow run is `column:'running'` on the
+ * wire and renders in "Ready for review": dragging it onto Running asks for the
+ * place it is already in, and shouting "nothing to start or resume here" at a
+ * gesture that changes nothing is noise the board never used to make.
+ */
+function isNoOpDrop(card: BoardCard, target: BoardColumnId): boolean {
+  return target === boardLaneId(card) || target === card.column;
+}
+
+/** Why a drop was rejected, for the snap-back toast. '' means say nothing. */
 export function rejectReason(card: BoardCard, target: BoardColumnId): string {
-  if (target === card.column) return '';
+  if (isNoOpDrop(card, target)) return '';
+  // Every needs-you lane is one destination: sliding a waiting card between
+  // them is not a rejection to shout about, it is a move nothing offers.
+  if (target === 'needs_you' || target === 'needs_you_blocked' || target === 'needs_you_review') return '';
   if (target === 'done') return 'This card can’t be cancelled.';
   if (card.status === 'awaiting_approval') return 'This one needs the card’s Approve button — open it to review first.';
   if (card.status === 'awaiting_input') return 'Answer in the originating chat, or use Cancel to clear this task.';
   if (card.status === 'awaiting_continue') return 'Move it to Running to continue the background task.';
   if (target === 'running') return 'Nothing to start or resume here.';
   return 'That move isn’t available.';
+}
+
+/**
+ * What a column should show while a card hovers over it.
+ *
+ * ONE derivation, so the border and the toast can never disagree: 'reject' is
+ * shown exactly when dropping would produce a message, and a drop that says
+ * nothing gets no border. The column compares against the LANE the card renders
+ * in — comparing the server column, as it did, painted a parked run's own lane
+ * red for a drop that is defined as a no-op.
+ */
+export function boardDropHighlight(card: BoardCard, target: BoardColumnId): 'accept' | 'reject' | 'none' {
+  if (intentForDrop(card, target) !== null) return 'accept';
+  return rejectReason(card, target) === '' ? 'none' : 'reject';
 }
 
 export type BoardActionIntent = 'cancel' | 'resume' | 'promote' | 'archive' | 'restore';

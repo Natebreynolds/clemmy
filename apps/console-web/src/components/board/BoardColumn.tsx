@@ -7,7 +7,7 @@ import { useState } from 'react';
 import { useDroppable } from '@dnd-kit/core';
 import { cn } from '@/lib/cn';
 import { BoardCard } from './BoardCard';
-import { intentForDrop, type BoardButtonIntent, type BoardCard as BoardCardT, type BoardColumnId } from '@/lib/board';
+import { boardDropHighlight, type BoardButtonIntent, type BoardCard as BoardCardT, type BoardColumnId } from '@/lib/board';
 
 /** A crowded column (a Done pile of 40) reads as clutter, not a queue — show the
  *  newest few and tuck the rest behind an expander. */
@@ -32,8 +32,12 @@ export function BoardColumn({
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const [showAll, setShowAll] = useState(false);
-  const validHover = activeCard && isOver ? intentForDrop(activeCard, id) !== null : null;
-  const showReject = activeCard && isOver && activeCard.column !== id && validHover === null;
+  // ONE answer for both borders (lib/board boardDropHighlight): the red border
+  // appears exactly when the drop would produce a toast. It has to be asked
+  // against the lane the card RENDERS in — a parked run is `column:'running'`
+  // on the wire while it sits in "Ready for review", and comparing the server
+  // column flashed reject on the lane the card was already in.
+  const highlight = activeCard && isOver ? boardDropHighlight(activeCard, id) : 'none';
   const visible = showAll ? cards : cards.slice(0, COLUMN_VISIBLE_MAX);
   const hidden = cards.length - visible.length;
 
@@ -47,8 +51,8 @@ export function BoardColumn({
         ref={setNodeRef}
         className={cn(
           'flex min-h-32 flex-1 flex-col gap-2 rounded-lg border border-dashed border-transparent bg-canvas/40 p-2 transition-colors',
-          isOver && validHover && 'border-success bg-success-tint/40',
-          showReject && 'border-danger bg-danger-tint/30',
+          highlight === 'accept' && 'border-success bg-success-tint/40',
+          highlight === 'reject' && 'border-danger bg-danger-tint/30',
         )}
       >
         {cards.length === 0 ? (
