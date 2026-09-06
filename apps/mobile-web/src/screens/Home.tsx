@@ -264,8 +264,6 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
         <p class="home-status">{status}</p>
       </header>
 
-      <PushPrompt />
-
       <ScreenNotice
         error={error}
         offline={offline}
@@ -287,6 +285,12 @@ export function Home({ name, onAsk, onOpenInbox, onOpenWorkspace, onCustomize, n
           <p class="empty-body">Nothing needs you and nothing’s running. Ask her something below.</p>
         </div>
       ) : null}
+
+      {/* Housekeeping, not work. It used to sit directly under the greeting as
+          the loudest element on the screen — a gradient card above every real
+          thing Clem was doing. Enabling push matters, but never more than the
+          decision waiting on you. */}
+      <PushPrompt />
 
       <button type="button" class="home-customize" onClick={() => { haptic('light'); onCustomize(); }}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

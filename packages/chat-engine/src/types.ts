@@ -39,6 +39,8 @@ export interface DelegatedWorkControl {
   state: 'running' | 'cancelling' | 'stopped';
 }
 
+import type { WriteLedgerRow } from './write-ledger.js';
+
 /** One live step in a turn's activity strip — a tool call, a spawned agent, a
  *  batch meter, or a trust check (judge verdict / watcher steer). */
 export interface ActivityItem {
@@ -60,6 +62,14 @@ export interface ActivityItem {
   count?: number;
   /** Bounded runtime-verified content peek (the opening of a file just written). */
   excerpt?: string;
+  /** The runtime's own effect class, projected on tool_called AND tool_returned
+   *  and read by nobody until now. It drives visual weight and glyph: reads and
+   *  compute recede, external writes and admin carry the ink. `variant` used to
+   *  approximate this and no longer decides weight. */
+  effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
+  /** Present only on rows that ARE an external write. Carries the settled
+   *  disposition, so a reservation can never render as a receipt. */
+  write?: WriteLedgerRow;
 }
 
 export interface ChatMessage {

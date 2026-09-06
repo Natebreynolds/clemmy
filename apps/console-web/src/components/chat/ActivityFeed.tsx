@@ -8,20 +8,13 @@
 import { useEffect, useState } from 'react';
 import { Wrench, Users, Check, X, Zap, Send, AlertCircle, CheckCircle2, Radio, Dot } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import { providerLabel } from '@clem/chat-engine';
 import type { ActivityItem } from '@/lib/useChat';
 import {
   narrateActivity,
   settleTerminalActivity,
   type ActivityTerminalOutcome,
 } from '@/lib/activity-presentation';
-
-export const PROVIDER_DOT: Record<NonNullable<ActivityItem['provider']>, string> = {
-  claude: '#d97757',
-  codex: '#10a37f',
-  byo: '#4f8fc0',
-  glm: '#7c6cf0',
-  unknown: '#8a8f98',
-};
 
 const TONE_TEXT: Record<NonNullable<ActivityItem['tone']>, string> = {
   success: 'text-success',
@@ -129,7 +122,9 @@ export function ActivityRow({ a, now, live, showDetails = false }: {
     <li className="flex flex-col gap-1 text-caption">
       <div className="flex items-center gap-2">
         {a.kind === 'agent' ? (
-          <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
+          // The provider is a WORD, not a colour. An 8px aria-hidden dot was
+          // the row's only carrier of which model did the work.
+          <span className="shrink-0 text-caption font-semibold text-muted">{providerLabel(a.provider)}</span>
         ) : a.kind === 'check' ? (
           a.status === 'interrupted'
             ? <AlertCircle className="h-3 w-3 shrink-0 text-warning" aria-hidden />

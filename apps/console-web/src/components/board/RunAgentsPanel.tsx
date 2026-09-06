@@ -17,23 +17,8 @@ import { ChevronRight } from 'lucide-react';
 import { usePoll } from '@/lib/poll';
 import { listRunAgents, getRunAgentOutput, type RunAgent } from '@/lib/board';
 import { cn } from '@/lib/cn';
+import { providerLabel } from '@clem/chat-engine';
 
-const PROVIDER_LABEL: Record<RunAgent['provider'], string> = {
-  claude: 'Claude',
-  codex: 'Codex',
-  byo: 'BYO',
-  glm: 'GLM',
-  unknown: 'Agent',
-};
-// Provider identity via an inline-styled dot so it renders regardless of the
-// Tailwind palette; status uses semantic tokens.
-const PROVIDER_DOT: Record<RunAgent['provider'], string> = {
-  claude: '#d97757',
-  codex: '#10a37f',
-  byo: '#4f8fc0',
-  glm: '#7c6cf0',
-  unknown: '#8a8f98',
-};
 const STATUS: Record<RunAgent['status'], { glyph: string; className: string; title: string }> = {
   ok: { glyph: '✓', className: 'text-success', title: 'completed' },
   error: { glyph: '✕', className: 'text-danger', title: 'failed' },
@@ -106,10 +91,7 @@ export function RunAgentsPanel({ slug, runId }: { slug: string; runId: string })
     return (
       <li key={a.id} className="rounded-lg border border-border/60 bg-surface">
         <button type="button" onClick={() => void toggle(a)} className="flex w-full items-center gap-2 px-3 py-2 text-left">
-          <span className="inline-flex shrink-0 items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: PROVIDER_DOT[a.provider] ?? PROVIDER_DOT.unknown }} aria-hidden />
-            <span className="text-caption font-medium text-muted">{PROVIDER_LABEL[a.provider] ?? 'Agent'}</span>
-          </span>
+          <span className="shrink-0 text-caption font-medium text-muted">{providerLabel(a.provider)}</span>
           <span className="min-w-0 flex-1">
             <span className="block truncate text-body text-fg">{showLabel ? agentLabel(a) : a.task}</span>
             {a.model && <span className="block truncate text-caption text-faint">{a.model}</span>}
@@ -138,8 +120,8 @@ export function RunAgentsPanel({ slug, runId }: { slug: string; runId: string })
         </button>
         {expanded && Object.entries(poll.data?.byProvider ?? {}).map(([p, n]) => (
           <span key={p} className="inline-flex items-center gap-1 text-caption text-faint">
-            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: PROVIDER_DOT[p as RunAgent['provider']] ?? PROVIDER_DOT.unknown }} aria-hidden />
-            {PROVIDER_LABEL[p as RunAgent['provider']] ?? p} {n}
+            <span className="font-medium text-muted">{providerLabel(p)}</span>
+            {n}
           </span>
         ))}
       </div>

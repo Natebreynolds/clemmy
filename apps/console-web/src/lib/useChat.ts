@@ -15,7 +15,15 @@ import {
 import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, apiPost, type ApiError } from './api';
 import { getPendingActionStatus } from './pendingActions';
-import { humanToolLabel, salientArgDetail, describeExternalWrite } from './toolLabels';
+import { humanToolLabel, salientArgDetail } from './toolLabels';
+import {
+  applyWriteEvent,
+  writeRowKey,
+  writeRowLabel,
+  writeRowStatus,
+  writeRowTone,
+  type WriteLedgerRow,
+} from '@clem/chat-engine';
 import { isWorkPlanRow, workPlanActivityItem, workPlanStepLabel } from './work-plan-presentation';
 import type { ChatPostResult, HarnessEvent, PendingActionApprovalView } from './types';
 
@@ -55,6 +63,12 @@ export interface ActivityItem {
    *  written). Rendered as an expandable pane under the row — the
    *  visibility window into what's actually being produced. */
   excerpt?: string;
+  /** The runtime's own effect class, projected on tool_called AND tool_returned
+   *  and read by nobody until now. Drives visual weight; `variant` no longer does. */
+  effect?: 'read' | 'compute' | 'local_write' | 'external_write' | 'admin';
+  /** Present only on rows that ARE an external write. Carries the settled
+   *  disposition, so a reservation can never render as a receipt. */
+  write?: WriteLedgerRow;
 }
 
 export interface ChatMessage {
@@ -725,29 +739,34 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     // describeExternalWrite (work-report.ts) so chat, the drawer feed, and the
     // report-back message all speak in ONE vocabulary. A failed/orphaned write
     // is the same line with an honest tail.
+    // ONE row per call, addressed by the id below, so a reservation and its
+    // terminal update the same line instead of listing the same draft twice.
+    // The disposition comes from the SHARED ledger — the same function the
+    // phone runs — because `external_write` alone is a PRE-DISPATCH
+    // reservation and was being stamped green here before the call had left
+    // the machine. See packages/chat-engine/src/write-ledger.ts.
     case 'external_write':
+    case 'external_write_succeeded':
     case 'external_write_failed':
     case 'external_write_orphaned': {
-      const shapeKey = typeof d.shapeKey === 'string' ? d.shapeKey : '';
-      const writeTool = typeof d.toolName === 'string' ? d.toolName : tool;
-      const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
-      // The recorded irreversibility bit rides through so a reversible write
-      // (draft/update) can never render as delivery in the live feed either.
-      const base = describeExternalWrite(shapeKey, writeTool, targets, {
-        ...(typeof d.irreversible === 'boolean' ? { irreversible: d.irreversible } : {}),
-        ...(typeof d.actionKey === 'string' ? { actionKey: d.actionKey } : {}),
-      });
-      const failed = ev.type === 'external_write_failed';
-      const orphaned = ev.type === 'external_write_orphaned';
-      const key = callId || shapeKey || writeTool || `${prev.length}`;
-      return [...prev, {
-        id: `x-${ev.type}-${key}`,
+      const key = writeRowKey(d, ev.seq);
+      const id = `x-write-${key}`;
+      const at = prev.findIndex((item) => item.id === id);
+      const row = applyWriteEvent(at >= 0 ? prev[at]!.write : undefined, ev);
+      const item: ActivityItem = {
+        id,
         kind: 'event',
         variant: 'write',
-        label: failed ? `${base} — failed` : orphaned ? `${base} — timed out, may have landed` : base,
-        status: failed ? 'failed' : 'done',
-        tone: failed ? 'danger' : orphaned ? 'warning' : 'success',
-      }];
+        effect: 'external_write',
+        label: writeRowLabel(row),
+        status: writeRowStatus(row),
+        tone: writeRowTone(row),
+        write: row,
+      };
+      if (at < 0) return [...prev, item];
+      const next = [...prev];
+      next[at] = item;
+      return next;
     }
     // ONE row per code-mode program: "Ran a batch program (N tool calls)". The
     // per-call plumbing stays inside the sandbox — the user sees the outcome, not

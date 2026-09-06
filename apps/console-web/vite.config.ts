@@ -10,7 +10,13 @@ export default defineConfig({
   base: '/console/',
   plugins: [react()],
   resolve: {
-    alias: { '@': path.resolve(__dirname, 'src') },
+    alias: {
+      '@': path.resolve(__dirname, 'src'),
+      // The shared chat engine, consumed as source exactly as the mobile PWA
+      // does. Stage 2 uses it for the write ledger so the settlement rule has
+      // ONE derivation instead of a copy in each surface.
+      '@clem/chat-engine': path.resolve(__dirname, '../../packages/chat-engine/src/index.ts'),
+    },
   },
   build: {
     target: 'es2022',

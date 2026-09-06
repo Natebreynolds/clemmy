@@ -12,7 +12,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Users, ArrowUpRight } from 'lucide-react';
-import { ActivityRow, BatchRow, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
+import { ActivityRow, BatchRow, useNowTick } from '@/components/chat/ActivityFeed';
+import { providerLabel } from '@clem/chat-engine';
 import type { ActivityItem } from '@/lib/useChat';
 import {
   isWorkPlanRow,
@@ -95,10 +96,10 @@ export function TurnActivity({ items, live, traceHref, terminalOutcome }: {
             <>
               <Users className="h-3.5 w-3.5" aria-hidden />
               <span>{live && runningAgents > 0 ? `${runningAgents} agent${runningAgents > 1 ? 's' : ''} working` : `${agents.length} agent${agents.length > 1 ? 's' : ''}`}</span>
-              <span className="flex -space-x-1">
-                {agents.slice(0, 6).map((a) => (
-                  <span key={a.id} className="h-2.5 w-2.5 rounded-full ring-1 ring-surface" style={{ backgroundColor: PROVIDER_DOT[a.provider ?? 'unknown'] }} aria-hidden />
-                ))}
+              {/* Which models, by name. A row of coloured dots needed a legend
+                  nobody ever shipped, and said nothing at all to a reader. */}
+              <span className="truncate">
+                {[...new Set(agents.map((a) => providerLabel(a.provider)))].join(', ')}
               </span>
             </>
           )}

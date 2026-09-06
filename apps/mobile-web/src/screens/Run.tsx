@@ -19,8 +19,11 @@
  */
 import { useMemo } from 'preact/hooks';
 import {
+  foldWriteLedger,
   narrateActivity,
   reduceActivity,
+  writeReversibilityLabel,
+  writeRowLabel,
   type ActivityItem,
   type HarnessEvent,
 } from '@clem/chat-engine';
@@ -42,6 +45,17 @@ export function Run({ sessionId, onBack }: Props) {
   );
   const run = data ?? null;
   const live = run ? isActiveRunStatus(run.status) : false;
+  /**
+   * What changed out there, folded from the events rather than the route's
+   * precomputed `receipts`. Two reasons: the events carry `callId`, so a
+   * reservation pairs to its own terminal instead of listing the same draft
+   * twice; and this is the SAME fold the chat transcript runs, so the run view
+   * and the conversation can no longer disagree about what settled.
+   */
+  const writes = useMemo(
+    () => [...foldWriteLedger(run?.events ?? []).values()],
+    [run?.events],
+  );
 
   const activity = useMemo(() => {
     if (!run) return [] as ActivityItem[];
@@ -89,20 +103,18 @@ export function Run({ sessionId, onBack }: Props) {
 
             {/* What it changed in the world. First, because it is the thing a
                 person most needs to know and the hardest to take back. */}
-            {run.receipts.length > 0 ? (
+            {writes.length > 0 ? (
               <section class="home-section">
                 <h2 class="section-head">What changed</h2>
-                {run.receipts.map((receipt, i) => (
-                  <div key={i} class="run-receipt">
-                    <div class="run-receipt-what">{receiptLabel(receipt)}</div>
-                    <div class="card-when">
-                      {receipt.kind === 'external_write_failed' ? 'failed · '
-                        : receipt.kind === 'external_write_orphaned' ? 'timed out, may have landed · '
-                          : ''}
-                      {receipt.irreversible === false ? 'reversible' : 'not reversible'}
+                {writes.map((row) => {
+                  const reversibility = writeReversibilityLabel(row);
+                  return (
+                    <div key={row.callId} class="run-receipt">
+                      <div class="run-receipt-what">{writeRowLabel(row)}</div>
+                      {reversibility ? <div class="card-when">{reversibility}</div> : null}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </section>
             ) : null}
 
@@ -155,14 +167,6 @@ export function Run({ sessionId, onBack }: Props) {
   );
 }
 
-/** Plain language for one external write. */
-function receiptLabel(receipt: { shapeKey: string | null; tool: string | null; targets: string[] }): string {
-  const key = (receipt.shapeKey || receipt.tool || 'action').toLowerCase().replace(/[_:]/g, ' ');
-  const to = receipt.targets.length
-    ? ` → ${receipt.targets.slice(0, 2).join(', ')}${receipt.targets.length > 2 ? ` +${receipt.targets.length - 2}` : ''}`
-    : '';
-  return `${key}${to}`;
-}
 
 function elapsed(startedAt: number, lastEventAt: number | null, live: boolean): string {
   const end = live ? Date.now() : (lastEventAt ?? Date.now());
