@@ -22,8 +22,10 @@ import {
   updateSession as updateHarnessSession,
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
+  type SessionStatus as HarnessSessionStatus,
 } from '../runtime/harness/eventlog.js';
 import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js';
+import { listPendingRuns } from '../execution/workflow-events.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
@@ -63,8 +65,38 @@ export interface ContinueHint {
   protocol: 'ndjson' | 'sse';
 }
 
+/**
+ * One step of a collapsed workflow run, addressed the way the console
+ * addresses a session.
+ *
+ * A workflow run is ONE row in the list but N sessions in the eventlog, and
+ * the run page reads events per session. Without this the page reads whichever
+ * step happened to be the collapse representative and presents that one step's
+ * ledger — its writes, its reply, its status — as the whole run's. A run that
+ * emailed in step 2 and wrote a sheet in step 4 then reads "1 change", and the
+ * email is simply gone.
+ */
+export interface UnifiedRunStep {
+  /** `harness:<sessionId>` — the same namespace the summary id uses. */
+  id: string;
+  /** The step's own id from the workflow definition, for naming it in the UI. */
+  label: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A session summary, plus the steps a collapsed run was collapsed FROM.
+ * `runSteps` is present only on a collapsed workflow run; a chat or a
+ * single-session run is its own whole story and carries none.
+ */
+export interface UnifiedRunSummary extends UnifiedSessionSummary {
+  runSteps?: UnifiedRunStep[];
+}
+
 export interface SessionDetail {
-  session: UnifiedSessionSummary;
+  session: UnifiedRunSummary;
   turns: UnifiedSessionTurn[];
   continueHint: ContinueHint | null;
 }
@@ -248,13 +280,129 @@ function mergedWorkflowRunMetadata(
   return metadata;
 }
 
+/**
+ * Statuses that describe a run more truthfully than any sibling can override.
+ * Read in order: one active step means the run is running; one paused step
+ * means it is waiting on someone; one failed step means the run failed,
+ * whatever its siblings did.
+ */
+const WORKFLOW_RUN_STATUS_PRECEDENCE: readonly HarnessSessionStatus[] = [
+  'active',
+  'paused',
+  'failed',
+  'cancelled',
+];
+
+/**
+ * The status of a whole workflow run, never of its most-recent step.
+ *
+ * The collapse used to hand the representative row's status straight to the
+ * page, so between step 3 finishing and step 4 being created a running run
+ * wore a green "Completed" pill, elapsed froze, and Stop was withheld. Two
+ * sources are consulted, and "Completed" survives only if BOTH agree:
+ *
+ *   · the step sessions — one still `active` means the run is running;
+ *   · the workflow's own durable run log — a run with no terminal record is
+ *     still executing even in the gap where no step session is active. That
+ *     gap is precisely when the old code lied.
+ *
+ * Anything unrecognised is reported verbatim rather than rounded up to
+ * success: an unknown status is not a completed one.
+ */
+function aggregateWorkflowRunStatus(
+  rows: readonly HarnessSessionRow[],
+  fallback: HarnessSessionStatus,
+  runStillPending: boolean,
+): HarnessSessionStatus {
+  if (runStillPending) return 'active';
+  if (rows.length === 0) return fallback;
+  const statuses = new Set<HarnessSessionStatus>(rows.map((row) => row.status));
+  for (const loud of WORKFLOW_RUN_STATUS_PRECEDENCE) {
+    if (statuses.has(loud)) return loud;
+  }
+  // Nothing loud is left, so every step says completed — unless a newer
+  // daemon widened the enum, in which case the unrecognised status is
+  // reported verbatim rather than rounded up to success.
+  const unrecognised = [...statuses].find((status) => status !== 'completed');
+  return unrecognised ?? (statuses.has('completed') ? 'completed' : fallback);
+}
+
+function earliest(values: readonly string[], fallback: string): string {
+  return values.reduce((min, value) => (value && value < min ? value : min), fallback);
+}
+
+function latest(values: readonly string[], fallback: string): string {
+  return values.reduce((max, value) => (value && value > max ? value : max), fallback);
+}
+
+/**
+ * The collapsed row a workflow run is summarized from. Its window spans every
+ * step (the representative is the NEWEST step, so its own createdAt would date
+ * the run from its last step and report a minutes-long run as seconds), and
+ * its status is the run's, not the representative's.
+ */
 function mergedWorkflowRunRow(
   representative: HarnessSessionRow,
   rows: HarnessSessionRow[],
+  runStillPending = false,
 ): HarnessSessionRow {
+  const relatedRows = rows.length > 0 ? rows : [representative];
   return {
     ...representative,
+    createdAt: earliest(relatedRows.map((row) => row.createdAt), representative.createdAt),
+    updatedAt: latest(relatedRows.map((row) => row.updatedAt), representative.updatedAt),
+    status: aggregateWorkflowRunStatus(relatedRows, representative.status, runStillPending),
     metadata: mergedWorkflowRunMetadata(representative, rows),
+  };
+}
+
+function workflowStepLabel(row: HarnessSessionRow): string {
+  const stepId = typeof row.metadata?.stepId === 'string' ? row.metadata.stepId.trim() : '';
+  if (stepId) return stepId.slice(0, 80);
+  // Step sessions are titled `<workflow name>::<stepId>` (workflow-runner.ts).
+  const title = (row.title ?? '').trim();
+  const marker = title.lastIndexOf('::');
+  const tail = marker >= 0 ? title.slice(marker + 2).trim() : title;
+  return (tail || row.id).slice(0, 80);
+}
+
+/** Chronological, because a run is a sequence and its ledger reads in order. */
+function workflowRunSteps(rows: readonly HarnessSessionRow[]): UnifiedRunStep[] {
+  return [...rows]
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+    .map((row) => ({
+      id: `${HARNESS_PREFIX}${row.id}`,
+      label: workflowStepLabel(row),
+      status: row.status,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    }));
+}
+
+/**
+ * Whether a workflow run has reached a terminal in its own durable log — the
+ * only authority that can see the gap between two step sessions. Read lazily
+ * and once per request, and fail OPEN (treat an unreadable log as "no claim")
+ * rather than blocking the list.
+ */
+function pendingWorkflowRunIds(): Set<string> {
+  try {
+    return new Set(listPendingRuns().map((run) => run.runId));
+  } catch {
+    return new Set();
+  }
+}
+
+function summarizeWorkflowRun(
+  representative: HarnessSessionRow,
+  rows: HarnessSessionRow[],
+  runStillPending: boolean,
+): UnifiedRunSummary {
+  const aggregate = mergedWorkflowRunRow(representative, rows, runStillPending);
+  const workflowName = workflowNameFor(aggregate);
+  return {
+    ...summarizeHarness(aggregate, workflowName || undefined),
+    runSteps: workflowRunSteps(rows.length > 0 ? rows : [representative]),
   };
 }
 
@@ -264,13 +412,13 @@ function relatedHarnessRowsForPatch(row: HarnessSessionRow): HarnessSessionRow[]
 }
 
 interface HarnessSummaryCollection {
-  summaries: UnifiedSessionSummary[];
+  summaries: UnifiedRunSummary[];
   rawIds: Set<string>;
 }
 
 function collectHarnessSummaries(): HarnessSummaryCollection {
   const rows = listUserFacingHarnessRows();
-  const out: UnifiedSessionSummary[] = [];
+  const out: UnifiedRunSummary[] = [];
   const rawIds = new Set(rows.map((row) => row.id));
   const workflowRows = new Map<string, HarnessSessionRow[]>();
   const seenWorkflowRuns = new Set<string>();
@@ -283,6 +431,14 @@ function collectHarnessSummaries(): HarnessSummaryCollection {
     else workflowRows.set(runId, [row]);
   }
 
+  // One filesystem scan for the whole list, and only when a collapsed
+  // workflow run is actually present.
+  let pending: Set<string> | null = null;
+  const stillPending = (runId: string): boolean => {
+    pending ??= pendingWorkflowRunIds();
+    return pending.has(runId);
+  };
+
   for (const row of rows) {
     const runId = workflowRunIdFor(row);
     if (runId) {
@@ -290,9 +446,7 @@ function collectHarnessSummaries(): HarnessSummaryCollection {
       // most recent step — keep it as the run's representative row.
       if (seenWorkflowRuns.has(runId)) continue;
       seenWorkflowRuns.add(runId);
-      const aggregate = mergedWorkflowRunRow(row, workflowRows.get(runId) ?? [row]);
-      const workflowName = workflowNameFor(aggregate);
-      out.push(summarizeHarness(aggregate, workflowName || undefined));
+      out.push(summarizeWorkflowRun(row, workflowRows.get(runId) ?? [row], stillPending(runId)));
       continue;
     }
     out.push(summarizeHarness(row));
@@ -368,9 +522,9 @@ function canonicalHarnessRowForRawId(rawId: string): HarnessSessionRow | null {
 
 function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
   const runId = workflowRunIdFor(row);
-  const summaryRow = runId ? mergedWorkflowRunRow(row, listHarnessRowsForWorkflowRun(runId)) : row;
-  const workflowName = workflowNameFor(summaryRow);
-  const summary = summarizeHarness(summaryRow, runId && workflowName ? workflowName : undefined);
+  const summary: UnifiedRunSummary = runId
+    ? summarizeWorkflowRun(row, listHarnessRowsForWorkflowRun(runId), pendingWorkflowRunIds().has(runId))
+    : summarizeHarness(row);
   const turns = reconstructHarnessDetailTurns(row);
   appendPendingApprovalTurns(row.id, turns);
   // Only a continuable chat can own an inline plan decision. Workflow,
@@ -484,7 +638,7 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
-export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSessionSummary[] {
+export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRunSummary[] {
   const store = new SessionStore();
   const q = query.q?.trim().toLowerCase() ?? '';
   const tag = query.tag?.trim() ?? '';
@@ -497,7 +651,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedSe
 
   // Desktop side — also keep the matching records for cheap search/preview.
   const desktopRecords = new Map<string, SessionRecord>();
-  const desktop: UnifiedSessionSummary[] = [];
+  const desktop: UnifiedRunSummary[] = [];
   for (const record of store.listAll()) {
     if (isInternalSessionId(record.id)) continue;
     // If a raw id exists in both stores, the harness row is the canonical
@@ -589,7 +743,7 @@ export function getUnifiedSessionDetail(id: string): SessionDetail | null {
   return detailForHarnessRow(row);
 }
 
-export function patchUnifiedSession(id: string, patch: SessionPatchInput): UnifiedSessionSummary | null {
+export function patchUnifiedSession(id: string, patch: SessionPatchInput): UnifiedRunSummary | null {
   const parsed = parseId(id);
   if (!parsed) return null;
 
@@ -627,7 +781,17 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
     });
     if (target.id === parsed.rawId) next = updated;
   }
-  const summary = summarizeHarness(next, workflowRunId ? workflowNameFor(next) || undefined : undefined);
+  // The patched row goes back as the SAME shape the list serves — a collapsed
+  // run re-aggregated over its steps, not the one step that was addressed.
+  // Anything less and a pin or rename would swap a run's status pill for its
+  // representative step's on the way back.
+  const summary: UnifiedRunSummary = workflowRunId
+    ? summarizeWorkflowRun(
+      next,
+      listHarnessRowsForWorkflowRun(workflowRunId),
+      pendingWorkflowRunIds().has(workflowRunId),
+    )
+    : summarizeHarness(next);
   fillHarnessPreviewAndCount(summary);
   return summary;
 }

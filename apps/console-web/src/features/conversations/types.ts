@@ -1,3 +1,5 @@
+import type { RunStep } from '@/lib/run-presentation';
+
 /** Mirrors the backend UnifiedSessionSummary (src/types.ts). */
 export type SessionOrigin = 'desktop' | 'cli' | 'discord' | 'workflow' | 'agent';
 
@@ -16,6 +18,10 @@ export interface Session {
   archived: boolean;
   continuable: boolean;
   turnCount: number;
+  /** The step sessions a collapsed workflow run was collapsed FROM
+   *  (sessions-api.ts UnifiedRunStep). Present only on a collapsed run; the
+   *  run page reads every one of them rather than the representative alone. */
+  runSteps?: RunStep[];
 }
 
 export interface Turn {
@@ -57,4 +63,9 @@ export interface SessionFilters {
   tag?: string;
   source?: string;
   includeArchived?: boolean;
+  /** Rows to ask the server for. Runs share the page with chats now, so the
+   *  route's default of 100 would let a busy morning of workflow runs push
+   *  yesterday's conversations off the end of the list. Capped at 500 server
+   *  side (sessions-api.ts buildUnifiedSessionList). */
+  limit?: number;
 }

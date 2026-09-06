@@ -13,6 +13,7 @@ export function buildSessionsQuery(f: SessionFilters): string {
   if (f.tag) params.set('tag', f.tag);
   if (f.source) params.set('source', f.source);
   if (f.includeArchived) params.set('includeArchived', '1');
+  if (f.limit) params.set('limit', String(f.limit));
   const qs = params.toString();
   return qs ? `?${qs}` : '';
 }

@@ -14,6 +14,7 @@ import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { cn } from '@/lib/cn';
 import { listFocusSnapshot } from '@/lib/focus';
 import { usePoll } from '@/lib/poll';
+import { isRunKind } from '@/lib/run-presentation';
 import { useSession } from '../hooks/useSession';
 import { useSessionMutations } from '../hooks/useSessionMutations';
 import { sessionKeys } from '../hooks/keys';
@@ -21,6 +22,7 @@ import { rawId } from '../lib/ids';
 import { originMeta } from '../lib/origin';
 import type { Session, Turn } from '../types';
 import { ReadOnlyNotice } from './ReadOnlyNotice';
+import { RunThread } from './RunThread';
 import { historyToMessages } from './conversation-history';
 
 function Header({ session }: { session: Session }) {
@@ -169,9 +171,14 @@ export function ConversationThread() {
   }
 
   const { session, turns } = detail.data;
+  // A run is not a conversation, so it does not get a transcript. It gets the
+  // run page — what it changed, produced and reported — at the durable address
+  // it already had. Only legacy desktop (sessions.json) chats still fall
+  // through to the locked transcript.
+  if (isRunKind(session.kind)) return <RunThread key={session.id} session={session} />;
+
   // Their chat loop is harness-native, so only harness chat sessions can be
-  // continued in the new console. Workflow/agent runs and legacy desktop
-  // (sessions.json) chats are read-only here.
+  // continued in the new console.
   const canContinue = session.continuable && session.store === 'harness';
 
   return canContinue

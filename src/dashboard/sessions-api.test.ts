@@ -754,3 +754,103 @@ test('raw report-back titles heal at read time; synthetic first turns derive hum
   const synthetic = sessions.find((s) => s.id === 'desktop:chat-synthetic');
   assert.equal(synthetic?.title, 'Workflow run: Daily standup email', 'synthetic turn derives a human title');
 });
+
+// ── A collapsed run's status is the RUN's, and its steps are addressable ──
+//
+// The collapse used to hand the page the most-recent STEP's session id and
+// status. A four-step run that emailed in step 2 then read "1 change" (step 4
+// only), and a run whose step 3 had just finished wore a green "Completed"
+// pill while step 4 was still executing.
+
+function workflowStep(
+  runId: string,
+  stepId: string,
+  status: 'active' | 'paused' | 'completed' | 'failed' | 'cancelled',
+) {
+  const created = createSession({
+    id: `workflow:${runId}:${stepId}`,
+    kind: 'workflow',
+    channel: 'workflow',
+    title: `Status Flow ${runId}::${stepId}`,
+    metadata: { source: 'workflow', workflowName: `Status Flow ${runId}`, workflowRunId: runId, stepId },
+  });
+  appendEvent({ sessionId: created.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: `${stepId} reply` } });
+  if (status !== 'active') updateSession(created.id, { status });
+  return created;
+}
+
+function collapsedRun(runId: string) {
+  const found = buildUnifiedSessionList({ includeArchived: true, limit: 500 })
+    .find((s) => s.title === `Status Flow ${runId}`);
+  assert.ok(found, `collapsed row for ${runId}`);
+  return found;
+}
+
+test('a collapsed run carries every step session, in order, addressable by the page', () => {
+  const runId = 'run-steps-addressable';
+  workflowStep(runId, 'a', 'completed');
+  workflowStep(runId, 'b', 'completed');
+  const row = collapsedRun(runId);
+  assert.deepEqual(row.runSteps?.map((s) => s.id), [
+    `harness:workflow:${runId}:a`,
+    `harness:workflow:${runId}:b`,
+  ], 'both steps, oldest first — the page unions their events rather than reading one');
+  assert.deepEqual(row.runSteps?.map((s) => s.label), ['a', 'b']);
+  // Detail must carry the same steps, whichever step id was addressed.
+  const viaStepA = getUnifiedSessionDetail(`harness:workflow:${runId}:a`);
+  assert.deepEqual(viaStepA?.session.runSteps?.map((s) => s.id), row.runSteps?.map((s) => s.id));
+});
+
+test('a run with a step still running never reports Completed', () => {
+  const runId = 'run-step-still-running';
+  workflowStep(runId, 'a', 'completed');
+  workflowStep(runId, 'b', 'active');
+  assert.equal(collapsedRun(runId).status, 'active');
+  assert.equal(getUnifiedSessionDetail(`harness:workflow:${runId}:a`)?.session.status, 'active');
+});
+
+test('a paused or failed step outranks its completed siblings', () => {
+  const paused = 'run-step-paused';
+  workflowStep(paused, 'a', 'completed');
+  workflowStep(paused, 'b', 'paused');
+  assert.equal(collapsedRun(paused).status, 'paused');
+
+  const failed = 'run-step-failed';
+  workflowStep(failed, 'a', 'failed');
+  workflowStep(failed, 'b', 'completed');
+  assert.equal(collapsedRun(failed).status, 'failed', 'the newest step completing does not clear a failure');
+});
+
+test('Completed is reported only when every step completed', () => {
+  const runId = 'run-all-complete';
+  workflowStep(runId, 'a', 'completed');
+  workflowStep(runId, 'b', 'completed');
+  assert.equal(collapsedRun(runId).status, 'completed');
+});
+
+test('a collapsed run is dated from its first step, not its most recent one', () => {
+  const runId = 'run-window-spans-steps';
+  const first = workflowStep(runId, 'a', 'completed');
+  const second = workflowStep(runId, 'b', 'completed');
+  const row = collapsedRun(runId);
+  assert.equal(row.createdAt, first.createdAt, 'elapsed measures the whole run');
+  assert.ok(row.updatedAt >= second.updatedAt);
+});
+
+test('a chat carries no run steps to union', () => {
+  const chat = buildUnifiedSessionList({ source: 'discord', includeArchived: true, limit: 500 })[0];
+  assert.ok(chat);
+  assert.equal(chat.runSteps, undefined);
+});
+
+test('a patched run comes back aggregated, not as the one step that was patched', () => {
+  const runId = 'run-patch-keeps-aggregate';
+  workflowStep(runId, 'a', 'completed');
+  workflowStep(runId, 'b', 'active');
+  const patched = patchUnifiedSession(`harness:workflow:${runId}:a`, { pinned: true });
+  assert.ok(patched);
+  assert.equal(patched.pinned, true);
+  assert.equal(patched.status, 'active', 'pinning a finished step must not settle the run');
+  assert.equal(patched.runSteps?.length, 2);
+  patchUnifiedSession(`harness:workflow:${runId}:a`, { pinned: false });
+});
