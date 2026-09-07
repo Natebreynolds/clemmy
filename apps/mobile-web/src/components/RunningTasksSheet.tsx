@@ -5,8 +5,8 @@ import { haptic } from '../lib/native-bridge';
 import {
   hasExpandableTaskFacts,
   kindLabel,
-  lifecycleLabel,
   mobileRunControl,
+  runStatusLabel,
   workerCountLabel,
 } from '../lib/running-tasks';
 import { presentWorkingNow } from '@clem/chat-engine';
@@ -99,7 +99,10 @@ export function RunningTasksSheet({
   // the accessible name and lives inside the sheet; right-aligned overflow
   // in the header escapes LEFT, straight over the screen title — a compact
   // chip makes that geometry impossible.
-  const compact = [view.running, view.needsYou].filter((n) => n > 0).join('·');
+  // Every group the sheet LISTS gets a digit, stalled included: the sheet
+  // shows all three, so a chip that counted two of them under-reported the
+  // list it opens.
+  const compact = [view.running, view.needsYou, view.stalled].filter((n) => n > 0).join('·');
 
   return (
     <div class="running-tasks-affordance">
@@ -154,10 +157,14 @@ export function RunningTasksSheet({
                       />
                       <div class="running-task-identity">
                         <h3>{entry.headline}</h3>
+                        {/* The same words the chip above uses. The lifecycle
+                            word alone described the moment a row stopped, so a
+                            run blocked on Tuesday sat here reading "Needs
+                            review" under a chip that said "21 stalled". */}
                         <div class="running-task-meta">
                           <span>{kindLabel(entry.kind)}</span>
-                          <span>{lifecycleLabel(entry.lifecycle)}</span>
-                          {elapsed ? <span>{elapsed}</span> : null}
+                          <span>{runStatusLabel(p)}</span>
+                          {elapsed && !p.stalled ? <span>{elapsed}</span> : null}
                         </div>
                       </div>
                     </div>

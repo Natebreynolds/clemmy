@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'preact/hooks';
 import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
-import { presentWorkingNow } from '@clem/chat-engine';
-import { mobileRunControl } from '../lib/running-tasks';
+import { presentWorkingNow, type PresentedWorkingNowEntry } from '@clem/chat-engine';
+import { mobileRunControl, runStatusLabel } from '../lib/running-tasks';
 import { lastGoodAt, lastGoodNotice } from '../lib/last-good';
 import { runRowLabel } from '../lib/run-rows';
 import { relativeTime } from '../components/Approvals';
@@ -42,6 +42,11 @@ export function Activity({ initialRunId, onRunChange }: Props = {}) {
   // the same one the running-tasks sheet and desktop read — so a workflow
   // dispatched from chat appears here and its Stop targets the right route.
   // "Earlier" stays on the run history, which is where terminal rows live.
+  //
+  // It heads only the rows the presenter calls RUNNING. It used to head every
+  // non-terminal row, which is how six runs blocked two days earlier came to
+  // sit under the words "Happening now" — each of them still printing the live
+  // phase text it had been showing when it died.
   const { data, loading, error, offline, refresh } = useScreenData(
     async () => {
       const [runsResult, workingNow] = await Promise.all([
@@ -100,16 +105,20 @@ export function Activity({ initialRunId, onRunChange }: Props = {}) {
   return (
     <div class="home">
       {notice}
-      {workingView.total > 0 ? (
-        <section class="home-section">
-          <h2 class="section-head">Happening now</h2>
-          <div class="stack">
-            {workingView.entries.map((p, i) => (
-              <LiveCard key={p.entry.runKey} entry={p.entry} pulse={p.pulse} elapsed={p.elapsed} index={i} onChanged={() => void refresh()} onOpen={showRun} />
-            ))}
-          </div>
-        </section>
-      ) : null}
+      {LIVE_SECTIONS.map(({ membership, head }) => {
+        const rows = workingView.entries.filter((p) => p.membership === membership);
+        if (rows.length === 0) return null;
+        return (
+          <section class="home-section" key={membership}>
+            <h2 class="section-head">{head}</h2>
+            <div class="stack">
+              {rows.map((p, i) => (
+                <LiveCard key={p.entry.runKey} presented={p} index={i} onChanged={() => void refresh()} onOpen={showRun} />
+              ))}
+            </div>
+          </section>
+        );
+      })}
       {done.length > 0 ? (
         <section class="home-section">
           <h2 class="section-head">Earlier</h2>
@@ -123,14 +132,22 @@ export function Activity({ initialRunId, onRunChange }: Props = {}) {
 }
 
 
-function LiveCard({ entry, pulse, elapsed, index, onChanged, onOpen }: {
-  entry: ActivityEntry;
-  pulse: boolean;
-  elapsed: string;
+/** Each membership gets its OWN heading, so a heading is never a claim about a
+ *  row underneath it. Order is what a person cares about first. */
+const LIVE_SECTIONS: ReadonlyArray<{ membership: 'needs_you' | 'running' | 'stalled'; head: string }> = [
+  { membership: 'needs_you', head: 'Waiting on you' },
+  { membership: 'running', head: 'Happening now' },
+  { membership: 'stalled', head: 'Stalled' },
+];
+
+function LiveCard({ presented, index, onChanged, onOpen }: {
+  presented: PresentedWorkingNowEntry<ActivityEntry>;
   index: number;
   onChanged: () => void;
   onOpen: (sessionId: string) => void;
 }) {
+  const entry = presented.entry;
+  const { pulse, elapsed } = presented;
   const control = mobileRunControl(entry);
   const body = (
     <>
@@ -141,9 +158,15 @@ function LiveCard({ entry, pulse, elapsed, index, onChanged, onOpen }: {
         : <span class="running-task-state" style={{ background: 'var(--line-strong)' }} aria-hidden="true" />}
       <div class="min-w-0">
         <div class="card-title-sm">{entry.headline || 'Working…'}</div>
+        {/* One vocabulary with the chip and with Home: a row that stopped
+            says so, and how long ago, instead of replaying the phase text it
+            was showing when it stopped. */}
         <div class="card-when">
-          {entry.activity?.text || entry.lifecycle.replace(/_/g, ' ')}
-          {elapsed ? ` · ${elapsed}` : ''}
+          {runStatusLabel(presented)}
+          {/* A stalled row already states an age, and for a row whose only
+              evidence is its start the two ages are the same number — one
+              suffix, not "nothing for 2d · 2d". */}
+          {elapsed && !presented.stalled ? ` · ${elapsed}` : ''}
         </div>
       </div>
     </>

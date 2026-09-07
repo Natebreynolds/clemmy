@@ -219,3 +219,19 @@ test('board feed uses durable terminal events and fails closed without one', () 
   }
   console.log('activity narration wiring pinned');
 }
+
+// ─── the desktop Home pane, WIRED ────────────────────────────────────────────
+// A stalled row has no second home on this screen: Home's Needs-you pane is fed
+// by the command-center query, not by this view. Filtering it out of the
+// Running pane made an unfinished run render NOWHERE while the pane said
+// "Nothing is running right now." — the owner's "I don't see the ability to
+// clear certain things", exactly. And the words on the row come from the ONE
+// presenter, so the pill and the rows under it cannot disagree.
+test('the Running pane keeps stalled rows and words them from the shared presenter', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../components/home/RunningPane.tsx', import.meta.url), 'utf8');
+  assert.match(source, /membership === 'stalled'/, 'stalled rows must still reach the pane');
+  assert.match(source, /workingNowStatusLabel\(/, 'the row must render the shared status label');
+  assert.match(source, /steer && !presented\.stalled/,
+    'Steer may not be offered on a run that stopped days ago');
+});
