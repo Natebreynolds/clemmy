@@ -64,6 +64,7 @@ import {
   loadNotifications,
   listNotifications,
   markNotificationRead,
+  markNotificationsRead,
   removeWebPushDestinationByEndpoint,
   removeWebPushDestinationsByDeviceId,
   upsertApnsDestination,
@@ -2580,6 +2581,72 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       cleared: changed.length,
       notification: serializeInboxNotificationForMobile(changed[0] ?? existing),
     });
+  });
+
+  /**
+   * Clear a NAMED SET of notifications in one tap.
+   *
+   * Nobody clears 176 history rows one at a time, so before this route the
+   * phone's only clearing verb was unusable at the size the store actually
+   * reaches — measured live: 200 of 200 unread, none ever marked read.
+   *
+   * The client sends exact ids, never a filter, so a bulk action can always
+   * name its own scope to the person tapping it and can never widen past what
+   * was on screen. CLEARING IS NOT DECIDING: markNotificationsRead holds back
+   * anything still awaiting an answer and returns those ids, so the response
+   * can say what was left alone rather than silently swallowing it.
+   */
+  router.post('/api/inbox/notifications/read', requireMobileSession, (req, res) => {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+    const raw = Array.isArray(body.ids) ? body.ids : null;
+    if (!raw || raw.length === 0) {
+      res.status(400).json({ error: 'IDS_REQUIRED', detail: 'Send the exact notification ids to clear.' });
+      return;
+    }
+    if (raw.length > 500) {
+      res.status(400).json({ error: 'TOO_MANY_IDS', detail: 'Clear at most 500 notifications per request.' });
+      return;
+    }
+    const ids = raw
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.length <= 200);
+    if (ids.length === 0) {
+      res.status(400).json({ error: 'IDS_REQUIRED', detail: 'Send the exact notification ids to clear.' });
+      return;
+    }
+    try {
+      // THE FLOOR IS HERE, not in the client. markNotificationsRead can only
+      // tell a live proposal from a settled one if this route says which are
+      // pending — the same three sets /api/inbox/summary passes — and without
+      // them it holds every proposal-bearing row back rather than clearing it.
+      // The phone also pre-filters those rows, but a pre-filter is one
+      // client's habit; this is the rule for every caller of the route.
+      const pendingApprovalIds = new Set(
+        approvalRegistry.listPending({ status: 'pending' })
+          .filter((row) => !approvalRegistry.isExpired(row))
+          .filter((row) => approvalRegistry.isFormalApprovalSurface(row))
+          .map((row) => row.approvalId),
+      );
+      const pendingPlanIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
+      const pendingTrustIds = new Set(listTrustProposals('pending').map((row) => row.id));
+      const result = markNotificationsRead(ids, {
+        approvalPending: (id) => pendingApprovalIds.has(id),
+        planPending: (id) => pendingPlanIds.has(id),
+        trustPending: (id) => pendingTrustIds.has(id),
+      });
+      res.json({
+        ok: true,
+        cleared: result.cleared,
+        clearedCount: result.cleared.length,
+        held: result.held,
+        heldCount: result.held.length,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   router.get('/api/inbox/summary', requireMobileSession, async (_req, res) => {

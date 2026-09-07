@@ -505,24 +505,97 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .home { display: flex; flex-direction: column; gap: var(--sp-5); padding-top: var(--sp-2); }
 .home-section { display: flex; flex-direction: column; }
 
-.home-greet h2 {
-  font-family: var(--font-display);
-  font-size: var(--t-hero);
-  font-weight: 800;
-  letter-spacing: -0.03em;
-  line-height: 1.08;
-  margin: 0 0 var(--sp-2);
-  /* Solid, not a gradient. Gradient text on a heading is decorative rather
-     than meaningful, and by 2026 it is one of the recognizable signatures of
-     a generated interface. The greeting earns its presence from scale and
-     the warmth already in --fg; it does not need to shimmer. */
-  color: var(--fg);
+/* THE LEAD — the answer the phone opens with.
+
+   Home used to open with "Good afternoon, Nathan" in the largest type on the
+   screen and the thing that actually mattered whispered underneath it. That
+   is inverted. The greeting is an eyebrow; the answer carries the weight, and
+   it is the ONLY thing on Home at this size — which is what makes a stack of
+   lists stop reading as one flat wall. */
+.home-lead {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
 }
-.home-status {
+/* The two states where a person is genuinely the blocker are the only place
+   on Home that spends the accent on a surface. Everything else — work that is
+   merely running, work that never finished, what happened while you were away
+   — is information, and reads at paper weight. */
+.home-lead-answer,
+.home-lead-elsewhere,
+.home-lead-attention {
+  border-color: var(--line-hot);
+  background: var(--accent-soft);
+}
+/* One live region for the whole answer — headline, qualifier, provenance —
+   so a screen reader hears the count change AND how old it is, in one
+   announcement. Layout is unchanged: the gap and align-items are the
+   parent's own, inherited rather than restated. */
+.home-lead-say {
+  display: flex;
+  flex-direction: column;
+  align-items: inherit;
+  gap: 2px;
+  width: 100%;
+}
+.home-lead-clear { align-items: center; text-align: center; }
+.home-lead-mark { opacity: 0.8; margin-bottom: var(--sp-2); }
+.home-lead-eyebrow {
   margin: 0;
+  color: var(--fg-3);
+  font-size: var(--t-sm);
+}
+/* Specificity matched to `.app-main h2:not(.section-head)`, which would
+   otherwise size this heading. */
+.app-main h2.home-lead-head {
+  margin: 0;
+  font-family: var(--font-display);
+  /* Deliberately a step below the old greeting's --t-hero: it has real
+     sentences to carry, and a 38px headline that wraps to three lines is
+     the "overwhelming" the owner named, not presence. */
+  font-size: clamp(1.3125rem, 5.6vw, 1.75rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.16;
+  color: var(--fg);
+  text-wrap: balance;
+}
+.home-lead-detail {
+  margin: 6px 0 0;
   color: var(--fg-2);
   font-size: var(--t-sm);
 }
+/* How old the number above it is. Quieter than the detail — it qualifies the
+   answer, it never competes with it — but never hidden: this is the only
+   staleness disclosure left on the screen that leads with the count. */
+.home-lead-asof {
+  margin: 4px 0 0;
+  color: var(--fg-3);
+  font-size: var(--t-xs);
+}
+/* One tap, on the headline's own terms. Not a filled button: the rows below
+   carry the real decisions and their primaries must stay the loudest thing. */
+.home-lead-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-deep);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--t-sm);
+  transition: transform var(--clem-dur-fast) var(--ease-out);
+}
+.home-lead-action:active { transform: scale(var(--clem-press)); }
+.home-lead-action svg { width: 16px; height: 16px; }
 
 /* ── cards ──────────────────────────────────────────────────────── */
 
@@ -2451,7 +2524,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
 @media (max-height: 500px) and (orientation: landscape) {
   .app-header { padding: 4px var(--sp-4); }
   .home { gap: var(--sp-3); }
-  .home-greet h2 { font-size: 24px; }
+  .app-main h2.home-lead-head { font-size: 21px; }
+  .home-lead { padding: var(--sp-3); }
   .empty { padding: 20px; }
 }
 
@@ -2459,7 +2533,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
    assistant's state is legible at a glance instead of a long scroll. */
 @media (min-width: 700px) {
   .app-main { max-width: 900px; padding-left: var(--sp-5); padding-right: var(--sp-5); }
-  .home-greet, .home-customize, .home > .screen-notice, .home > .skeleton-stack { grid-column: 1 / -1; }
+  .home-lead, .home-customize, .home > .screen-notice, .home > .skeleton-stack { grid-column: 1 / -1; }
   .home {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -3422,8 +3496,6 @@ textarea:focus-visible,
 .home-away-glyph.warn { color: var(--accent-warn); }
 .home-away-text { flex: 1 1 auto; min-width: 0; font-size: 14px; }
 .home-away-time { flex: 0 0 auto; font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
-.home-skeleton { width: 100%; }
-.home-skeleton i { height: 44px; }
 .home-customize {
   display: flex;
   align-items: center;
@@ -3479,7 +3551,6 @@ textarea:focus-visible,
 .qa-chip:active:not(:disabled) { transform: scale(0.96); border-color: var(--line-hot); }
 .qa-chip:disabled { opacity: 0.6; }
 .qa-chip-more { padding: 0 12px; color: var(--fg-3); }
-.qa-chip-add { color: var(--accent-deep); border-style: dashed; }
 .qa-queued { border-color: rgba(53, 123, 41, 0.4); color: var(--accent-2); }
 .qa-error { border-color: rgba(208, 69, 58, 0.4); }
 .qa-note { margin: 0 2px; font-size: var(--t-xs); color: var(--fg-2); }

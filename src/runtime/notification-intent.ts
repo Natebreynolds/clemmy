@@ -194,6 +194,33 @@ export function classifyNotification(
   return 'neither';
 }
 
+/**
+ * Does this record name a proposal whose liveness the caller CANNOT check?
+ *
+ * `classifyNotification` deliberately answers "not live" for a referent it was
+ * given no predicate for — that is right for a badge, where guessing a decision
+ * into existence was the original defect. It is exactly wrong for a WRITE:
+ * a bulk mark-read that silently hides the carrier for a genuinely pending
+ * approval is the same shape of harm, pointing the other way. Marking read is
+ * not deciding, so nothing is lost either way, but the carrier for a live
+ * decision must not disappear off the screen because the writer did not know.
+ *
+ * So a write path asks this too, and holds the row back when the answer is yes.
+ * A caller that supplies the pending sets (mobile-routes' bulk-read route does,
+ * the same three it gives /api/inbox/summary) gets a real decision instead and
+ * clears every long-settled proposal row normally.
+ */
+export function hasUnverifiableProposalReferent(
+  notification: IntentInput,
+  live: LiveReferents = {},
+): boolean {
+  const meta = notification.metadata;
+  if (str(meta, 'approvalId') && !live.approvalPending) return true;
+  if (str(meta, 'planProposalId') && !live.planPending) return true;
+  if (str(meta, 'trustProposalId') && !live.trustPending) return true;
+  return false;
+}
+
 /** Rule (1): the badge, and only the badge. */
 export function isAwaitingUser(notification: IntentInput, live: LiveReferents = {}): boolean {
   return classifyNotification(notification, live) === 'awaiting_you';

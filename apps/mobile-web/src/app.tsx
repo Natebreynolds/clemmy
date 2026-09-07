@@ -44,6 +44,7 @@ import {
   type TabId as Tab,
 } from './lib/deep-link';
 import { SWITCHER_MORE, phoneSwitcherIds, useHomePreferences } from './lib/home-prefs';
+import { phoneHeaderChrome } from './lib/home-presentation';
 import { appBadgeAuthAction, clearAppBadge, syncAppBadge } from './lib/app-badge';
 import { lastGoodAt } from './lib/last-good';
 import { needsYouChrome } from './lib/needs-you';
@@ -572,6 +573,14 @@ export function App() {
     nowMs: Date.now(),
   });
 
+  // The header is identity, where you are, and connection state. Anything else
+  // it carries is a shortcut to something the CURRENT screen cannot show — so
+  // on Home, which now leads with the answer and lists the work below it, the
+  // row is three items and the title finally has room. (Before: five controls
+  // fought for it — mark, title, a "6·42" chip, a "Needs you · 86" pill and
+  // the connection state — and the title was crushed to a sliver.)
+  const headerChrome = phoneHeaderChrome({ tab, needsYouSignal: needsYou.show });
+
   const switcherEntries: SwitcherEntry[] = phoneSwitcherIds(prefs, TABS.map((t) => t.id))
     .filter((id) => id !== SWITCHER_MORE)
     .flatMap((id) => {
@@ -621,12 +630,15 @@ export function App() {
         <div class="meta">
           {/* Compact running-work chip — the sheet's trigger, which must not
               float at the bottom now that the dock is gone. Absent at zero
-              (presenter contract: the pill disappears when total is 0). */}
-          <RunningTasksSheet onOpenRun={openRun} />
+              (presenter contract: the pill disappears when total is 0), and
+              absent on the screens that already list the work themselves. */}
+          {headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} /> : null}
           {/* The pill has no room for a banner, so it discloses the age in the
               space it has: "Needs you · 3 · 6h ago" when the number came off
-              the worker's shelf or a poll stopped answering. */}
-          {tab === 'home' && needsYou.show ? (
+              the worker's shelf or a poll stopped answering. It is the standing
+              signal for screens that have no other way to show it — never on
+              Home or Needs you, which say it in their own content. */}
+          {headerChrome.needsPill ? (
             <button
               type="button"
               class={`needs-pill${needsYou.stale ? ' needs-pill-stale' : ''}`}
@@ -782,9 +794,16 @@ export function App() {
               onAsk={(draft) => goToChat({ draft, autoSend: true })}
               onOpenInbox={() => navigateTo('inbox')}
               onOpenWorkspace={openWorkspace}
+              onOpenActivity={() => navigateTo('activity')}
               onCustomize={() => setCustomizeOpen(true)}
               needsYouCount={decisions}
               needsYouCountKnown={decisionsKnown}
+              // The pill is suppressed on Home (Home says the number itself),
+              // so the age it used to carry travels with the number instead —
+              // same ONE presenter, so chrome and Home can never disagree
+              // about how old this count is.
+              needsYouCountLive={!needsYou.stale}
+              needsYouCountAge={needsYou.age}
             />
           ) : tab === 'inbox' ? (
             <Inbox

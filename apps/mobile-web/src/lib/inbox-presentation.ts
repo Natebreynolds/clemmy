@@ -231,3 +231,133 @@ export function collapseAttentionNotifications(rows: InboxNotification[]): Array
   }
   return [...seen.values()];
 }
+
+// ─── clearing ──────────────────────────────────────────────────────────────
+//
+// "I don't see the ability to clear certain things." — the owner, 2026-09-06,
+// with 200 of 200 notifications unread on his machine. Nothing had ever marked
+// one read and the phone offered no verb that scaled, so the count could only
+// grow, and the app read as an accusation.
+//
+// The two rules these functions exist to hold:
+//   CLEARING IS NOT DECIDING. A cleared row is marked read. It approves,
+//   rejects, and answers nothing.
+//   NEVER CLEAR WHAT THE USER HAS NOT SEEN. The scope is a list of exact ids
+//   taken from the rows on screen, and it names its own size out loud.
+
+/** A row a clear could touch. Structural, so callers can pass the feed. */
+export type ClearableRow = Pick<InboxNotification, 'id' | 'read' | 'needsAttention'>
+  & Partial<Pick<InboxNotification, 'workflowCapability'>>;
+
+export interface ClearScope {
+  /** The exact rows this clear will mark read — never a filter, never "all". */
+  ids: string[];
+  count: number;
+  /** The button's own words, naming the size so the tap can't surprise. */
+  label: string;
+}
+
+/**
+ * What a bulk clear on the Updates tab would touch.
+ *
+ * Two rows are held back even when a caller passes the whole feed, so the
+ * safety does not depend on the caller's filter being right:
+ *  - anything still flagged as needing the user, which is a DECISION and must
+ *    be answered or dismissed one at a time, with its consequences on screen;
+ *  - a workflow capability gate, which is the only exact chooser for a parked
+ *    run and is retired by that run, not by a tap (the daemon refuses it too).
+ */
+export function updatesClearScope(rows: readonly ClearableRow[]): ClearScope {
+  const ids: string[] = [];
+  for (const row of rows) {
+    if (row.read || row.needsAttention || row.workflowCapability) continue;
+    ids.push(row.id);
+  }
+  return {
+    ids,
+    count: ids.length,
+    label: `Clear ${ids.length} update${ids.length === 1 ? '' : 's'}`,
+  };
+}
+
+/**
+ * Show a row as read before the daemon has said so.
+ *
+ * Optimistic because it is reversible: marking read changes presentation only,
+ * and if the request fails the caller drops the id and the row comes straight
+ * back. Returns the SAME array when nothing applies, so an unrelated refresh
+ * cannot churn the list.
+ */
+export function applyLocalReads<T extends { id: string; read: boolean }>(
+  rows: readonly T[],
+  clearedIds: ReadonlySet<string>,
+): T[] {
+  if (clearedIds.size === 0) return rows as T[];
+  let touched = false;
+  const next = rows.map((row) => {
+    if (row.read || !clearedIds.has(row.id)) return row;
+    touched = true;
+    return { ...row, read: true };
+  });
+  return touched ? next : (rows as T[]);
+}
+
+/** Why the daemon left one row alone. Mirrors NotificationReadHeldReason. */
+export type ClearHeldReason = 'awaiting_you' | 'capability_gate' | 'not_found';
+
+/**
+ * What to tell the user after a clear — the counts the daemon actually
+ * reported, never the count that was asked for. A held-back row is named
+ * rather than swallowed: that is the difference between clearing and deciding.
+ *
+ * EACH REASON GETS ITS OWN SENTENCE, because they are not the same fact and a
+ * receipt that blurs them renders a falsehood. The first version said "N still
+ * need an answer, so they stayed in Needs you" about every held row, which was
+ * wrong two ways: a `not_found` row is one that no longer exists — calling it
+ * an answer the user owes is inventing an obligation — and an `awaiting_you`
+ * row is, by construction, one the phone was showing on UPDATES (the scope
+ * filter and the daemon floor use different predicates, and the held set is
+ * exactly where they disagree), so naming a tab it is not on sends the user
+ * looking in the wrong place. Nothing here names a tab.
+ */
+export function clearReceipt(result: {
+  clearedCount: number;
+  heldCount: number;
+  held?: ReadonlyArray<{ reason: ClearHeldReason }>;
+}): string {
+  const { clearedCount, heldCount } = result;
+  const counts = { awaiting_you: 0, capability_gate: 0, not_found: 0 };
+  for (const row of result.held ?? []) {
+    if (row.reason in counts) counts[row.reason] += 1;
+  }
+  // A caller that reports a heldCount without the reasons still gets a true
+  // sentence: "kept" claims only that they were not cleared.
+  const unattributed = Math.max(0, heldCount - (counts.awaiting_you + counts.capability_gate + counts.not_found));
+  const held: string[] = [];
+  if (counts.awaiting_you > 0) {
+    held.push(counts.awaiting_you === 1
+      ? '1 still needs an answer, so it stayed unread.'
+      : `${counts.awaiting_you} still need an answer, so they stayed unread.`);
+  }
+  if (counts.capability_gate > 0) {
+    held.push(counts.capability_gate === 1
+      ? '1 is waiting on an account choice, so it stayed unread.'
+      : `${counts.capability_gate} are waiting on an account choice, so they stayed unread.`);
+  }
+  if (counts.not_found > 0) {
+    held.push(counts.not_found === 1
+      ? '1 was already gone.'
+      : `${counts.not_found} were already gone.`);
+  }
+  if (unattributed > 0) {
+    held.push(unattributed === 1 ? '1 was kept.' : `${unattributed} were kept.`);
+  }
+  const heldText = held.join(' ');
+  if (clearedCount === 0) {
+    return heldCount > 0 ? `Nothing was cleared. ${heldText}` : 'Those updates were already read.';
+  }
+  const cleared = `Cleared ${clearedCount} update${clearedCount === 1 ? '' : 's'}.`;
+  return heldCount > 0
+    ? `${cleared} ${heldText}`
+    : `${cleared} Nothing was decided — they stay in your history.`;
+}

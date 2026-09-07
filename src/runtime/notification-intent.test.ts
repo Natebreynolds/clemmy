@@ -21,7 +21,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyNotification, isAwaitingUser, isWorthNotifying } from './notification-intent.js';
+import {
+  classifyNotification,
+  hasUnverifiableProposalReferent,
+  isAwaitingUser,
+  isWorthNotifying,
+} from './notification-intent.js';
 
 test('a finished run is FINISHED even though it is stamped needsAttention', () => {
   // 10 rows on the live store look exactly like this. The flag is written when
@@ -179,4 +184,39 @@ test('the live store, replayed: the badge collapses from 86 to a handful', () =>
   assert.equal(awaiting, 10, 'the six readiness gates plus the four real questions');
   assert.equal(finished, 14, 'ten done, two cancelled, two failed — told once, never badged');
   assert.equal(store.length - awaiting - finished, 174, 'the rest is history, and belongs in the record');
+});
+
+
+// ─── the same silence, read the other way, for a WRITE ───────────────────────
+//
+// classifyNotification answers "not live" for a referent it was given no
+// predicate for. That is right for a badge — guessing a decision into existence
+// was the original defect — and exactly wrong for a bulk mark-read, where the
+// same silence means "hide the only carrier for a decision you could not
+// check". So a write path asks this instead and holds the row back.
+
+test('a proposal referent the caller cannot check is reported as unverifiable', () => {
+  assert.equal(hasUnverifiableProposalReferent({ metadata: { approvalId: 'ap-1' } }), true);
+  assert.equal(hasUnverifiableProposalReferent({ metadata: { planProposalId: 'pl-1' } }), true);
+  assert.equal(hasUnverifiableProposalReferent({ metadata: { trustProposalId: 'tr-1' } }), true);
+  // Answering for one referent says nothing about the other two.
+  assert.equal(
+    hasUnverifiableProposalReferent({ metadata: { planProposalId: 'pl-1' } }, { approvalPending: () => false }),
+    true,
+  );
+  assert.equal(
+    hasUnverifiableProposalReferent({ metadata: { approvalId: 'ap-1' } }, { approvalPending: () => false }),
+    false,
+    'a caller that CAN check gets a real answer, settled or not',
+  );
+});
+
+test('a row that names no proposal is never unverifiable, whatever the caller knows', () => {
+  // The 111 restart notices and the finished reports the bulk clear exists for.
+  assert.equal(hasUnverifiableProposalReferent({ metadata: { status: 'error' } }), false);
+  assert.equal(hasUnverifiableProposalReferent({ metadata: { status: 'completed' } }), false);
+  assert.equal(hasUnverifiableProposalReferent({ metadata: {} }), false);
+  assert.equal(hasUnverifiableProposalReferent({}), false);
+  // An empty string is not a referent.
+  assert.equal(hasUnverifiableProposalReferent({ metadata: { approvalId: '   ' } }), false);
 });

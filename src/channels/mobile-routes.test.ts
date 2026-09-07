@@ -4801,3 +4801,95 @@ test('auth/status withholds PIN posture from an unauthenticated caller it cannot
     await h.close();
   }
 });
+
+test('a bulk clear reads the named updates and refuses to decide anything', async () => {
+  // 200 of 200 unread on the owner's machine, and no verb that scaled: the
+  // phone could only ever mark one row at a time, so 176 history items were
+  // unclearable in practice. The bulk route exists for exactly that, and it
+  // must be structurally unable to resolve a decision on the way.
+  const stamp = Date.now();
+  const doneId = `bulk-done-${stamp}`;
+  const blockedId = `bulk-blocked-${stamp}`;
+  const questionId = `bulk-question-${stamp}`;
+  addNotification({
+    id: doneId,
+    kind: 'execution',
+    title: 'Renewal digest finished',
+    body: 'Sent to the sheet.',
+    createdAt: '2099-01-01T00:00:00.000Z',
+    read: false,
+    metadata: { status: 'done', needsAttention: true },
+  });
+  addNotification({
+    id: blockedId,
+    kind: 'execution',
+    title: 'Chat run blocked: pre-tag verifier',
+    body: 'It stopped two days ago.',
+    createdAt: '2099-01-01T00:00:01.000Z',
+    read: false,
+    metadata: { status: 'blocked' },
+  });
+  addNotification({
+    id: questionId,
+    kind: 'workflow',
+    title: 'Which quarter should I use?',
+    body: 'Waiting on you.',
+    createdAt: '2099-01-01T00:00:02.000Z',
+    read: false,
+    metadata: { status: 'awaiting_input', questionId: `q-${stamp}`, needsAttention: true },
+  });
+
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Bulk clear phone');
+    const cleared = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [doneId, blockedId, questionId] }),
+    });
+    assert.equal(cleared.status, 200);
+    const body = await cleared.json() as {
+      cleared: string[];
+      clearedCount: number;
+      held: Array<{ id: string; reason: string }>;
+    };
+    assert.deepEqual(body.cleared.sort(), [blockedId, doneId].sort(),
+      'finished and dead-stopped reports are history and clear');
+    assert.equal(body.clearedCount, 2);
+    assert.deepEqual(body.held, [{ id: questionId, reason: 'awaiting_you' }],
+      'an unanswered question is held back and NAMED, never silently swallowed');
+
+    const still = await fetch(`${h.url}/m/api/inbox/notifications/${encodeURIComponent(questionId)}`, {
+      headers: { cookie },
+    });
+    assert.equal((await still.json() as { notification: { read: boolean } }).notification.read, false);
+
+    // An empty or oversized ask is a 400, not a silent no-op the phone would
+    // report as a successful clear.
+    const empty = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [] }),
+    });
+    assert.equal(empty.status, 400);
+    const oversized = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from({ length: 501 }, (_, i) => `x-${i}`) }),
+    });
+    assert.equal(oversized.status, 400);
+
+    // Unauthenticated callers cannot clear anyone's inbox.
+    const anonymous = await fetch(`${h.url}/m/api/inbox/notifications/read`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ids: [doneId] }),
+    });
+    assert.equal(anonymous.status, 401);
+  } finally {
+    await h.close();
+    markNotificationRead(doneId);
+    markNotificationRead(blockedId);
+    markNotificationRead(questionId);
+  }
+});

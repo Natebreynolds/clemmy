@@ -92,7 +92,10 @@ export function visiblePanes(prefs: HomePreferences): HomePaneId[] {
 export const PHONE_PANES: ReadonlyArray<{ id: HomePaneId; label: string }> = [
   { id: 'quick_actions', label: 'Quick actions' },
   { id: 'needs_you', label: 'Needs you' },
-  { id: 'running', label: 'Running' },
+  // The pane's own heading is derived from what is in it — "Running" only when
+  // the server certified something live, "Still open" when it did not — so the
+  // switch that turns it on names the pane, not one of its states.
+  { id: 'running', label: 'Current work' },
   { id: 'while_away', label: 'While you were away' },
   { id: 'projects', label: 'Coming up · Projects' },
 ];

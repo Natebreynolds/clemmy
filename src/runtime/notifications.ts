@@ -12,6 +12,11 @@ import {
   SLACK_PROACTIVE_CHANNEL,
 } from '../config.js';
 import { actionBus } from './action-bus.js';
+import {
+  classifyNotification,
+  hasUnverifiableProposalReferent,
+  type LiveReferents,
+} from './notification-intent.js';
 import { withFileLockSyncStrict } from './atomic-json.js';
 import { readWorkflowOriginGroupSettlement } from '../execution/workflow-origin-group.js';
 import {
@@ -1468,6 +1473,92 @@ export function markNotificationRead(id: string): NotificationRecord | undefined
     item.read = true;
     saveNotificationsUnlocked(items);
     return item;
+  });
+}
+
+/** Why a bulk clear left one row alone. Never a silent drop — the caller
+ * shows the count, so the user learns what clearing does NOT do. */
+export type NotificationReadHeldReason =
+  /** There is something here to ANSWER. Clearing is not deciding. */
+  | 'awaiting_you'
+  /** The only exact chooser for a parked run. Retired by the run, not by a tap. */
+  | 'capability_gate'
+  /** No such notification (already pruned, or never existed). */
+  | 'not_found';
+
+export interface BulkNotificationReadResult {
+  /** Ids that are read now — including ones that already were (idempotent). */
+  cleared: string[];
+  held: Array<{ id: string; reason: NotificationReadHeldReason }>;
+}
+
+/**
+ * Mark an EXPLICIT set of notifications read, in one lock and one write.
+ *
+ * THE DEFECT THIS EXISTS TO FIX. On the owner's live store 200 of 200
+ * notifications were unread: nothing had ever marked one read, and the only
+ * verb that existed was one row at a time. Nobody reads 176 history items
+ * individually, so the count only ever grew and the app read as an accusation.
+ *
+ * The set is explicit — never "everything", never a title/workflow guess like
+ * markNotificationGroupRead — because a bulk action must be able to name its
+ * own scope ("clear 176 updates") to the person tapping it.
+ *
+ * CLEARING IS NOT DECIDING, and THIS FUNCTION IS THE FLOOR that guarantees it
+ * — not the client's pre-filter. Whatever the caller passes, a row that
+ * classifyNotification calls `awaiting_you` is held back and reported, so no
+ * bulk tap can ever resolve an open question, an unsettled gate, or a live
+ * check-in by marking it read.
+ *
+ * `live` is how a caller tells the floor which proposals are actually pending;
+ * it is the same knowledge /api/inbox/summary already passes. WITHOUT IT THE
+ * FLOOR FAILS CLOSED: a row naming an approval/plan/trust proposal this call
+ * cannot check is held rather than cleared. The first version simply passed no
+ * referents, so hasPendingProposal always answered false and a genuinely
+ * pending proposal's carrier could be hidden by a bulk tap — safe only because
+ * one client happened to strip those rows first, which is not a floor at all.
+ * A caller that supplies the sets clears settled proposal rows exactly as
+ * before; a caller that cannot keeps them on screen, which is the reversible
+ * direction (marking read decides nothing either way).
+ */
+export function markNotificationsRead(
+  ids: readonly string[],
+  live?: LiveReferents,
+): BulkNotificationReadResult {
+  const wanted = [...new Set(ids.map((id) => (typeof id === 'string' ? id.trim() : '')).filter(Boolean))];
+  if (wanted.length === 0) return { cleared: [], held: [] };
+  return withNotificationStateLock(() => {
+    const items = loadNotificationsUnlocked();
+    const byId = new Map(items.map((entry) => [entry.id, entry] as const));
+    const cleared: string[] = [];
+    const held: BulkNotificationReadResult['held'] = [];
+    let changed = 0;
+    for (const id of wanted) {
+      const item = byId.get(id);
+      if (!item) {
+        held.push({ id, reason: 'not_found' });
+        continue;
+      }
+      if (isUnresolvedWorkflowCapabilityCarrier(item)) {
+        held.push({ id, reason: 'capability_gate' });
+        continue;
+      }
+      if (classifyNotification(item, live ?? {}) === 'awaiting_you') {
+        held.push({ id, reason: 'awaiting_you' });
+        continue;
+      }
+      if (hasUnverifiableProposalReferent(item, live ?? {})) {
+        held.push({ id, reason: 'awaiting_you' });
+        continue;
+      }
+      if (!item.read) {
+        item.read = true;
+        changed += 1;
+      }
+      cleared.push(id);
+    }
+    if (changed > 0) saveNotificationsUnlocked(items);
+    return { cleared, held };
   });
 }
 
