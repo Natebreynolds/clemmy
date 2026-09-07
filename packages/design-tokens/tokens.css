@@ -69,6 +69,18 @@
                                                                    its own tint; now 5.00:1 */
   --clem-danger:       #c0392b;  --clem-danger-tint:  #fbe9e7;
 
+  /* ── The destructive button ───────────────────────────────────────────────
+     Danger had a tint pair but no FILL states, so the one control that deletes
+     things was written as `bg-danger text-white hover:opacity-90` — a label
+     whose contrast nobody had measured and a hover expressed as opacity, which
+     is by construction unmeasurable. In dark that label measured 3.07:1 and
+     got worse under the finger. Danger now carries the same three-state fill
+     contract the primary button already had, and the contrast test asserts the
+     label against all three states in both themes. */
+  --clem-danger-hover: #a5301f;  /* light hovers DARKER */
+  --clem-danger-press: #8f2417;
+  --clem-danger-fg:    #ffffff;  /* 5.44:1 rest · 6.90:1 hover · 8.63:1 press */
+
   /* ── Focus ──────────────────────────────────────────────────────────────
      An outline, not a box-shadow. The old ring was
      color-mix(in srgb, var(--ring) 55%, transparent) = #f8aa80 = 1.90:1,
@@ -84,11 +96,23 @@
      Adopted from mobile, which had reasoned it out and written it down:
      "things arrive and settle, they do not bounce." Deliberately no overshoot.
      Desktop tokenised duration but never easing, so ~95 of its 120 transitions
-     were running Tailwind's default curve. */
+     were running Tailwind's default curve.
+
+     THE BUDGET: 180ms is the default, 300ms is the ceiling, one curve. `fast`
+     is for the colour-only changes that read as instant (hover tints); `slow`
+     is reserved for something entering or leaving the page, and nothing is
+     allowed past it. Anything that used to sit at 200ms is now 180ms, which is
+     the difference between "animated" and "responsive".
+
+     THE PRESS: one scale, everywhere, and it is 0.97 — a nudge, not a squash.
+     Never animate FROM scale(0): a control that grows out of nothing reads as
+     an entrance, so the eye waits for it to finish before believing the click
+     registered. */
   --clem-ease:       cubic-bezier(0.22, 1, 0.36, 1);
-  --clem-dur-fast:   150ms;
-  --clem-dur-base:   200ms;
-  --clem-dur-slow:   300ms;
+  --clem-dur-fast:   120ms;
+  --clem-dur-base:   180ms;
+  --clem-dur-slow:   300ms;  /* ceiling */
+  --clem-press:      0.97;
 }
 
 /* ── Dark ────────────────────────────────────────────────────────────────────
@@ -118,4 +142,13 @@
   --clem-info:         #5ba8e0;  --clem-info-tint:    #122838;
   --clem-warning:      #e0a030;  --clem-warning-tint: #2f2410;
   --clem-danger:       #f0685a;  --clem-danger-tint:  #331715;
+
+  /* THE LIVE AA FAILURE. `bg-danger text-white` measured 3.07:1 here — the
+     delete button, in the theme most people run, below the 4.5:1 floor — and
+     `hover:opacity-90` took it lower still at the moment of the click. Dark's
+     danger fill is a bright colour, so like the primary button its label is
+     warm ink, not white. Dark hovers BRIGHTER, matching the accent. */
+  --clem-danger-hover: #ff8a7a;
+  --clem-danger-press: #e5604f;
+  --clem-danger-fg:    #1f1b16;  /* 5.57:1 rest · 7.47:1 hover · 4.99:1 press */
 }
