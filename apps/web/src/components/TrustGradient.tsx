@@ -120,7 +120,7 @@ export function TrustGradient() {
           {COLS.map((c) => (
             <div
               key={c.key}
-              className="px-5 py-4 border-r border-black/5 last:border-r-0 font-mono text-[11px] uppercase tracking-wider text-[var(--ink-dim)]"
+              className="px-5 py-4 border-r border-black/5 last:border-r-0 text-[13px] font-semibold tracking-normal text-[var(--ink-dim)]"
             >
               {c.label}
             </div>

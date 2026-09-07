@@ -21,6 +21,9 @@ import {
   Wrench,
   FileText,
   Smartphone,
+  Check,
+  Pencil,
+  X,
 } from "lucide-react";
 import { Section } from "./ui/Section";
 import { fadeUp, stagger } from "@/lib/motion";
@@ -230,7 +233,7 @@ function FeatureRow({
 const TOOLS = [
   { name: "Gmail", c: "#ea4335" },
   { name: "Slack", c: "#611f69" },
-  { name: "Notion", c: "#1a1410" },
+  { name: "Notion", c: "#1f1b16" },
   { name: "Sheets", c: "#0f9d58" },
   { name: "Drive", c: "#1a73e8" },
   { name: "Calendar", c: "#3a87f0" },
@@ -278,7 +281,7 @@ function ToolOrbit() {
         <motion.div
           animate={reducedMotion ? undefined : { scale: [1, 1.06, 1] }}
           transition={{ duration: 3.5, repeat: Infinity, ease: "easeInOut" }}
-          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 size-16 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 shadow-[0_0_70px_rgba(249,115,22,0.6)] ring-2 ring-clem-200"
+          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 size-16 rounded-full bg-gradient-to-br from-clem-300 to-clem-600 shadow-[0_0_70px_rgba(242,100,25,0.6)] ring-2 ring-clem-200"
         >
           <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-transparent to-white/30" />
         </motion.div>
@@ -368,13 +371,13 @@ function VoiceWave() {
 // Fixed node layout — a small slice of the console's 3D memory constellation,
 // drawn as SVG so the marketing site never imports three.js.
 const C_NODES: Array<{ x: number; y: number; r: number; c: string; pulse?: boolean }> = [
-  { x: 95,  y: 70,  r: 7,   c: "#fb923c", pulse: true },
+  { x: 95,  y: 70,  r: 7,   c: "#ff8442", pulse: true },
   { x: 170, y: 45,  r: 4.5, c: "#38bdf8" },
   { x: 230, y: 95,  r: 5.5, c: "#a78bfa" },
   { x: 150, y: 120, r: 4,   c: "#fbbf24" },
   { x: 60,  y: 130, r: 5,   c: "#34d399" },
   { x: 280, y: 55,  r: 4,   c: "#f472b6" },
-  { x: 305, y: 130, r: 6,   c: "#fb923c" },
+  { x: 305, y: 130, r: 6,   c: "#ff8442" },
   { x: 215, y: 160, r: 4.5, c: "#38bdf8" },
   { x: 110, y: 175, r: 4,   c: "#a78bfa" },
   { x: 30,  y: 60,  r: 3.5, c: "#fbbf24" },
@@ -391,7 +394,7 @@ function ConstellationPreview() {
   const reducedMotion = useReducedMotion();
   return (
     <div className="absolute inset-0 flex items-center justify-center">
-      <div className="relative w-full max-w-sm overflow-hidden rounded-xl bg-[#0d0907] ring-1 ring-black/20 shadow-[0_20px_50px_-20px_rgba(0,0,0,0.5)]">
+      <div className="relative w-full max-w-sm overflow-hidden rounded-xl bg-[var(--panel)] ring-1 ring-black/20 shadow-[0_20px_50px_-20px_rgba(0,0,0,0.5)]">
         <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2 font-mono text-[9px] uppercase tracking-wider text-white/45">
           <Brain className="h-3 w-3 text-clem-300" />
           memory · 1,046 facts · 120k links
@@ -442,7 +445,7 @@ function ConstellationPreview() {
               cy={C_NODES[0].y}
               r={8}
               fill="none"
-              stroke="#fb923c"
+              stroke="#ff8442"
               strokeWidth={1}
               initial={{ r: 8, opacity: 0.8 }}
               animate={{ r: [8, 22], opacity: [0.8, 0] }}
@@ -595,7 +598,7 @@ function SelfHealPreview() {
           className="rounded-lg bg-white ring-1 ring-amber-400/40 px-3 py-2 text-[var(--ink)]"
         >
           <div className="flex items-center gap-2">
-            <span className="inline-grid size-3.5 place-items-center rounded-full bg-red-100 text-[9px] text-red-600 ring-1 ring-red-400/50">✗</span>
+            <span className="inline-grid size-3.5 place-items-center rounded-full bg-red-100 text-red-600 ring-1 ring-red-400/50"><X className="h-2.5 w-2.5" strokeWidth={3} /></span>
             step 2 · update sheet
             <span className="ml-auto text-[10px] text-red-500">429</span>
           </div>
@@ -663,7 +666,7 @@ function WorkflowsPreview() {
             className="rounded-lg bg-white ring-1 ring-black/10 p-3 shadow-[0_4px_14px_-6px_rgba(80,40,10,0.15)]"
           >
             <div className="flex items-center gap-2">
-              <Workflow className="h-3.5 w-3.5 text-clem-600" />
+              <Workflow className="h-3.5 w-3.5 text-clem-700" />
               <span className="text-[12px] font-semibold tracking-tight text-[var(--ink-strong)]">
                 {w.name}
               </span>
@@ -694,7 +697,7 @@ const SKILLS = [
 function SkillsPreview() {
   return (
     <div className="absolute inset-0 flex items-center justify-center p-2">
-      <div className="rounded-lg bg-[#0d0907] ring-1 ring-black/20 p-3 w-full max-w-sm font-mono text-[11px] shadow-[0_8px_24px_-8px_rgba(0,0,0,0.4)]">
+      <div className="rounded-lg bg-[var(--panel)] ring-1 ring-black/20 p-3 w-full max-w-sm font-mono text-[11px] shadow-[0_8px_24px_-8px_rgba(0,0,0,0.4)]">
         <div className="flex items-center gap-1.5 text-emerald-300/80 text-[10px] mb-2">
           <span className="text-clem-300">~/.clementine-next/skills/</span>
         </div>
@@ -776,7 +779,11 @@ function Arrow({ auto, done }: { auto?: boolean; done?: boolean }) {
     <div className="font-mono text-[10px] text-[var(--ink-dim)] flex items-center gap-1">
       <span className="size-px h-3 w-px bg-black/20" />
       {auto && <span className="text-emerald-700">auto</span>}
-      {done && <span className="text-clem-700">approved ✓</span>}
+      {done && (
+        <span className="inline-flex items-center gap-0.5 text-clem-700">
+          approved <Check className="h-3 w-3" strokeWidth={3} />
+        </span>
+      )}
       <span className="size-px h-3 w-px bg-black/20" />
     </div>
   );
@@ -845,7 +852,7 @@ function MeetingRecording() {
   const visibleActions = ACTIONS.slice(0, actionStep);
 
   return (
-    <div className="absolute inset-0 flex flex-col overflow-hidden rounded-xl bg-[#0d0907] ring-1 ring-black/20 shadow-[0_30px_60px_-20px_rgba(0,0,0,0.4)]">
+    <div className="absolute inset-0 flex flex-col overflow-hidden rounded-xl bg-[var(--panel)] ring-1 ring-black/20 shadow-[0_30px_60px_-20px_rgba(0,0,0,0.4)]">
       <div className="flex items-center gap-2.5 border-b border-white/5 px-4 py-2.5 text-[11px]">
         <span className="relative inline-flex h-2.5 w-2.5">
           <span className="absolute inset-0 rounded-full bg-red-500/60 animate-ping" />
@@ -943,8 +950,8 @@ function ActionIcon({ kind }: { kind: Action["kind"] }) {
   if (kind === "todo")
     return <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />;
   return (
-    <span className="mt-0.5 inline-grid place-items-center size-4 rounded text-[10px] text-clem-300 bg-clem-400/15 ring-1 ring-clem-400/30">
-      ✎
+    <span className="mt-0.5 inline-grid place-items-center size-4 rounded text-clem-300 bg-clem-400/15 ring-1 ring-clem-400/30">
+      <Pencil className="h-2.5 w-2.5" />
     </span>
   );
 }

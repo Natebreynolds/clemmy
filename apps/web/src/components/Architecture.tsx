@@ -35,7 +35,7 @@ export function Architecture() {
             whileInView={{ opacity: 1 }}
             viewport={{ once: true, margin: "-80px" }}
             transition={{ delay: 0.2 }}
-            className="fill-[#6b5d50] font-mono"
+            className="fill-[var(--ink-dim)] font-mono"
             fontSize={11}
           >
             Clementine.app · signed macOS bundle
@@ -114,7 +114,7 @@ function Node({
         x={wide ? x + 24 : x + w / 2}
         y={y + (sub ? h / 2 - 4 : h / 2 + 5)}
         textAnchor={wide ? "start" : "middle"}
-        className="fill-[#0f0a06] font-medium"
+        className="fill-[var(--ink-strong)] font-medium"
         fontSize={14}
       >
         {title}
@@ -124,7 +124,7 @@ function Node({
           x={wide ? x + 24 : x + w / 2}
           y={y + h / 2 + 14}
           textAnchor={wide ? "start" : "middle"}
-          className="fill-[#6b5d50] font-mono"
+          className="fill-[var(--ink-dim)] font-mono"
           fontSize={11}
         >
           {sub}
@@ -142,7 +142,7 @@ function Connector({ path, delay = 0 }: { path: string; delay?: number }) {
       whileInView={{ pathLength: 1, opacity: 0.5 }}
       viewport={{ once: true, margin: "-80px" }}
       transition={{ duration: 0.9, delay, ease: "easeInOut" }}
-      stroke="#ea580c"
+      stroke="#b94300"
       strokeWidth={1.5}
       fill="none"
       strokeDasharray="4 4"
@@ -157,7 +157,7 @@ function DataFlow({ path, delay = 0 }: { path: string; delay?: number }) {
     <g>
       <motion.circle
         r={4}
-        fill="#ea580c"
+        fill="#b94300"
         initial={{ "--offset": "0%", opacity: 0 } as never}
         whileInView={{
           "--offset": ["0%", "100%"],
@@ -189,7 +189,7 @@ function Tile({ eyebrow, body }: { eyebrow: string; body: React.ReactNode }) {
       transition={{ duration: 0.7, ease: [0.16, 1, 0.3, 1] }}
       className="rounded-xl card-surface p-5"
     >
-      <div className="font-mono text-xs uppercase tracking-wider text-clem-700 mb-2">
+      <div className="text-[13px] font-semibold tracking-normal text-clem-700 mb-2">
         {eyebrow}
       </div>
       <div className="text-[var(--ink)]">{body}</div>

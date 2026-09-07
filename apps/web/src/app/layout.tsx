@@ -31,7 +31,7 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#fbf6ef",
+  themeColor: "#faf7f2", // --bg, which is the console's --bg-canvas
   width: "device-width",
   initialScale: 1,
 };

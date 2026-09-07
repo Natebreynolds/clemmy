@@ -91,7 +91,7 @@ function FlywheelStep({
         <div className="absolute inset-0 rounded-full bg-white ring-1 ring-black/10 shadow-[0_8px_24px_-8px_rgba(80,40,10,0.20)]" />
         <div
           className={
-            "relative size-12 rounded-full grid place-items-center shadow-[0_4px_18px_-4px_rgba(249,115,22,0.6)] " +
+            "relative size-12 rounded-full grid place-items-center shadow-[0_4px_18px_-4px_rgba(242,100,25,0.6)] " +
             step.accent
           }
         >
@@ -105,11 +105,11 @@ function FlywheelStep({
           <div className={"size-10 rounded-full grid place-items-center " + step.accent}>
             <Icon className="h-4 w-4 text-white" />
           </div>
-          <div className="font-mono text-[11px] uppercase tracking-[0.18em] text-clem-700/80">
+          <div className="text-[13px] font-semibold tracking-normal text-clem-700">
             {step.eyebrow}
           </div>
         </div>
-        <div className="hidden md:block font-mono text-[11px] uppercase tracking-[0.18em] text-clem-700/80 mb-1.5">
+        <div className="hidden md:block text-[13px] font-semibold tracking-normal text-clem-700 mb-1.5">
           {step.eyebrow}
         </div>
         <h3 className="text-xl sm:text-2xl font-semibold tracking-tight text-[var(--ink-strong)]">

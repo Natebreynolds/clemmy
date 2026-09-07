@@ -127,7 +127,7 @@ export function DownloadCTA() {
 function SpecChip({ icon: Icon, label }: { icon: typeof Cpu; label: string }) {
   return (
     <div className="inline-flex items-center gap-2 text-sm text-[var(--ink-strong)]">
-      <Icon className="h-4 w-4 text-clem-600" />
+      <Icon className="h-4 w-4 text-clem-700" />
       <span className="font-mono text-[12px] tracking-tight">{label}</span>
     </div>
   );

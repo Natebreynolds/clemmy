@@ -73,10 +73,10 @@ export function Primitives() {
             className="group relative overflow-hidden card-surface p-7 transition-all"
           >
             <div className="absolute -top-24 -right-24 h-48 w-48 rounded-full bg-clem-500/[0.10] blur-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-            <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-clem-700/70 mb-3">
+            <div className="font-mono text-[11px] tracking-[0.18em] text-clem-700 mb-3">
               {String(i + 1).padStart(2, "0")}
             </div>
-            <Icon className="h-7 w-7 text-clem-600" />
+            <Icon className="h-7 w-7 text-clem-700" />
             <h3 className="mt-5 text-xl font-semibold tracking-tight text-[var(--ink-strong)]">{title}</h3>
             <ul className="mt-4 space-y-2">
               {bullets.map((b) => (

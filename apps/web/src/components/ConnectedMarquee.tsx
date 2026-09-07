@@ -16,7 +16,7 @@ export function ConnectedMarquee() {
       <div className="absolute inset-0 bg-gradient-to-b from-transparent via-clem-500/[0.04] to-transparent" />
       <div className="relative max-w-6xl mx-auto px-6">
         <div className="text-center mb-8">
-          <div className="font-mono text-xs uppercase tracking-[0.18em] text-clem-700 mb-3">
+          <div className="text-[13px] font-semibold tracking-normal text-clem-700 mb-3">
             Reaches everything you already pay for
           </div>
           <p className="text-[var(--ink-dim)]">

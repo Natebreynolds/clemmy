@@ -97,7 +97,7 @@ export function ConsoleTour() {
               </div>
             </button>
             <figcaption className="mt-3 px-1">
-              <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-clem-700">
+              <span className="text-[13px] font-semibold tracking-normal text-clem-700">
                 {shot.eyebrow}
               </span>
               <span className="ml-2 text-[13px] text-[var(--ink-dim)]">{shot.caption}</span>
@@ -149,7 +149,7 @@ function Lightbox({ shot, onClose }: { shot: Shot | null; onClose: () => void })
           aria-modal="true"
           aria-label={`${shot.eyebrow} screenshot, enlarged`}
           onClick={onClose}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-[#0d0907]/85 p-4 sm:p-10 backdrop-blur-sm"
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-[color-mix(in_srgb,var(--panel)_85%,transparent)] p-4 sm:p-10 backdrop-blur-sm"
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.96, y: 12 }}
