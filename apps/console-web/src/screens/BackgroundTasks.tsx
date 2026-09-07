@@ -351,8 +351,12 @@ export function BackgroundTasks() {
       {toast && (
         <div
           className={cn(
-            'fixed bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-md px-4 py-2.5 text-body shadow-lg animate-fade-in',
-            toast.tone === 'danger' ? 'bg-danger text-white' : 'bg-fg text-canvas',
+            'fixed bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-md px-4 py-2.5 text-body shadow-popover animate-fade-in',
+            // `text-white` on the danger fill measured 3.07:1 in dark; the
+            // token pair measures 5.44:1 light / 5.57:1 dark. Read as --clem-*
+            // because `text-danger-fg` resolves to --danger-fg, which
+            // styles.css:73 never declares (see LocalRecordingBanner).
+            toast.tone === 'danger' ? 'bg-danger text-[color:var(--clem-danger-fg)]' : 'bg-fg text-canvas',
           )}
           role="status"
         >
@@ -368,7 +372,7 @@ export function BackgroundTasks() {
 function DragPreview({ card }: { card: BoardCard }) {
   const tone = cardTone(card);
   return (
-    <div className="w-64 rotate-1 rounded-md border border-border bg-surface p-3 shadow-lg">
+    <div className="w-64 rotate-1 rounded-md border border-border bg-surface p-3 shadow-drag">
       <div className="flex items-center justify-between gap-2">
         <span className="rounded-sm bg-subtle px-1.5 py-0.5 text-caption font-semibold text-muted">{sourceLabel(card.sourceKind)}</span>
         <StatusPill tone={tone.tone}>{tone.label}</StatusPill>

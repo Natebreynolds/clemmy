@@ -113,9 +113,23 @@ export function Composer({
 
   return (
     <div
+      // Elevation is the hairline and the lighter surface, not a shadow. The
+      // focus ring lives HERE, on the wrapper: the textarea sets outline-none
+      // (an outline inside the box reads as a second border), so without this
+      // replacement ring a keyboard user could not see where they were.
+      //
+      // It keys off the TEXTAREA's :focus-visible, not the box's :focus-within,
+      // for two reasons. :focus-within matches :focus, so a mouse click painted
+      // a 2px outline that stayed for the whole typing session — the one site
+      // in the console breaking the :focus-visible-only policy that styles.css
+      // sets out and explains. And :focus-within also fires for the four
+      // buttons inside this box, which have their own base ring, so tabbing to
+      // Send drew two concentric outlines.
       className={cn(
-        'rounded-lg border bg-surface shadow-sm transition-colors',
-        dragOver ? 'border-primary ring-2 ring-primary/30' : 'border-border',
+        'rounded-lg border bg-surface transition-colors duration-fast',
+        'has-[textarea:focus-visible]:outline has-[textarea:focus-visible]:outline-2',
+        'has-[textarea:focus-visible]:-outline-offset-2 has-[textarea:focus-visible]:[outline-color:var(--clem-focus)]',
+        dragOver ? 'border-primary bg-primary-tint' : 'border-border',
       )}
       onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
       onDragLeave={() => setDragOver(false)}

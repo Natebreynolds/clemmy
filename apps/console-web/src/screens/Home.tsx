@@ -21,7 +21,7 @@ import { RunningPane } from '@/components/home/RunningPane';
 import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
-import { awayCounts, presenceLine, type HomeFeedItem } from '@/components/home/home-model';
+import { awayCounts, homeBlocks, homeRows, presenceLine, type HomeBlockId, type HomeFeedItem } from '@/components/home/home-model';
 
 /** How long the home waits for the daemon's 202 before giving up on opening
  *  the thread. The send itself keeps going server-side either way. */
@@ -37,6 +37,8 @@ const OPEN_THREAD_TIMEOUT_MS = 30_000;
  * The composer is the real chat composer: a send mints or continues the
  * conversation and the thread route takes over the moment the daemon
  * acknowledges it, so there is never a second chat surface to keep in sync.
+ * It sits BELOW the work (see homeBlocks): this is an operations console, so
+ * the first thing on it is what the employees are doing, not a text box.
  */
 export function Home() {
   const navigate = useNavigate();
@@ -175,25 +177,27 @@ export function Home() {
     }
   };
 
-  // Needs you + Running share one row when the user keeps them together.
-  const order = visiblePanes(prefs);
-  const panes: ReactNode[] = [];
-  for (let i = 0; i < order.length; i += 1) {
-    const id = order[i];
-    const next = order[i + 1];
-    const paired = (id === 'needs_you' && next === 'running') || (id === 'running' && next === 'needs_you');
-    if (paired && next) {
-      panes.push(
-        <div key={`${id}+${next}`} className="grid gap-5 lg:grid-cols-2">
-          {renderPane(id)}
-          {renderPane(next)}
-        </div>,
-      );
-      i += 1;
-      continue;
-    }
-    panes.push(<Fragment key={id}>{renderPane(id)}</Fragment>);
-  }
+  // The composer is a peer of the panes, not the page's opening statement.
+  const renderBlock = (id: HomeBlockId): ReactNode => {
+    if (id !== 'composer') return renderPane(id);
+    return (
+      <section key={id} aria-labelledby="home-ask" className="flex flex-col gap-2.5">
+        <SectionHeader id="home-ask" label="Ask Clementine" />
+        <Composer
+          inputRef={composerRef}
+          busy={chat.busy}
+          onSend={sendAndOpen}
+          onStop={chat.stop}
+        />
+        {opening && !notice && (
+          <p role="status" className="text-small text-faint">Opening your conversation…</p>
+        )}
+        {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
+      </section>
+    );
+  };
+
+  const rows = homeRows(homeBlocks(visiblePanes(prefs)));
 
   const greeting = timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile));
   const presence = ccLoading && workingNow.isLoading
@@ -207,26 +211,24 @@ export function Home() {
 
   return (
     <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-5 px-5 py-5 animate-fade-in sm:px-10 sm:py-6">
-      <section className="flex flex-col gap-3.5" aria-label="Ask Clementine">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <h1 className="text-h1 text-fg">{greeting}</h1>
-          {presence === null
-            ? <Skeleton className="h-4 w-64 self-center" />
-            : <p className="text-body text-muted" aria-live="polite">{presence}</p>}
-        </div>
-        <Composer
-          inputRef={composerRef}
-          busy={chat.busy}
-          onSend={sendAndOpen}
-          onStop={chat.stop}
-        />
-        {opening && !notice && (
-          <p role="status" className="text-small text-faint">Opening your conversation…</p>
-        )}
-        {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
-      </section>
+      {/* The greeting stays — it is Clementine's, and losing it would cost the
+          screen its warmth — but it is a byline now. The headline is the state
+          of the work, which is the sentence the owner actually opens this
+          window to read. */}
+      <header className="flex flex-col gap-0.5">
+        <p className="text-small text-muted">{greeting}</p>
+        {presence === null
+          ? <Skeleton className="mt-1 h-7 w-72" />
+          : <h1 className="text-h1 text-fg" aria-live="polite">{presence}</h1>}
+      </header>
 
-      {panes}
+      {rows.map((row) => (row.length === 1
+        ? <Fragment key={row[0]}>{renderBlock(row[0])}</Fragment>
+        : (
+          <div key={row.join('+')} className="grid gap-5 lg:grid-cols-2">
+            {row.map((id) => renderBlock(id))}
+          </div>
+        )))}
     </div>
   );
 }

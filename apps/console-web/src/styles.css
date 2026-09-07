@@ -36,15 +36,29 @@
   --primary-ink: var(--clem-primary-ink);
   --primary-ink-hover: var(--clem-primary-ink-hover);
 
-  /* Surfaces (warm paper) — this surface's own ramp. */
+  /* Surfaces (warm paper) — this surface's own ramp.
+     ELEVATION IS THIS RAMP PLUS A HAIRLINE, not a shadow stack. A card one
+     step up is one step lighter and carries a 1px line; a card two steps up is
+     two steps lighter. That is the whole system. A drop shadow is reserved for
+     the three things that genuinely detach from the page — a popover, a modal,
+     a card under the cursor mid-drag — because a lift that every card has is a
+     lift that distinguishes nothing. */
   --bg-canvas: #faf7f2;
   --bg-surface: #ffffff;
   --bg-subtle: #f4f0e9;
   --bg-hover: #efeae1;
+  /* Raised: the surface a card takes when it must sit above --bg-surface
+     without floating. In light, white is already the top of the ramp, so a
+     raised card separates on its LINE rather than its fill. */
+  --bg-raised: #ffffff;
 
   /* Lines */
   --border: #e7e1d6;
   --border-strong: #d6cfc0;
+  /* The hairline that replaces `shadow-xs`/`shadow-sm` on cards. Darker than
+     --border so a card edge still reads on white, where the surface step has
+     nowhere left to go. */
+  --border-raised: #ded7c9;
   --ring: var(--clem-primary-ink);
 
   /* Text */
@@ -57,6 +71,18 @@
   --info: var(--clem-info);       --info-tint: var(--clem-info-tint);
   --warning: var(--clem-warning); --warning-tint: var(--clem-warning-tint);
   --danger: var(--clem-danger);   --danger-tint: var(--clem-danger-tint);
+  /* The three the danger button actually reads. Without these bridges
+     `bg-danger text-danger-fg hover:bg-danger-hover` resolves to UNDEFINED
+     var()s — invalid-at-computed-value-time — so the label fell back to
+     `inherit` and the hover fill to TRANSPARENT on all six destructive
+     controls (Connect, Meetings ×2, CustomizePanel, RunningTasksDrawer,
+     AgentTraceDrawer). The AA fix that replaced `text-white hover:opacity-90`
+     was therefore not shipping at all: a contrast fix that renders nothing is
+     worse than the 3.07:1 it replaced, because the suite goes green over it.
+     The shared layer already defines all three, in both themes. */
+  --danger-fg: var(--clem-danger-fg);
+  --danger-hover: var(--clem-danger-hover);
+  --danger-press: var(--clem-danger-press);
 }
 
 .dark {
@@ -66,9 +92,13 @@
   --bg-surface: #1f1c16;
   --bg-subtle: #2a271f;
   --bg-hover: #332f26;
+  /* Dark has room the light ramp does not: a raised card genuinely gets
+     LIGHTER (+~5% L), which is the whole reason dark UIs need fewer shadows. */
+  --bg-raised: #262219;
 
   --border: #3a352b;
   --border-strong: #4e4839;
+  --border-raised: #453f33;
 }
 
 @layer base {
@@ -78,13 +108,20 @@
   html, body, #root {
     height: 100%;
   }
+  /* 16px / 1.6, not 14px / 1.375.
+     A measurement, not a preference: ~77% of the console's typed text sat at
+     12-13px, because the document default was 14 and every "quiet" thing was
+     written one step below it. Raising the FLOOR is what fixes that — the
+     dense tabular rows that legitimately want 12-13px still ask for it
+     explicitly (text-small, text-caption), and now they do so against a base
+     that reads, instead of inheriting a size that was already too small. */
   body {
     margin: 0;
     background: var(--bg-canvas);
     color: var(--text);
     font-family: theme('fontFamily.sans');
-    font-size: 0.875rem;
-    line-height: 1.375rem;
+    font-size: 1rem;
+    line-height: 1.6;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
@@ -110,6 +147,27 @@
 
   /* macOS hiddenInset: push the brand below the window traffic lights. */
   .is-mac .sidebar-brand { padding-top: 30px; }
+
+  /* ── Reading measure ──────────────────────────────────────────────────────
+     Prose has a maximum line length; a dashboard's habit of letting a
+     paragraph run the full width of a 1600px window is what makes long copy
+     unreadable even at a correct size. 68ch sits mid-range of the 65-72ch
+     band. Apply to explanatory copy, empty states, error text — anything the
+     user READS. Never to a table. */
+  .reading {
+    max-width: 68ch;
+    font-size: 1rem;
+    line-height: 1.6;
+  }
+
+  /* ── Elevation ────────────────────────────────────────────────────────────
+     A card that is above the page, expressed as the contract describes it: a
+     1px low-alpha line plus one step of surface lightness. No shadow. Pair
+     with `rounded-lg`. */
+  .raised {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-raised);
+  }
 
   /* Skeleton shimmer (disabled under reduced-motion below). */
   .skeleton {
@@ -139,12 +197,20 @@
   50% { opacity: 1; }
 }
 
-/* Respect the user's reduced-motion preference globally. */
+/* Reduced motion resolves to a FADE, not to nothing.
+   The previous rule crushed every duration to 0.001ms, which also deleted the
+   opacity cross-fades that tell you a panel was replaced rather than merely
+   redrawn — so the setting cost information, not just movement. What actually
+   bothers a motion-sensitive user is TRAVEL: transform, scale, position. Kill
+   those; keep a short opacity transition so state changes still read. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+    animation-delay: 0.001ms !important;
+    transition-property: opacity, background-color, border-color, color, fill, stroke !important;
+    transition-duration: var(--clem-dur-fast) !important;
+    scroll-behavior: auto !important;
   }
   .skeleton::after { animation: none; }
 }

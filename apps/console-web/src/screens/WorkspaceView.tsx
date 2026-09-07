@@ -12,6 +12,7 @@ import { Composer } from '@/components/chat/Composer';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
 import { usePoll } from '@/lib/poll';
+import { sentence } from '@/lib/sentence-case';
 import {
   isCurrentWorkspaceDiffScope,
   type WorkspaceDiffScope,
@@ -351,7 +352,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
 
         {/* Details drawer */}
         {detailsOpen && (
-          <aside className="absolute right-0 top-0 flex h-full w-full max-w-[440px] flex-col border-l border-border bg-surface shadow-lg">
+          <aside className="absolute right-0 top-0 flex h-full w-full max-w-[440px] flex-col border-l border-border bg-surface shadow-modal">
             <div className="flex items-center gap-2 border-b border-border px-3 py-2">
               {(['health', 'dataHistory', 'code', 'history', 'audit'] as DetailTab[]).map((t) => (
                 <button
@@ -492,7 +493,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
 
         {/* Floating "Ask Clem" dock */}
         {dockOpen ? (
-          <div className="absolute bottom-4 right-4 flex h-[480px] w-[360px] max-w-[calc(100%-2rem)] flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-lg">
+          <div className="absolute bottom-4 right-4 flex h-[480px] w-[360px] max-w-[calc(100%-2rem)] flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-popover">
             <div className="flex items-center gap-2 border-b border-border px-3 py-2">
               <DogMark className="h-6 w-6" />
               <div className="min-w-0 flex-1">
@@ -528,7 +529,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
           <button
             type="button"
             onClick={() => setDockOpen(true)}
-            className="absolute bottom-4 right-4 inline-flex items-center gap-2 rounded-full bg-primary px-4 py-3 text-primary-fg shadow-lg transition-transform hover:scale-105 cursor-pointer"
+            className="absolute bottom-4 right-4 inline-flex items-center gap-2 rounded-full bg-primary px-4 py-3 text-primary-fg shadow-popover transition-transform duration-base active:scale-press motion-reduce:transition-none cursor-pointer"
           >
             <MessageCircle className="h-5 w-5" aria-hidden /> Ask Clem
           </button>
@@ -543,13 +544,13 @@ function observationState(observation: SpaceObservationSummary): {
   className: string;
 } {
   if (observation.status === 'error') {
-    return { label: 'failed', className: 'bg-danger/10 text-danger' };
+    return { label: 'Failed', className: 'bg-danger/10 text-danger' };
   }
   if (observation.status === 'awaiting_approval') {
-    return { label: 'awaiting approval', className: 'bg-warning/10 text-warning' };
+    return { label: 'Awaiting approval', className: 'bg-warning/10 text-warning' };
   }
   if (!observation.previousObservationId) {
-    return { label: 'baseline', className: 'bg-subtle text-muted' };
+    return { label: 'Baseline', className: 'bg-subtle text-muted' };
   }
   if (observation.changed === true) {
     return { label: 'changed', className: 'bg-primary-tint text-primary' };
@@ -636,11 +637,11 @@ function DataHistoryPanel({
                   {diff.diff.changes.map((change, index) => (
                     <li key={`${change.op}-${change.path}-${index}`} className="rounded border border-border bg-surface px-2 py-1.5">
                       <div className="flex items-center gap-2 text-caption">
-                        <span className="font-semibold uppercase text-primary">{change.op}</span>
+                        <span className="font-semibold text-primary">{sentence(change.op)}</span>
                         <code className="min-w-0 break-all text-fg">{change.path || '/'}</code>
                       </div>
                       {(change.before !== undefined || change.after !== undefined) && (
-                        <div className="mt-1 grid grid-cols-2 gap-1 font-mono text-[11px] text-muted">
+                        <div className="mt-1 grid grid-cols-2 gap-1 font-mono text-caption text-muted">
                           <span className="break-all rounded bg-subtle px-1.5 py-1">{change.before ?? '—'}</span>
                           <span className="break-all rounded bg-subtle px-1.5 py-1">{change.after ?? '—'}</span>
                         </div>
@@ -665,9 +666,9 @@ function DataHistoryPanel({
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="truncate font-mono text-small text-fg">{observation.sourceKey}</span>
                     {observation.isCurrent && (
-                      <span className="rounded-full bg-success/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-success">current</span>
+                      <span className="rounded-full bg-success/10 px-1.5 py-0.5 text-caption font-semibold text-success">Current</span>
                     )}
-                    <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase ${state.className}`}>
+                    <span className={`rounded-full px-1.5 py-0.5 text-caption font-semibold ${state.className}`}>
                       {state.label}
                     </span>
                   </div>

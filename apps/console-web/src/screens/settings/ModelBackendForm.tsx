@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Cpu, Layers, Zap, AlertTriangle } from 'lucide-react';
+import { Check, Cpu, Layers, Zap, AlertTriangle, Brain, Wrench } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Select } from '@/components/ui/Field';
@@ -145,8 +145,8 @@ export function ModelBackendForm({ embedded = false }: { embedded?: boolean } = 
         <p className="text-small text-muted"><span className="text-fg">How this works:</span> {activeMode.blurb}</p>
         {form.mode !== 'off' && (
           <ul className="mt-2 space-y-0.5 text-caption text-muted">
-            <li>🧠 Brain &amp; Judge → {form.mode === 'all_in' ? (form.judgeId.trim() || form.modelId.trim() || 'your model') : 'Codex (GPT-5.x)'}</li>
-            <li>🛠 Workers / grunt work → {form.workerModel.trim() || form.modelId.trim() || 'your model'}</li>
+            <li className="flex items-center gap-1.5"><Brain className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden /> Brain &amp; judge: {form.mode === 'all_in' ? (form.judgeId.trim() || form.modelId.trim() || 'your model') : 'Codex (GPT-5.x)'}</li>
+            <li className="flex items-center gap-1.5"><Wrench className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden /> Workers / grunt work: {form.workerModel.trim() || form.modelId.trim() || 'your model'}</li>
           </ul>
         )}
       </div>

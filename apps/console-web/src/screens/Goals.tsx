@@ -92,7 +92,7 @@ function percent(done: number, total: number): number {
 function StatCard({ label, value, tone }: { label: string; value: number; tone: Tone }) {
   return (
     <Card className="min-w-0 p-4">
-      <div className="text-caption font-semibold uppercase tracking-wide text-faint">{label}</div>
+      <div className="text-caption font-semibold text-faint">{label}</div>
       <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
         <div className="text-title font-semibold text-fg">{value}</div>
         <StatusPill tone={tone} className="shrink-0">{label}</StatusPill>
@@ -181,21 +181,21 @@ function GoalCard({
 
       <div className="mt-4 grid min-w-0 gap-4 lg:grid-cols-3">
         <div className="min-w-0">
-          <div className="text-caption font-semibold uppercase tracking-wide text-faint">Criteria</div>
+          <div className="text-caption font-semibold text-faint">Criteria</div>
           <ul className="mt-2 space-y-1 break-words text-small text-muted">
             {goal.successCriteria.slice(0, 4).map((item) => <li key={item}>- {item}</li>)}
             {goal.successCriteria.length === 0 && <li>No criteria pinned</li>}
           </ul>
         </div>
         <div className="min-w-0">
-          <div className="text-caption font-semibold uppercase tracking-wide text-faint">Progress</div>
+          <div className="text-caption font-semibold text-faint">Progress</div>
           <ul className="mt-2 space-y-1 break-words text-small text-muted">
             {latestLedger.map((item) => <li key={item}>- {item}</li>)}
             {latestLedger.length === 0 && <li>No ledger entries yet</li>}
           </ul>
         </div>
         <div className="min-w-0">
-          <div className="text-caption font-semibold uppercase tracking-wide text-faint">Evidence</div>
+          <div className="text-caption font-semibold text-faint">Evidence</div>
           <ul className="mt-2 space-y-1 break-words text-small text-muted">
             {latestEvidence.map((item) => (
               <li key={`${item.at}-${item.criterion}`} className={item.pass ? 'text-success' : 'text-warning'}>

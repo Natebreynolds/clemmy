@@ -48,12 +48,25 @@ export interface HomePreferences {
   phoneSwitcher: string[];
 }
 
+/**
+ * The shipped order, and the ONLY place "work leads" is expressed.
+ *
+ * The renderer used to enforce it instead, by sinking `quick_actions` below
+ * every pane at draw time — which meant the Customize sheet showed the chips
+ * in position 1 while the home drew them last, and dragging them to the top
+ * did nothing. The rule belongs here, in data the sheet displays and the user
+ * can reorder, so that what the sheet says is what the home renders.
+ *
+ * NOTE for whoever owns src/runtime/home-preferences.ts:52 — the daemon ships
+ * its own copy of this array, still chips-first, and it is the one a fresh
+ * install actually receives. The two should match.
+ */
 export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
-  'quick_actions',
   'needs_you',
   'running',
   'while_away',
   'projects',
+  'quick_actions',
 ];
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
@@ -70,6 +83,38 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
 
 export const HOME_PREFS_KEY = ['settings', 'home'] as const;
 
+/** The order the daemon still ships (src/runtime/home-preferences.ts:52), and
+ *  the one a fresh install receives over the wire. */
+const LEGACY_DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
+  'quick_actions',
+  'needs_you',
+  'running',
+  'while_away',
+  'projects',
+];
+
+/**
+ * Re-express the shipped chips-first default as chips-last, ONCE, at the
+ * boundary — so the Customize sheet and the home read the same record.
+ *
+ * This fires only on a record whose order is byte-for-byte the legacy default,
+ * and that shape cannot be a user's choice: every order the Customize sheet
+ * writes has been through normalizePreferences(), which appends the full pane
+ * id set, so a saved order always carries all six ids and never equals this
+ * five-id array. And for any record where it DOES fire, the previous build
+ * already drew the chips last (homeBlocks sank them), so nothing the user sees
+ * moves — what changes is that the sheet now agrees with the screen, and a
+ * user who drags "Quick actions" back to slot 1 keeps it there.
+ */
+export function migrateHomePreferences(prefs: HomePreferences): HomePreferences {
+  const order = prefs.panes.order;
+  const isShippedDefault =
+    order.length === LEGACY_DEFAULT_HOME_PANE_ORDER.length
+    && order.every((id, i) => id === LEGACY_DEFAULT_HOME_PANE_ORDER[i]);
+  if (!isShippedDefault) return prefs;
+  return { ...prefs, panes: { ...prefs.panes, order: [...DEFAULT_HOME_PANE_ORDER] } };
+}
+
 /**
  * Always yields a usable record: the placeholder while loading, the defaults
  * if the daemon predates the route (404) or is unreachable, the saved record
@@ -78,7 +123,8 @@ export const HOME_PREFS_KEY = ['settings', 'home'] as const;
 export function useHomePreferences() {
   const query = useQuery({
     queryKey: HOME_PREFS_KEY,
-    queryFn: () => apiGet<{ home: HomePreferences }>('/api/console/settings/home').then((r) => r.home),
+    queryFn: () =>
+      apiGet<{ home: HomePreferences }>('/api/console/settings/home').then((r) => migrateHomePreferences(r.home)),
     staleTime: 30_000,
     retry: 1,
     placeholderData: DEFAULT_HOME_PREFERENCES,
@@ -91,7 +137,11 @@ export function useSaveHomePreferences() {
   return useMutation({
     mutationFn: (patch: Partial<HomePreferences>) =>
       apiPatch<{ home: HomePreferences }>('/api/console/settings/home', patch).then((r) => r.home),
-    onSuccess: (home) => qc.setQueryData(HOME_PREFS_KEY, home),
+    // Same migration on the way back: a PATCH that touches only `landing`
+    // returns a record whose order is still the legacy default, and putting
+    // that into the cache raw would make the chips jump to the top the moment
+    // the user saved an unrelated setting.
+    onSuccess: (home) => qc.setQueryData(HOME_PREFS_KEY, migrateHomePreferences(home)),
   });
 }
 

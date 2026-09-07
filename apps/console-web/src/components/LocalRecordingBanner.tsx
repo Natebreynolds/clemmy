@@ -78,7 +78,19 @@ export function LocalRecordingBanner() {
         type="button"
         onClick={() => { void stop(); }}
         disabled={stopping || state.phase === 'stopping'}
-        className="flex shrink-0 items-center gap-1 rounded-md bg-danger px-2 py-1 text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+        /* Was `text-white transition-opacity hover:opacity-90`: 3.07:1 in dark
+         * on the control that ENDS a live recording, getting worse under the
+         * finger. Now the same three-state contract the danger Button states —
+         * 5.44:1 / 6.90:1 / 8.63:1 light, 5.57 / 7.47 / 4.99 dark, recomputed
+         * from the shipped hex in design-tokens.contrast.test.ts.
+         *
+         * It reads --clem-* directly rather than `text-danger-fg` etc. because
+         * those class names are currently INERT: tailwind.config.ts maps them
+         * to --danger-fg/-hover/-press and styles.css:73 defines only --danger
+         * and --danger-tint, so the label falls back to `inherit` and the hover
+         * background to `transparent`. Collapse these back to the semantic
+         * classes the moment styles.css declares the three aliases. */
+        className="flex shrink-0 items-center gap-1 rounded-md bg-danger px-2 py-1 text-[color:var(--clem-danger-fg)] transition-colors duration-fast hover:bg-[var(--clem-danger-hover)] active:bg-[var(--clem-danger-press)] disabled:opacity-50"
       >
         <Square className="h-3 w-3" aria-hidden /> {stopping || state.phase === 'stopping' ? 'Stopping…' : 'Stop & transcribe'}
       </button>

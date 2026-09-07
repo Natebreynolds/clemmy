@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X } from 'lucide-react';
+import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X, Star, CircleHelp, Flag, type LucideIcon } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -11,6 +11,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
+import { sentence } from '@/lib/sentence-case';
 import { statusTone, relativeTime } from '@/lib/inbox';
 import { clemmy, isDesktop } from '@/lib/clemmy';
 import {
@@ -582,7 +583,7 @@ export function Meetings() {
               : rows.map((m) => <MeetingRow key={m.id} m={m} selected={selected === m.id} onSelect={() => setSelected(m.id)} />)}
         </div>
 
-        <div className="rounded-lg border border-border bg-surface p-5 shadow-sm">
+        <div className="rounded-lg border border-border-raised bg-raised p-5">
           {!selected ? (
             <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
               <Video className="h-6 w-6 text-faint" aria-hidden />
@@ -611,13 +612,13 @@ export function Meetings() {
   );
 }
 
-const NOTE_MARKERS: { kind: MeetingNoteKind; glyph: string; label: string }[] = [
-  { kind: 'action', glyph: '★', label: 'Action' },
-  { kind: 'question', glyph: '❓', label: 'Question' },
-  { kind: 'followup', glyph: '⚑', label: 'Follow-up' },
+const NOTE_MARKERS: { kind: MeetingNoteKind; Icon: LucideIcon; label: string }[] = [
+  { kind: 'action', Icon: Star, label: 'Action' },
+  { kind: 'question', Icon: CircleHelp, label: 'Question' },
+  { kind: 'followup', Icon: Flag, label: 'Follow-up' },
 ];
-const markerGlyph = (kind?: MeetingNoteKind): string =>
-  NOTE_MARKERS.find((m) => m.kind === kind)?.glyph ?? '';
+const markerIcon = (kind?: MeetingNoteKind): LucideIcon | undefined =>
+  NOTE_MARKERS.find((m) => m.kind === kind)?.Icon;
 
 function noteClock(atSeconds?: number): string {
   if (typeof atSeconds !== 'number' || !Number.isFinite(atSeconds) || atSeconds < 0) return '--:--';
@@ -691,7 +692,7 @@ function ScratchpadPanel({ windowId, startedAtMs, readOnly, compact }: {
           {sorted.map((n) => (
             <li key={n.id} className="group flex items-start gap-2 text-small text-fg">
               <span className="mt-0.5 shrink-0 font-mono text-caption tabular-nums text-faint">{noteClock(n.atSeconds)}</span>
-              {n.kind && <span className="shrink-0" aria-label={n.kind}>{markerGlyph(n.kind)}</span>}
+              {n.kind && (() => { const Icon = markerIcon(n.kind); return Icon ? <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" aria-label={n.kind} /> : null; })()}
               <span className="flex-1 whitespace-pre-wrap break-words">{n.text}</span>
               {!readOnly && (
                 <button
@@ -721,7 +722,7 @@ function ScratchpadPanel({ windowId, startedAtMs, readOnly, compact }: {
                   kind === m.kind ? 'bg-primary/15 text-primary ring-1 ring-primary/40' : 'text-muted hover:bg-surface-3',
                 )}
               >
-                {m.glyph} {m.label}
+                <m.Icon className="mr-1 inline h-3.5 w-3.5 align-[-2px]" aria-hidden />{m.label}
               </button>
             ))}
           </div>
@@ -733,7 +734,7 @@ function ScratchpadPanel({ windowId, startedAtMs, readOnly, compact }: {
               rows={2}
               maxLength={2000}
               placeholder="Type a note… (⌘/Ctrl+Enter to add)"
-              className="min-h-[2.5rem] flex-1 resize-y rounded-md border border-line bg-surface px-3 py-2 text-small text-fg placeholder:text-faint focus:border-primary focus:outline-none"
+              className="min-h-[2.5rem] flex-1 resize-y rounded-md border border-line bg-surface px-3 py-2 text-small text-fg placeholder:text-faint focus:border-primary outline-none focus-visible:ring-2 focus-visible:ring-primary"
             />
             <Button onClick={() => void submit()} disabled={!draft.trim() || busy}>Add</Button>
           </div>
@@ -826,7 +827,7 @@ function MeetingDetailView({
   return (
     <div>
       <div className="mb-2 flex items-center gap-2 text-caption text-faint">
-        <span className="uppercase tracking-wide">{asText(r.platform)}</span>
+        <span>{sentence(asText(r.platform))}</span>
         {r.startedAt ? <span>· {relativeTime(asText(r.startedAt))}</span> : null}
       </div>
       <h3 className="mb-3 text-h2 text-fg">{asText(a.title) || 'Meeting'}</h3>

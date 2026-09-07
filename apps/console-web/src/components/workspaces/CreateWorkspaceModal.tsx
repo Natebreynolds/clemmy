@@ -92,7 +92,7 @@ export function CreateWorkspaceModal({
       aria-label="New workspace"
     >
       <div
-        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-lg"
+        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-modal"
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="border-b border-border px-5 py-4">
@@ -110,7 +110,7 @@ export function CreateWorkspaceModal({
               onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); }}
               rows={4}
               placeholder="e.g. A live dashboard of my pipeline by stage, with a follow-up email button on each stalled deal."
-              className="w-full resize-y rounded-lg border border-border bg-canvas px-3 py-2 text-body text-fg outline-none placeholder:text-faint focus:border-border-strong"
+              className="w-full resize-y rounded-lg border border-border bg-canvas px-3 py-2 text-body text-fg outline-none placeholder:text-faint focus:border-border-strong focus-visible:ring-2 focus-visible:ring-primary"
             />
           </label>
 
@@ -169,7 +169,7 @@ export function CreateWorkspaceModal({
                 setTitleWasManuallyEdited(true);
               }}
               placeholder="Derived from your description if left blank"
-              className="w-full rounded-lg border border-border bg-canvas px-3 py-2 text-body text-fg outline-none placeholder:text-faint focus:border-border-strong"
+              className="w-full rounded-lg border border-border bg-canvas px-3 py-2 text-body text-fg outline-none placeholder:text-faint focus:border-border-strong focus-visible:ring-2 focus-visible:ring-primary"
             />
           </label>
 

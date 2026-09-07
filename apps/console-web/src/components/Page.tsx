@@ -23,7 +23,7 @@ export function Page({
         <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
             {title && <h2 className="text-h1 text-fg">{title}</h2>}
-            {subtitle && <p className="mt-1 text-body-lg text-muted">{subtitle}</p>}
+            {subtitle && <p className="reading mt-1.5 text-body-lg text-muted">{subtitle}</p>}
           </div>
           {actions && <div className="flex flex-wrap items-center gap-2 sm:shrink-0">{actions}</div>}
         </div>

@@ -75,7 +75,7 @@ export function AgentTraceDrawer({
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`Agent: ${agent.name}`}>
       <div className="absolute inset-0 bg-black/30 animate-fade-in" onClick={onClose} />
-      <div className="relative flex h-full w-full max-w-xl flex-col border-l border-border bg-surface shadow-lg animate-fade-in">
+      <div className="relative flex h-full w-full max-w-xl flex-col border-l border-border bg-surface shadow-modal animate-fade-in">
         <header className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
@@ -101,7 +101,7 @@ export function AgentTraceDrawer({
         <div className="min-h-0 flex-1 overflow-y-auto">
           {/* Run list */}
           <div className="border-b border-border px-5 py-3">
-            <div className="mb-2 flex items-center gap-2 text-caption font-semibold uppercase tracking-wide text-faint">
+            <div className="mb-2 flex items-center gap-2 text-caption font-semibold text-faint">
               <Cpu className="h-3.5 w-3.5" aria-hidden /> Recent cycles
             </div>
             {error && <p className="text-body text-danger">Couldn't load runs: {error}</p>}
@@ -133,7 +133,7 @@ export function AgentTraceDrawer({
           {/* Selected run timeline */}
           {selected && (
             <div className="px-5 py-4">
-              <div className="mb-2 text-caption font-semibold uppercase tracking-wide text-faint">Timeline</div>
+              <div className="mb-2 text-caption font-semibold text-faint">Timeline</div>
               {selected.events.length === 0 ? (
                 <p className="text-body text-faint">No events recorded for this cycle.</p>
               ) : (

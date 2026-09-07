@@ -218,7 +218,9 @@ export function Chat() {
   return (
     <div className="flex h-full flex-col">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-3xl space-y-5 px-8 py-6">
+        {/* space-y-8: with the boxes gone, the air between turns IS the
+            separator. 20px was tuned for lozenges that drew their own edges. */}
+        <div className="mx-auto w-full max-w-3xl space-y-8 px-8 py-6">
           {needsYou.length > 0 && (
             <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
           )}

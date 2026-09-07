@@ -57,10 +57,15 @@ export function ProjectsPane({
                   <Link
                     key={space.id}
                     to={`/workspaces/${encodeURIComponent(space.id)}`}
+                    // The current project is marked by an accent hairline and a
+                    // warmer surface — not by a halo the other tiles have to be
+                    // measured against.
                     className={cn(
                       TILE,
-                      'bg-surface hover:-translate-y-0.5 hover:shadow-md',
-                      active ? 'border-primary shadow-warm-halo' : 'border-border hover:border-border-strong',
+                      'transition-colors duration-fast',
+                      active
+                        ? 'border-primary bg-primary-tint'
+                        : 'border-border bg-surface hover:border-border-strong hover:bg-hover',
                     )}
                   >
                     <span className="flex items-center gap-2">

@@ -66,7 +66,7 @@ function chipsOf(contents: PluginPreview['contents']): Array<{ kind: ShelfKind; 
 /** The cartridge shell — grip ridges, a label plate, clementine-brand accent. */
 function Cartridge({ title, subtitle, glow }: { title: string; subtitle?: string; glow?: boolean }) {
   return (
-    <div className={`w-64 rounded-lg border border-border-strong bg-surface p-3 shadow-lg ${glow ? 'shadow-warm-halo' : ''}`}>
+    <div className={`w-64 rounded-lg border border-border-strong bg-surface p-3 shadow-popover ${glow ? 'shadow-warm-halo' : ''}`}>
       <div className="mb-2 flex justify-center gap-1.5" aria-hidden>
         {Array.from({ length: 6 }, (_, i) => <div key={i} className="h-1.5 w-6 rounded-full bg-subtle" />)}
       </div>
@@ -227,7 +227,7 @@ export function CartridgeInsert({ source, onClose }: { source: CartridgeSource; 
           {stage === 'consent' && preview && (
             <motion.div
               key="consent"
-              className="rounded-lg border border-border bg-surface p-5 shadow-lg"
+              className="rounded-lg border border-border bg-surface p-5 shadow-modal"
               initial={reduced ? { opacity: 0 } : { opacity: 0, y: 32 }}
               animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
             >
@@ -319,7 +319,7 @@ export function CartridgeInsert({ source, onClose }: { source: CartridgeSource; 
           {stage === 'error' && (
             <motion.div
               key="error"
-              className="rounded-lg border border-danger/40 bg-surface p-6 text-center shadow-lg"
+              className="rounded-lg border border-danger/40 bg-surface p-6 text-center shadow-modal"
               initial={{ opacity: 0 }}
               animate={reduced ? { opacity: 1 } : { opacity: 1, x: [0, -8, 8, -4, 4, 0] }}
               transition={{ duration: 0.4 }}

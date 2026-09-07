@@ -13,16 +13,16 @@
  * a genuine fan-out (multiple agents on a step, or a distinct task) stays open.
  */
 import { useState } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Check, X, Hourglass, type LucideIcon } from 'lucide-react';
 import { usePoll } from '@/lib/poll';
 import { listRunAgents, getRunAgentOutput, type RunAgent } from '@/lib/board';
 import { cn } from '@/lib/cn';
 import { providerLabel } from '@clem/chat-engine';
 
-const STATUS: Record<RunAgent['status'], { glyph: string; className: string; title: string }> = {
-  ok: { glyph: '✓', className: 'text-success', title: 'completed' },
-  error: { glyph: '✕', className: 'text-danger', title: 'failed' },
-  capped: { glyph: '⏳', className: 'text-warning', title: 'hit its turn cap' },
+const STATUS: Record<RunAgent['status'], { Icon: LucideIcon; className: string; title: string }> = {
+  ok: { Icon: Check, className: 'text-success', title: 'Completed' },
+  error: { Icon: X, className: 'text-danger', title: 'Failed' },
+  capped: { Icon: Hourglass, className: 'text-warning', title: 'Hit its turn cap' },
 };
 
 /** A row is a bare "step echo" when its task is just the stepId repeated
@@ -96,7 +96,7 @@ export function RunAgentsPanel({ slug, runId }: { slug: string; runId: string })
             <span className="block truncate text-body text-fg">{showLabel ? agentLabel(a) : a.task}</span>
             {a.model && <span className="block truncate text-caption text-faint">{a.model}</span>}
           </span>
-          <span className={cn('shrink-0 text-body', st.className)} title={st.title} aria-label={st.title}>{st.glyph}</span>
+          <st.Icon className={cn('h-4 w-4 shrink-0', st.className)} aria-label={st.title} />
         </button>
         {isOpen && (
           <div className="border-t border-border/60 px-3 py-2">
@@ -113,7 +113,7 @@ export function RunAgentsPanel({ slug, runId }: { slug: string; runId: string })
         <button
           type="button"
           onClick={() => setExpandOverride(!expanded)}
-          className="inline-flex items-center gap-1 text-caption font-semibold uppercase tracking-wide text-muted hover:text-fg"
+          className="inline-flex items-center gap-1 text-caption font-semibold text-muted hover:text-fg"
         >
           <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', expanded && 'rotate-90')} aria-hidden />
           Agents · {agents.length}{stepEcho ? ' — mirror of steps' : ''}

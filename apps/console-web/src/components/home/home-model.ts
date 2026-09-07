@@ -7,6 +7,7 @@
  * results feed. The screen composes; this file decides copy and targets.
  */
 import type { ActivityEntry } from '@/lib/activity';
+import type { HomePaneId } from '@/lib/home-prefs';
 import type { CommandCenterItem } from '@/lib/types';
 import type { SpaceRecord } from '@/lib/spaces';
 // Relative for VALUES, `@/` for types. The alias is a bundler/tsconfig path,
@@ -25,6 +26,57 @@ export interface HomeFeedItem extends CommandCenterItem {
   runId?: string;
   taskId?: string;
   targetRunId?: string;
+}
+
+// ─── The shape of the window ───────────────────────────────────────────────
+
+/** A thing the home stacks: one of the user's panes, or the composer. */
+export type HomeBlockId = HomePaneId | 'composer';
+
+/**
+ * WORK LEADS — and the order is the user's, not this function's.
+ *
+ * The home used to open with a greeting and a text box: on an operations
+ * console the first thing on screen was an invitation to type, and the panes
+ * that actually answer "what are my employees doing" started underneath it.
+ * The composer is still on the page and its send -> thread handoff is
+ * untouched; it is simply no longer the hero.
+ *
+ * ONE rule: the composer goes last, after every pane the user kept. The
+ * composer is the only block the Customize sheet does not list, so it is the
+ * only block this function may place.
+ *
+ * WHAT WAS HERE AND WHY IT IS GONE. This used to also sink `quick_actions`
+ * whenever it preceded every work pane, on the theory that the chips are the
+ * other half of "talk to Clementine" and belong beside the composer. But that
+ * condition cannot tell a shipped default from a deliberate choice — it is
+ * exactly the state produced by dragging "Quick actions" to slot 1 in the
+ * Customize sheet. So the sheet rendered the chips in position 1, the drag
+ * saved, and the home went on rendering them last: a preference the UI offered
+ * and silently discarded. Where the chips SIT by default is a question for the
+ * default order (DEFAULT_HOME_PANE_ORDER), which is data the user can see and
+ * change; it is not a question for the renderer.
+ */
+export function homeBlocks(visible: readonly HomePaneId[]): HomeBlockId[] {
+  return [...visible, 'composer'];
+}
+
+/** Needs you and Running share one row when the user keeps them adjacent.
+ *  Rows, not a flat list, so the screen never re-derives the pairing. */
+export function homeRows(blocks: readonly HomeBlockId[]): HomeBlockId[][] {
+  const rows: HomeBlockId[][] = [];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const id = blocks[i];
+    const next = blocks[i + 1];
+    const paired = (id === 'needs_you' && next === 'running') || (id === 'running' && next === 'needs_you');
+    if (paired && next) {
+      rows.push([id, next]);
+      i += 1;
+      continue;
+    }
+    rows.push([id]);
+  }
+  return rows;
 }
 
 export interface PresenceCounts {

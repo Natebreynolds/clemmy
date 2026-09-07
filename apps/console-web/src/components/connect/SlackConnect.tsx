@@ -117,7 +117,10 @@ export function SlackConnect() {
 function Step({ n, title, done, children }: { n: number; title: string; done?: boolean; children: React.ReactNode }) {
   return (
     <div className="flex gap-3">
-      <div className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-caption font-semibold ${done ? 'bg-primary text-white' : 'bg-subtle text-muted'}`}>
+      {/* The done marker is a filled accent circle, so its label is
+          --primary-fg (5.39:1 light / 6.62:1 dark), not white — white on
+          --primary is 3.18:1 light and 2.59:1 dark. */}
+      <div className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-caption font-semibold ${done ? 'bg-primary text-primary-fg' : 'bg-subtle text-muted'}`}>
         {done ? <Check className="h-3.5 w-3.5" aria-hidden /> : n}
       </div>
       <div className="min-w-0 flex-1">

@@ -189,7 +189,7 @@ export function LiveFeed({ items, live, showDetails, terminalOutcome }: {
   return (
     <div>
       {agents.length > 1 && (
-        <div className="mb-2 flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-faint">
+        <div className="mb-2 flex items-center gap-1.5 text-caption font-semibold text-muted">
           <Users className="h-3.5 w-3.5" aria-hidden />
           {live && doneAgents < agents.length ? `${doneAgents} of ${agents.length} done` : `${agents.length} agents`}
         </div>

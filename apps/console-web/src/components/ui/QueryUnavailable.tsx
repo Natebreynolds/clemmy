@@ -22,7 +22,7 @@ export function QueryUnavailable({
     >
       <AlertTriangle className="mb-3 h-7 w-7 text-warning" aria-hidden />
       <h3 className="text-h3 text-fg">{title}</h3>
-      {description && <p className="mt-1 max-w-md text-body text-muted">{description}</p>}
+      {description && <p className="reading mt-2 text-muted">{description}</p>}
       <Button variant="secondary" className="mt-4" onClick={onRetry}>
         <RefreshCw className="h-4 w-4" aria-hidden /> Retry
       </Button>

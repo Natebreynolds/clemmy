@@ -104,7 +104,7 @@ export function HealthIndicator() {
         <div
           role="dialog"
           aria-label="System status"
-          className="absolute right-0 top-full z-50 mt-2 w-64 rounded-md border border-border bg-surface p-2 shadow-lg animate-fade-in"
+          className="absolute right-0 top-full z-50 mt-2 w-64 rounded-md border border-border bg-surface p-2 shadow-popover animate-fade-in"
         >
           <Row label="Daemon" ok={online === true} okText="Connected" badText="Reconnecting…" />
           <Row

@@ -54,7 +54,7 @@ export function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: (
         try {
           const res = await codexDevicePoll(loginId);
           if (res.status === 'complete') {
-            setDeviceStatus('Signed in ✓'); onDone();
+            setDeviceStatus('Signed in'); onDone();
             setTimeout(() => { setDevice(null); setDeviceStatus(''); setDeviceBusy(false); }, 2500);
             return;
           }
@@ -110,7 +110,7 @@ export function CodexLoginForm({ embedded = false }: { embedded?: boolean } = {}
       </div>
       <div className="rounded-lg border border-border bg-canvas p-3 text-small">
         {signedIn
-          ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Signed in · subscription billing ✓</span>
+          ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Signed in · subscription billing</span>
           : <span className="text-muted">Not signed in. Connect your Codex/OpenAI subscription below.</span>}
       </div>
       <CodexReauth signedIn={signedIn} onDone={refetch} />

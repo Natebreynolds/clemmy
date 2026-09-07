@@ -9,10 +9,10 @@ export function CustomizeSection({ label, hint, children }: { label: string; hin
   return (
     <section aria-label={label} className="flex flex-col gap-1.5">
       <div className="flex items-baseline gap-2">
-        <h3 className="text-label uppercase tracking-[0.02em] text-faint">{label}</h3>
+        <h3 className="text-small font-semibold text-muted">{label}</h3>
         {hint && <span className="text-caption text-faint">{hint}</span>}
       </div>
-      <div className="overflow-hidden rounded-md border border-border bg-surface shadow-sm">{children}</div>
+      <div className="overflow-hidden rounded-md border border-border bg-surface">{children}</div>
     </section>
   );
 }

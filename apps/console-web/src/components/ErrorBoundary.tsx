@@ -30,7 +30,7 @@ export class ErrorBoundary extends Component<Props, State> {
     if (!this.state.error) return this.props.children;
     return (
       <div className="flex min-h-[60vh] items-center justify-center p-8">
-        <div className="max-w-md rounded-xl border border-border bg-surface p-6 text-center shadow-sm">
+        <div className="max-w-md rounded-xl border border-border-raised bg-raised p-6 text-center">
           <AlertTriangle className="mx-auto mb-3 h-8 w-8 text-warning" aria-hidden />
           <h2 className="mb-1 text-h3 text-fg">This view hit a snag</h2>
           <p className="mb-4 text-body text-muted">Something on this screen couldn't render. The rest of the app is fine — try again, or switch tabs.</p>

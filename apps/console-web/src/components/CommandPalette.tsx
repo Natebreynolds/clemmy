@@ -65,10 +65,10 @@ export function CommandPalette() {
       aria-label="Command palette"
     >
       <div
-        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-lg"
+        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-modal"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-3 border-b border-border px-4">
+        <div className="flex items-center gap-3 border-b border-border px-4 focus-within:ring-2 focus-within:ring-primary focus-within:ring-inset">
           <Search className="h-4 w-4 text-faint" aria-hidden />
           <input
             ref={inputRef}

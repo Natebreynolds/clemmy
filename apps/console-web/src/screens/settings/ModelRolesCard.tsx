@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Check, BrainCircuit, Users, Scale, Sparkles, X } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -368,7 +368,7 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
             {workerIntents.map((b) => (
               <li key={`wi-${b.whenIntent}`} className="flex min-w-0 items-center gap-2 text-small">
                 <span className="shrink-0 rounded bg-canvas px-1.5 py-0.5 text-caption text-fg">{b.whenIntent}</span>
-                <span className="text-muted" aria-hidden>→</span>
+                <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden />
                 <span className="truncate text-fg" title={b.modelId}>{modelLabel(b.modelId)}</span>
                 {modelProvider(b.modelId) && <span className="shrink-0 text-caption text-muted">· {modelProvider(b.modelId)}</span>}
                 <button type="button"
@@ -386,7 +386,7 @@ export function ModelRolesCard({ embedded = false, sessionId }: { embedded?: boo
         <div className="flex items-center gap-2">
           <Input className="h-9 max-w-[8rem]" placeholder="design" value={newIntent}
             onChange={(e) => setNewIntent(e.target.value)} aria-label="Task intent" />
-          <span className="text-muted" aria-hidden>→</span>
+          <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden />
           <Select className="h-9 min-w-0" value={newIntentModel}
             onChange={(e) => setNewIntentModel(e.target.value)} aria-label="Model for this intent">
             <option value="">Pick a model…</option>

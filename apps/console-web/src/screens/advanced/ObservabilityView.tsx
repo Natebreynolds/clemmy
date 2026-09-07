@@ -5,6 +5,7 @@ import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { cn } from '@/lib/cn';
+import { sentence } from '@/lib/sentence-case';
 import {
   subscribeTelemetry,
   OPERATIONAL_SOURCES,
@@ -39,7 +40,9 @@ const SOURCE_LABEL: Record<OperationalSource, string> = {
 /** Label for a source. The map above is exhaustive over the known sources; this
  *  still falls back for a source a newer daemon emits that this build predates. */
 function sourceLabel(source: string): string {
-  return (SOURCE_LABEL as Record<string, string>)[source] ?? source;
+  // The fallback used to lean on `uppercase` to look intentional; with the
+  // utility gone it must actually be a label.
+  return (SOURCE_LABEL as Record<string, string>)[source] ?? sentence(source);
 }
 
 function relTime(ts: string): string {
@@ -150,7 +153,7 @@ export function ObservabilityView() {
           {filtered.map((ev) => (
             <div key={ev.eventId} className="flex items-center gap-3 px-4 py-2.5">
               <span className={cn('h-2 w-2 shrink-0 rounded-full', SEVERITY_DOT[ev.severity] ?? 'bg-faint')} aria-hidden />
-              <span className="w-20 shrink-0 text-caption uppercase tracking-wide text-faint">{sourceLabel(ev.source)}</span>
+              <span className="w-20 shrink-0 text-caption text-faint">{sourceLabel(ev.source)}</span>
               <span className="shrink-0 font-mono text-small font-medium text-fg">{ev.type}</span>
               <span className="min-w-0 flex-1 truncate text-small text-muted">{eventDetail(ev)}</span>
               <span className="shrink-0 text-caption tabular-nums text-faint">{relTime(ev.ts)}</span>

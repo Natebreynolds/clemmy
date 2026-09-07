@@ -89,7 +89,7 @@ function NavRow({
           {showBadge && collapsed && (
             <span
               className={cn(
-                'absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold leading-none',
+                'absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-caption font-bold leading-none',
                 badgeClass,
               )}
               aria-hidden

@@ -401,6 +401,12 @@ function CustomizeSheet({ onClose }: { onClose: () => void }) {
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        // tabIndex={-1} with outline-none is the ONE legitimate shape of that
+        // pair: this container is focused programmatically when the sheet
+        // opens and nobody can Tab to it, so a ring around the whole panel
+        // would be noise. Every control inside keeps the base :focus-visible
+        // outline — which is what makes this different from the sites where
+        // outline-none locks a keyboard user out.
         tabIndex={-1}
         className="app-no-drag fixed bottom-3 right-3 top-3 z-[91] flex w-[min(440px,calc(100vw-24px))] flex-col overflow-hidden rounded-lg border border-border bg-surface shadow-lg outline-none"
         initial={{ x: reduced ? 0 : 24, opacity: 0 }}

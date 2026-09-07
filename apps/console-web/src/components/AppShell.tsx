@@ -98,7 +98,7 @@ export function AppShell() {
     <div className="flex h-screen w-screen overflow-hidden bg-canvas text-fg">
       <a
         href="#main"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[200] focus:rounded-md focus:bg-surface focus:px-3 focus:py-2 focus:shadow-lg"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-[200] focus:rounded-md focus:bg-surface focus:px-3 focus:py-2 focus:shadow-popover"
       >
         Skip to content
       </a>

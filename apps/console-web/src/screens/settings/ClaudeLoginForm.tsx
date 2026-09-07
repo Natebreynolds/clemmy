@@ -59,7 +59,7 @@ export function ClaudeLoginForm({ embedded = false }: { embedded?: boolean } = {
       <div className="rounded-lg border border-border bg-canvas p-3 text-small">
         {claude?.configured
           ? <span className="inline-flex items-center gap-1 text-success">
-              <Check className="h-4 w-4" aria-hidden /> Signed in{claude.plan ? ` (${claude.plan})` : ''} · subscription billing ✓{claude.expiresAt ? ` · valid until ${new Date(claude.expiresAt).toLocaleString()}` : ''}
+              <Check className="h-4 w-4" aria-hidden /> Signed in{claude.plan ? ` (${claude.plan})` : ''} · subscription billing{claude.expiresAt ? ` · valid until ${new Date(claude.expiresAt).toLocaleString()}` : ''}
             </span>
           : <span className="text-muted">Not signed in. {claude?.reason || 'Connect your Claude Max/Pro subscription — billed to your plan, never a pay-per-token API key.'}</span>}
       </div>

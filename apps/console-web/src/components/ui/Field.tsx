@@ -3,6 +3,10 @@ import { cn } from '@/lib/cn';
 
 const fieldClass =
   'w-full rounded-md border border-border bg-canvas px-3 text-body text-fg outline-none transition-colors ' +
+  // `outline-none` alone is a keyboard user with no idea where they are. It is
+  // only legal paired with a replacement indicator, so the pair lives here in
+  // the primitive rather than being remembered at each call site.
+  'focus-visible:ring-2 focus-visible:ring-primary ' +
   'focus:border-primary placeholder:text-faint disabled:opacity-50';
 
 export function Field({ label, hint, children }: { label: string; hint?: string; children: (id: string) => ReactNode }) {

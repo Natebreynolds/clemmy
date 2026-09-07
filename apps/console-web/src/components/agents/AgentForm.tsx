@@ -77,7 +77,7 @@ export function AgentForm({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={`${mode === 'create' ? 'New' : 'Edit'} agent`}>
       <div className="absolute inset-0 bg-black/30 animate-fade-in" onClick={onClose} />
-      <div className="relative flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-lg animate-fade-in">
+      <div className="relative flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-modal animate-fade-in">
         <header className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
           <h3 className="text-h3 text-fg">{mode === 'create' ? 'New agent' : `Edit ${agent?.name}`}</h3>
           <button onClick={onClose} className="rounded-sm p-1.5 text-muted hover:bg-hover hover:text-fg" aria-label="Close">

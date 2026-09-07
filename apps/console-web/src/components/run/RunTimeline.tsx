@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Check, X, Minus } from 'lucide-react';
 import type { ActivityItem } from '@clem/chat-engine';
 import { cn } from '@/lib/cn';
 
@@ -80,7 +80,8 @@ function StepMark({ status, live }: { status: ActivityItem['status']; live: bool
       ? <span className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-primary" aria-label="running" />
       : <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full border border-muted" aria-label="never finished" />;
   }
-  const mark = status === 'failed' ? '✗' : status === 'interrupted' ? '–' : '✓';
+  const Mark = status === 'failed' ? X : status === 'interrupted' ? Minus : Check;
   const ink = status === 'failed' ? 'text-danger' : status === 'interrupted' ? 'text-warning' : 'text-success';
-  return <span className={cn('w-2 shrink-0 text-center text-caption leading-5', ink)} aria-hidden>{mark}</span>;
+  const label = status === 'failed' ? 'failed' : status === 'interrupted' ? 'interrupted' : 'done';
+  return <Mark className={cn('mt-1 h-3 w-3 shrink-0', ink)} aria-label={label} />;
 }

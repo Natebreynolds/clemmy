@@ -64,7 +64,7 @@ export function Memory() {
 
   return (
     <Page title="Memory" subtitle="Everything Clementine knows — and where it comes from">
-      <div className="mb-5 flex items-center gap-2 rounded-lg border border-border bg-surface px-3 shadow-xs">
+      <div className="mb-5 flex items-center gap-2 rounded-lg border border-border-raised bg-raised px-3 transition-colors duration-fast focus-within:ring-2 focus-within:ring-primary">
         <Search className="h-4 w-4 text-faint" aria-hidden />
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search everything Clementine knows…" aria-label="Search memory"
           className="h-12 flex-1 bg-transparent text-body-lg text-fg outline-none placeholder:text-faint" />
@@ -80,7 +80,7 @@ export function Memory() {
               const Icon = t.icon; const active = tab === t.key;
               return (
                 <button key={t.key} type="button" onClick={() => setTab(t.key)}
-                  className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
+                  className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
                     active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
                   <Icon className="h-4 w-4" aria-hidden /> {t.label}
                 </button>
@@ -978,8 +978,8 @@ function EpisodesTab() {
           <Card className={cn('h-full p-3.5 transition-colors', pendingUniqueClaims > 0 && 'border-warning/40 bg-warning/5', review === 'pending' && 'ring-2 ring-warning/30')}>
             <div className="text-h2 text-fg">{pendingUniqueClaims.toLocaleString()}</div>
             <div className="text-caption text-muted">Unique claims awaiting review</div>
-            {pendingObservations !== pendingUniqueClaims && <div className="mt-1 text-[10px] leading-tight text-faint">{pendingObservations.toLocaleString()} source observations</div>}
-            {pendingBreakdown && <div className="mt-1 text-[10px] leading-tight text-faint">{pendingBreakdown}</div>}
+            {pendingObservations !== pendingUniqueClaims && <div className="mt-1 text-caption leading-tight text-faint">{pendingObservations.toLocaleString()} source observations</div>}
+            {pendingBreakdown && <div className="mt-1 text-caption leading-tight text-faint">{pendingBreakdown}</div>}
           </Card>
         </button>
         <Card className="p-3.5"><div className="text-h2 text-fg">{visiblePeople.toLocaleString()}</div><div className="text-caption text-muted">People/things observed in view</div></Card>

@@ -44,7 +44,7 @@ export function BoardColumn({
   return (
     <div className="flex min-w-0 flex-col">
       <div className="mb-2 flex items-center justify-between px-1">
-        <h3 className="text-label uppercase tracking-wide text-muted">{label}</h3>
+        <h3 className="text-label text-muted">{label}</h3>
         <span className="rounded-sm bg-subtle px-1.5 py-0.5 text-caption font-semibold text-faint">{cards.length}</span>
       </div>
       <div
