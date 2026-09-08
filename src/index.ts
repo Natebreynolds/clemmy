@@ -37,6 +37,7 @@ import { CUTOVER_HOLD } from './runtime/cutover-hold.js';
 import { warmMarkitdownInBackground } from './runtime/markitdown.js';
 import { runDoctor } from './setup/doctor.js';
 import { initHome } from './setup/init-home.js';
+import { provisionAuthoritySealKey } from './runtime/harness/authority-argument-seal.js';
 import { provisionBuiltinSkills } from './setup/builtin-skills.js';
 import { runSetupWizard } from './setup/setup.js';
 import { PLUGINS_DIR } from './plugins/loader.js';
@@ -554,6 +555,11 @@ async function main(): Promise<void> {
 
     // Internal foreground mode — spawned by `daemon start`
     if (sub === '--foreground') {
+      try {
+        provisionAuthoritySealKey();
+      } catch (err) {
+        logger.error({ err, vault: 'state/secrets-vault.json' }, 'authority seal key could not be provisioned — every model request will be refused until this is fixed');
+      }
       if (!claimForegroundDaemonLease()) return;
       provisionForegroundDaemonBuiltins();
       registerShutdownHandlers(async () => {
@@ -767,10 +773,17 @@ async function main(): Promise<void> {
     // never ran this, so fresh-install users were booting with an
     // empty vault. `ensureFile` is a no-op when files exist, so this
     // is safe to call on every daemon start.
+    // The seal key stands alone: a failure anywhere else in the scaffold must
+    // never leave a home that can make no model request at all.
+    try {
+      provisionAuthoritySealKey();
+    } catch (err) {
+      logger.error({ err, vault: 'state/secrets-vault.json' }, 'authority seal key could not be provisioned — every model request will be refused until this is fixed');
+    }
     try {
       await initHome();
     } catch (err) {
-      logger.warn({ err }, 'initHome failed during service boot — continuing with whatever scaffold exists');
+      logger.error({ err }, 'initHome failed during service boot — continuing with whatever scaffold exists');
     }
     // Degraded-auth boot (the factory no longer crashes on a missing grant):
     // tell the user ONCE per condition how to finish sign-in instead of

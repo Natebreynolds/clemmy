@@ -72,6 +72,10 @@ const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason
 const RAW_TOOL_OR_REASONING_PROTOCOL_RE = /(?:<\/?(?:analysis|reasoning|invoke|tool_call)\b|\[tool\s*:|"tool_call"\s*:)/i;
 const SAFE_TERMINAL_FALLBACK =
   'I finished the turn, but the final reply was not safe to display. The activity log has the technical details.';
+/** The host could not seal a model request because its local vault has no
+ *  seal key. Live 2026-09-08: a desktop user's every first message died as
+ *  "Something went wrong" while the only trace was a boot-time warning. */
+export const PUBLIC_VAULT_NOT_READY_TEXT = 'Clementine\'s local vault isn\'t ready, so no model request can start. Quit and reopen Clementine; if this keeps happening, tell me and I\'ll walk you through repairing the home folder.';
 export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
   'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.';

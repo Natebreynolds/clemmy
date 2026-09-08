@@ -29,6 +29,12 @@ async function main(): Promise<void> {
   const pluginsDir = path.join(BASE_DIR, 'plugins');
   const logsDir = path.join(BASE_DIR, 'logs');
 
+  // The seal key gates every typed crossing and every model request. It is
+  // minted FIRST, before any scaffold step that can fail on a packaged first
+  // run (live 2026-09-08: a desktop user's every turn died with
+  // "model request provenance refused" because a later scaffold step threw,
+  // the service boot swallowed it, and this line never ran).
+  provisionAuthoritySealKey();
   ensureVaultScaffold();
   ensureToolDirectories();
   ensureDir(systemDir);
@@ -43,10 +49,6 @@ async function main(): Promise<void> {
   // empty incomplete directory is recovered in place).
   provisionBuiltinSkills();
 
-  // The typed crossing path needs a host-local seal key before its first use.
-  // Scaffolding is the honest home for it: it is install state, not a user
-  // credential, and every other boot path already depends on this running.
-  provisionAuthoritySealKey();
 
   ensureFile(
     path.join(systemDir, 'SOUL.md'),

@@ -191,9 +191,16 @@ export type ModelRequestProjection =
     }
   | { status: 'invalid'; reason: string };
 
+function causeSuffix(cause: unknown): string {
+  const code = cause && typeof cause === 'object' && typeof (cause as { code?: unknown }).code === 'string'
+    ? (cause as { code: string }).code
+    : cause instanceof Error ? cause.message.slice(0, 120) : '';
+  return code ? ` (${code})` : '';
+}
+
 export class ModelRequestProvenanceError extends Error {
   constructor(readonly code: string, options?: { cause?: unknown }) {
-    super(`model request provenance refused: ${code}`, options);
+    super(`model request provenance refused: ${code}${causeSuffix(options?.cause)}`, options);
     this.name = 'ModelRequestProvenanceError';
   }
 }

@@ -116,6 +116,7 @@ import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from '.
 import { synthesizeTurnReport } from './work-report.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
+  PUBLIC_VAULT_NOT_READY_TEXT,
   publicAsyncWorkDispatchedData,
   publicReplyText,
 } from './public-presentation.js';
@@ -1233,7 +1234,12 @@ function reduceStandardConversationTerminal(input: {
         identity,
         status: 'failed',
         resumable: false,
-        presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+        presentation: {
+          kind: 'error',
+          text: /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
+            ? PUBLIC_VAULT_NOT_READY_TEXT
+            : PUBLIC_RUN_FAILURE_TEXT,
+        },
       };
       legacyReason = 'failed';
       // The user-facing text stays generic; the terminal EVENT names the
