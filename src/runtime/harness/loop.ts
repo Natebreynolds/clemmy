@@ -1,4 +1,5 @@
 import { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
+import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
@@ -1396,6 +1397,63 @@ function commitStandardNeedsInputTerminal(input: {
  * calls a model/tool: Q and its public shortcuts are cloned onto B, then the
  * continuity store supersedes the old packet with an exact-root successor so
  * the next human answer remains adjacent and consumable. */
+/**
+ * THE HOST HOLDS THE QUESTION — ASK IT.
+ *
+ * When the no-progress governor exhausts a fresh host turn and this source's
+ * own discovery left an unresolved account choice (tool_search returned
+ * account_selection_required with exact accountChoices), the turn must not end
+ * blocked. The host knows the question and the exact choices; the brain was
+ * merely told to ask and did not (live 2026-09-08: GLM 5.2 ignored the typed
+ * "ask the user" instruction three times then exhausted; Grok 4.6 wandered
+ * through spaces/skills/MCP status until the governor stopped it; Opus asked
+ * after one refusal). Publish the question as the turn's own awaiting row and
+ * hand the reducer an awaiting_user_input result: the terminal becomes a typed
+ * needs_input question and the continuity packet carries the choices, so the
+ * next human answer is adjacent and consumable. A cancelled/aborted turn, or
+ * one with no unresolved account choice, passes through untouched.
+ */
+export function hostAccountQuestionForExhaustedTurn(
+  turnResult: RunTurnResult,
+  input: { sessionId: string; sourceUserSeq: number | undefined },
+): RunTurnResult {
+  if (turnResult.status !== 'blocked' || turnResult.blockedReason !== 'control_no_progress_exhausted') return turnResult;
+  if (!Number.isSafeInteger(input.sourceUserSeq) || (input.sourceUserSeq ?? 0) <= 0) return turnResult;
+  let blockers: Array<{ name: string; choices: readonly string[]; reason?: string }> = [];
+  try {
+    blockers = thisTurnSearchAccountSelectionBlockers({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq as number })
+      .filter((blocker) => blocker.choices.length > 1);
+  } catch { return turnResult; }
+  const blocker = blockers[0];
+  if (!blocker) return turnResult;
+  const options = [...new Set(blocker.choices.map((choice) => choice.trim()).filter(Boolean))];
+  if (options.length < 2) return turnResult;
+  const operation = blocker.name.trim();
+  const question = `Which account should I use for ${operation.toLowerCase().replace(/_/g, ' ')}? You have more than one connected: ${options.join(', ')}.`;
+  const already = listEvents(input.sessionId, { types: ['awaiting_user_input'], desc: true, limit: 20 })
+    .find((event) => event.turn === turnResult.turn
+      && event.data.sourceUserSeq === input.sourceUserSeq
+      && event.data.source === 'host_account_selection');
+  if (!already) {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: turnResult.turn,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: {
+        question,
+        options,
+        purpose: 'clarification',
+        source: 'host_account_selection',
+        sourceUserSeq: input.sourceUserSeq,
+        operation,
+      },
+    });
+  }
+  const { blockedReason: _reason, blockedDetail: _detail, blockedResumable: _resumable, error: _error, ...rest } = turnResult;
+  return { ...rest, status: 'awaiting_user_input', finalOutput: question };
+}
+
 export function reofferUnresolvedAcceptedSourceClarification(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -5652,7 +5710,10 @@ async function runConversationWithinRuntimeConfig(
             }
           : {}),
       });
-      const result = hostActivationConversationResult(turnResult, sourceUserSeq);
+      const result = hostActivationConversationResult(
+        hostAccountQuestionForExhaustedTurn(turnResult, { sessionId: options.sessionId, sourceUserSeq }),
+        sourceUserSeq,
+      );
       if (result.status === 'held') {
         scheduleHostCheckpointRecovery(options, sourceUserSeq);
         return result;
