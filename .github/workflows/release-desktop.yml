@@ -169,9 +169,14 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
-      # Fast, cheap checks run first so a trivial break (a stale type, a file git
-      # does not track, a hygiene miss) fails the tag in minutes — the full unit
-      # suite below takes ~35 minutes on this runner (2026-09-08 v3.16.0 gate).
+      # A production tag is proven BEFORE it is cut: docs/NEXT-TAG-RELEASE-GATE.md
+      # requires typecheck, the full isolated unit suite, journeys, build, packed
+      # smoke and the upgrade rehearsal on the exact release commit, locally. The
+      # full suite and journeys also run on every push to main (test.yml). This
+      # job therefore re-checks only what a local pass cannot prove — the tree
+      # git actually holds, hygiene, release assets, and the packaged candidate —
+      # then builds. Owner decision 2026-09-08 after v3.16.0 spent 37 minutes per
+      # attempt re-running 15,000 already-green tests on a 2-core runner.
       - name: Typecheck
         run: npm run typecheck
 
@@ -184,17 +189,8 @@ jobs:
       - name: Release asset tests
         run: npm run test:release-assets
 
-      - name: Unit tests
-        run: npm test
-
-      - name: Canonical journeys
-        run: npm run journeys
-
-      - name: Measurement-layer tests
-        run: npm run test:measurement
-
-      - name: Proof self-tests
-        run: npm run proof:selftest
+      - name: Tracked-files guard
+        run: node scripts/run-tests-isolated.mjs scripts/tracked-test-references.test.mts
 
       - name: Release closure tests
         run: |
@@ -209,22 +205,6 @@ jobs:
         run: |
           npm run test:packed-candidate
           npm run test:packaged-upgrade
-
-      - name: Harness gate benchmark
-        run: npm run bench:gates
-
-      - name: Memory reliability gate
-        run: npm run eval:memory
-
-      - name: pass^k consistency (strict)
-        run: npm run eval:passk
-        env:
-          EVAL_PASSK_STRICT: 'on'
-
-      - name: Job evals (strict)
-        run: npm run eval:jobs
-        env:
-          EVAL_JOBS_STRICT: 'on'
 
   release-mac:
     name: Build signed and notarized macOS artifacts

@@ -409,18 +409,13 @@ test('DMGs are signed before electron-builder disposes its temporary keychain', 
 test('production desktop publishing is gated on exact-main preflight', () => {
   const preflight = workflow.jobs?.preflight;
   const scripts = runScripts(preflight);
-  assert.match(scripts, /npm test/);
-  assert.match(scripts, /npm run test:measurement/);
-  assert.match(scripts, /npm run proof:selftest/);
+  // The full unit suite, journeys, benchmarks and evals are the LOCAL tag
+  // procedure's proof (and run on every push to main); see the preflight pin.
   assert.match(scripts, /npm run check:public-hygiene/);
   assert.match(scripts, /npm run test:public-hygiene/);
   assert.match(scripts, /npm run test:release-assets/);
   assert.match(scripts, /npm run test:release-closure/);
   assert.match(scripts, /npm run typecheck/);
-  assert.match(scripts, /npm run bench:gates/);
-  assert.match(scripts, /npm run eval:memory/);
-  assert.match(scripts, /npm run eval:passk/);
-  assert.match(scripts, /npm run eval:jobs/);
   assert.match(scripts, /refs\/remotes\/origin\/main/);
   assert.match(scripts, /tag_sha.*main_sha/s);
   assert.match(scripts, /source_version.*package\.json/s);
@@ -431,9 +426,33 @@ test('production desktop publishing is gated on exact-main preflight', () => {
   assert.equal(workflow.concurrency?.['cancel-in-progress'], false);
 });
 
-test('main CI and desktop release preflight run broad units before serialized journeys', () => {
+test('main CI runs broad units before serialized journeys', () => {
   assertUnitBeforeJourneys(testWorkflow.jobs?.test, 'main CI');
-  assertUnitBeforeJourneys(workflow.jobs?.preflight, 'desktop release preflight');
+});
+
+// Owner decision 2026-09-08: a production tag is proven by the LOCAL gate on the
+// exact release commit (full suite, journeys, build, packed smoke, rehearsal),
+// and the full suite runs on every push to main. The tag job re-checks only what
+// a local pass cannot prove, then builds — v3.16.0 spent 37 minutes per attempt
+// re-running 15,000 already-green tests on a 2-core runner.
+test('desktop release preflight re-checks packaging and tree truth, never the full unit suite', () => {
+  const steps = workflow.jobs?.preflight?.steps ?? [];
+  const runs = steps.map((step) => String(step?.run ?? '').trim());
+  assert.ok(!runs.includes('npm test'), 'the tag job must not re-run the full unit suite');
+  assert.ok(!runs.includes('npm run journeys'), 'the tag job must not re-run serialized journeys');
+  for (const required of [
+    'npm run typecheck',
+    'npm run check:public-hygiene',
+    'npm run test:release-assets',
+    'node scripts/run-tests-isolated.mjs scripts/tracked-test-references.test.mts',
+    'npm run prepack',
+  ]) assert.ok(runs.includes(required), `the tag job keeps: ${required}`);
+  assert.ok(runs.some((run) => run.includes('npm run test:release-closure')), 'the tag job keeps release closure tests');
+  assert.ok(runs.some((run) => run.includes('npm run test:packed-candidate') && run.includes('npm run test:packaged-upgrade')),
+    'the tag job keeps both post-build package gates');
+  const prepack = runs.indexOf('npm run prepack');
+  const postBuild = runs.findIndex((run) => run.includes('npm run test:packed-candidate'));
+  assert.ok(prepack >= 0 && postBuild > prepack, 'package gates run only after the packaged candidate is built');
 });
 
 test('fresh CI and release preflight run both package gates only after building the complete package candidate', () => {

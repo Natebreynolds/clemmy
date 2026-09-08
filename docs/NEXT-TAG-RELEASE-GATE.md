@@ -276,6 +276,17 @@ v3.14 home before it is installed over any user home.
 
 ## Candidate and tag procedure
 
+**Where the proof lives (owner decision 2026-09-08).** The full isolated unit
+suite, canonical journeys, build, packed-candidate smoke and the v3.14 upgrade
+rehearsal are run LOCALLY on the exact release commit, by this procedure, before
+the tag is cut. The full suite and journeys also run on every push to `main`
+(`test.yml`). The tag workflow's preflight job therefore re-checks only what a
+local pass cannot prove — typecheck, repository hygiene, release assets, the
+tracked-files guard, release closure — then builds the packaged candidate and
+runs the two package gates on it, then builds and publishes. v3.16.0 spent
+37 minutes per attempt re-running ~15,000 already-green tests on a 2-core runner
+before this change; the whole release should again take about 45 minutes.
+
 The tag is withheld unless every item is true:
 
 - the intended work is one reviewed clean commit (or a reviewed, documented
